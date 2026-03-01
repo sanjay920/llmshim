@@ -1,0 +1,28 @@
+[package]
+name = "llmshim"
+version = "0.1.0"
+edition = "2021"
+description = "Blazing fast LLM API translation layer in pure Rust"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+thiserror = "2"
+bytes = "1"
+tokio-stream = "0.1"
+eventsource-stream = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[example]]
+name = "chat"
+path = "examples/chat.rs"
+
+[[example]]
+name = "stream"
+path = "examples/stream.rs"
