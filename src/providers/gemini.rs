@@ -1,5 +1,6 @@
 use crate::error::{Result, ShimError};
 use crate::provider::{Provider, ProviderRequest};
+use crate::vision;
 use serde_json::{json, Value};
 
 pub struct Gemini {
@@ -86,11 +87,31 @@ fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
 fn build_parts(msg: &Value) -> Vec<Value> {
     let mut parts = Vec::new();
 
-    // Text content
-    if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
-        if !text.is_empty() {
-            parts.push(json!({"text": text}));
+    // Text content (string or array of content blocks)
+    match msg.get("content") {
+        Some(Value::String(text)) => {
+            if !text.is_empty() {
+                parts.push(json!({"text": text}));
+            }
         }
+        Some(Value::Array(blocks)) => {
+            for block in blocks {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            parts.push(json!({"text": text}));
+                        }
+                    }
+                    Some("image_url" | "input_image" | "image") => {
+                        if let Some(gemini_part) = vision::to_gemini(block) {
+                            parts.push(gemini_part);
+                        }
+                    }
+                    _ => {} // skip unknown block types
+                }
+            }
+        }
+        _ => {}
     }
 
     // Tool calls (OpenAI format) → Gemini functionCall parts

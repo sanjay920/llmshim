@@ -1,5 +1,6 @@
 use crate::error::{Result, ShimError};
 use crate::provider::{Provider, ProviderRequest};
+use crate::vision;
 use serde_json::{json, Value};
 
 pub struct Anthropic {
@@ -85,6 +86,14 @@ fn transform_messages(messages: &[Value]) -> Vec<Value> {
                 obj.remove("refusal"); // OpenAI safety refusal field
                 obj.remove("audio"); // OpenAI audio response field
                 obj.remove("logprobs"); // OpenAI logprobs on message
+            }
+
+            // Translate image content blocks from OpenAI format to Anthropic format
+            if let Some(content) = out.get("content").cloned() {
+                if content.is_array() {
+                    out["content"] =
+                        vision::translate_content_blocks(&content, vision::to_anthropic);
+                }
             }
 
             // Anthropic doesn't have a "function" role — map to "user" with context

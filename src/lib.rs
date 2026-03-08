@@ -6,6 +6,7 @@ pub mod models;
 pub mod provider;
 pub mod providers;
 pub mod router;
+pub mod vision;
 
 #[cfg(feature = "proxy")]
 pub mod proxy;

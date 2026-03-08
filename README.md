@@ -205,6 +205,7 @@ Commands: `/model` (switch by name, number, or fuzzy match), `/clear`, `/history
 - **Multi-model conversations** — switch providers mid-chat, history carries over
 - **Reasoning/thinking** — visible chain-of-thought from OpenAI, Anthropic, and Gemini
 - **Streaming** — token-by-token with thinking in dim grey, answers in default color
+- **Vision/images** — send images in any format, auto-translated between providers
 - **Retry + fallback chains** — automatic failover across providers with exponential backoff
 - **Cross-provider translation** — tool calls, system messages, and provider-specific fields all handled automatically
 - **JSONL logging** — `cargo run --bin llmshim -- --log llmshim.log`

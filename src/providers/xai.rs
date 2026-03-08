@@ -1,5 +1,6 @@
 use crate::error::{Result, ShimError};
 use crate::provider::{Provider, ProviderRequest};
+use crate::vision;
 use serde_json::{json, Value};
 
 pub struct Xai {
@@ -21,7 +22,7 @@ impl Xai {
     }
 }
 
-/// Sanitize messages: strip cross-provider fields.
+/// Sanitize messages: strip cross-provider fields and translate images.
 fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
@@ -31,6 +32,12 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
                 obj.remove("reasoning_content");
                 obj.remove("annotations");
                 obj.remove("refusal");
+            }
+            // Translate image content blocks to OpenAI Responses API format (same as xAI)
+            if let Some(content) = out.get("content").cloned() {
+                if content.is_array() {
+                    out["content"] = vision::translate_content_blocks(&content, vision::to_openai);
+                }
             }
             out
         })
