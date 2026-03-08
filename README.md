@@ -4,16 +4,14 @@ A blazing fast LLM API translation layer in pure Rust. One interface, every prov
 
 ## What it does
 
-Send OpenAI-format requests → llmshim translates them to the native API of whichever provider you choose → translates the response back. Zero infrastructure, zero databases, 3.7MB binary.
+Send requests through llmshim's API → it translates to whichever provider you choose → translates the response back. Zero infrastructure, zero databases, ~5MB binary.
 
-```rust
-let router = Router::from_env();
-let request = json!({
-    "model": "anthropic/claude-sonnet-4-6",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "max_tokens": 1000,
-});
-let response = llmshim::completion(&router, &request).await?;
+```python
+from llmshim import LlmShim
+
+client = LlmShim()
+resp = client.chat("claude-sonnet-4-6", "What is Rust?")
+print(resp.message.content)
 ```
 
 Switch providers by changing the model string. Everything else stays the same.
@@ -34,17 +32,128 @@ Switch providers by changing the model string. Everything else stays the same.
 cp .env.example .env
 # Edit .env with your keys
 
-# Run the interactive chat
-cargo run
+# Start the proxy server
+cargo run --features proxy --bin llmshim-proxy
 
-# Or use as a library
-cargo add llmshim
+# Or run the interactive CLI chat
+cargo run --bin llmshim
+```
+
+## Proxy Server
+
+llmshim runs as an HTTP proxy with its own API spec (not OpenAI-compatible). Any language can talk to it.
+
+```bash
+cargo run --features proxy --bin llmshim-proxy
+# Listening on http://localhost:3000
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/chat` | Chat completion (or streaming with `stream: true`) |
+| `POST` | `/v1/chat/stream` | Always-streaming SSE with typed events |
+| `GET` | `/v1/models` | List available models |
+| `GET` | `/health` | Health check |
+
+### Request format
+
+```json
+{
+  "model": "anthropic/claude-sonnet-4-6",
+  "messages": [{"role": "user", "content": "Hello!"}],
+  "config": {
+    "max_tokens": 1000,
+    "reasoning_effort": "high"
+  },
+  "provider_config": {
+    "thinking": {"type": "adaptive"}
+  }
+}
+```
+
+`config` holds provider-agnostic settings. `provider_config` passes raw JSON to the underlying provider for features like Anthropic thinking or Gemini safety settings.
+
+### Streaming events
+
+The `/v1/chat/stream` endpoint emits typed SSE events:
+
+```
+event: reasoning
+data: {"type":"reasoning","text":"Let me think..."}
+
+event: content
+data: {"type":"content","text":"The answer is 42."}
+
+event: usage
+data: {"type":"usage","input_tokens":30,"output_tokens":50}
+
+event: done
+data: {"type":"done"}
+```
+
+## Client Libraries
+
+Generated from the [OpenAPI spec](api/openapi.yaml). Install and go.
+
+### Python
+
+```python
+from llmshim import LlmShim
+
+client = LlmShim()
+
+# Chat
+resp = client.chat("claude-sonnet-4-6", "Hello!", max_tokens=500)
+print(resp.message.content)
+
+# Stream
+for event in client.stream("gpt-5.4", "Write a poem"):
+    if event["type"] == "content":
+        print(event["text"], end="")
+
+# Multi-model conversation
+messages = [{"role": "user", "content": "What is Rust?"}]
+r1 = client.chat("claude-sonnet-4-6", messages, max_tokens=500)
+messages.append({"role": "assistant", "content": r1.message.content})
+messages.append({"role": "user", "content": "Now explain it differently."})
+r2 = client.chat("gpt-5.4", messages, max_tokens=500)
+```
+
+See [`clients/python/`](clients/python/) for setup.
+
+### TypeScript
+
+```typescript
+import { LlmShim } from "./src/index.ts";
+
+const client = new LlmShim();
+
+// Chat
+const resp = await client.chat("claude-sonnet-4-6", "Hello!", { max_tokens: 500 });
+console.log(resp.message.content);
+
+// Stream
+for await (const chunk of client.stream("gpt-5.4", "Write a poem")) {
+  if (chunk.type === "content") process.stdout.write(chunk.text!);
+}
+```
+
+See [`clients/typescript/`](clients/typescript/) for setup.
+
+### curl
+
+```bash
+curl http://localhost:3000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}],"config":{"max_tokens":100}}'
 ```
 
 ## Interactive CLI
 
 ```
-$ cargo run
+$ cargo run --bin llmshim
 
   llmshim — multi-provider LLM chat
 
@@ -67,31 +176,37 @@ you: Tell me more
 GPT-5.4: [continues the conversation...]
 ```
 
-Commands: `/model` (switch), `/clear` (reset), `/history`, `/quit`
+Commands: `/model` (switch by name, number, or fuzzy match), `/clear`, `/history`, `/quit`
 
 ## Key features
 
 - **Multi-model conversations** — switch providers mid-chat, history carries over
 - **Reasoning/thinking** — visible chain-of-thought from OpenAI, Anthropic, and Gemini
-- **Streaming** — token-by-token output with thinking in dim grey
-- **Cross-provider translation** — tool calls, system messages, and provider-specific fields all handled
-- **JSONL logging** — `cargo run -- --log llmshim.log`
+- **Streaming** — token-by-token with thinking in dim grey, answers in default color
+- **Cross-provider translation** — tool calls, system messages, and provider-specific fields all handled automatically
+- **JSONL logging** — `cargo run --bin llmshim -- --log llmshim.log`
+- **OpenAPI spec** — generate clients for any language from `api/openapi.yaml`
 
 ## Architecture
 
 No canonical struct. Requests flow as `serde_json::Value` — each provider maps only what it understands. Adding a provider = implementing one trait with three methods.
 
 ```
-completion(router, request)
+llmshim::completion(router, request)
   → router.resolve("anthropic/claude-sonnet-4-6")
   → provider.transform_request(model, &value)
   → HTTP
   → provider.transform_response(model, body)
 ```
 
-## Testing
+## Build & Test
 
 ```bash
-cargo test --tests            # 168 unit tests
-cargo test -- --ignored       # 52 integration tests (needs API keys)
+cargo build                                          # dev build
+cargo build --release                                # release build
+cargo test --tests                                   # unit tests (~184)
+cargo test -- --ignored                              # integration tests (needs API keys)
+cargo test --features proxy --tests                  # includes proxy tests
+cargo run --bin llmshim                              # interactive CLI
+cargo run --features proxy --bin llmshim-proxy       # proxy server on :3000
 ```
