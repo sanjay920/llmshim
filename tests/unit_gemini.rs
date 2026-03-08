@@ -498,3 +498,149 @@ fn strips_openai_annotations_from_history() {
     assert!(model_msg.get("refusal").is_none());
     assert!(model_msg.get("reasoning_content").is_none());
 }
+
+// ============================================================
+// includeThoughts always set
+// ============================================================
+
+#[test]
+fn request_always_includes_thoughts() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert_eq!(
+        result.body["generationConfig"]["thinkingConfig"]["includeThoughts"], true,
+        "includeThoughts should always be true"
+    );
+}
+
+#[test]
+fn request_includes_thoughts_with_thinking_level() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let tc = &result.body["generationConfig"]["thinkingConfig"];
+    assert_eq!(tc["includeThoughts"], true);
+    assert_eq!(tc["thinkingLevel"], "high");
+}
+
+// ============================================================
+// Response with thought parts
+// ============================================================
+
+#[test]
+fn response_with_thought_parts() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Let me think about this...", "thought": true},
+            {"text": "The answer is 42."}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 10, "totalTokenCount": 15},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    assert_eq!(
+        result["choices"][0]["message"]["content"],
+        "The answer is 42."
+    );
+    assert_eq!(
+        result["choices"][0]["message"]["reasoning_content"],
+        "Let me think about this..."
+    );
+}
+
+#[test]
+fn response_thought_only_no_text() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Just thinking...", "thought": true}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    assert!(result["choices"][0]["message"]["content"].is_null());
+    assert_eq!(
+        result["choices"][0]["message"]["reasoning_content"],
+        "Just thinking..."
+    );
+}
+
+#[test]
+fn response_no_thought_no_reasoning_content() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Hello!"}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    assert_eq!(result["choices"][0]["message"]["content"], "Hello!");
+    assert!(result["choices"][0]["message"]
+        .get("reasoning_content")
+        .is_none());
+}
+
+// ============================================================
+// Stream with thought parts
+// ============================================================
+
+#[test]
+fn stream_thought_part() {
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Thinking...", "thought": true}
+        ], "role": "model"}, "index": 0}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_stream_chunk(
+            "gemini-3-flash-preview",
+            &serde_json::to_string(&chunk).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        parsed["choices"][0]["delta"]["reasoning_content"],
+        "Thinking..."
+    );
+    assert!(parsed["choices"][0]["delta"].get("content").is_none());
+}
+
+#[test]
+fn stream_text_and_thought_in_same_chunk() {
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Reasoning here", "thought": true},
+            {"text": "Answer here"}
+        ], "role": "model"}, "index": 0}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_stream_chunk(
+            "gemini-3-flash-preview",
+            &serde_json::to_string(&chunk).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        parsed["choices"][0]["delta"]["reasoning_content"],
+        "Reasoning here"
+    );
+    assert_eq!(parsed["choices"][0]["delta"]["content"], "Answer here");
+}

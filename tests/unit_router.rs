@@ -202,3 +202,57 @@ fn router_multiple_aliases() {
     assert_eq!(p3.name(), "openai");
     assert_eq!(m3, "gpt-4o");
 }
+
+// ============================================================
+// Auto-detection — gemini and grok
+// ============================================================
+
+#[test]
+fn parse_infer_gemini() {
+    let aliases = HashMap::new();
+    let (provider, model) = parse_model("gemini-3-flash-preview", &aliases).unwrap();
+    assert_eq!(provider, "gemini");
+    assert_eq!(model, "gemini-3-flash-preview");
+}
+
+#[test]
+fn parse_infer_grok() {
+    let aliases = HashMap::new();
+    let (provider, model) = parse_model("grok-4-1-fast-reasoning", &aliases).unwrap();
+    assert_eq!(provider, "xai");
+    assert_eq!(model, "grok-4-1-fast-reasoning");
+}
+
+#[test]
+fn parse_infer_case_insensitive() {
+    let aliases = HashMap::new();
+    let (p1, _) = parse_model("GPT-5.4", &aliases).unwrap();
+    assert_eq!(p1, "openai");
+    let (p2, _) = parse_model("Claude-Sonnet-4-6", &aliases).unwrap();
+    assert_eq!(p2, "anthropic");
+    let (p3, _) = parse_model("GEMINI-3-flash", &aliases).unwrap();
+    assert_eq!(p3, "gemini");
+    let (p4, _) = parse_model("Grok-4", &aliases).unwrap();
+    assert_eq!(p4, "xai");
+}
+
+// ============================================================
+// provider_keys
+// ============================================================
+
+#[test]
+fn router_provider_keys() {
+    let router = Router::new()
+        .register("openai", Box::new(OpenAi::new("k".into())))
+        .register("anthropic", Box::new(Anthropic::new("k".into())));
+    let keys = router.provider_keys();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&"openai"));
+    assert!(keys.contains(&"anthropic"));
+}
+
+#[test]
+fn router_provider_keys_empty() {
+    let router = Router::new();
+    assert!(router.provider_keys().is_empty());
+}
