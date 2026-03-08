@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Blazing fast LLM API translation layer in pure Rust"
 
+[features]
+default = []
+proxy = ["dep:axum", "dep:tower", "dep:tower-http", "dep:async-stream"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -16,8 +20,23 @@ tokio-stream = "0.1"
 eventsource-stream = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 
+# Proxy dependencies (feature-gated)
+axum = { version = "0.8", features = ["json"], optional = true }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+async-stream = { version = "0.3", optional = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
+
+[[bin]]
+name = "llmshim"
+path = "src/main.rs"
+
+[[bin]]
+name = "llmshim-proxy"
+path = "src/bin/proxy.rs"
+required-features = ["proxy"]
 
 [[example]]
 name = "chat"

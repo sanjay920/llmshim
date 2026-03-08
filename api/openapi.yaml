@@ -1,0 +1,353 @@
+openapi: 3.1.0
+info:
+  title: llmshim API
+  version: 0.1.0
+  description: |
+    Multi-provider LLM API proxy. Send requests in a single format,
+    llmshim translates to the native API of whichever provider you choose.
+
+    Supports OpenAI, Anthropic, Google Gemini, and xAI with automatic
+    provider detection from model names.
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+paths:
+  /v1/chat:
+    post:
+      operationId: chat
+      summary: Send a chat completion request
+      description: |
+        Non-streaming by default. Set `stream: true` to receive SSE events
+        (same format as POST /v1/chat/stream).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      responses:
+        '200':
+          description: Chat completion response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+        '400':
+          description: Bad request (missing model, unknown provider)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: Provider error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/chat/stream:
+    post:
+      operationId: chatStream
+      summary: Send a streaming chat completion request
+      description: |
+        Always returns SSE events. Each event has a typed `event:` field
+        (content, reasoning, tool_call, usage, done, error).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/StreamEvent'
+
+  /v1/models:
+    get:
+      operationId: listModels
+      summary: List available models
+      description: Returns models filtered to providers with configured API keys.
+      responses:
+        '200':
+          description: List of available models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelsResponse'
+
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Health check
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  schemas:
+    ChatRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: |
+            Model identifier. Use "provider/model" format (e.g., "anthropic/claude-sonnet-4-6")
+            or just the model name for auto-detection (e.g., "claude-sonnet-4-6").
+          examples:
+            - anthropic/claude-sonnet-4-6
+            - gpt-5.4
+            - gemini-3-flash-preview
+        messages:
+          type: array
+          description: Conversation messages
+          items:
+            $ref: '#/components/schemas/Message'
+        stream:
+          type: boolean
+          default: false
+          description: If true on /v1/chat, returns SSE stream instead of JSON.
+        config:
+          $ref: '#/components/schemas/Config'
+        provider_config:
+          type: object
+          additionalProperties: true
+          description: |
+            Raw provider-specific JSON merged into the underlying request.
+            Use this for features like Anthropic thinking, Gemini safety settings, etc.
+          examples:
+            - thinking:
+                type: adaptive
+              output_config:
+                effort: high
+
+    Message:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool, developer]
+        content:
+          description: Text content or array of content blocks
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+            - type: 'null'
+        tool_call_id:
+          type: string
+          description: For tool role messages, the ID of the tool call being responded to
+        tool_calls:
+          type: array
+          description: Tool calls made by the assistant
+          items:
+            $ref: '#/components/schemas/ToolCall'
+
+    Config:
+      type: object
+      description: Provider-agnostic configuration
+      properties:
+        max_tokens:
+          type: integer
+          description: Maximum output tokens
+        temperature:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          format: double
+        top_k:
+          type: integer
+        stop:
+          type: array
+          items:
+            type: string
+        reasoning_effort:
+          type: string
+          enum: [low, medium, high]
+          description: Controls reasoning/thinking depth across all providers
+
+    ChatResponse:
+      type: object
+      required: [id, model, provider, message, usage, latency_ms]
+      properties:
+        id:
+          type: string
+          description: Response ID from the provider
+        model:
+          type: string
+        provider:
+          type: string
+          description: Which provider handled the request
+        message:
+          $ref: '#/components/schemas/ResponseMessage'
+        reasoning:
+          type: string
+          nullable: true
+          description: Reasoning/thinking content if the model produced it
+        usage:
+          $ref: '#/components/schemas/Usage'
+        latency_ms:
+          type: integer
+          description: End-to-end latency in milliseconds
+
+    ResponseMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+        content:
+          description: Text content or null
+          oneOf:
+            - type: string
+            - type: 'null'
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+
+    ToolCall:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          properties:
+            name:
+              type: string
+            arguments:
+              type: string
+              description: JSON-encoded arguments
+
+    Usage:
+      type: object
+      properties:
+        input_tokens:
+          type: integer
+        output_tokens:
+          type: integer
+        reasoning_tokens:
+          type: integer
+          description: Reasoning/thinking tokens used (if applicable)
+        total_tokens:
+          type: integer
+
+    StreamEvent:
+      description: |
+        SSE events emitted during streaming. Each event has a typed `event:` field.
+      oneOf:
+        - type: object
+          properties:
+            type:
+              type: string
+              const: content
+            text:
+              type: string
+        - type: object
+          properties:
+            type:
+              type: string
+              const: reasoning
+            text:
+              type: string
+        - type: object
+          properties:
+            type:
+              type: string
+              const: tool_call
+            id:
+              type: string
+            name:
+              type: string
+            arguments:
+              type: string
+        - type: object
+          properties:
+            type:
+              type: string
+              const: usage
+            input_tokens:
+              type: integer
+            output_tokens:
+              type: integer
+            reasoning_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+        - type: object
+          properties:
+            type:
+              type: string
+              const: done
+        - type: object
+          properties:
+            type:
+              type: string
+              const: error
+            message:
+              type: string
+
+    ModelsResponse:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: array
+          items:
+            type: object
+            required: [id, provider, name]
+            properties:
+              id:
+                type: string
+                description: Full model identifier (provider/name)
+              provider:
+                type: string
+              name:
+                type: string
+                description: Model name without provider prefix
+
+    HealthResponse:
+      type: object
+      required: [status, providers]
+      properties:
+        status:
+          type: string
+        providers:
+          type: array
+          items:
+            type: string
+          description: List of configured providers
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string

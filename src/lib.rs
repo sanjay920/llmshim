@@ -1,9 +1,13 @@
 pub mod client;
 pub mod error;
 pub mod log;
+pub mod models;
 pub mod provider;
 pub mod providers;
 pub mod router;
+
+#[cfg(feature = "proxy")]
+pub mod proxy;
 
 use client::ShimClient;
 use error::Result;

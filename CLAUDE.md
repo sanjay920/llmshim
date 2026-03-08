@@ -18,9 +18,12 @@ A pure Rust LLM API translation layer. Takes OpenAI-format JSON requests, transl
 ```bash
 cargo build                                          # dev build
 cargo build --release                                # release build (~3.7MB binary)
-cargo test --tests                                   # unit tests (~168)
+cargo test --tests                                   # unit tests (~184)
 cargo test -- --ignored                              # integration tests (needs API keys)
+cargo test --features proxy --tests                  # unit tests including proxy
+cargo test --features proxy -- --ignored             # all integration tests including proxy
 cargo run                                            # interactive CLI chat
+cargo run --features proxy --bin llmshim-proxy       # proxy server on :3000
 ```
 
 API keys: `.env` in project root (auto-loaded by CLI) or env vars `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`.
@@ -64,6 +67,21 @@ Interactive chat with streaming. `/model` to switch, `/clear` to reset. Reasonin
 ### Logging (`src/log.rs`)
 
 JSONL structured logging. Each entry: timestamp, model, provider, latency_ms, input/output/reasoning token counts, status, request_id. Logged from API-reported usage (not local counting). CLI shows summary after each response; file logging is opt-in.
+
+### Proxy server (`src/proxy/`, feature-gated behind `proxy`)
+
+HTTP proxy with our own API spec (not OpenAI-compatible). Built on axum.
+
+Endpoints:
+- `POST /v1/chat` — non-streaming (or streaming if `stream: true`)
+- `POST /v1/chat/stream` — always SSE streaming with typed events (`content`, `reasoning`, `tool_call`, `usage`, `done`, `error`)
+- `GET /v1/models` — list available models (filtered to configured providers)
+- `GET /health` — health check with provider list
+
+Request format uses `config` for provider-agnostic settings and `provider_config` for raw passthrough. OpenAPI 3.1 spec at `api/openapi.yaml`.
+
+Run: `cargo run --features proxy --bin llmshim-proxy`
+Config: `LLMSHIM_HOST` (default `0.0.0.0`), `LLMSHIM_PORT` (default `3000`)
 
 ## Detailed reference
 

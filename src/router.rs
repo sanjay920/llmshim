@@ -65,6 +65,11 @@ impl Router {
         self
     }
 
+    /// Returns the keys of all registered providers.
+    pub fn provider_keys(&self) -> Vec<&str> {
+        self.providers.keys().map(|s| s.as_str()).collect()
+    }
+
     pub fn get(&self, key: &str) -> Result<&dyn Provider> {
         self.providers
             .get(key)
