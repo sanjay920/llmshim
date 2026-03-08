@@ -22,7 +22,7 @@ cargo test --tests                                   # unit tests (~184)
 cargo test -- --ignored                              # integration tests (needs API keys)
 cargo test --features proxy --tests                  # unit tests including proxy
 cargo test --features proxy -- --ignored             # all integration tests including proxy
-cargo run                                            # interactive CLI chat
+cargo run --bin llmshim                               # interactive CLI chat
 cargo run --features proxy --bin llmshim-proxy       # proxy server on :3000
 ```
 
