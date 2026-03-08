@@ -25,6 +25,13 @@ impl Anthropic {
         m.contains("4-6") || m.contains("4.6") || m.contains("4_6")
     }
 
+    /// Models that support the 1M context window beta.
+    /// Opus 4.6, Sonnet 4.6, Sonnet 4.5, and Sonnet 4.
+    fn supports_1m_context(model: &str) -> bool {
+        let m = model.to_lowercase();
+        m.contains("opus-4") || m.contains("sonnet-4")
+    }
+
     fn supports_thinking(model: &str) -> bool {
         let m = model.to_lowercase();
         // Claude 3.7 Sonnet and all Claude 4+ models support thinking
@@ -417,15 +424,24 @@ impl Provider for Anthropic {
 
         let url = format!("{}/messages", self.base_url);
 
-        Ok(ProviderRequest {
-            url,
-            headers: vec![
-                ("x-api-key".into(), self.api_key.clone()),
-                ("anthropic-version".into(), "2023-06-01".into()),
-                ("content-type".into(), "application/json".into()),
-            ],
-            body,
-        })
+        // Build headers — include 1M context beta by default for supported models
+        let mut headers = vec![
+            ("x-api-key".into(), self.api_key.clone()),
+            ("anthropic-version".into(), "2023-06-01".into()),
+            ("content-type".into(), "application/json".into()),
+        ];
+
+        // Add 1M context window beta header by default (can be disabled via x-anthropic)
+        let disable_1m = obj
+            .get("x-anthropic")
+            .and_then(|x| x.get("disable_1m_context"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !disable_1m && Self::supports_1m_context(model) {
+            headers.push(("anthropic-beta".into(), "context-1m-2025-08-07".into()));
+        }
+
+        Ok(ProviderRequest { url, headers, body })
     }
 
     fn transform_response(&self, model: &str, response: Value) -> Result<Value> {

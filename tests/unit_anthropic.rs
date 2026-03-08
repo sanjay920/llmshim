@@ -1103,3 +1103,82 @@ fn non_thinking_models_skip_reasoning() {
         );
     }
 }
+
+// ============================================================
+// 1M context window beta header
+// ============================================================
+
+#[test]
+fn context_1m_header_on_by_default_for_supported_models() {
+    let p = provider();
+    let supported = [
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+    ];
+    for model in supported {
+        let req = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let result = p.transform_request(model, &req).unwrap();
+        let has_beta = result
+            .headers
+            .iter()
+            .any(|(k, v)| k == "anthropic-beta" && v == "context-1m-2025-08-07");
+        assert!(has_beta, "Expected context-1m beta header for {}", model);
+    }
+}
+
+#[test]
+fn context_1m_header_not_on_for_haiku() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let result = p
+        .transform_request("claude-haiku-4-5-20251001", &req)
+        .unwrap();
+    let has_beta = result
+        .headers
+        .iter()
+        .any(|(k, v)| k == "anthropic-beta" && v == "context-1m-2025-08-07");
+    assert!(!has_beta, "Haiku should not get 1M context header");
+}
+
+#[test]
+fn context_1m_header_can_be_disabled() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "x-anthropic": {"disable_1m_context": true},
+    });
+    let result = p.transform_request("claude-sonnet-4-6", &req).unwrap();
+    let has_beta = result
+        .headers
+        .iter()
+        .any(|(k, v)| k == "anthropic-beta" && v == "context-1m-2025-08-07");
+    assert!(
+        !has_beta,
+        "Should be disabled when x-anthropic.disable_1m_context=true"
+    );
+}
+
+#[test]
+fn context_1m_header_enabled_when_disable_flag_false() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "x-anthropic": {"disable_1m_context": false},
+    });
+    let result = p.transform_request("claude-sonnet-4-6", &req).unwrap();
+    let has_beta = result
+        .headers
+        .iter()
+        .any(|(k, v)| k == "anthropic-beta" && v == "context-1m-2025-08-07");
+    assert!(has_beta, "Should be enabled when disable_1m_context=false");
+}
