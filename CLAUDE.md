@@ -85,4 +85,8 @@ Config: `LLMSHIM_HOST` (default `0.0.0.0`), `LLMSHIM_PORT` (default `3000`)
 
 ## Detailed reference
 
-Provider API format details are in `.claude/rules/provider-api-formats.md`. Testing conventions and gotchas are in `.claude/rules/testing.md`. These load automatically when working in relevant files.
+Scoped rules in `.claude/rules/` load automatically when working in relevant files:
+- `provider-api-formats.md` — exact API formats for each provider and the proxy
+- `testing.md` — test conventions, model IDs, gotchas
+- `adding-a-provider.md` — full checklist for adding a new provider (all files that need changes)
+- `env-and-config.md` — .env loading, API keys, binary targets, proxy config
