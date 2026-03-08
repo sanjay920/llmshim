@@ -228,7 +228,7 @@ llmshim::completion(router, request)
 ```bash
 cargo build                                          # dev build
 cargo build --release                                # release build
-cargo test --tests                                   # unit tests (~184)
+cargo test --tests                                   # unit tests (~288)
 cargo test -- --ignored                              # integration tests (needs API keys)
 cargo test --features proxy --tests                  # includes proxy tests
 cargo run --bin llmshim                              # interactive CLI

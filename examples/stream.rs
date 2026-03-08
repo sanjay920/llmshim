@@ -5,7 +5,7 @@ use serde_json::json;
 async fn main() {
     let router = llmshim::router::Router::from_env();
 
-    let models = ["anthropic/claude-sonnet-4-20250514", "openai/gpt-4o"];
+    let models = ["anthropic/claude-sonnet-4-6", "openai/gpt-5.4"];
 
     for model in models {
         println!("\n--- streaming: {} ---", model);

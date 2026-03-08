@@ -18,7 +18,7 @@ A pure Rust LLM API translation layer. Takes OpenAI-format JSON requests, transl
 ```bash
 cargo build                                          # dev build
 cargo build --release                                # release build (~3.7MB binary)
-cargo test --tests                                   # unit tests (~184)
+cargo test --tests                                   # unit tests (~288)
 cargo test -- --ignored                              # integration tests (needs API keys)
 cargo test --features proxy --tests                  # unit tests including proxy
 cargo test --features proxy -- --ignored             # all integration tests including proxy
@@ -98,3 +98,5 @@ Scoped rules in `.claude/rules/` load automatically when working in relevant fil
 - `testing.md` — test conventions, model IDs, gotchas
 - `adding-a-provider.md` — full checklist for adding a new provider (all files that need changes)
 - `env-and-config.md` — .env loading, API keys, binary targets, proxy config
+- `before-pushing.md` — required checks before every `git push`
+- `keep-docs-current.md` — enforces doc updates when project behavior changes

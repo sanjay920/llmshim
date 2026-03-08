@@ -3,8 +3,8 @@ use serde_json::json;
 #[tokio::main]
 async fn main() {
     let router = llmshim::router::Router::from_env()
-        .alias("smart", "anthropic/claude-sonnet-4-20250514")
-        .alias("fast", "openai/gpt-4o-mini");
+        .alias("smart", "anthropic/claude-sonnet-4-6")
+        .alias("fast", "openai/gpt-5.4");
 
     // Use an alias
     let request = json!({
