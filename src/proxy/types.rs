@@ -24,6 +24,11 @@ pub struct ChatRequest {
     /// Raw provider-specific JSON, merged into the underlying request
     #[serde(default)]
     pub provider_config: Option<Value>,
+
+    /// Fallback models to try if the primary model fails (ordered).
+    /// On retryable errors (429, 500, 502, 503), tries the next model in the list.
+    #[serde(default)]
+    pub fallback: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

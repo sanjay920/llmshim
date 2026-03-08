@@ -75,6 +75,28 @@ cargo run --features proxy --bin llmshim-proxy
 
 `config` holds provider-agnostic settings. `provider_config` passes raw JSON to the underlying provider for features like Anthropic thinking or Gemini safety settings.
 
+### Fallback chains
+
+Add `fallback` to automatically try other models when the primary fails (429, 500, 502, 503):
+
+```json
+{
+  "model": "anthropic/claude-sonnet-4-6",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "fallback": ["openai/gpt-5.4", "gemini/gemini-3-flash-preview"]
+}
+```
+
+Each model is retried up to 2 times with exponential backoff before moving to the next. Also available as a Rust API:
+
+```rust
+let config = FallbackConfig::new(vec![
+    "anthropic/claude-sonnet-4-6".into(),
+    "openai/gpt-5.4".into(),
+]);
+let resp = llmshim::completion_with_fallback(&router, &request, &config, None).await?;
+```
+
 ### Streaming events
 
 The `/v1/chat/stream` endpoint emits typed SSE events:
@@ -183,6 +205,7 @@ Commands: `/model` (switch by name, number, or fuzzy match), `/clear`, `/history
 - **Multi-model conversations** — switch providers mid-chat, history carries over
 - **Reasoning/thinking** — visible chain-of-thought from OpenAI, Anthropic, and Gemini
 - **Streaming** — token-by-token with thinking in dim grey, answers in default color
+- **Retry + fallback chains** — automatic failover across providers with exponential backoff
 - **Cross-provider translation** — tool calls, system messages, and provider-specific fields all handled automatically
 - **JSONL logging** — `cargo run --bin llmshim -- --log llmshim.log`
 - **OpenAPI spec** — generate clients for any language from `api/openapi.yaml`

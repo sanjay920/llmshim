@@ -56,6 +56,10 @@ Parses `"provider/model"` strings. Auto-infers provider from prefix (`gpt*`/`o*`
 
 `SseStream` buffers bytes, extracts `data:` lines, routes through provider's `transform_stream_chunk`. Returns `None` to skip non-content events.
 
+### Fallback chains (`src/fallback.rs`)
+
+`FallbackConfig` defines an ordered list of models to try. On retryable errors (429, 500, 502, 503, 529), retries with exponential backoff then falls through to the next model. `completion_with_fallback()` is the top-level API. The proxy supports this via `"fallback": ["model1", "model2"]` in the request body.
+
 ### Multi-model conversations
 
 Each provider sanitizes messages from other providers in `transform_request`. OpenAI's `annotations`/`refusal` stripped for Anthropic/Gemini. `reasoning_content` stripped for all. Tool calls normalized to OpenAI format in responses, translated back per-provider on input.

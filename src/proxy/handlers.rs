@@ -26,14 +26,28 @@ pub async fn chat(
     let timer = RequestTimer::start();
     let value = convert::request_to_value(&req);
 
-    // Resolve provider name for response
+    let resp = if let Some(fallback_models) = &req.fallback {
+        // Build fallback chain: primary model + fallback models
+        let mut models = vec![req.model.clone()];
+        models.extend(fallback_models.iter().cloned());
+        let config = crate::FallbackConfig::new(models);
+        crate::completion_with_fallback(&state.router, &value, &config, state.logger.as_ref())
+            .await?
+    } else {
+        crate::completion_with_logger(&state.router, &value, state.logger.as_ref()).await?
+    };
+
+    // Resolve provider name from the response (it may have fallen back to a different model)
+    let actual_model = resp
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(&req.model);
     let provider_name = state
         .router
-        .resolve(&req.model)
+        .resolve(actual_model)
+        .or_else(|_| state.router.resolve(&req.model))
         .map(|(p, _)| p.name().to_string())
         .unwrap_or_default();
-
-    let resp = crate::completion_with_logger(&state.router, &value, state.logger.as_ref()).await?;
 
     let elapsed = timer.elapsed();
     let chat_resp = convert::value_to_response(&resp, &provider_name, elapsed.as_millis() as u64);

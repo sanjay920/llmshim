@@ -1,5 +1,6 @@
 pub mod client;
 pub mod error;
+pub mod fallback;
 pub mod log;
 pub mod models;
 pub mod provider;
@@ -11,6 +12,7 @@ pub mod proxy;
 
 use client::ShimClient;
 use error::Result;
+pub use fallback::{completion_with_fallback, FallbackConfig};
 use log::{LogEntry, Logger, RequestTimer};
 use router::Router;
 use serde_json::Value;
