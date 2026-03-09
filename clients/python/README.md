@@ -96,4 +96,4 @@ print(client.health())  # {"status": "ok", "providers": ["openai", "anthropic", 
 cargo run --features proxy --bin llmshim-proxy
 ```
 
-Set API keys in `.env` or as environment variables: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`.
+Configure API keys with `llmshim configure` or set environment variables: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`.

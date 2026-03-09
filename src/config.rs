@@ -4,8 +4,7 @@
 //!
 //! Precedence (highest to lowest):
 //! 1. Environment variables (OPENAI_API_KEY, etc.)
-//! 2. `.env` file in current directory
-//! 3. `~/.llmshim/config.toml`
+//! 2. `~/.llmshim/config.toml`
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -87,7 +86,7 @@ pub fn save(config: &Config) -> std::io::Result<()> {
 }
 
 /// Apply config keys as environment variables (only if not already set).
-/// This implements the precedence: env vars > .env > config file.
+/// This implements the precedence: env vars > config file.
 pub fn apply_to_env(config: &Config) {
     let mappings = [
         ("OPENAI_API_KEY", &config.keys.openai),

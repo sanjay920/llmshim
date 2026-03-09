@@ -45,7 +45,7 @@ llmshim
 llmshim proxy
 ```
 
-Keys are stored in `~/.llmshim/config.toml`. You can also use `.env` files or environment variables — precedence is: env vars > `.env` > config file.
+Keys are stored in `~/.llmshim/config.toml`. You can also set environment variables directly. Precedence: env vars > config file.
 
 ### Docker
 
