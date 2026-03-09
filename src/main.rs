@@ -427,24 +427,8 @@ fn prompt_model_selection(current: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() {
-    // Load .env if present
-    if let Ok(contents) = std::fs::read_to_string(".env") {
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                let value = value.trim();
-                // Strip surrounding quotes
-                let value = value
-                    .strip_prefix('"')
-                    .and_then(|v| v.strip_suffix('"'))
-                    .unwrap_or(value);
-                std::env::set_var(key.trim(), value);
-            }
-        }
-    }
+    // Load config: env vars > .env > ~/.llmshim/config.toml
+    llmshim::env::load_all();
 
     let router = llmshim::router::Router::from_env();
 

@@ -20,6 +20,8 @@ tokio-stream = "0.1"
 eventsource-stream = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.28"
+toml = "0.8"
+dirs = "6"
 
 # Proxy dependencies (feature-gated)
 axum = { version = "0.8", features = ["json"], optional = true }
@@ -33,6 +35,10 @@ tokio-test = "0.4"
 [[bin]]
 name = "llmshim"
 path = "src/main.rs"
+
+[[bin]]
+name = "llmshim-config"
+path = "src/bin/config.rs"
 
 [[bin]]
 name = "llmshim-proxy"

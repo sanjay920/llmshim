@@ -26,7 +26,7 @@ cargo run --bin llmshim                               # interactive CLI chat
 cargo run --features proxy --bin llmshim-proxy       # proxy server on :3000
 ```
 
-API keys: `.env` in project root (auto-loaded by CLI) or env vars `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`.
+API keys: `~/.llmshim/config.toml` (via `llmshim-config configure`) or `.env` in project root or env vars `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`. Precedence: env vars > `.env` > config file.
 
 ## Architecture
 

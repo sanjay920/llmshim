@@ -28,15 +28,35 @@ Switch providers by changing the model string. Everything else stays the same.
 ## Quick start
 
 ```bash
-# Set API keys
-cp .env.example .env
-# Edit .env with your keys
+# Configure API keys (interactive, like aws configure)
+cargo run --bin llmshim-config -- configure
+
+# Or set keys individually
+cargo run --bin llmshim-config -- set openai sk-...
+cargo run --bin llmshim-config -- set anthropic sk-ant-...
 
 # Start the proxy server
 cargo run --features proxy --bin llmshim-proxy
 
 # Or run the interactive CLI chat
 cargo run --bin llmshim
+```
+
+Keys are stored in `~/.llmshim/config.toml`. You can also use `.env` files or environment variables — precedence is: env vars > `.env` > config file.
+
+### Docker
+
+```bash
+docker build -t llmshim .
+docker run -p 3000:3000 \
+  -e OPENAI_API_KEY=sk-... \
+  -e ANTHROPIC_API_KEY=sk-ant-... \
+  llmshim
+
+# Or mount your config file
+docker run -p 3000:3000 \
+  -v ~/.llmshim:/root/.llmshim \
+  llmshim
 ```
 
 ## Proxy Server

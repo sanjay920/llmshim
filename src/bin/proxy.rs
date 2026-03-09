@@ -1,33 +1,19 @@
 use std::net::SocketAddr;
 
-fn load_env() {
-    if let Ok(contents) = std::fs::read_to_string(".env") {
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                let value = value.trim();
-                let value = value
-                    .strip_prefix('"')
-                    .and_then(|v| v.strip_suffix('"'))
-                    .unwrap_or(value);
-                std::env::set_var(key.trim(), value);
-            }
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
-    load_env();
+    // Load config: env vars > .env > ~/.llmshim/config.toml
+    llmshim::env::load_all();
 
     let router = llmshim::router::Router::from_env();
     let providers = router.provider_keys();
 
     if providers.is_empty() {
-        eprintln!("No API keys found. Set OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, or XAI_API_KEY.");
+        eprintln!("No API keys found. Configure with:");
+        eprintln!("  llmshim-config configure");
+        eprintln!(
+            "  # or set env vars: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, XAI_API_KEY"
+        );
         std::process::exit(1);
     }
 
@@ -36,11 +22,13 @@ async fn main() {
         .ok()
         .and_then(|path| llmshim::log::Logger::to_file(&path).ok());
 
-    let host = std::env::var("LLMSHIM_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    // Read proxy config from config file, then allow env var overrides
+    let config = llmshim::config::load();
+    let host = std::env::var("LLMSHIM_HOST").unwrap_or(config.proxy.host);
     let port: u16 = std::env::var("LLMSHIM_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(3000);
+        .unwrap_or(config.proxy.port);
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .expect("Invalid address");
