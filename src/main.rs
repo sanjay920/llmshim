@@ -452,6 +452,20 @@ fn config_prompt(label: &str, current: Option<&str>) -> String {
     }
 }
 
+/// Prompt for a non-secret value (shows full current value, not masked).
+fn config_prompt_plain(label: &str, current: &str) -> String {
+    print!("{} [{}]: ", label, current);
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    let input = input.trim().to_string();
+    if input.is_empty() {
+        current.to_string()
+    } else {
+        input
+    }
+}
+
 fn cmd_configure() {
     use llmshim::config;
 
@@ -479,12 +493,12 @@ fn cmd_configure() {
         cfg.keys.xai = Some(xai);
     }
 
-    let host = config_prompt("Proxy host", Some(&cfg.proxy.host));
+    let host = config_prompt_plain("Proxy host", &cfg.proxy.host);
     if !host.is_empty() {
         cfg.proxy.host = host;
     }
 
-    let port_str = config_prompt("Proxy port", Some(&cfg.proxy.port.to_string()));
+    let port_str = config_prompt_plain("Proxy port", &cfg.proxy.port.to_string());
     if let Ok(port) = port_str.parse::<u16>() {
         cfg.proxy.port = port;
     }
