@@ -28,6 +28,9 @@ Switch providers by changing the model string. Everything else stays the same.
 ## Quick start
 
 ```bash
+# Install
+cargo install --path . --features proxy
+
 # Configure API keys (interactive, like aws configure)
 llmshim configure
 
