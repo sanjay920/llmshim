@@ -260,7 +260,7 @@ fn openai_transforms_image_in_message() {
     let result = p.transform_request("gpt-5.4", &req).unwrap();
     let input = result.body["input"].as_array().unwrap();
     let content = input[0]["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["type"], "input_text"); // "text" → "input_text" for Responses API
     assert_eq!(content[1]["type"], "input_image");
     assert_eq!(content[1]["image_url"], "data:image/png;base64,abc");
 }

@@ -178,7 +178,7 @@ pub fn translate_content_blocks(content: &Value, translator: fn(&Value) -> Optio
                 .map(|block| {
                     let block_type = block.get("type").and_then(|t| t.as_str());
                     match block_type {
-                        Some("text") => block.clone(),
+                        Some("text" | "input_text") => block.clone(),
                         Some("image_url" | "input_image" | "image") => {
                             translator(block).unwrap_or_else(|| block.clone())
                         }
@@ -189,5 +189,27 @@ pub fn translate_content_blocks(content: &Value, translator: fn(&Value) -> Optio
             Value::Array(translated)
         }
         _ => content.clone(), // string or null — pass through
+    }
+}
+
+/// Translate text blocks to OpenAI Responses API format ("input_text" instead of "text").
+pub fn text_blocks_to_openai(content: &Value) -> Value {
+    match content {
+        Value::Array(blocks) => {
+            let translated: Vec<Value> = blocks
+                .iter()
+                .map(|block| {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        let mut out = block.clone();
+                        out["type"] = Value::String("input_text".into());
+                        out
+                    } else {
+                        block.clone()
+                    }
+                })
+                .collect();
+            Value::Array(translated)
+        }
+        _ => content.clone(),
     }
 }

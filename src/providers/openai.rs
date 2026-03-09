@@ -36,7 +36,8 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
             // Translate image content blocks to OpenAI Responses API format
             if let Some(content) = out.get("content").cloned() {
                 if content.is_array() {
-                    out["content"] = vision::translate_content_blocks(&content, vision::to_openai);
+                    let translated = vision::translate_content_blocks(&content, vision::to_openai);
+                    out["content"] = vision::text_blocks_to_openai(&translated);
                 }
             }
             out
