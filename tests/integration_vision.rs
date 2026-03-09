@@ -358,3 +358,61 @@ async fn gemini_interleaved_text_image_position() {
     println!("Gemini interleaved: {}", content);
     assert!(content.contains('2'), "Expected 2 images, got: {}", content);
 }
+
+#[tokio::test]
+#[ignore]
+async fn openai_interleaved_text_image_position() {
+    if std::env::var("OPENAI_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+
+    let req = json!({
+        "model": "openai/gpt-5.4",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "I'll show you two images labeled A and B."},
+                {"type": "text", "text": "Image A:"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", TINY_PNG_B64)}},
+                {"type": "text", "text": "Image B:"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", TINY_PNG_B64)}},
+                {"type": "text", "text": "How many images did I show you? Reply with just the number."}
+            ]
+        }],
+        "max_tokens": 200,
+    });
+    let resp = llmshim::completion(&router, &req).await.unwrap();
+    let content = extract_content(&resp);
+    println!("OpenAI interleaved: {}", content);
+    assert!(
+        content.contains('2'),
+        "Expected 2 images recognized, got: {}",
+        content
+    );
+}
+
+/// xAI Grok models do NOT support vision — verify we get a clear error.
+#[tokio::test]
+#[ignore]
+async fn xai_vision_returns_error() {
+    if std::env::var("XAI_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+
+    let req = json!({
+        "model": "xai/grok-4-1-fast-non-reasoning",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", TINY_PNG_B64)}}
+            ]
+        }],
+        "max_tokens": 200,
+    });
+    let result = llmshim::completion(&router, &req).await;
+    assert!(result.is_err(), "xAI should reject vision requests");
+    println!("xAI vision error (expected): {}", result.unwrap_err());
+}
