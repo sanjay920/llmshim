@@ -437,10 +437,9 @@ fn mask_key(key: &str) -> String {
 }
 
 fn config_prompt(label: &str, current: Option<&str>) -> String {
-    if let Some(cur) = current {
-        print!("{} [{}]: ", label, mask_key(cur));
-    } else {
-        print!("{}: ", label);
+    match current {
+        Some(cur) if !cur.is_empty() => print!("{} [{}]: ", label, mask_key(cur)),
+        _ => print!("{} (not set): ", label),
     }
     io::stdout().flush().ok();
     let mut input = String::new();
