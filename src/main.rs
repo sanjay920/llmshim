@@ -631,21 +631,26 @@ async fn cmd_proxy() {
 
 fn print_global_usage() {
     eprintln!("llmshim — multi-provider LLM gateway\n");
-    eprintln!("Usage: llmshim [command]\n");
-    eprintln!("Commands:");
-    eprintln!("  chat              Interactive chat (default)");
-    eprintln!("  proxy             Start HTTP proxy server");
-    eprintln!("  configure         Interactive API key setup");
-    eprintln!("  set <key> <val>   Set a config value");
-    eprintln!("  get <key>         Get a config value");
-    eprintln!("  list              Show all configured keys");
-    eprintln!("  models            List available models");
-    eprintln!("  docker start      Start proxy in Docker");
-    eprintln!("  docker stop       Stop Docker proxy");
-    eprintln!("  docker status     Show Docker container status");
-    eprintln!("  docker logs       Show Docker container logs");
-    eprintln!("  help              Show this help");
-    eprintln!("\nRun 'llmshim' with no arguments to start chatting.");
+    eprintln!("Usage: llmshim <command>\n");
+    eprintln!("Chat:");
+    eprintln!("  chat                  Interactive multi-model chat");
+    eprintln!();
+    eprintln!("Server:");
+    eprintln!("  proxy                 Start HTTP proxy server");
+    eprintln!("  docker start          Start proxy in Docker");
+    eprintln!("  docker stop           Stop Docker proxy");
+    eprintln!("  docker status|logs    Container status and logs");
+    eprintln!();
+    eprintln!("Config:");
+    eprintln!("  configure             Interactive API key setup");
+    eprintln!("  set <key> <value>     Set a config value");
+    eprintln!("  get <key>             Get a config value");
+    eprintln!("  list                  Show all configured keys");
+    eprintln!("  models                List available models");
+    eprintln!();
+    eprintln!("Get started:");
+    eprintln!("  llmshim configure     Set up API keys");
+    eprintln!("  llmshim chat          Start chatting");
 }
 
 const DOCKER_CONTAINER: &str = "llmshim-proxy";
@@ -831,7 +836,14 @@ fn docker_build() {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("chat");
+    let cmd = args.get(1).map(|s| s.as_str());
+
+    // No subcommand → show help
+    if cmd.is_none() {
+        print_global_usage();
+        return;
+    }
+    let cmd = cmd.unwrap();
 
     match cmd {
         "configure" => {
@@ -889,11 +901,11 @@ async fn main() {
             }
         }
         "chat" => { /* fall through to chat */ }
-        _ if cmd.starts_with('-') => {
+        _ => {
+            eprintln!("Unknown command: {}\n", cmd);
             print_global_usage();
             return;
         }
-        _ => { /* unknown subcommand — treat as chat */ }
     }
 
     // --- Chat mode ---
