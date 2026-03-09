@@ -31,10 +31,211 @@ fn print_help() {
     println!("\n  Commands:");
     println!("    /model         - switch model");
     println!("    /models        - list available models");
+    println!("    /image <path>  - attach an image file");
+    println!("    /paste         - attach image from clipboard");
     println!("    /clear         - clear conversation history");
     println!("    /history       - show message count");
     println!("    /quit          - exit");
     println!();
+    println!("  Images:");
+    println!("    You can also include image paths inline in your message:");
+    println!("    > Describe this image /path/to/photo.jpg");
+    println!();
+}
+
+/// Detect image file extensions.
+fn is_image_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".bmp")
+        || lower.ends_with(".svg")
+}
+
+/// Infer MIME type from file extension.
+fn mime_from_path(path: &str) -> &'static str {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".svg") {
+        "image/svg+xml"
+    } else if lower.ends_with(".bmp") {
+        "image/bmp"
+    } else {
+        "image/jpeg"
+    }
+}
+
+/// Read a file and return a base64 image content block, or None on failure.
+fn image_file_to_block(path: &str) -> Option<Value> {
+    let path = path.trim().trim_matches('"').trim_matches('\'');
+    let expanded = if path.starts_with('~') {
+        if let Ok(home) = std::env::var("HOME") {
+            path.replacen('~', &home, 1)
+        } else {
+            path.to_string()
+        }
+    } else {
+        path.to_string()
+    };
+
+    let data = std::fs::read(&expanded).ok()?;
+    let b64 = base64_encode(&data);
+    let mime = mime_from_path(&expanded);
+    Some(json!({
+        "type": "image_url",
+        "image_url": {"url": format!("data:{};base64,{}", mime, b64)}
+    }))
+}
+
+/// Simple base64 encoder (no external dependency needed).
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+/// Try to get an image from the system clipboard (macOS: pbpaste, Linux: xclip).
+fn clipboard_image() -> Option<Value> {
+    // macOS: check if clipboard has image data
+    #[cfg(target_os = "macos")]
+    {
+        // Check clipboard type
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg("clipboard info")
+            .output()
+            .ok()?;
+        let info = String::from_utf8_lossy(&output.stdout);
+        if !info.contains("TIFF") && !info.contains("PNGf") && !info.contains("JPEG") {
+            return None;
+        }
+
+        // Get clipboard image as PNG using osascript
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(
+                r#"set theFile to (POSIX path of (path to temporary items)) & "llmshim_clipboard.png"
+set theImage to the clipboard as «class PNGf»
+set fp to open for access theFile with write permission
+write theImage to fp
+close access fp
+return theFile"#,
+            )
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let data = std::fs::read(&path).ok()?;
+        let _ = std::fs::remove_file(&path); // cleanup
+        let b64 = base64_encode(&data);
+        Some(json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:image/png;base64,{}", b64)}
+        }))
+    }
+
+    // Linux: try xclip
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "image/png", "-o"])
+            .output()
+            .ok()?;
+        if !output.status.success() || output.stdout.is_empty() {
+            return None;
+        }
+        let b64 = base64_encode(&output.stdout);
+        return Some(json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:image/png;base64,{}", b64)}
+        }));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    None
+}
+
+/// Parse user input to extract text and any inline image file paths.
+/// Returns content as either a string (no images) or an array of content blocks.
+fn parse_input_with_images(input: &str, pending_images: &mut Vec<Value>) -> Value {
+    // Check for inline image paths
+    let words: Vec<&str> = input.split_whitespace().collect();
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut _images_found = false;
+
+    for word in &words {
+        let clean = word.trim_matches('"').trim_matches('\'');
+        if is_image_path(clean) && std::path::Path::new(clean).exists() {
+            if let Some(block) = image_file_to_block(clean) {
+                pending_images.push(block);
+                _images_found = true;
+                continue;
+            }
+        }
+        // Also check with ~ expansion
+        if is_image_path(clean) {
+            let expanded = if clean.starts_with('~') {
+                std::env::var("HOME")
+                    .map(|h| clean.replacen('~', &h, 1))
+                    .unwrap_or_else(|_| clean.to_string())
+            } else {
+                clean.to_string()
+            };
+            if std::path::Path::new(&expanded).exists() {
+                if let Some(block) = image_file_to_block(clean) {
+                    pending_images.push(block);
+                    _images_found = true;
+                    continue;
+                }
+            }
+        }
+        text_parts.push(word.to_string());
+    }
+
+    let text = text_parts.join(" ");
+
+    if pending_images.is_empty() {
+        // No images — plain string
+        json!(text)
+    } else {
+        // Build content blocks array
+        let mut blocks: Vec<Value> = Vec::new();
+        if !text.is_empty() {
+            blocks.push(json!({"type": "text", "text": text}));
+        }
+        blocks.append(pending_images);
+        json!(blocks)
+    }
 }
 
 fn model_label(id: &str) -> &str {
@@ -138,10 +339,18 @@ async fn main() {
     println!("  Type /help for commands.\n");
 
     let mut messages: Vec<Value> = Vec::new();
+    let mut pending_images: Vec<Value> = Vec::new();
 
     loop {
         // Prompt
-        print!("\x1b[36myou\x1b[0m: ");
+        if pending_images.is_empty() {
+            print!("\x1b[36myou\x1b[0m: ");
+        } else {
+            print!(
+                "\x1b[36myou\x1b[0m \x1b[2m[{} image(s) attached]\x1b[0m: ",
+                pending_images.len()
+            );
+        }
         io::stdout().flush().ok();
 
         let mut input = String::new();
@@ -214,11 +423,44 @@ async fn main() {
                 }
                 continue;
             }
+            "/paste" => {
+                match clipboard_image() {
+                    Some(block) => {
+                        pending_images.push(block);
+                        println!(
+                            "  \x1b[32mImage pasted from clipboard ({} total attached)\x1b[0m\n",
+                            pending_images.len()
+                        );
+                    }
+                    None => {
+                        println!("  No image found in clipboard.\n");
+                    }
+                }
+                continue;
+            }
+            _ if input.starts_with("/image ") => {
+                let path = input[7..].trim();
+                match image_file_to_block(path) {
+                    Some(block) => {
+                        pending_images.push(block);
+                        println!(
+                            "  \x1b[32mAttached: {} ({} total)\x1b[0m\n",
+                            path,
+                            pending_images.len()
+                        );
+                    }
+                    None => {
+                        println!("  Could not read image: {}\n", path);
+                    }
+                }
+                continue;
+            }
             _ => {}
         }
 
-        // Add user message
-        messages.push(json!({"role": "user", "content": input}));
+        // Build user message with any images (inline paths + pending attachments)
+        let content = parse_input_with_images(input, &mut pending_images);
+        messages.push(json!({"role": "user", "content": content}));
 
         // Build request
         let request = json!({
