@@ -1,3 +1,5 @@
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal;
 use futures::StreamExt;
 use llmshim::log::{LogEntry, Logger, RequestTimer};
 use serde_json::{json, Value};
@@ -238,6 +240,117 @@ fn parse_input_with_images(input: &str, pending_images: &mut Vec<Value>) -> Valu
     }
 }
 
+/// Read a line of input using raw terminal mode.
+/// Intercepts Ctrl-V to check clipboard for images.
+/// Returns None on EOF/Ctrl-C/Ctrl-D.
+fn read_line_raw(pending_images: &mut Vec<Value>) -> Option<String> {
+    let mut line = String::new();
+
+    terminal::enable_raw_mode().ok()?;
+
+    let result = loop {
+        match event::read() {
+            Ok(Event::Key(KeyEvent {
+                code, modifiers, ..
+            })) => {
+                match (code, modifiers) {
+                    // Ctrl-V: check clipboard for image
+                    (KeyCode::Char('v'), m) if m.contains(KeyModifiers::CONTROL) => {
+                        match clipboard_image() {
+                            Some(block) => {
+                                pending_images.push(block);
+                                // Show feedback inline
+                                print!(
+                                    "\x1b[2m[image pasted — {} attached]\x1b[0m ",
+                                    pending_images.len()
+                                );
+                                io::stdout().flush().ok();
+                            }
+                            None => {
+                                // No image in clipboard — try to paste text instead
+                                if let Some(text) = clipboard_text() {
+                                    print!("{}", text);
+                                    io::stdout().flush().ok();
+                                    line.push_str(&text);
+                                }
+                            }
+                        }
+                    }
+
+                    // Ctrl-C or Ctrl-D: exit
+                    (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                        println!();
+                        break None;
+                    }
+                    (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
+                        println!();
+                        break None;
+                    }
+
+                    // Enter: submit
+                    (KeyCode::Enter, _) => {
+                        println!();
+                        break Some(line);
+                    }
+
+                    // Backspace: delete last char
+                    (KeyCode::Backspace, _) => {
+                        if !line.is_empty() {
+                            line.pop();
+                            print!("\x08 \x08"); // move back, overwrite, move back
+                            io::stdout().flush().ok();
+                        }
+                    }
+
+                    // Regular character
+                    (KeyCode::Char(c), m) => {
+                        if m.is_empty() || m == KeyModifiers::SHIFT {
+                            line.push(c);
+                            print!("{}", c);
+                            io::stdout().flush().ok();
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+            Ok(Event::Paste(text)) => {
+                // Bracketed paste — handle pasted text
+                print!("{}", text);
+                io::stdout().flush().ok();
+                line.push_str(&text);
+            }
+            Err(_) => break None,
+            _ => {}
+        }
+    };
+
+    terminal::disable_raw_mode().ok();
+    result
+}
+
+/// Get text from clipboard (macOS).
+fn clipboard_text() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("pbpaste").output().ok()?;
+        if output.status.success() && !output.stdout.is_empty() {
+            return String::from_utf8(output.stdout).ok();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-o"])
+            .output()
+            .ok()?;
+        if output.status.success() && !output.stdout.is_empty() {
+            return String::from_utf8(output.stdout).ok();
+        }
+    }
+    None
+}
+
 fn model_label(id: &str) -> &str {
     MODELS
         .iter()
@@ -353,10 +466,21 @@ async fn main() {
         }
         io::stdout().flush().ok();
 
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() || input.is_empty() {
-            break;
-        }
+        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        let input = if is_tty {
+            // Interactive terminal — raw mode for Ctrl-V image paste
+            match read_line_raw(&mut pending_images) {
+                Some(line) => line,
+                None => break,
+            }
+        } else {
+            // Piped stdin — regular line reading
+            let mut line = String::new();
+            if io::stdin().read_line(&mut line).is_err() || line.is_empty() {
+                break;
+            }
+            line
+        };
         let input = input.trim();
         if input.is_empty() {
             continue;

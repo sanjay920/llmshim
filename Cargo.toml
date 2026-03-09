@@ -19,6 +19,7 @@ bytes = "1"
 tokio-stream = "0.1"
 eventsource-stream = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
+crossterm = "0.28"
 
 # Proxy dependencies (feature-gated)
 axum = { version = "0.8", features = ["json"], optional = true }
