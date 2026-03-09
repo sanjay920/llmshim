@@ -292,3 +292,69 @@ async fn vision_three_provider_hop() {
     println!("Turn 3 (OpenAI): {}", content3);
     assert!(!content3.is_empty());
 }
+
+// ============================================================
+// Interleaved text + images — position matters
+// ============================================================
+
+#[tokio::test]
+#[ignore]
+async fn anthropic_interleaved_text_image_position() {
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+
+    // Send two identical images with different labels — model should distinguish by position
+    let req = json!({
+        "model": "anthropic/claude-sonnet-4-6",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "I'll show you two images labeled A and B."},
+                {"type": "text", "text": "Image A:"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", TINY_PNG_B64)}},
+                {"type": "text", "text": "Image B:"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", TINY_PNG_B64)}},
+                {"type": "text", "text": "How many images did I show you? Reply with just the number."}
+            ]
+        }],
+        "max_tokens": 100,
+    });
+    let resp = llmshim::completion(&router, &req).await.unwrap();
+    let content = extract_content(&resp);
+    println!("Interleaved test: {}", content);
+    assert!(
+        content.contains('2'),
+        "Expected 2 images recognized, got: {}",
+        content
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn gemini_interleaved_text_image_position() {
+    if std::env::var("GEMINI_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+
+    let req = json!({
+        "model": "gemini/gemini-3-flash-preview",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Image A:"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", TINY_PNG_B64)}},
+                {"type": "text", "text": "Image B:"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", TINY_PNG_B64)}},
+                {"type": "text", "text": "How many images did I show you? Reply with just the number."}
+            ]
+        }],
+        "max_tokens": 200,
+    });
+    let resp = llmshim::completion(&router, &req).await.unwrap();
+    let content = extract_content(&resp);
+    println!("Gemini interleaved: {}", content);
+    assert!(content.contains('2'), "Expected 2 images, got: {}", content);
+}

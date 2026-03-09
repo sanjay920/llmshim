@@ -264,3 +264,107 @@ fn openai_transforms_image_in_message() {
     assert_eq!(content[1]["type"], "input_image");
     assert_eq!(content[1]["image_url"], "data:image/png;base64,abc");
 }
+
+// ============================================================
+// Interleaved text + image ordering is preserved
+// ============================================================
+
+#[test]
+fn anthropic_preserves_interleaved_text_image_order() {
+    use llmshim::provider::Provider;
+    use llmshim::providers::anthropic::Anthropic;
+
+    let p = Anthropic::new("key".into());
+    let req = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "First look at this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,img1data"}},
+                {"type": "text", "text": "Now compare with this"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,img2data"}},
+                {"type": "text", "text": "Which is better?"}
+            ]
+        }],
+        "max_tokens": 100,
+    });
+    let result = p.transform_request("claude-sonnet-4-6", &req).unwrap();
+    let content = result.body["messages"][0]["content"].as_array().unwrap();
+
+    // Verify order: text, image, text, image, text
+    assert_eq!(content.len(), 5);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "First look at this");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["data"], "img1data");
+    assert_eq!(content[2]["type"], "text");
+    assert_eq!(content[2]["text"], "Now compare with this");
+    assert_eq!(content[3]["type"], "image");
+    assert_eq!(content[3]["source"]["data"], "img2data");
+    assert_eq!(content[4]["type"], "text");
+    assert_eq!(content[4]["text"], "Which is better?");
+}
+
+#[test]
+fn gemini_preserves_interleaved_text_image_order() {
+    use llmshim::provider::Provider;
+    use llmshim::providers::gemini::Gemini;
+
+    let p = Gemini::new("key".into());
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Image A:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aaa"}},
+                {"type": "text", "text": "Image B:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,bbb"}}
+            ]
+        }],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let parts = result.body["contents"][0]["parts"].as_array().unwrap();
+
+    // Verify order: text, inline_data, text, inline_data
+    assert_eq!(parts.len(), 4);
+    assert_eq!(parts[0]["text"], "Image A:");
+    assert!(parts[1].get("inline_data").is_some());
+    assert_eq!(parts[1]["inline_data"]["data"], "aaa");
+    assert_eq!(parts[2]["text"], "Image B:");
+    assert!(parts[3].get("inline_data").is_some());
+    assert_eq!(parts[3]["inline_data"]["data"], "bbb");
+}
+
+#[test]
+fn openai_preserves_interleaved_text_image_order() {
+    use llmshim::provider::Provider;
+    use llmshim::providers::openai::OpenAi;
+
+    let p = OpenAi::new("key".into());
+    let req = json!({
+        "model": "gpt-5.4",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Compare:"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x1"}},
+                {"type": "text", "text": "vs"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x2"}}
+            ]
+        }],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    let content = input[0]["content"].as_array().unwrap();
+
+    // Verify order: input_text, input_image, input_text, input_image
+    assert_eq!(content.len(), 4);
+    assert_eq!(content[0]["type"], "input_text");
+    assert_eq!(content[0]["text"], "Compare:");
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(content[2]["type"], "input_text");
+    assert_eq!(content[2]["text"], "vs");
+    assert_eq!(content[3]["type"], "input_image");
+}

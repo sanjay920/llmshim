@@ -240,11 +240,26 @@ fn parse_input_with_images(input: &str, pending_images: &mut Vec<Value>) -> Valu
     }
 }
 
+/// Result from the raw input reader.
+struct RawInput {
+    /// The plain text the user typed (for command detection).
+    text: String,
+    /// Ordered content blocks preserving interleaved text + images.
+    /// Empty if no images were pasted (plain text message).
+    blocks: Vec<Value>,
+    /// Whether any images were included.
+    has_images: bool,
+}
+
 /// Read a line of input using raw terminal mode.
 /// Intercepts Ctrl-V to check clipboard for images.
+/// Tracks interleaving: text typed before/between/after images is preserved in order.
 /// Returns None on EOF/Ctrl-C/Ctrl-D.
-fn read_line_raw(pending_images: &mut Vec<Value>) -> Option<String> {
-    let mut line = String::new();
+fn read_line_raw() -> Option<RawInput> {
+    let mut current_text = String::new();
+    let mut blocks: Vec<Value> = Vec::new();
+    let mut has_images = false;
+    let mut image_count = 0;
 
     terminal::enable_raw_mode().ok()?;
 
@@ -258,20 +273,25 @@ fn read_line_raw(pending_images: &mut Vec<Value>) -> Option<String> {
                     (KeyCode::Char('v'), m) if m.contains(KeyModifiers::CONTROL) => {
                         match clipboard_image() {
                             Some(block) => {
-                                pending_images.push(block);
-                                // Show feedback inline
-                                print!(
-                                    "\x1b[2m[image pasted — {} attached]\x1b[0m ",
-                                    pending_images.len()
-                                );
+                                // Flush any accumulated text as a text block
+                                let trimmed = current_text.trim().to_string();
+                                if !trimmed.is_empty() {
+                                    blocks.push(json!({"type": "text", "text": trimmed}));
+                                }
+                                current_text.clear();
+
+                                blocks.push(block);
+                                has_images = true;
+                                image_count += 1;
+                                print!("\x1b[2m[image {} pasted]\x1b[0m ", image_count);
                                 io::stdout().flush().ok();
                             }
                             None => {
-                                // No image in clipboard — try to paste text instead
+                                // No image — paste text from clipboard
                                 if let Some(text) = clipboard_text() {
                                     print!("{}", text);
                                     io::stdout().flush().ok();
-                                    line.push_str(&text);
+                                    current_text.push_str(&text);
                                 }
                             }
                         }
@@ -290,14 +310,28 @@ fn read_line_raw(pending_images: &mut Vec<Value>) -> Option<String> {
                     // Enter: submit
                     (KeyCode::Enter, _) => {
                         println!();
-                        break Some(line);
+                        // Flush remaining text
+                        let trimmed = current_text.trim().to_string();
+                        if !trimmed.is_empty() {
+                            blocks.push(json!({"type": "text", "text": trimmed}));
+                        }
+                        let full_text = blocks
+                            .iter()
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        break Some(RawInput {
+                            text: full_text,
+                            blocks,
+                            has_images,
+                        });
                     }
 
                     // Backspace: delete last char
                     (KeyCode::Backspace, _) => {
-                        if !line.is_empty() {
-                            line.pop();
-                            print!("\x08 \x08"); // move back, overwrite, move back
+                        if !current_text.is_empty() {
+                            current_text.pop();
+                            print!("\x08 \x08");
                             io::stdout().flush().ok();
                         }
                     }
@@ -305,7 +339,7 @@ fn read_line_raw(pending_images: &mut Vec<Value>) -> Option<String> {
                     // Regular character
                     (KeyCode::Char(c), m) => {
                         if m.is_empty() || m == KeyModifiers::SHIFT {
-                            line.push(c);
+                            current_text.push(c);
                             print!("{}", c);
                             io::stdout().flush().ok();
                         }
@@ -315,10 +349,9 @@ fn read_line_raw(pending_images: &mut Vec<Value>) -> Option<String> {
                 }
             }
             Ok(Event::Paste(text)) => {
-                // Bracketed paste — handle pasted text
                 print!("{}", text);
                 io::stdout().flush().ok();
-                line.push_str(&text);
+                current_text.push_str(&text);
             }
             Err(_) => break None,
             _ => {}
@@ -467,10 +500,22 @@ async fn main() {
         io::stdout().flush().ok();
 
         let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-        let input = if is_tty {
+        let (input_text, input_content) = if is_tty {
             // Interactive terminal — raw mode for Ctrl-V image paste
-            match read_line_raw(&mut pending_images) {
-                Some(line) => line,
+            match read_line_raw() {
+                Some(raw) => {
+                    if raw.has_images {
+                        // Interleaved text + images — use the blocks directly
+                        // Also add any pending images from /image command
+                        let mut all_blocks = raw.blocks;
+                        all_blocks.append(&mut pending_images);
+                        (raw.text, json!(all_blocks))
+                    } else {
+                        // Pure text — process inline file paths
+                        let content = parse_input_with_images(&raw.text, &mut pending_images);
+                        (raw.text, content)
+                    }
+                }
                 None => break,
             }
         } else {
@@ -479,9 +524,11 @@ async fn main() {
             if io::stdin().read_line(&mut line).is_err() || line.is_empty() {
                 break;
             }
-            line
+            let text = line.trim().to_string();
+            let content = parse_input_with_images(&text, &mut pending_images);
+            (text, content)
         };
-        let input = input.trim();
+        let input = input_text.trim();
         if input.is_empty() {
             continue;
         }
@@ -582,9 +629,8 @@ async fn main() {
             _ => {}
         }
 
-        // Build user message with any images (inline paths + pending attachments)
-        let content = parse_input_with_images(input, &mut pending_images);
-        messages.push(json!({"role": "user", "content": content}));
+        // Add user message (content already built with proper interleaving)
+        messages.push(json!({"role": "user", "content": input_content}));
 
         // Build request
         let request = json!({
