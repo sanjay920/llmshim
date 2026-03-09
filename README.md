@@ -29,17 +29,17 @@ Switch providers by changing the model string. Everything else stays the same.
 
 ```bash
 # Configure API keys (interactive, like aws configure)
-cargo run --bin llmshim-config -- configure
+llmshim configure
 
 # Or set keys individually
-cargo run --bin llmshim-config -- set openai sk-...
-cargo run --bin llmshim-config -- set anthropic sk-ant-...
+llmshim set openai sk-...
+llmshim set anthropic sk-ant-...
+
+# Start the interactive chat
+llmshim
 
 # Start the proxy server
-cargo run --features proxy --bin llmshim-proxy
-
-# Or run the interactive CLI chat
-cargo run --bin llmshim
+llmshim proxy
 ```
 
 Keys are stored in `~/.llmshim/config.toml`. You can also use `.env` files or environment variables — precedence is: env vars > `.env` > config file.
@@ -195,7 +195,7 @@ curl http://localhost:3000/v1/chat \
 ## Interactive CLI
 
 ```
-$ cargo run --bin llmshim
+$ llmshim
 
   llmshim — multi-provider LLM chat
 
@@ -228,7 +228,7 @@ Commands: `/model` (switch by name, number, or fuzzy match), `/clear`, `/history
 - **Vision/images** — send images in any format, auto-translated between providers
 - **Retry + fallback chains** — automatic failover across providers with exponential backoff
 - **Cross-provider translation** — tool calls, system messages, and provider-specific fields all handled automatically
-- **JSONL logging** — `cargo run --bin llmshim -- --log llmshim.log`
+- **JSONL logging** — `llmshim chat --log llmshim.log`
 - **OpenAPI spec** — generate clients for any language from `api/openapi.yaml`
 
 ## Architecture
@@ -247,10 +247,12 @@ llmshim::completion(router, request)
 
 ```bash
 cargo build                                          # dev build
-cargo build --release                                # release build
+cargo build --release --features proxy               # release build with proxy
 cargo test --tests                                   # unit tests (~288)
 cargo test -- --ignored                              # integration tests (needs API keys)
 cargo test --features proxy --tests                  # includes proxy tests
-cargo run --bin llmshim                              # interactive CLI
-cargo run --features proxy --bin llmshim-proxy       # proxy server on :3000
+llmshim                                              # interactive chat
+llmshim configure                                    # setup API keys
+llmshim proxy                                        # proxy server (needs --features proxy)
+llmshim models                                       # list available models
 ```

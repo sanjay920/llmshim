@@ -36,15 +36,6 @@ tokio-test = "0.4"
 name = "llmshim"
 path = "src/main.rs"
 
-[[bin]]
-name = "llmshim-config"
-path = "src/bin/config.rs"
-
-[[bin]]
-name = "llmshim-proxy"
-path = "src/bin/proxy.rs"
-required-features = ["proxy"]
-
 [[example]]
 name = "chat"
 path = "examples/chat.rs"

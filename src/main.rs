@@ -425,17 +425,296 @@ fn prompt_model_selection(current: &str) -> Option<String> {
     None
 }
 
-#[tokio::main]
-async fn main() {
-    // Load config: env vars > .env > ~/.llmshim/config.toml
+// ============================================================
+// Config subcommand functions (from bin/config.rs)
+// ============================================================
+
+fn mask_key(key: &str) -> String {
+    if key.len() <= 8 {
+        return "****".to_string();
+    }
+    format!("{}...{}", &key[..4], &key[key.len() - 4..])
+}
+
+fn config_prompt(label: &str, current: Option<&str>) -> String {
+    if let Some(cur) = current {
+        print!("{} [{}]: ", label, mask_key(cur));
+    } else {
+        print!("{}: ", label);
+    }
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    let input = input.trim().to_string();
+    if input.is_empty() {
+        current.unwrap_or("").to_string()
+    } else {
+        input
+    }
+}
+
+fn cmd_configure() {
+    use llmshim::config;
+
+    let mut cfg = config::load();
+    println!("llmshim configuration");
+    println!("Enter API keys (press Enter to keep current value)\n");
+
+    let openai = config_prompt("OpenAI API Key", cfg.keys.openai.as_deref());
+    if !openai.is_empty() {
+        cfg.keys.openai = Some(openai);
+    }
+
+    let anthropic = config_prompt("Anthropic API Key", cfg.keys.anthropic.as_deref());
+    if !anthropic.is_empty() {
+        cfg.keys.anthropic = Some(anthropic);
+    }
+
+    let gemini = config_prompt("Gemini API Key", cfg.keys.gemini.as_deref());
+    if !gemini.is_empty() {
+        cfg.keys.gemini = Some(gemini);
+    }
+
+    let xai = config_prompt("xAI API Key", cfg.keys.xai.as_deref());
+    if !xai.is_empty() {
+        cfg.keys.xai = Some(xai);
+    }
+
+    let host = config_prompt("Proxy host", Some(&cfg.proxy.host));
+    if !host.is_empty() {
+        cfg.proxy.host = host;
+    }
+
+    let port_str = config_prompt("Proxy port", Some(&cfg.proxy.port.to_string()));
+    if let Ok(port) = port_str.parse::<u16>() {
+        cfg.proxy.port = port;
+    }
+
+    match config::save(&cfg) {
+        Ok(()) => println!(
+            "\nConfiguration saved to {}",
+            config::config_path().display()
+        ),
+        Err(e) => {
+            eprintln!("\nError saving config: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_set(key: &str, value: &str) {
+    use llmshim::config;
+
+    let mut cfg = config::load();
+    match key {
+        "openai" => cfg.keys.openai = Some(value.to_string()),
+        "anthropic" => cfg.keys.anthropic = Some(value.to_string()),
+        "gemini" => cfg.keys.gemini = Some(value.to_string()),
+        "xai" => cfg.keys.xai = Some(value.to_string()),
+        "proxy.host" => cfg.proxy.host = value.to_string(),
+        "proxy.port" => {
+            cfg.proxy.port = value.parse().unwrap_or_else(|_| {
+                eprintln!("Invalid port: {}", value);
+                std::process::exit(1);
+            });
+        }
+        _ => {
+            eprintln!(
+                "Unknown key: {}. Valid: openai, anthropic, gemini, xai, proxy.host, proxy.port",
+                key
+            );
+            std::process::exit(1);
+        }
+    }
+    match config::save(&cfg) {
+        Ok(()) => println!(
+            "Set {} = {}",
+            key,
+            if key.contains("proxy") {
+                value.to_string()
+            } else {
+                mask_key(value)
+            }
+        ),
+        Err(e) => {
+            eprintln!("Error saving config: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_get(key: &str) {
+    let cfg = llmshim::config::load();
+    let value = match key {
+        "openai" => cfg.keys.openai.as_deref().map(mask_key),
+        "anthropic" => cfg.keys.anthropic.as_deref().map(mask_key),
+        "gemini" => cfg.keys.gemini.as_deref().map(mask_key),
+        "xai" => cfg.keys.xai.as_deref().map(mask_key),
+        "proxy.host" => Some(cfg.proxy.host.clone()),
+        "proxy.port" => Some(cfg.proxy.port.to_string()),
+        _ => {
+            eprintln!("Unknown key: {}", key);
+            std::process::exit(1);
+        }
+    };
+    println!("{}", value.unwrap_or_else(|| "(not set)".to_string()));
+}
+
+fn cmd_list() {
+    let cfg = llmshim::config::load();
+    println!("Config: {}\n", llmshim::config::config_path().display());
+    println!("API Keys:");
+    for (name, value) in [
+        ("openai", &cfg.keys.openai),
+        ("anthropic", &cfg.keys.anthropic),
+        ("gemini", &cfg.keys.gemini),
+        ("xai", &cfg.keys.xai),
+    ] {
+        let display = match value {
+            Some(v) if !v.is_empty() => mask_key(v),
+            _ => "(not set)".to_string(),
+        };
+        println!("  {:12} {}", name, display);
+    }
+    println!("\nProxy:");
+    println!("  {:12} {}", "host", cfg.proxy.host);
+    println!("  {:12} {}", "port", cfg.proxy.port);
+}
+
+fn cmd_models() {
     llmshim::env::load_all();
+    let router = llmshim::router::Router::from_env();
+    let keys = router.provider_keys();
+    let models = llmshim::models::available_models(&keys);
+    for m in models {
+        println!("  {} ({})", m.id, m.label);
+    }
+}
+
+#[cfg(feature = "proxy")]
+async fn cmd_proxy() {
+    use std::net::SocketAddr;
 
     let router = llmshim::router::Router::from_env();
+    let providers = router.provider_keys();
+    if providers.is_empty() {
+        eprintln!("No API keys found. Run: llmshim configure");
+        std::process::exit(1);
+    }
 
-    // Set up logger — write to llmshim.log if --log flag or LLMSHIM_LOG env var
-    let log_path = std::env::args()
-        .skip_while(|a| a != "--log")
-        .nth(1)
+    let logger = std::env::var("LLMSHIM_LOG")
+        .ok()
+        .and_then(|path| llmshim::log::Logger::to_file(&path).ok());
+
+    let config = llmshim::config::load();
+    let host = std::env::var("LLMSHIM_HOST").unwrap_or(config.proxy.host);
+    let port: u16 = std::env::var("LLMSHIM_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(config.proxy.port);
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .expect("Invalid address");
+
+    eprintln!("llmshim proxy starting on http://{}", addr);
+    eprintln!("  Providers: {:?}", providers);
+    eprintln!("  POST /v1/chat · POST /v1/chat/stream · GET /v1/models · GET /health");
+
+    let app = llmshim::proxy::app(router, logger);
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+// ============================================================
+// Main entrypoint — subcommand dispatch
+// ============================================================
+
+fn print_global_usage() {
+    eprintln!("llmshim — multi-provider LLM gateway\n");
+    eprintln!("Usage: llmshim [command]\n");
+    eprintln!("Commands:");
+    eprintln!("  chat              Interactive chat (default)");
+    eprintln!("  proxy             Start HTTP proxy server");
+    eprintln!("  configure         Interactive API key setup");
+    eprintln!("  set <key> <val>   Set a config value");
+    eprintln!("  get <key>         Get a config value");
+    eprintln!("  list              Show all configured keys");
+    eprintln!("  models            List available models");
+    eprintln!("  help              Show this help");
+    eprintln!("\nRun 'llmshim' with no arguments to start chatting.");
+}
+
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("chat");
+
+    match cmd {
+        "configure" => {
+            cmd_configure();
+            return;
+        }
+        "set" => {
+            if args.len() < 4 {
+                eprintln!("Usage: llmshim set <key> <value>");
+                std::process::exit(1);
+            }
+            cmd_set(&args[2], &args[3]);
+            return;
+        }
+        "get" => {
+            if args.len() < 3 {
+                eprintln!("Usage: llmshim get <key>");
+                std::process::exit(1);
+            }
+            cmd_get(&args[2]);
+            return;
+        }
+        "list" | "ls" => {
+            cmd_list();
+            return;
+        }
+        "models" => {
+            cmd_models();
+            return;
+        }
+        "path" => {
+            println!("{}", llmshim::config::config_path().display());
+            return;
+        }
+        "help" | "--help" | "-h" => {
+            print_global_usage();
+            return;
+        }
+        "proxy" => {
+            llmshim::env::load_all();
+            #[cfg(feature = "proxy")]
+            {
+                cmd_proxy().await;
+                return;
+            }
+            #[cfg(not(feature = "proxy"))]
+            {
+                eprintln!("Proxy not available. Rebuild with: cargo build --features proxy");
+                std::process::exit(1);
+            }
+        }
+        "chat" => { /* fall through to chat */ }
+        _ if cmd.starts_with('-') => {
+            print_global_usage();
+            return;
+        }
+        _ => { /* unknown subcommand — treat as chat */ }
+    }
+
+    // --- Chat mode ---
+    llmshim::env::load_all();
+    let router = llmshim::router::Router::from_env();
+
+    let log_path = args
+        .iter()
+        .position(|a| a == "--log")
+        .and_then(|i| args.get(i + 1).cloned())
         .or_else(|| std::env::var("LLMSHIM_LOG").ok());
     let logger = match log_path {
         Some(path) => match Logger::to_file(&path) {
@@ -451,7 +730,6 @@ async fn main() {
         None => None,
     };
 
-    // Model selection
     println!("\n  llmshim — multi-provider LLM chat\n");
     let mut current_model = match prompt_model_selection("") {
         Some(m) => m,

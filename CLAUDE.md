@@ -22,11 +22,11 @@ cargo test --tests                                   # unit tests (~288)
 cargo test -- --ignored                              # integration tests (needs API keys)
 cargo test --features proxy --tests                  # unit tests including proxy
 cargo test --features proxy -- --ignored             # all integration tests including proxy
-cargo run --bin llmshim                               # interactive CLI chat
-cargo run --features proxy --bin llmshim-proxy       # proxy server on :3000
+cargo run                                            # interactive CLI chat
+cargo run --features proxy -- proxy                  # proxy server on :3000
 ```
 
-API keys: `~/.llmshim/config.toml` (via `llmshim-config configure`) or `.env` in project root or env vars `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`. Precedence: env vars > `.env` > config file.
+API keys: `~/.llmshim/config.toml` (via `llmshim configure`) or `.env` in project root or env vars `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`. Precedence: env vars > `.env` > config file.
 
 ## Architecture
 
@@ -70,7 +70,7 @@ Each provider sanitizes messages from other providers in `transform_request`. Op
 
 ### CLI (`src/main.rs`)
 
-Interactive chat with streaming. `/model` to switch, `/clear` to reset. Reasoning on by default (`reasoning_effort: "high"`). Thinking tokens shown in dim grey, answers in default color. Final summary shows timing and token counts (`↑` input, `↓` output). Optional JSONL file logging via `--log <path>` or `LLMSHIM_LOG` env var.
+Single binary with subcommands: `llmshim chat` (default), `llmshim proxy`, `llmshim configure`, `llmshim set/get/list`, `llmshim models`. Interactive chat with streaming, `/model` to switch, `/clear` to reset. Reasoning on by default (`reasoning_effort: "high"`). Thinking tokens shown in dim grey, answers in default color. Final summary shows timing and token counts (`↑` input, `↓` output). Optional JSONL file logging via `--log <path>` or `LLMSHIM_LOG` env var.
 
 ### Logging (`src/log.rs`)
 
@@ -88,7 +88,7 @@ Endpoints:
 
 Request format uses `config` for provider-agnostic settings and `provider_config` for raw passthrough. OpenAPI 3.1 spec at `api/openapi.yaml`.
 
-Run: `cargo run --features proxy --bin llmshim-proxy`
+Run: `llmshim proxy` (requires `--features proxy` at build time)
 Config: `LLMSHIM_HOST` (default `0.0.0.0`), `LLMSHIM_PORT` (default `3000`)
 
 ## Detailed reference
