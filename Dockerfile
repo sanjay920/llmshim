@@ -1,10 +1,15 @@
 # Build stage
 FROM rust:1.86-slim AS builder
 
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY api/ api/
+
+# Create empty examples dir so Cargo.toml [[example]] entries don't error
+RUN mkdir -p examples && touch examples/chat.rs examples/stream.rs
 
 RUN cargo build --release --features proxy
 
