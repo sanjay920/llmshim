@@ -47,16 +47,19 @@ Keys are stored in `~/.llmshim/config.toml`. You can also use `.env` files or en
 ### Docker
 
 ```bash
-docker build -t llmshim .
-docker run -p 3000:3000 \
-  -e OPENAI_API_KEY=sk-... \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
-  llmshim
+# Build the image
+llmshim docker build
 
-# Or mount your config file
-docker run -p 3000:3000 \
-  -v ~/.llmshim:/root/.llmshim \
-  llmshim
+# Start the proxy (uses keys from ~/.llmshim/config.toml or env vars)
+llmshim docker start
+
+# Check status, view logs, stop
+llmshim docker status
+llmshim docker logs
+llmshim docker stop
+
+# Or run directly with docker
+docker run -p 3000:3000 -e OPENAI_API_KEY=sk-... llmshim
 ```
 
 ## Proxy Server

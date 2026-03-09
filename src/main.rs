@@ -640,8 +640,192 @@ fn print_global_usage() {
     eprintln!("  get <key>         Get a config value");
     eprintln!("  list              Show all configured keys");
     eprintln!("  models            List available models");
+    eprintln!("  docker start      Start proxy in Docker");
+    eprintln!("  docker stop       Stop Docker proxy");
+    eprintln!("  docker status     Show Docker container status");
+    eprintln!("  docker logs       Show Docker container logs");
     eprintln!("  help              Show this help");
     eprintln!("\nRun 'llmshim' with no arguments to start chatting.");
+}
+
+const DOCKER_CONTAINER: &str = "llmshim-proxy";
+const DOCKER_IMAGE: &str = "llmshim";
+
+fn cmd_docker(subcmd: &str, args: &[String]) {
+    match subcmd {
+        "start" => docker_start(args),
+        "stop" => docker_stop(),
+        "status" => docker_status(),
+        "logs" => docker_logs(args),
+        "build" => docker_build(),
+        _ => {
+            eprintln!("Usage: llmshim docker <start|stop|status|logs|build>");
+        }
+    }
+}
+
+fn docker_start(args: &[String]) {
+    // Check if already running
+    let status = std::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", DOCKER_CONTAINER])
+        .output();
+    if let Ok(output) = &status {
+        if String::from_utf8_lossy(&output.stdout).trim() == "true" {
+            eprintln!("llmshim proxy is already running in Docker.");
+            eprintln!("  Stop it with: llmshim docker stop");
+            return;
+        }
+    }
+
+    // Remove dead container if exists
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", DOCKER_CONTAINER])
+        .output();
+
+    // Check image exists
+    let image_check = std::process::Command::new("docker")
+        .args(["image", "inspect", DOCKER_IMAGE])
+        .output();
+    if image_check.map(|o| !o.status.success()).unwrap_or(true) {
+        eprintln!("Docker image '{}' not found. Build it with:", DOCKER_IMAGE);
+        eprintln!("  llmshim docker build");
+        eprintln!("  # or: docker build -t llmshim .");
+        std::process::exit(1);
+    }
+
+    // Build env var args from config
+    let cfg = llmshim::config::load();
+    let mut docker_args = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--name".to_string(),
+        DOCKER_CONTAINER.to_string(),
+    ];
+
+    // Port
+    let port = args
+        .iter()
+        .position(|a| a == "--port" || a == "-p")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(cfg.proxy.port);
+    docker_args.push("-p".to_string());
+    docker_args.push(format!("{}:3000", port));
+
+    // Pass API keys from config/env
+    let key_mappings = [
+        ("OPENAI_API_KEY", &cfg.keys.openai),
+        ("ANTHROPIC_API_KEY", &cfg.keys.anthropic),
+        ("GEMINI_API_KEY", &cfg.keys.gemini),
+        ("XAI_API_KEY", &cfg.keys.xai),
+    ];
+    for (env_name, cfg_value) in key_mappings {
+        if let Ok(val) = std::env::var(env_name) {
+            docker_args.push("-e".to_string());
+            docker_args.push(format!("{}={}", env_name, val));
+        } else if let Some(val) = cfg_value {
+            if !val.is_empty() {
+                docker_args.push("-e".to_string());
+                docker_args.push(format!("{}={}", env_name, val));
+            }
+        }
+    }
+
+    docker_args.push(DOCKER_IMAGE.to_string());
+
+    let result = std::process::Command::new("docker")
+        .args(&docker_args)
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            println!("llmshim proxy started on http://localhost:{}", port);
+            println!("  Stop:   llmshim docker stop");
+            println!("  Logs:   llmshim docker logs");
+            println!("  Status: llmshim docker status");
+        }
+        Ok(output) => {
+            eprintln!(
+                "Failed to start: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Docker not found: {}. Is Docker installed?", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn docker_stop() {
+    let result = std::process::Command::new("docker")
+        .args(["stop", DOCKER_CONTAINER])
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", DOCKER_CONTAINER])
+                .output();
+            println!("llmshim proxy stopped.");
+        }
+        _ => {
+            eprintln!("No running llmshim container found.");
+        }
+    }
+}
+
+fn docker_status() {
+    let result = std::process::Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "Status: {{.State.Status}} | Up: {{.State.Running}} | Port: {{range $p, $conf := .NetworkSettings.Ports}}{{$p}} -> {{(index $conf 0).HostPort}}{{end}}",
+            DOCKER_CONTAINER,
+        ])
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
+        _ => {
+            println!("llmshim proxy is not running.");
+        }
+    }
+}
+
+fn docker_logs(args: &[String]) {
+    let follow = args.iter().any(|a| a == "-f" || a == "--follow");
+    let mut cmd_args = vec!["logs"];
+    if follow {
+        cmd_args.push("-f");
+    } else {
+        cmd_args.push("--tail");
+        cmd_args.push("50");
+    }
+    cmd_args.push(DOCKER_CONTAINER);
+
+    let _ = std::process::Command::new("docker")
+        .args(&cmd_args)
+        .status();
+}
+
+fn docker_build() {
+    println!("Building llmshim Docker image...");
+    let status = std::process::Command::new("docker")
+        .args(["build", "-t", DOCKER_IMAGE, "."])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("Image '{}' built successfully.", DOCKER_IMAGE),
+        Ok(_) => {
+            eprintln!("Build failed.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Docker not found: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 #[tokio::main]
@@ -684,6 +868,11 @@ async fn main() {
         }
         "help" | "--help" | "-h" => {
             print_global_usage();
+            return;
+        }
+        "docker" => {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("help");
+            cmd_docker(subcmd, &args);
             return;
         }
         "proxy" => {
