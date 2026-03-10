@@ -3,6 +3,12 @@ name = "llmshim"
 version = "0.1.0"
 edition = "2021"
 description = "Blazing fast LLM API translation layer in pure Rust"
+license = "MIT"
+repository = "https://github.com/sanjay920/llmshim"
+homepage = "https://github.com/sanjay920/llmshim"
+keywords = ["llm", "openai", "anthropic", "gemini", "ai"]
+categories = ["api-bindings", "web-programming"]
+exclude = ["clients/", "api/", ".claude/", "Dockerfile", ".dockerignore"]
 
 [features]
 default = []
