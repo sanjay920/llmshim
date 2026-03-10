@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A pure Rust LLM API translation layer. Takes OpenAI-format JSON requests, translates them to provider-native formats (and back), with zero infrastructure requirements. Supports OpenAI (Responses API), Anthropic, Google Gemini, and xAI. Includes an interactive CLI chat with streaming, reasoning, and mid-conversation model switching.
 
+**Published on crates.io as `llmshim`** — https://crates.io/crates/llmshim
+
+This is a public crate. Do NOT make breaking changes to `pub` items in `src/lib.rs`, `src/router.rs`, `src/provider.rs`, `src/error.rs`, `src/fallback.rs`, `src/log.rs`, `src/config.rs`, `src/models.rs`, or `src/vision.rs` without a semver bump. The `ragents` crate (https://github.com/sanjay920/ragents) depends on this.
+
 ## Supported models
 
 - **OpenAI:** `gpt-5.4`
