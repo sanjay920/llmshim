@@ -1,6 +1,6 @@
-# llmshim Python Client
+# llmshim
 
-One interface, every LLM provider. The proxy server starts automatically — no separate process to manage.
+One interface, every LLM provider. The proxy server starts automatically — no setup needed.
 
 ## Install
 
@@ -8,42 +8,46 @@ One interface, every LLM provider. The proxy server starts automatically — no 
 pip install llmshim
 ```
 
-For development (from the repo):
-
-```bash
-# Build the binary
-cargo build --release --features proxy
-
-# Copy into the package
-cp target/release/llmshim clients/python/llmshim/bin/
-
-# Install in dev mode
-pip install -e clients/python/
-```
-
-## Quick Start
+## Configure
 
 ```python
-from llmshim import Shim
+import llmshim
 
-client = Shim()  # server starts automatically
-
-resp = client.chat("claude-sonnet-4-6", "What is Rust?")
-print(resp["message"]["content"])
+# Set API keys (writes to ~/.llmshim/config.toml — only needed once)
+llmshim.configure(
+    anthropic="sk-ant-...",
+    openai="sk-...",
+    gemini="AIza...",
+    xai="xai-...",
+)
 ```
 
-That's it. No server to start, no config to write (if you've run `llmshim configure`).
+Or from the CLI: `llmshim configure`
 
 ## Chat
 
 ```python
-# Simple string message
-resp = client.chat("claude-sonnet-4-6", "Hello!", max_tokens=500)
-print(resp["message"]["content"])
-print(f"Provider: {resp['provider']}, Latency: {resp['latency_ms']}ms")
+import llmshim
 
-# Message array with system prompt
-resp = client.chat("gpt-5.4", [
+resp = llmshim.chat("claude-sonnet-4-6", "What is Rust?")
+print(resp["message"]["content"])
+```
+
+With options:
+
+```python
+resp = llmshim.chat(
+    "openai/gpt-5.4",
+    "Explain quicksort",
+    max_tokens=500,
+    temperature=0.7,
+)
+```
+
+With message history:
+
+```python
+resp = llmshim.chat("claude-sonnet-4-6", [
     {"role": "system", "content": "You are a pirate."},
     {"role": "user", "content": "Hello!"},
 ], max_tokens=500)
@@ -52,7 +56,7 @@ resp = client.chat("gpt-5.4", [
 ## Streaming
 
 ```python
-for event in client.stream("claude-sonnet-4-6", "Write a poem"):
+for event in llmshim.stream("claude-sonnet-4-6", "Write a poem"):
     if event["type"] == "content":
         print(event["text"], end="", flush=True)
     elif event["type"] == "reasoning":
@@ -68,36 +72,33 @@ Switch models mid-conversation. History carries over.
 ```python
 messages = [{"role": "user", "content": "What is a closure?"}]
 
-# Ask Claude
-r1 = client.chat("claude-sonnet-4-6", messages, max_tokens=500)
+r1 = llmshim.chat("claude-sonnet-4-6", messages, max_tokens=500)
 print(f"Claude: {r1['message']['content']}")
 
-# Continue with GPT
 messages.append({"role": "assistant", "content": r1["message"]["content"]})
-messages.append({"role": "user", "content": "Now explain it differently."})
-r2 = client.chat("gpt-5.4", messages, max_tokens=500)
+messages.append({"role": "user", "content": "Now explain differently."})
+
+r2 = llmshim.chat("gpt-5.4", messages, max_tokens=500)
 print(f"GPT: {r2['message']['content']}")
 ```
 
 ## Reasoning / Thinking
 
 ```python
-# Via config (all providers)
-resp = client.chat("claude-sonnet-4-6", "Solve: x^2 - 5x + 6 = 0",
-                    reasoning_effort="high", max_tokens=4000)
-print(resp["reasoning"])  # thinking content
+resp = llmshim.chat(
+    "claude-sonnet-4-6",
+    "Solve: x^2 - 5x + 6 = 0",
+    max_tokens=4000,
+    reasoning_effort="high",
+)
+print(resp["reasoning"])        # thinking content
 print(resp["message"]["content"])  # answer
-
-# Via provider-specific config
-resp = client.chat("claude-sonnet-4-6", "Complex problem...",
-                    max_tokens=4000,
-                    provider_config={"thinking": {"type": "enabled", "budget_tokens": 5000}})
 ```
 
 ## Fallback Chains
 
 ```python
-resp = client.chat(
+resp = llmshim.chat(
     "anthropic/claude-sonnet-4-6",
     "Hello",
     max_tokens=100,
@@ -105,26 +106,22 @@ resp = client.chat(
 )
 ```
 
-## Other Methods
+## Other
 
 ```python
-# List available models
-for m in client.models():
-    print(f"{m['id']} ({m['provider']})")
-
-# Health check
-print(client.health())
+llmshim.models()   # list available models
+llmshim.health()   # {"status": "ok", "providers": [...]}
 ```
 
 ## How It Works
 
-The first time you call any method, the package:
-1. Finds the `llmshim` binary (bundled in package, on PATH, or in repo)
-2. Starts the proxy server on a random localhost port
-3. Sends your request through the proxy
-4. Server auto-stops when your Python process exits
+On first call, the package:
+1. Finds the `llmshim` binary (bundled, on PATH, or in repo)
+2. Starts the proxy on a random localhost port
+3. Routes your request through it
+4. Server stops automatically when Python exits
 
-No Docker, no background services, no config files needed.
+No Docker, no background services, no manual server management.
 
 ## Supported Models
 
@@ -134,5 +131,3 @@ No Docker, no background services, no config files needed.
 | Anthropic | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` |
 | Gemini | `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview` |
 | xAI | `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning` |
-
-Configure API keys with `llmshim configure` or set environment variables.

@@ -2,17 +2,16 @@
 llmshim — Multi-provider LLM gateway for Python.
 
 Usage:
-    from llmshim import Shim
+    import llmshim
 
-    client = Shim()
-    resp = client.chat("claude-sonnet-4-6", "Hello!")
+    llmshim.configure(anthropic="sk-ant-...", openai="sk-...")
+    resp = llmshim.chat("claude-sonnet-4-6", "Hello!")
     print(resp["message"]["content"])
 
 The proxy server starts automatically on first use and stops on exit.
-No separate server process needed.
 """
 
-from llmshim._client import Shim
+from llmshim._client import chat, stream, models, health, configure
 
-__all__ = ["Shim"]
+__all__ = ["chat", "stream", "models", "health", "configure"]
 __version__ = "0.1.0"
