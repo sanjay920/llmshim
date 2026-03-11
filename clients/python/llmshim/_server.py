@@ -26,29 +26,40 @@ def _find_binary() -> str:
     2. On PATH (e.g., installed via cargo install)
     3. In the repo's target/release/ directory
     """
-    # 1. Bundled binary
-    pkg_dir = Path(__file__).parent
     bin_name = "llmshim.exe" if platform.system() == "Windows" else "llmshim"
+    pkg_dir = Path(__file__).parent
+
+    # 1. Python scripts directory (where maturin/pip installs binaries)
+    import sysconfig
+    scripts_dir = sysconfig.get_path("scripts")
+    if scripts_dir:
+        candidate = Path(scripts_dir) / bin_name
+        if candidate.exists() and os.access(str(candidate), os.X_OK):
+            return str(candidate)
+
+    # 2. Bundled in package (dev installs, manual copy)
     bundled = pkg_dir / "bin" / bin_name
     if bundled.exists() and os.access(str(bundled), os.X_OK):
         return str(bundled)
 
-    # 2. On PATH
+    # 3. On PATH (cargo install)
     import shutil
     on_path = shutil.which("llmshim")
     if on_path:
         return on_path
 
-    # 3. Repo target directory (development mode)
-    repo_root = pkg_dir.parent.parent.parent  # clients/python/llmshim -> repo root
-    for build_dir in ["target/release", "target/debug"]:
-        candidate = repo_root / build_dir / bin_name
-        if candidate.exists() and os.access(str(candidate), os.X_OK):
-            return str(candidate)
+    # 4. Repo target directory (development)
+    for root in [pkg_dir.parent.parent.parent, pkg_dir.parent.parent]:
+        for build_dir in ["target/release", "target/debug"]:
+            candidate = root / build_dir / bin_name
+            if candidate.exists() and os.access(str(candidate), os.X_OK):
+                return str(candidate)
 
     raise FileNotFoundError(
-        "llmshim binary not found. Install with: cargo install --path . --features proxy\n"
-        "Or build with: cargo build --release --features proxy"
+        "llmshim binary not found. Install with:\n"
+        "  pip install llmshim          (includes the binary)\n"
+        "  cargo install llmshim        (from crates.io)\n"
+        "  cargo build --release --features proxy  (from source)"
     )
 
 
