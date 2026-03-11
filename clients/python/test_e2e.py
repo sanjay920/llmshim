@@ -19,7 +19,7 @@ import os
 # Add the package to path (for development — in production, pip install handles this)
 sys.path.insert(0, os.path.dirname(__file__))
 
-from llmshim import LlmShim
+from llmshim import Shim
 
 passed = 0
 failed = 0
@@ -48,7 +48,7 @@ def test(name):
 
 
 # Create client — this will auto-start the server on first use
-client = LlmShim()
+client = Shim()
 
 
 @test("Auto-start: server starts on first health check")

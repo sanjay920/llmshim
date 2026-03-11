@@ -24,9 +24,9 @@ pip install -e clients/python/
 ## Quick Start
 
 ```python
-from llmshim import LlmShim
+from llmshim import Shim
 
-client = LlmShim()  # server starts automatically
+client = Shim()  # server starts automatically
 
 resp = client.chat("claude-sonnet-4-6", "What is Rust?")
 print(resp["message"]["content"])

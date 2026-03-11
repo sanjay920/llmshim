@@ -14,14 +14,14 @@ import httpx
 from llmshim._server import ensure_server
 
 
-class LlmShim:
+class Shim:
     """Multi-provider LLM client.
 
     Automatically starts the llmshim proxy server on first use.
     The server stops when the Python process exits.
 
     Usage:
-        client = LlmShim()
+        client = Shim()
         resp = client.chat("claude-sonnet-4-6", "Hello!")
         print(resp["message"]["content"])
     """
