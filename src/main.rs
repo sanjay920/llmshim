@@ -177,10 +177,10 @@ return theFile"#,
             return None;
         }
         let b64 = base64_encode(&output.stdout);
-        return Some(json!({
+        Some(json!({
             "type": "image_url",
             "image_url": {"url": format!("data:image/png;base64,{}", b64)}
-        }));
+        }))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
