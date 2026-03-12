@@ -22,27 +22,148 @@ impl OpenAi {
     }
 }
 
-/// Sanitize messages for OpenAI: strip cross-provider fields and translate images.
+/// Sanitize messages for OpenAI Responses API: strip cross-provider fields,
+/// translate images, and convert tool call/result messages to Responses API format.
+///
+/// The Responses API expects:
+/// - Assistant messages with tool_calls → split into the assistant message +
+///   separate `function_call` items
+/// - `role: "tool"` messages → `function_call_output` items
 fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|msg| {
-            let mut out = msg.clone();
-            if let Some(obj) = out.as_object_mut() {
-                obj.remove("reasoning_content");
-                obj.remove("annotations");
-                obj.remove("refusal");
-            }
-            // Translate image content blocks to OpenAI Responses API format
-            if let Some(content) = out.get("content").cloned() {
-                if content.is_array() {
-                    let translated = vision::translate_content_blocks(&content, vision::to_openai);
-                    out["content"] = vision::text_blocks_to_openai(&translated);
+    let mut result = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        match role {
+            "assistant" => {
+                // Emit the assistant message (content part).
+                let mut out = msg.clone();
+                if let Some(obj) = out.as_object_mut() {
+                    obj.remove("reasoning_content");
+                    obj.remove("annotations");
+                    obj.remove("refusal");
+                    obj.remove("tool_calls"); // Handled separately below.
+                }
+                if let Some(content) = out.get("content").cloned() {
+                    if content.is_array() {
+                        let translated =
+                            vision::translate_content_blocks(&content, vision::to_openai);
+                        out["content"] = vision::text_blocks_to_openai(&translated);
+                    }
+                }
+                // Only emit the assistant message if it has non-empty content.
+                let has_content = out
+                    .get("content")
+                    .map(|c| !c.is_null() && c.as_str().map(|s| !s.is_empty()).unwrap_or(true))
+                    .unwrap_or(false);
+                if has_content {
+                    result.push(out);
+                }
+
+                // Emit function_call items for each tool call.
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                    for tc in tool_calls {
+                        let call_id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("{}")
+                            .to_string();
+                        result.push(json!({
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                        }));
+                    }
                 }
             }
-            out
-        })
-        .collect()
+            "tool" => {
+                // Convert to function_call_output for Responses API.
+                let call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let output = msg
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                result.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                }));
+            }
+            _ => {
+                // user, system, developer — standard sanitization.
+                let mut out = msg.clone();
+                if let Some(obj) = out.as_object_mut() {
+                    obj.remove("reasoning_content");
+                    obj.remove("annotations");
+                    obj.remove("refusal");
+                }
+                if let Some(content) = out.get("content").cloned() {
+                    if content.is_array() {
+                        let translated =
+                            vision::translate_content_blocks(&content, vision::to_openai);
+                        out["content"] = vision::text_blocks_to_openai(&translated);
+                    }
+                }
+                result.push(out);
+            }
+        }
+    }
+    result
+}
+
+/// Translate Chat Completions tool definitions to Responses API format.
+/// Chat Completions: `{"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}`
+/// Responses API:    `{"type": "function", "name": ..., "description": ..., "parameters": ...}`
+fn translate_tools(tools: &Value) -> Value {
+    if let Some(arr) = tools.as_array() {
+        let translated: Vec<Value> = arr
+            .iter()
+            .map(|tool| {
+                // If it has a nested "function" object, flatten it.
+                if let Some(func) = tool.get("function") {
+                    let mut flat = json!({"type": "function"});
+                    if let Some(obj) = func.as_object() {
+                        for (k, v) in obj {
+                            flat[k] = v.clone();
+                        }
+                    }
+                    // Preserve any extra top-level fields besides "type" and "function"
+                    if let Some(obj) = tool.as_object() {
+                        for (k, v) in obj {
+                            if k != "type" && k != "function" {
+                                flat[k] = v.clone();
+                            }
+                        }
+                    }
+                    flat
+                } else {
+                    // Already in flat format, pass through.
+                    tool.clone()
+                }
+            })
+            .collect();
+        json!(translated)
+    } else {
+        tools.clone()
+    }
 }
 
 /// Translate Anthropic-style tool_choice to OpenAI format.
@@ -121,9 +242,9 @@ impl Provider for OpenAi {
             body_obj.insert("stream".to_string(), v.clone());
         }
 
-        // Tools
+        // Tools — translate Chat Completions format to Responses API flat format
         if let Some(tools) = obj.get("tools") {
-            body_obj.insert("tools".to_string(), tools.clone());
+            body_obj.insert("tools".to_string(), translate_tools(tools));
         }
 
         // tool_choice
@@ -309,6 +430,65 @@ impl Provider for OpenAi {
                     "choices": [{
                         "index": 0,
                         "delta": {"content": delta},
+                        "finish_reason": null,
+                    }]
+                });
+                Ok(Some(serde_json::to_string(&chunk)?))
+            }
+
+            // Function call output item added — emit tool_calls start chunk
+            "response.output_item.added" => {
+                let empty = json!({});
+                let item = parsed.get("item").unwrap_or(&empty);
+                if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
+                    return Ok(None);
+                }
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let index = parsed
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let chunk = json!({
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": ""},
+                            }]
+                        },
+                        "finish_reason": null,
+                    }]
+                });
+                Ok(Some(serde_json::to_string(&chunk)?))
+            }
+
+            // Function call argument deltas
+            "response.function_call_arguments.delta" => {
+                let delta = parsed.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+                if delta.is_empty() {
+                    return Ok(None);
+                }
+                let index = parsed
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let chunk = json!({
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "function": {"arguments": delta},
+                            }]
+                        },
                         "finish_reason": null,
                     }]
                 });

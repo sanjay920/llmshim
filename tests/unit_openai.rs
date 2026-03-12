@@ -239,7 +239,7 @@ fn request_strips_anthropic_thinking_param() {
 // ============================================================
 
 #[test]
-fn request_tools_passthrough() {
+fn request_tools_chat_completions_format_flattened() {
     let p = provider();
     let req = json!({
         "model": "x",
@@ -254,7 +254,46 @@ fn request_tools_passthrough() {
         }],
     });
     let result = p.transform_request("gpt-5.4", &req).unwrap();
-    assert_eq!(result.body["tools"][0]["function"]["name"], "get_weather");
+    let tool = &result.body["tools"][0];
+    // Responses API flat format: name/description/parameters at top level, no "function" wrapper.
+    assert_eq!(tool["name"], "get_weather");
+    assert_eq!(tool["description"], "Get weather");
+    assert_eq!(tool["type"], "function");
+    assert!(tool.get("function").is_none());
+    assert!(tool["parameters"]["properties"]["city"]["type"] == "string");
+}
+
+#[test]
+fn request_tools_already_flat_passthrough() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {"type": "object"},
+        }],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["tools"][0]["name"], "get_weather");
+}
+
+#[test]
+fn request_tools_multiple_flattened() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {"name": "tool_a", "description": "A", "parameters": {}}},
+            {"type": "function", "function": {"name": "tool_b", "description": "B", "parameters": {}}},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["tools"][0]["name"], "tool_a");
+    assert_eq!(result.body["tools"][1]["name"], "tool_b");
 }
 
 #[test]
@@ -280,6 +319,67 @@ fn request_tool_choice_anthropic_tool_to_function() {
     let result = p.transform_request("gpt-5.4", &req).unwrap();
     assert_eq!(result.body["tool_choice"]["type"], "function");
     assert_eq!(result.body["tool_choice"]["function"]["name"], "search");
+}
+
+// ============================================================
+// transform_request — tool call/result message translation
+// ============================================================
+
+#[test]
+fn request_assistant_tool_calls_become_function_call_items() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_123", "content": "72F sunny"},
+            {"role": "assistant", "content": "It's 72F and sunny in Paris."},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+
+    // user message
+    assert_eq!(input[0]["role"], "user");
+    // assistant with empty content is dropped, but function_call item emitted
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_123");
+    assert_eq!(input[1]["name"], "get_weather");
+    assert_eq!(input[1]["arguments"], "{\"city\":\"Paris\"}");
+    // tool result → function_call_output
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["call_id"], "call_123");
+    assert_eq!(input[2]["output"], "72F sunny");
+    // final assistant message
+    assert_eq!(input[3]["role"], "assistant");
+    assert_eq!(input[3]["content"], "It's 72F and sunny in Paris.");
+}
+
+#[test]
+fn request_tool_result_message_becomes_function_call_output() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_abc", "content": "result data"},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    assert_eq!(input[1]["type"], "function_call_output");
+    assert_eq!(input[1]["call_id"], "call_abc");
+    assert_eq!(input[1]["output"], "result data");
+    assert!(input[1].get("role").is_none());
 }
 
 #[test]
@@ -455,6 +555,61 @@ fn stream_response_completed() {
     assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
     assert_eq!(parsed["usage"]["prompt_tokens"], 10);
     assert_eq!(parsed["usage"]["completion_tokens"], 5);
+}
+
+#[test]
+fn stream_function_call_output_item_added() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": {
+            "type": "function_call",
+            "call_id": "call_xyz",
+            "name": "get_weather",
+        },
+    });
+    let result = p
+        .transform_stream_chunk("gpt-5.4", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc["id"], "call_xyz");
+    assert_eq!(tc["function"]["name"], "get_weather");
+    assert_eq!(tc["index"], 1);
+}
+
+#[test]
+fn stream_function_call_non_function_item_skipped() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {"type": "message"},
+    });
+    let result = p
+        .transform_stream_chunk("gpt-5.4", &serde_json::to_string(&chunk).unwrap())
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn stream_function_call_arguments_delta() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.function_call_arguments.delta",
+        "output_index": 0,
+        "delta": "{\"city\":",
+    });
+    let result = p
+        .transform_stream_chunk("gpt-5.4", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc["function"]["arguments"], "{\"city\":");
+    assert_eq!(tc["index"], 0);
 }
 
 #[test]

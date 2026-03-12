@@ -96,7 +96,7 @@ jobs:
           name: wheels-linux-x86_64
           path: clients/python/dist
 
-  # --- Linux aarch64 wheel ---
+  # --- Linux aarch64 wheel (use zig for cross-compilation) ---
   linux-arm:
     needs: test
     runs-on: ubuntu-latest
@@ -110,7 +110,7 @@ jobs:
         with:
           target: aarch64-unknown-linux-gnu
           manylinux: "2_17"
-          args: --release --out dist
+          args: --release --out dist --zig
           working-directory: clients/python
       - uses: actions/upload-artifact@v4
         with:

@@ -72,6 +72,14 @@ Image content blocks are translated between providers automatically. Users can s
 
 Each provider sanitizes messages from other providers in `transform_request`. OpenAI's `annotations`/`refusal` stripped for Anthropic/Gemini. `reasoning_content` stripped for all. Tool calls normalized to OpenAI format in responses, translated back per-provider on input.
 
+### Tool format translation
+
+llmshim accepts tools in OpenAI Chat Completions format (nested `function` object) and translates them to each provider's native format:
+
+- **OpenAI (Responses API):** Tool definitions flattened from `{"type": "function", "function": {"name": ..., "parameters": ...}}` to `{"type": "function", "name": ..., "parameters": ...}`. Assistant messages with `tool_calls` → `function_call` items. `role: "tool"` messages → `function_call_output` items. Streaming function call events (`response.output_item.added`, `response.function_call_arguments.delta`) translated to Chat Completions chunk format.
+- **Anthropic:** Tools translated to `{"name": ..., "description": ..., "input_schema": ...}` format. Tool results translated to Anthropic's `tool_result` content blocks.
+- **Gemini:** Tools wrapped in `functionDeclarations`. Tool results translated to `functionResponse` format.
+
 ### CLI (`src/main.rs`)
 
 Single binary with subcommands: `llmshim chat` (default), `llmshim proxy`, `llmshim configure`, `llmshim set/get/list`, `llmshim models`. Interactive chat with streaming, `/model` to switch, `/clear` to reset. Reasoning on by default (`reasoning_effort: "high"`). Thinking tokens shown in dim grey, answers in default color. Final summary shows timing and token counts (`↑` input, `↓` output). Optional JSONL file logging via `--log <path>` or `LLMSHIM_LOG` env var.

@@ -167,8 +167,13 @@ fn anthropic_tool_response_format_works_for_openai() {
     });
     let result = o.transform_request("gpt-5.4", &req).unwrap();
     let input = result.body["input"].as_array().unwrap();
-    assert!(input[1].get("tool_calls").is_some());
-    assert_eq!(input[1]["tool_calls"][0]["function"]["name"], "search");
+    // Assistant tool_calls are translated to Responses API function_call items.
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["name"], "search");
+    assert_eq!(input[1]["call_id"], "tu_456");
+    // Tool result is translated to function_call_output.
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["call_id"], "tu_456");
 }
 
 // ============================================================
