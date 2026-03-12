@@ -95,6 +95,29 @@ print(resp["reasoning"])        # thinking content
 print(resp["message"]["content"])  # answer
 ```
 
+## Tool Use / Function Calling
+
+```python
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get current weather",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}]
+
+resp = llmshim.chat("claude-sonnet-4-6", "Weather in Tokyo?", max_tokens=500, tools=tools)
+for tc in resp["message"].get("tool_calls", []):
+    print(f"{tc['function']['name']}({tc['function']['arguments']})")
+```
+
+Tools are accepted in OpenAI Chat Completions format and auto-translated to each provider's native format.
+
 ## Fallback Chains
 
 ```python

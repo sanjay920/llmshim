@@ -78,6 +78,7 @@ llmshim accepts tools in OpenAI Chat Completions format (nested `function` objec
 
 - **OpenAI (Responses API):** Tool definitions flattened from `{"type": "function", "function": {"name": ..., "parameters": ...}}` to `{"type": "function", "name": ..., "parameters": ...}`. Assistant messages with `tool_calls` → `function_call` items. `role: "tool"` messages → `function_call_output` items. Streaming function call events (`response.output_item.added`, `response.function_call_arguments.delta`) translated to Chat Completions chunk format.
 - **Anthropic:** Tools translated to `{"name": ..., "description": ..., "input_schema": ...}` format. Tool results translated to Anthropic's `tool_result` content blocks.
+- **xAI:** Same flat format as OpenAI Responses API — `translate_tools()` flattens nested format.
 - **Gemini:** Tools wrapped in `functionDeclarations`. Tool results translated to `functionResponse` format.
 
 ### CLI (`src/main.rs`)
