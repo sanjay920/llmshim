@@ -22,27 +22,107 @@ impl Xai {
     }
 }
 
-/// Sanitize messages: strip cross-provider fields and translate images.
+/// Sanitize messages for xAI Responses API: strip cross-provider fields,
+/// translate images, and convert tool call/result messages to Responses API format.
+///
+/// The Responses API expects:
+/// - Assistant messages with tool_calls → split into the assistant message +
+///   separate `function_call` items
+/// - `role: "tool"` messages → `function_call_output` items
 fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|msg| {
-            let mut out = msg.clone();
-            if let Some(obj) = out.as_object_mut() {
-                obj.remove("reasoning_content");
-                obj.remove("annotations");
-                obj.remove("refusal");
-            }
-            // Translate image content blocks to OpenAI Responses API format (same as xAI)
-            if let Some(content) = out.get("content").cloned() {
-                if content.is_array() {
-                    let translated = vision::translate_content_blocks(&content, vision::to_openai);
-                    out["content"] = vision::text_blocks_to_openai(&translated);
+    let mut result = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        match role {
+            "assistant" => {
+                let mut out = msg.clone();
+                if let Some(obj) = out.as_object_mut() {
+                    obj.remove("reasoning_content");
+                    obj.remove("annotations");
+                    obj.remove("refusal");
+                    obj.remove("tool_calls");
+                }
+                if let Some(content) = out.get("content").cloned() {
+                    if content.is_array() {
+                        let translated =
+                            vision::translate_content_blocks(&content, vision::to_openai);
+                        out["content"] = vision::text_blocks_to_openai(&translated);
+                    }
+                }
+                let has_content = out
+                    .get("content")
+                    .map(|c| !c.is_null() && c.as_str().map(|s| !s.is_empty()).unwrap_or(true))
+                    .unwrap_or(false);
+                if has_content {
+                    result.push(out);
+                }
+
+                // Emit function_call items for each tool call
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                    for tc in tool_calls {
+                        let call_id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("{}")
+                            .to_string();
+                        result.push(json!({
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                        }));
+                    }
                 }
             }
-            out
-        })
-        .collect()
+            "tool" => {
+                let call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let output = msg
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                result.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                }));
+            }
+            _ => {
+                let mut out = msg.clone();
+                if let Some(obj) = out.as_object_mut() {
+                    obj.remove("reasoning_content");
+                    obj.remove("annotations");
+                    obj.remove("refusal");
+                }
+                if let Some(content) = out.get("content").cloned() {
+                    if content.is_array() {
+                        let translated =
+                            vision::translate_content_blocks(&content, vision::to_openai);
+                        out["content"] = vision::text_blocks_to_openai(&translated);
+                    }
+                }
+                result.push(out);
+            }
+        }
+    }
+    result
 }
 
 /// Translate tools from Chat Completions nested format to Responses API flat format.

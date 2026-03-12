@@ -151,7 +151,12 @@ fn build_parts(msg: &Value) -> Vec<Value> {
                     .and_then(|a| a.as_str())
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or(json!({}));
-                parts.push(json!({"functionCall": {"name": name, "args": args}}));
+                let mut fc_part = json!({"functionCall": {"name": name, "args": args}});
+                // Echo thought_signature back — Gemini requires it for tool roundtrips
+                if let Some(sig) = tc.get("thought_signature") {
+                    fc_part["thoughtSignature"] = sig.clone();
+                }
+                parts.push(fc_part);
             }
         }
     }
@@ -346,7 +351,7 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
         }
         if let Some(fc) = part.get("functionCall") {
             let id = format!("call_{}", tool_calls.len());
-            tool_calls.push(json!({
+            let mut tc = json!({
                 "id": id,
                 "type": "function",
                 "function": {
@@ -355,7 +360,12 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
                         .map(|a| serde_json::to_string(a).unwrap_or_default())
                         .unwrap_or_default(),
                 }
-            }));
+            });
+            // Preserve thought_signature — Gemini requires it echoed back in follow-up requests
+            if let Some(sig) = part.get("thoughtSignature") {
+                tc["thought_signature"] = sig.clone();
+            }
+            tool_calls.push(tc);
         }
     }
 
@@ -596,7 +606,7 @@ impl Provider for Gemini {
             if let Some(fc) = part.get("functionCall") {
                 has_function_call = true;
                 let id = format!("call_{}", tool_calls.len());
-                tool_calls.push(json!({
+                let mut tc = json!({
                     "index": tool_calls.len(),
                     "id": id,
                     "type": "function",
@@ -606,7 +616,11 @@ impl Provider for Gemini {
                             .map(|a| serde_json::to_string(a).unwrap_or_default())
                             .unwrap_or_default(),
                     }
-                }));
+                });
+                if let Some(sig) = part.get("thoughtSignature") {
+                    tc["thought_signature"] = sig.clone();
+                }
+                tool_calls.push(tc);
             }
         }
 

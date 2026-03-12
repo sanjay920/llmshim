@@ -435,3 +435,118 @@ fn stream_done_returns_none() {
     let p = provider();
     assert!(p.transform_stream_chunk("x", "[DONE]").unwrap().is_none());
 }
+
+// ============================================================
+// Session history: tool calls/results converted to Responses API format
+// ============================================================
+
+#[test]
+fn session_history_tool_calls_converted_to_function_call_items() {
+    let p = provider();
+    let req = json!({
+        "model": "grok-4-1-fast-reasoning",
+        "messages": [
+            {"role": "user", "content": "Get AAPL quote"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "{\"price\":150}"},
+            {"role": "assistant", "content": "AAPL is at $150."},
+            {"role": "user", "content": "thanks"},
+        ],
+    });
+    let result = p
+        .transform_request("grok-4-1-fast-reasoning", &req)
+        .unwrap();
+    let input = result.body["input"].as_array().unwrap();
+
+    // user message
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[0]["content"], "Get AAPL quote");
+
+    // assistant tool_calls → function_call item (no assistant message since content was null)
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_abc");
+    assert_eq!(input[1]["name"], "get_quote");
+
+    // tool result → function_call_output
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["call_id"], "call_abc");
+    assert_eq!(input[2]["output"], "{\"price\":150}");
+
+    // subsequent assistant message with content
+    assert_eq!(input[3]["role"], "assistant");
+    assert_eq!(input[3]["content"], "AAPL is at $150.");
+    assert!(input[3].get("tool_calls").is_none());
+
+    // final user message
+    assert_eq!(input[4]["role"], "user");
+}
+
+#[test]
+fn session_history_multiple_tool_calls_in_one_message() {
+    let p = provider();
+    let req = json!({
+        "model": "grok-4-1-fast-reasoning",
+        "messages": [
+            {"role": "user", "content": "Compare AAPL and GOOGL"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"}},
+                    {"id": "call_2", "type": "function", "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"GOOGL\"]}"}},
+                ]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"price\":150}"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "{\"price\":180}"},
+        ],
+    });
+    let result = p
+        .transform_request("grok-4-1-fast-reasoning", &req)
+        .unwrap();
+    let input = result.body["input"].as_array().unwrap();
+
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["name"], "get_quote");
+    assert_eq!(input[1]["call_id"], "call_1");
+    assert_eq!(input[2]["type"], "function_call");
+    assert_eq!(input[2]["name"], "get_quote");
+    assert_eq!(input[2]["call_id"], "call_2");
+    assert_eq!(input[3]["type"], "function_call_output");
+    assert_eq!(input[3]["call_id"], "call_1");
+    assert_eq!(input[4]["type"], "function_call_output");
+    assert_eq!(input[4]["call_id"], "call_2");
+}
+
+#[test]
+fn session_history_strips_cross_provider_fields() {
+    let p = provider();
+    let req = json!({
+        "model": "grok-4-1-fast-reasoning",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "hello",
+                "reasoning_content": "thinking...",
+                "annotations": [],
+                "refusal": null
+            },
+        ],
+    });
+    let result = p
+        .transform_request("grok-4-1-fast-reasoning", &req)
+        .unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    assert_eq!(input[0]["content"], "hello");
+    assert!(input[0].get("reasoning_content").is_none());
+    assert!(input[0].get("annotations").is_none());
+    assert!(input[0].get("refusal").is_none());
+}

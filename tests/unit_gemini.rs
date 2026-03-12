@@ -700,3 +700,123 @@ fn stream_text_and_thought_in_same_chunk() {
     );
     assert_eq!(parsed["choices"][0]["delta"]["content"], "Answer here");
 }
+
+// ============================================================
+// thought_signature roundtrip
+// ============================================================
+
+#[test]
+fn response_preserves_thought_signature_on_tool_calls() {
+    let p = provider();
+    let gemini_response = json!({
+        "candidates": [{
+            "content": {
+                "parts": [
+                    {
+                        "functionCall": {"name": "get_quote", "args": {"symbols": ["AAPL"]}},
+                        "thoughtSignature": "abc123-sig"
+                    }
+                ],
+                "role": "model"
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", gemini_response)
+        .unwrap();
+    let tc = &result["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(tc["function"]["name"], "get_quote");
+    assert_eq!(tc["thought_signature"], "abc123-sig");
+}
+
+#[test]
+fn request_echoes_thought_signature_in_function_call_parts() {
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Get AAPL quote"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"},
+                    "thought_signature": "abc123-sig"
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "get_quote", "content": "{\"price\": 150}"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+    // The model (assistant) message should have functionCall with thoughtSignature
+    let model_parts = contents[1]["parts"].as_array().unwrap();
+    let fc_part = model_parts
+        .iter()
+        .find(|p| p.get("functionCall").is_some())
+        .unwrap();
+    assert_eq!(fc_part["functionCall"]["name"], "get_quote");
+    assert_eq!(fc_part["thoughtSignature"], "abc123-sig");
+}
+
+#[test]
+fn request_works_without_thought_signature() {
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Get quote"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "get_quote", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "get_quote", "content": "{}"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+    let model_parts = contents[1]["parts"].as_array().unwrap();
+    let fc_part = model_parts
+        .iter()
+        .find(|p| p.get("functionCall").is_some())
+        .unwrap();
+    assert!(fc_part.get("thoughtSignature").is_none());
+}
+
+#[test]
+fn stream_preserves_thought_signature_on_tool_calls() {
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{
+            "content": {
+                "parts": [{
+                    "functionCall": {"name": "get_quote", "args": {"symbols": ["AAPL"]}},
+                    "thoughtSignature": "stream-sig-xyz"
+                }],
+                "role": "model"
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
+    });
+    let result = p
+        .transform_stream_chunk(
+            "gemini-3-flash-preview",
+            &serde_json::to_string(&chunk).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc["function"]["name"], "get_quote");
+    assert_eq!(tc["thought_signature"], "stream-sig-xyz");
+}
