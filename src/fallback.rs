@@ -1,7 +1,7 @@
-use crate::client::ShimClient;
 use crate::error::{Result, ShimError};
 use crate::log::{LogEntry, Logger, RequestTimer};
 use crate::router::Router;
+use crate::SHARED_CLIENT;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -75,7 +75,7 @@ pub async fn completion_with_fallback(
     };
 
     let mut errors: Vec<String> = Vec::new();
-    let client = ShimClient::new();
+    let client = &*SHARED_CLIENT;
 
     for model_str in &models {
         // Build request with this model

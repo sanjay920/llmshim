@@ -349,6 +349,10 @@ impl Provider for Anthropic {
         // Anthropic-specific extensions (x-anthropic namespace)
         if let Some(ext) = obj.get("x-anthropic").and_then(|e| e.as_object()) {
             for (k, v) in ext {
+                // Skip control flags that are handled elsewhere (not API body params)
+                if k == "disable_1m_context" {
+                    continue;
+                }
                 body_obj.insert(k.clone(), v.clone());
             }
         }
@@ -440,7 +444,7 @@ impl Provider for Anthropic {
             ("content-type".into(), "application/json".into()),
         ];
 
-        // Add 1M context window beta header by default (can be disabled via x-anthropic)
+        // 1M context beta header — enabled by default, disable via x-anthropic
         let disable_1m = obj
             .get("x-anthropic")
             .and_then(|x| x.get("disable_1m_context"))

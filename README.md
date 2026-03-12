@@ -2,6 +2,28 @@
 
 A blazing fast LLM API translation layer in pure Rust. One interface, every provider.
 
+## Benchmarks
+
+p50 latency over 20 runs. Same prompt, same models, same machine.
+
+| Metric | llmshim | litellm | langchain |
+|---|---|---|---|
+| Anthropic (p50) | **1,234ms** | 1,288ms | 1,363ms |
+| OpenAI (p50) | **648ms** | 1,180ms | 700ms |
+| Streaming TTFT | **1,065ms** | 1,658ms | 1,623ms |
+| Cold start | **1,396ms** | 2,382ms | 1,619ms |
+| Memory (RSS) | **8 MB** | 255 MB | 255 MB |
+
+All three libraries hit the same APIs (Responses API for OpenAI, Messages API for Anthropic). llmshim adds ~2µs of translation overhead per request — the rest is network.
+
+Run it yourself:
+
+```bash
+cargo run --release --example bench        # Rust (llmshim)
+uv run --with litellm --with langchain-anthropic --with langchain-openai \
+  python benchmarks/bench_python.py        # Python (litellm + langchain)
+```
+
 ## What it does
 
 Send requests through llmshim → it translates to whichever provider you choose → translates the response back. Zero infrastructure, zero databases, ~5MB binary.

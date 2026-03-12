@@ -94,12 +94,11 @@ fn request_max_completion_tokens_becomes_max_output_tokens() {
 // ============================================================
 
 #[test]
-fn request_default_reasoning_high_with_summary() {
+fn request_no_reasoning_by_default() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
     let result = p.transform_request("gpt-5.4", &req).unwrap();
-    assert_eq!(result.body["reasoning"]["effort"], "high");
-    assert_eq!(result.body["reasoning"]["summary"], "auto");
+    assert!(result.body.get("reasoning").is_none());
 }
 
 #[test]

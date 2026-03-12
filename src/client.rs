@@ -4,6 +4,7 @@ use bytes::Bytes;
 use futures::Stream;
 use reqwest::Client;
 use std::pin::Pin;
+use std::time::Duration;
 
 pub struct ShimClient {
     http: Client,
@@ -18,7 +19,36 @@ impl Default for ShimClient {
 impl ShimClient {
     pub fn new() -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(4)
+                .tcp_keepalive(Duration::from_secs(30))
+                .tcp_nodelay(true)
+                .build()
+                .expect("failed to build HTTP client"),
+        }
+    }
+
+    /// Pre-establish TCP+TLS connections to provider endpoints.
+    /// Call this after creating the Router to warm the connection pool.
+    pub async fn warmup(&self, urls: &[&str]) {
+        let futs: Vec<_> = urls
+            .iter()
+            .map(|url| {
+                let client = self.http.clone();
+                let url = url.to_string();
+                tokio::spawn(async move {
+                    // HEAD request — cheapest way to establish a connection
+                    let _ = client
+                        .head(&url)
+                        .timeout(Duration::from_secs(5))
+                        .send()
+                        .await;
+                })
+            })
+            .collect();
+        for f in futs {
+            let _ = f.await;
         }
     }
 

@@ -215,7 +215,7 @@ impl Provider for OpenAi {
             body_obj.insert("max_output_tokens".to_string(), v.clone());
         }
 
-        // Build reasoning config
+        // Reasoning config — only when explicitly requested
         let effort = obj
             .get("reasoning_effort")
             .and_then(|e| e.as_str())
@@ -225,17 +225,16 @@ impl Provider for OpenAi {
                     .and_then(|e| e.as_str())
             });
 
-        let mut reasoning = json!({
-            "effort": effort.unwrap_or("high"),
-            "summary": "auto",
-        });
-
-        // If explicit reasoning_effort or effort is "none", disable summary
-        if effort == Some("none") {
-            reasoning["summary"] = json!(null);
+        if let Some(effort) = effort {
+            let mut reasoning = json!({
+                "effort": effort,
+                "summary": "auto",
+            });
+            if effort == "none" {
+                reasoning["summary"] = json!(null);
+            }
+            body_obj.insert("reasoning".to_string(), reasoning);
         }
-
-        body_obj.insert("reasoning".to_string(), reasoning);
 
         // Stream flag
         if let Some(v) = obj.get("stream") {
