@@ -183,6 +183,139 @@ fn gemini_translates_nested_tools() {
     assert_eq!(decls[0]["description"], "Get current weather");
 }
 
+#[test]
+fn gemini_handles_flat_tools() {
+    let p = llmshim::providers::gemini::Gemini::new("k".into());
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": flat_tools(),
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let decls = &result.body["tools"][0]["functionDeclarations"];
+    assert_eq!(decls[0]["name"], "get_weather");
+}
+
+#[test]
+fn gemini_strips_schema_and_defs() {
+    let p = llmshim::providers::gemini::Gemini::new("k".into());
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "analyze_spread",
+                "description": "Analyze a spread",
+                "parameters": {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "properties": {
+                        "underlying": {"type": "string"},
+                        "legs": {
+                            "type": "array",
+                            "items": {"$ref": "#/$defs/SpreadLeg"}
+                        }
+                    },
+                    "required": ["underlying", "legs"],
+                    "$defs": {
+                        "SpreadLeg": {
+                            "type": "object",
+                            "properties": {
+                                "symbol": {"type": "string"},
+                                "side": {"type": "string"},
+                                "quantity": {"type": ["integer", "null"]}
+                            },
+                            "required": ["symbol", "side"]
+                        }
+                    }
+                }
+            }
+        }],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let params = &result.body["tools"][0]["functionDeclarations"][0]["parameters"];
+
+    // $schema stripped
+    assert!(
+        params.get("$schema").is_none(),
+        "$schema should be stripped"
+    );
+    // $defs stripped
+    assert!(params.get("$defs").is_none(), "$defs should be stripped");
+    // $ref resolved: legs.items should be inlined SpreadLeg object
+    let items = &params["properties"]["legs"]["items"];
+    assert_eq!(items["type"], "object");
+    assert_eq!(items["properties"]["symbol"]["type"], "string");
+    // type array converted to single type
+    assert_eq!(items["properties"]["quantity"]["type"], "integer");
+}
+
+#[test]
+fn gemini_converts_nullable_type_arrays() {
+    let p = llmshim::providers::gemini::Gemini::new("k".into());
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": ["integer", "null"]},
+                        "filter": {"type": ["string", "null"]},
+                        "score": {"type": ["number", "null"]}
+                    }
+                }
+            }
+        }],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let props = &result.body["tools"][0]["functionDeclarations"][0]["parameters"]["properties"];
+    assert_eq!(props["query"]["type"], "string");
+    assert_eq!(props["limit"]["type"], "integer");
+    assert_eq!(props["filter"]["type"], "string");
+    assert_eq!(props["score"]["type"], "number");
+}
+
+#[test]
+fn gemini_handles_mcp_style_tools_with_all_issues() {
+    let p = llmshim::providers::gemini::Gemini::new("k".into());
+    // Simulate what schemars generates for an MCP tool with Option fields
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_unusual_activity",
+                "description": "Get unusual market activity",
+                "parameters": {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "properties": {
+                        "watchlist": {"type": ["string", "null"], "description": "Watchlist name"},
+                        "min_iv_rank": {"type": ["number", "null"], "description": "Min IV rank"},
+                        "limit": {"type": ["integer", "null"], "description": "Max results"}
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let params = &result.body["tools"][0]["functionDeclarations"][0]["parameters"];
+    assert!(params.get("$schema").is_none());
+    assert!(params.get("additionalProperties").is_none());
+    assert_eq!(params["properties"]["watchlist"]["type"], "string");
+    assert_eq!(params["properties"]["min_iv_rank"]["type"], "number");
+    assert_eq!(params["properties"]["limit"]["type"], "integer");
+}
+
 // ============================================================
 // Tool call result messages in conversation history
 // ============================================================

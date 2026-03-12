@@ -148,16 +148,115 @@ fn sanitize_parts(parts: &mut Vec<Value>) {
 }
 
 /// Convert OpenAI tools array to Gemini functionDeclarations.
+/// Handles both nested (Chat Completions) and flat (Responses API) tool formats.
+/// Sanitizes JSON Schema for Gemini compatibility.
 fn transform_tools(tools: &[Value]) -> Value {
-    let declarations: Vec<Value> = tools.iter().filter_map(|tool| {
-        let func = tool.get("function")?;
-        Some(json!({
-            "name": func.get("name")?,
-            "description": func.get("description").unwrap_or(&json!("")),
-            "parameters": func.get("parameters").unwrap_or(&json!({"type": "object", "properties": {}})),
-        }))
-    }).collect();
-    json!([{"functionDeclarations": declarations}])
+    let empty = json!("");
+    let default_params = json!({"type": "object", "properties": {}});
+    let declarations: Vec<Value> = tools
+        .iter()
+        .filter_map(|tool| {
+            // Support both nested {"function": {"name": ...}} and flat {"name": ...}
+            let source = tool.get("function").unwrap_or(tool);
+            let name = source.get("name")?;
+            let description = source.get("description").unwrap_or(&empty);
+            let parameters = source.get("parameters").unwrap_or(&default_params).clone();
+            let sanitized = sanitize_schema(parameters);
+            Some(json!({
+                "name": name,
+                "description": description,
+                "parameters": sanitized,
+            }))
+        })
+        .collect();
+    json!([{ "functionDeclarations": declarations }])
+}
+
+/// Sanitize a JSON Schema for Gemini compatibility.
+/// - Resolves `$ref` / `$defs` by inlining referenced definitions
+/// - Strips `$schema` (Gemini doesn't accept it)
+/// - Converts `"type": ["string", "null"]` → `"type": "string"` (Gemini requires single type)
+fn sanitize_schema(mut schema: Value) -> Value {
+    // Extract $defs before recursing so we can resolve $ref
+    let defs = schema
+        .as_object_mut()
+        .and_then(|obj| obj.remove("$defs").or_else(|| obj.remove("definitions")));
+
+    if let Some(defs_val) = &defs {
+        resolve_refs(&mut schema, defs_val);
+    }
+
+    clean_schema_fields(&mut schema);
+    schema
+}
+
+/// Recursively resolve `$ref` pointers by inlining from defs.
+fn resolve_refs(value: &mut Value, defs: &Value) {
+    match value {
+        Value::Object(obj) => {
+            if let Some(ref_val) = obj.remove("$ref") {
+                if let Some(ref_str) = ref_val.as_str() {
+                    // Parse "#/$defs/Foo" or "#/definitions/Foo"
+                    let def_name = ref_str
+                        .strip_prefix("#/$defs/")
+                        .or_else(|| ref_str.strip_prefix("#/definitions/"));
+                    if let Some(name) = def_name {
+                        if let Some(def) = defs.get(name) {
+                            let mut inlined = def.clone();
+                            resolve_refs(&mut inlined, defs);
+                            clean_schema_fields(&mut inlined);
+                            *value = inlined;
+                            return;
+                        }
+                    }
+                }
+            }
+            for v in obj.values_mut() {
+                resolve_refs(v, defs);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                resolve_refs(v, defs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Remove Gemini-incompatible fields and normalize type arrays.
+fn clean_schema_fields(value: &mut Value) {
+    match value {
+        Value::Object(obj) => {
+            obj.remove("$schema");
+            obj.remove("$defs");
+            obj.remove("definitions");
+            obj.remove("$ref"); // stale refs after resolution
+            obj.remove("additionalProperties");
+            obj.remove("default");
+
+            // Convert "type": ["string", "null"] → "type": "string"
+            if let Some(type_val) = obj.get_mut("type") {
+                if let Some(arr) = type_val.as_array().cloned() {
+                    let non_null: Vec<&Value> =
+                        arr.iter().filter(|v| v.as_str() != Some("null")).collect();
+                    if non_null.len() == 1 {
+                        *type_val = non_null[0].clone();
+                    }
+                }
+            }
+
+            for v in obj.values_mut() {
+                clean_schema_fields(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                clean_schema_fields(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Translate OpenAI tool_choice to Gemini toolConfig.
