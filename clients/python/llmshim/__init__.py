@@ -14,4 +14,4 @@ The proxy server starts automatically on first use and stops on exit.
 from llmshim._client import chat, stream, models, health, configure
 
 __all__ = ["chat", "stream", "models", "health", "configure"]
-__version__ = "0.1.3"
+__version__ = "0.1.4"

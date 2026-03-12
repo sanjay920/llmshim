@@ -687,7 +687,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "llmshim"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-stream",
  "axum",
