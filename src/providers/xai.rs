@@ -45,6 +45,40 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// Translate tools from Chat Completions nested format to Responses API flat format.
+/// Chat Completions: {"type": "function", "function": {"name": ..., "parameters": ...}}
+/// Responses API:    {"type": "function", "name": ..., "parameters": ...}
+fn translate_tools(tools: &Value) -> Value {
+    if let Some(arr) = tools.as_array() {
+        let translated: Vec<Value> = arr
+            .iter()
+            .map(|tool| {
+                if let Some(func) = tool.get("function") {
+                    let mut flat = json!({"type": "function"});
+                    if let Some(obj) = func.as_object() {
+                        for (k, v) in obj {
+                            flat[k] = v.clone();
+                        }
+                    }
+                    if let Some(obj) = tool.as_object() {
+                        for (k, v) in obj {
+                            if k != "type" && k != "function" {
+                                flat[k] = v.clone();
+                            }
+                        }
+                    }
+                    flat
+                } else {
+                    tool.clone()
+                }
+            })
+            .collect();
+        json!(translated)
+    } else {
+        tools.clone()
+    }
+}
+
 /// Translate tool_choice from Anthropic format if needed.
 fn translate_tool_choice(tc: &Value) -> Value {
     if let Some(tc_obj) = tc.as_object() {
@@ -96,9 +130,9 @@ impl Provider for Xai {
             body_obj.insert("stream".to_string(), v.clone());
         }
 
-        // Tools
+        // Tools — translate Chat Completions format to Responses API flat format
         if let Some(tools) = obj.get("tools") {
-            body_obj.insert("tools".to_string(), tools.clone());
+            body_obj.insert("tools".to_string(), translate_tools(tools));
         }
 
         // tool_choice

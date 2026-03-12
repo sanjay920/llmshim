@@ -121,6 +121,8 @@ def chat(
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     reasoning_effort: Optional[str] = None,
+    tools: Optional[list[dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
     provider_config: Optional[dict[str, Any]] = None,
     fallback: Optional[list[str]] = None,
 ) -> dict[str, Any]:
@@ -132,6 +134,8 @@ def chat(
         max_tokens: Maximum output tokens
         temperature: Sampling temperature
         reasoning_effort: "low", "medium", or "high"
+        tools: Tool definitions (Chat Completions format — auto-translated per provider)
+        tool_choice: Tool selection ("auto", "required", "none", or specific tool)
         provider_config: Raw provider-specific JSON
         fallback: Ordered list of fallback model IDs
 
@@ -159,8 +163,15 @@ def chat(
     if config:
         body["config"] = config
 
-    if provider_config is not None:
-        body["provider_config"] = provider_config
+    # Tools go in provider_config (the proxy passes them through to the provider)
+    pc = dict(provider_config) if provider_config else {}
+    if tools is not None:
+        pc["tools"] = tools
+    if tool_choice is not None:
+        pc["tool_choice"] = tool_choice
+    if pc:
+        body["provider_config"] = pc
+
     if fallback is not None:
         body["fallback"] = fallback
 
@@ -176,6 +187,8 @@ def stream(
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     reasoning_effort: Optional[str] = None,
+    tools: Optional[list[dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
     provider_config: Optional[dict[str, Any]] = None,
 ) -> Generator[dict[str, Any], None, None]:
     """Stream a chat completion. Yields typed event dicts.
@@ -204,8 +217,13 @@ def stream(
     if config:
         body["config"] = config
 
-    if provider_config is not None:
-        body["provider_config"] = provider_config
+    pc = dict(provider_config) if provider_config else {}
+    if tools is not None:
+        pc["tools"] = tools
+    if tool_choice is not None:
+        pc["tool_choice"] = tool_choice
+    if pc:
+        body["provider_config"] = pc
 
     with httpx.stream(
         "POST",
