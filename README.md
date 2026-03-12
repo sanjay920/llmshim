@@ -40,13 +40,9 @@ Switch providers by changing the model string. Everything else stays the same.
 ## Install
 
 ```bash
-pip install llmshim
-```
-
-Or from source:
-
-```bash
-cargo install --path . --features proxy
+brew install sanjay920/tap/llmshim   # macOS
+pip install llmshim                   # Python (any platform)
+cargo install llmshim --features proxy # from source
 ```
 
 ## Configure

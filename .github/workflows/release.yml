@@ -34,6 +34,112 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --allow-dirty
 
+  # --- Build standalone macOS binaries + GitHub release ---
+  github-release:
+    needs: test
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build arm64
+        run: cargo build --release --features proxy --target aarch64-apple-darwin
+      - name: Build x86_64
+        run: cargo build --release --features proxy --target x86_64-apple-darwin
+      - name: Package tarballs
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            mkdir -p staging
+            cp target/$target/release/llmshim staging/
+            tar -czf llmshim-${target}.tar.gz -C staging llmshim
+            rm -rf staging
+          done
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            llmshim-aarch64-apple-darwin.tar.gz \
+            llmshim-x86_64-apple-darwin.tar.gz
+
+  # --- Update Homebrew tap ---
+  homebrew:
+    needs: github-release
+    runs-on: macos-14
+    steps:
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          BASE_URL="https://github.com/sanjay920/llmshim/releases/download/${GITHUB_REF_NAME}"
+
+          # Download tarballs to compute sha256
+          curl -sL "${BASE_URL}/llmshim-aarch64-apple-darwin.tar.gz" -o /tmp/arm64.tar.gz
+          curl -sL "${BASE_URL}/llmshim-x86_64-apple-darwin.tar.gz" -o /tmp/x86.tar.gz
+          SHA_ARM=$(shasum -a 256 /tmp/arm64.tar.gz | cut -d' ' -f1)
+          SHA_X86=$(shasum -a 256 /tmp/x86.tar.gz | cut -d' ' -f1)
+
+          # Generate formula
+          cat > /tmp/llmshim.rb << 'ENDOFTEMPLATE'
+          class Llmshim < Formula
+            desc "Blazing fast LLM API translation layer — one interface, every provider"
+            homepage "https://github.com/sanjay920/llmshim"
+            license "MIT"
+            version "VERSION_PLACEHOLDER"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "URL_ARM_PLACEHOLDER"
+                sha256 "SHA_ARM_PLACEHOLDER"
+              else
+                url "URL_X86_PLACEHOLDER"
+                sha256 "SHA_X86_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "llmshim"
+            end
+
+            test do
+              assert_predicate bin/"llmshim", :executable?
+            end
+          end
+          ENDOFTEMPLATE
+
+          # Replace placeholders
+          sed -i '' "s|VERSION_PLACEHOLDER|${VERSION}|g" /tmp/llmshim.rb
+          sed -i '' "s|URL_ARM_PLACEHOLDER|${BASE_URL}/llmshim-aarch64-apple-darwin.tar.gz|g" /tmp/llmshim.rb
+          sed -i '' "s|URL_X86_PLACEHOLDER|${BASE_URL}/llmshim-x86_64-apple-darwin.tar.gz|g" /tmp/llmshim.rb
+          sed -i '' "s|SHA_ARM_PLACEHOLDER|${SHA_ARM}|g" /tmp/llmshim.rb
+          sed -i '' "s|SHA_X86_PLACEHOLDER|${SHA_X86}|g" /tmp/llmshim.rb
+
+          # Remove leading whitespace from heredoc
+          sed -i '' 's/^          //' /tmp/llmshim.rb
+
+          # Get existing file SHA (if updating)
+          EXISTING_SHA=$(gh api repos/sanjay920/homebrew-tap/contents/Formula/llmshim.rb --jq .sha 2>/dev/null || echo "")
+
+          # Push to homebrew-tap repo
+          if [ -n "$EXISTING_SHA" ]; then
+            gh api repos/sanjay920/homebrew-tap/contents/Formula/llmshim.rb \
+              --method PUT \
+              --field message="Update llmshim to ${VERSION}" \
+              --field content="$(base64 -i /tmp/llmshim.rb)" \
+              --field sha="${EXISTING_SHA}"
+          else
+            gh api repos/sanjay920/homebrew-tap/contents/Formula/llmshim.rb \
+              --method PUT \
+              --field message="Add llmshim ${VERSION}" \
+              --field content="$(base64 -i /tmp/llmshim.rb)"
+          fi
+
   # --- Build PyPI source distribution ---
   sdist:
     needs: test
