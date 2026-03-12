@@ -151,6 +151,17 @@ def ensure_server() -> str:
         except Exception:
             pass
         _stop_server()
+
+        # Detect common errors and give helpful messages
+        if "No API keys found" in stderr_output:
+            raise RuntimeError(
+                "No API keys configured. Set them with:\n\n"
+                "  import llmshim\n"
+                "  llmshim.configure(anthropic='sk-ant-...', openai='sk-...')\n\n"
+                "Or from the command line:\n"
+                "  llmshim configure"
+            )
+
         raise RuntimeError(
             f"llmshim proxy failed to start on port {port}.\n"
             f"Binary: {binary}\n"
