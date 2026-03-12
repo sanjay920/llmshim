@@ -203,10 +203,12 @@ impl Provider for OpenAi {
 
         let clean_messages = sanitize_messages(messages);
 
-        // Build Responses API request
+        // Build Responses API request — store defaults to false (OpenAI defaults to true)
+        let store = obj.get("store").cloned().unwrap_or(json!(false));
         let mut body = json!({
             "model": model,
             "input": clean_messages,
+            "store": store,
         });
         let body_obj = body.as_object_mut().unwrap();
 
