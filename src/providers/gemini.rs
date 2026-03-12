@@ -28,6 +28,9 @@ impl Gemini {
 fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
+    // Track tool_call_id → function name from assistant messages.
+    let mut call_id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for msg in messages {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
@@ -38,6 +41,19 @@ fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
                 }
             }
             "assistant" => {
+                // Record tool_call_id → name mapping for subsequent tool results.
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tool_calls {
+                        if let (Some(id), Some(name)) = (
+                            tc.get("id").and_then(|v| v.as_str()),
+                            tc.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str()),
+                        ) {
+                            call_id_to_name.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                }
                 // Gemini uses "model" role for assistant
                 let mut parts = build_parts(msg);
                 sanitize_parts(&mut parts);
@@ -48,14 +64,25 @@ fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
             }
             "tool" => {
                 // OpenAI tool result → Gemini functionResponse
+                let call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let name = msg
                     .get("name")
-                    .or_else(|| msg.get("tool_call_id"))
                     .and_then(|n| n.as_str())
-                    .unwrap_or("function");
+                    .map(|s| s.to_string())
+                    .or_else(|| call_id_to_name.get(call_id).cloned())
+                    .unwrap_or_else(|| "function".to_string());
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                let response: Value =
+                // Gemini requires response to be an object, never an array or primitive.
+                let parsed: Value =
                     serde_json::from_str(content).unwrap_or_else(|_| json!({"result": content}));
+                let response = if parsed.is_object() {
+                    parsed
+                } else {
+                    json!({"result": parsed})
+                };
                 contents.push(json!({
                     "role": "user",
                     "parts": [{"functionResponse": {"name": name, "response": response}}]

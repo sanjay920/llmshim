@@ -299,13 +299,69 @@ fn request_tool_calls_in_history() {
         "Paris"
     );
 
-    // Tool result should be functionResponse
+    // Tool result should be functionResponse with resolved function name
     assert_eq!(contents[2]["role"], "user");
     assert!(contents[2]["parts"][0].get("functionResponse").is_some());
     assert_eq!(
         contents[2]["parts"][0]["functionResponse"]["name"],
-        "call_1"
+        "get_weather"
     );
+    // JSON object response passed through directly
+    assert_eq!(
+        contents[2]["parts"][0]["functionResponse"]["response"]["temp"],
+        22
+    );
+}
+
+#[test]
+fn request_tool_result_array_wrapped_as_object() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "data?"},
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "list_items", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "[\"a\", \"b\", \"c\"]"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+    let fr = &contents[2]["parts"][0]["functionResponse"];
+    assert_eq!(fr["name"], "list_items");
+    // Array should be wrapped in {"result": [...]}
+    assert!(fr["response"]["result"].is_array());
+    assert_eq!(fr["response"]["result"][0], "a");
+}
+
+#[test]
+fn request_tool_result_plain_string_wrapped() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "echo", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "hello world"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let fr = &result.body["contents"].as_array().unwrap()[2]["parts"][0]["functionResponse"];
+    assert_eq!(fr["name"], "echo");
+    assert_eq!(fr["response"]["result"], "hello world");
 }
 
 // ============================================================
