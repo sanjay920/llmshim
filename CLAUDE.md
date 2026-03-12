@@ -105,10 +105,4 @@ Config: `LLMSHIM_HOST` (default `0.0.0.0`), `LLMSHIM_PORT` (default `3000`)
 
 ## Detailed reference
 
-Scoped rules in `.claude/rules/` load automatically when working in relevant files:
-- `provider-api-formats.md` — exact API formats for each provider and the proxy
-- `testing.md` — test conventions, model IDs, gotchas
-- `adding-a-provider.md` — full checklist for adding a new provider (all files that need changes)
-- `env-and-config.md` — .env loading, API keys, binary targets, proxy config
-- `before-pushing.md` — required checks before every `git push`
-- `keep-docs-current.md` — enforces doc updates when project behavior changes
+Scoped rules in `.claude/rules/` load automatically when working in relevant files.
