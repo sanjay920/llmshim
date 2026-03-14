@@ -16,6 +16,12 @@ const MODELS: &[(&str, &str)] = &[
         "gemini/gemini-3.1-flash-lite-preview",
         "Gemini 3.1 Flash Lite",
     ),
+    (
+        "xai/grok-4.20-multi-agent-beta-0309",
+        "Grok 4.20 Multi-Agent",
+    ),
+    ("xai/grok-4.20-beta-0309-reasoning", "Grok 4.20 Reasoning"),
+    ("xai/grok-4.20-beta-0309-non-reasoning", "Grok 4.20"),
     ("xai/grok-4-1-fast-reasoning", "Grok 4.1 Fast Reasoning"),
     ("xai/grok-4-1-fast-non-reasoning", "Grok 4.1 Fast"),
 ];

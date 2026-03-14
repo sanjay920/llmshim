@@ -50,6 +50,24 @@ pub const MODELS: &[ModelInfo] = &[
         label: "Gemini 3.1 Flash Lite",
     },
     ModelInfo {
+        id: "xai/grok-4.20-multi-agent-beta-0309",
+        provider: "xai",
+        name: "grok-4.20-multi-agent-beta-0309",
+        label: "Grok 4.20 Multi-Agent",
+    },
+    ModelInfo {
+        id: "xai/grok-4.20-beta-0309-reasoning",
+        provider: "xai",
+        name: "grok-4.20-beta-0309-reasoning",
+        label: "Grok 4.20 Reasoning",
+    },
+    ModelInfo {
+        id: "xai/grok-4.20-beta-0309-non-reasoning",
+        provider: "xai",
+        name: "grok-4.20-beta-0309-non-reasoning",
+        label: "Grok 4.20",
+    },
+    ModelInfo {
         id: "xai/grok-4-1-fast-reasoning",
         provider: "xai",
         name: "grok-4-1-fast-reasoning",

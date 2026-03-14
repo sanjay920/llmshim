@@ -153,4 +153,4 @@ No Docker, no background services, no manual server management.
 | OpenAI | `gpt-5.4` |
 | Anthropic | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` |
 | Gemini | `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview` |
-| xAI | `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning` |
+| xAI | `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`, `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning` |

@@ -11,7 +11,7 @@ fn models_registry_has_all_providers() {
 
 #[test]
 fn models_registry_has_expected_count() {
-    assert_eq!(MODELS.len(), 9);
+    assert_eq!(MODELS.len(), 12);
 }
 
 #[test]
