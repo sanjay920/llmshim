@@ -52,23 +52,54 @@ impl ShimClient {
         }
     }
 
-    pub async fn send(&self, req: &ProviderRequest) -> Result<reqwest::Response> {
-        let mut builder = self.http.post(&req.url);
-        for (k, v) in &req.headers {
-            builder = builder.header(k, v);
-        }
-        builder = builder.json(&req.body);
+    const MAX_RETRIES: u32 = 3;
+    const RETRYABLE_STATUSES: &'static [u16] = &[429, 500, 502, 503, 504, 529];
 
-        let resp = builder.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ShimError::ProviderError {
-                status: status.as_u16(),
-                body,
-            });
+    pub async fn send(&self, req: &ProviderRequest) -> Result<reqwest::Response> {
+        let mut backoff = Duration::from_secs(1);
+
+        for attempt in 0..=Self::MAX_RETRIES {
+            let mut builder = self.http.post(&req.url);
+            for (k, v) in &req.headers {
+                builder = builder.header(k, v);
+            }
+            builder = builder.json(&req.body);
+
+            match builder.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return Ok(resp);
+                    }
+                    let status_code = status.as_u16();
+                    if Self::RETRYABLE_STATUSES.contains(&status_code)
+                        && attempt < Self::MAX_RETRIES
+                    {
+                        // Consume body before retrying (can't reuse response)
+                        let _ = resp.text().await;
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                        continue;
+                    }
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ShimError::ProviderError {
+                        status: status_code,
+                        body,
+                    });
+                }
+                Err(e) if Self::is_retryable_transport(&e) && attempt < Self::MAX_RETRIES => {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    continue;
+                }
+                Err(e) => return Err(ShimError::Http(e)),
+            }
         }
-        Ok(resp)
+        unreachable!()
+    }
+
+    fn is_retryable_transport(err: &reqwest::Error) -> bool {
+        err.is_connect() || err.is_timeout() || err.is_request()
     }
 
     pub async fn completion(
