@@ -107,7 +107,82 @@ fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
         }))
     };
 
+    // Post-process: enforce Gemini's strict turn ordering requirements.
+    let contents = enforce_gemini_turn_order(contents);
+
     (system_instruction, contents)
+}
+
+/// Gemini requires:
+/// 1. Strict alternation between "user" and "model" roles (no consecutive same-role turns)
+/// 2. A model turn with functionCall parts must be immediately followed by a user turn
+///    with functionResponse parts
+///
+/// This function merges consecutive same-role turns and strips orphaned functionCall parts
+/// that have no matching functionResponse.
+fn enforce_gemini_turn_order(contents: Vec<Value>) -> Vec<Value> {
+    if contents.is_empty() {
+        return contents;
+    }
+
+    // Step 1: Merge consecutive same-role turns
+    let mut merged: Vec<Value> = Vec::new();
+    for turn in contents {
+        let role = turn.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let last_role = merged
+            .last()
+            .and_then(|t| t.get("role"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+
+        if role == last_role {
+            // Merge parts into the previous turn
+            if let Some(new_parts) = turn.get("parts").and_then(|p| p.as_array()) {
+                if let Some(last) = merged.last_mut() {
+                    if let Some(existing) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                        existing.extend(new_parts.clone());
+                    }
+                }
+            }
+        } else {
+            merged.push(turn);
+        }
+    }
+
+    // Step 2: Ensure every model turn with functionCall is followed by a user turn with
+    // functionResponse. If not, strip the functionCall parts from that model turn.
+    for i in 0..merged.len() {
+        let has_function_call = merged[i]
+            .get("parts")
+            .and_then(|p| p.as_array())
+            .map(|parts| parts.iter().any(|p| p.get("functionCall").is_some()))
+            .unwrap_or(false);
+
+        if !has_function_call {
+            continue;
+        }
+
+        let next_has_response = merged.get(i + 1).map_or(false, |next| {
+            next.get("parts")
+                .and_then(|p| p.as_array())
+                .map(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
+                .unwrap_or(false)
+        });
+
+        if !next_has_response {
+            // Strip functionCall parts from this model turn
+            if let Some(parts) = merged[i].get_mut("parts").and_then(|p| p.as_array_mut()) {
+                parts.retain(|p| {
+                    p.get("functionCall").is_none() && p.get("thoughtSignature").is_none()
+                });
+                if parts.is_empty() {
+                    parts.push(json!({"text": ""}));
+                }
+            }
+        }
+    }
+
+    merged
 }
 
 /// Build parts array from an OpenAI message.

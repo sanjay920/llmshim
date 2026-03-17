@@ -820,3 +820,117 @@ fn stream_preserves_thought_signature_on_tool_calls() {
     assert_eq!(tc["function"]["name"], "get_quote");
     assert_eq!(tc["thought_signature"], "stream-sig-xyz");
 }
+
+// ============================================================
+// Session history: turn ordering enforcement
+// ============================================================
+
+#[test]
+fn session_history_orphaned_tool_calls_stripped() {
+    // Simulate session history where assistant made tool calls but the session
+    // was cut short — no tool results followed. Gemini should not see the functionCall.
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Check the news"},
+            {
+                "role": "assistant",
+                "content": "Let me check.",
+                "tool_calls": [{
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {"name": "get_news", "arguments": "{}"}
+                }]
+            },
+            // No tool result — session was interrupted
+            // New run starts with a new user message
+            {"role": "user", "content": "Check the news again"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // The model turn should NOT have functionCall parts (orphaned)
+    for turn in contents {
+        if turn["role"] == "model" {
+            let parts = turn["parts"].as_array().unwrap();
+            for part in parts {
+                assert!(
+                    part.get("functionCall").is_none(),
+                    "Orphaned functionCall should be stripped"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn session_history_valid_tool_roundtrip_preserved() {
+    // Valid history: assistant tool call followed by tool result
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Get a quote"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "name": "get_quote", "content": "{\"price\":150}"},
+            {"role": "assistant", "content": "AAPL is at $150."},
+            {"role": "user", "content": "Thanks"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // The model turn with functionCall should be preserved (followed by functionResponse)
+    let model_with_fc = contents.iter().any(|t| {
+        t["role"] == "model"
+            && t["parts"]
+                .as_array()
+                .map(|p| p.iter().any(|part| part.get("functionCall").is_some()))
+                .unwrap_or(false)
+    });
+    assert!(model_with_fc, "Valid functionCall should be preserved");
+
+    // And there should be a functionResponse
+    let has_fr = contents.iter().any(|t| {
+        t["parts"]
+            .as_array()
+            .map(|p| p.iter().any(|part| part.get("functionResponse").is_some()))
+            .unwrap_or(false)
+    });
+    assert!(has_fr, "functionResponse should be present");
+}
+
+#[test]
+fn session_history_consecutive_roles_merged() {
+    // If session has two consecutive user messages, they should be merged
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "First message"},
+            {"role": "user", "content": "Second message"},
+            {"role": "assistant", "content": "Reply"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // Should have exactly 2 turns: user (merged) + model
+    assert_eq!(contents.len(), 2, "Consecutive user turns should be merged");
+    assert_eq!(contents[0]["role"], "user");
+    assert_eq!(contents[1]["role"], "model");
+
+    // Merged user turn should have 2 text parts
+    let user_parts = contents[0]["parts"].as_array().unwrap();
+    assert_eq!(user_parts.len(), 2);
+}
