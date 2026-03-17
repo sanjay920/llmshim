@@ -162,7 +162,7 @@ fn enforce_gemini_turn_order(contents: Vec<Value>) -> Vec<Value> {
             continue;
         }
 
-        let next_has_response = merged.get(i + 1).map_or(false, |next| {
+        let next_has_response = merged.get(i + 1).is_some_and(|next| {
             next.get("parts")
                 .and_then(|p| p.as_array())
                 .map(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
