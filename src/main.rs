@@ -7,6 +7,8 @@ use std::io::{self, Write};
 
 const MODELS: &[(&str, &str)] = &[
     ("openai/gpt-5.4", "GPT-5.4"),
+    ("openai/gpt-5.4-mini", "GPT-5.4 Mini"),
+    ("openai/gpt-5.4-nano", "GPT-5.4 Nano"),
     ("anthropic/claude-opus-4-6", "Claude Opus 4.6"),
     ("anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6"),
     ("anthropic/claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
