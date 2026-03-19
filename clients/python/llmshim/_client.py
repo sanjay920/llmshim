@@ -190,6 +190,7 @@ def stream(
     tools: Optional[list[dict[str, Any]]] = None,
     tool_choice: Optional[Any] = None,
     provider_config: Optional[dict[str, Any]] = None,
+    fallback: Optional[list[str]] = None,
 ) -> Generator[dict[str, Any], None, None]:
     """Stream a chat completion. Yields typed event dicts.
 
@@ -224,6 +225,9 @@ def stream(
         pc["tool_choice"] = tool_choice
     if pc:
         body["provider_config"] = pc
+
+    if fallback is not None:
+        body["fallback"] = fallback
 
     with httpx.stream(
         "POST",

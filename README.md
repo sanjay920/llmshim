@@ -235,6 +235,6 @@ llmshim::completion(router, request)
 ```bash
 cargo build                                    # dev build
 cargo build --release --features proxy         # release build
-cargo test --features proxy --tests            # unit tests (~380)
+cargo test --features proxy --tests            # unit tests (~326)
 cargo test --features proxy -- --ignored       # integration tests (needs API keys)
 ```

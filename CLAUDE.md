@@ -22,7 +22,7 @@ This is a public crate. Do NOT make breaking changes to `pub` items in `src/lib.
 ```bash
 cargo build                                          # dev build
 cargo build --release                                # release build (~3.7MB binary)
-cargo test --tests                                   # unit tests (~288)
+cargo test --tests                                   # unit tests (~326)
 cargo test -- --ignored                              # integration tests (needs API keys)
 cargo test --features proxy --tests                  # unit tests including proxy
 cargo test --features proxy -- --ignored             # all integration tests including proxy
@@ -56,9 +56,9 @@ Every provider implements: `transform_request`, `transform_response`, `transform
 
 Parses `"provider/model"` strings. Auto-infers provider from prefix (`gpt*`/`o*` → openai, `claude*` → anthropic, `gemini*` → gemini, `grok*` → xai). Supports aliases. `Router::from_env()` reads API key env vars.
 
-### Streaming (`src/client.rs`)
+### HTTP Client (`src/client.rs`)
 
-`SseStream` buffers bytes, extracts `data:` lines, routes through provider's `transform_stream_chunk`. Returns `None` to skip non-content events.
+`ShimClient` with shared connection pool (`LazyLock`), HTTP/2, gzip/brotli/zstd compression, TCP keepalive + nodelay. Automatic retry (3 attempts, exponential backoff) on transport errors and 429/500/502/503/504/529 status codes. `warmup()` pre-establishes TCP+TLS connections. `SseStream` buffers bytes, extracts `data:` lines, routes through provider's `transform_stream_chunk`.
 
 ### Fallback chains (`src/fallback.rs`)
 

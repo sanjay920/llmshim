@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: llmshim API
-  version: 0.1.0
+  version: 0.1.15
   description: |
     Multi-provider LLM API proxy. Send requests in a single format,
     llmshim translates to the native API of whichever provider you choose.
