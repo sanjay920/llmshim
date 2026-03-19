@@ -135,18 +135,110 @@ fn enforce_gemini_turn_order(contents: Vec<Value>) -> Vec<Value> {
         return contents;
     }
 
-    // Step 1: Merge consecutive same-role turns
+    // Initial merge of consecutive same-role turns
+    let mut merged = merge_same_role(contents);
+
+    // Iteratively fix violations until stable — each pass may create new ones
+    for _ in 0..20 {
+        let mut changed = false;
+
+        // Strip functionCalls without valid context (no preceding user, or no following response)
+        for i in 0..merged.len() {
+            let has_fc = merged[i]
+                .get("parts")
+                .and_then(|p| p.as_array())
+                .map(|parts| parts.iter().any(|p| p.get("functionCall").is_some()))
+                .unwrap_or(false);
+            if !has_fc {
+                continue;
+            }
+
+            let prev_ok =
+                i > 0 && merged[i - 1].get("role").and_then(|r| r.as_str()) == Some("user");
+            let next_ok = merged.get(i + 1).is_some_and(|next| {
+                next.get("parts")
+                    .and_then(|p| p.as_array())
+                    .map(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
+                    .unwrap_or(false)
+            });
+
+            if !prev_ok || !next_ok {
+                strip_function_calls(&mut merged[i]);
+                changed = true;
+            }
+        }
+
+        // Remove functionResponse turns without preceding functionCall
+        let before = merged.len();
+        let mut i = 0;
+        while i < merged.len() {
+            let has_fr = merged[i]
+                .get("parts")
+                .and_then(|p| p.as_array())
+                .map(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
+                .unwrap_or(false);
+            if has_fr {
+                let prev_fc = i > 0
+                    && merged[i - 1]
+                        .get("parts")
+                        .and_then(|p| p.as_array())
+                        .map(|parts| parts.iter().any(|p| p.get("functionCall").is_some()))
+                        .unwrap_or(false);
+                if !prev_fc {
+                    merged.remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        if merged.len() != before {
+            changed = true;
+        }
+
+        // Remove empty turns
+        let before = merged.len();
+        merged.retain(|turn| {
+            turn.get("parts")
+                .and_then(|p| p.as_array())
+                .map(|parts| {
+                    parts.iter().any(|p| {
+                        p.get("text")
+                            .and_then(|t| t.as_str())
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(true)
+                    })
+                })
+                .unwrap_or(true)
+        });
+        if merged.len() != before {
+            changed = true;
+        }
+
+        // Re-merge consecutive same-role turns
+        let before = merged.len();
+        merged = merge_same_role(merged);
+        if merged.len() != before {
+            changed = true;
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    merged
+}
+
+fn merge_same_role(turns: Vec<Value>) -> Vec<Value> {
     let mut merged: Vec<Value> = Vec::new();
-    for turn in contents {
+    for turn in turns {
         let role = turn.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let last_role = merged
             .last()
             .and_then(|t| t.get("role"))
             .and_then(|r| r.as_str())
             .unwrap_or("");
-
         if role == last_role {
-            // Merge parts into the previous turn
             if let Some(new_parts) = turn.get("parts").and_then(|p| p.as_array()) {
                 if let Some(last) = merged.last_mut() {
                     if let Some(existing) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
@@ -158,88 +250,7 @@ fn enforce_gemini_turn_order(contents: Vec<Value>) -> Vec<Value> {
             merged.push(turn);
         }
     }
-
-    // Step 2: Ensure every model turn with functionCall has proper context:
-    // - Must be preceded by a user turn or a functionResponse turn (not the first turn)
-    // - Must be followed by a user turn with functionResponse
-    // If either condition fails, strip the functionCall parts.
-    for i in 0..merged.len() {
-        let has_function_call = merged[i]
-            .get("parts")
-            .and_then(|p| p.as_array())
-            .map(|parts| parts.iter().any(|p| p.get("functionCall").is_some()))
-            .unwrap_or(false);
-
-        if !has_function_call {
-            continue;
-        }
-
-        let next_has_response = merged.get(i + 1).is_some_and(|next| {
-            next.get("parts")
-                .and_then(|p| p.as_array())
-                .map(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
-                .unwrap_or(false)
-        });
-
-        // Also check: the preceding turn must be user or functionResponse (not another model)
-        let prev_is_valid = if i == 0 {
-            false // Can't start conversation with functionCall
-        } else {
-            let prev_role = merged[i - 1]
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("");
-            prev_role == "user"
-        };
-
-        if !next_has_response || !prev_is_valid {
-            strip_function_calls(&mut merged[i]);
-        }
-    }
-
-    // Step 3: Remove empty model turns (turns that became {"text": ""} after stripping)
-    merged.retain(|turn| {
-        let parts = turn.get("parts").and_then(|p| p.as_array());
-        if let Some(parts) = parts {
-            // Keep if any part has real content
-            parts.iter().any(|p| {
-                if let Some(text) = p.get("text").and_then(|t| t.as_str()) {
-                    !text.is_empty()
-                } else {
-                    // functionCall, functionResponse, inlineData, etc.
-                    true
-                }
-            })
-        } else {
-            true
-        }
-    });
-
-    // Step 4: Final validation — ensure alternating roles after cleanup
-    // If we still have consecutive same-role turns after removal, merge again
-    let mut final_merged: Vec<Value> = Vec::new();
-    for turn in merged {
-        let role = turn.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let last_role = final_merged
-            .last()
-            .and_then(|t| t.get("role"))
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-
-        if role == last_role {
-            if let Some(new_parts) = turn.get("parts").and_then(|p| p.as_array()) {
-                if let Some(last) = final_merged.last_mut() {
-                    if let Some(existing) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
-                        existing.extend(new_parts.clone());
-                    }
-                }
-            }
-        } else {
-            final_merged.push(turn);
-        }
-    }
-
-    final_merged
+    merged
 }
 
 /// Build parts array from an OpenAI message.

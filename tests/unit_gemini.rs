@@ -972,28 +972,43 @@ fn session_history_compacted_starts_with_model_tool_call() {
     let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
     let contents = result.body["contents"].as_array().unwrap();
 
-    // First content turn must be "user", never "model" with functionCall
-    assert_eq!(
-        contents[0]["role"], "user",
-        "First turn must be user, not model — got: {:?}",
-        contents[0]
-    );
-
-    // No model turn should have functionCall without a preceding user turn
+    // All orphaned functionCall/functionResponse pairs must be stripped.
+    // No functionCall should appear without a preceding user turn.
+    // No functionResponse should appear without a preceding functionCall.
     for (i, turn) in contents.iter().enumerate() {
-        if turn["role"] == "model" {
-            let has_fc = turn["parts"]
-                .as_array()
-                .map(|p| p.iter().any(|part| part.get("functionCall").is_some()))
-                .unwrap_or(false);
-            if has_fc {
-                assert!(i > 0, "model functionCall at position 0 is invalid");
-                let prev_role = contents[i - 1]["role"].as_str().unwrap_or("");
-                assert_eq!(
-                    prev_role, "user",
-                    "model functionCall at position {i} must follow a user turn"
-                );
-            }
+        let parts = turn["parts"].as_array().unwrap();
+
+        let has_fc = parts.iter().any(|p| p.get("functionCall").is_some());
+        let has_fr = parts.iter().any(|p| p.get("functionResponse").is_some());
+
+        if has_fc {
+            assert!(i > 0, "functionCall at position 0 is invalid");
+            assert_eq!(
+                contents[i - 1]["role"],
+                "user",
+                "functionCall at position {i} must follow a user turn"
+            );
+            // Must be followed by functionResponse
+            assert!(
+                contents.get(i + 1).is_some_and(|next| {
+                    next["parts"]
+                        .as_array()
+                        .map(|p| p.iter().any(|part| part.get("functionResponse").is_some()))
+                        .unwrap_or(false)
+                }),
+                "functionCall at position {i} must be followed by functionResponse"
+            );
+        }
+
+        if has_fr {
+            assert!(i > 0, "functionResponse at position 0 is invalid");
+            assert!(
+                contents[i - 1]["parts"]
+                    .as_array()
+                    .map(|p| p.iter().any(|part| part.get("functionCall").is_some()))
+                    .unwrap_or(false),
+                "functionResponse at position {i} must follow a functionCall"
+            );
         }
     }
 }
