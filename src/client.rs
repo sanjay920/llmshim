@@ -99,7 +99,9 @@ impl ShimClient {
     }
 
     fn is_retryable_transport(err: &reqwest::Error) -> bool {
-        err.is_connect() || err.is_timeout() || err.is_request()
+        // Retry all transport-level failures: connect, timeout, request build,
+        // body read errors, connection reset, incomplete messages, etc.
+        err.is_connect() || err.is_timeout() || err.is_request() || err.is_body()
     }
 
     pub async fn completion(

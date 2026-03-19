@@ -934,3 +934,97 @@ fn session_history_consecutive_roles_merged() {
     let user_parts = contents[0]["parts"].as_array().unwrap();
     assert_eq!(user_parts.len(), 2);
 }
+
+#[test]
+fn session_history_compacted_starts_with_model_tool_call() {
+    // Reproduces the news-producer bug: session history starts with
+    // assistant(tool_calls) after system message extraction, meaning
+    // the first content turn is model(functionCall) — invalid for Gemini.
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "system", "content": "You are a news agent."},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "read_news_board", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "read_news_board", "content": "{\"items\":[]}"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "get_news", "arguments": "{\"count\":10}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "get_news", "content": "{\"headlines\":[]}"},
+            {"role": "assistant", "content": "No new headlines."},
+            {"role": "user", "content": "Check news again"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // First content turn must be "user", never "model" with functionCall
+    assert_eq!(
+        contents[0]["role"], "user",
+        "First turn must be user, not model — got: {:?}",
+        contents[0]
+    );
+
+    // No model turn should have functionCall without a preceding user turn
+    for (i, turn) in contents.iter().enumerate() {
+        if turn["role"] == "model" {
+            let has_fc = turn["parts"]
+                .as_array()
+                .map(|p| p.iter().any(|part| part.get("functionCall").is_some()))
+                .unwrap_or(false);
+            if has_fc {
+                assert!(i > 0, "model functionCall at position 0 is invalid");
+                let prev_role = contents[i - 1]["role"].as_str().unwrap_or("");
+                assert_eq!(
+                    prev_role, "user",
+                    "model functionCall at position {i} must follow a user turn"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn session_history_empty_assistant_turns_removed() {
+    // Empty assistant messages (no content, no tool_calls) should be removed
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "Hello again"},
+            {"role": "assistant", "content": "Hi there"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // The empty assistant turn should be removed, resulting in merged user turns
+    for turn in contents {
+        if turn["role"] == "model" {
+            let parts = turn["parts"].as_array().unwrap();
+            let has_real_content = parts.iter().any(|p| {
+                p.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(true)
+            });
+            assert!(has_real_content, "Empty model turns should be removed");
+        }
+    }
+}

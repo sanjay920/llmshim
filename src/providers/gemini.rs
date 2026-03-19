@@ -120,6 +120,16 @@ fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
 ///
 /// This function merges consecutive same-role turns and strips orphaned functionCall parts
 /// that have no matching functionResponse.
+/// Remove functionCall and thoughtSignature parts from a turn, leaving text parts.
+fn strip_function_calls(turn: &mut Value) {
+    if let Some(parts) = turn.get_mut("parts").and_then(|p| p.as_array_mut()) {
+        parts.retain(|p| p.get("functionCall").is_none() && p.get("thoughtSignature").is_none());
+        if parts.is_empty() {
+            parts.push(json!({"text": ""}));
+        }
+    }
+}
+
 fn enforce_gemini_turn_order(contents: Vec<Value>) -> Vec<Value> {
     if contents.is_empty() {
         return contents;
@@ -149,8 +159,10 @@ fn enforce_gemini_turn_order(contents: Vec<Value>) -> Vec<Value> {
         }
     }
 
-    // Step 2: Ensure every model turn with functionCall is followed by a user turn with
-    // functionResponse. If not, strip the functionCall parts from that model turn.
+    // Step 2: Ensure every model turn with functionCall has proper context:
+    // - Must be preceded by a user turn or a functionResponse turn (not the first turn)
+    // - Must be followed by a user turn with functionResponse
+    // If either condition fails, strip the functionCall parts.
     for i in 0..merged.len() {
         let has_function_call = merged[i]
             .get("parts")
@@ -169,20 +181,65 @@ fn enforce_gemini_turn_order(contents: Vec<Value>) -> Vec<Value> {
                 .unwrap_or(false)
         });
 
-        if !next_has_response {
-            // Strip functionCall parts from this model turn
-            if let Some(parts) = merged[i].get_mut("parts").and_then(|p| p.as_array_mut()) {
-                parts.retain(|p| {
-                    p.get("functionCall").is_none() && p.get("thoughtSignature").is_none()
-                });
-                if parts.is_empty() {
-                    parts.push(json!({"text": ""}));
-                }
-            }
+        // Also check: the preceding turn must be user or functionResponse (not another model)
+        let prev_is_valid = if i == 0 {
+            false // Can't start conversation with functionCall
+        } else {
+            let prev_role = merged[i - 1]
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("");
+            prev_role == "user"
+        };
+
+        if !next_has_response || !prev_is_valid {
+            strip_function_calls(&mut merged[i]);
         }
     }
 
-    merged
+    // Step 3: Remove empty model turns (turns that became {"text": ""} after stripping)
+    merged.retain(|turn| {
+        let parts = turn.get("parts").and_then(|p| p.as_array());
+        if let Some(parts) = parts {
+            // Keep if any part has real content
+            parts.iter().any(|p| {
+                if let Some(text) = p.get("text").and_then(|t| t.as_str()) {
+                    !text.is_empty()
+                } else {
+                    // functionCall, functionResponse, inlineData, etc.
+                    true
+                }
+            })
+        } else {
+            true
+        }
+    });
+
+    // Step 4: Final validation — ensure alternating roles after cleanup
+    // If we still have consecutive same-role turns after removal, merge again
+    let mut final_merged: Vec<Value> = Vec::new();
+    for turn in merged {
+        let role = turn.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let last_role = final_merged
+            .last()
+            .and_then(|t| t.get("role"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+
+        if role == last_role {
+            if let Some(new_parts) = turn.get("parts").and_then(|p| p.as_array()) {
+                if let Some(last) = final_merged.last_mut() {
+                    if let Some(existing) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                        existing.extend(new_parts.clone());
+                    }
+                }
+            }
+        } else {
+            final_merged.push(turn);
+        }
+    }
+
+    final_merged
 }
 
 /// Build parts array from an OpenAI message.
