@@ -279,7 +279,8 @@ fn request_tool_calls_in_history() {
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                    "thought_signature": "test-sig"
                 }]
             },
             {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 22}"},
@@ -325,7 +326,8 @@ fn request_tool_result_array_wrapped_as_object() {
                 "tool_calls": [{
                     "id": "call_0",
                     "type": "function",
-                    "function": {"name": "list_items", "arguments": "{}"}
+                    "function": {"name": "list_items", "arguments": "{}"},
+                    "thought_signature": "test-sig"
                 }]
             },
             {"role": "tool", "tool_call_id": "call_0", "content": "[\"a\", \"b\", \"c\"]"},
@@ -352,7 +354,8 @@ fn request_tool_result_plain_string_wrapped() {
                 "tool_calls": [{
                     "id": "call_0",
                     "type": "function",
-                    "function": {"name": "echo", "arguments": "{}"}
+                    "function": {"name": "echo", "arguments": "{}"},
+                    "thought_signature": "test-sig"
                 }]
             },
             {"role": "tool", "tool_call_id": "call_0", "content": "hello world"},
@@ -764,7 +767,8 @@ fn request_echoes_thought_signature_in_function_call_parts() {
 }
 
 #[test]
-fn request_works_without_thought_signature() {
+fn request_without_thought_signature_strips_function_calls() {
+    // functionCall without thought_signature should be stripped by enforce_gemini_turn_order
     let p = provider();
     let req = json!({
         "model": "gemini-3-flash-preview",
@@ -784,12 +788,21 @@ fn request_works_without_thought_signature() {
     });
     let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
     let contents = result.body["contents"].as_array().unwrap();
-    let model_parts = contents[1]["parts"].as_array().unwrap();
-    let fc_part = model_parts
-        .iter()
-        .find(|p| p.get("functionCall").is_some())
-        .unwrap();
-    assert!(fc_part.get("thoughtSignature").is_none());
+    // The functionCall+functionResponse pair should be stripped (missing thought_signature)
+    // Only the user turn should remain
+    for turn in contents {
+        let parts = turn["parts"].as_array().unwrap();
+        for part in parts {
+            assert!(
+                part.get("functionCall").is_none(),
+                "functionCall without thought_signature should be stripped"
+            );
+            assert!(
+                part.get("functionResponse").is_none(),
+                "orphaned functionResponse should be stripped"
+            );
+        }
+    }
 }
 
 #[test]
@@ -867,7 +880,7 @@ fn session_history_orphaned_tool_calls_stripped() {
 
 #[test]
 fn session_history_valid_tool_roundtrip_preserved() {
-    // Valid history: assistant tool call followed by tool result
+    // Valid history: assistant tool call with thought_signature followed by tool result
     let p = provider();
     let req = json!({
         "model": "gemini-3-flash-preview",
@@ -879,7 +892,8 @@ fn session_history_valid_tool_roundtrip_preserved() {
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
-                    "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"}
+                    "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"},
+                    "thought_signature": "valid-sig"
                 }]
             },
             {"role": "tool", "tool_call_id": "call_1", "name": "get_quote", "content": "{\"price\":150}"},

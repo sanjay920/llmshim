@@ -142,7 +142,10 @@ fn enforce_gemini_turn_order(contents: Vec<Value>) -> Vec<Value> {
     for _ in 0..20 {
         let mut changed = false;
 
-        // Strip functionCalls without valid context (no preceding user, or no following response)
+        // Strip functionCalls that are invalid:
+        // - No preceding user turn
+        // - No following functionResponse turn
+        // - Missing thoughtSignature (required by Gemini for tool roundtrips)
         for i in 0..merged.len() {
             let has_fc = merged[i]
                 .get("parts")
@@ -162,7 +165,18 @@ fn enforce_gemini_turn_order(contents: Vec<Value>) -> Vec<Value> {
                     .unwrap_or(false)
             });
 
-            if !prev_ok || !next_ok {
+            // Check if any functionCall part is missing thoughtSignature
+            let missing_sig = merged[i]
+                .get("parts")
+                .and_then(|p| p.as_array())
+                .map(|parts| {
+                    parts.iter().any(|p| {
+                        p.get("functionCall").is_some() && p.get("thoughtSignature").is_none()
+                    })
+                })
+                .unwrap_or(false);
+
+            if !prev_ok || !next_ok || missing_sig {
                 strip_function_calls(&mut merged[i]);
                 changed = true;
             }
