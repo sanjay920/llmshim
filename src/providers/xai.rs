@@ -379,6 +379,65 @@ impl Provider for Xai {
                 Ok(Some(serde_json::to_string(&chunk)?))
             }
 
+            // Function call output item added — emit tool_calls start chunk
+            "response.output_item.added" => {
+                let empty = json!({});
+                let item = parsed.get("item").unwrap_or(&empty);
+                if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
+                    return Ok(None);
+                }
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let index = parsed
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let chunk = json!({
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": ""},
+                            }]
+                        },
+                        "finish_reason": null,
+                    }]
+                });
+                Ok(Some(serde_json::to_string(&chunk)?))
+            }
+
+            // Function call argument deltas
+            "response.function_call_arguments.delta" => {
+                let delta = parsed.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+                if delta.is_empty() {
+                    return Ok(None);
+                }
+                let index = parsed
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let chunk = json!({
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "function": {"arguments": delta},
+                            }]
+                        },
+                        "finish_reason": null,
+                    }]
+                });
+                Ok(Some(serde_json::to_string(&chunk)?))
+            }
+
             // Response completed
             "response.completed" => {
                 let resp = &parsed["response"];

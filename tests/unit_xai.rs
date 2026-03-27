@@ -410,17 +410,115 @@ fn stream_response_completed() {
 #[test]
 fn stream_other_events_skipped() {
     let p = provider();
-    for event_type in &[
-        "response.created",
-        "response.in_progress",
-        "response.output_item.added",
-    ] {
+    for event_type in &["response.created", "response.in_progress"] {
         let chunk = json!({"type": event_type});
         let result = p
             .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
             .unwrap();
         assert!(result.is_none(), "{} should be skipped", event_type);
     }
+}
+
+#[test]
+fn stream_output_item_added_non_function_call_skipped() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.output_item.added",
+        "item": {"type": "message"},
+        "output_index": 0,
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap();
+    assert!(result.is_none(), "non-function_call output_item.added should be skipped");
+}
+
+#[test]
+fn stream_output_item_added_function_call() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call",
+            "call_id": "call_abc",
+            "name": "get_quote",
+            "arguments": "",
+        },
+        "output_index": 0,
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc["id"], "call_abc");
+    assert_eq!(tc["function"]["name"], "get_quote");
+    assert_eq!(tc["index"], 0);
+}
+
+#[test]
+fn stream_function_call_arguments_delta() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.function_call_arguments.delta",
+        "delta": "{\"symbols\":[\"AAPL\"]}",
+        "output_index": 0,
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc["function"]["arguments"], "{\"symbols\":[\"AAPL\"]}");
+    assert_eq!(tc["index"], 0);
+}
+
+#[test]
+fn stream_function_call_arguments_delta_empty_skipped() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.function_call_arguments.delta",
+        "delta": "",
+        "output_index": 0,
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap();
+    assert!(result.is_none(), "empty arguments delta should be skipped");
+}
+
+#[test]
+fn stream_function_call_multiple_tools_indices() {
+    let p = provider();
+    // First tool at index 0
+    let chunk0 = json!({
+        "type": "response.output_item.added",
+        "item": {"type": "function_call", "call_id": "call_1", "name": "get_quote", "arguments": ""},
+        "output_index": 0,
+    });
+    let result0 = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk0).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed0: Value = serde_json::from_str(&result0).unwrap();
+    assert_eq!(parsed0["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+
+    // Second tool at index 1
+    let chunk1 = json!({
+        "type": "response.output_item.added",
+        "item": {"type": "function_call", "call_id": "call_2", "name": "get_technicals", "arguments": ""},
+        "output_index": 1,
+    });
+    let result1 = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk1).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed1: Value = serde_json::from_str(&result1).unwrap();
+    assert_eq!(parsed1["choices"][0]["delta"]["tool_calls"][0]["index"], 1);
+    assert_eq!(parsed1["choices"][0]["delta"]["tool_calls"][0]["id"], "call_2");
+    assert_eq!(parsed1["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "get_technicals");
 }
 
 #[test]
