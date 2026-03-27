@@ -430,7 +430,10 @@ fn stream_output_item_added_non_function_call_skipped() {
     let result = p
         .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
         .unwrap();
-    assert!(result.is_none(), "non-function_call output_item.added should be skipped");
+    assert!(
+        result.is_none(),
+        "non-function_call output_item.added should be skipped"
+    );
 }
 
 #[test]
@@ -517,8 +520,14 @@ fn stream_function_call_multiple_tools_indices() {
         .unwrap();
     let parsed1: Value = serde_json::from_str(&result1).unwrap();
     assert_eq!(parsed1["choices"][0]["delta"]["tool_calls"][0]["index"], 1);
-    assert_eq!(parsed1["choices"][0]["delta"]["tool_calls"][0]["id"], "call_2");
-    assert_eq!(parsed1["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "get_technicals");
+    assert_eq!(
+        parsed1["choices"][0]["delta"]["tool_calls"][0]["id"],
+        "call_2"
+    );
+    assert_eq!(
+        parsed1["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+        "get_technicals"
+    );
 }
 
 #[test]
