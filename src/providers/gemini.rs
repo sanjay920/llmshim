@@ -507,15 +507,23 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
             }
         }
         if let Some(fc) = part.get("functionCall") {
-            let id = format!("call_{}", tool_calls.len());
+            let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let id = fc.get("id").and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
+            let args_str = fc.get("args")
+                .filter(|a| !a.is_null())
+                .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string()))
+                .unwrap_or_else(|| "{}".to_string());
             let mut tc = json!({
                 "id": id,
                 "type": "function",
                 "function": {
-                    "name": fc.get("name").cloned().unwrap_or(json!("")),
-                    "arguments": fc.get("args")
-                        .map(|a| serde_json::to_string(a).unwrap_or_default())
-                        .unwrap_or_default(),
+                    "name": name,
+                    "arguments": args_str,
                 }
             });
             // Preserve thought_signature — Gemini requires it echoed back in follow-up requests
@@ -761,17 +769,27 @@ impl Provider for Gemini {
                 }
             }
             if let Some(fc) = part.get("functionCall") {
+                // Skip functionCall parts that have no name — these are incomplete
+                // chunks from Gemini streaming that will be followed by a complete one
+                let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
                 has_function_call = true;
-                let id = format!("call_{}", tool_calls.len());
+                let id = fc.get("id").and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
+                let args_str = fc.get("args")
+                    .filter(|a| !a.is_null())
+                    .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string()))
+                    .unwrap_or_else(|| "{}".to_string());
                 let mut tc = json!({
                     "index": tool_calls.len(),
                     "id": id,
                     "type": "function",
                     "function": {
-                        "name": fc.get("name").cloned().unwrap_or(json!("")),
-                        "arguments": fc.get("args")
-                            .map(|a| serde_json::to_string(a).unwrap_or_default())
-                            .unwrap_or_default(),
+                        "name": name,
+                        "arguments": args_str,
                     }
                 });
                 if let Some(sig) = part.get("thoughtSignature") {

@@ -835,6 +835,203 @@ fn stream_preserves_thought_signature_on_tool_calls() {
 }
 
 // ============================================================
+// Streaming: parallel tool calls, empty args, no-name skipped
+// ============================================================
+
+#[test]
+fn stream_parallel_tool_calls_each_get_unique_index() {
+    // Gemini sends each parallel tool call as a separate SSE chunk.
+    // Each chunk arrives with its own parts containing functionCall.
+    // The llmshim transform_stream_chunk assigns incrementing indices.
+    let p = provider();
+
+    // First tool call chunk
+    let chunk1 = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "get_quote", "args": {"symbol": "AAPL"}}, "thoughtSignature": "sig1"}
+        ], "role": "model"}}],
+        "usageMetadata": {},
+    });
+    let result1 = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk1).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed1: Value = serde_json::from_str(&result1).unwrap();
+    let tc1 = &parsed1["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc1["function"]["name"], "get_quote");
+    assert_eq!(tc1["index"], 0);
+    assert_eq!(tc1["thought_signature"], "sig1");
+
+    // Second tool call chunk (same SSE stream, would arrive separately)
+    let chunk2 = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "get_news", "args": {"count": 5}}, "thoughtSignature": "sig2"}
+        ], "role": "model"}}],
+        "usageMetadata": {},
+    });
+    let result2 = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk2).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed2: Value = serde_json::from_str(&result2).unwrap();
+    let tc2 = &parsed2["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc2["function"]["name"], "get_news");
+    // Each chunk is independently transformed — index starts at 0 within the chunk.
+    // The ragents runner handles deduplication across chunks.
+    assert_eq!(tc2["index"], 0);
+    assert_eq!(tc2["thought_signature"], "sig2");
+}
+
+#[test]
+fn stream_multiple_tool_calls_in_single_chunk() {
+    // Gemini can also send multiple functionCall parts in a single chunk
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "get_quote", "args": {"symbol": "AAPL"}}, "thoughtSignature": "sig1"},
+            {"functionCall": {"name": "get_news", "args": {"count": 5}}, "thoughtSignature": "sig2"}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let tcs = parsed["choices"][0]["delta"]["tool_calls"].as_array().unwrap();
+    assert_eq!(tcs.len(), 2);
+    assert_eq!(tcs[0]["function"]["name"], "get_quote");
+    assert_eq!(tcs[0]["index"], 0);
+    assert_eq!(tcs[0]["thought_signature"], "sig1");
+    assert_eq!(tcs[1]["function"]["name"], "get_news");
+    assert_eq!(tcs[1]["index"], 1);
+    assert_eq!(tcs[1]["thought_signature"], "sig2");
+}
+
+#[test]
+fn stream_empty_args_produces_empty_json_object() {
+    let p = provider();
+    // functionCall with no args field at all
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "list_positions"}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let args = parsed["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    assert_eq!(args, "{}", "Missing args should produce empty JSON object string");
+}
+
+#[test]
+fn stream_null_args_produces_empty_json_object() {
+    let p = provider();
+    // functionCall with null args
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "list_positions", "args": null}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let args = parsed["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    assert_eq!(args, "{}", "Null args should produce empty JSON object string");
+}
+
+#[test]
+fn stream_no_name_function_call_skipped() {
+    let p = provider();
+    // functionCall with empty name should be skipped entirely
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "", "args": {"x": 1}}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    // Should not have tool_calls since the only functionCall had empty name
+    assert!(
+        parsed["choices"][0]["delta"].get("tool_calls").is_none(),
+        "functionCall with empty name should be skipped"
+    );
+}
+
+#[test]
+fn stream_no_name_function_call_skipped_but_valid_ones_kept() {
+    let p = provider();
+    // Mix of empty-name and valid functionCalls
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "", "args": {}}},
+            {"functionCall": {"name": "get_quote", "args": {"symbol": "AAPL"}}, "thoughtSignature": "sig"}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let tcs = parsed["choices"][0]["delta"]["tool_calls"].as_array().unwrap();
+    assert_eq!(tcs.len(), 1, "Only valid functionCalls should be included");
+    assert_eq!(tcs[0]["function"]["name"], "get_quote");
+}
+
+#[test]
+fn response_empty_args_produces_empty_json_object() {
+    // Non-streaming: functionCall with no args
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "list_positions"}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    let args = result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    assert_eq!(args, "{}", "Missing args should produce empty JSON object string");
+}
+
+#[test]
+fn response_no_name_function_call_skipped() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "", "args": {"x": 1}}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    // No tool_calls should be present
+    assert!(
+        result["choices"][0]["message"].get("tool_calls").is_none(),
+        "functionCall with empty name should be skipped"
+    );
+}
+
+// ============================================================
 // Session history: turn ordering enforcement
 // ============================================================
 
@@ -1054,6 +1251,158 @@ fn session_history_empty_assistant_turns_removed() {
                     .unwrap_or(true)
             });
             assert!(has_real_content, "Empty model turns should be removed");
+        }
+    }
+}
+
+// ============================================================
+// Full tool call roundtrip: Gemini response -> OpenAI format -> back to Gemini request
+// Simulates what ragents does: receives tool calls via streaming, accumulates them,
+// sends results back. thought_signature MUST survive the full roundtrip.
+// ============================================================
+
+#[test]
+fn full_roundtrip_thought_signature_preserved() {
+    let p = provider();
+
+    // Step 1: Gemini returns a functionCall with thoughtSignature (via streaming)
+    let stream_chunk = json!({
+        "candidates": [{
+            "content": {
+                "parts": [{
+                    "functionCall": {"name": "get_quote", "args": {"symbol": "AAPL"}},
+                    "thoughtSignature": "roundtrip-sig-abc"
+                }],
+                "role": "model"
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
+    });
+    let chunk_result = p
+        .transform_stream_chunk("gemini-3-flash-preview", &serde_json::to_string(&stream_chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let chunk_parsed: Value = serde_json::from_str(&chunk_result).unwrap();
+
+    // Extract tool call from the transformed chunk (what ragents would accumulate)
+    let tc = &chunk_parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc["thought_signature"], "roundtrip-sig-abc");
+
+    // Step 2: Simulate ragents building the assistant message with accumulated tool calls
+    // This is what ragents/src/runner.rs does after streaming accumulation
+    let assistant_message = json!({
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": tc["id"].as_str().unwrap(),
+            "type": "function",
+            "function": {
+                "name": tc["function"]["name"].as_str().unwrap(),
+                "arguments": tc["function"]["arguments"].as_str().unwrap(),
+            },
+            "thought_signature": tc["thought_signature"].clone()
+        }]
+    });
+
+    // Step 3: Simulate ragents adding the tool result
+    let tool_result = json!({
+        "role": "tool",
+        "tool_call_id": tc["id"].as_str().unwrap(),
+        "name": "get_quote",
+        "content": "{\"price\": 150.0}"
+    });
+
+    // Step 4: Send the full conversation back to Gemini
+    let follow_up_request = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Get me an AAPL quote"},
+            assistant_message,
+            tool_result,
+            {"role": "user", "content": "Now what about TSLA?"},
+        ]
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &follow_up_request).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // The model turn with functionCall should be preserved (has thought_signature)
+    let model_fc_turn = contents.iter().find(|t| {
+        t["role"] == "model"
+            && t["parts"]
+                .as_array()
+                .map(|p| p.iter().any(|part| part.get("functionCall").is_some()))
+                .unwrap_or(false)
+    });
+    assert!(
+        model_fc_turn.is_some(),
+        "Model turn with functionCall should be preserved when thought_signature is present"
+    );
+
+    // Verify thoughtSignature is echoed back
+    let fc_part = model_fc_turn.unwrap()["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p.get("functionCall").is_some())
+        .unwrap();
+    assert_eq!(
+        fc_part["thoughtSignature"], "roundtrip-sig-abc",
+        "thoughtSignature must be echoed back in the Gemini request"
+    );
+
+    // And there should be a functionResponse following it
+    let fr_turn = contents.iter().find(|t| {
+        t["parts"]
+            .as_array()
+            .map(|p| p.iter().any(|part| part.get("functionResponse").is_some()))
+            .unwrap_or(false)
+    });
+    assert!(
+        fr_turn.is_some(),
+        "functionResponse should be present after the functionCall"
+    );
+}
+
+#[test]
+fn full_roundtrip_without_thought_signature_gets_stripped() {
+    // When ragents does NOT preserve thought_signature (the bug scenario),
+    // enforce_gemini_turn_order strips the functionCall pair, breaking Gemini
+    let p = provider();
+
+    let request = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Get me a quote"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "get_quote", "arguments": "{\"symbol\":\"AAPL\"}"}
+                    // NOTE: no thought_signature — this is the bug case
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "get_quote", "content": "{\"price\":150}"},
+            {"role": "user", "content": "Now TSLA?"},
+        ]
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &request).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // Without thought_signature, the functionCall pair gets stripped
+    for turn in contents {
+        let parts = turn["parts"].as_array().unwrap();
+        for part in parts {
+            assert!(
+                part.get("functionCall").is_none(),
+                "functionCall without thought_signature should be stripped by enforce_gemini_turn_order"
+            );
+            assert!(
+                part.get("functionResponse").is_none(),
+                "orphaned functionResponse should be stripped"
+            );
         }
     }
 }
