@@ -534,6 +534,9 @@ impl Provider for Anthropic {
                             .get("partial_json")
                             .and_then(|t| t.as_str())
                             .unwrap_or("");
+                        // Use the content_block index from the Anthropic event so
+                        // parallel tool calls get separate indices in OpenAI format
+                        let block_index = parsed.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                         let chunk = json!({
                             "object": "chat.completion.chunk",
                             "model": model,
@@ -541,7 +544,7 @@ impl Provider for Anthropic {
                                 "index": 0,
                                 "delta": {
                                     "tool_calls": [{
-                                        "index": 0,
+                                        "index": block_index,
                                         "function": { "arguments": partial }
                                     }]
                                 },
@@ -558,6 +561,8 @@ impl Provider for Anthropic {
             "content_block_start" => {
                 if let Some(cb) = parsed.get("content_block") {
                     if cb.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                        // Use the content_block index from the Anthropic event
+                        let block_index = parsed.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                         let chunk = json!({
                             "object": "chat.completion.chunk",
                             "model": model,
@@ -565,7 +570,7 @@ impl Provider for Anthropic {
                                 "index": 0,
                                 "delta": {
                                     "tool_calls": [{
-                                        "index": 0,
+                                        "index": block_index,
                                         "id": cb.get("id").cloned().unwrap_or(json!("")),
                                         "type": "function",
                                         "function": {
