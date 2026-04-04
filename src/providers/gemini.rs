@@ -511,10 +511,13 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
             if name.is_empty() {
                 continue;
             }
-            let id = fc.get("id").and_then(|v| v.as_str())
+            let id = fc
+                .get("id")
+                .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
-            let args_str = fc.get("args")
+            let args_str = fc
+                .get("args")
                 .filter(|a| !a.is_null())
                 .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string()))
                 .unwrap_or_else(|| "{}".to_string());
@@ -776,10 +779,13 @@ impl Provider for Gemini {
                     continue;
                 }
                 has_function_call = true;
-                let id = fc.get("id").and_then(|v| v.as_str())
+                let id = fc
+                    .get("id")
+                    .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
-                let args_str = fc.get("args")
+                let args_str = fc
+                    .get("args")
                     .filter(|a| !a.is_null())
                     .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string()))
                     .unwrap_or_else(|| "{}".to_string());

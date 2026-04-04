@@ -898,7 +898,9 @@ fn stream_multiple_tool_calls_in_single_chunk() {
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
-    let tcs = parsed["choices"][0]["delta"]["tool_calls"].as_array().unwrap();
+    let tcs = parsed["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .unwrap();
     assert_eq!(tcs.len(), 2);
     assert_eq!(tcs[0]["function"]["name"], "get_quote");
     assert_eq!(tcs[0]["index"], 0);
@@ -926,7 +928,10 @@ fn stream_empty_args_produces_empty_json_object() {
     let args = parsed["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
         .as_str()
         .unwrap();
-    assert_eq!(args, "{}", "Missing args should produce empty JSON object string");
+    assert_eq!(
+        args, "{}",
+        "Missing args should produce empty JSON object string"
+    );
 }
 
 #[test]
@@ -947,7 +952,10 @@ fn stream_null_args_produces_empty_json_object() {
     let args = parsed["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
         .as_str()
         .unwrap();
-    assert_eq!(args, "{}", "Null args should produce empty JSON object string");
+    assert_eq!(
+        args, "{}",
+        "Null args should produce empty JSON object string"
+    );
 }
 
 #[test]
@@ -988,7 +996,9 @@ fn stream_no_name_function_call_skipped_but_valid_ones_kept() {
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
-    let tcs = parsed["choices"][0]["delta"]["tool_calls"].as_array().unwrap();
+    let tcs = parsed["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .unwrap();
     assert_eq!(tcs.len(), 1, "Only valid functionCalls should be included");
     assert_eq!(tcs[0]["function"]["name"], "get_quote");
 }
@@ -1009,7 +1019,10 @@ fn response_empty_args_produces_empty_json_object() {
     let args = result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
         .as_str()
         .unwrap();
-    assert_eq!(args, "{}", "Missing args should produce empty JSON object string");
+    assert_eq!(
+        args, "{}",
+        "Missing args should produce empty JSON object string"
+    );
 }
 
 #[test]
@@ -1280,7 +1293,10 @@ fn full_roundtrip_thought_signature_preserved() {
         "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
     });
     let chunk_result = p
-        .transform_stream_chunk("gemini-3-flash-preview", &serde_json::to_string(&stream_chunk).unwrap())
+        .transform_stream_chunk(
+            "gemini-3-flash-preview",
+            &serde_json::to_string(&stream_chunk).unwrap(),
+        )
         .unwrap()
         .unwrap();
     let chunk_parsed: Value = serde_json::from_str(&chunk_result).unwrap();
@@ -1323,7 +1339,9 @@ fn full_roundtrip_thought_signature_preserved() {
             {"role": "user", "content": "Now what about TSLA?"},
         ]
     });
-    let result = p.transform_request("gemini-3-flash-preview", &follow_up_request).unwrap();
+    let result = p
+        .transform_request("gemini-3-flash-preview", &follow_up_request)
+        .unwrap();
     let contents = result.body["contents"].as_array().unwrap();
 
     // The model turn with functionCall should be preserved (has thought_signature)
@@ -1388,7 +1406,9 @@ fn full_roundtrip_without_thought_signature_gets_stripped() {
             {"role": "user", "content": "Now TSLA?"},
         ]
     });
-    let result = p.transform_request("gemini-3-flash-preview", &request).unwrap();
+    let result = p
+        .transform_request("gemini-3-flash-preview", &request)
+        .unwrap();
     let contents = result.body["contents"].as_array().unwrap();
 
     // Without thought_signature, the functionCall pair gets stripped
