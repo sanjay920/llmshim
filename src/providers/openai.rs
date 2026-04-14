@@ -270,6 +270,17 @@ impl Provider for OpenAi {
             body_obj.insert("instructions".to_string(), json!(instructions.join("\n\n")));
         }
 
+        // Fast mode / priority processing: translate "speed": "fast" to
+        // OpenAI's priority processing format.
+        if let Some(speed) = obj.get("speed").and_then(|s| s.as_str()) {
+            if speed == "fast" {
+                body_obj.insert(
+                    "priority".to_string(),
+                    json!({"type": "default_with_boost"}),
+                );
+            }
+        }
+
         // Strip x-* namespaces and provider-specific params from body
         body_obj.remove("thinking");
 

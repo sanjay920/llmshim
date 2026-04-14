@@ -435,6 +435,13 @@ impl Provider for Anthropic {
             }
         }
 
+        // Fast mode support: extract "speed" from the request and apply
+        // Anthropic-specific transformations (body field + beta header).
+        let speed = obj.get("speed").and_then(|s| s.as_str()).map(String::from);
+        if let Some(ref s) = speed {
+            body_obj.insert("speed".to_string(), json!(s));
+        }
+
         let url = format!("{}/messages", self.base_url);
 
         // Build headers — include 1M context beta by default for supported models
@@ -444,6 +451,9 @@ impl Provider for Anthropic {
             ("content-type".into(), "application/json".into()),
         ];
 
+        // Collect beta headers
+        let mut betas: Vec<String> = Vec::new();
+
         // 1M context beta header — enabled by default, disable via x-anthropic
         let disable_1m = obj
             .get("x-anthropic")
@@ -451,7 +461,16 @@ impl Provider for Anthropic {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if !disable_1m && Self::supports_1m_context(model) {
-            headers.push(("anthropic-beta".into(), "context-1m-2025-08-07".into()));
+            betas.push("context-1m-2025-08-07".to_string());
+        }
+
+        // Fast mode beta header
+        if speed.as_deref() == Some("fast") {
+            betas.push("fast-mode-2026-02-01".to_string());
+        }
+
+        if !betas.is_empty() {
+            headers.push(("anthropic-beta".into(), betas.join(",")));
         }
 
         Ok(ProviderRequest { url, headers, body })
