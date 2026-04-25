@@ -273,10 +273,8 @@ fn build_parts(msg: &Value) -> Vec<Value> {
 
     // Text content (string or array of content blocks)
     match msg.get("content") {
-        Some(Value::String(text)) => {
-            if !text.is_empty() {
-                parts.push(json!({"text": text}));
-            }
+        Some(Value::String(text)) if !text.is_empty() => {
+            parts.push(json!({"text": text}));
         }
         Some(Value::Array(blocks)) => {
             for block in blocks {
