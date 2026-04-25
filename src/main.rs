@@ -337,21 +337,17 @@ fn read_line_raw() -> Option<RawInput> {
                     }
 
                     // Backspace: delete last char
-                    (KeyCode::Backspace, _) => {
-                        if !current_text.is_empty() {
-                            current_text.pop();
-                            print!("\x08 \x08");
-                            io::stdout().flush().ok();
-                        }
+                    (KeyCode::Backspace, _) if !current_text.is_empty() => {
+                        current_text.pop();
+                        print!("\x08 \x08");
+                        io::stdout().flush().ok();
                     }
 
                     // Regular character
-                    (KeyCode::Char(c), m) => {
-                        if m.is_empty() || m == KeyModifiers::SHIFT {
-                            current_text.push(c);
-                            print!("{}", c);
-                            io::stdout().flush().ok();
-                        }
+                    (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                        current_text.push(c);
+                        print!("{}", c);
+                        io::stdout().flush().ok();
                     }
 
                     _ => {}
