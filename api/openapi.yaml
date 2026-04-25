@@ -108,7 +108,7 @@ components:
             or just the model name for auto-detection (e.g., "claude-sonnet-4-6").
           examples:
             - anthropic/claude-sonnet-4-6
-            - gpt-5.4
+            - gpt-5.5
             - gemini-3-flash-preview
         messages:
           type: array
@@ -142,7 +142,7 @@ components:
             Each model is retried up to 2 times with exponential backoff before
             moving to the next.
           examples:
-            - ["openai/gpt-5.4", "gemini/gemini-3-flash-preview"]
+            - ["openai/gpt-5.5", "gemini/gemini-3-flash-preview"]
 
     Message:
       type: object

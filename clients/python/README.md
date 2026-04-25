@@ -37,7 +37,7 @@ With options:
 
 ```python
 resp = llmshim.chat(
-    "openai/gpt-5.4",
+    "openai/gpt-5.5",
     "Explain quicksort",
     max_tokens=500,
     temperature=0.7,
@@ -78,7 +78,7 @@ print(f"Claude: {r1['message']['content']}")
 messages.append({"role": "assistant", "content": r1["message"]["content"]})
 messages.append({"role": "user", "content": "Now explain differently."})
 
-r2 = llmshim.chat("gpt-5.4", messages, max_tokens=500)
+r2 = llmshim.chat("gpt-5.5", messages, max_tokens=500)
 print(f"GPT: {r2['message']['content']}")
 ```
 
@@ -125,7 +125,7 @@ resp = llmshim.chat(
     "anthropic/claude-sonnet-4-6",
     "Hello",
     max_tokens=100,
-    fallback=["openai/gpt-5.4", "gemini/gemini-3-flash-preview"],
+    fallback=["openai/gpt-5.5", "gemini/gemini-3-flash-preview"],
 )
 ```
 
@@ -150,7 +150,7 @@ No Docker, no background services, no manual server management.
 
 | Provider | Models |
 |----------|--------|
-| OpenAI | `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano` |
+| OpenAI | `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano` |
 | Anthropic | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` |
 | Gemini | `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview` |
 | xAI | `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`, `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning` |
