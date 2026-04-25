@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::io::{self, Write};
 
 const MODELS: &[(&str, &str)] = &[
+    ("openai/gpt-5.5", "GPT-5.5"),
     ("openai/gpt-5.4", "GPT-5.4"),
     ("openai/gpt-5.4-mini", "GPT-5.4 Mini"),
     ("openai/gpt-5.4-nano", "GPT-5.4 Nano"),

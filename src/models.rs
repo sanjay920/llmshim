@@ -8,6 +8,12 @@ pub struct ModelInfo {
 
 pub const MODELS: &[ModelInfo] = &[
     ModelInfo {
+        id: "openai/gpt-5.5",
+        provider: "openai",
+        name: "gpt-5.5",
+        label: "GPT-5.5",
+    },
+    ModelInfo {
         id: "openai/gpt-5.4",
         provider: "openai",
         name: "gpt-5.4",

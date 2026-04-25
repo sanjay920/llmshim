@@ -65,7 +65,7 @@ Or from the CLI: `llmshim configure`
 
 | Provider | Models | Reasoning visible |
 |----------|--------|-------------------|
-| **OpenAI** | `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano` | Yes (summaries) |
+| **OpenAI** | `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano` | Yes (summaries) |
 | **Anthropic** | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` | Yes (full thinking) |
 | **Google Gemini** | `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview` | Yes (thought summaries) |
 | **xAI** | `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`, `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning` | No (hidden) |
@@ -80,7 +80,7 @@ resp = llmshim.chat("claude-sonnet-4-6", "Hello!", max_tokens=500)
 print(resp["message"]["content"])
 
 # With message history
-resp = llmshim.chat("gpt-5.4", [
+resp = llmshim.chat("gpt-5.5", [
     {"role": "system", "content": "You are a pirate."},
     {"role": "user", "content": "Hello!"},
 ], max_tokens=500)
@@ -111,7 +111,7 @@ print(f"Claude: {r1['message']['content']}")
 messages.append({"role": "assistant", "content": r1["message"]["content"]})
 messages.append({"role": "user", "content": "Now explain differently."})
 
-r2 = llmshim.chat("gpt-5.4", messages, max_tokens=500)
+r2 = llmshim.chat("gpt-5.5", messages, max_tokens=500)
 print(f"GPT: {r2['message']['content']}")
 ```
 
@@ -158,7 +158,7 @@ resp = llmshim.chat(
     "anthropic/claude-sonnet-4-6",
     "Hello",
     max_tokens=100,
-    fallback=["openai/gpt-5.4", "gemini/gemini-3-flash-preview"],
+    fallback=["openai/gpt-5.5", "gemini/gemini-3-flash-preview"],
 )
 ```
 

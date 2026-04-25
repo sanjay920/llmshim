@@ -203,9 +203,7 @@ fn gemini_fast_mode_ignored() {
         "messages": [{"role": "user", "content": "hi"}],
         "speed": "fast",
     });
-    let result = p
-        .transform_request("gemini-3-flash-preview", &req)
-        .unwrap();
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
     // "speed" should not appear in the Gemini request body
     assert!(
         result.body.get("speed").is_none(),
