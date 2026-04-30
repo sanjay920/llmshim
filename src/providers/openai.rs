@@ -22,6 +22,23 @@ impl OpenAi {
     }
 }
 
+fn strip_cache_control(value: &mut Value) {
+    match value {
+        Value::Object(obj) => {
+            obj.remove("cache_control");
+            for nested in obj.values_mut() {
+                strip_cache_control(nested);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_cache_control(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Sanitize messages for OpenAI Responses API: strip cross-provider fields,
 /// translate images, and convert tool call/result messages to Responses API format.
 ///
@@ -44,6 +61,7 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
                     obj.remove("refusal");
                     obj.remove("tool_calls"); // Handled separately below.
                 }
+                strip_cache_control(&mut out);
                 if let Some(content) = out.get("content").cloned() {
                     if content.is_array() {
                         let translated =
@@ -115,6 +133,7 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
                     obj.remove("annotations");
                     obj.remove("refusal");
                 }
+                strip_cache_control(&mut out);
                 if let Some(content) = out.get("content").cloned() {
                     if content.is_array() {
                         let translated =
@@ -148,7 +167,7 @@ fn translate_tools(tools: &Value) -> Value {
                     // Preserve any extra top-level fields besides "type" and "function"
                     if let Some(obj) = tool.as_object() {
                         for (k, v) in obj {
-                            if k != "type" && k != "function" {
+                            if k != "type" && k != "function" && k != "cache_control" {
                                 flat[k] = v.clone();
                             }
                         }
@@ -186,6 +205,39 @@ fn translate_tool_choice(tc: &Value) -> Value {
         }
     }
     tc.clone()
+}
+
+fn cached_tokens_from_usage(usage: &Value) -> Option<Value> {
+    usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .cloned()
+        .or_else(|| {
+            usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .cloned()
+        })
+}
+
+fn normalized_openai_usage(usage: &Value) -> Value {
+    let mut normalized = json!({
+        "prompt_tokens": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
+        "completion_tokens": usage.get("output_tokens").cloned().unwrap_or(json!(0)),
+        "total_tokens": usage.get("total_tokens").cloned().unwrap_or(json!(0)),
+    });
+
+    if let Some(cached_tokens) = cached_tokens_from_usage(usage) {
+        normalized["prompt_tokens_details"] = json!({
+            "cached_tokens": cached_tokens,
+        });
+    }
+    if let Some(output_details) = usage.get("output_tokens_details") {
+        normalized["completion_tokens_details"] = output_details.clone();
+        if let Some(reasoning_tokens) = output_details.get("reasoning_tokens") {
+            normalized["reasoning_tokens"] = reasoning_tokens.clone();
+        }
+    }
+
+    normalized
 }
 
 impl Provider for OpenAi {
@@ -253,6 +305,21 @@ impl Provider for OpenAi {
             body_obj.insert("tool_choice".to_string(), translate_tool_choice(tc));
         }
 
+        for key in [
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "safety_identifier",
+        ] {
+            if let Some(v) = obj.get(key) {
+                body_obj.insert(key.to_string(), v.clone());
+            }
+        }
+        if let Some(ext) = obj.get("x-openai").and_then(|e| e.as_object()) {
+            for (k, v) in ext {
+                body_obj.insert(k.clone(), v.clone());
+            }
+        }
+
         // System instruction via "instructions" field
         // Also map system/developer messages out of input into instructions
         let input = body_obj.get_mut("input").unwrap().as_array_mut().unwrap();
@@ -281,7 +348,7 @@ impl Provider for OpenAi {
             }
         }
 
-        // Strip x-* namespaces and provider-specific params from body
+        // Strip provider-specific params from body
         body_obj.remove("thinking");
 
         let url = format!("{}/responses", self.base_url);
@@ -384,6 +451,7 @@ impl Provider for OpenAi {
         };
 
         let usage = response.get("usage").cloned().unwrap_or(json!({}));
+        let normalized_usage = normalized_openai_usage(&usage);
 
         Ok(json!({
             "id": response.get("id").cloned().unwrap_or(json!("")),
@@ -394,11 +462,7 @@ impl Provider for OpenAi {
                 "message": message,
                 "finish_reason": finish_reason,
             }],
-            "usage": {
-                "prompt_tokens": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
-                "completion_tokens": usage.get("output_tokens").cloned().unwrap_or(json!(0)),
-                "total_tokens": usage.get("total_tokens").cloned().unwrap_or(json!(0)),
-            }
+            "usage": normalized_usage
         }))
     }
 
@@ -524,6 +588,10 @@ impl Provider for OpenAi {
                     .pointer("/output_tokens_details/reasoning_tokens")
                     .cloned()
                     .unwrap_or(json!(0));
+                let mut usage_out = normalized_openai_usage(&usage);
+                if usage_out.get("reasoning_tokens").is_none() {
+                    usage_out["reasoning_tokens"] = reasoning_tokens;
+                }
                 let chunk = json!({
                     "object": "chat.completion.chunk",
                     "model": model,
@@ -532,11 +600,7 @@ impl Provider for OpenAi {
                         "delta": {},
                         "finish_reason": finish_reason,
                     }],
-                    "usage": {
-                        "prompt_tokens": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
-                        "completion_tokens": usage.get("output_tokens").cloned().unwrap_or(json!(0)),
-                        "reasoning_tokens": reasoning_tokens,
-                    }
+                    "usage": usage_out
                 });
                 Ok(Some(serde_json::to_string(&chunk)?))
             }
