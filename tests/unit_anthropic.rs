@@ -149,6 +149,35 @@ fn request_no_system_message() {
     assert!(result.body.get("system").is_none());
 }
 
+#[test]
+fn request_preserves_system_content_blocks_for_prompt_caching() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Stable instructions.",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                    },
+                    {"type": "input_text", "text": "Dynamic instructions."}
+                ]
+            },
+            {"role": "user", "content": "hi"},
+        ],
+    });
+    let result = p.transform_request("x", &req).unwrap();
+    let system = result.body["system"].as_array().unwrap();
+    assert_eq!(system[0]["text"], "Stable instructions.");
+    assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(system[0]["cache_control"]["ttl"], "1h");
+    assert_eq!(system[1]["type"], "text");
+    assert_eq!(system[1]["text"], "Dynamic instructions.");
+}
+
 // ============================================================
 // transform_request — standard params
 // ============================================================
@@ -227,6 +256,27 @@ fn request_transforms_tools() {
         tools[0]["input_schema"]["properties"]["city"]["type"],
         "string"
     );
+}
+
+#[test]
+fn request_preserves_tool_cache_control() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {"type": "object", "properties": {}}
+            },
+            "cache_control": {"type": "ephemeral"}
+        }]
+    });
+    let result = p.transform_request("x", &req).unwrap();
+    let tools = result.body["tools"].as_array().unwrap();
+    assert_eq!(tools[0]["cache_control"]["type"], "ephemeral");
 }
 
 #[test]
@@ -382,6 +432,38 @@ fn response_text_only() {
     assert_eq!(result["usage"]["prompt_tokens"], 10);
     assert_eq!(result["usage"]["completion_tokens"], 5);
     assert_eq!(result["usage"]["total_tokens"], 15);
+}
+
+#[test]
+fn response_preserves_prompt_cache_usage() {
+    let p = provider();
+    let resp = json!({
+        "id": "msg_cache",
+        "content": [{"type": "text", "text": "Cached hello"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 10,
+            "cache_read_input_tokens": 50,
+            "cache_creation_input_tokens": 20,
+            "output_tokens": 5,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 20
+            }
+        }
+    });
+    let result = p.transform_response("claude-sonnet-4-6", resp).unwrap();
+    assert_eq!(result["usage"]["prompt_tokens"], 10);
+    assert_eq!(result["usage"]["cache_read_input_tokens"], 50);
+    assert_eq!(result["usage"]["cache_creation_input_tokens"], 20);
+    assert_eq!(
+        result["usage"]["prompt_tokens_details"]["cached_tokens"],
+        50
+    );
+    assert_eq!(
+        result["usage"]["cache_creation"]["ephemeral_5m_input_tokens"],
+        20
+    );
+    assert_eq!(result["usage"]["total_tokens"], 85);
 }
 
 #[test]
@@ -592,7 +674,12 @@ fn stream_message_delta_stop() {
     let chunk = json!({
         "type": "message_delta",
         "delta": {"stop_reason": "end_turn"},
-        "usage": {"input_tokens": 10, "output_tokens": 20}
+        "usage": {
+            "input_tokens": 10,
+            "cache_read_input_tokens": 30,
+            "cache_creation_input_tokens": 7,
+            "output_tokens": 20
+        }
     });
     let result = p
         .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
@@ -601,6 +688,12 @@ fn stream_message_delta_stop() {
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
     assert_eq!(parsed["usage"]["completion_tokens"], 20);
+    assert_eq!(parsed["usage"]["cache_read_input_tokens"], 30);
+    assert_eq!(parsed["usage"]["cache_creation_input_tokens"], 7);
+    assert_eq!(
+        parsed["usage"]["prompt_tokens_details"]["cached_tokens"],
+        30
+    );
 }
 
 #[test]
@@ -1181,4 +1274,32 @@ fn context_1m_header_enabled_when_disable_flag_false() {
         .iter()
         .any(|(k, v)| k == "anthropic-beta" && v == "context-1m-2025-08-07");
     assert!(has_beta, "Should be enabled when disable_1m_context=false");
+}
+
+#[test]
+fn extended_cache_ttl_adds_beta_header() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "messages": [{
+            "role": "system",
+            "content": [{
+                "type": "text",
+                "text": "stable",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }]
+        }, {
+            "role": "user",
+            "content": "hi"
+        }],
+    });
+    let result = p
+        .transform_request("claude-haiku-4-5-20251001", &req)
+        .unwrap();
+    let beta = result
+        .headers
+        .iter()
+        .find(|(k, _)| k == "anthropic-beta")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(beta, Some("extended-cache-ttl-2025-04-11"));
 }
