@@ -66,6 +66,26 @@ fn request_messages_become_input() {
 }
 
 #[test]
+fn request_strips_anthropic_cache_control_from_openai_messages() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "hi",
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    assert_eq!(input[0]["content"][0]["type"], "input_text");
+    assert!(input[0]["content"][0].get("cache_control").is_none());
+}
+
+#[test]
 fn request_max_tokens_becomes_max_output_tokens() {
     let p = provider();
     let req = json!({
@@ -87,6 +107,24 @@ fn request_max_completion_tokens_becomes_max_output_tokens() {
     });
     let result = p.transform_request("gpt-5.4", &req).unwrap();
     assert_eq!(result.body["max_output_tokens"], 256);
+}
+
+#[test]
+fn request_passes_prompt_cache_controls() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "prompt_cache_key": "rcode-workspace-model",
+        "prompt_cache_retention": "24h",
+        "x-openai": {
+            "safety_identifier": "user-hash"
+        }
+    });
+    let result = p.transform_request("gpt-5.5", &req).unwrap();
+    assert_eq!(result.body["prompt_cache_key"], "rcode-workspace-model");
+    assert_eq!(result.body["prompt_cache_retention"], "24h");
+    assert_eq!(result.body["safety_identifier"], "user-hash");
 }
 
 // ============================================================
@@ -413,6 +451,40 @@ fn response_text_only() {
 }
 
 #[test]
+fn response_preserves_prompt_cache_usage() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_cache",
+        "status": "completed",
+        "output": [
+            {"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "Hello!"}], "role": "assistant"}
+        ],
+        "usage": {
+            "input_tokens": 2006,
+            "output_tokens": 2,
+            "total_tokens": 2008,
+            "input_tokens_details": {
+                "cached_tokens": 1920
+            },
+            "output_tokens_details": {
+                "reasoning_tokens": 100
+            }
+        },
+    });
+    let result = p.transform_response("gpt-5.5", resp).unwrap();
+    assert_eq!(result["usage"]["prompt_tokens"], 2006);
+    assert_eq!(
+        result["usage"]["prompt_tokens_details"]["cached_tokens"],
+        1920
+    );
+    assert_eq!(
+        result["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        100
+    );
+    assert_eq!(result["usage"]["reasoning_tokens"], 100);
+}
+
+#[test]
 fn response_with_reasoning_summary() {
     let p = provider();
     let resp = json!({
@@ -543,7 +615,11 @@ fn stream_response_completed() {
         "type": "response.completed",
         "response": {
             "status": "completed",
-            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "input_tokens_details": {"cached_tokens": 8}
+            },
         },
     });
     let result = p
@@ -554,6 +630,7 @@ fn stream_response_completed() {
     assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
     assert_eq!(parsed["usage"]["prompt_tokens"], 10);
     assert_eq!(parsed["usage"]["completion_tokens"], 5);
+    assert_eq!(parsed["usage"]["prompt_tokens_details"]["cached_tokens"], 8);
 }
 
 #[test]
