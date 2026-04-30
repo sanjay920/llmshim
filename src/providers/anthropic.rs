@@ -49,25 +49,87 @@ impl Anthropic {
 
 // -- Request transformation helpers --
 
-fn extract_system_message(messages: &[Value]) -> (Option<String>, Vec<Value>) {
+fn normalize_anthropic_content_blocks(content: &Value) -> Value {
+    let mut translated = vision::translate_content_blocks(content, vision::to_anthropic);
+    if let Some(blocks) = translated.as_array_mut() {
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) == Some("input_text") {
+                block["type"] = json!("text");
+            }
+        }
+    }
+    translated
+}
+
+fn uses_extended_cache_ttl(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object
+                .get("cache_control")
+                .and_then(|cache_control| cache_control.get("ttl"))
+                .and_then(Value::as_str)
+                == Some("1h")
+                || object.values().any(uses_extended_cache_ttl)
+        }
+        Value::Array(items) => items.iter().any(uses_extended_cache_ttl),
+        _ => false,
+    }
+}
+
+fn text_block(text: &str) -> Value {
+    json!({
+        "type": "text",
+        "text": text,
+    })
+}
+
+fn extract_system_message(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
     let mut system_parts: Vec<String> = Vec::new();
+    let mut system_blocks: Vec<Value> = Vec::new();
+    let mut has_block_content = false;
     let mut rest: Vec<Value> = Vec::new();
 
     for msg in messages {
         match msg.get("role").and_then(|r| r.as_str()) {
             Some("system" | "developer") => {
-                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                    system_parts.push(content.to_string());
+                if let Some(content) = msg.get("content") {
+                    match content {
+                        Value::String(text) if !has_block_content => {
+                            system_parts.push(text.to_string());
+                        }
+                        Value::String(text) => {
+                            system_blocks.push(text_block(text));
+                        }
+                        Value::Array(blocks) => {
+                            if !system_parts.is_empty() {
+                                system_blocks
+                                    .extend(system_parts.drain(..).map(|text| text_block(&text)));
+                            }
+                            has_block_content = true;
+                            if let Value::Array(normalized) =
+                                normalize_anthropic_content_blocks(&Value::Array(blocks.clone()))
+                            {
+                                system_blocks.extend(normalized);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => rest.push(msg.clone()),
         }
     }
 
-    let system = if system_parts.is_empty() {
+    let system = if has_block_content {
+        if system_blocks.is_empty() {
+            None
+        } else {
+            Some(Value::Array(system_blocks))
+        }
+    } else if system_parts.is_empty() {
         None
     } else {
-        Some(system_parts.join("\n\n"))
+        Some(Value::String(system_parts.join("\n\n")))
     };
     (system, rest)
 }
@@ -91,8 +153,7 @@ fn transform_messages(messages: &[Value]) -> Vec<Value> {
             // Translate image content blocks from OpenAI format to Anthropic format
             if let Some(content) = out.get("content").cloned() {
                 if content.is_array() {
-                    out["content"] =
-                        vision::translate_content_blocks(&content, vision::to_anthropic);
+                    out["content"] = normalize_anthropic_content_blocks(&content);
                 }
             }
 
@@ -139,13 +200,18 @@ fn transform_messages(messages: &[Value]) -> Vec<Value> {
                 let content = out.get("content").cloned().unwrap_or(json!(""));
                 let tool_use_id = out.get("tool_call_id").cloned().unwrap_or(json!(""));
 
+                let mut tool_result = json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": content,
+                });
+                if let Some(cache_control) = out.get("cache_control") {
+                    tool_result["cache_control"] = cache_control.clone();
+                }
+
                 out = json!({
                     "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": content,
-                    }]
+                    "content": [tool_result]
                 });
             }
 
@@ -159,13 +225,57 @@ fn transform_tools(tools: &[Value]) -> Vec<Value> {
         .iter()
         .filter_map(|tool| {
             let func = tool.get("function")?;
-            Some(json!({
+            let mut out = json!({
                 "name": func.get("name")?,
                 "description": func.get("description").unwrap_or(&json!("")),
                 "input_schema": func.get("parameters").unwrap_or(&json!({"type": "object", "properties": {}})),
-            }))
+            });
+            if let Some(cache_control) = tool.get("cache_control") {
+                out["cache_control"] = cache_control.clone();
+            }
+            Some(out)
         })
         .collect()
+}
+
+fn normalized_anthropic_usage(usage: &Value) -> Value {
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut normalized = json!({
+        "prompt_tokens": input,
+        "completion_tokens": output,
+        "total_tokens": input + output + cache_read + cache_creation,
+    });
+
+    if cache_read > 0 {
+        normalized["cache_read_input_tokens"] = json!(cache_read);
+        normalized["prompt_tokens_details"] = json!({
+            "cached_tokens": cache_read,
+        });
+    }
+    if cache_creation > 0 {
+        normalized["cache_creation_input_tokens"] = json!(cache_creation);
+    }
+    if let Some(cache_creation_detail) = usage.get("cache_creation") {
+        normalized["cache_creation"] = cache_creation_detail.clone();
+    }
+
+    normalized
 }
 
 /// Translate OpenAI-style tool_choice to Anthropic format.
@@ -255,6 +365,7 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Value {
         .unwrap_or("stop");
 
     let usage = resp.get("usage").cloned().unwrap_or(json!({}));
+    let normalized_usage = normalized_anthropic_usage(&usage);
 
     let mut message = json!({
         "role": "assistant",
@@ -277,13 +388,7 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Value {
             "message": message,
             "finish_reason": stop_reason,
         }],
-        "usage": {
-            "prompt_tokens": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
-            "completion_tokens": usage.get("output_tokens").cloned().unwrap_or(json!(0)),
-            "total_tokens":
-                usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) +
-                usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-        }
+        "usage": normalized_usage
     })
 }
 
@@ -317,7 +422,7 @@ impl Provider for Anthropic {
 
         // System message
         if let Some(sys) = system {
-            body_obj.insert("system".to_string(), json!(sys));
+            body_obj.insert("system".to_string(), sys);
         }
 
         // max_tokens — required by Anthropic
@@ -355,6 +460,9 @@ impl Provider for Anthropic {
                 }
                 body_obj.insert(k.clone(), v.clone());
             }
+        }
+        if let Some(cache_control) = obj.get("cache_control") {
+            body_obj.insert("cache_control".to_string(), cache_control.clone());
         }
 
         // -- Thinking / reasoning support --
@@ -467,6 +575,9 @@ impl Provider for Anthropic {
         // Fast mode beta header
         if speed.as_deref() == Some("fast") {
             betas.push("fast-mode-2026-02-01".to_string());
+        }
+        if uses_extended_cache_ttl(request) {
+            betas.push("extended-cache-ttl-2025-04-11".to_string());
         }
 
         if !betas.is_empty() {
@@ -619,6 +730,7 @@ impl Provider for Anthropic {
 
                 if let Some(reason) = stop {
                     let usage = parsed.get("usage").cloned().unwrap_or(json!({}));
+                    let normalized_usage = normalized_anthropic_usage(&usage);
                     let chunk = json!({
                         "object": "chat.completion.chunk",
                         "model": model,
@@ -627,10 +739,7 @@ impl Provider for Anthropic {
                             "delta": {},
                             "finish_reason": reason,
                         }],
-                        "usage": {
-                            "prompt_tokens": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
-                            "completion_tokens": usage.get("output_tokens").cloned().unwrap_or(json!(0)),
-                        }
+                        "usage": normalized_usage
                     });
                     Ok(Some(serde_json::to_string(&chunk)?))
                 } else {
