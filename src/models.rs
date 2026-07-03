@@ -86,6 +86,12 @@ pub const MODELS: &[ModelInfo] = &[
         label: "Gemini 3.1 Flash Lite",
     },
     ModelInfo {
+        id: "gemini/gemini-3.5-flash",
+        provider: "gemini",
+        name: "gemini-3.5-flash",
+        label: "Gemini 3.5 Flash",
+    },
+    ModelInfo {
         id: "xai/grok-4.20-multi-agent-beta-0309",
         provider: "xai",
         name: "grok-4.20-multi-agent-beta-0309",

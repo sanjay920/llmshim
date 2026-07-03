@@ -23,6 +23,17 @@ fn request_url_non_streaming() {
 }
 
 #[test]
+fn request_url_gemini_3_5_flash() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("gemini-3.5-flash", &req).unwrap();
+    assert!(result
+        .url
+        .contains("/models/gemini-3.5-flash:generateContent"));
+    assert!(result.url.contains("key=test-key"));
+}
+
+#[test]
 fn request_url_streaming() {
     let p = provider();
     let req =
