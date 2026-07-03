@@ -32,6 +32,18 @@ pub const MODELS: &[ModelInfo] = &[
         label: "GPT-5.4 Nano",
     },
     ModelInfo {
+        id: "openai/gpt-5.5-pro",
+        provider: "openai",
+        name: "gpt-5.5-pro",
+        label: "GPT-5.5 Pro",
+    },
+    ModelInfo {
+        id: "openai/gpt-5.4-pro",
+        provider: "openai",
+        name: "gpt-5.4-pro",
+        label: "GPT-5.4 Pro",
+    },
+    ModelInfo {
         id: "anthropic/claude-opus-4-8",
         provider: "anthropic",
         name: "claude-opus-4-8",
