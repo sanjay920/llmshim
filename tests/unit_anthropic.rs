@@ -1303,3 +1303,87 @@ fn extended_cache_ttl_adds_beta_header() {
         .map(|(_, v)| v.as_str());
     assert_eq!(beta, Some("extended-cache-ttl-2025-04-11"));
 }
+
+// ============================================================
+// New Anthropic families (Opus 4.7/4.8, Sonnet 5)
+//
+// Verified against the live API: these models reject the pre-4.6
+// `thinking.type=enabled` path with HTTP 400 and require the adaptive
+// path (`thinking:{type:"adaptive"}` + `output_config:{effort}`).
+// The 1M context beta returns 200 for all three.
+// ============================================================
+
+#[test]
+fn reasoning_effort_on_new_families_uses_adaptive() {
+    let p = provider();
+    for model in ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5"] {
+        let req = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        });
+        let result = p.transform_request(model, &req).unwrap();
+        assert_eq!(
+            result.body["thinking"]["type"], "adaptive",
+            "{model} should use adaptive thinking, not enabled"
+        );
+        assert_eq!(
+            result.body["output_config"]["effort"], "high",
+            "{model} should carry output_config.effort"
+        );
+        // Must NOT emit the pre-4.6 enabled-thinking budget path.
+        assert!(
+            result.body["thinking"].get("budget_tokens").is_none(),
+            "{model} must not set budget_tokens (adaptive path only)"
+        );
+    }
+}
+
+#[test]
+fn reasoning_effort_effort_mapping_on_new_families() {
+    let p = provider();
+    for (effort, expected) in [("low", "low"), ("medium", "medium"), ("high", "high")] {
+        let req = json!({
+            "model": "claude-sonnet-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let result = p.transform_request("claude-sonnet-5", &req).unwrap();
+        assert_eq!(result.body["thinking"]["type"], "adaptive");
+        assert_eq!(result.body["output_config"]["effort"], expected);
+    }
+}
+
+#[test]
+fn context_1m_header_on_by_default_for_new_families() {
+    let p = provider();
+    for model in ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5"] {
+        let req = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let result = p.transform_request(model, &req).unwrap();
+        let has_beta = result
+            .headers
+            .iter()
+            .any(|(k, v)| k == "anthropic-beta" && v == "context-1m-2025-08-07");
+        assert!(has_beta, "Expected context-1m beta header for {model}");
+    }
+}
+
+#[test]
+fn new_families_support_thinking() {
+    let p = provider();
+    for model in ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5"] {
+        let req = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        });
+        let result = p.transform_request(model, &req).unwrap();
+        assert!(
+            result.body.get("thinking").is_some(),
+            "Expected thinking to be set for {model}"
+        );
+    }
+}
