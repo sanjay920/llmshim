@@ -1,6 +1,18 @@
 # llmshim
 
-A blazing fast LLM API translation layer in pure Rust. One interface, every provider.
+A blazing-fast LLM API translation layer written in **pure Rust**. One request format, every provider — OpenAI, Anthropic, Google Gemini, and xAI.
+
+Send an OpenAI-style request, pick any model, and llmshim translates it to that provider's native API (and translates the response back). Switch providers by changing one string.
+
+**Three ways to use it:**
+
+| Surface | For | Install |
+|---|---|---|
+| **Rust crate** | Rust apps that call LLMs directly, in-process | `cargo add llmshim` |
+| **CLI** | Interactive chat + a local proxy, from your terminal | `brew install sanjay920/tap/llmshim` |
+| **HTTP proxy** | Any language (Python, JS, Go, …) over HTTP | run `llmshim proxy`, or `pip install llmshim` |
+
+The Rust crate is the engine. The CLI and proxy wrap it. The Python package is a thin client that bundles the Rust binary, starts the proxy for you, and talks to it over HTTP — so you get the Rust engine behind a Python API.
 
 ## Benchmarks
 
@@ -26,83 +38,151 @@ uv run --with litellm --with langchain-anthropic --with langchain-openai \
   python benchmarks/bench_python.py        # Python (litellm + langchain)
 ```
 
-## What it does
+## Configure API keys
 
-Send requests through llmshim → it translates to whichever provider you choose → translates the response back. Zero infrastructure, zero databases, ~6MB binary.
-
-```python
-import llmshim
-
-resp = llmshim.chat("claude-sonnet-4-6", "What is Rust?")
-print(resp["message"]["content"])
-```
-
-Switch providers by changing the model string. Everything else stays the same.
-
-## Install
+llmshim reads keys from environment variables or `~/.llmshim/config.toml`. Precedence: **env vars > config file**.
 
 ```bash
-brew install sanjay920/tap/llmshim   # macOS
-pip install llmshim                   # Python (any platform)
-cargo install llmshim --features proxy # from source
+export OPENAI_API_KEY=sk-...
+export ANTHROPIC_API_KEY=sk-ant-...
+export GEMINI_API_KEY=AIza...
+export XAI_API_KEY=xai-...
 ```
 
-## Configure
+Or persist them to the config file (used by all three surfaces):
+
+```bash
+llmshim configure          # interactive prompt
+```
+
+---
+
+## Use it from Rust
+
+```bash
+cargo add llmshim tokio serde_json
+```
+
+```rust
+use serde_json::json;
+
+#[tokio::main]
+async fn main() {
+    // Router::from_env() picks up the *_API_KEY env vars.
+    let router = llmshim::router::Router::from_env();
+
+    let request = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "What is Rust?"}],
+        "max_tokens": 500,
+    });
+
+    // Responses come back in OpenAI Chat Completions format.
+    let resp = llmshim::completion(&router, &request).await.unwrap();
+    println!("{}", resp["choices"][0]["message"]["content"]);
+}
+```
+
+Switch providers by changing the `"model"` string — everything else stays the same.
+
+**Streaming:**
+
+```rust
+use futures::StreamExt;
+use serde_json::json;
+
+let router = llmshim::router::Router::from_env();
+let request = json!({
+    "model": "gpt-5.5",
+    "messages": [{"role": "user", "content": "Write a haiku about Rust."}],
+    "max_tokens": 128,
+});
+
+let mut stream = llmshim::stream(&router, &request).await.unwrap();
+while let Some(Ok(chunk)) = stream.next().await {
+    let parsed: serde_json::Value = serde_json::from_str(&chunk).unwrap_or_default();
+    if let Some(text) = parsed.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
+        print!("{text}");
+    }
+}
+```
+
+See [`examples/chat.rs`](examples/chat.rs) and [`examples/stream.rs`](examples/stream.rs) for runnable programs (`cargo run --example chat`).
+
+---
+
+## Use it from the CLI
+
+```bash
+brew install sanjay920/tap/llmshim        # macOS
+cargo install llmshim --features proxy    # from source (any platform)
+```
+
+```bash
+llmshim                     # show help
+llmshim chat                # interactive multi-model chat (streaming, /model to switch)
+llmshim configure           # set API keys
+llmshim set <key> <value>   # set a config value
+llmshim list                # show configured keys
+llmshim models              # list available models
+llmshim proxy               # start the HTTP proxy (see below)
+```
+
+---
+
+## Use it from any language (HTTP proxy)
+
+Run llmshim as a local HTTP server and call it from any language. It has its own compact API (not OpenAI-shaped).
+
+```bash
+llmshim proxy
+# Listening on http://localhost:3000
+```
+
+```bash
+curl http://localhost:3000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}],"config":{"max_tokens":100}}'
+```
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/chat` | Chat completion (or streaming with `stream: true`) |
+| `POST` | `/v1/chat/stream` | Always-streaming SSE with typed events |
+| `GET` | `/v1/models` | List available models |
+| `GET` | `/health` | Health check |
+
+Full API spec: [`api/openapi.yaml`](api/openapi.yaml).
+
+### Python client
+
+`pip install llmshim` gives you a Python wrapper that bundles the Rust binary, starts the proxy on first use, and stops it on exit — no server to manage.
+
+```bash
+pip install llmshim
+```
 
 ```python
 import llmshim
 
-# Set API keys once — persisted to ~/.llmshim/config.toml
-llmshim.configure(
-    anthropic="sk-ant-...",
-    openai="sk-...",
-    gemini="AIza...",
-    xai="xai-...",
-)
-```
+# Keys can also come from env vars or `llmshim configure`.
+llmshim.configure(anthropic="sk-ant-...", openai="sk-...")
 
-Or from the CLI: `llmshim configure`
-
-## Supported models
-
-| Provider | Models | Reasoning visible |
-|----------|--------|-------------------|
-| **OpenAI** | `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano` | Yes (summaries) |
-| **Anthropic** | `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` | Yes (full thinking) |
-| **Google Gemini** | `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite-preview`, `gemini-3-flash-preview` | Yes (thought summaries) |
-| **xAI** | `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`, `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning` | No (hidden) |
-
-## Chat
-
-```python
-import llmshim
-
-# Simple
 resp = llmshim.chat("claude-sonnet-4-6", "Hello!", max_tokens=500)
 print(resp["message"]["content"])
-
-# With message history
-resp = llmshim.chat("gpt-5.5", [
-    {"role": "system", "content": "You are a pirate."},
-    {"role": "user", "content": "Hello!"},
-], max_tokens=500)
 ```
 
-## Streaming
+**Streaming:**
 
 ```python
 for event in llmshim.stream("claude-sonnet-4-6", "Write a poem"):
     if event["type"] == "content":
         print(event["text"], end="", flush=True)
-    elif event["type"] == "reasoning":
-        pass  # thinking tokens
     elif event["type"] == "usage":
         print(f"\n[↑{event['input_tokens']} ↓{event['output_tokens']}]")
 ```
 
-## Multi-model conversations
-
-Switch models mid-conversation. History carries over.
+**Multi-model conversation** — switch providers mid-chat, history carries over:
 
 ```python
 messages = [{"role": "user", "content": "What is a closure?"}]
@@ -111,13 +191,13 @@ r1 = llmshim.chat("claude-sonnet-4-6", messages, max_tokens=500)
 print(f"Claude: {r1['message']['content']}")
 
 messages.append({"role": "assistant", "content": r1["message"]["content"]})
-messages.append({"role": "user", "content": "Now explain differently."})
+messages.append({"role": "user", "content": "Now explain it differently."})
 
 r2 = llmshim.chat("gpt-5.5", messages, max_tokens=500)
 print(f"GPT: {r2['message']['content']}")
 ```
 
-## Tool use
+**Tool use** — pass tools in OpenAI Chat Completions format; llmshim translates to each provider's native format:
 
 ```python
 tools = [{
@@ -138,9 +218,7 @@ for tc in resp["message"].get("tool_calls", []):
     print(f"{tc['function']['name']}({tc['function']['arguments']})")
 ```
 
-Tools are accepted in OpenAI Chat Completions format and auto-translated to each provider's native format.
-
-## Reasoning / thinking
+**Reasoning / thinking:**
 
 ```python
 resp = llmshim.chat(
@@ -153,40 +231,31 @@ print(resp["reasoning"])          # thinking content
 print(resp["message"]["content"]) # answer
 ```
 
-## Fallback chains
+**Fallback chains** — automatic failover across providers:
 
 ```python
 resp = llmshim.chat(
     "anthropic/claude-sonnet-4-6",
     "Hello",
     max_tokens=100,
-    fallback=["openai/gpt-5.5", "gemini/gemini-3-flash-preview"],
+    fallback=["openai/gpt-5.5", "gemini/gemini-3.5-flash"],
 )
 ```
 
-## Proxy server
+> These capabilities (streaming, multi-model, tools, reasoning, fallback) are all provided by the Rust core, so they work identically from the Rust crate and the proxy — the Python snippets above are just the most concise way to show them.
 
-llmshim runs as an HTTP proxy with its own API spec. Any language can talk to it.
+---
 
-```bash
-llmshim proxy
-# Listening on http://localhost:3000
-```
+## Supported models
 
-```bash
-curl http://localhost:3000/v1/chat \
-  -H "Content-Type: application/json" \
-  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hi"}],"config":{"max_tokens":100}}'
-```
+| Provider | Models | Reasoning visible |
+|----------|--------|-------------------|
+| **OpenAI** | `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano` | Yes (summaries) |
+| **Anthropic** | `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` | Yes (full thinking) |
+| **Google Gemini** | `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite-preview`, `gemini-3-flash-preview` | Yes (thought summaries) |
+| **xAI** | `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`, `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning` | No (hidden) |
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/chat` | Chat completion (or streaming with `stream: true`) |
-| `POST` | `/v1/chat/stream` | Always-streaming SSE with typed events |
-| `GET` | `/v1/models` | List available models |
-| `GET` | `/health` | Health check |
-
-Full API spec: [`api/openapi.yaml`](api/openapi.yaml)
+Use a bare model name (auto-detected by prefix) or an explicit `provider/model` string.
 
 ## Docker
 
@@ -196,18 +265,6 @@ llmshim docker start
 llmshim docker status
 llmshim docker logs
 llmshim docker stop
-```
-
-## CLI
-
-```bash
-llmshim                     # show help
-llmshim chat                # interactive multi-model chat
-llmshim configure           # set API keys
-llmshim set <key> <value>   # set a config value
-llmshim list                # show configured keys
-llmshim models              # list available models
-llmshim proxy               # start HTTP proxy
 ```
 
 ## How it works
@@ -226,7 +283,7 @@ llmshim::completion(router, request)
 
 - **Multi-model conversations** — switch providers mid-chat, history carries over
 - **Reasoning/thinking** — visible chain-of-thought from OpenAI, Anthropic, and Gemini
-- **Streaming** — token-by-token with thinking in dim grey
+- **Streaming** — token-by-token, with thinking surfaced separately
 - **Tool use** — Chat Completions format auto-translated to each provider
 - **Vision/images** — send images in any format, auto-translated between providers
 - **Fallback chains** — automatic failover across providers with exponential backoff
@@ -236,7 +293,7 @@ llmshim::completion(router, request)
 
 ```bash
 cargo build                                    # dev build
-cargo build --release --features proxy         # release build
-cargo test --features proxy --tests            # unit tests (~326)
+cargo build --release --features proxy         # release build (~6MB binary)
+cargo test --features proxy --tests            # unit tests (~370)
 cargo test --features proxy -- --ignored       # integration tests (needs API keys)
 ```
