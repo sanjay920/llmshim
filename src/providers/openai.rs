@@ -240,6 +240,13 @@ fn normalized_openai_usage(usage: &Value) -> Value {
     normalized
 }
 
+/// OpenAI "pro" tier models (e.g. `gpt-5.5-pro`, `gpt-5.4-pro`) only accept
+/// `reasoning.effort` of `medium`, `high`, or `xhigh` — they reject
+/// `minimal`/`low`/`none` with HTTP 400.
+fn is_pro_model(model: &str) -> bool {
+    model.to_lowercase().contains("-pro")
+}
+
 impl Provider for OpenAi {
     fn name(&self) -> &str {
         "openai"
@@ -280,6 +287,13 @@ impl Provider for OpenAi {
             });
 
         if let Some(effort) = effort {
+            // Pro models reject sub-`medium` efforts (minimal/low/none) with HTTP 400 —
+            // clamp them up to `medium`. Non-pro models pass all values through unchanged.
+            let effort = if is_pro_model(model) && matches!(effort, "minimal" | "low" | "none") {
+                "medium"
+            } else {
+                effort
+            };
             let mut reasoning = json!({
                 "effort": effort,
                 "summary": "auto",

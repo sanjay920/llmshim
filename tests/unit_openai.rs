@@ -177,6 +177,50 @@ fn request_reasoning_effort_takes_precedence_over_output_config() {
     assert_eq!(result.body["reasoning"]["effort"], "high");
 }
 
+#[test]
+fn request_pro_model_clamps_sub_medium_effort_to_medium() {
+    let p = provider();
+    // Pro models reject minimal/low/none with HTTP 400 — clamp them up to medium.
+    for effort in ["minimal", "low", "none"] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let result = p.transform_request("gpt-5.5-pro", &req).unwrap();
+        assert_eq!(
+            result.body["reasoning"]["effort"], "medium",
+            "effort {effort} should clamp to medium for pro models"
+        );
+        assert_eq!(result.body["reasoning"]["summary"], "auto");
+    }
+}
+
+#[test]
+fn request_pro_model_preserves_high_effort() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+    });
+    let result = p.transform_request("gpt-5.4-pro", &req).unwrap();
+    assert_eq!(result.body["reasoning"]["effort"], "high");
+}
+
+#[test]
+fn request_non_pro_model_preserves_low_effort() {
+    let p = provider();
+    // Regression: non-pro models must still pass low through unchanged.
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "low",
+    });
+    let result = p.transform_request("gpt-5.5", &req).unwrap();
+    assert_eq!(result.body["reasoning"]["effort"], "low");
+}
+
 // ============================================================
 // transform_request — system/developer → instructions
 // ============================================================
