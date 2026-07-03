@@ -22,6 +22,7 @@ const MODELS: &[(&str, &str)] = &[
         "gemini/gemini-3.1-flash-lite-preview",
         "Gemini 3.1 Flash Lite",
     ),
+    ("gemini/gemini-3.5-flash", "Gemini 3.5 Flash"),
     (
         "xai/grok-4.20-multi-agent-beta-0309",
         "Grok 4.20 Multi-Agent",
