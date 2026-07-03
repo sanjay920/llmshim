@@ -4,17 +4,19 @@ A blazing fast LLM API translation layer in pure Rust. One interface, every prov
 
 ## Benchmarks
 
-p50 latency over 20 runs. Same prompt, same models, same machine.
+Median of 5 runs, each p50 over 20 warm requests. Same prompt, same models, same machine.
 
 | Metric | llmshim | litellm | langchain |
 |---|---|---|---|
-| Anthropic (p50) | **1,234ms** | 1,288ms | 1,363ms |
-| OpenAI (p50) | **648ms** | 1,180ms | 700ms |
-| Streaming TTFT | **1,065ms** | 1,658ms | 1,623ms |
-| Cold start | **1,396ms** | 2,382ms | 1,619ms |
-| Memory (RSS) | **8 MB** | 255 MB | 255 MB |
+| Anthropic (p50) | 999ms | 981ms | **973ms** |
+| OpenAI (p50) | **511ms** | 613ms | 602ms |
+| Streaming TTFT | 1,023ms | **906ms** | 1,249ms |
+| Memory (RSS) | **12 MB** | 281 MB | 281 MB |
+| Transform overhead | **1.5µs** | — | — |
 
-All three libraries hit the same APIs (Responses API for OpenAI, Messages API for Anthropic). llmshim adds ~2µs of translation overhead per request — the rest is network.
+All three libraries hit the same APIs (Responses API for OpenAI, Messages API for Anthropic), so latency is dominated by the network round-trip — llmshim's own translation work is ~1.5µs, roughly a millionth of the request time.[^bench] The differences between libraries on any single latency row are within network noise and reshuffle run-to-run; the durable wins are memory footprint (~24× leaner than the Python stacks) and near-zero startup/overhead.
+
+[^bench]: Because latency is >99.9% network, per-request p50s vary by more between runs of the same library than between libraries, which is why these are medians of 5 full runs rather than a single sample. Numbers were measured with `gpt-5.4` and `claude-sonnet-4-6`; your absolute values will differ by region and time of day.
 
 Run it yourself:
 
@@ -26,7 +28,7 @@ uv run --with litellm --with langchain-anthropic --with langchain-openai \
 
 ## What it does
 
-Send requests through llmshim → it translates to whichever provider you choose → translates the response back. Zero infrastructure, zero databases, ~5MB binary.
+Send requests through llmshim → it translates to whichever provider you choose → translates the response back. Zero infrastructure, zero databases, ~6MB binary.
 
 ```python
 import llmshim
