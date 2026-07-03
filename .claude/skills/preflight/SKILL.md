@@ -20,6 +20,6 @@ cargo test --features proxy --tests
 
 - **`cargo fmt --check`** — non-zero exit means formatting drift. Fix with `cargo fmt` (no `--check`).
 - **`cargo clippy ... -D warnings`** — every warning is an error in CI. Fix the lint; do not blanket-`#[allow]` unless there's a clear reason.
-- **`cargo test --features proxy --tests`** — runs ~326 unit tests including the proxy. `--tests` skips doctests; `--features proxy` is required or proxy tests won't compile. Integration tests (`#[ignore]`, need API keys) are not part of preflight — run `cargo test -- --ignored` separately when you have keys.
+- **`cargo test --features proxy --tests`** — runs ~370 unit tests including the proxy. `--tests` skips doctests; `--features proxy` is required or proxy tests won't compile. Integration tests (`#[ignore]`, need API keys) are not part of preflight — run `cargo test -- --ignored` separately when you have keys.
 
 Report each check's pass/fail plainly. If anything fails, show the relevant output and fix it before proceeding — do not report success on a failing tree.
