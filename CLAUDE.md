@@ -21,7 +21,7 @@ This is a public crate. Do NOT make breaking changes to `pub` items in `src/lib.
 
 ```bash
 cargo build                                          # dev build
-cargo build --release                                # release build (~3.7MB binary)
+cargo build --release                                # release build (~6MB binary)
 cargo test --tests                                   # unit tests (~326)
 cargo test -- --ignored                              # integration tests (needs API keys)
 cargo test --features proxy --tests                  # unit tests including proxy
