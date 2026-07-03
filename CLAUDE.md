@@ -107,3 +107,12 @@ Config: `LLMSHIM_HOST` (default `0.0.0.0`), `LLMSHIM_PORT` (default `3000`)
 ## Detailed reference
 
 Scoped rules in `.claude/rules/` load automatically when working in relevant files.
+
+## Maintainer skills
+
+Common maintenance workflows are packaged as [skills](https://code.claude.com/docs/en/skills) in `.claude/skills/` (see `.claude/skills/README.md`):
+
+- `/add-model provider/id "Label"` — register a new model on an existing provider.
+- `/add-provider key Name` — wire up a brand-new upstream provider.
+- `/preflight` — run the fmt + clippy + test trio CI enforces.
+- `/release 0.1.22` — bump version and tag so CI publishes.
