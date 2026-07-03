@@ -27,6 +27,7 @@ const MODELS: &[(&str, &str)] = &[
     ("xai/grok-4.20-beta-0309-non-reasoning", "Grok 4.20"),
     ("xai/grok-4-1-fast-reasoning", "Grok 4.1 Fast Reasoning"),
     ("xai/grok-4-1-fast-non-reasoning", "Grok 4.1 Fast"),
+    ("xai/grok-4.3", "Grok 4.3"),
 ];
 
 fn print_models(current: &str) {

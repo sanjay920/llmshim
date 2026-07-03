@@ -41,6 +41,15 @@ fn request_sets_model() {
 }
 
 #[test]
+fn request_sets_model_grok_4_3() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["model"], "grok-4.3");
+    assert_eq!(result.url, "https://api.x.ai/v1/responses");
+}
+
+#[test]
 fn request_auth_header() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
