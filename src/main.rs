@@ -7,24 +7,25 @@ use std::io::{self, Write};
 
 const MODELS: &[(&str, &str)] = &[
     ("openai/gpt-5.5", "GPT-5.5"),
+    ("openai/gpt-5.5-pro", "GPT-5.5 Pro"),
     ("openai/gpt-5.4", "GPT-5.4"),
+    ("openai/gpt-5.4-pro", "GPT-5.4 Pro"),
     ("openai/gpt-5.4-mini", "GPT-5.4 Mini"),
     ("openai/gpt-5.4-nano", "GPT-5.4 Nano"),
-    ("openai/gpt-5.5-pro", "GPT-5.5 Pro"),
-    ("openai/gpt-5.4-pro", "GPT-5.4 Pro"),
     ("anthropic/claude-opus-4-8", "Claude Opus 4.8"),
     ("anthropic/claude-sonnet-5", "Claude Sonnet 5"),
     ("anthropic/claude-opus-4-7", "Claude Opus 4.7"),
     ("anthropic/claude-opus-4-6", "Claude Opus 4.6"),
     ("anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6"),
     ("anthropic/claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+    ("gemini/gemini-3.5-flash", "Gemini 3.5 Flash"),
     ("gemini/gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
-    ("gemini/gemini-3-flash-preview", "Gemini 3 Flash"),
     (
         "gemini/gemini-3.1-flash-lite-preview",
         "Gemini 3.1 Flash Lite",
     ),
-    ("gemini/gemini-3.5-flash", "Gemini 3.5 Flash"),
+    ("gemini/gemini-3-flash-preview", "Gemini 3 Flash"),
+    ("xai/grok-4.3", "Grok 4.3"),
     (
         "xai/grok-4.20-multi-agent-beta-0309",
         "Grok 4.20 Multi-Agent",
@@ -33,7 +34,6 @@ const MODELS: &[(&str, &str)] = &[
     ("xai/grok-4.20-beta-0309-non-reasoning", "Grok 4.20"),
     ("xai/grok-4-1-fast-reasoning", "Grok 4.1 Fast Reasoning"),
     ("xai/grok-4-1-fast-non-reasoning", "Grok 4.1 Fast"),
-    ("xai/grok-4.3", "Grok 4.3"),
 ];
 
 fn print_models(current: &str) {

@@ -14,10 +14,22 @@ pub const MODELS: &[ModelInfo] = &[
         label: "GPT-5.5",
     },
     ModelInfo {
+        id: "openai/gpt-5.5-pro",
+        provider: "openai",
+        name: "gpt-5.5-pro",
+        label: "GPT-5.5 Pro",
+    },
+    ModelInfo {
         id: "openai/gpt-5.4",
         provider: "openai",
         name: "gpt-5.4",
         label: "GPT-5.4",
+    },
+    ModelInfo {
+        id: "openai/gpt-5.4-pro",
+        provider: "openai",
+        name: "gpt-5.4-pro",
+        label: "GPT-5.4 Pro",
     },
     ModelInfo {
         id: "openai/gpt-5.4-mini",
@@ -30,18 +42,6 @@ pub const MODELS: &[ModelInfo] = &[
         provider: "openai",
         name: "gpt-5.4-nano",
         label: "GPT-5.4 Nano",
-    },
-    ModelInfo {
-        id: "openai/gpt-5.5-pro",
-        provider: "openai",
-        name: "gpt-5.5-pro",
-        label: "GPT-5.5 Pro",
-    },
-    ModelInfo {
-        id: "openai/gpt-5.4-pro",
-        provider: "openai",
-        name: "gpt-5.4-pro",
-        label: "GPT-5.4 Pro",
     },
     ModelInfo {
         id: "anthropic/claude-opus-4-8",
@@ -80,16 +80,16 @@ pub const MODELS: &[ModelInfo] = &[
         label: "Claude Haiku 4.5",
     },
     ModelInfo {
+        id: "gemini/gemini-3.5-flash",
+        provider: "gemini",
+        name: "gemini-3.5-flash",
+        label: "Gemini 3.5 Flash",
+    },
+    ModelInfo {
         id: "gemini/gemini-3.1-pro-preview",
         provider: "gemini",
         name: "gemini-3.1-pro-preview",
         label: "Gemini 3.1 Pro",
-    },
-    ModelInfo {
-        id: "gemini/gemini-3-flash-preview",
-        provider: "gemini",
-        name: "gemini-3-flash-preview",
-        label: "Gemini 3 Flash",
     },
     ModelInfo {
         id: "gemini/gemini-3.1-flash-lite-preview",
@@ -98,10 +98,16 @@ pub const MODELS: &[ModelInfo] = &[
         label: "Gemini 3.1 Flash Lite",
     },
     ModelInfo {
-        id: "gemini/gemini-3.5-flash",
+        id: "gemini/gemini-3-flash-preview",
         provider: "gemini",
-        name: "gemini-3.5-flash",
-        label: "Gemini 3.5 Flash",
+        name: "gemini-3-flash-preview",
+        label: "Gemini 3 Flash",
+    },
+    ModelInfo {
+        id: "xai/grok-4.3",
+        provider: "xai",
+        name: "grok-4.3",
+        label: "Grok 4.3",
     },
     ModelInfo {
         id: "xai/grok-4.20-multi-agent-beta-0309",
@@ -132,12 +138,6 @@ pub const MODELS: &[ModelInfo] = &[
         provider: "xai",
         name: "grok-4-1-fast-non-reasoning",
         label: "Grok 4.1 Fast",
-    },
-    ModelInfo {
-        id: "xai/grok-4.3",
-        provider: "xai",
-        name: "grok-4.3",
-        label: "Grok 4.3",
     },
 ];
 
