@@ -26,11 +26,31 @@ impl Anthropic {
         m.contains("4-6") || m.contains("4.6") || m.contains("4_6")
     }
 
+    /// Newer Claude families (Opus 4.7/4.8, Sonnet 5) that reject the pre-4.6
+    /// `thinking.type=enabled` path. Verified against the live API: these
+    /// models return HTTP 400 for enabled-thinking and 200 for adaptive.
+    fn is_new_adaptive_family(model: &str) -> bool {
+        let m = model.to_lowercase();
+        m.contains("opus-4-7")
+            || m.contains("opus-4.7")
+            || m.contains("opus-4-8")
+            || m.contains("opus-4.8")
+            || m.contains("sonnet-5")
+    }
+
+    /// Models that must use the adaptive thinking path
+    /// (`thinking:{type:"adaptive"}` + `output_config:{effort}`) rather than the
+    /// pre-4.6 `thinking:{type:"enabled", budget_tokens}` path. Covers Claude 4.6
+    /// and the newer Opus 4.7/4.8 and Sonnet 5 families.
+    fn uses_adaptive_thinking(model: &str) -> bool {
+        Self::is_claude_4_6(model) || Self::is_new_adaptive_family(model)
+    }
+
     /// Models that support the 1M context window beta.
-    /// Opus 4.6, Sonnet 4.6, Sonnet 4.5, and Sonnet 4.
+    /// Opus 4.x, Sonnet 4.x, and Sonnet 5.
     fn supports_1m_context(model: &str) -> bool {
         let m = model.to_lowercase();
-        m.contains("opus-4") || m.contains("sonnet-4")
+        m.contains("opus-4") || m.contains("sonnet-4") || m.contains("sonnet-5")
     }
 
     fn supports_thinking(model: &str) -> bool {
@@ -43,7 +63,8 @@ impl Anthropic {
             || m.contains("claude-sonnet-4")
             || m.contains("claude-opus-4")
             || m.contains("claude-haiku-4")
-            || Self::is_claude_4_6(&m)
+            || m.contains("claude-sonnet-5")
+            || Self::uses_adaptive_thinking(&m)
     }
 }
 
@@ -475,8 +496,9 @@ impl Provider for Anthropic {
         // Handle reasoning_effort -> Anthropic thinking translation
         if let Some(effort) = obj.get("reasoning_effort").and_then(|e| e.as_str()) {
             if Self::supports_thinking(model) && !has_thinking {
-                if Self::is_claude_4_6(model) {
-                    // Claude 4.6: use adaptive thinking with output_config.effort
+                if Self::uses_adaptive_thinking(model) {
+                    // Claude 4.6+ (incl. Opus 4.7/4.8, Sonnet 5): use adaptive
+                    // thinking with output_config.effort
                     body_obj.insert("thinking".to_string(), json!({"type": "adaptive"}));
                     let anthropic_effort = match effort {
                         "low" | "minimal" => "low",

@@ -32,6 +32,24 @@ pub const MODELS: &[ModelInfo] = &[
         label: "GPT-5.4 Nano",
     },
     ModelInfo {
+        id: "anthropic/claude-opus-4-8",
+        provider: "anthropic",
+        name: "claude-opus-4-8",
+        label: "Claude Opus 4.8",
+    },
+    ModelInfo {
+        id: "anthropic/claude-sonnet-5",
+        provider: "anthropic",
+        name: "claude-sonnet-5",
+        label: "Claude Sonnet 5",
+    },
+    ModelInfo {
+        id: "anthropic/claude-opus-4-7",
+        provider: "anthropic",
+        name: "claude-opus-4-7",
+        label: "Claude Opus 4.7",
+    },
+    ModelInfo {
         id: "anthropic/claude-opus-4-6",
         provider: "anthropic",
         name: "claude-opus-4-6",
