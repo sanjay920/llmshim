@@ -121,6 +121,12 @@ pub const MODELS: &[ModelInfo] = &[
         name: "grok-4-1-fast-non-reasoning",
         label: "Grok 4.1 Fast",
     },
+    ModelInfo {
+        id: "xai/grok-4.3",
+        provider: "xai",
+        name: "grok-4.3",
+        label: "Grok 4.3",
+    },
 ];
 
 /// Get models filtered to only providers that are registered (have API keys).
