@@ -9,9 +9,50 @@ Usage:
     print(resp["message"]["content"])
 
 The proxy server starts automatically on first use and stops on exit.
+
+Spec-faithful TypedDicts live in ``llmshim.types`` (also re-exported here) for
+static type-checking of requests, responses, and stream events.
 """
 
-from llmshim._client import chat, stream, models, health, configure
+from llmshim import types
+from llmshim._client import LlmShimError, chat, configure, health, models, stream
+from llmshim.types import (
+    ChatRequest,
+    ChatResponse,
+    Config,
+    ErrorResponse,
+    HealthResponse,
+    Message,
+    ModelEntry,
+    ModelsResponse,
+    ResponseMessage,
+    StreamEvent,
+    ToolCall,
+    Usage,
+)
 
-__all__ = ["chat", "stream", "models", "health", "configure"]
-__version__ = "0.1.20"
+__all__ = [
+    # functions
+    "chat",
+    "stream",
+    "models",
+    "health",
+    "configure",
+    # errors
+    "LlmShimError",
+    # types module + common aliases
+    "types",
+    "ChatRequest",
+    "ChatResponse",
+    "Config",
+    "ErrorResponse",
+    "HealthResponse",
+    "Message",
+    "ModelEntry",
+    "ModelsResponse",
+    "ResponseMessage",
+    "StreamEvent",
+    "ToolCall",
+    "Usage",
+]
+__version__ = "0.1.22"

@@ -1,7 +1,16 @@
 """
 End-to-end test for the llmshim Python package.
 
-Run: python3 test_e2e.py
+WARNING: This is a LIVE integration test. It spawns the real llmshim proxy
+binary and makes REAL, billed calls to provider APIs — it requires configured
+API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY) and costs money.
+It is intentionally NOT part of the mocked unit-test suite in tests/.
+
+For fast, free, offline tests that mock the HTTP layer, run:
+    pytest tests/
+
+Run this live suite only when you deliberately want to hit real APIs:
+    python3 test_e2e.py
 """
 
 import sys
