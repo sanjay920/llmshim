@@ -37,6 +37,7 @@ async-stream = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+mockito = "1"
 
 [[bin]]
 name = "llmshim"
