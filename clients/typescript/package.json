@@ -1,0 +1,46 @@
+{
+  "name": "@llmshim/client",
+  "version": "0.1.0",
+  "description": "Thin, dependency-free TypeScript client for the llmshim proxy (multi-provider LLM API).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "llm",
+    "llmshim",
+    "openai",
+    "anthropic",
+    "gemini",
+    "xai",
+    "proxy",
+    "sse"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sanjay920/llmshim.git",
+    "directory": "clients/typescript"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
