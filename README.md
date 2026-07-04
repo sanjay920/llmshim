@@ -186,6 +186,12 @@ cargo build --release --features redis-coordination
 LLMSHIM_REDIS_URL=redis://my-redis:6379 LLMSHIM_OPENAI_RPM=10000 llmshim proxy
 ```
 
+Verify the shedding behavior yourself — the load-test harness drives the real proxy against a mock upstream (no provider calls, $0) and asserts the concurrency-cap, RPM-shed, and overload paths all shed correctly with `Retry-After`:
+
+```bash
+cargo run --release --features proxy --example loadtest
+```
+
 ### Python client
 
 `pip install llmshim` gives you a Python wrapper that bundles the Rust binary, starts the proxy on first use, and stops it on exit — no server to manage.
