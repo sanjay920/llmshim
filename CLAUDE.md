@@ -58,7 +58,7 @@ Parses `"provider/model"` strings. Auto-infers provider from prefix (`gpt*`/`o*`
 
 ### HTTP Client (`src/client.rs`)
 
-`ShimClient` with shared connection pool (`LazyLock`), HTTP/2, gzip/brotli/zstd compression, TCP keepalive + nodelay. Automatic retry (3 attempts, exponential backoff) on transport errors and 429/500/502/503/504/529 status codes. `warmup()` pre-establishes TCP+TLS connections. `SseStream` buffers bytes, extracts `data:` lines, routes through provider's `transform_stream_chunk`.
+`ShimClient` with shared connection pool (`LazyLock`), HTTP/2, gzip/brotli/zstd compression, TCP keepalive + nodelay. Automatic retry (3 attempts by default) on transport errors and 429/500/502/503/504/529 status codes. This is the **reactive** layer: on a retryable *response* it honors the server's `Retry-After` header (integer seconds or HTTP-date) and provider reset hints (OpenAI `x-ratelimit-reset-*`, Anthropic `anthropic-ratelimit-*-reset`), clamped to a cap and nudged with a little jitter; when there's no server hint (or a transport error) it falls back to full-jitter exponential backoff (uniform in `[0, min(cap, base·2^attempt)]`) to avoid a thundering herd. Tunable via `LLMSHIM_MAX_RETRIES` and `LLMSHIM_MAX_BACKOFF_SECS`. `warmup()` pre-establishes TCP+TLS connections. `SseStream` buffers bytes, extracts `data:` lines, routes through provider's `transform_stream_chunk`.
 
 ### Fallback chains (`src/fallback.rs`)
 
@@ -103,6 +103,30 @@ Request format uses `config` for provider-agnostic settings and `provider_config
 
 Run: `llmshim proxy` (requires `--features proxy` at build time)
 Config: `LLMSHIM_HOST` (default `0.0.0.0`), `LLMSHIM_PORT` (default `3000`)
+
+#### Horizontal scaling / rate limiting (`src/proxy/ratelimit.rs`)
+
+A **proactive** load-shedding layer sits in front of the reactive retry in `client.rs` so a fleet of proxy replicas (Cloud Run / ECS, ~10k concurrent requests across N instances) doesn't collectively blow provider TPM/RPM limits. Three pieces:
+
+1. **`trait RateLimiter`** (`acquire` / `penalize`) — a pluggable token-bucket coordinator held as `Arc<dyn RateLimiter>` in `AppState`. `acquire` returns `Err(RetryAfter(Duration))` on exhaustion (never blocks); `penalize` backs a bucket off after an upstream 429. The pure token-bucket math (`TokenBucket`) is unit-tested with `tokio::time` paused.
+2. **`InMemoryRateLimiter`** (default, zero infra) — per-provider RPM + optional TPM token buckets, refilling continuously. Governs a single instance.
+3. **`RedisRateLimiter`** (opt-in, feature `redis-coordination`) — distributed token bucket via an atomic Redis Lua script (refill-by-timestamp + check-and-decrement), keyed per provider and shared across replicas for a true global limit. Enabled when `LLMSHIM_REDIS_URL` is set *and* the binary was built with `--features redis-coordination`; it connects lazily and **fails open** (admits + logs) if Redis is unreachable. If `LLMSHIM_REDIS_URL` is set but the feature is missing, it logs a warning and falls back to in-memory. The `redis` crate is gated so the default proxy binary stays lean.
+
+Plus a per-instance **concurrency cap + bounded queue** (`Backpressure`, a `tokio::sync::Semaphore`): waiting for a permit is bounded, and on timeout the handler returns **503 + `Retry-After`** instead of growing memory unboundedly. A proactive rate-limit rejection returns **429 + `Retry-After`**. Both are mapped in `src/proxy/error.rs` (existing proxy responses are unchanged — this only adds the headers + new 429/503 backpressure responses).
+
+Env config (all optional, safe defaults; when no RPM/TPM limits are set the limiter is a no-op but the concurrency cap still applies):
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `LLMSHIM_MAX_CONCURRENCY` | `256` | Max in-flight upstream requests per instance. |
+| `LLMSHIM_QUEUE_TIMEOUT_MS` | `5000` | Max wait for a concurrency permit before 503. |
+| `LLMSHIM_RATE_LIMIT_RPM` | unset | Global requests-per-minute limit (per provider). |
+| `LLMSHIM_RATE_LIMIT_TPM` | unset | Global tokens-per-minute limit (estimated from content + `max_tokens`). |
+| `LLMSHIM_<PROVIDER>_RPM` / `_TPM` | unset | Per-provider overrides, e.g. `LLMSHIM_OPENAI_RPM`, `LLMSHIM_ANTHROPIC_TPM`. Inherit the global for any unset field. |
+| `LLMSHIM_REDIS_URL` | unset | Enable distributed coordination (needs `--features redis-coordination`). |
+| `LLMSHIM_PENALTY_SECS` | `5` | Bucket backoff applied after an upstream 429. |
+
+Topologies: **sidecar / zero-infra** (default in-memory limiter — set limits to `global / N` when running N replicas) vs. **Redis-coordinated fleet** (one shared global limit across all replicas).
 
 ## Detailed reference
 

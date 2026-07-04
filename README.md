@@ -154,6 +154,38 @@ curl http://localhost:3000/v1/chat \
 
 Full API spec: [`api/openapi.yaml`](api/openapi.yaml).
 
+### Scaling the proxy
+
+The proxy is built to run as a horizontally-scaled fleet (Cloud Run, ECS, Kubernetes) without hammering provider rate limits. Two layers protect you:
+
+- **Reactive retry** (always on): on an upstream 429/5xx it honors the provider's `Retry-After` header and reset hints, falling back to full-jitter exponential backoff.
+- **Proactive shedding** (this layer): a per-provider token bucket rejects excess load *before* dispatching, and a per-instance concurrency cap sheds with 503 instead of running out of memory. Rejections carry a `Retry-After` header so clients back off cleanly.
+
+All configuration is via env vars — everything optional with safe defaults. With no RPM/TPM limits set, only the concurrency cap applies.
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `LLMSHIM_MAX_CONCURRENCY` | `256` | Max in-flight upstream requests per instance. |
+| `LLMSHIM_QUEUE_TIMEOUT_MS` | `5000` | Max wait for a concurrency slot before returning 503. |
+| `LLMSHIM_RATE_LIMIT_RPM` | unset | Global requests-per-minute limit (per provider). |
+| `LLMSHIM_RATE_LIMIT_TPM` | unset | Global tokens-per-minute limit. |
+| `LLMSHIM_OPENAI_RPM`, `LLMSHIM_ANTHROPIC_TPM`, … | unset | Per-provider overrides (`LLMSHIM_<PROVIDER>_RPM`/`_TPM`). |
+| `LLMSHIM_REDIS_URL` | unset | Enable distributed coordination (see below). |
+
+Two deployment modes:
+
+1. **Sidecar / zero-infra (default).** Each replica limits itself with an in-memory token bucket — no extra services. Running N replicas? Set each instance's limit to `provider_limit / N`.
+2. **Redis-coordinated fleet.** Build with the `redis-coordination` feature and set `LLMSHIM_REDIS_URL`; all replicas share one global token bucket in Redis, so you can set the true provider limit once regardless of replica count. It fails open (keeps serving) if Redis is briefly unreachable.
+
+```bash
+# Zero-infra: cap each instance
+LLMSHIM_MAX_CONCURRENCY=512 LLMSHIM_OPENAI_RPM=1000 llmshim proxy
+
+# Redis-coordinated fleet (build with the feature once)
+cargo build --release --features redis-coordination
+LLMSHIM_REDIS_URL=redis://my-redis:6379 LLMSHIM_OPENAI_RPM=10000 llmshim proxy
+```
+
 ### Python client
 
 `pip install llmshim` gives you a Python wrapper that bundles the Rust binary, starts the proxy on first use, and stops it on exit — no server to manage.
