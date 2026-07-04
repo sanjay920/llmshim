@@ -33,7 +33,7 @@ resp = llmshim.chat("claude-sonnet-4-6", "What is Rust?")
 print(resp["message"]["content"])
 ```
 
-With options:
+With options (all map to the API's provider-agnostic `config`):
 
 ```python
 resp = llmshim.chat(
@@ -41,6 +41,10 @@ resp = llmshim.chat(
     "Explain quicksort",
     max_tokens=500,
     temperature=0.7,
+    top_p=0.9,
+    top_k=40,
+    stop=["\n\n"],
+    reasoning_effort="high",
 )
 ```
 
@@ -129,6 +133,40 @@ resp = llmshim.chat(
 )
 ```
 
+## Error Handling
+
+Non-streaming errors (bad model, unknown provider, provider failures) raise
+`LlmShimError`, which carries the API's structured `error` fields:
+
+```python
+try:
+    llmshim.chat("unknown/model", "hi")
+except llmshim.LlmShimError as e:
+    print(e.status_code)  # 400
+    print(e.code)         # "bad_request"
+    print(e.message)      # human-readable message
+```
+
+Streaming errors that occur mid-stream instead arrive as an `error` event
+(`event["type"] == "error"`); an HTTP error before the stream starts still
+raises `LlmShimError`.
+
+## Types
+
+Spec-faithful `TypedDict` definitions are available in `llmshim.types` (and the
+common ones are re-exported at the top level) for static type-checking:
+
+```python
+from llmshim.types import ChatResponse, StreamEvent, Message, Config
+
+resp: ChatResponse = llmshim.chat("claude-sonnet-4-6", "hi")
+```
+
+Available: `ChatRequest`, `ChatResponse`, `Config`, `Message`, `ToolCall`,
+`Usage`, `ResponseMessage`, `ModelEntry`, `ModelsResponse`, `HealthResponse`,
+`ErrorResponse`, and the `StreamEvent` union (`ContentEvent`, `ReasoningEvent`,
+`ToolCallEvent`, `UsageEvent`, `DoneEvent`, `ErrorEvent`).
+
 ## Other
 
 ```python
@@ -146,11 +184,27 @@ On first call, the package:
 
 No Docker, no background services, no manual server management.
 
+## Development
+
+The unit tests under `tests/` are fully mocked — they run a local HTTP server
+returning canned JSON and SSE, so they need no API keys and make no real
+provider calls:
+
+```bash
+pip install httpx pytest
+pytest tests/
+```
+
+`test_e2e.py` is a separate LIVE suite that spawns the real binary and makes
+billed provider calls; run it only when you deliberately want to hit real APIs.
+
 ## Supported Models
 
 | Provider | Models |
 |----------|--------|
-| OpenAI | `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano` |
-| Anthropic | `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` |
-| Gemini | `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview` |
-| xAI | `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`, `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning` |
+| OpenAI | `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano` |
+| Anthropic | `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` |
+| Gemini | `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite-preview`, `gemini-3-flash-preview` |
+| xAI | `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`, `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning` |
+
+Call `llmshim.models()` for the live list filtered to your configured providers.
