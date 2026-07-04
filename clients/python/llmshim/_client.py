@@ -10,15 +10,45 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Generator, Optional
+from typing import Any, Generator, List, Optional, Union
 
 import httpx
 
 from llmshim._server import ensure_server
+from llmshim.types import (
+    ChatResponse,
+    HealthResponse,
+    Message,
+    ModelEntry,
+    ReasoningEffort,
+    StreamEvent,
+)
 
 _base_url: Optional[str] = None
 _http: Optional[httpx.Client] = None
 _timeout: float = 120.0
+
+
+class LlmShimError(Exception):
+    """Raised when the proxy returns an error response.
+
+    Mirrors the spec's ``ErrorResponse`` shape. ``code`` and ``message`` come
+    from the ``error`` object when the body is a structured error; otherwise
+    they fall back to the raw response text.
+
+    Attributes:
+        code: Machine-readable error code (e.g., "bad_request").
+        message: Human-readable error message.
+        status_code: HTTP status code of the response.
+    """
+
+    def __init__(self, message: str, *, code: str = "error", status_code: int = 0):
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        super().__init__(
+            f"[{status_code} {code}] {message}" if status_code else message
+        )
 
 
 def _get_base_url() -> str:
@@ -33,6 +63,23 @@ def _get_http() -> httpx.Client:
     if _http is None:
         _http = httpx.Client(timeout=_timeout)
     return _http
+
+
+def _raise_for_error(resp: httpx.Response) -> None:
+    """Raise LlmShimError if the response is an error, parsing ErrorResponse."""
+    if resp.status_code < 400:
+        return
+    code = "error"
+    message = resp.text
+    try:
+        body = resp.json()
+        err = body.get("error") if isinstance(body, dict) else None
+        if isinstance(err, dict):
+            code = err.get("code", code)
+            message = err.get("message", message)
+    except (ValueError, json.JSONDecodeError):
+        pass
+    raise LlmShimError(message, code=code, status_code=resp.status_code)
 
 
 def configure(
@@ -114,25 +161,89 @@ def configure(
     _base_url = None
 
 
+def _build_body(
+    model: str,
+    messages: Union[str, List[Message]],
+    *,
+    max_tokens: Optional[int],
+    temperature: Optional[float],
+    top_p: Optional[float],
+    top_k: Optional[int],
+    stop: Optional[List[str]],
+    reasoning_effort: Optional[ReasoningEffort],
+    tools: Optional[List[dict]],
+    tool_choice: Optional[Any],
+    provider_config: Optional[dict],
+    fallback: Optional[List[str]],
+    stream: bool = False,
+) -> dict[str, Any]:
+    """Build a spec-faithful ChatRequest body."""
+    if isinstance(messages, str):
+        msgs: List[Any] = [{"role": "user", "content": messages}]
+    else:
+        msgs = messages
+
+    body: dict[str, Any] = {"model": model, "messages": msgs}
+    if stream:
+        body["stream"] = True
+
+    # config — provider-agnostic settings
+    config: dict[str, Any] = {}
+    if max_tokens is not None:
+        config["max_tokens"] = max_tokens
+    if temperature is not None:
+        config["temperature"] = temperature
+    if top_p is not None:
+        config["top_p"] = top_p
+    if top_k is not None:
+        config["top_k"] = top_k
+    if stop is not None:
+        config["stop"] = stop
+    if reasoning_effort is not None:
+        config["reasoning_effort"] = reasoning_effort
+    if config:
+        body["config"] = config
+
+    # Tools go in provider_config (passed through to the provider).
+    pc = dict(provider_config) if provider_config else {}
+    if tools is not None:
+        pc["tools"] = tools
+    if tool_choice is not None:
+        pc["tool_choice"] = tool_choice
+    if pc:
+        body["provider_config"] = pc
+
+    if fallback is not None:
+        body["fallback"] = fallback
+
+    return body
+
+
 def chat(
     model: str,
-    messages: str | list[dict[str, Any]],
+    messages: Union[str, List[Message]],
     *,
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
-    reasoning_effort: Optional[str] = None,
-    tools: Optional[list[dict[str, Any]]] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    stop: Optional[List[str]] = None,
+    reasoning_effort: Optional[ReasoningEffort] = None,
+    tools: Optional[List[dict]] = None,
     tool_choice: Optional[Any] = None,
-    provider_config: Optional[dict[str, Any]] = None,
-    fallback: Optional[list[str]] = None,
-) -> dict[str, Any]:
+    provider_config: Optional[dict] = None,
+    fallback: Optional[List[str]] = None,
+) -> ChatResponse:
     """Send a chat completion request.
 
     Args:
         model: Model ID (e.g., "anthropic/claude-sonnet-4-6" or "claude-sonnet-4-6")
         messages: A string (single user message) or list of message dicts
         max_tokens: Maximum output tokens
-        temperature: Sampling temperature
+        temperature: Sampling temperature (0–2)
+        top_p: Nucleus sampling probability
+        top_k: Top-k sampling
+        stop: Stop sequences
         reasoning_effort: "low", "medium", or "high"
         tools: Tool definitions (Chat Completions format — auto-translated per provider)
         tool_choice: Tool selection ("auto", "required", "none", or specific tool)
@@ -140,94 +251,80 @@ def chat(
         fallback: Ordered list of fallback model IDs
 
     Returns:
-        Response dict with keys: id, model, provider, message, usage, latency_ms
+        A ChatResponse dict with keys: id, model, provider, message, usage,
+        latency_ms, and optionally reasoning.
+
+    Raises:
+        LlmShimError: If the proxy returns an error (e.g., 400, 502).
 
     Usage:
         resp = llmshim.chat("claude-sonnet-4-6", "What is Rust?")
         print(resp["message"]["content"])
     """
-    if isinstance(messages, str):
-        msgs = [{"role": "user", "content": messages}]
-    else:
-        msgs = messages
-
-    body: dict[str, Any] = {"model": model, "messages": msgs}
-
-    config: dict[str, Any] = {}
-    if max_tokens is not None:
-        config["max_tokens"] = max_tokens
-    if temperature is not None:
-        config["temperature"] = temperature
-    if reasoning_effort is not None:
-        config["reasoning_effort"] = reasoning_effort
-    if config:
-        body["config"] = config
-
-    # Tools go in provider_config (the proxy passes them through to the provider)
-    pc = dict(provider_config) if provider_config else {}
-    if tools is not None:
-        pc["tools"] = tools
-    if tool_choice is not None:
-        pc["tool_choice"] = tool_choice
-    if pc:
-        body["provider_config"] = pc
-
-    if fallback is not None:
-        body["fallback"] = fallback
+    body = _build_body(
+        model,
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        stop=stop,
+        reasoning_effort=reasoning_effort,
+        tools=tools,
+        tool_choice=tool_choice,
+        provider_config=provider_config,
+        fallback=fallback,
+    )
 
     resp = _get_http().post(f"{_get_base_url()}/v1/chat", json=body)
-    resp.raise_for_status()
+    _raise_for_error(resp)
     return resp.json()
 
 
 def stream(
     model: str,
-    messages: str | list[dict[str, Any]],
+    messages: Union[str, List[Message]],
     *,
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
-    reasoning_effort: Optional[str] = None,
-    tools: Optional[list[dict[str, Any]]] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    stop: Optional[List[str]] = None,
+    reasoning_effort: Optional[ReasoningEffort] = None,
+    tools: Optional[List[dict]] = None,
     tool_choice: Optional[Any] = None,
-    provider_config: Optional[dict[str, Any]] = None,
-    fallback: Optional[list[str]] = None,
-) -> Generator[dict[str, Any], None, None]:
+    provider_config: Optional[dict] = None,
+    fallback: Optional[List[str]] = None,
+) -> Generator[StreamEvent, None, None]:
     """Stream a chat completion. Yields typed event dicts.
 
-    Event types: content, reasoning, tool_call, usage, done, error
+    Event types: content, reasoning, tool_call, usage, done, error.
+    Each yielded dict has a ``type`` key matching the SSE ``event:`` field.
+
+    Raises:
+        LlmShimError: If the endpoint itself returns an HTTP error before the
+            stream begins. Provider errors mid-stream arrive as an ``error``
+            event rather than an exception.
 
     Usage:
         for event in llmshim.stream("claude-sonnet-4-6", "Write a poem"):
             if event["type"] == "content":
                 print(event["text"], end="")
     """
-    if isinstance(messages, str):
-        msgs = [{"role": "user", "content": messages}]
-    else:
-        msgs = messages
-
-    body: dict[str, Any] = {"model": model, "messages": msgs}
-
-    config: dict[str, Any] = {}
-    if max_tokens is not None:
-        config["max_tokens"] = max_tokens
-    if temperature is not None:
-        config["temperature"] = temperature
-    if reasoning_effort is not None:
-        config["reasoning_effort"] = reasoning_effort
-    if config:
-        body["config"] = config
-
-    pc = dict(provider_config) if provider_config else {}
-    if tools is not None:
-        pc["tools"] = tools
-    if tool_choice is not None:
-        pc["tool_choice"] = tool_choice
-    if pc:
-        body["provider_config"] = pc
-
-    if fallback is not None:
-        body["fallback"] = fallback
+    body = _build_body(
+        model,
+        messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        stop=stop,
+        reasoning_effort=reasoning_effort,
+        tools=tools,
+        tool_choice=tool_choice,
+        provider_config=provider_config,
+        fallback=fallback,
+    )
 
     with httpx.stream(
         "POST",
@@ -235,7 +332,9 @@ def stream(
         json=body,
         timeout=_timeout,
     ) as resp:
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            resp.read()
+            _raise_for_error(resp)
         current_event = ""
         for line in resp.iter_lines():
             if line.startswith("event: "):
@@ -244,25 +343,28 @@ def stream(
                 data = json.loads(line[6:])
                 data["type"] = current_event or data.get("type", "")
                 yield data
+            elif line == "":
+                # Blank line terminates an SSE event.
+                current_event = ""
 
 
-def models() -> list[dict[str, str]]:
+def models() -> List[ModelEntry]:
     """List available models.
 
     Returns:
-        List of dicts with keys: id, provider, name
+        List of ModelEntry dicts with keys: id, provider, name.
     """
     resp = _get_http().get(f"{_get_base_url()}/v1/models")
-    resp.raise_for_status()
+    _raise_for_error(resp)
     return resp.json()["models"]
 
 
-def health() -> dict[str, Any]:
+def health() -> HealthResponse:
     """Health check.
 
     Returns:
-        Dict with keys: status, providers
+        A HealthResponse dict with keys: status, providers.
     """
     resp = _get_http().get(f"{_get_base_url()}/health")
-    resp.raise_for_status()
+    _raise_for_error(resp)
     return resp.json()
