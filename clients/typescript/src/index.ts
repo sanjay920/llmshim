@@ -1,13 +1,14 @@
 /**
  * llmshim TypeScript client.
  *
- * A thin, dependency-free HTTP client for the llmshim proxy. Talks to a running
- * proxy over HTTP (default http://localhost:3000). It does NOT spawn or bundle
- * the Rust binary — start the proxy separately with `llmshim proxy`.
+ * A dependency-free HTTP client for the llmshim proxy. If you don't pass a
+ * `baseUrl`, it bundles and auto-starts a prebuilt proxy binary for your
+ * platform (like the Python client) — nothing to run yourself. Pass an
+ * explicit `baseUrl` to talk to a proxy you're already running instead.
  *
  * @example
  * import { Client } from "llmshim";
- * const client = new Client();
+ * const client = new Client(); // auto-starts the bundled proxy on first request
  * const res = await client.chat({
  *   model: "anthropic/claude-sonnet-4-6",
  *   messages: [{ role: "user", content: "Hello!" }],
@@ -16,6 +17,7 @@
  */
 
 export * from "./types.js";
+export { ensureServer, platformPackageName } from "./server.js";
 
 import type {
   ChatRequest,
@@ -25,13 +27,18 @@ import type {
   ModelsResponse,
   StreamEvent,
 } from "./types.js";
+import { ensureServer } from "./server.js";
 
 /** A `fetch` implementation. Defaults to the global `fetch` (Node 18+). */
 export type FetchLike = typeof fetch;
 
 /** Options for constructing a {@link Client}. */
 export interface ClientOptions {
-  /** Base URL of the running proxy. Defaults to `http://localhost:3000`. */
+  /**
+   * Base URL of a proxy you're already running. If omitted, the client
+   * bundles and auto-starts a prebuilt proxy binary on the first request
+   * (see {@link ensureServer}) instead of assuming a fixed default.
+   */
   baseUrl?: string;
   /** Custom fetch implementation. Defaults to the global `fetch`. */
   fetch?: FetchLike;
@@ -59,12 +66,15 @@ export class LlmshimError extends Error {
 
 /** HTTP client for the llmshim proxy. */
 export class Client {
-  private readonly baseUrl: string;
+  /** Set only when an explicit `baseUrl` was passed at construction. */
+  private readonly explicitBaseUrl: string | undefined;
+  /** Memoized auto-start resolution, shared across calls on this instance. */
+  private autoBaseUrl: Promise<string> | undefined;
   private readonly fetchImpl: FetchLike;
   private readonly headers: Record<string, string>;
 
   constructor(options: ClientOptions = {}) {
-    this.baseUrl = (options.baseUrl ?? "http://localhost:3000").replace(/\/+$/, "");
+    this.explicitBaseUrl = options.baseUrl?.replace(/\/+$/, "");
     const f = options.fetch ?? globalThis.fetch;
     if (typeof f !== "function") {
       throw new Error(
@@ -74,6 +84,18 @@ export class Client {
     // Bind to preserve `this` for the global fetch.
     this.fetchImpl = f === globalThis.fetch ? f.bind(globalThis) : f;
     this.headers = { ...options.headers };
+  }
+
+  /**
+   * Resolve the base URL to use for the next request: the explicit `baseUrl`
+   * if one was given at construction, otherwise the bundled proxy's URL
+   * (starting it on first call). Memoized so the bundled proxy is only
+   * started once per `Client` instance.
+   */
+  private resolveBaseUrl(): Promise<string> {
+    if (this.explicitBaseUrl) return Promise.resolve(this.explicitBaseUrl);
+    if (!this.autoBaseUrl) this.autoBaseUrl = ensureServer();
+    return this.autoBaseUrl;
   }
 
   /**
@@ -119,8 +141,9 @@ export class Client {
     return (await res.json()) as HealthResponse;
   }
 
-  private post(path: string, body: unknown): Promise<Response> {
-    return this.fetchImpl(this.baseUrl + path, {
+  private async post(path: string, body: unknown): Promise<Response> {
+    const baseUrl = await this.resolveBaseUrl();
+    return this.fetchImpl(baseUrl + path, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -131,8 +154,9 @@ export class Client {
     });
   }
 
-  private get(path: string): Promise<Response> {
-    return this.fetchImpl(this.baseUrl + path, {
+  private async get(path: string): Promise<Response> {
+    const baseUrl = await this.resolveBaseUrl();
+    return this.fetchImpl(baseUrl + path, {
       method: "GET",
       headers: { accept: "application/json", ...this.headers },
     });

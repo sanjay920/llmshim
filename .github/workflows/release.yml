@@ -140,12 +140,173 @@ jobs:
               --field content="$(base64 -i /tmp/llmshim.rb)"
           fi
 
+  # --- Build + publish the platform-specific npm binary packages ---
+  # The TS client bundles a prebuilt binary the same way the Python client
+  # does (via maturin). npm has no maturin equivalent, so this follows the
+  # standard npm pattern for native binaries (esbuild, swc, turborepo): one
+  # tiny package per os/cpu combo, gated by "os"/"cpu" fields, installed
+  # automatically as an optionalDependency of the root `llmshim` package.
+  #
+  # Each of these 5 packages needs its own Trusted Publisher configured on
+  # npmjs.com once (same values as the root package: repo sanjay920/llmshim,
+  # workflow release.yml, environment release) — see clients/typescript/README.md.
+  npm-macos-binaries:
+    needs: test
+    runs-on: macos-14
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Verify versions match the release tag
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          for pkg in llmshim-darwin-arm64 llmshim-darwin-x64; do
+            PKG_VERSION=$(node -p "require('./clients/typescript/packages/$pkg/package.json').version")
+            if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+              echo "::error::$pkg version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+              exit 1
+            fi
+          done
+      - name: Build arm64 + x64
+        run: |
+          cargo build --release --features proxy --target aarch64-apple-darwin
+          cargo build --release --features proxy --target x86_64-apple-darwin
+      - name: Publish llmshim-darwin-arm64
+        working-directory: clients/typescript/packages/llmshim-darwin-arm64
+        run: |
+          cp "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/llmshim" bin/llmshim
+          chmod +x bin/llmshim
+          npm publish --access public --provenance
+      - name: Publish llmshim-darwin-x64
+        working-directory: clients/typescript/packages/llmshim-darwin-x64
+        run: |
+          cp "$GITHUB_WORKSPACE/target/x86_64-apple-darwin/release/llmshim" bin/llmshim
+          chmod +x bin/llmshim
+          npm publish --access public --provenance
+
+  npm-linux-x64-binary:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Verify version matches the release tag
+        working-directory: clients/typescript/packages/llmshim-linux-x64
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::llmshim-linux-x64 version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+            exit 1
+          fi
+      - name: Build
+        run: cargo build --release --features proxy --target x86_64-unknown-linux-gnu
+      - name: Publish llmshim-linux-x64
+        working-directory: clients/typescript/packages/llmshim-linux-x64
+        run: |
+          cp $GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/llmshim bin/llmshim
+          chmod +x bin/llmshim
+          npm publish --access public --provenance
+
+  # Native arm64 runner (GA, free on public repos) — no cross-compilation needed.
+  npm-linux-arm64-binary:
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Verify version matches the release tag
+        working-directory: clients/typescript/packages/llmshim-linux-arm64
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::llmshim-linux-arm64 version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+            exit 1
+          fi
+      - name: Build
+        run: cargo build --release --features proxy --target aarch64-unknown-linux-gnu
+      - name: Publish llmshim-linux-arm64
+        working-directory: clients/typescript/packages/llmshim-linux-arm64
+        run: |
+          cp $GITHUB_WORKSPACE/target/aarch64-unknown-linux-gnu/release/llmshim bin/llmshim
+          chmod +x bin/llmshim
+          npm publish --access public --provenance
+
+  npm-windows-binary:
+    needs: test
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Verify version matches the release tag
+        shell: bash
+        working-directory: clients/typescript/packages/llmshim-win32-x64
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::llmshim-win32-x64 version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+            exit 1
+          fi
+      - name: Build
+        shell: bash
+        run: cargo build --release --features proxy --target x86_64-pc-windows-msvc
+      - name: Publish llmshim-win32-x64
+        shell: bash
+        working-directory: clients/typescript/packages/llmshim-win32-x64
+        run: |
+          cp "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/llmshim.exe" bin/llmshim.exe
+          npm publish --access public --provenance
+
   # --- Publish TypeScript client to npm ---
   # First release must be published manually once (npm's trusted-publisher UI
   # requires the package to already exist); every release after that publishes
-  # here via OIDC, no token stored. See clients/typescript/README.md.
+  # here via OIDC, no token stored. See clients/typescript/README.md. Depends
+  # on the binary packages above so `optionalDependencies` resolve to a real,
+  # already-published version by the time this installs/publishes.
   npm:
-    needs: test
+    needs:
+      - test
+      - npm-macos-binaries
+      - npm-linux-x64-binary
+      - npm-linux-arm64-binary
+      - npm-windows-binary
     runs-on: ubuntu-latest
     environment: release
     permissions:
