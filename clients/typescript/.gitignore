@@ -1,3 +1,5 @@
 node_modules/
 dist/
 *.tsbuildinfo
+packages/*/bin/llmshim
+packages/*/bin/llmshim.exe
