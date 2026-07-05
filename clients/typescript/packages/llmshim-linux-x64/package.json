@@ -1,0 +1,14 @@
+{
+  "name": "llmshim-linux-x64",
+  "version": "0.1.23",
+  "description": "llmshim proxy binary (Linux x64). Installed automatically as an optional dependency of the `llmshim` package — you should not need to depend on this directly.",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["bin"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sanjay920/llmshim.git",
+    "directory": "clients/typescript/packages/llmshim-linux-x64"
+  }
+}

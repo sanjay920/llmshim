@@ -284,7 +284,7 @@ resp = llmshim.chat(
 
 ### TypeScript / JavaScript client
 
-`npm install llmshim` gives you a thin, dependency-free client. Unlike the Python package it does not bundle the Rust binary — start the proxy yourself first (`llmshim proxy`).
+`npm install llmshim` bundles a prebuilt proxy binary for your platform (same idea as the Python package) and auto-starts it on first use — nothing to run yourself. Pass an explicit `baseUrl` instead to connect to a proxy you're already running.
 
 ```bash
 npm install llmshim
@@ -293,7 +293,7 @@ npm install llmshim
 ```typescript
 import { Client } from "llmshim";
 
-const client = new Client(); // defaults to http://localhost:3000
+const client = new Client(); // no baseUrl -> auto-starts the bundled proxy
 const res = await client.chat({
   model: "anthropic/claude-sonnet-4-6",
   messages: [{ role: "user", content: "Hello!" }],
