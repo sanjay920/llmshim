@@ -33,11 +33,14 @@ git log --oneline $(git describe --tags --abbrev=0)..HEAD
 
 1. **Bump the version** in `Cargo.toml` (`version = "$ARGUMENTS"`).
 2. **Update `Cargo.lock`** — run `cargo build` (or `cargo build --features proxy`) so the lockfile's llmshim entry matches. Both `Cargo.toml` and `Cargo.lock` change; the release commit should include both (see commit `c393418`).
-3. **Bump the client versions to match** — the `npm` and `rubygems` CI jobs verify these against the tag and fail the release if they drift:
-   - `clients/typescript/package.json` — `"version": "$ARGUMENTS"`
+3. **Bump the client versions to match** — the `npm*`/`rubygems` CI jobs verify these against the tag and fail the release if they drift:
+   - `clients/typescript/package.json` — `"version": "$ARGUMENTS"`, AND its `optionalDependencies` block (all 5 entries) to `"$ARGUMENTS"`.
+   - `clients/typescript/packages/*/package.json` (5 platform packages: darwin-arm64, darwin-x64, linux-x64, linux-arm64, win32-x64) — `"version": "$ARGUMENTS"` in each.
    - `clients/ruby/lib/llmshim/version.rb` — `VERSION = "$ARGUMENTS"`
    - Python's version is derived automatically from `Cargo.toml` by maturin — no separate file to bump.
    - Go has no in-file version — `go-tag` tags `clients/go/v$ARGUMENTS` from the release commit automatically.
+
+   The 5 platform packages must publish successfully before the root `npm` job runs (`optionalDependencies` need a real published version to resolve) — this ordering is already encoded in `release.yml`'s `needs:` graph, nothing to do here beyond bumping all the version files together.
 4. **Preflight** — run the CI gate locally (this is what blocks the release job on failure):
    ```
    cargo fmt --check
@@ -52,7 +55,7 @@ git log --oneline $(git describe --tags --abbrev=0)..HEAD
    git tag v$ARGUMENTS
    git push origin v$ARGUMENTS
    ```
-7. **Watch CI** — `test` gates everything; `crates-io` / `github-release` / `npm` / `rubygems` / `go-tag` / `sdist`+wheels→`pypi` all run independently off it, so one failing (e.g. npm before trusted publishing is configured) doesn't block the others. If `test` fails the tag published nothing; fix, delete the tag, and re-tag.
+7. **Watch CI** — `test` gates everything; `crates-io` / `github-release` / `npm-macos-binaries` / `npm-linux-x64-binary` / `npm-linux-arm64-binary` / `npm-windows-binary` → `npm` / `rubygems` / `go-tag` / `sdist`+wheels→`pypi` all run independently off it (the npm binary jobs must succeed before the root `npm` job, since its `optionalDependencies` need a real published version to resolve), so one failing doesn't block the others. If `test` fails the tag published nothing; fix, delete the tag, and re-tag.
 
 ## Do not
 
