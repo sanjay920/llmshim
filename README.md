@@ -282,6 +282,58 @@ resp = llmshim.chat(
 
 > These capabilities (streaming, multi-model, tools, reasoning, fallback) are all provided by the Rust core, so they work identically from the Rust crate and the proxy — the Python snippets above are just the most concise way to show them.
 
+### TypeScript / JavaScript client
+
+`npm install llmshim` gives you a thin, dependency-free client. Unlike the Python package it does not bundle the Rust binary — start the proxy yourself first (`llmshim proxy`).
+
+```bash
+npm install llmshim
+```
+
+```typescript
+import { Client } from "llmshim";
+
+const client = new Client(); // defaults to http://localhost:3000
+const res = await client.chat({
+  model: "anthropic/claude-sonnet-4-6",
+  messages: [{ role: "user", content: "Hello!" }],
+});
+console.log(res.message.content);
+```
+
+Full docs: [`clients/typescript/README.md`](clients/typescript/README.md).
+
+### Go client
+
+```bash
+go get github.com/sanjay920/llmshim/clients/go
+```
+
+```go
+client := llmshim.New() // defaults to http://localhost:3000
+resp, err := client.Chat(ctx, llmshim.ChatRequest{
+    Model:    "anthropic/claude-sonnet-4-6",
+    Messages: []llmshim.Message{{Role: "user", Content: "Hello!"}},
+})
+```
+
+Standard library only. Full docs: [`clients/go/README.md`](clients/go/README.md).
+
+### Ruby client
+
+```bash
+gem install llmshim
+```
+
+```ruby
+require "llmshim"
+
+resp = Llmshim.chat(model: "anthropic/claude-sonnet-4-6", messages: [{role: "user", content: "Hello!"}])
+puts resp.message.content
+```
+
+Standard library only. Full docs: [`clients/ruby/README.md`](clients/ruby/README.md).
+
 ---
 
 ## Supported models

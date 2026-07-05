@@ -1,6 +1,6 @@
 {
-  "name": "@llmshim/client",
-  "version": "0.1.0",
+  "name": "llmshim",
+  "version": "0.1.23",
   "description": "Thin, dependency-free TypeScript client for the llmshim proxy (multi-provider LLM API).",
   "type": "module",
   "main": "./dist/index.js",
