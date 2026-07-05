@@ -1,7 +1,7 @@
 {
   "name": "llmshim",
   "version": "0.1.23",
-  "description": "Thin, dependency-free TypeScript client for the llmshim proxy (multi-provider LLM API).",
+  "description": "TypeScript client for the llmshim proxy (multi-provider LLM API) — bundles a prebuilt binary and auto-starts it, or connects to a proxy you run yourself.",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -18,6 +18,13 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "optionalDependencies": {
+    "llmshim-darwin-arm64": "0.1.23",
+    "llmshim-darwin-x64": "0.1.23",
+    "llmshim-linux-x64": "0.1.23",
+    "llmshim-linux-arm64": "0.1.23",
+    "llmshim-win32-x64": "0.1.23"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -41,6 +48,7 @@
     "directory": "clients/typescript"
   },
   "devDependencies": {
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "@types/node": "^22.0.0"
   }
 }
