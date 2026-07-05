@@ -1,4 +1,4 @@
-# @llmshim/client
+# llmshim
 
 Thin, **dependency-free** TypeScript/JavaScript client for the [llmshim](https://crates.io/crates/llmshim) proxy.
 
@@ -15,13 +15,13 @@ llmshim proxy            # requires a build with --features proxy
 ## Install
 
 ```bash
-npm install @llmshim/client
+npm install llmshim
 ```
 
 ## 30-second quickstart
 
 ```ts
-import { Client } from "@llmshim/client";
+import { Client } from "llmshim";
 
 const client = new Client(); // defaults to http://localhost:3000
 
@@ -65,7 +65,7 @@ Non-2xx responses throw a typed `LlmshimError` carrying `status`, `code`, and `m
 (parsed from the proxy's `{ error: { code, message } }` envelope):
 
 ```ts
-import { LlmshimError } from "@llmshim/client";
+import { LlmshimError } from "llmshim";
 
 try {
   await client.chat({ model: "", messages: [] });

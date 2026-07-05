@@ -140,6 +140,105 @@ jobs:
               --field content="$(base64 -i /tmp/llmshim.rb)"
           fi
 
+  # --- Publish TypeScript client to npm ---
+  # First release must be published manually once (npm's trusted-publisher UI
+  # requires the package to already exist); every release after that publishes
+  # here via OIDC, no token stored. See clients/typescript/README.md.
+  npm:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Verify package.json version matches the release tag
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::clients/typescript/package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+
+  # --- Publish Ruby client to RubyGems ---
+  # Uses a "pending trusted publisher" — configurable on rubygems.org before
+  # the gem's first-ever release, no manual bootstrap publish needed.
+  rubygems:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: clients/ruby
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Verify version.rb matches the release tag
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          GEM_VERSION=$(ruby -Ilib -e 'require "llmshim/version"; print Llmshim::VERSION')
+          if [ "$TAG_VERSION" != "$GEM_VERSION" ]; then
+            echo "::error::clients/ruby/lib/llmshim/version.rb ($GEM_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+            exit 1
+          fi
+      - name: Run tests
+        run: rake test
+      - name: Configure RubyGems credentials (OIDC trusted publishing)
+        uses: rubygems/configure-rubygems-credentials@v2
+      - name: Build gem
+        run: gem build llmshim.gemspec
+      - name: Push gem
+        run: gem push llmshim-*.gem
+
+  # --- Tag the Go client module for a clean `go get` version ---
+  # `go get github.com/sanjay920/llmshim/clients/go` already works today via
+  # Go's VCS auto-fetch (no registry to publish to), but without a tag of the
+  # form "clients/go/vX.Y.Z" it resolves an ugly pseudo-version. This job adds
+  # that tag on every release so `go get .../clients/go@latest` resolves clean
+  # semver matching the crate version.
+  go-tag:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: clients/go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+      - name: Build, vet, and test the Go client
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+      - name: Tag the Go module
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          GO_TAG="clients/go/v${VERSION}"
+          git tag "$GO_TAG"
+          git push origin "$GO_TAG"
+
   # --- Build PyPI source distribution ---
   sdist:
     needs: test
