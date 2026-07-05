@@ -6,7 +6,7 @@
  * the Rust binary — start the proxy separately with `llmshim proxy`.
  *
  * @example
- * import { Client } from "@llmshim/client";
+ * import { Client } from "llmshim";
  * const client = new Client();
  * const res = await client.chat({
  *   model: "anthropic/claude-sonnet-4-6",
