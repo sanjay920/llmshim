@@ -183,6 +183,8 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        run: npm install -g npm@latest
       - name: Verify versions match the release tag
         run: |
           TAG_VERSION=${GITHUB_REF_NAME#v}
@@ -225,6 +227,8 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        run: npm install -g npm@latest
       - name: Verify version matches the release tag
         working-directory: clients/typescript/packages/llmshim-linux-x64
         run: |
@@ -259,6 +263,8 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        run: npm install -g npm@latest
       - name: Verify version matches the release tag
         working-directory: clients/typescript/packages/llmshim-linux-arm64
         run: |
@@ -292,6 +298,9 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        shell: bash
+        run: npm install -g npm@latest
       - name: Verify version matches the release tag
         shell: bash
         working-directory: clients/typescript/packages/llmshim-win32-x64
@@ -338,6 +347,8 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        run: npm install -g npm@latest
       - name: Verify package.json version matches the release tag
         run: |
           TAG_VERSION=${GITHUB_REF_NAME#v}
@@ -370,6 +381,7 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.3"
+          bundler-cache: true
       - name: Verify version.rb matches the release tag
         run: |
           TAG_VERSION=${GITHUB_REF_NAME#v}
@@ -379,7 +391,7 @@ jobs:
             exit 1
           fi
       - name: Run tests
-        run: rake test
+        run: bundle exec rake test
       - name: Configure RubyGems credentials (OIDC trusted publishing)
         uses: rubygems/configure-rubygems-credentials@v2.1.0
       - name: Build gem
