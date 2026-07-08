@@ -1,10 +1,16 @@
 {
   "name": "llmshim-darwin-arm64",
-  "version": "0.1.23",
+  "version": "0.1.24",
   "description": "llmshim proxy binary (macOS arm64). Installed automatically as an optional dependency of the `llmshim` package — you should not need to depend on this directly.",
-  "os": ["darwin"],
-  "cpu": ["arm64"],
-  "files": ["bin"],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
