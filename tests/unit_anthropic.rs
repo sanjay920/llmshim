@@ -1387,3 +1387,66 @@ fn new_families_support_thinking() {
         );
     }
 }
+
+// ============================================================
+// Anthropic — caller-supplied extra betas (x-anthropic.extra_betas)
+// ============================================================
+
+#[test]
+fn anthropic_extra_betas_are_appended_to_beta_header() {
+    let p = Anthropic::new("test-key".into());
+    let req = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "messages": [{"role": "user", "content": "hi"}],
+        "x-anthropic": { "extra_betas": ["my-beta-2026-01-01", "other-beta-2026-02-02"] },
+    });
+    let result = p
+        .transform_request("claude-haiku-4-5-20251001", &req)
+        .unwrap();
+    let beta_header = result
+        .headers
+        .iter()
+        .find(|(k, _)| k == "anthropic-beta")
+        .expect("Expected anthropic-beta header");
+    assert!(
+        beta_header.1.contains("my-beta-2026-01-01"),
+        "got: {}",
+        beta_header.1
+    );
+    assert!(
+        beta_header.1.contains("other-beta-2026-02-02"),
+        "got: {}",
+        beta_header.1
+    );
+    // extra_betas is a header control, not an API body param.
+    assert!(result.body.get("extra_betas").is_none());
+    assert!(result.body.get("x-anthropic").is_none());
+}
+
+#[test]
+fn anthropic_extra_betas_dedupe_against_auto_managed() {
+    let p = Anthropic::new("test-key".into());
+    // Opus 4.6 auto-adds context-1m; requesting it again must not double it.
+    let req = json!({
+        "model": "claude-opus-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "x-anthropic": { "extra_betas": ["context-1m-2025-08-07", "brand-new-beta"] },
+    });
+    let result = p.transform_request("claude-opus-4-6", &req).unwrap();
+    let beta_header = result
+        .headers
+        .iter()
+        .find(|(k, _)| k == "anthropic-beta")
+        .expect("Expected anthropic-beta header");
+    assert_eq!(
+        beta_header.1.matches("context-1m-2025-08-07").count(),
+        1,
+        "got: {}",
+        beta_header.1
+    );
+    assert!(
+        beta_header.1.contains("brand-new-beta"),
+        "got: {}",
+        beta_header.1
+    );
+}
