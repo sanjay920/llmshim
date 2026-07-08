@@ -22,9 +22,9 @@ This is a public crate. Do NOT make breaking changes to `pub` items in `src/lib.
 ```bash
 cargo build                                          # dev build
 cargo build --release                                # release build (~6MB binary)
-cargo test --tests                                   # unit tests (~326)
+cargo test --tests                                   # unit tests
 cargo test -- --ignored                              # integration tests (needs API keys)
-cargo test --features proxy --tests                  # unit tests including proxy
+cargo test --features proxy --tests                  # unit tests incl. proxy (~420; what CI runs)
 cargo test --features proxy -- --ignored             # all integration tests including proxy
 cargo run                                            # interactive CLI chat
 cargo run --features proxy -- proxy                  # proxy server on :3000
@@ -71,6 +71,13 @@ Image content blocks are translated between providers automatically. Users can s
 ### Multi-model conversations
 
 Each provider sanitizes messages from other providers in `transform_request`. OpenAI's `annotations`/`refusal` stripped for Anthropic/Gemini. `reasoning_content` stripped for all. Tool calls normalized to OpenAI format in responses, translated back per-provider on input.
+
+### Provider extension namespaces (`x-anthropic`, `x-gemini`)
+
+Callers pass provider-specific controls under these keys. Each provider copies what it understands into the native request but **excludes control-only keys from the upstream body**. Anthropic supports:
+
+- `x-anthropic.disable_1m_context` (bool) — opt out of the 1M-context beta header (on by default for supported models).
+- `x-anthropic.extra_betas` (string array) — extra `anthropic-beta` tokens appended to the auto-managed set (1M-context / fast-mode / cache-TTL), de-duplicated. It's a header control, not a body param (e.g. lets a caller forward Claude Code's `--betas`). Logic + tests: `src/providers/anthropic.rs`, `tests/unit_anthropic.rs`.
 
 ### Tool format translation
 
@@ -127,6 +134,24 @@ Env config (all optional, safe defaults; when no RPM/TPM limits are set the limi
 | `LLMSHIM_PENALTY_SECS` | `5` | Bucket backoff applied after an upstream 429. |
 
 Topologies: **sidecar / zero-infra** (default in-memory limiter — set limits to `global / N` when running N replicas) vs. **Redis-coordinated fleet** (one shared global limit across all replicas).
+
+## Client libraries (`clients/`)
+
+Thin clients that speak the proxy's HTTP API. They are faithful to the OpenAPI contract in `api/openapi.yaml` — when you change the proxy's request/response shapes, update that spec and keep the clients in sync. All publish in lockstep with the crate version on every release.
+
+- **Python** (`clients/python`, PyPI `llmshim`): built with maturin (`bindings = "bin"`, `manifest-path = "../../Cargo.toml"`), so wheels **bundle the Rust binary** and `_server.py` auto-spawns `llmshim proxy` on first call. Version derives from `Cargo.toml` — no separate bump.
+- **TypeScript/JS** (`clients/typescript`, npm `llmshim`): dependency-free, and **also bundles the binary + auto-spawns** it (unless you pass an explicit `baseUrl`). The binary ships via `optionalDependencies` on five per-platform packages in `clients/typescript/packages/` — npm installs only the one matching `os`/`cpu`. `src/server.ts` maps `process.platform`-`process.arch` → package name; the Windows package is **scoped under the maintainer's npm namespace** to sidestep npm's spam filter on unscoped `*-win32-*` names.
+- **Go** (`clients/go`): stdlib-only, pure HTTP (no bundled binary). `go get` resolves the `clients/go/vX.Y.Z` tag that CI pushes each release (Go needs no registry).
+- **Ruby** (`clients/ruby`, RubyGems `llmshim`): stdlib-only, pure HTTP. Tests use `webrick`, which is not a default gem on Ruby ≥ 3.0.
+
+## Releasing (tag-driven, multi-registry)
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: an fmt+clippy+test gate, then publishes to **crates.io, PyPI, npm (root + 5 platform packages), RubyGems, Homebrew, and a Go module tag**. All registry auth is **OIDC trusted publishing** (no stored tokens) except the crates.io token. The `/release` skill has the exact checklist. Rules learned the hard way — don't regress these:
+
+- **Version lockstep**: bump `Cargo.toml` + `Cargo.lock`, `clients/typescript/package.json` (and its five `optionalDependencies`), every `clients/typescript/packages/*/package.json`, and `clients/ruby/lib/llmshim/version.rb` together. Python derives from `Cargo.toml`. The npm/rubygems jobs fail the release if a version file drifts from the tag.
+- **Idempotent pipeline**: every publish step (crates/PyPI/npm/GitHub release/Go tag) skips if that version already exists, so the release is safe to re-run or re-tag when one registry hiccups.
+- **First publish of a new npm package** is manual once (npm's Trusted Publisher UI requires the package to exist first); PyPI/RubyGems support pre-configured "pending" publishers. Each package needs a Trusted Publisher pointing at workflow `release.yml`, environment `release`.
+- **CI environment quirks handled in the workflow**: OIDC npm publish needs npm ≥ 11.5.1 (upgrade npm in-job — the bundled one is too old); `mkdir -p bin` before copying binaries into platform packages (git doesn't track empty dirs); install `webrick` explicitly for the Ruby test; the root npm job uses `npm install --omit=optional` (not `npm ci`) because the platform packages publish in the same run.
 
 ## Detailed reference
 
