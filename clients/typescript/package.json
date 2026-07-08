@@ -24,7 +24,7 @@
     "llmshim-darwin-x64": "0.1.23",
     "llmshim-linux-x64": "0.1.23",
     "llmshim-linux-arm64": "0.1.23",
-    "llmshim-win32-x64": "0.1.23"
+    "@sanjay920/llmshim-win32-x64": "0.1.23"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

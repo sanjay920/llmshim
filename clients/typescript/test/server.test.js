@@ -27,7 +27,7 @@ const knownPlatforms = [
   ["darwin", "x64", "llmshim-darwin-x64"],
   ["linux", "x64", "llmshim-linux-x64"],
   ["linux", "arm64", "llmshim-linux-arm64"],
-  ["win32", "x64", "llmshim-win32-x64"],
+  ["win32", "x64", "@sanjay920/llmshim-win32-x64"],
 ];
 
 for (const [platform, arch, expected] of knownPlatforms) {

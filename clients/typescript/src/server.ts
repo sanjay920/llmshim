@@ -30,7 +30,9 @@ export function platformPackageName(): string {
     "darwin-x64": "llmshim-darwin-x64",
     "linux-x64": "llmshim-linux-x64",
     "linux-arm64": "llmshim-linux-arm64",
-    "win32-x64": "llmshim-win32-x64",
+    // Scoped to dodge npm's spam filter, which flags unscoped `*-win32-*`
+    // names (the darwin/linux siblings publish unscoped fine).
+    "win32-x64": "@sanjay920/llmshim-win32-x64",
   };
   const pkg = known[key];
   if (!pkg) {
