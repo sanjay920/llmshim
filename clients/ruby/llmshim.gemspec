@@ -33,4 +33,7 @@ Gem::Specification.new do |spec|
 
   spec.add_development_dependency "minitest", "~> 5.0"
   spec.add_development_dependency "rake", "~> 13.0"
+  # Ruby 3.0+ removed webrick from the default gems; the test suite spins up a
+  # local WEBrick server to exercise real HTTP parsing.
+  spec.add_development_dependency "webrick", "~> 1.8"
 end
