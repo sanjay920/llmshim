@@ -357,7 +357,11 @@ jobs:
             echo "::error::clients/typescript/package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
             exit 1
           fi
-      - run: npm ci
+      # Only devDeps (typescript) are needed to build/publish. Skip the
+      # optional platform packages — they publish in this same run, so the
+      # lockfile can't reference their new version yet, and `npm ci`'s strict
+      # sync check would fail. They're end-user runtime deps, not build deps.
+      - run: npm install --omit=optional --no-audit --no-fund
       - run: npm run build
       - run: npm test
       - name: Publish to npm
@@ -381,7 +385,6 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.3"
-          bundler-cache: true
       - name: Verify version.rb matches the release tag
         run: |
           TAG_VERSION=${GITHUB_REF_NAME#v}
@@ -390,8 +393,13 @@ jobs:
             echo "::error::clients/ruby/lib/llmshim/version.rb ($GEM_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
             exit 1
           fi
+      # Install test-only gems explicitly (Ruby 3.0+ dropped webrick from the
+      # default gems). Avoids bundler-cache serving a stale bundle when only the
+      # gemspec — not the Gemfile — changes.
       - name: Run tests
-        run: bundle exec rake test
+        run: |
+          gem install --no-document minitest webrick
+          ruby -Itest -Ilib test/llmshim_test.rb
       - name: Configure RubyGems credentials (OIDC trusted publishing)
         uses: rubygems/configure-rubygems-credentials@v2.1.0
       - name: Build gem
