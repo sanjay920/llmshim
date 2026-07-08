@@ -476,7 +476,7 @@ impl Provider for Anthropic {
         if let Some(ext) = obj.get("x-anthropic").and_then(|e| e.as_object()) {
             for (k, v) in ext {
                 // Skip control flags that are handled elsewhere (not API body params)
-                if k == "disable_1m_context" {
+                if k == "disable_1m_context" || k == "extra_betas" {
                     continue;
                 }
                 body_obj.insert(k.clone(), v.clone());
@@ -600,6 +600,23 @@ impl Provider for Anthropic {
         }
         if uses_extended_cache_ttl(request) {
             betas.push("extended-cache-ttl-2025-04-11".to_string());
+        }
+
+        // Caller-supplied beta tokens (e.g. Claude Code's `--betas`), passed as
+        // a string array under `x-anthropic.extra_betas`. Appended to the
+        // auto-managed set above; de-duplicated so an explicit request for an
+        // already-enabled beta does not double it.
+        if let Some(extra) = obj
+            .get("x-anthropic")
+            .and_then(|x| x.get("extra_betas"))
+            .and_then(|v| v.as_array())
+        {
+            for beta in extra.iter().filter_map(|b| b.as_str()) {
+                let beta = beta.trim();
+                if !beta.is_empty() && !betas.iter().any(|existing| existing == beta) {
+                    betas.push(beta.to_string());
+                }
+            }
         }
 
         if !betas.is_empty() {
