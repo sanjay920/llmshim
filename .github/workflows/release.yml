@@ -204,13 +204,23 @@ jobs:
         run: |
           mkdir -p bin && cp "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/llmshim" bin/llmshim
           chmod +x bin/llmshim
-          npm publish --access public --provenance
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
       - name: Publish llmshim-darwin-x64
         working-directory: clients/typescript/packages/llmshim-darwin-x64
         run: |
           mkdir -p bin && cp "$GITHUB_WORKSPACE/target/x86_64-apple-darwin/release/llmshim" bin/llmshim
           chmod +x bin/llmshim
-          npm publish --access public --provenance
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
 
   npm-linux-x64-binary:
     needs: test
@@ -245,7 +255,12 @@ jobs:
         run: |
           mkdir -p bin && cp $GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/llmshim bin/llmshim
           chmod +x bin/llmshim
-          npm publish --access public --provenance
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
 
   # Native arm64 runner (GA, free on public repos) — no cross-compilation needed.
   npm-linux-arm64-binary:
@@ -281,7 +296,12 @@ jobs:
         run: |
           mkdir -p bin && cp $GITHUB_WORKSPACE/target/aarch64-unknown-linux-gnu/release/llmshim bin/llmshim
           chmod +x bin/llmshim
-          npm publish --access public --provenance
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
 
   npm-windows-binary:
     needs: test
@@ -319,7 +339,12 @@ jobs:
         working-directory: clients/typescript/packages/llmshim-win32-x64
         run: |
           mkdir -p bin && cp "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/llmshim.exe" bin/llmshim.exe
-          npm publish --access public --provenance
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
 
   # --- Publish TypeScript client to npm ---
   # First release must be published manually once (npm's trusted-publisher UI
@@ -365,7 +390,13 @@ jobs:
       - run: npm run build
       - run: npm test
       - name: Publish to npm
-        run: npm publish --access public --provenance
+        run: |
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
 
   # --- Publish Ruby client to RubyGems ---
   # Uses a "pending trusted publisher" — configurable on rubygems.org before
