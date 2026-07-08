@@ -32,7 +32,16 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --allow-dirty
+        # Idempotent: treat "already uploaded" as success so re-running the
+        # release (e.g. to fill a failed downstream registry) is safe.
+        run: |
+          set +e
+          out=$(cargo publish --allow-dirty 2>&1); code=$?
+          echo "$out"
+          [ $code -eq 0 ] && exit 0
+          echo "$out" | grep -qiE "already (been )?uploaded|already exists" \
+            && { echo "Version already on crates.io; skipping."; exit 0; }
+          exit $code
 
   # --- Build standalone macOS binaries + GitHub release ---
   github-release:
@@ -60,12 +69,21 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Idempotent: if the release already exists (re-run), (re-)upload the
+        # tarballs to it instead of failing on create.
         run: |
-          gh release create ${{ github.ref_name }} \
-            --title "${{ github.ref_name }}" \
-            --generate-notes \
-            llmshim-aarch64-apple-darwin.tar.gz \
-            llmshim-x86_64-apple-darwin.tar.gz
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            echo "Release already exists; uploading assets with --clobber."
+            gh release upload "${{ github.ref_name }}" \
+              llmshim-aarch64-apple-darwin.tar.gz \
+              llmshim-x86_64-apple-darwin.tar.gz --clobber
+          else
+            gh release create ${{ github.ref_name }} \
+              --title "${{ github.ref_name }}" \
+              --generate-notes \
+              llmshim-aarch64-apple-darwin.tar.gz \
+              llmshim-x86_64-apple-darwin.tar.gz
+          fi
 
   # --- Update Homebrew tap ---
   homebrew:
@@ -182,13 +200,13 @@ jobs:
       - name: Publish llmshim-darwin-arm64
         working-directory: clients/typescript/packages/llmshim-darwin-arm64
         run: |
-          cp "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/llmshim" bin/llmshim
+          mkdir -p bin && cp "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/llmshim" bin/llmshim
           chmod +x bin/llmshim
           npm publish --access public --provenance
       - name: Publish llmshim-darwin-x64
         working-directory: clients/typescript/packages/llmshim-darwin-x64
         run: |
-          cp "$GITHUB_WORKSPACE/target/x86_64-apple-darwin/release/llmshim" bin/llmshim
+          mkdir -p bin && cp "$GITHUB_WORKSPACE/target/x86_64-apple-darwin/release/llmshim" bin/llmshim
           chmod +x bin/llmshim
           npm publish --access public --provenance
 
@@ -221,7 +239,7 @@ jobs:
       - name: Publish llmshim-linux-x64
         working-directory: clients/typescript/packages/llmshim-linux-x64
         run: |
-          cp $GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/llmshim bin/llmshim
+          mkdir -p bin && cp $GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/llmshim bin/llmshim
           chmod +x bin/llmshim
           npm publish --access public --provenance
 
@@ -255,7 +273,7 @@ jobs:
       - name: Publish llmshim-linux-arm64
         working-directory: clients/typescript/packages/llmshim-linux-arm64
         run: |
-          cp $GITHUB_WORKSPACE/target/aarch64-unknown-linux-gnu/release/llmshim bin/llmshim
+          mkdir -p bin && cp $GITHUB_WORKSPACE/target/aarch64-unknown-linux-gnu/release/llmshim bin/llmshim
           chmod +x bin/llmshim
           npm publish --access public --provenance
 
@@ -291,7 +309,7 @@ jobs:
         shell: bash
         working-directory: clients/typescript/packages/llmshim-win32-x64
         run: |
-          cp "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/llmshim.exe" bin/llmshim.exe
+          mkdir -p bin && cp "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/llmshim.exe" bin/llmshim.exe
           npm publish --access public --provenance
 
   # --- Publish TypeScript client to npm ---
@@ -363,7 +381,7 @@ jobs:
       - name: Run tests
         run: rake test
       - name: Configure RubyGems credentials (OIDC trusted publishing)
-        uses: rubygems/configure-rubygems-credentials@v2
+        uses: rubygems/configure-rubygems-credentials@v2.1.0
       - name: Build gem
         run: gem build llmshim.gemspec
       - name: Push gem
@@ -394,11 +412,16 @@ jobs:
           go vet ./...
           go test ./...
       - name: Tag the Go module
+        # Idempotent: skip if the module tag already exists (re-run).
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           GO_TAG="clients/go/v${VERSION}"
-          git tag "$GO_TAG"
-          git push origin "$GO_TAG"
+          if git ls-remote --exit-code --tags origin "refs/tags/$GO_TAG" >/dev/null 2>&1; then
+            echo "$GO_TAG already exists; skipping."
+          else
+            git tag "$GO_TAG"
+            git push origin "$GO_TAG"
+          fi
 
   # --- Build PyPI source distribution ---
   sdist:
@@ -522,3 +545,5 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          # Idempotent: don't fail if this version is already on PyPI (re-run).
+          skip-existing: true
