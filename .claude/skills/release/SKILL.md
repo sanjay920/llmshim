@@ -35,7 +35,7 @@ git log --oneline $(git describe --tags --abbrev=0)..HEAD
 2. **Update `Cargo.lock`** — run `cargo build` (or `cargo build --features proxy`) so the lockfile's llmshim entry matches. Both `Cargo.toml` and `Cargo.lock` change; the release commit should include both (see commit `c393418`).
 3. **Bump the client versions to match** — the `npm*`/`rubygems` CI jobs verify these against the tag and fail the release if they drift:
    - `clients/typescript/package.json` — `"version": "$ARGUMENTS"`, AND its `optionalDependencies` block (all 5 entries) to `"$ARGUMENTS"`.
-   - `clients/typescript/packages/*/package.json` (5 platform packages: darwin-arm64, darwin-x64, linux-x64, linux-arm64, win32-x64) — `"version": "$ARGUMENTS"` in each.
+   - `clients/typescript/packages/*/package.json` (5 platform packages: darwin-arm64, darwin-x64, linux-x64, linux-arm64, win32-x64) — `"version": "$ARGUMENTS"` in each. (The win32 dir publishes under the scoped npm name `@sanjay920/llmshim-win32-x64` — unscoped `*-win32-*` names trip npm's spam filter; the other four publish unscoped.)
    - `clients/ruby/lib/llmshim/version.rb` — `VERSION = "$ARGUMENTS"`
    - Python's version is derived automatically from `Cargo.toml` by maturin — no separate file to bump.
    - Go has no in-file version — `go-tag` tags `clients/go/v$ARGUMENTS` from the release commit automatically.

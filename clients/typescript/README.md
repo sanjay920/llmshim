@@ -58,7 +58,7 @@ Omit `baseUrl` to auto-spawn the bundled binary instead (see below). `createClie
 
 ## How the bundled binary works
 
-`npm install llmshim` also installs one of five tiny `optionalDependencies` — `llmshim-darwin-arm64`, `llmshim-darwin-x64`, `llmshim-linux-x64`, `llmshim-linux-arm64`, or `llmshim-win32-x64` — npm resolves the one matching your platform automatically via each package's `os`/`cpu` fields, so only ~8MB for your actual platform ever downloads. Each contains nothing but the prebuilt `llmshim` binary.
+`npm install llmshim` also installs one of five tiny `optionalDependencies` — `llmshim-darwin-arm64`, `llmshim-darwin-x64`, `llmshim-linux-x64`, `llmshim-linux-arm64`, or `@sanjay920/llmshim-win32-x64` (the Windows one is scoped to sidestep npm's spam filter on unscoped `*-win32-*` names) — npm resolves the one matching your platform automatically via each package's `os`/`cpu` fields, so only ~8MB for your actual platform ever downloads. Each contains nothing but the prebuilt `llmshim` binary.
 
 On the first `chat`/`stream`/`models`/`health` call on a `Client` constructed without `baseUrl`, the client finds that bundled binary (falling back to `PATH`, e.g. a `cargo install llmshim`), starts `llmshim proxy` on a free local port, waits for it to accept connections, and reuses that same process for every subsequent call in the same Node process — mirroring the Python client's `_server.py`. It's stopped automatically on process exit.
 
