@@ -28,6 +28,9 @@ pub fn request_to_value(req: &ChatRequest) -> Value {
         if let Some(effort) = &cfg.reasoning_effort {
             v["reasoning_effort"] = json!(effort);
         }
+        if let Some(mode) = &cfg.reasoning_mode {
+            v["reasoning_mode"] = json!(mode);
+        }
     }
 
     // Merge provider_config as top-level keys (passthrough to provider transform)

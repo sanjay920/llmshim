@@ -254,24 +254,55 @@ fn is_gpt_5_6(model: &str) -> bool {
     model.to_lowercase().starts_with("gpt-5.6")
 }
 
-/// Coerce a caller's `reasoning_effort` up to the lowest tier the target model
-/// actually accepts, so a value the model would 400 on is clamped rather than
-/// failing the request. Models with no restriction pass the value unchanged.
+/// GPT-5.4 family (`gpt-5.4`, `-mini`, `-nano`) rejects "minimal": its
+/// API-reported enum is none/low/medium/high/xhigh (verified live). The
+/// `-pro` variant is caught by `is_pro_model` first, which is stricter.
+fn is_gpt_5_4(model: &str) -> bool {
+    model.to_lowercase().starts_with("gpt-5.4")
+}
+
+/// Coerce a caller's effort to a value the target model actually accepts, so a
+/// value the model would 400 on is clamped rather than failing the request.
+/// "max" is gpt-5.6-exclusive (verified live) — clamp to xhigh elsewhere.
 fn clamp_reasoning_effort<'a>(model: &str, effort: &'a str) -> &'a str {
     if is_pro_model(model) {
-        // pro: only medium/high/xhigh
+        // pro tier: only medium/high/xhigh (verified live)
         match effort {
             "minimal" | "low" | "none" => "medium",
+            "max" => "xhigh",
             other => other,
         }
     } else if is_gpt_5_6(model) {
-        // 5.6: rejects only "minimal"
+        // 5.6: full range incl. "max"; rejects only "minimal"
         match effort {
             "minimal" => "low",
             other => other,
         }
+    } else if is_gpt_5_4(model) {
+        // 5.4 family: rejects "minimal" and lacks "max"
+        match effort {
+            "minimal" => "low",
+            "max" => "xhigh",
+            other => other,
+        }
     } else {
-        effort
+        // gpt-5.5 & unknown models: pass through, but "max" is 5.6-only
+        match effort {
+            "max" => "xhigh",
+            other => other,
+        }
+    }
+}
+
+/// One-tier effort bump, used to emulate mode:"pro" on models where
+/// `reasoning.mode` isn't accepted natively. Explicit "none" wins.
+fn bump_effort(effort: &str) -> &'static str {
+    match effort {
+        "none" => "none",
+        "minimal" => "low",
+        "low" => "medium",
+        "medium" => "high",
+        _ => "xhigh", // high, xhigh, max
     }
 }
 
@@ -314,9 +345,25 @@ impl Provider for OpenAi {
                     .and_then(|e| e.as_str())
             });
 
+        // Unified reasoning mode: "pro" is NATIVE on gpt-5.6 and -pro models
+        // (`reasoning.mode`, verified live); every other model 400s on the
+        // field, so emulate it there with a one-tier effort bump — the same
+        // policy the non-OpenAI providers use.
+        let pro_mode = matches!(
+            obj.get("reasoning_mode").and_then(|m| m.as_str()),
+            Some("pro")
+        );
+        let mode_is_native = is_gpt_5_6(model) || is_pro_model(model);
+
+        let effort = match (effort, pro_mode, mode_is_native) {
+            (Some(e), true, false) => Some(bump_effort(e)),
+            (None, true, false) => Some("high"), // pro alone ≈ medium, bumped
+            (e, _, _) => e,
+        };
+
         if let Some(effort) = effort {
-            // Clamp efforts the target model would reject (pro: minimal/low/none;
-            // gpt-5.6: minimal) up to its lowest accepted tier. Others pass through.
+            // Clamp efforts the target model would reject up to its nearest
+            // accepted tier (per-family rules in clamp_reasoning_effort).
             let effort = clamp_reasoning_effort(model, effort);
             let mut reasoning = json!({
                 "effort": effort,
@@ -325,7 +372,17 @@ impl Provider for OpenAi {
             if effort == "none" {
                 reasoning["summary"] = json!(null);
             }
+            if pro_mode && mode_is_native {
+                reasoning["mode"] = json!("pro");
+            }
             body_obj.insert("reasoning".to_string(), reasoning);
+        } else if pro_mode && mode_is_native {
+            // mode without effort: valid natively — let the model pick its
+            // default effort under pro mode.
+            body_obj.insert(
+                "reasoning".to_string(),
+                json!({"mode": "pro", "summary": "auto"}),
+            );
         }
 
         // Stream flag
