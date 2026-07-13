@@ -21,6 +21,7 @@ from llmshim.types import (
     Message,
     ModelEntry,
     ReasoningEffort,
+    ReasoningMode,
     StreamEvent,
 )
 
@@ -171,6 +172,7 @@ def _build_body(
     top_k: Optional[int],
     stop: Optional[List[str]],
     reasoning_effort: Optional[ReasoningEffort],
+    reasoning_mode: Optional[ReasoningMode],
     tools: Optional[List[dict]],
     tool_choice: Optional[Any],
     provider_config: Optional[dict],
@@ -201,6 +203,8 @@ def _build_body(
         config["stop"] = stop
     if reasoning_effort is not None:
         config["reasoning_effort"] = reasoning_effort
+    if reasoning_mode is not None:
+        config["reasoning_mode"] = reasoning_mode
     if config:
         body["config"] = config
 
@@ -229,6 +233,7 @@ def chat(
     top_k: Optional[int] = None,
     stop: Optional[List[str]] = None,
     reasoning_effort: Optional[ReasoningEffort] = None,
+    reasoning_mode: Optional[ReasoningMode] = None,
     tools: Optional[List[dict]] = None,
     tool_choice: Optional[Any] = None,
     provider_config: Optional[dict] = None,
@@ -244,7 +249,10 @@ def chat(
         top_p: Nucleus sampling probability
         top_k: Top-k sampling
         stop: Stop sequences
-        reasoning_effort: "low", "medium", or "high"
+        reasoning_effort: "none", "low", "medium", "high", "xhigh", or "max"
+            (mapped per provider/model with clamping; see docs/reasoning.md)
+        reasoning_mode: "standard" (default) or "pro" — "pro" requests
+            substantially more model work
         tools: Tool definitions (Chat Completions format — auto-translated per provider)
         tool_choice: Tool selection ("auto", "required", "none", or specific tool)
         provider_config: Raw provider-specific JSON
@@ -270,6 +278,7 @@ def chat(
         top_k=top_k,
         stop=stop,
         reasoning_effort=reasoning_effort,
+        reasoning_mode=reasoning_mode,
         tools=tools,
         tool_choice=tool_choice,
         provider_config=provider_config,
@@ -291,6 +300,7 @@ def stream(
     top_k: Optional[int] = None,
     stop: Optional[List[str]] = None,
     reasoning_effort: Optional[ReasoningEffort] = None,
+    reasoning_mode: Optional[ReasoningMode] = None,
     tools: Optional[List[dict]] = None,
     tool_choice: Optional[Any] = None,
     provider_config: Optional[dict] = None,
@@ -320,6 +330,7 @@ def stream(
         top_k=top_k,
         stop=stop,
         reasoning_effort=reasoning_effort,
+        reasoning_mode=reasoning_mode,
         tools=tools,
         tool_choice=tool_choice,
         provider_config=provider_config,

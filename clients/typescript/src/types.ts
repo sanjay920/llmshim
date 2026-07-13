@@ -3,7 +3,14 @@
  */
 
 /** Reasoning/thinking depth, applied across all providers. */
-export type ReasoningEffort = "low" | "medium" | "high";
+export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/**
+ * Unified reasoning mode. "pro" requests substantially more model work:
+ * native `reasoning.mode` on OpenAI gpt-5.6/-pro models, emulated as a
+ * one-tier effort bump on all other models/providers.
+ */
+export type ReasoningMode = "standard" | "pro";
 
 /** Role of a conversation message. */
 export type Role = "system" | "user" | "assistant" | "tool" | "developer";
@@ -39,8 +46,14 @@ export interface Config {
   top_p?: number;
   top_k?: number;
   stop?: string[];
-  /** Controls reasoning/thinking depth across all providers. */
+  /**
+   * Unified reasoning/thinking depth across all providers. llmshim maps each
+   * value to the target provider/model's native control, clamping to the
+   * nearest supported tier (see docs/reasoning.md).
+   */
   reasoning_effort?: ReasoningEffort;
+  /** Unified reasoning mode; see {@link ReasoningMode}. Default "standard". */
+  reasoning_mode?: ReasoningMode;
 }
 
 /** Request body for POST /v1/chat and POST /v1/chat/stream. */

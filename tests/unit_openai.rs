@@ -800,3 +800,94 @@ fn stream_done_returns_none() {
         .unwrap()
         .is_none());
 }
+
+// ============================================================
+// Unified reasoning — six-tier efforts + reasoning_mode
+// ============================================================
+
+#[test]
+fn effort_max_is_gpt_5_6_exclusive() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "max",
+    });
+    let r = p.transform_request("gpt-5.6-sol", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "max");
+    for model in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5-pro"] {
+        let r = p.transform_request(model, &req).unwrap();
+        assert_eq!(
+            r.body["reasoning"]["effort"], "xhigh",
+            "{model} should clamp max -> xhigh"
+        );
+    }
+}
+
+#[test]
+fn gpt_5_4_family_clamps_minimal_to_low() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "minimal",
+    });
+    for model in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"] {
+        let r = p.transform_request(model, &req).unwrap();
+        assert_eq!(r.body["reasoning"]["effort"], "low", "{model}");
+    }
+    // gpt-5.5 accepts minimal natively — passes through unchanged
+    let r = p.transform_request("gpt-5.5", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "minimal");
+}
+
+#[test]
+fn mode_pro_native_on_5_6_and_pro_models() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+        "reasoning_mode": "pro",
+    });
+    for model in ["gpt-5.6-terra", "gpt-5.5-pro"] {
+        let r = p.transform_request(model, &req).unwrap();
+        assert_eq!(r.body["reasoning"]["mode"], "pro", "{model}");
+        assert_eq!(r.body["reasoning"]["effort"], "high", "{model}");
+    }
+}
+
+#[test]
+fn mode_pro_emulated_as_bump_elsewhere() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "medium",
+        "reasoning_mode": "pro",
+    });
+    let r = p.transform_request("gpt-5.5", &req).unwrap();
+    assert!(
+        r.body["reasoning"].get("mode").is_none(),
+        "gpt-5.5 rejects reasoning.mode — must not be sent"
+    );
+    assert_eq!(r.body["reasoning"]["effort"], "high"); // medium bumped one tier
+}
+
+#[test]
+fn mode_pro_without_effort() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_mode": "pro",
+    });
+    // native: send mode only, model picks its own effort under pro
+    let r = p.transform_request("gpt-5.6-luna", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["mode"], "pro");
+    assert!(r.body["reasoning"].get("effort").is_none());
+    // emulated: behaves as medium bumped one tier
+    let r = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "high");
+    assert!(r.body["reasoning"].get("mode").is_none());
+}

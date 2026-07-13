@@ -102,7 +102,7 @@ module Llmshim
       body = { "model" => model, "messages" => msgs }
 
       config = stringify(opts[:config] || {})
-      %i[max_tokens temperature top_p top_k stop reasoning_effort].each do |key|
+      %i[max_tokens temperature top_p top_k stop reasoning_effort reasoning_mode].each do |key|
         config[key.to_s] = opts[key] unless opts[key].nil?
       end
       body["config"] = config unless config.empty?

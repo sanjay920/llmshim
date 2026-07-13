@@ -16,6 +16,7 @@ from typing import Any, List, Literal, TypedDict, Union
 __all__ = [
     "Role",
     "ReasoningEffort",
+    "ReasoningMode",
     "ToolCallFunction",
     "ToolCall",
     "Message",
@@ -42,7 +43,12 @@ __all__ = [
 # --- primitives -------------------------------------------------------------
 
 Role = Literal["system", "user", "assistant", "tool", "developer"]
-ReasoningEffort = Literal["low", "medium", "high"]
+# Unified reasoning depth: mapped per provider/model with clamping to the
+# nearest supported tier (see docs/reasoning.md in the llmshim repo).
+ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
+# Unified reasoning mode: "pro" requests substantially more model work
+# (native on OpenAI gpt-5.6/-pro models, emulated elsewhere).
+ReasoningMode = Literal["standard", "pro"]
 StreamEventType = Literal["content", "reasoning", "tool_call", "usage", "done", "error"]
 
 
@@ -87,6 +93,7 @@ class Config(TypedDict, total=False):
     top_k: int
     stop: List[str]
     reasoning_effort: ReasoningEffort
+    reasoning_mode: ReasoningMode
 
 
 class _ChatRequestBase(TypedDict):
