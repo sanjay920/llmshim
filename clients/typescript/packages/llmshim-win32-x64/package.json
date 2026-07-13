@@ -1,6 +1,6 @@
 {
   "name": "@sanjay920/llmshim-win32-x64",
-  "version": "0.1.24",
+  "version": "0.1.25",
   "description": "llmshim proxy binary (Windows x64). Installed automatically as an optional dependency of the `llmshim` package — you should not need to depend on this directly.",
   "os": [
     "win32"
