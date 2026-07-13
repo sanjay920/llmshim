@@ -455,15 +455,14 @@ fn translate_tool_choice(tc: &Value) -> Option<Value> {
             "none" => "NONE",
             _ => return None,
         }
-    } else if let Some(obj) = tc.as_object() {
+    } else {
+        let obj = tc.as_object()?;
         match obj.get("type").and_then(|t| t.as_str()) {
             Some("auto") => "AUTO",
             Some("any" | "required") => "ANY",
             Some("none") => "NONE",
             _ => return None,
         }
-    } else {
-        return None;
     };
     Some(json!({"functionCallingConfig": {"mode": mode}}))
 }
