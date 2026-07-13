@@ -178,6 +178,13 @@ fn translate_tool_choice(tc: &Value) -> Value {
     tc.clone()
 }
 
+/// grok-4.20-* models encode reasoning on/off in the MODEL NAME and reject
+/// any reasoning parameter with a 400 ("does not support parameter
+/// reasoningEffort", verified live) — the param must be omitted entirely.
+fn is_reasoning_name_locked(model: &str) -> bool {
+    model.to_lowercase().contains("4.20")
+}
+
 impl Provider for Xai {
     fn name(&self) -> &str {
         "xai"
@@ -236,7 +243,35 @@ impl Provider for Xai {
             body_obj.insert("instructions".to_string(), json!(instructions.join("\n\n")));
         }
 
-        // Strip provider-specific params
+        // Unified reasoning controls -> xAI's nested `reasoning: {effort}`.
+        // The flat `reasoning_effort` string is silently IGNORED by xAI's API
+        // (verified live) — only the nested object works. grok-4.20-* models
+        // are name-locked (reasoning baked into the model name) and 400 on any
+        // reasoning param, so omit it entirely for them.
+        if !is_reasoning_name_locked(model) {
+            if let Some(effort) = obj.get("reasoning_effort").and_then(|e| e.as_str()) {
+                // mode:"pro" has no xAI analog; map to a one-tier effort bump.
+                let pro = obj
+                    .get("reasoning_mode")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m == "pro")
+                    .unwrap_or(false);
+                let effort = match (effort, pro) {
+                    ("none", _) => "none", // explicit off wins, even in pro mode
+                    ("minimal" | "low", false) => "low",
+                    ("minimal" | "low", true) => "medium",
+                    ("medium", false) => "medium",
+                    ("medium", true) => "high",
+                    ("high", false) => "high",
+                    // xAI's ceiling is xhigh ("max" rejected, verified live 400)
+                    ("high", true) | ("xhigh", _) | ("max", _) => "xhigh",
+                    _ => "low", // unknown -> xAI's default
+                };
+                body_obj.insert("reasoning".to_string(), json!({ "effort": effort }));
+            }
+        }
+
+        // Strip provider-specific params that don't apply to xAI
         body_obj.remove("thinking");
         body_obj.remove("output_config");
         body_obj.remove("reasoning_effort");
@@ -277,6 +312,7 @@ impl Provider for Xai {
             })?;
 
         let mut text_content: Option<String> = None;
+        let mut reasoning_content: Option<String> = None;
         let mut tool_calls: Vec<Value> = Vec::new();
 
         for item in output {
@@ -300,7 +336,19 @@ impl Provider for Xai {
                         }
                     }));
                 }
-                // "reasoning" type — no visible summary for Grok, skip
+                Some("reasoning") => {
+                    // grok-4.3 returns a real summary here (older models emit
+                    // an empty item); surface it like the OpenAI provider does.
+                    if let Some(summary) = item.get("summary").and_then(|s| s.as_array()) {
+                        let texts: Vec<&str> = summary
+                            .iter()
+                            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                            .collect();
+                        if !texts.is_empty() {
+                            reasoning_content = Some(texts.join("\n"));
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -309,6 +357,9 @@ impl Provider for Xai {
         let mut message = json!({"role": "assistant", "content": content});
         if !tool_calls.is_empty() {
             message["tool_calls"] = json!(tool_calls);
+        }
+        if let Some(reasoning) = reasoning_content {
+            message["reasoning_content"] = json!(reasoning);
         }
 
         let status = response

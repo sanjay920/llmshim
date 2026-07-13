@@ -666,3 +666,84 @@ fn session_history_strips_cross_provider_fields() {
     assert!(input[0].get("annotations").is_none());
     assert!(input[0].get("refusal").is_none());
 }
+
+// ============================================================
+// Unified reasoning — six-tier efforts + reasoning_mode
+// ============================================================
+
+#[test]
+fn effort_translates_to_nested_reasoning_object() {
+    let p = provider();
+    for (effort, expected) in [
+        ("none", "none"),
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"), // xAI rejects "max" (verified live) — clamp
+    ] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let r = p.transform_request("grok-4.3", &req).unwrap();
+        assert_eq!(r.body["reasoning"]["effort"], expected, "effort {effort}");
+        // the flat string form is inert on xAI's API — must not be sent
+        assert!(r.body.get("reasoning_effort").is_none());
+    }
+}
+
+#[test]
+fn name_locked_grok_4_20_omits_reasoning_entirely() {
+    let p = provider();
+    for model in [
+        "grok-4.20-beta-0309-reasoning",
+        "grok-4.20-beta-0309-non-reasoning",
+    ] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        });
+        let r = p.transform_request(model, &req).unwrap();
+        assert!(
+            r.body.get("reasoning").is_none(),
+            "{model} 400s on any reasoning param — must be omitted"
+        );
+    }
+}
+
+#[test]
+fn mode_pro_bumps_effort() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "medium",
+        "reasoning_mode": "pro",
+    });
+    let r = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "high");
+}
+
+#[test]
+fn response_surfaces_reasoning_summary() {
+    let p = provider();
+    let resp = json!({
+        "error": null,
+        "status": "completed",
+        "model": "grok-4.3",
+        "output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thought about it"}]},
+            {"type": "message", "content": [{"type": "output_text", "text": "hi there"}]}
+        ],
+        "usage": {"input_tokens": 1, "output_tokens": 2}
+    });
+    let result = p.transform_response("grok-4.3", resp).unwrap();
+    assert_eq!(
+        result["choices"][0]["message"]["reasoning_content"],
+        "thought about it"
+    );
+    assert_eq!(result["choices"][0]["message"]["content"], "hi there");
+}

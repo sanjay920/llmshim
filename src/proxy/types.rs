@@ -55,7 +55,12 @@ pub struct Config {
     pub top_p: Option<f64>,
     pub top_k: Option<u64>,
     pub stop: Option<Vec<String>>,
+    /// Unified reasoning depth: none|low|medium|high|xhigh|max.
+    /// Mapped per provider/model with clamping — see docs/reasoning.md.
     pub reasoning_effort: Option<String>,
+    /// Unified reasoning mode: standard (default) | pro. Native on OpenAI
+    /// gpt-5.6/-pro models; emulated as a one-tier effort bump elsewhere.
+    pub reasoning_mode: Option<String>,
 }
 
 // ============================================================

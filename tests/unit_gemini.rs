@@ -1437,3 +1437,73 @@ fn full_roundtrip_without_thought_signature_gets_stripped() {
         }
     }
 }
+
+// ============================================================
+// Unified reasoning — six-tier efforts + reasoning_mode
+// ============================================================
+
+#[test]
+fn effort_none_disables_thinking_via_minimal() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let r = p.transform_request("gemini-3.5-flash", &req).unwrap();
+    assert_eq!(
+        r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "minimal"
+    );
+    // gemini-3.1-pro cannot disable thinking (verified live) — clamp to floor
+    let r = p.transform_request("gemini-3.1-pro-preview", &req).unwrap();
+    assert_eq!(
+        r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "low"
+    );
+}
+
+#[test]
+fn effort_xhigh_and_max_clamp_to_high() {
+    let p = provider();
+    for effort in ["xhigh", "max"] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let r = p.transform_request("gemini-3.5-flash", &req).unwrap();
+        assert_eq!(
+            r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high",
+            "{effort}"
+        );
+    }
+}
+
+#[test]
+fn mode_pro_bumps_thinking_level_and_none_wins() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "low",
+        "reasoning_mode": "pro",
+    });
+    let r = p.transform_request("gemini-3.5-flash", &req).unwrap();
+    assert_eq!(
+        r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "medium"
+    );
+    // explicit "none" wins over pro
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+        "reasoning_mode": "pro",
+    });
+    let r = p.transform_request("gemini-3.5-flash", &req).unwrap();
+    assert_eq!(
+        r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "minimal"
+    );
+}

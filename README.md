@@ -256,18 +256,21 @@ for tc in resp["message"].get("tool_calls", []):
     print(f"{tc['function']['name']}({tc['function']['arguments']})")
 ```
 
-**Reasoning / thinking:**
+**Reasoning / thinking** — one vocabulary across every provider:
 
 ```python
 resp = llmshim.chat(
     "claude-sonnet-4-6",
     "Solve: x^2 - 5x + 6 = 0",
     max_tokens=4000,
-    reasoning_effort="high",
+    reasoning_effort="high",   # none | low | medium | high | xhigh | max
+    reasoning_mode="pro",      # standard (default) | pro — much more model work
 )
 print(resp["reasoning"])          # thinking content
 print(resp["message"]["content"]) # answer
 ```
+
+llmshim maps these to each provider's native control (OpenAI `reasoning.effort`/`mode`, Anthropic adaptive thinking, Gemini `thinkingLevel`, xAI `reasoning.effort`), clamping to the nearest tier the target model actually supports — so `reasoning_effort="max"` works everywhere even though only some models have a native `max`. Full verified mapping tables: [`docs/reasoning.md`](docs/reasoning.md). Prefer a provider's exact native dialect? Pass it via `provider_config` (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) and llmshim won't touch it.
 
 **Fallback chains** — automatic failover across providers:
 
