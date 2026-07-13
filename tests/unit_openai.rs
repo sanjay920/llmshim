@@ -221,6 +221,42 @@ fn request_non_pro_model_preserves_low_effort() {
     assert_eq!(result.body["reasoning"]["effort"], "low");
 }
 
+#[test]
+fn request_gpt_5_6_clamps_minimal_to_low() {
+    let p = provider();
+    // gpt-5.6 variants reject "minimal" but accept "low" — clamp it up.
+    for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "minimal",
+        });
+        let result = p.transform_request(model, &req).unwrap();
+        assert_eq!(
+            result.body["reasoning"]["effort"], "low",
+            "{model} should clamp minimal -> low"
+        );
+    }
+}
+
+#[test]
+fn request_gpt_5_6_preserves_low_none_and_high() {
+    let p = provider();
+    // gpt-5.6 accepts low/none/high/xhigh unchanged (only minimal is rejected).
+    for effort in ["low", "none", "high", "xhigh"] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let result = p.transform_request("gpt-5.6-sol", &req).unwrap();
+        assert_eq!(
+            result.body["reasoning"]["effort"], effort,
+            "gpt-5.6-sol should pass {effort} through unchanged"
+        );
+    }
+}
+
 // ============================================================
 // transform_request — system/developer → instructions
 // ============================================================

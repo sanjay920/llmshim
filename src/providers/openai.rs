@@ -247,6 +247,34 @@ fn is_pro_model(model: &str) -> bool {
     model.to_lowercase().contains("-pro")
 }
 
+/// GPT-5.6 named variants (`gpt-5.6-sol`, `-terra`, `-luna`) reject
+/// `reasoning.effort: "minimal"` with HTTP 400 but accept
+/// `low`/`medium`/`high`/`xhigh`/`none`.
+fn is_gpt_5_6(model: &str) -> bool {
+    model.to_lowercase().starts_with("gpt-5.6")
+}
+
+/// Coerce a caller's `reasoning_effort` up to the lowest tier the target model
+/// actually accepts, so a value the model would 400 on is clamped rather than
+/// failing the request. Models with no restriction pass the value unchanged.
+fn clamp_reasoning_effort<'a>(model: &str, effort: &'a str) -> &'a str {
+    if is_pro_model(model) {
+        // pro: only medium/high/xhigh
+        match effort {
+            "minimal" | "low" | "none" => "medium",
+            other => other,
+        }
+    } else if is_gpt_5_6(model) {
+        // 5.6: rejects only "minimal"
+        match effort {
+            "minimal" => "low",
+            other => other,
+        }
+    } else {
+        effort
+    }
+}
+
 impl Provider for OpenAi {
     fn name(&self) -> &str {
         "openai"
@@ -287,13 +315,9 @@ impl Provider for OpenAi {
             });
 
         if let Some(effort) = effort {
-            // Pro models reject sub-`medium` efforts (minimal/low/none) with HTTP 400 —
-            // clamp them up to `medium`. Non-pro models pass all values through unchanged.
-            let effort = if is_pro_model(model) && matches!(effort, "minimal" | "low" | "none") {
-                "medium"
-            } else {
-                effort
-            };
+            // Clamp efforts the target model would reject (pro: minimal/low/none;
+            // gpt-5.6: minimal) up to its lowest accepted tier. Others pass through.
+            let effort = clamp_reasoning_effort(model, effort);
             let mut reasoning = json!({
                 "effort": effort,
                 "summary": "auto",
