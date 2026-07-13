@@ -91,14 +91,14 @@ via `x-gemini.thinkingConfig` only.
 
 ### xAI (Responses API, native nested `reasoning: {effort}`)
 
-| unified | grok-4.3 / grok-4-1-fast-* | grok-4.20-\*-reasoning / -non-reasoning |
-|---|---|---|
-| `none` | `none` | *(omitted — see below)* |
-| `low` | `low` | *(omitted)* |
-| `medium` | `medium` | *(omitted)* |
-| `high` | `high` | *(omitted)* |
-| `xhigh` | `xhigh` | *(omitted)* |
-| `max` | **`xhigh`** (xAI rejects max) | *(omitted)* |
+| unified | grok-4.3 / grok-4-1-fast-* | grok-4.5 | grok-4.20-\*-reasoning / -non-reasoning |
+|---|---|---|---|
+| `none` | `none` | **`low`** (4.5 can't disable reasoning) | *(omitted — see below)* |
+| `low` | `low` | `low` | *(omitted)* |
+| `medium` | `medium` | `medium` | *(omitted)* |
+| `high` | `high` | `high` | *(omitted)* |
+| `xhigh` | `xhigh` | `xhigh` | *(omitted)* |
+| `max` | **`xhigh`** (xAI rejects max) | **`xhigh`** | *(omitted)* |
 
 grok-4.20 models are **name-locked**: reasoning on/off is encoded in the model
 name and the API 400s on *any* reasoning parameter, so llmshim omits it

@@ -185,6 +185,13 @@ fn is_reasoning_name_locked(model: &str) -> bool {
     model.to_lowercase().contains("4.20")
 }
 
+/// grok-4.5 cannot disable reasoning: `effort: "none"` -> 400 ("does not
+/// support `reasoning_effort` value `none`", verified live). Unified effort
+/// "none" clamps to "low". grok-4.3 and the fast pair DO accept "none".
+fn reasoning_cannot_disable(model: &str) -> bool {
+    model.to_lowercase().contains("4.5")
+}
+
 impl Provider for Xai {
     fn name(&self) -> &str {
         "xai"
@@ -257,7 +264,10 @@ impl Provider for Xai {
                     .map(|m| m == "pro")
                     .unwrap_or(false);
                 let effort = match (effort, pro) {
-                    ("none", _) => "none", // explicit off wins, even in pro mode
+                    // Explicit off wins — except on models that can't disable
+                    // reasoning (grok-4.5), where it clamps to the floor.
+                    ("none", _) if reasoning_cannot_disable(model) => "low",
+                    ("none", _) => "none",
                     ("minimal" | "low", false) => "low",
                     ("minimal" | "low", true) => "medium",
                     ("medium", false) => "medium",
