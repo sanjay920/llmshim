@@ -747,3 +747,40 @@ fn response_surfaces_reasoning_summary() {
     );
     assert_eq!(result["choices"][0]["message"]["content"], "hi there");
 }
+
+#[test]
+fn grok_4_5_cannot_disable_reasoning_clamps_none_to_low() {
+    let p = provider();
+    // grok-4.5 rejects effort "none" (verified live) — clamp to its floor.
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let r = p.transform_request("grok-4.5", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "low");
+
+    // grok-4.3 still accepts "none" (turns reasoning off) — no clamp.
+    let r = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn grok_4_5_effort_range() {
+    let p = provider();
+    for (effort, expected) in [
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"), // xAI rejects "max"
+    ] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let r = p.transform_request("grok-4.5", &req).unwrap();
+        assert_eq!(r.body["reasoning"]["effort"], expected, "effort {effort}");
+    }
+}

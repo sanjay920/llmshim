@@ -122,6 +122,12 @@ pub const MODELS: &[ModelInfo] = &[
         label: "Gemini 3 Flash",
     },
     ModelInfo {
+        id: "xai/grok-4.5",
+        provider: "xai",
+        name: "grok-4.5",
+        label: "Grok 4.5",
+    },
+    ModelInfo {
         id: "xai/grok-4.3",
         provider: "xai",
         name: "grok-4.3",
