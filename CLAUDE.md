@@ -79,6 +79,10 @@ Callers pass provider-specific controls under these keys. Each provider copies w
 - `x-anthropic.disable_1m_context` (bool) — opt out of the 1M-context beta header (on by default for supported models).
 - `x-anthropic.extra_betas` (string array) — extra `anthropic-beta` tokens appended to the auto-managed set (1M-context / fast-mode / cache-TTL), de-duplicated. It's a header control, not a body param (e.g. lets a caller forward Claude Code's `--betas`). Logic + tests: `src/providers/anthropic.rs`, `tests/unit_anthropic.rs`.
 
+### Unified reasoning controls
+
+Two knobs work across every provider: `reasoning_effort` (`none|low|medium|high|xhigh|max`) and `reasoning_mode` (`standard|pro`). Each provider transform maps them to its native dialect, **clamping to the nearest tier the target model accepts** (all boundaries verified live — e.g. `max` is native only on OpenAI gpt-5.6; Anthropic 4.6 rejects `xhigh` but has `max`; Gemini's enum tops out at `high`; xAI grok-4.20 models reject any reasoning param). `mode: "pro"` is native on OpenAI gpt-5.6/-pro models (`reasoning.mode`), emulated as a one-tier effort bump elsewhere; explicit `none` always wins. Native passthrough (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) bypasses the mapping entirely and always takes precedence. **Full per-provider mapping tables: `docs/reasoning.md`** — update it and the pinning tests in `tests/unit_*.rs` together whenever a mapping changes.
+
 ### Tool format translation
 
 llmshim accepts tools in OpenAI Chat Completions format (nested `function` object) and translates them to each provider's native format:

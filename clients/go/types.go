@@ -53,9 +53,15 @@ type Config struct {
 	TopP        *float64 `json:"top_p,omitempty"`
 	TopK        *int     `json:"top_k,omitempty"`
 	Stop        []string `json:"stop,omitempty"`
-	// ReasoningEffort controls reasoning/thinking depth: "low", "medium",
-	// or "high".
+	// ReasoningEffort controls reasoning/thinking depth: "none", "low",
+	// "medium", "high", "xhigh", or "max". llmshim maps each value to the
+	// target provider/model's native control, clamping to the nearest
+	// supported tier (see docs/reasoning.md).
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// ReasoningMode is "standard" (default) or "pro". "pro" requests
+	// substantially more model work: native on OpenAI gpt-5.6/-pro models,
+	// emulated as a one-tier effort bump elsewhere.
+	ReasoningMode string `json:"reasoning_mode,omitempty"`
 }
 
 // ChatResponse is the response body from POST /v1/chat.

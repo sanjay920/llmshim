@@ -413,6 +413,32 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Value {
     })
 }
 
+/// Normalize a unified reasoning effort (`none|low|medium|high|xhigh|max`,
+/// legacy `minimal` accepted) and apply the mode:"pro" one-tier bump.
+/// Unknown values fall back to "medium" (the pre-existing default).
+fn normalize_unified_effort(effort: &str, pro: bool) -> &'static str {
+    let base = match effort {
+        "none" => "none",
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        _ => "medium",
+    };
+    if !pro {
+        return base;
+    }
+    match base {
+        // Explicit "none" wins even in pro mode.
+        "none" => "none",
+        "low" => "medium",
+        "medium" => "high",
+        "high" => "xhigh",
+        _ => "max", // xhigh, max
+    }
+}
+
 impl Provider for Anthropic {
     fn name(&self) -> &str {
         "anthropic"
@@ -493,34 +519,54 @@ impl Provider for Anthropic {
                 .and_then(|x| x.get("thinking"))
                 .is_some();
 
-        // Handle reasoning_effort -> Anthropic thinking translation
+        // Handle unified reasoning controls (reasoning_effort + reasoning_mode)
+        // -> Anthropic thinking translation. Explicit thinking config always wins.
         if let Some(effort) = obj.get("reasoning_effort").and_then(|e| e.as_str()) {
             if Self::supports_thinking(model) && !has_thinking {
-                if Self::uses_adaptive_thinking(model) {
-                    // Claude 4.6+ (incl. Opus 4.7/4.8, Sonnet 5): use adaptive
-                    // thinking with output_config.effort
+                // Anthropic has no request-level standard/pro mode; map the
+                // unified mode:"pro" to a one-tier effort bump (docs/reasoning.md).
+                let pro = obj
+                    .get("reasoning_mode")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m == "pro")
+                    .unwrap_or(false);
+                let effort = normalize_unified_effort(effort, pro);
+
+                if effort == "none" {
+                    if Self::uses_adaptive_thinking(model) {
+                        // Adaptive models think by default even with no config;
+                        // "disabled" is the only true zero-thinking request
+                        // (verified live on sonnet-5, opus-4-8, sonnet-4-6).
+                        body_obj.insert("thinking".to_string(), json!({"type": "disabled"}));
+                    }
+                    // Pre-4.6/Haiku: thinking is opt-in; omitting the key IS "none".
+                } else if Self::uses_adaptive_thinking(model) {
                     body_obj.insert("thinking".to_string(), json!({"type": "adaptive"}));
-                    let anthropic_effort = match effort {
-                        "low" | "minimal" => "low",
-                        "medium" => "medium",
-                        "high" => "high",
-                        _ => "medium",
-                    };
+                    // Opus/Sonnet 4.6 reject "xhigh" (their tiers: low/medium/high/max);
+                    // Opus 4.7/4.8 + Sonnet 5 accept the full low..max range (verified).
+                    let anthropic_effort =
+                        if effort == "xhigh" && !Self::is_new_adaptive_family(model) {
+                            "max"
+                        } else {
+                            effort
+                        };
                     body_obj.insert(
                         "output_config".to_string(),
                         json!({"effort": anthropic_effort}),
                     );
                 } else {
-                    // Pre-4.6: use enabled thinking with a budget based on effort
+                    // Pre-4.6: enabled thinking with a budget scaled to effort.
+                    // Six monotonic tiers over the max_tokens budget.
                     let max_tokens = body_obj
                         .get("max_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(8192);
                     let budget = match effort {
-                        "low" | "minimal" => 1024_u64.max(max_tokens / 4),
+                        "low" => max_tokens / 4,
                         "medium" => max_tokens / 2,
-                        "high" => max_tokens.saturating_sub(1),
-                        _ => max_tokens / 2,
+                        "high" => max_tokens * 3 / 4,
+                        "xhigh" => max_tokens * 9 / 10,
+                        _ => max_tokens.saturating_sub(1), // "max"
                     };
                     let budget = budget.max(1024); // Anthropic minimum
                     body_obj.insert(
@@ -531,13 +577,26 @@ impl Provider for Anthropic {
                         }),
                     );
                 }
-                // Thinking requires temperature=1, so remove any custom temperature
-                body_obj.remove("temperature");
-                body_obj.remove("top_k");
             }
         }
 
-        // If user passed thinking directly (via x-anthropic or top-level), handle constraints
+        // Pass through top-level thinking / output_config if user provided them
+        // directly. This runs BEFORE the constraint check below so passthrough
+        // thinking also gets the temperature/top_k strip (previously it ran
+        // after, leaving temperature set -> upstream 400).
+        if let Some(thinking) = obj.get("thinking") {
+            if !body_obj.contains_key("thinking") {
+                body_obj.insert("thinking".to_string(), thinking.clone());
+            }
+        }
+        if let Some(output_config) = obj.get("output_config") {
+            if !body_obj.contains_key("output_config") {
+                body_obj.insert("output_config".to_string(), output_config.clone());
+            }
+        }
+
+        // Thinking requires temperature=1: strip custom temperature/top_k
+        // whenever thinking is active, however it was configured.
         if body_obj.contains_key("thinking") {
             let thinking_type = body_obj
                 .get("thinking")
@@ -545,23 +604,8 @@ impl Provider for Anthropic {
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
             if thinking_type == "enabled" || thinking_type == "adaptive" {
-                // Temperature must be 1 (default) when thinking is enabled
                 body_obj.remove("temperature");
                 body_obj.remove("top_k");
-            }
-        }
-
-        // Pass through top-level thinking if user provided it directly
-        if let Some(thinking) = obj.get("thinking") {
-            if !body_obj.contains_key("thinking") {
-                body_obj.insert("thinking".to_string(), thinking.clone());
-            }
-        }
-
-        // Pass through output_config if user provided it directly
-        if let Some(output_config) = obj.get("output_config") {
-            if !body_obj.contains_key("output_config") {
-                body_obj.insert("output_config".to_string(), output_config.clone());
             }
         }
 

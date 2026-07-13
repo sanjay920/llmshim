@@ -833,7 +833,7 @@ fn reasoning_effort_high_on_pre_4_6_uses_enabled_with_budget() {
         .unwrap();
     assert_eq!(result.body["thinking"]["type"], "enabled");
     let budget = result.body["thinking"]["budget_tokens"].as_u64().unwrap();
-    assert_eq!(budget, 4095); // max_tokens - 1
+    assert_eq!(budget, 3072); // 75% of max_tokens (max_tokens-1 is the "max" tier now)
 }
 
 #[test]
@@ -1449,4 +1449,130 @@ fn anthropic_extra_betas_dedupe_against_auto_managed() {
         "got: {}",
         beta_header.1
     );
+}
+
+// ============================================================
+// Unified reasoning — six-tier efforts + reasoning_mode
+// ============================================================
+
+#[test]
+fn effort_none_disables_thinking_on_adaptive() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let result = p.transform_request("claude-sonnet-5", &req).unwrap();
+    assert_eq!(result.body["thinking"]["type"], "disabled");
+    assert!(result.body.get("output_config").is_none());
+    assert!(result.body["thinking"].get("budget_tokens").is_none());
+}
+
+#[test]
+fn effort_none_on_pre_4_6_omits_thinking() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4096,
+        "reasoning_effort": "none",
+    });
+    let result = p
+        .transform_request("claude-haiku-4-5-20251001", &req)
+        .unwrap();
+    assert!(result.body.get("thinking").is_none());
+}
+
+#[test]
+fn effort_xhigh_passes_on_new_family_clamps_to_max_on_4_6() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "xhigh",
+    });
+    let r_new = p.transform_request("claude-sonnet-5", &req).unwrap();
+    assert_eq!(r_new.body["output_config"]["effort"], "xhigh");
+    // 4.6 rejects xhigh (its tiers: low/medium/high/max) — clamp up to max
+    let r_46 = p.transform_request("claude-sonnet-4-6", &req).unwrap();
+    assert_eq!(r_46.body["output_config"]["effort"], "max");
+}
+
+#[test]
+fn effort_max_maps_to_max_on_adaptive() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "max",
+    });
+    let result = p.transform_request("claude-opus-4-8", &req).unwrap();
+    assert_eq!(result.body["output_config"]["effort"], "max");
+}
+
+#[test]
+fn mode_pro_bumps_effort_one_tier_and_none_wins() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "medium",
+        "reasoning_mode": "pro",
+    });
+    let result = p.transform_request("claude-sonnet-5", &req).unwrap();
+    assert_eq!(result.body["output_config"]["effort"], "high");
+
+    // explicit "none" wins even in pro mode
+    let req_none = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+        "reasoning_mode": "pro",
+    });
+    let result = p.transform_request("claude-sonnet-5", &req_none).unwrap();
+    assert_eq!(result.body["thinking"]["type"], "disabled");
+}
+
+#[test]
+fn pre_4_6_six_tier_budgets() {
+    let p = provider();
+    for (effort, expected) in [
+        ("low", 1024u64),
+        ("medium", 2048),
+        ("high", 3072),
+        ("xhigh", 3686),
+        ("max", 4095),
+    ] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 4096,
+            "reasoning_effort": effort,
+        });
+        let result = p
+            .transform_request("claude-haiku-4-5-20251001", &req)
+            .unwrap();
+        assert_eq!(
+            result.body["thinking"]["budget_tokens"].as_u64().unwrap(),
+            expected,
+            "effort {effort}"
+        );
+    }
+}
+
+#[test]
+fn top_level_thinking_passthrough_strips_temperature() {
+    // Regression: the passthrough previously ran AFTER the temperature strip,
+    // leaving temperature set alongside active thinking -> upstream 400.
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.3,
+        "thinking": {"type": "adaptive"},
+    });
+    let result = p.transform_request("claude-sonnet-5", &req).unwrap();
+    assert_eq!(result.body["thinking"]["type"], "adaptive");
+    assert!(result.body.get("temperature").is_none());
 }

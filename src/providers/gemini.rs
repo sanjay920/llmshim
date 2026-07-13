@@ -582,6 +582,13 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
     }))
 }
 
+/// Models that cannot turn thinking off: gemini-3.1-pro rejects both
+/// thinkingLevel "minimal" and thinkingBudget 0 ("This model only works in
+/// thinking mode", verified live). Unified effort "none" clamps to "low".
+fn cannot_disable_thinking(model: &str) -> bool {
+    model.to_lowercase().contains("3.1-pro")
+}
+
 impl Provider for Gemini {
     fn name(&self) -> &str {
         "gemini"
@@ -629,7 +636,9 @@ impl Provider for Gemini {
             gc.insert("stopSequences".to_string(), v.clone());
         }
 
-        // Thinking config: always include thoughts, translate reasoning_effort to thinkingLevel
+        // Thinking config: translate the unified reasoning controls
+        // (reasoning_effort + reasoning_mode) onto Gemini 3.x's 4-level
+        // thinkingLevel enum (minimal < low < medium < high).
         let effort = obj
             .get("reasoning_effort")
             .and_then(|e| e.as_str())
@@ -639,12 +648,41 @@ impl Provider for Gemini {
                     .and_then(|e| e.as_str())
             });
 
-        let level = effort.map(|e| match e {
-            "low" | "minimal" => "low",
-            "medium" => "medium",
-            "high" => "high",
-            "none" => "minimal",
-            _ => "medium",
+        // mode:"pro" has no Gemini analog (Deep Think is not API-accessible);
+        // map it to a one-tier bump toward the enum ceiling, same policy as
+        // the other providers without a native mode. Explicit "none" wins.
+        let pro = obj
+            .get("reasoning_mode")
+            .and_then(|m| m.as_str())
+            .map(|m| m == "pro")
+            .unwrap_or(false);
+
+        let level = effort.map(|e| {
+            // "none" disables thinking via level "minimal" — except
+            // gemini-3.1-pro, which cannot disable thinking (rejects minimal
+            // AND budget 0, verified live); clamp to its floor.
+            if e == "none" {
+                return if cannot_disable_thinking(model) {
+                    "low"
+                } else {
+                    "minimal"
+                };
+            }
+            let base = match e {
+                "minimal" | "low" => "low",
+                "medium" => "medium",
+                // Gemini's enum tops out at "high": xhigh/max clamp to it.
+                "high" | "xhigh" | "max" => "high",
+                _ => "medium",
+            };
+            if pro {
+                match base {
+                    "low" => "medium",
+                    _ => "high",
+                }
+            } else {
+                base
+            }
         });
 
         {

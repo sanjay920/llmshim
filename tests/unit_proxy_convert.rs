@@ -193,3 +193,16 @@ fn stream_event_error_has_message() {
     assert_eq!(v["type"], "error");
     assert_eq!(v["message"], "boom");
 }
+
+#[test]
+fn config_reasoning_mode_deserializes() {
+    let json = r#"{
+        "model": "gpt-5.6-sol",
+        "messages": [{"role": "user", "content": "hi"}],
+        "config": {"reasoning_effort": "xhigh", "reasoning_mode": "pro"}
+    }"#;
+    let req: ChatRequest = serde_json::from_str(json).unwrap();
+    let cfg = req.config.unwrap();
+    assert_eq!(cfg.reasoning_effort.as_deref(), Some("xhigh"));
+    assert_eq!(cfg.reasoning_mode.as_deref(), Some("pro"));
+}
