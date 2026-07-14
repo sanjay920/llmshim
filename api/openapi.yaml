@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: llmshim API
-  version: 0.1.22
+  version: 0.1.26
   description: |
     Multi-provider LLM API proxy. Send requests in a single format,
     llmshim translates to the native API of whichever provider you choose.
@@ -42,6 +42,34 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: |
+            Rate limited by the proxy or upstream provider. Proactive proxy
+            rejections include Retry-After.
+          headers:
+            Retry-After:
+              description: Suggested delay in whole seconds when supplied by the proxy.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: |
+            Proxy capacity is exhausted or the upstream provider is unavailable.
+            Proxy overload rejections include Retry-After.
+          headers:
+            Retry-After:
+              description: Suggested delay in whole seconds when supplied by the proxy.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '502':
           description: Provider error
           content:
@@ -69,6 +97,35 @@ paths:
             text/event-stream:
               schema:
                 $ref: '#/components/schemas/StreamEvent'
+        '429':
+          description: |
+            Request rate limited before the SSE response begins. Proactive
+            proxy rejections include Retry-After.
+          headers:
+            Retry-After:
+              description: Suggested delay in whole seconds.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: |
+            Proxy capacity is exhausted or the upstream provider is unavailable
+            before the SSE response begins. Proxy overload rejections include
+            Retry-After.
+          headers:
+            Retry-After:
+              description: Suggested delay in whole seconds.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /v1/models:
     get:
@@ -138,9 +195,10 @@ components:
             type: string
           description: |
             Ordered list of fallback model IDs. If the primary model fails with a
-            retryable error (429, 500, 502, 503), tries the next model in the list.
-            Each model is retried up to 2 times with exponential backoff before
-            moving to the next.
+            retryable error (429, 500, 502, 503, 529), tries the next model in the list.
+            The fallback layer retries eligible failures with exponential
+            backoff before moving to the next model. Fallback applies only to
+            non-streaming requests; streaming endpoints ignore this field.
           examples:
             - ["openai/gpt-5.5", "gemini/gemini-3-flash-preview"]
 
