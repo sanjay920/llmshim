@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The public request contract is a serde_json::Value.
     let request = json!({
-        "model": "anthropic/claude-sonnet-4-6",
+        "model": "openai/gpt-5.6-sol",
         "messages": [
             {"role": "user", "content": "What is Rust in one sentence?"}
         ],
@@ -75,7 +75,7 @@ use std::io::{self, Write};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = llmshim::router::Router::from_env();
     let request = json!({
-        "model": "anthropic/claude-sonnet-4-6",
+        "model": "anthropic/claude-sonnet-5",
         "messages": [
             {"role": "user", "content": "Write a haiku about Rust."}
         ],

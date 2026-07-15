@@ -52,7 +52,7 @@ keys control headers instead:
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-4-6",
+  "model": "anthropic/claude-sonnet-5",
   "messages": [{"role": "user", "content": "Analyze this carefully."}],
   "x-anthropic": {
     "thinking": {"type": "adaptive"},

@@ -25,7 +25,7 @@ Valid config keys for `set` and `get` are `openai`, `anthropic`, `gemini`,
 ## Interactive chat
 
 `llmshim chat` opens a model picker. Pressing Enter without a selection chooses
-`anthropic/claude-sonnet-4-6`. Every answer streams, requests use
+`anthropic/claude-sonnet-5`. Every answer streams, requests use
 `reasoning_effort: "high"`, and reasoning text is rendered dimly before answer
 text.
 

@@ -28,8 +28,8 @@ into two things:
 - a registered provider adapter;
 - the raw model name to send to that provider.
 
-For example, `anthropic/claude-sonnet-4-6` selects the adapter registered as
-`anthropic` and passes `claude-sonnet-4-6` to it. A bare model name can use
+For example, `anthropic/claude-sonnet-5` selects the adapter registered as
+`anthropic` and passes `claude-sonnet-5` to it. A bare model name can use
 prefix inference instead. [Models and the Router](routing.md) covers the exact
 rules.
 

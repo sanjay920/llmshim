@@ -16,7 +16,7 @@ In a Rust request, both are top-level fields:
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-4-6",
+  "model": "anthropic/claude-sonnet-5",
   "messages": [{"role": "user", "content": "Solve this carefully."}],
   "reasoning_effort": "high",
   "reasoning_mode": "pro"
@@ -27,7 +27,7 @@ In the proxy contract, put them under `config`:
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-4-6",
+  "model": "anthropic/claude-sonnet-5",
   "messages": [{"role": "user", "content": "Solve this carefully."}],
   "config": {
     "reasoning_effort": "high",

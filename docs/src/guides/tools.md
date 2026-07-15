@@ -37,7 +37,7 @@ In a Rust request, `tools` is a top-level field:
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-4-6",
+  "model": "anthropic/claude-sonnet-5",
   "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
   "tools": [
     {
@@ -60,7 +60,7 @@ Through the proxy, place the identical array at `provider_config.tools`:
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-4-6",
+  "model": "anthropic/claude-sonnet-5",
   "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
   "provider_config": {
     "tools": [

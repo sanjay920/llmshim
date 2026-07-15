@@ -16,8 +16,8 @@ Start with a history:
 Send it to another provider by keeping `messages` and changing the address:
 
 ```diff
-- "model": "anthropic/claude-sonnet-4-6"
-+ "model": "openai/gpt-5.5"
+- "model": "anthropic/claude-opus-4-8"
++ "model": "openai/gpt-5.6-sol"
 ```
 
 There is no session handoff between Anthropic and OpenAI. The new provider sees

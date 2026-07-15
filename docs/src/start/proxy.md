@@ -48,7 +48,7 @@ The examples below assume the default port and use `localhost` to reach it.
 curl http://localhost:3000/v1/chat \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "anthropic/claude-sonnet-4-6",
+    "model": "openai/gpt-5.6-sol",
     "messages": [
       {"role": "user", "content": "What is Rust in one sentence?"}
     ],
@@ -72,8 +72,8 @@ The non-streaming response uses llmshim's compact `ChatResponse`:
 ```json
 {
   "id": "msg_...",
-  "model": "claude-sonnet-4-6",
-  "provider": "anthropic",
+  "model": "gpt-5.6-sol",
+  "provider": "openai",
   "message": {
     "role": "assistant",
     "content": "Rust is a systems programming language..."

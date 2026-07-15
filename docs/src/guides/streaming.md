@@ -63,7 +63,7 @@ Send the compact request to the always-streaming endpoint:
 curl -N http://localhost:3000/v1/chat/stream \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "anthropic/claude-sonnet-4-6",
+    "model": "anthropic/claude-sonnet-5",
     "messages": [{"role": "user", "content": "Write a haiku."}],
     "config": {"max_tokens": 128}
   }'
