@@ -225,6 +225,9 @@ components:
           description: Tool calls made by the assistant
           items:
             $ref: '#/components/schemas/ToolCall'
+        reasoning_content:
+          type: string
+          description: Provider-returned reasoning carried into a later turn
 
     Config:
       type: object
