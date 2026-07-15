@@ -10,7 +10,7 @@ different native API and translates only the fields that API understands.
 | Google Gemini | `generateContent` / `streamGenerateContent` | `gemini*` | `x-gemini` |
 | xAI | Responses API | `grok*` | none |
 
-An explicit address such as `anthropic/claude-sonnet-4-6` avoids inference.
+An explicit address such as `anthropic/claude-sonnet-5` avoids inference.
 The named provider must be registered in the Router—that normally means its
 API key is configured.
 

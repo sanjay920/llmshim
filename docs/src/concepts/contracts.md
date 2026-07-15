@@ -13,7 +13,7 @@ The contracts are related, but they are not wire-compatible.
 
 ```rust
 let request = serde_json::json!({
-    "model": "anthropic/claude-sonnet-4-6",
+    "model": "anthropic/claude-sonnet-5",
     "messages": [{ "role": "user", "content": "Hello" }],
     "max_tokens": 200,
     "reasoning_effort": "high"
@@ -34,7 +34,7 @@ The proxy accepts `model` and `messages`, then groups portable controls under
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-4-6",
+  "model": "anthropic/claude-sonnet-5",
   "messages": [{ "role": "user", "content": "Hello" }],
   "config": {
     "max_tokens": 200,
@@ -48,7 +48,7 @@ A non-streaming proxy response is a compact `ChatResponse`:
 ```json
 {
   "id": "...",
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5",
   "provider": "anthropic",
   "message": { "role": "assistant", "content": "..." },
   "usage": {

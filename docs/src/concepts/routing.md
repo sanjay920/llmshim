@@ -9,8 +9,8 @@ send upstream.
 The most explicit form is `provider/model`:
 
 ```text
-openai/gpt-5.5
-anthropic/claude-sonnet-4-6
+openai/gpt-5.6-sol
+anthropic/claude-opus-4-8
 gemini/gemini-3.5-flash
 xai/grok-4.5
 ```
@@ -54,7 +54,7 @@ Rust applications can attach a one-level alias while building a Router:
 
 ```rust
 let router = llmshim::router::Router::from_env()
-    .alias("smart", "anthropic/claude-sonnet-4-6");
+    .alias("smart", "anthropic/claude-opus-4-8");
 ```
 
 The Router checks an alias before parsing the provider address. An alias target
