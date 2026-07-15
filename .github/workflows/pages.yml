@@ -28,7 +28,9 @@ jobs:
       - name: Install mdBook + mermaid preprocessor
         uses: taiki-e/install-action@v2
         with:
-          tool: mdbook@0.4.52,mdbook-mermaid
+          # Pin both: mdbook-mermaid must match mdbook's preprocessor protocol
+          # (an unpinned mismatch fails with "Unable to parse the input").
+          tool: mdbook@0.4.52,mdbook-mermaid@0.16.2
       - name: Build book
         run: mdbook build docs
       - name: Upload Pages artifact
