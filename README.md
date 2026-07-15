@@ -270,7 +270,7 @@ print(resp["reasoning"])          # thinking content
 print(resp["message"]["content"]) # answer
 ```
 
-llmshim maps these to each provider's native control (OpenAI `reasoning.effort`/`mode`, Anthropic adaptive thinking, Gemini `thinkingLevel`, xAI `reasoning.effort`), clamping to the nearest tier the target model actually supports — so `reasoning_effort="max"` works everywhere even though only some models have a native `max`. Full verified mapping tables: [`docs/reasoning.md`](docs/reasoning.md). Prefer a provider's exact native dialect? Pass it via `provider_config` (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) and llmshim won't touch it.
+llmshim maps these to each provider's native control (OpenAI `reasoning.effort`/`mode`, Anthropic adaptive thinking, Gemini `thinkingLevel`, xAI `reasoning.effort`), clamping to the nearest tier the target model actually supports — so `reasoning_effort="max"` works everywhere even though only some models have a native `max`. Full verified mapping tables: [the reasoning guide](https://sanjay920.github.io/llmshim/guides/reasoning.html). Prefer a provider's exact native dialect? Pass it via `provider_config` (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) and llmshim won't touch it.
 
 **Fallback chains** — automatic failover across providers:
 
