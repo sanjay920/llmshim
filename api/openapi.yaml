@@ -259,7 +259,7 @@ components:
             to the nearest supported tier where a model lacks one (e.g. "max"
             is native only on OpenAI gpt-5.6; Gemini tops out at its "high"
             thinking level). "none" disables thinking where the model allows it.
-            Full per-provider mapping tables: docs/reasoning.md. To bypass the
+            Full per-provider mapping tables: docs/src/guides/reasoning.md. To bypass the
             mapping and speak a provider's native dialect verbatim, use
             provider_config (x-openai.reasoning, x-anthropic.thinking,
             x-gemini.thinkingConfig) instead.
