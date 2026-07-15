@@ -524,7 +524,7 @@ impl Provider for Anthropic {
         if let Some(effort) = obj.get("reasoning_effort").and_then(|e| e.as_str()) {
             if Self::supports_thinking(model) && !has_thinking {
                 // Anthropic has no request-level standard/pro mode; map the
-                // unified mode:"pro" to a one-tier effort bump (docs/reasoning.md).
+                // unified mode:"pro" to a one-tier effort bump (docs/src/guides/reasoning.md).
                 let pro = obj
                     .get("reasoning_mode")
                     .and_then(|m| m.as_str())
