@@ -223,13 +223,11 @@ fn gemini_fast_mode_ignored() {
 fn xai_fast_mode_ignored() {
     let p = Xai::new("test-key".into());
     let req = json!({
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.3",
         "messages": [{"role": "user", "content": "hi"}],
         "speed": "fast",
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     // "speed" should not appear in the xAI request body
     assert!(
         result.body.get("speed").is_none(),

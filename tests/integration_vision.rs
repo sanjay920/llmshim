@@ -402,7 +402,7 @@ async fn xai_vision_returns_error() {
     let router = router();
 
     let req = json!({
-        "model": "xai/grok-4-1-fast-non-reasoning",
+        "model": "xai/grok-4.5",
         "messages": [{
             "role": "user",
             "content": [

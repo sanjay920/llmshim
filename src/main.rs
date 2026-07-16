@@ -23,10 +23,6 @@ const MODELS: &[(&str, &str)] = &[
     ("anthropic/claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
     ("gemini/gemini-3.5-flash", "Gemini 3.5 Flash"),
     ("gemini/gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
-    (
-        "gemini/gemini-3.1-flash-lite-preview",
-        "Gemini 3.1 Flash Lite",
-    ),
     ("gemini/gemini-3-flash-preview", "Gemini 3 Flash"),
     ("xai/grok-4.5", "Grok 4.5"),
     ("xai/grok-4.3", "Grok 4.3"),
@@ -36,8 +32,6 @@ const MODELS: &[(&str, &str)] = &[
     ),
     ("xai/grok-4.20-beta-0309-reasoning", "Grok 4.20 Reasoning"),
     ("xai/grok-4.20-beta-0309-non-reasoning", "Grok 4.20"),
-    ("xai/grok-4-1-fast-reasoning", "Grok 4.1 Fast Reasoning"),
-    ("xai/grok-4-1-fast-non-reasoning", "Grok 4.1 Fast"),
 ];
 
 fn print_models(current: &str) {

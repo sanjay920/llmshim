@@ -14,9 +14,7 @@ fn provider() -> Xai {
 fn request_url() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert_eq!(result.url, "https://api.x.ai/v1/responses");
 }
 
@@ -24,9 +22,7 @@ fn request_url() {
 fn request_custom_base_url() {
     let p = Xai::new("k".into()).with_base_url("http://localhost:9090".into());
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert_eq!(result.url, "http://localhost:9090/responses");
 }
 
@@ -34,10 +30,8 @@ fn request_custom_base_url() {
 fn request_sets_model() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
-    assert_eq!(result.body["model"], "grok-4-1-fast-reasoning");
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["model"], "grok-4.3");
 }
 
 #[test]
@@ -53,9 +47,7 @@ fn request_sets_model_grok_4_3() {
 fn request_auth_header() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     let auth = result
         .headers
         .iter()
@@ -74,9 +66,7 @@ fn request_messages_become_input() {
             {"role": "assistant", "content": "hi"},
         ],
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     let input = result.body["input"].as_array().unwrap();
     assert_eq!(input.len(), 2);
     assert_eq!(input[0]["role"], "user");
@@ -92,9 +82,7 @@ fn request_max_tokens_becomes_max_output_tokens() {
     let p = provider();
     let req =
         json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 500});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert_eq!(result.body["max_output_tokens"], 500);
 }
 
@@ -102,9 +90,7 @@ fn request_max_tokens_becomes_max_output_tokens() {
 fn request_max_completion_tokens_becomes_max_output_tokens() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 256});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert_eq!(result.body["max_output_tokens"], 256);
 }
 
@@ -116,9 +102,7 @@ fn request_max_completion_tokens_becomes_max_output_tokens() {
 fn request_strips_reasoning_effort() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "high"});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert!(
         result.body.get("reasoning_effort").is_none(),
         "reasoning_effort should be stripped for xAI"
@@ -129,9 +113,7 @@ fn request_strips_reasoning_effort() {
 fn request_strips_thinking() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert!(
         result.body.get("thinking").is_none(),
         "thinking should be stripped for xAI"
@@ -142,9 +124,7 @@ fn request_strips_thinking() {
 fn request_strips_output_config() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "output_config": {"effort": "high"}});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert!(
         result.body.get("output_config").is_none(),
         "output_config should be stripped for xAI"
@@ -165,9 +145,7 @@ fn request_system_becomes_instructions() {
             {"role": "user", "content": "hi"},
         ],
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert_eq!(result.body["instructions"], "You are helpful.");
     let input = result.body["input"].as_array().unwrap();
     assert_eq!(input.len(), 1);
@@ -184,9 +162,7 @@ fn request_developer_becomes_instructions() {
             {"role": "user", "content": "hi"},
         ],
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert_eq!(result.body["instructions"], "Be concise.");
 }
 
@@ -194,9 +170,7 @@ fn request_developer_becomes_instructions() {
 fn request_no_system_no_instructions() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert!(result.body.get("instructions").is_none());
 }
 
@@ -214,9 +188,7 @@ fn request_strips_reasoning_content_from_messages() {
             {"role": "user", "content": "hi"},
         ],
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     let input = result.body["input"].as_array().unwrap();
     assert!(input[0].get("reasoning_content").is_none());
     assert!(input[0].get("annotations").is_none());
@@ -230,9 +202,7 @@ fn request_strips_reasoning_content_from_messages() {
 fn tool_choice_anthropic_any_to_required() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "tool_choice": {"type": "any"}});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert_eq!(result.body["tool_choice"], "required");
 }
 
@@ -240,9 +210,7 @@ fn tool_choice_anthropic_any_to_required() {
 fn tool_choice_anthropic_tool_to_function() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "tool_choice": {"type": "tool", "name": "search"}});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert_eq!(result.body["tool_choice"]["type"], "function");
     assert_eq!(result.body["tool_choice"]["function"]["name"], "search");
 }
@@ -251,9 +219,7 @@ fn tool_choice_anthropic_tool_to_function() {
 fn tool_choice_string_passthrough() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "tool_choice": "auto"});
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert_eq!(result.body["tool_choice"], "auto");
 }
 
@@ -279,9 +245,7 @@ fn response_text_only() {
         ],
         "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
     });
-    let result = p
-        .transform_response("grok-4-1-fast-reasoning", resp)
-        .unwrap();
+    let result = p.transform_response("grok-4.3", resp).unwrap();
     assert_eq!(result["object"], "chat.completion");
     assert_eq!(result["id"], "resp_xai");
     assert_eq!(result["choices"][0]["message"]["content"], "Hello!");
@@ -303,9 +267,7 @@ fn response_with_reasoning_tokens() {
         ],
         "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15, "output_tokens_details": {"reasoning_tokens": 100}},
     });
-    let result = p
-        .transform_response("grok-4-1-fast-reasoning", resp)
-        .unwrap();
+    let result = p.transform_response("grok-4.3", resp).unwrap();
     assert_eq!(result["usage"]["reasoning_tokens"], 100);
 }
 
@@ -321,9 +283,7 @@ fn response_no_reasoning_tokens_field_when_zero() {
         ],
         "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
     });
-    let result = p
-        .transform_response("grok-4-1-fast-non-reasoning", resp)
-        .unwrap();
+    let result = p.transform_response("grok-4.3", resp).unwrap();
     assert!(result["usage"].get("reasoning_tokens").is_none());
 }
 
@@ -339,9 +299,7 @@ fn response_function_call() {
         ],
         "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
     });
-    let result = p
-        .transform_response("grok-4-1-fast-reasoning", resp)
-        .unwrap();
+    let result = p.transform_response("grok-4.3", resp).unwrap();
     let tc = &result["choices"][0]["message"]["tool_calls"][0];
     assert_eq!(tc["id"], "call_1");
     assert_eq!(tc["function"]["name"], "search");
@@ -560,7 +518,7 @@ fn stream_done_returns_none() {
 fn session_history_tool_calls_converted_to_function_call_items() {
     let p = provider();
     let req = json!({
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.3",
         "messages": [
             {"role": "user", "content": "Get AAPL quote"},
             {
@@ -577,9 +535,7 @@ fn session_history_tool_calls_converted_to_function_call_items() {
             {"role": "user", "content": "thanks"},
         ],
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     let input = result.body["input"].as_array().unwrap();
 
     // user message
@@ -609,7 +565,7 @@ fn session_history_tool_calls_converted_to_function_call_items() {
 fn session_history_multiple_tool_calls_in_one_message() {
     let p = provider();
     let req = json!({
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.3",
         "messages": [
             {"role": "user", "content": "Compare AAPL and GOOGL"},
             {
@@ -624,9 +580,7 @@ fn session_history_multiple_tool_calls_in_one_message() {
             {"role": "tool", "tool_call_id": "call_2", "content": "{\"price\":180}"},
         ],
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     let input = result.body["input"].as_array().unwrap();
 
     assert_eq!(input[0]["role"], "user");
@@ -646,7 +600,7 @@ fn session_history_multiple_tool_calls_in_one_message() {
 fn session_history_strips_cross_provider_fields() {
     let p = provider();
     let req = json!({
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.3",
         "messages": [
             {
                 "role": "assistant",
@@ -657,9 +611,7 @@ fn session_history_strips_cross_provider_fields() {
             },
         ],
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     let input = result.body["input"].as_array().unwrap();
     assert_eq!(input[0]["content"], "hello");
     assert!(input[0].get("reasoning_content").is_none());
