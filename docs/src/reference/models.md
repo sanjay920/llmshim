@@ -83,11 +83,20 @@ parallel table:
 | `capabilities.reasoning` | `Support` | Accepts a reasoning-effort control |
 
 `Support` is tri-state: `Supported`, `Unsupported`, or `Unknown`. **`Unknown` is
-honest, not a bug** — llmshim never guesses a spec to fill a cell. A field is
-populated only once verified; everything else stays `Unknown`/`None` and is
-filled in over releases. As of this snapshot, `reasoning` is populated for every
-model (derived from the provider clamp logic); token counts and the remaining
-capabilities are `Unknown`/`None` pending authoritative provider numbers.
+honest, not a bug** — llmshim never guesses a spec to fill a cell. As of the
+2026-07-16 snapshot, context window, output ceiling, and capabilities are
+populated from official provider docs (platform.claude.com, developers.openai.com,
+ai.google.dev, docs.x.ai), and `reasoning` is cross-checked against the provider
+clamp logic. What's deliberately left `Unknown`/`None`:
+
+- `parallel_tool_calls` for most models (providers rarely document it per model);
+- xAI `max_output_tokens` (not published) and per-model streaming;
+- everything for `grok-4-1-fast-*` except reasoning (its doc pages are delisted).
+
+A few documented exceptions are recorded honestly too — e.g. `gpt-5.5-pro` has
+`streaming: Unsupported` and `gpt-5.4-pro` has `structured_output: Unsupported`.
+Note also that Gemini publishes an input limit rather than a combined total, so
+`context_window_tokens` is the input window with `max_output_tokens` separate.
 
 `reasoning` is deliberately a single flag — "does this model accept a reasoning
 control at all." The detailed per-tier mapping is not duplicated here; it lives

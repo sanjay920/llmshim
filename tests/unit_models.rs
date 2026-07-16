@@ -85,13 +85,49 @@ fn spec_returns_none_for_unregistered() {
 
 #[test]
 fn unpopulated_spec_fields_are_unknown_not_guessed() {
-    // The honesty rule: fields we haven't verified stay Unknown/None.
-    let m = spec("openai/gpt-5.6-sol").unwrap();
+    // The honesty rule: grok-4-1-fast-* doc pages are delisted, so only the
+    // code-derived reasoning support is known — everything else stays
+    // Unknown/None rather than being guessed.
+    let m = spec("xai/grok-4-1-fast-reasoning").unwrap();
     assert_eq!(m.context_window_tokens, None);
     assert_eq!(m.max_output_tokens, None);
     assert_eq!(m.capabilities.tools, Support::Unknown);
     assert_eq!(m.capabilities.images, Support::Unknown);
     assert_eq!(m.capabilities.prompt_cache, Support::Unknown);
+    assert_eq!(m.capabilities.reasoning, Support::Supported);
+}
+
+#[test]
+fn verified_specs_are_populated() {
+    let opus = spec("anthropic/claude-opus-4-8").unwrap();
+    assert_eq!(opus.context_window_tokens, Some(1_000_000));
+    assert_eq!(opus.max_output_tokens, Some(128_000));
+    assert_eq!(opus.capabilities.images, Support::Supported);
+    assert_eq!(opus.capabilities.prompt_cache, Support::Supported);
+
+    let haiku = spec("anthropic/claude-haiku-4-5-20251001").unwrap();
+    assert_eq!(haiku.context_window_tokens, Some(200_000));
+    assert_eq!(haiku.max_output_tokens, Some(64_000));
+
+    let mini = spec("openai/gpt-5.4-mini").unwrap();
+    assert_eq!(mini.context_window_tokens, Some(400_000));
+}
+
+#[test]
+fn documented_capability_exceptions_are_recorded() {
+    // gpt-5.5-pro: streaming explicitly not supported.
+    assert_eq!(
+        spec("openai/gpt-5.5-pro").unwrap().capabilities.streaming,
+        Support::Unsupported
+    );
+    // gpt-5.4-pro: structured outputs explicitly not supported.
+    assert_eq!(
+        spec("openai/gpt-5.4-pro")
+            .unwrap()
+            .capabilities
+            .structured_output,
+        Support::Unsupported
+    );
 }
 
 #[test]
