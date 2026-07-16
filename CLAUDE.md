@@ -8,7 +8,7 @@ A pure Rust LLM API translation layer. Takes OpenAI-format JSON requests, transl
 
 **Published on crates.io as `llmshim`** — https://crates.io/crates/llmshim
 
-This is a public crate. Do NOT make breaking changes to `pub` items in `src/lib.rs`, `src/router.rs`, `src/provider.rs`, `src/error.rs`, `src/fallback.rs`, `src/log.rs`, `src/config.rs`, `src/models.rs`, or `src/vision.rs` without a semver bump. The `ragents` crate (https://github.com/sanjay920/ragents) depends on this.
+This is a public crate on crates.io. Do NOT make breaking changes to `pub` items in `src/lib.rs`, `src/router.rs`, `src/provider.rs`, `src/error.rs`, `src/fallback.rs`, `src/log.rs`, `src/config.rs`, `src/models.rs`, or `src/vision.rs` without a semver bump.
 
 ## Supported models
 

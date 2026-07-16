@@ -74,4 +74,4 @@ Then confirm the model appears: `cargo run -- models` should list it, and `cargo
 
 ## Public-API note
 
-`MODELS` and `ModelInfo` in `src/models.rs` are `pub` and depended on by the `ragents` crate. Adding entries is additive and safe. `ModelInfo` is `#[non_exhaustive]`, so **adding a new spec field is non-breaking** — do that freely. Renaming/removing fields, or changing `Support`/`ModelCapabilities`, still needs a semver bump — see `/release`.
+`MODELS` and `ModelInfo` in `src/models.rs` are `pub` (this is a public crate on crates.io). Adding entries is additive and safe. `ModelInfo` is `#[non_exhaustive]`, so **adding a new spec field is non-breaking** — do that freely. Renaming/removing fields, or changing `Support`/`ModelCapabilities`, still needs a semver bump — see `/release`.

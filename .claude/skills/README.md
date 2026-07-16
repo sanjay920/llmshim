@@ -11,4 +11,4 @@ Project [skills](https://code.claude.com/docs/en/skills) that let coding agents 
 
 `add-model`, `add-provider`, and `release` set `disable-model-invocation: true` — they have side effects, so a human triggers them explicitly. `preflight` is safe for the agent to run automatically.
 
-These skills encode the repo-specific gotchas (the duplicated model list in `src/models.rs` + `src/main.rs`, the `--features proxy` requirement, the semver-protected public surface used by `ragents`). Keep them in sync when those workflows change.
+These skills encode the repo-specific gotchas (the duplicated model list in `src/models.rs` + `src/main.rs`, the `--features proxy` requirement, the semver-protected public surface). Keep them in sync when those workflows change.

@@ -59,4 +59,4 @@ Set `<KEY>_API_KEY` and run `cargo test -- --ignored` to exercise the live integ
 
 ## Public-API note
 
-`src/router.rs` and `src/provider.rs` are public and used by `ragents`. New provider modules and registrations are additive. Do not change existing trait signatures without a semver bump — see `/release`.
+`src/router.rs` and `src/provider.rs` are public API. New provider modules and registrations are additive. Do not change existing trait signatures without a semver bump — see `/release`.
