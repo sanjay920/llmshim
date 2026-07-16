@@ -111,7 +111,7 @@ async fn gemini_tool_roundtrip_with_thought_signature() {
 #[tokio::test]
 #[ignore]
 async fn xai_tool_roundtrip() {
-    let result = tool_roundtrip("xai/grok-4-1-fast-reasoning").await;
+    let result = tool_roundtrip("xai/grok-4.5").await;
     match result {
         Ok(answer) => {
             println!("xAI tool roundtrip OK: {answer}");
@@ -166,7 +166,7 @@ async fn xai_accumulated_session_history() {
     // Simulate what a session would look like after a prior run:
     // user → assistant (tool call) → tool result → assistant (answer) → user (new turn)
     let accumulated = json!({
-        "model": "xai/grok-4-1-fast-reasoning",
+        "model": "xai/grok-4.5",
         "messages": [
             {"role": "user", "content": "What is the weather in Tokyo?"},
             {

@@ -11,7 +11,7 @@ fn models_registry_has_all_providers() {
 
 #[test]
 fn models_registry_has_expected_count() {
-    assert_eq!(MODELS.len(), 26);
+    assert_eq!(MODELS.len(), 23);
 }
 
 #[test]
@@ -84,17 +84,18 @@ fn spec_returns_none_for_unregistered() {
 }
 
 #[test]
-fn unpopulated_spec_fields_are_unknown_not_guessed() {
-    // The honesty rule: grok-4-1-fast-* doc pages are delisted, so only the
-    // code-derived reasoning support is known — everything else stays
-    // Unknown/None rather than being guessed.
-    let m = spec("xai/grok-4-1-fast-reasoning").unwrap();
-    assert_eq!(m.context_window_tokens, None);
+fn undocumented_spec_fields_stay_unknown_not_guessed() {
+    // The honesty rule: xAI publishes no max-output ceiling and doesn't state
+    // per-model streaming / parallel-tool-call support, so those stay
+    // None/Unknown rather than being guessed — even though other fields are
+    // populated for the same model.
+    let m = spec("xai/grok-4.5").unwrap();
     assert_eq!(m.max_output_tokens, None);
-    assert_eq!(m.capabilities.tools, Support::Unknown);
-    assert_eq!(m.capabilities.images, Support::Unknown);
-    assert_eq!(m.capabilities.prompt_cache, Support::Unknown);
-    assert_eq!(m.capabilities.reasoning, Support::Supported);
+    assert_eq!(m.capabilities.streaming, Support::Unknown);
+    assert_eq!(m.capabilities.parallel_tool_calls, Support::Unknown);
+    // Verified fields are populated:
+    assert_eq!(m.context_window_tokens, Some(500_000));
+    assert_eq!(m.capabilities.tools, Support::Supported);
 }
 
 #[test]

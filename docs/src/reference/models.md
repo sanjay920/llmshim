@@ -14,7 +14,7 @@ the ID and display label.
 
 ## Registered catalog
 
-The current registry contains 26 entries, newest first within each provider.
+The current registry contains 23 entries, newest first within each provider.
 This page mirrors `src/models.rs`; use runtime discovery rather than parsing
 this table in applications.
 
@@ -49,7 +49,6 @@ this table in applications.
 |---|---|
 | `gemini/gemini-3.5-flash` | Gemini 3.5 Flash |
 | `gemini/gemini-3.1-pro-preview` | Gemini 3.1 Pro |
-| `gemini/gemini-3.1-flash-lite-preview` | Gemini 3.1 Flash Lite |
 | `gemini/gemini-3-flash-preview` | Gemini 3 Flash |
 
 ### xAI
@@ -61,8 +60,6 @@ this table in applications.
 | `xai/grok-4.20-multi-agent-beta-0309` | Grok 4.20 Multi-Agent |
 | `xai/grok-4.20-beta-0309-reasoning` | Grok 4.20 Reasoning |
 | `xai/grok-4.20-beta-0309-non-reasoning` | Grok 4.20 |
-| `xai/grok-4-1-fast-reasoning` | Grok 4.1 Fast Reasoning |
-| `xai/grok-4-1-fast-non-reasoning` | Grok 4.1 Fast |
 
 ## Spec metadata
 
@@ -90,8 +87,7 @@ ai.google.dev, docs.x.ai), and `reasoning` is cross-checked against the provider
 clamp logic. What's deliberately left `Unknown`/`None`:
 
 - `parallel_tool_calls` for most models (providers rarely document it per model);
-- xAI `max_output_tokens` (not published) and per-model streaming;
-- everything for `grok-4-1-fast-*` except reasoning (its doc pages are delisted).
+- xAI `max_output_tokens` (not published) and per-model streaming.
 
 A few documented exceptions are recorded honestly too — e.g. `gpt-5.5-pro` has
 `streaming: Unsupported` and `gpt-5.4-pro` has `structured_output: Unsupported`.

@@ -218,9 +218,9 @@ fn parse_infer_gemini() {
 #[test]
 fn parse_infer_grok() {
     let aliases = HashMap::new();
-    let (provider, model) = parse_model("grok-4-1-fast-reasoning", &aliases).unwrap();
+    let (provider, model) = parse_model("grok-4.3", &aliases).unwrap();
     assert_eq!(provider, "xai");
-    assert_eq!(model, "grok-4-1-fast-reasoning");
+    assert_eq!(model, "grok-4.3");
 }
 
 #[test]

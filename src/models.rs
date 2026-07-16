@@ -24,8 +24,6 @@
 //!   (`Unknown`, not upgraded from the general API behavior).
 //! - `parallel_tool_calls` is `Unknown` for most models — providers rarely
 //!   document it per model, and we don't infer it.
-//! - `grok-4-1-fast-*` doc pages are currently delisted (404), so only their
-//!   code-derived `reasoning` support is known; all else is `Unknown`/`None`.
 
 /// Whether a model supports a capability. Tri-state so "we haven't verified
 /// this yet" is a first-class, honest value rather than a silent `false`.
@@ -176,11 +174,6 @@ const CAPS_XAI: ModelCapabilities = ModelCapabilities {
     parallel_tool_calls: Support::Unknown,
     reasoning: Support::Supported,
 };
-/// reasoning known-supported (code-derived), everything else unverified — used
-/// where the provider's per-model doc page is unavailable.
-const CAPS_REASONING_ONLY: ModelCapabilities =
-    ModelCapabilities::unknown().with_reasoning(Support::Supported);
-
 pub const MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "openai/gpt-5.6-sol",
@@ -342,15 +335,6 @@ pub const MODELS: &[ModelInfo] = &[
         capabilities: CAPS_STD,
     },
     ModelInfo {
-        id: "gemini/gemini-3.1-flash-lite-preview",
-        provider: "gemini",
-        name: "gemini-3.1-flash-lite-preview",
-        label: "Gemini 3.1 Flash Lite",
-        context_window_tokens: Some(1_048_576),
-        max_output_tokens: Some(65_536),
-        capabilities: CAPS_STD,
-    },
-    ModelInfo {
         id: "gemini/gemini-3-flash-preview",
         provider: "gemini",
         name: "gemini-3-flash-preview",
@@ -406,26 +390,6 @@ pub const MODELS: &[ModelInfo] = &[
         context_window_tokens: Some(1_000_000),
         max_output_tokens: None,
         capabilities: CAPS_XAI.with_reasoning(Support::Unsupported),
-    },
-    // grok-4-1-fast-* doc pages are delisted (404); only code-derived reasoning
-    // support is known — everything else stays Unknown/None.
-    ModelInfo {
-        id: "xai/grok-4-1-fast-reasoning",
-        provider: "xai",
-        name: "grok-4-1-fast-reasoning",
-        label: "Grok 4.1 Fast Reasoning",
-        context_window_tokens: None,
-        max_output_tokens: None,
-        capabilities: CAPS_REASONING_ONLY,
-    },
-    ModelInfo {
-        id: "xai/grok-4-1-fast-non-reasoning",
-        provider: "xai",
-        name: "grok-4-1-fast-non-reasoning",
-        label: "Grok 4.1 Fast",
-        context_window_tokens: None,
-        max_output_tokens: None,
-        capabilities: CAPS_REASONING_ONLY,
     },
 ];
 
