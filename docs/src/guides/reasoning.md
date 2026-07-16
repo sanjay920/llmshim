@@ -134,7 +134,7 @@ through `x-gemini.thinkingConfig`.
 
 xAI receives the nested native shape `reasoning: {effort}`:
 
-| unified | grok-4.3 / grok-4-1-fast-\* | grok-4.5 | grok-4.20-\*-reasoning / -non-reasoning |
+| unified | grok-4.3 | grok-4.5 | grok-4.20-\*-reasoning / -non-reasoning |
 |---|---|---|---|
 | `none` | `none` | **`low`** | omitted |
 | `low` | `low` | `low` | omitted |
