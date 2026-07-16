@@ -1,4 +1,4 @@
-use llmshim::models::{available_models, MODELS};
+use llmshim::models::{available_models, spec, ModelCapabilities, Support, MODELS};
 
 #[test]
 fn models_registry_has_all_providers() {
@@ -66,4 +66,80 @@ fn available_models_unknown_provider_ignored() {
     let registered = vec!["nonexistent"];
     let models = available_models(&registered);
     assert!(models.is_empty());
+}
+
+// --- spec metadata (issue #31) ---
+
+#[test]
+fn spec_looks_up_by_full_id_and_bare_name() {
+    let by_id = spec("openai/gpt-5.6-sol").expect("lookup by full id");
+    let by_name = spec("gpt-5.6-sol").expect("lookup by bare name");
+    assert_eq!(by_id.id, by_name.id);
+    assert_eq!(by_id.name, "gpt-5.6-sol");
+}
+
+#[test]
+fn spec_returns_none_for_unregistered() {
+    assert!(spec("openai/does-not-exist").is_none());
+}
+
+#[test]
+fn unpopulated_spec_fields_are_unknown_not_guessed() {
+    // The honesty rule: fields we haven't verified stay Unknown/None.
+    let m = spec("openai/gpt-5.6-sol").unwrap();
+    assert_eq!(m.context_window_tokens, None);
+    assert_eq!(m.max_output_tokens, None);
+    assert_eq!(m.capabilities.tools, Support::Unknown);
+    assert_eq!(m.capabilities.images, Support::Unknown);
+    assert_eq!(m.capabilities.prompt_cache, Support::Unknown);
+}
+
+#[test]
+fn default_capabilities_are_all_unknown() {
+    let caps = ModelCapabilities::default();
+    assert_eq!(caps, ModelCapabilities::unknown());
+    assert_eq!(caps.reasoning, Support::Unknown);
+    assert_eq!(caps.structured_output, Support::Unknown);
+}
+
+#[test]
+fn reasoning_support_is_populated_for_every_model() {
+    // reasoning is derived from the provider clamp logic, so no model should be
+    // left Unknown on this field.
+    for m in MODELS {
+        assert_ne!(
+            m.capabilities.reasoning,
+            Support::Unknown,
+            "{} has unpopulated reasoning support",
+            m.id
+        );
+    }
+}
+
+#[test]
+fn reasoning_support_matches_provider_behavior() {
+    // Effort-controlled models accept a reasoning control.
+    for id in [
+        "openai/gpt-5.6-sol",
+        "anthropic/claude-opus-4-8",
+        "xai/grok-4.5",
+    ] {
+        assert_eq!(
+            spec(id).unwrap().capabilities.reasoning,
+            Support::Supported,
+            "{id} should support a reasoning control"
+        );
+    }
+    // grok-4.20-* are name-locked and 400 on any reasoning param.
+    for id in [
+        "xai/grok-4.20-beta-0309-reasoning",
+        "xai/grok-4.20-beta-0309-non-reasoning",
+        "xai/grok-4.20-multi-agent-beta-0309",
+    ] {
+        assert_eq!(
+            spec(id).unwrap().capabilities.reasoning,
+            Support::Unsupported,
+            "{id} rejects reasoning controls"
+        );
+    }
 }
