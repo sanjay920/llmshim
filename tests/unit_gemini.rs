@@ -888,7 +888,7 @@ fn stream_parallel_tool_calls_each_get_unique_index() {
     let tc2 = &parsed2["choices"][0]["delta"]["tool_calls"][0];
     assert_eq!(tc2["function"]["name"], "get_news");
     // Each chunk is independently transformed — index starts at 0 within the chunk.
-    // The ragents runner handles deduplication across chunks.
+    // The client's streaming runner handles deduplication across chunks.
     assert_eq!(tc2["index"], 0);
     assert_eq!(tc2["thought_signature"], "sig2");
 }
@@ -1281,8 +1281,8 @@ fn session_history_empty_assistant_turns_removed() {
 
 // ============================================================
 // Full tool call roundtrip: Gemini response -> OpenAI format -> back to Gemini request
-// Simulates what ragents does: receives tool calls via streaming, accumulates them,
-// sends results back. thought_signature MUST survive the full roundtrip.
+// Simulates what a streaming client does: receives tool calls via streaming,
+// accumulates them, sends results back. thought_signature MUST survive the full roundtrip.
 // ============================================================
 
 #[test]
@@ -1312,12 +1312,12 @@ fn full_roundtrip_thought_signature_preserved() {
         .unwrap();
     let chunk_parsed: Value = serde_json::from_str(&chunk_result).unwrap();
 
-    // Extract tool call from the transformed chunk (what ragents would accumulate)
+    // Extract tool call from the transformed chunk (what a streaming client would accumulate)
     let tc = &chunk_parsed["choices"][0]["delta"]["tool_calls"][0];
     assert_eq!(tc["thought_signature"], "roundtrip-sig-abc");
 
-    // Step 2: Simulate ragents building the assistant message with accumulated tool calls
-    // This is what ragents/src/runner.rs does after streaming accumulation
+    // Step 2: Simulate a client building the assistant message with accumulated tool calls
+    // This is what a client's streaming runner does after accumulation
     let assistant_message = json!({
         "role": "assistant",
         "content": "",
@@ -1332,7 +1332,7 @@ fn full_roundtrip_thought_signature_preserved() {
         }]
     });
 
-    // Step 3: Simulate ragents adding the tool result
+    // Step 3: Simulate the client adding the tool result
     let tool_result = json!({
         "role": "tool",
         "tool_call_id": tc["id"].as_str().unwrap(),
@@ -1395,7 +1395,7 @@ fn full_roundtrip_thought_signature_preserved() {
 
 #[test]
 fn full_roundtrip_without_thought_signature_gets_stripped() {
-    // When ragents does NOT preserve thought_signature (the bug scenario),
+    // When a client does NOT preserve thought_signature (the bug scenario),
     // enforce_gemini_turn_order strips the functionCall pair, breaking Gemini
     let p = provider();
 
