@@ -64,6 +64,47 @@ this table in applications.
 | `xai/grok-4-1-fast-reasoning` | Grok 4.1 Fast Reasoning |
 | `xai/grok-4-1-fast-non-reasoning` | Grok 4.1 Fast |
 
+## Spec metadata
+
+Each registry entry can also carry **spec metadata** beyond its identity, so a
+consumer can read a model's facts from one place instead of maintaining its own
+parallel table:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `context_window_tokens` | `Option<u32>` | Total context window (input + output), if published |
+| `max_output_tokens` | `Option<u32>` | Maximum output tokens per response, if published |
+| `capabilities.tools` | `Support` | Function/tool calling |
+| `capabilities.streaming` | `Support` | Streaming responses |
+| `capabilities.images` | `Support` | Image input |
+| `capabilities.prompt_cache` | `Support` | Provider-side prompt caching |
+| `capabilities.structured_output` | `Support` | JSON-schema / structured responses |
+| `capabilities.parallel_tool_calls` | `Support` | Multiple tool calls per turn |
+| `capabilities.reasoning` | `Support` | Accepts a reasoning-effort control |
+
+`Support` is tri-state: `Supported`, `Unsupported`, or `Unknown`. **`Unknown` is
+honest, not a bug** — llmshim never guesses a spec to fill a cell. A field is
+populated only once verified; everything else stays `Unknown`/`None` and is
+filled in over releases. As of this snapshot, `reasoning` is populated for every
+model (derived from the provider clamp logic); token counts and the remaining
+capabilities are `Unknown`/`None` pending authoritative provider numbers.
+
+`reasoning` is deliberately a single flag — "does this model accept a reasoning
+control at all." The detailed per-tier mapping is not duplicated here; it lives
+in the [reasoning guide](../guides/reasoning.md) and the provider transforms.
+
+Look up one model's full spec from the Rust crate:
+
+```rust
+if let Some(m) = llmshim::models::spec("openai/gpt-5.6-sol") {
+    println!("{}: reasoning = {:?}", m.label, m.capabilities.reasoning);
+}
+```
+
+`spec()` accepts a full id (`"openai/gpt-5.6-sol"`) or a bare name
+(`"gpt-5.6-sol"`) and returns `None` for unregistered models. These specs are a
+point-in-time snapshot pinned by the crate version, exactly like the list above.
+
 ## Catalog is not an allowlist
 
 The Router does not check explicit model names against this registry. If a
