@@ -8,7 +8,7 @@ allowed-tools: Bash(cargo fmt*), Bash(cargo clippy*), Bash(cargo test*), Bash(ca
 
 # Cut an llmshim release
 
-llmshim is published on crates.io and depended on by the `ragents` crate. Releases are tag-driven: pushing a `v*` tag triggers `.github/workflows/release.yml`, which runs the test gate, then publishes to crates.io, builds macOS binaries + a GitHub release, updates the Homebrew tap, publishes the Python/npm/RubyGems clients, and tags the Go client module. There is no manual publish step for any of these — the tag does it.
+llmshim is published on crates.io. Releases are tag-driven: pushing a `v*` tag triggers `.github/workflows/release.yml`, which runs the test gate, then publishes to crates.io, builds macOS binaries + a GitHub release, updates the Homebrew tap, publishes the Python/npm/RubyGems clients, and tags the Go client module. There is no manual publish step for any of these — the tag does it.
 
 **All language clients ship in lockstep with the crate** — every release publishes Python, TypeScript, Ruby, and Go at the same version number as `Cargo.toml`, even if a given client's code didn't change (matches how Stripe/AWS/etc. version multi-language SDKs). Keep it that way; don't special-case a client's version.
 
@@ -16,7 +16,7 @@ Target version: **$ARGUMENTS**
 
 ## Semver gate — check BEFORE bumping
 
-Breaking changes to `pub` items require a **minor** bump (pre-1.0, minor is the breaking channel), not a patch. `ragents` depends on this crate. The public surface under semver protection:
+Breaking changes to `pub` items require a **minor** bump (pre-1.0, minor is the breaking channel), not a patch. The public surface under semver protection:
 
 `src/lib.rs`, `src/router.rs`, `src/provider.rs`, `src/error.rs`, `src/fallback.rs`, `src/log.rs`, `src/config.rs`, `src/models.rs`, `src/vision.rs`.
 

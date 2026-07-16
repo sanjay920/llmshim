@@ -14,7 +14,7 @@ the ID and display label.
 
 ## Registered catalog
 
-The current registry contains 26 entries, newest first within each provider.
+The current registry contains 23 entries, newest first within each provider.
 This page mirrors `src/models.rs`; use runtime discovery rather than parsing
 this table in applications.
 
@@ -49,7 +49,6 @@ this table in applications.
 |---|---|
 | `gemini/gemini-3.5-flash` | Gemini 3.5 Flash |
 | `gemini/gemini-3.1-pro-preview` | Gemini 3.1 Pro |
-| `gemini/gemini-3.1-flash-lite-preview` | Gemini 3.1 Flash Lite |
 | `gemini/gemini-3-flash-preview` | Gemini 3 Flash |
 
 ### xAI
@@ -61,8 +60,55 @@ this table in applications.
 | `xai/grok-4.20-multi-agent-beta-0309` | Grok 4.20 Multi-Agent |
 | `xai/grok-4.20-beta-0309-reasoning` | Grok 4.20 Reasoning |
 | `xai/grok-4.20-beta-0309-non-reasoning` | Grok 4.20 |
-| `xai/grok-4-1-fast-reasoning` | Grok 4.1 Fast Reasoning |
-| `xai/grok-4-1-fast-non-reasoning` | Grok 4.1 Fast |
+
+## Spec metadata
+
+Each registry entry can also carry **spec metadata** beyond its identity, so a
+consumer can read a model's facts from one place instead of maintaining its own
+parallel table:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `context_window_tokens` | `Option<u32>` | Total context window (input + output), if published |
+| `max_output_tokens` | `Option<u32>` | Maximum output tokens per response, if published |
+| `capabilities.tools` | `Support` | Function/tool calling |
+| `capabilities.streaming` | `Support` | Streaming responses |
+| `capabilities.images` | `Support` | Image input |
+| `capabilities.prompt_cache` | `Support` | Provider-side prompt caching |
+| `capabilities.structured_output` | `Support` | JSON-schema / structured responses |
+| `capabilities.parallel_tool_calls` | `Support` | Multiple tool calls per turn |
+| `capabilities.reasoning` | `Support` | Accepts a reasoning-effort control |
+
+`Support` is tri-state: `Supported`, `Unsupported`, or `Unknown`. **`Unknown` is
+honest, not a bug** — llmshim never guesses a spec to fill a cell. As of the
+2026-07-16 snapshot, context window, output ceiling, and capabilities are
+populated from official provider docs (platform.claude.com, developers.openai.com,
+ai.google.dev, docs.x.ai), and `reasoning` is cross-checked against the provider
+clamp logic. What's deliberately left `Unknown`/`None`:
+
+- `parallel_tool_calls` for most models (providers rarely document it per model);
+- xAI `max_output_tokens` (not published) and per-model streaming.
+
+A few documented exceptions are recorded honestly too — e.g. `gpt-5.5-pro` has
+`streaming: Unsupported` and `gpt-5.4-pro` has `structured_output: Unsupported`.
+Note also that Gemini publishes an input limit rather than a combined total, so
+`context_window_tokens` is the input window with `max_output_tokens` separate.
+
+`reasoning` is deliberately a single flag — "does this model accept a reasoning
+control at all." The detailed per-tier mapping is not duplicated here; it lives
+in the [reasoning guide](../guides/reasoning.md) and the provider transforms.
+
+Look up one model's full spec from the Rust crate:
+
+```rust
+if let Some(m) = llmshim::models::spec("openai/gpt-5.6-sol") {
+    println!("{}: reasoning = {:?}", m.label, m.capabilities.reasoning);
+}
+```
+
+`spec()` accepts a full id (`"openai/gpt-5.6-sol"`) or a bare name
+(`"gpt-5.6-sol"`) and returns `None` for unregistered models. These specs are a
+point-in-time snapshot pinned by the crate version, exactly like the list above.
 
 ## Catalog is not an allowlist
 

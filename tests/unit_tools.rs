@@ -111,13 +111,11 @@ fn openai_translates_multiple_tools() {
 fn xai_translates_nested_tools_to_flat() {
     let p = llmshim::providers::xai::Xai::new("k".into());
     let req = json!({
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.3",
         "messages": [{"role": "user", "content": "weather?"}],
         "tools": chat_completions_tools(),
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     let tools = result.body["tools"].as_array().unwrap();
     assert_eq!(tools[0]["name"], "get_weather");
     assert_eq!(tools[0]["type"], "function");
@@ -131,13 +129,11 @@ fn xai_translates_nested_tools_to_flat() {
 fn xai_passes_through_flat_tools() {
     let p = llmshim::providers::xai::Xai::new("k".into());
     let req = json!({
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.3",
         "messages": [{"role": "user", "content": "weather?"}],
         "tools": flat_tools(),
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     let tools = result.body["tools"].as_array().unwrap();
     assert_eq!(tools[0]["name"], "get_weather");
 }
@@ -347,7 +343,7 @@ fn openai_handles_tool_result_in_history() {
 fn xai_handles_tool_result_in_history() {
     let p = llmshim::providers::xai::Xai::new("k".into());
     let req = json!({
-        "model": "grok-4-1-fast-reasoning",
+        "model": "grok-4.3",
         "messages": [
             {"role": "user", "content": "weather?"},
             {"role": "assistant", "content": null, "tool_calls": [{
@@ -358,9 +354,7 @@ fn xai_handles_tool_result_in_history() {
         ],
         "tools": chat_completions_tools(),
     });
-    let result = p
-        .transform_request("grok-4-1-fast-reasoning", &req)
-        .unwrap();
+    let result = p.transform_request("grok-4.3", &req).unwrap();
     assert!(result.body.get("tools").is_some());
     let tools = result.body["tools"].as_array().unwrap();
     assert_eq!(tools[0]["name"], "get_weather");

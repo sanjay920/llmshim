@@ -19,7 +19,7 @@ fn skip_if_missing_all() -> bool {
 
 const FLASH: &str = "gemini/gemini-3-flash-preview";
 const PRO: &str = "gemini/gemini-3.1-pro-preview";
-const LITE: &str = "gemini/gemini-3.1-flash-lite-preview";
+const LITE: &str = "gemini/gemini-3-flash-preview";
 
 // ============================================================
 // Basic completions — all 3 models

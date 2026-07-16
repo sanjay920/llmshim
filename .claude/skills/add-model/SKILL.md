@@ -27,8 +27,27 @@ The canonical list lives in `src/models.rs` (`MODELS: &[ModelInfo]`, used by the
        provider: "<provider>",          // openai | anthropic | gemini | xai
        name: "<model-name>",            // the id without the provider prefix
        label: "<Display Label>",        // e.g. "GPT-5.6"
+       context_window_tokens: None,     // Some(n) ONLY if verified from provider docs
+       max_output_tokens: None,         // Some(n) ONLY if verified from provider docs
+       capabilities: CAPS_REASONING,    // see spec-metadata rules below
    },
    ```
+
+   **Spec metadata — the honesty rule (issue #31):** never guess a number or a
+   capability to fill a cell. Anything unverified stays `None` /
+   `Support::Unknown`. Concretely:
+   - `context_window_tokens` / `max_output_tokens`: `None` unless you have an
+     authoritative provider-doc number. A wrong number is worse than `None`.
+   - `capabilities.reasoning`: this one is **derivable, so populate it**. Use the
+     `CAPS_REASONING` baseline for a model that accepts a reasoning control, and
+     `CAPS_NO_REASONING` for one that rejects it (e.g. xAI's name-locked
+     `grok-4.20-*` — check the provider's clamp logic / name-lock predicate in
+     `src/providers/<provider>.rs`). The `reasoning_support_is_populated_for_every_model`
+     test fails if you leave it `Unknown`.
+   - Other capabilities (tools, streaming, images, prompt_cache,
+     structured_output, parallel_tool_calls): stay `Unknown` in the baselines
+     until verified. To set a verified one, chain the const builder, e.g.
+     `CAPS_REASONING.with_images(Support::Supported)`.
 
 2. **`src/main.rs`** — add the matching tuple to `const MODELS` in the same order:
    ```rust
@@ -55,4 +74,4 @@ Then confirm the model appears: `cargo run -- models` should list it, and `cargo
 
 ## Public-API note
 
-`MODELS` and `ModelInfo` in `src/models.rs` are `pub` and depended on by the `ragents` crate. Adding entries is additive and safe. Do **not** rename or remove fields without a semver bump — see `/release`.
+`MODELS` and `ModelInfo` in `src/models.rs` are `pub` (this is a public crate on crates.io). Adding entries is additive and safe. `ModelInfo` is `#[non_exhaustive]`, so **adding a new spec field is non-breaking** — do that freely. Renaming/removing fields, or changing `Support`/`ModelCapabilities`, still needs a semver bump — see `/release`.
