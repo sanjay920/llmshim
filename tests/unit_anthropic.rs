@@ -1131,7 +1131,9 @@ fn stream_thinking_delta() {
 }
 
 #[test]
-fn stream_signature_delta_skipped() {
+fn stream_signature_delta_emits_signature() {
+    // Issue #34: the signature is now surfaced (was previously dropped) so a
+    // streaming consumer can reassemble a round-trippable thinking block.
     let p = provider();
     let chunk = json!({
         "type": "content_block_delta",
@@ -1139,8 +1141,13 @@ fn stream_signature_delta_skipped() {
     });
     let result = p
         .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
         .unwrap();
-    assert!(result.is_none(), "signature_delta should be skipped");
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        parsed["choices"][0]["delta"]["reasoning_signature"],
+        "EqoBCkgIAxgC..."
+    );
 }
 
 // ============================================================
@@ -1575,4 +1582,174 @@ fn top_level_thinking_passthrough_strips_temperature() {
     let result = p.transform_request("claude-sonnet-5", &req).unwrap();
     assert_eq!(result.body["thinking"]["type"], "adaptive");
     assert!(result.body.get("temperature").is_none());
+}
+
+// ============================================================
+// Reasoning round-trip (issue #34): signature + redacted passthrough
+// ============================================================
+
+#[test]
+fn response_surfaces_reasoning_signature() {
+    let p = provider();
+    let resp = json!({
+        "id": "msg_r",
+        "content": [
+            {"type": "thinking", "thinking": "Let me think...", "signature": "sig-abc123"},
+            {"type": "text", "text": "The answer is 42."}
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 5, "output_tokens": 3}
+    });
+    let result = p.transform_response("claude-opus-4-8", resp).unwrap();
+    let msg = &result["choices"][0]["message"];
+    assert_eq!(msg["reasoning_content"], "Let me think...");
+    assert_eq!(msg["reasoning_signature"], "sig-abc123");
+    assert_eq!(msg["content"], "The answer is 42.");
+}
+
+#[test]
+fn response_surfaces_redacted_reasoning() {
+    let p = provider();
+    let resp = json!({
+        "id": "msg_r",
+        "content": [
+            {"type": "redacted_thinking", "data": "encrypted-blob-xyz"},
+            {"type": "text", "text": "Done."}
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 5, "output_tokens": 3}
+    });
+    let result = p.transform_response("claude-opus-4-8", resp).unwrap();
+    assert_eq!(
+        result["choices"][0]["message"]["redacted_reasoning_content"],
+        "encrypted-blob-xyz"
+    );
+}
+
+#[test]
+fn request_reconstructs_thinking_block_first_with_tool_calls() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-opus-4-8",
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "I should call the tool.",
+                "reasoning_signature": "sig-xyz",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}
+                }]
+            }
+        ]
+    });
+    let result = p.transform_request("claude-opus-4-8", &req).unwrap();
+    let content = &result.body["messages"][1]["content"];
+    // Thinking block must be FIRST (with signature), before the tool_use block.
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "I should call the tool.");
+    assert_eq!(content[0]["signature"], "sig-xyz");
+    assert_eq!(content[1]["type"], "tool_use");
+    // Normalized fields must not leak raw on the message.
+    assert!(result.body["messages"][1]
+        .get("reasoning_content")
+        .is_none());
+    assert!(result.body["messages"][1]
+        .get("reasoning_signature")
+        .is_none());
+}
+
+#[test]
+fn request_reconstructs_thinking_block_plain_text() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-opus-4-8",
+        "messages": [{
+            "role": "assistant",
+            "content": "Final answer.",
+            "reasoning_content": "thinking...",
+            "reasoning_signature": "sig-1"
+        }]
+    });
+    let result = p.transform_request("claude-opus-4-8", &req).unwrap();
+    let content = &result.body["messages"][0]["content"];
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["signature"], "sig-1");
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "Final answer.");
+}
+
+#[test]
+fn request_reconstructs_redacted_thinking() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-opus-4-8",
+        "messages": [{
+            "role": "assistant",
+            "content": "ok",
+            "redacted_reasoning_content": "blob-1"
+        }]
+    });
+    let result = p.transform_request("claude-opus-4-8", &req).unwrap();
+    let content = &result.body["messages"][0]["content"];
+    assert_eq!(content[0]["type"], "redacted_thinking");
+    assert_eq!(content[0]["data"], "blob-1");
+}
+
+#[test]
+fn request_no_signature_strips_reasoning() {
+    // Without a signature a thinking block would 400, so we strip (no regression).
+    let p = provider();
+    let req = json!({
+        "model": "claude-opus-4-8",
+        "messages": [{
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": "orphan thinking, no signature"
+        }]
+    });
+    let result = p.transform_request("claude-opus-4-8", &req).unwrap();
+    let msg = &result.body["messages"][0];
+    assert!(msg.get("reasoning_content").is_none());
+    assert_eq!(msg["content"], "hi"); // stays a plain string, no thinking block
+}
+
+#[test]
+fn stream_signature_delta_emits_reasoning_signature() {
+    let p = provider();
+    let chunk = json!({
+        "type": "content_block_delta",
+        "delta": {"type": "signature_delta", "signature": "sig-stream-1"}
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        parsed["choices"][0]["delta"]["reasoning_signature"],
+        "sig-stream-1"
+    );
+}
+
+#[test]
+fn stream_redacted_thinking_block_start_emits() {
+    let p = provider();
+    let chunk = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "redacted_thinking", "data": "blob-stream"}
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        parsed["choices"][0]["delta"]["redacted_reasoning_content"],
+        "blob-stream"
+    );
 }

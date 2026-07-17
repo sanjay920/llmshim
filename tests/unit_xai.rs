@@ -736,3 +736,25 @@ fn grok_4_5_effort_range() {
         assert_eq!(r.body["reasoning"]["effort"], expected, "effort {effort}");
     }
 }
+
+#[test]
+fn request_strips_foreign_reasoning_signature() {
+    // Issue #34: an opaque Anthropic reasoning signature must never leak into an
+    // xAI request in a multi-model conversation.
+    let p = provider();
+    let req = json!({
+        "model": "grok-4.3",
+        "messages": [{
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": "x",
+            "reasoning_signature": "anthropic-sig-should-not-leak",
+            "redacted_reasoning_content": "redacted-should-not-leak"
+        }]
+    });
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    let body = serde_json::to_string(&result.body).unwrap();
+    assert!(!body.contains("anthropic-sig-should-not-leak"));
+    assert!(!body.contains("redacted-should-not-leak"));
+    assert!(!body.contains("reasoning_signature"));
+}
