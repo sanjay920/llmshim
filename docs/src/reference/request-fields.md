@@ -52,9 +52,24 @@ are covered in [Native provider controls](../guides/native-controls.md).
 | `tool_calls` | array | Assistant tool requests returned on a previous turn |
 | `tool_call_id` | string | Connects a `role: "tool"` result to its request |
 | `reasoning_content` | string | Provider-returned reasoning carried into a later turn |
+| `reasoning_signature` | string | Opaque provider signature for the reasoning block; echo it back with `reasoning_content` for lossless round-trip |
+| `redacted_reasoning_content` | string | Opaque data for a redacted reasoning block; echo it back to reconstruct it |
 
 Content blocks may use OpenAI `image_url`, Anthropic `image`, or Gemini
 `inline_data` input forms. See [Images and vision](../guides/images.md).
+
+### Lossless reasoning round-trip
+
+A thinking-capable Anthropic model returns `reasoning_content` **and**
+`reasoning_signature` (streaming emits both incrementally; the signature arrives
+as a `reasoning_signature` delta). Echo the assistant message back verbatim on a
+follow-up request and llmshim reconstructs the provider-native `thinking` block
+(as the first block of the turn) — required for extended-thinking + tool-use
+continuations and for keeping the prompt cache warm. The signature is opaque and
+provider-specific: other providers strip it, so it never leaks in a multi-model
+conversation. Absent a signature, `reasoning_content` is stripped (a thinking
+block without its signature is rejected). Symmetric to the tool-call
+`thought_signature` round-trip.
 
 ## Proxy request
 

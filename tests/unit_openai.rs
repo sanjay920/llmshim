@@ -891,3 +891,25 @@ fn mode_pro_without_effort() {
     assert_eq!(r.body["reasoning"]["effort"], "high");
     assert!(r.body["reasoning"].get("mode").is_none());
 }
+
+#[test]
+fn request_strips_foreign_reasoning_signature() {
+    // Issue #34: an opaque Anthropic reasoning signature must never leak into an
+    // OpenAI request in a multi-model conversation.
+    let p = provider();
+    let req = json!({
+        "model": "gpt-5.4",
+        "messages": [{
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": "x",
+            "reasoning_signature": "anthropic-sig-should-not-leak",
+            "redacted_reasoning_content": "redacted-should-not-leak"
+        }]
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let body = serde_json::to_string(&result.body).unwrap();
+    assert!(!body.contains("anthropic-sig-should-not-leak"));
+    assert!(!body.contains("redacted-should-not-leak"));
+    assert!(!body.contains("reasoning_signature"));
+}

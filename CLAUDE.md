@@ -70,7 +70,7 @@ Image content blocks are translated between providers automatically. Users can s
 
 ### Multi-model conversations
 
-Each provider sanitizes messages from other providers in `transform_request`. OpenAI's `annotations`/`refusal` stripped for Anthropic/Gemini. `reasoning_content` stripped for all. Tool calls normalized to OpenAI format in responses, translated back per-provider on input.
+Each provider sanitizes messages from other providers in `transform_request`. OpenAI's `annotations`/`refusal` stripped for Anthropic/Gemini. `reasoning_content` is stripped by other providers, but **Anthropic reconstructs a native `thinking` block** from `reasoning_content` + `reasoning_signature` (and `redacted_thinking` from `redacted_reasoning_content`) as the first block of the assistant turn, so extended-thinking + tool-use round-trips losslessly (surfaced on responses incl. streaming; opaque signatures are stripped by other providers so they never leak cross-provider; no signature → still stripped). Symmetric to the tool-call `thought_signature` round-trip. Tool calls normalized to OpenAI format in responses, translated back per-provider on input.
 
 ### Provider extension namespaces (`x-anthropic`, `x-gemini`)
 
