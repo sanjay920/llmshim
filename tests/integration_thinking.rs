@@ -330,3 +330,76 @@ async fn three_hop_with_thinking_in_middle() {
         content3
     );
 }
+
+// ============================================================
+// Reasoning round-trip (issue #34) — lossless thinking + tool-use continuation
+// ============================================================
+
+#[tokio::test]
+#[ignore]
+async fn anthropic_reasoning_roundtrip_accepted_live() {
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+    let model = "anthropic/claude-sonnet-4-6";
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }
+    }]);
+    let user_turn = json!({"role": "user", "content": "What's the weather in Tokyo? Use the get_weather tool."});
+
+    // Turn 1: thinking on + a tool available → expect thinking + a tool call.
+    let req1 = json!({
+        "model": model,
+        "messages": [user_turn],
+        "max_tokens": 4000,
+        "reasoning_effort": "high",
+        "tools": tools,
+    });
+    let resp1 = llmshim::completion(&router, &req1).await.unwrap();
+    let msg1 = &resp1["choices"][0]["message"];
+
+    let tool_calls = msg1
+        .get("tool_calls")
+        .and_then(|t| t.as_array())
+        .filter(|a| !a.is_empty());
+    assert!(tool_calls.is_some(), "expected a tool call, got: {resp1}");
+    assert!(
+        msg1.get("reasoning_signature").is_some(),
+        "expected reasoning_signature to be surfaced, got: {msg1}"
+    );
+    let call_id = tool_calls.unwrap()[0]["id"].as_str().unwrap().to_string();
+
+    // Turn 2: echo the assistant message VERBATIM (reasoning_content +
+    // reasoning_signature + tool_calls) and add the tool result. The shim must
+    // reconstruct a valid thinking block first — the API must accept it (200).
+    let req2 = json!({
+        "model": model,
+        "messages": [
+            user_turn,
+            msg1.clone(),
+            {"role": "tool", "tool_call_id": call_id, "content": "72F and sunny"}
+        ],
+        "max_tokens": 4000,
+        "reasoning_effort": "high",
+        "tools": tools,
+    });
+    let resp2 = llmshim::completion(&router, &req2)
+        .await
+        .expect("reconstructed thinking block must be accepted by the API");
+    assert_eq!(resp2["object"], "chat.completion");
+    let content = resp2["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
+    assert!(!content.is_empty(), "expected a final answer, got: {resp2}");
+    println!("Round-trip accepted. Final answer: {content}");
+}

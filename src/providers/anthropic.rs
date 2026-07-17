@@ -161,10 +161,29 @@ fn transform_messages(messages: &[Value]) -> Vec<Value> {
         .map(|msg| {
             let mut out = msg.clone();
 
+            // Capture normalized reasoning fields before sanitizing, so an
+            // assistant turn's thinking block can be reconstructed losslessly
+            // below (symmetric to the tool-call thought_signature round-trip).
+            let role = out.get("role").and_then(|r| r.as_str()).map(str::to_string);
+            let reasoning_content = out
+                .get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let reasoning_signature = out
+                .get("reasoning_signature")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let redacted_reasoning = out
+                .get("redacted_reasoning_content")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+
             // Sanitize cross-provider fields that Anthropic's API rejects.
             // This enables multi-model conversations (e.g., Cursor-style provider switching).
             if let Some(obj) = out.as_object_mut() {
                 obj.remove("reasoning_content"); // our normalized thinking field
+                obj.remove("reasoning_signature"); // reconstructed into a thinking block below
+                obj.remove("redacted_reasoning_content"); // reconstructed into redacted_thinking below
                 obj.remove("annotations"); // OpenAI returns this on every message
                 obj.remove("refusal"); // OpenAI safety refusal field
                 obj.remove("audio"); // OpenAI audio response field
@@ -234,6 +253,38 @@ fn transform_messages(messages: &[Value]) -> Vec<Value> {
                     "role": "user",
                     "content": [tool_result]
                 });
+            }
+
+            // Reconstruct thinking block(s) as the FIRST content block(s) of an
+            // assistant turn so extended-thinking + tool-use continuations are
+            // accepted (the API requires thinking before text/tool_use). Only when
+            // we hold the opaque token — a thinking block without its signature is
+            // rejected, so absent a signature we leave it stripped (no regression).
+            if role.as_deref() == Some("assistant") {
+                let mut thinking_blocks: Vec<Value> = Vec::new();
+                if let (Some(text), Some(sig)) = (&reasoning_content, &reasoning_signature) {
+                    thinking_blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": text,
+                        "signature": sig,
+                    }));
+                }
+                if let Some(data) = &redacted_reasoning {
+                    thinking_blocks.push(json!({
+                        "type": "redacted_thinking",
+                        "data": data,
+                    }));
+                }
+                if !thinking_blocks.is_empty() {
+                    match out.get("content").cloned() {
+                        Some(Value::Array(arr)) => thinking_blocks.extend(arr),
+                        Some(Value::String(s)) if !s.is_empty() => {
+                            thinking_blocks.push(json!({"type": "text", "text": s}))
+                        }
+                        _ => {}
+                    }
+                    out["content"] = json!(thinking_blocks);
+                }
             }
 
             out
@@ -339,6 +390,10 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Value {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut thinking_content: Option<String> = None;
+    // Opaque signature + redacted data so reasoning can round-trip losslessly
+    // (see transform_messages reconstruction). Symmetric to tool thought_signature.
+    let mut thinking_signature: Option<String> = None;
+    let mut redacted_thinking: Option<String> = None;
 
     for block in &content_blocks {
         match block.get("type").and_then(|t| t.as_str()) {
@@ -350,6 +405,14 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Value {
             Some("thinking") => {
                 if let Some(t) = block.get("thinking").and_then(|t| t.as_str()) {
                     thinking_content = Some(t.to_string());
+                }
+                if let Some(s) = block.get("signature").and_then(|s| s.as_str()) {
+                    thinking_signature = Some(s.to_string());
+                }
+            }
+            Some("redacted_thinking") => {
+                if let Some(d) = block.get("data").and_then(|d| d.as_str()) {
+                    redacted_thinking = Some(d.to_string());
                 }
             }
             Some("tool_use") => {
@@ -398,6 +461,14 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Value {
     // Surface thinking content in a way OpenAI SDK consumers can access
     if let Some(thinking) = thinking_content {
         message["reasoning_content"] = json!(thinking);
+    }
+    // Surface the opaque signature + redacted data so the reasoning block can be
+    // echoed back losslessly on a follow-up request (see transform_messages).
+    if let Some(sig) = thinking_signature {
+        message["reasoning_signature"] = json!(sig);
+    }
+    if let Some(data) = redacted_thinking {
+        message["redacted_reasoning_content"] = json!(data);
     }
 
     json!({
@@ -766,8 +837,25 @@ impl Provider for Anthropic {
                         });
                         Ok(Some(serde_json::to_string(&chunk)?))
                     }
-                    // signature_delta: skip (opaque verification, not useful to consumers)
-                    Some("signature_delta") => Ok(None),
+                    // signature_delta: emit the opaque signature so a streaming
+                    // consumer can reassemble a complete, round-trippable thinking
+                    // block (fed back via reasoning_signature on the next request).
+                    Some("signature_delta") => {
+                        let signature = delta
+                            .get("signature")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+                        let chunk = json!({
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "reasoning_signature": signature },
+                                "finish_reason": null,
+                            }]
+                        });
+                        Ok(Some(serde_json::to_string(&chunk)?))
+                    }
                     _ => Ok(None),
                 }
             }
@@ -796,6 +884,22 @@ impl Provider for Anthropic {
                             }]
                         });
                         return Ok(Some(serde_json::to_string(&chunk)?));
+                    }
+                    // redacted_thinking arrives whole (no deltas); surface its
+                    // opaque data so it can be echoed back on a later request.
+                    if cb.get("type").and_then(|t| t.as_str()) == Some("redacted_thinking") {
+                        if let Some(data) = cb.get("data").and_then(|d| d.as_str()) {
+                            let chunk = json!({
+                                "object": "chat.completion.chunk",
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": { "redacted_reasoning_content": data },
+                                    "finish_reason": null,
+                                }]
+                            });
+                            return Ok(Some(serde_json::to_string(&chunk)?));
+                        }
                     }
                 }
                 Ok(None)
