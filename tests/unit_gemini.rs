@@ -1507,3 +1507,25 @@ fn mode_pro_bumps_thinking_level_and_none_wins() {
         "minimal"
     );
 }
+
+#[test]
+fn request_strips_foreign_reasoning_signature() {
+    // Issue #34: Gemini rebuilds messages into contents/parts, so an opaque
+    // Anthropic reasoning signature is naturally dropped — verify it never leaks.
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3.5-flash",
+        "messages": [{
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": "x",
+            "reasoning_signature": "anthropic-sig-should-not-leak",
+            "redacted_reasoning_content": "redacted-should-not-leak"
+        }]
+    });
+    let result = p.transform_request("gemini-3.5-flash", &req).unwrap();
+    let body = serde_json::to_string(&result.body).unwrap();
+    assert!(!body.contains("anthropic-sig-should-not-leak"));
+    assert!(!body.contains("redacted-should-not-leak"));
+    assert!(!body.contains("reasoning_signature"));
+}

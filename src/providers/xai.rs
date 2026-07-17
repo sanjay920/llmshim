@@ -39,6 +39,8 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
                 let mut out = msg.clone();
                 if let Some(obj) = out.as_object_mut() {
                     obj.remove("reasoning_content");
+                    obj.remove("reasoning_signature"); // opaque Anthropic token — never forward
+                    obj.remove("redacted_reasoning_content"); // opaque Anthropic token — never forward
                     obj.remove("annotations");
                     obj.remove("refusal");
                     obj.remove("tool_calls");
@@ -108,6 +110,8 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
                 let mut out = msg.clone();
                 if let Some(obj) = out.as_object_mut() {
                     obj.remove("reasoning_content");
+                    obj.remove("reasoning_signature"); // opaque Anthropic token — never forward
+                    obj.remove("redacted_reasoning_content"); // opaque Anthropic token — never forward
                     obj.remove("annotations");
                     obj.remove("refusal");
                 }
