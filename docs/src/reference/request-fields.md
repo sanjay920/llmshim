@@ -23,6 +23,7 @@ renamed or reshaped for the selected provider; unsupported controls are omitted.
 | `stop` | array of strings | Conditional, mapped | Passed as `stop` to Anthropic or mapped to Gemini `stopSequences`; omitted by OpenAI/xAI |
 | `reasoning_effort` | string | Portable, mapped/clamped | Unified effort from `none` through `max` |
 | `reasoning_mode` | string | Portable, mapped/clamped | `standard` or `pro` |
+| `reasoning_summary` | string | Anthropic (`auto`\|`none`) | Reasoning visibility → Anthropic `thinking.display`; `auto`→`summarized` (default with `reasoning_effort`), `none`→`omitted` for lower latency |
 | `tools` | array | Portable, mapped | OpenAI Chat Completions function schema translated to native tools |
 | `tool_choice` | string or object | Portable, mapped | Translated where the provider supports tool choice |
 | `x-openai` | object | Native passthrough | Fields copied to an OpenAI Responses request |

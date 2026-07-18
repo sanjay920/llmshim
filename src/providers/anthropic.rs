@@ -603,6 +603,17 @@ impl Provider for Anthropic {
                     .unwrap_or(false);
                 let effort = normalize_unified_effort(effort, pro);
 
+                // Reasoning-summary visibility. Newer models (Sonnet 5, Opus
+                // 4.7/4.8, ...) default `display` to "omitted" — a signed but
+                // empty thinking block with no thinking_delta text. Default to
+                // "summarized" so reasoning text is returned consistently across
+                // model generations; a latency-sensitive caller opts back into
+                // "omitted" via reasoning_summary. Verified live 2026-07-17.
+                let display = match obj.get("reasoning_summary").and_then(|v| v.as_str()) {
+                    Some("none") | Some("omitted") => "omitted",
+                    _ => "summarized",
+                };
+
                 if effort == "none" {
                     if Self::uses_adaptive_thinking(model) {
                         // Adaptive models think by default even with no config;
@@ -612,7 +623,10 @@ impl Provider for Anthropic {
                     }
                     // Pre-4.6/Haiku: thinking is opt-in; omitting the key IS "none".
                 } else if Self::uses_adaptive_thinking(model) {
-                    body_obj.insert("thinking".to_string(), json!({"type": "adaptive"}));
+                    body_obj.insert(
+                        "thinking".to_string(),
+                        json!({"type": "adaptive", "display": display}),
+                    );
                     // Opus/Sonnet 4.6 reject "xhigh" (their tiers: low/medium/high/max);
                     // Opus 4.7/4.8 + Sonnet 5 accept the full low..max range (verified).
                     let anthropic_effort =
@@ -644,7 +658,8 @@ impl Provider for Anthropic {
                         "thinking".to_string(),
                         json!({
                             "type": "enabled",
-                            "budget_tokens": budget
+                            "budget_tokens": budget,
+                            "display": display
                         }),
                     );
                 }
