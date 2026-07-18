@@ -1753,3 +1753,94 @@ fn stream_redacted_thinking_block_start_emits() {
         "blob-stream"
     );
 }
+
+// ============================================================
+// Reasoning summary visibility (issue #37): thinking.display
+// ============================================================
+
+#[test]
+fn adaptive_thinking_defaults_display_summarized() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+    });
+    let result = p.transform_request("claude-sonnet-5", &req).unwrap();
+    assert_eq!(result.body["thinking"]["type"], "adaptive");
+    assert_eq!(result.body["thinking"]["display"], "summarized");
+    assert_eq!(result.body["output_config"]["effort"], "high");
+}
+
+#[test]
+fn adaptive_thinking_reasoning_summary_none_omits() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+        "reasoning_summary": "none",
+    });
+    let result = p.transform_request("claude-sonnet-5", &req).unwrap();
+    assert_eq!(result.body["thinking"]["display"], "omitted");
+    // The unified control must not leak into the API body.
+    assert!(result.body.get("reasoning_summary").is_none());
+}
+
+#[test]
+fn adaptive_thinking_reasoning_summary_auto_summarizes() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-opus-4-8",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "medium",
+        "reasoning_summary": "auto",
+    });
+    let result = p.transform_request("claude-opus-4-8", &req).unwrap();
+    assert_eq!(result.body["thinking"]["display"], "summarized");
+}
+
+#[test]
+fn enabled_thinking_forwards_display() {
+    // Pre-4.6 / Haiku use the enabled-budget path; display is valid there too.
+    let p = provider();
+    let req = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+    });
+    let result = p
+        .transform_request("claude-haiku-4-5-20251001", &req)
+        .unwrap();
+    assert_eq!(result.body["thinking"]["type"], "enabled");
+    assert_eq!(result.body["thinking"]["display"], "summarized");
+    assert!(result.body["thinking"]["budget_tokens"].as_u64().unwrap() >= 1024);
+}
+
+#[test]
+fn reasoning_effort_none_stays_disabled_without_display() {
+    let p = provider();
+    let req = json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let result = p.transform_request("claude-sonnet-5", &req).unwrap();
+    assert_eq!(result.body["thinking"]["type"], "disabled");
+    assert!(result.body["thinking"].get("display").is_none());
+}
+
+#[test]
+fn passthrough_thinking_display_untouched() {
+    // A caller-supplied thinking block wins; the effort translation (and its
+    // default display) is bypassed by the has_thinking gate.
+    let p = provider();
+    let req = json!({
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+        "thinking": {"type": "adaptive", "display": "omitted"},
+    });
+    let result = p.transform_request("claude-sonnet-5", &req).unwrap();
+    assert_eq!(result.body["thinking"]["display"], "omitted");
+}

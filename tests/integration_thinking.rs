@@ -403,3 +403,34 @@ async fn anthropic_reasoning_roundtrip_accepted_live() {
     assert!(!content.is_empty(), "expected a final answer, got: {resp2}");
     println!("Round-trip accepted. Final answer: {content}");
 }
+
+#[tokio::test]
+#[ignore]
+async fn anthropic_sonnet5_reasoning_summary_default_returns_text_live() {
+    // Issue #37: sonnet-5 defaults display to "omitted" (empty thinking text).
+    // With the fix, reasoning_effort defaults display to "summarized" so real
+    // reasoning text comes back.
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+    // A prompt that reliably engages adaptive thinking (trivial prompts may be
+    // answered directly even at high effort — "adaptive" means the model decides).
+    let prompt = "Prove or disprove: for every positive integer n, the value \
+        n^2 + n + 41 is prime. Give rigorous reasoning.";
+    let req = json!({
+        "model": "anthropic/claude-sonnet-5",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4000,
+        "reasoning_effort": "high",
+    });
+    let resp = llmshim::completion(&router, &req).await.unwrap();
+    let reasoning = resp["choices"][0]["message"]["reasoning_content"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !reasoning.is_empty(),
+        "expected reasoning text by default (display=summarized), got empty. resp: {resp}"
+    );
+    println!("sonnet-5 reasoning text chars: {}", reasoning.len());
+}
