@@ -390,3 +390,20 @@ cargo build --release --features proxy         # release build (~6MB binary)
 cargo test --features proxy --tests            # unit tests (~370)
 cargo test --features proxy -- --ignored       # integration tests (needs API keys)
 ```
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+development setup, the CI gates, and the rules that protect the public API.
+Report suspected vulnerabilities privately per [SECURITY.md](SECURITY.md), and
+be excellent to each other ([Code of Conduct](CODE_OF_CONDUCT.md)).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. llmshim is provided **"AS IS",
+without warranty of any kind**; the authors and contributors accept no
+liability for its use. See [NOTICE](NOTICE). Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in llmshim by
+you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.
