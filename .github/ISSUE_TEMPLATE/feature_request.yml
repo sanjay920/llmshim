@@ -1,0 +1,24 @@
+name: Feature request
+description: Propose new provider/model support, API surface, or output shape
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The consumer-side problem, not just the feature — what do you need llmshim to translate or expose, and for which surface/provider?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: >
+        If it changes the request or response shape, sketch it. Note that
+        portable controls map across providers, while provider-specific controls
+        go under an `x-openai` / `x-anthropic` / `x-gemini` passthrough.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including a native `x-*` passthrough or handling it in your own application — why isn't that enough?

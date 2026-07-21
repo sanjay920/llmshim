@@ -1,0 +1,67 @@
+name: Bug report
+description: A request produced wrong output, an error, or a crash
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! The single most useful thing you can attach is a **minimal
+        request that reproduces the problem** — the `model` and `messages` (plus
+        any `tools` or reasoning fields), with API keys and confidential content
+        redacted.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you send, what did you expect, and what did you get instead?
+      placeholder: |
+        Sent {"model":"anthropic/claude-sonnet-5", ...} and the tool_calls came back ...
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant request / output
+      description: The request JSON, the error object, or the response snippet (redact keys).
+      render: json
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface?
+      options:
+        - Rust crate
+        - CLI
+        - Proxy (HTTP)
+        - Python client
+        - TypeScript client
+        - Go client
+        - Ruby client
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - OpenAI
+        - Anthropic
+        - Gemini
+        - xAI
+        - Multiple / model switching
+        - N/A
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: llmshim version / commit
+      placeholder: "0.2.2 (or main @ <sha>)"
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I redacted any API keys from the request/output above
+        - label: I can share a request that reproduces this (or described it if it involves confidential content)
