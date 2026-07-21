@@ -1,0 +1,12 @@
+llmshim
+Copyright (c) 2026 Sanjay Nadhavajhala and the llmshim contributors
+
+This product is dual-licensed under the MIT License and the Apache License,
+Version 2.0 (see LICENSE-MIT and LICENSE-APACHE).
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. IN NO EVENT SHALL THE AUTHORS OR ANY CONTRIBUTOR BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE USE OF THIS SOFTWARE.
+Users are solely responsible for validating the software's fitness for
+their purposes, including how it handles untrusted input and third-party API
+responses, before relying on it.
