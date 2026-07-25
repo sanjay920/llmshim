@@ -434,3 +434,36 @@ async fn anthropic_sonnet5_reasoning_summary_default_returns_text_live() {
     );
     println!("sonnet-5 reasoning text chars: {}", reasoning.len());
 }
+
+#[tokio::test]
+#[ignore]
+async fn anthropic_opus_5_reasoning_live() {
+    // End-to-end through llmshim: opus-5 is a new adaptive family — adaptive
+    // thinking, native xhigh, summarized display by default, reasoning surfaced.
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+    let req = json!({
+        "model": "anthropic/claude-opus-5",
+        "messages": [{"role":"user","content":"Prove or disprove: for every positive integer n, n^2 + n + 41 is prime. Give rigorous reasoning."}],
+        "max_tokens": 4000,
+        "reasoning_effort": "xhigh",
+    });
+    let resp = llmshim::completion(&router, &req).await.unwrap();
+    assert_eq!(resp["object"], "chat.completion");
+    assert_eq!(resp["model"], "claude-opus-5");
+    let msg = &resp["choices"][0]["message"];
+    let content = msg["content"].as_str().unwrap_or("");
+    assert!(!content.is_empty(), "expected an answer, got: {resp}");
+    let reasoning = msg["reasoning_content"].as_str().unwrap_or("");
+    assert!(
+        !reasoning.is_empty(),
+        "expected reasoning text (adaptive + summarized default), got: {resp}"
+    );
+    println!(
+        "opus-5 OK — reasoning {} chars, answer {} chars",
+        reasoning.len(),
+        content.len()
+    );
+}

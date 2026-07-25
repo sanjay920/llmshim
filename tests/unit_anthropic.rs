@@ -1844,3 +1844,28 @@ fn passthrough_thinking_display_untouched() {
     let result = p.transform_request("claude-sonnet-5", &req).unwrap();
     assert_eq!(result.body["thinking"]["display"], "omitted");
 }
+
+#[test]
+fn opus_5_adaptive_native_xhigh_and_no_1m_beta() {
+    // Opus 5 is a new adaptive family (adaptive thinking, native low..max incl.
+    // xhigh — not clamped). Its 1M context is the DEFAULT, so unlike opus-4-8 it
+    // must NOT send the context-1m beta header. Verified live 2026-07-25.
+    let p = provider();
+    let req = json!({
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "xhigh",
+    });
+    let result = p.transform_request("claude-opus-5", &req).unwrap();
+    assert_eq!(result.body["thinking"]["type"], "adaptive");
+    assert!(result.body["thinking"].get("budget_tokens").is_none());
+    assert_eq!(result.body["output_config"]["effort"], "xhigh"); // native, not clamped to max
+    let has_1m_beta = result
+        .headers
+        .iter()
+        .any(|(k, v)| k == "anthropic-beta" && v.contains("context-1m"));
+    assert!(
+        !has_1m_beta,
+        "opus-5 should not send the context-1m beta (1M is its default)"
+    );
+}

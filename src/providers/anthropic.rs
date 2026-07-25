@@ -35,6 +35,7 @@ impl Anthropic {
             || m.contains("opus-4.7")
             || m.contains("opus-4-8")
             || m.contains("opus-4.8")
+            || m.contains("opus-5")
             || m.contains("sonnet-5")
     }
 

@@ -263,6 +263,15 @@ pub const MODELS: &[ModelInfo] = &[
         capabilities: CAPS_STD,
     },
     ModelInfo {
+        id: "anthropic/claude-opus-5",
+        provider: "anthropic",
+        name: "claude-opus-5",
+        label: "Claude Opus 5",
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_FULL,
+    },
+    ModelInfo {
         id: "anthropic/claude-opus-4-8",
         provider: "anthropic",
         name: "claude-opus-4-8",

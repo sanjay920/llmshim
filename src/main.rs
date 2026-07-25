@@ -15,6 +15,7 @@ const MODELS: &[(&str, &str)] = &[
     ("openai/gpt-5.4-pro", "GPT-5.4 Pro"),
     ("openai/gpt-5.4-mini", "GPT-5.4 Mini"),
     ("openai/gpt-5.4-nano", "GPT-5.4 Nano"),
+    ("anthropic/claude-opus-5", "Claude Opus 5"),
     ("anthropic/claude-opus-4-8", "Claude Opus 4.8"),
     ("anthropic/claude-sonnet-5", "Claude Sonnet 5"),
     ("anthropic/claude-opus-4-7", "Claude Opus 4.7"),
