@@ -87,7 +87,7 @@ would reject it.
 
 Adaptive models use `thinking: {type}` plus `output_config: {effort}`:
 
-| unified | Opus 4.7/4.8, Sonnet 5 | Opus/Sonnet 4.6 |
+| unified | Opus 5, Opus 4.7/4.8, Sonnet 5 | Opus/Sonnet 4.6 |
 |---|---|---|
 | `none` | `thinking: {type: "disabled"}` | `thinking: {type: "disabled"}` |
 | `low` | `adaptive` + `low` | `adaptive` + `low` |

@@ -14,7 +14,7 @@ the ID and display label.
 
 ## Registered catalog
 
-The current registry contains 23 entries, newest first within each provider.
+The current registry contains 24 entries, newest first within each provider.
 This page mirrors `src/models.rs`; use runtime discovery rather than parsing
 this table in applications.
 
@@ -36,6 +36,7 @@ this table in applications.
 
 | ID | Display name |
 |---|---|
+| `anthropic/claude-opus-5` | Claude Opus 5 |
 | `anthropic/claude-opus-4-8` | Claude Opus 4.8 |
 | `anthropic/claude-sonnet-5` | Claude Sonnet 5 |
 | `anthropic/claude-opus-4-7` | Claude Opus 4.7 |
