@@ -167,6 +167,50 @@ pub fn to_openai(block: &Value) -> Option<Value> {
     }
 }
 
+/// Translate an image block to OpenAI **Chat Completions** format
+/// (`{"type":"image_url","image_url":{"url":...}}`) — the shape OpenAI-compatible
+/// aggregators like OpenRouter expect. (`to_openai` targets the Responses API's
+/// `input_image` string form instead.)
+pub fn to_openai_chat(block: &Value) -> Option<Value> {
+    let block_type = block.get("type").and_then(|t| t.as_str())?;
+
+    match block_type {
+        // Already Chat Completions format.
+        "image_url" => Some(block.clone()),
+
+        // OpenAI Responses API `input_image` (image_url is a bare string).
+        "input_image" => {
+            let url = block.get("image_url").and_then(|u| u.as_str())?;
+            Some(json!({ "type": "image_url", "image_url": { "url": url } }))
+        }
+
+        // Anthropic format → Chat Completions.
+        "image" => {
+            let source = block.get("source")?;
+            match source.get("type").and_then(|t| t.as_str())? {
+                "base64" => {
+                    let media_type = source
+                        .get("media_type")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("image/jpeg");
+                    let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                    Some(json!({
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{};base64,{}", media_type, data) }
+                    }))
+                }
+                "url" => {
+                    let url = source.get("url").and_then(|u| u.as_str())?;
+                    Some(json!({ "type": "image_url", "image_url": { "url": url } }))
+                }
+                _ => None,
+            }
+        }
+
+        _ => None,
+    }
+}
+
 /// Translate all content blocks in a message's content array.
 /// If content is a string, returns it unchanged.
 /// If content is an array, translates image blocks using the given translator.

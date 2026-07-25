@@ -368,3 +368,31 @@ fn openai_preserves_interleaved_text_image_order() {
     assert_eq!(content[2]["text"], "vs");
     assert_eq!(content[3]["type"], "input_image");
 }
+
+// to_openai_chat — Chat Completions image_url form (for OpenRouter et al.)
+
+#[test]
+fn to_openai_chat_passthrough_image_url() {
+    let block = json!({"type": "image_url", "image_url": {"url": "https://x/y.png"}});
+    let out = llmshim::vision::to_openai_chat(&block).unwrap();
+    assert_eq!(out, block);
+}
+
+#[test]
+fn to_openai_chat_from_responses_input_image() {
+    let block = json!({"type": "input_image", "image_url": "https://x/y.png"});
+    let out = llmshim::vision::to_openai_chat(&block).unwrap();
+    assert_eq!(out["type"], "image_url");
+    assert_eq!(out["image_url"]["url"], "https://x/y.png");
+}
+
+#[test]
+fn to_openai_chat_from_anthropic_base64() {
+    let block = json!({
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}
+    });
+    let out = llmshim::vision::to_openai_chat(&block).unwrap();
+    assert_eq!(out["type"], "image_url");
+    assert_eq!(out["image_url"]["url"], "data:image/png;base64,AAAA");
+}
