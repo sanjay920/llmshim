@@ -25,6 +25,8 @@ pub struct Keys {
     pub anthropic: Option<String>,
     pub gemini: Option<String>,
     pub xai: Option<String>,
+    #[serde(default)]
+    pub openrouter: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +95,7 @@ pub fn apply_to_env(config: &Config) {
         ("ANTHROPIC_API_KEY", &config.keys.anthropic),
         ("GEMINI_API_KEY", &config.keys.gemini),
         ("XAI_API_KEY", &config.keys.xai),
+        ("OPENROUTER_API_KEY", &config.keys.openrouter),
     ];
     for (env_key, value) in mappings {
         if std::env::var(env_key).is_err() {

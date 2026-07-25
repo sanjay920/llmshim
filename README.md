@@ -1,6 +1,6 @@
 # llmshim
 
-A blazing-fast LLM API translation layer written in **pure Rust**. One request format, every provider — OpenAI, Anthropic, Google Gemini, and xAI.
+A blazing-fast LLM API translation layer written in **pure Rust**. One request format, every provider — OpenAI, Anthropic, Google Gemini, xAI, and OpenRouter.
 
 Send an OpenAI-style request, pick any model, and llmshim translates it to that provider's native API (and translates the response back). Switch providers by changing one string.
 
@@ -47,7 +47,14 @@ export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
 export GEMINI_API_KEY=AIza...
 export XAI_API_KEY=xai-...
+export OPENROUTER_API_KEY=sk-or-...
 ```
+
+Reach any model through [OpenRouter](https://openrouter.ai) by addressing it as
+`openrouter/<vendor>/<model>` (e.g. `openrouter/anthropic/claude-sonnet-4.5`).
+OpenRouter is OpenAI Chat Completions-compatible, so tools, vision, streaming,
+and `reasoning_effort` all pass through; OpenRouter-only controls (provider
+routing, model fallbacks, transforms) go under an `x-openrouter` key.
 
 Or persist them to the config file (used by all three surfaces):
 

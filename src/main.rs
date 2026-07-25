@@ -504,6 +504,11 @@ fn cmd_configure() {
         cfg.keys.xai = Some(xai);
     }
 
+    let openrouter = config_prompt("OpenRouter API Key", cfg.keys.openrouter.as_deref());
+    if !openrouter.is_empty() {
+        cfg.keys.openrouter = Some(openrouter);
+    }
+
     let host = config_prompt_plain("Proxy host", &cfg.proxy.host);
     if !host.is_empty() {
         cfg.proxy.host = host;
@@ -535,6 +540,7 @@ fn cmd_set(key: &str, value: &str) {
         "anthropic" => cfg.keys.anthropic = Some(value.to_string()),
         "gemini" => cfg.keys.gemini = Some(value.to_string()),
         "xai" => cfg.keys.xai = Some(value.to_string()),
+        "openrouter" => cfg.keys.openrouter = Some(value.to_string()),
         "proxy.host" => cfg.proxy.host = value.to_string(),
         "proxy.port" => {
             cfg.proxy.port = value.parse().unwrap_or_else(|_| {
@@ -544,7 +550,7 @@ fn cmd_set(key: &str, value: &str) {
         }
         _ => {
             eprintln!(
-                "Unknown key: {}. Valid: openai, anthropic, gemini, xai, proxy.host, proxy.port",
+                "Unknown key: {}. Valid: openai, anthropic, gemini, xai, openrouter, proxy.host, proxy.port",
                 key
             );
             std::process::exit(1);
@@ -574,6 +580,7 @@ fn cmd_get(key: &str) {
         "anthropic" => cfg.keys.anthropic.as_deref().map(mask_key),
         "gemini" => cfg.keys.gemini.as_deref().map(mask_key),
         "xai" => cfg.keys.xai.as_deref().map(mask_key),
+        "openrouter" => cfg.keys.openrouter.as_deref().map(mask_key),
         "proxy.host" => Some(cfg.proxy.host.clone()),
         "proxy.port" => Some(cfg.proxy.port.to_string()),
         _ => {
@@ -593,6 +600,7 @@ fn cmd_list() {
         ("anthropic", &cfg.keys.anthropic),
         ("gemini", &cfg.keys.gemini),
         ("xai", &cfg.keys.xai),
+        ("openrouter", &cfg.keys.openrouter),
     ] {
         let display = match value {
             Some(v) if !v.is_empty() => mask_key(v),

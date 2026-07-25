@@ -12,6 +12,7 @@ set. Therefore **environment variables take precedence over the file**.
 | Anthropic | `ANTHROPIC_API_KEY` | `keys.anthropic` |
 | Google Gemini | `GEMINI_API_KEY` | `keys.gemini` |
 | xAI | `XAI_API_KEY` | `keys.xai` |
+| OpenRouter | `OPENROUTER_API_KEY` | `keys.openrouter` |
 
 The config file shape is:
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is llmshim
 
-A pure Rust LLM API translation layer. Takes OpenAI-format JSON requests, translates them to provider-native formats (and back), with zero infrastructure requirements. Supports OpenAI (Responses API), Anthropic, Google Gemini, and xAI. Includes an interactive CLI chat with streaming, reasoning, and mid-conversation model switching.
+A pure Rust LLM API translation layer. Takes OpenAI-format JSON requests, translates them to provider-native formats (and back), with zero infrastructure requirements. Supports OpenAI (Responses API), Anthropic, Google Gemini, xAI, and OpenRouter (an OpenAI Chat Completions-compatible aggregator). Includes an interactive CLI chat with streaming, reasoning, and mid-conversation model switching.
 
 **Published on crates.io as `llmshim`** — https://crates.io/crates/llmshim
 
@@ -16,6 +16,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 - **Anthropic:** `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
 - **Gemini:** `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3-flash-preview`
 - **xAI:** `grok-4.5`, `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`
+- **OpenRouter:** not enumerated (huge/dynamic catalog) — any `openrouter/<vendor>/<model>` slug routes through, e.g. `openrouter/anthropic/claude-sonnet-4.5`.
 
 ## Build & Test
 
@@ -30,13 +31,15 @@ cargo run                                            # interactive CLI chat
 cargo run --features proxy -- proxy                  # proxy server on :3000
 ```
 
-API keys: `~/.llmshim/config.toml` (via `llmshim configure`) or env vars `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`. Precedence: env vars > config file.
+API keys: `~/.llmshim/config.toml` (via `llmshim configure`) or env vars `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`. Precedence: env vars > config file.
 
 ## Architecture
 
 ### Value-based transforms, no canonical struct
 
-Requests flow as `serde_json::Value`. Each provider's transform takes raw JSON and maps only what it understands. Provider-specific features use `x-anthropic`, `x-gemini` namespaces.
+Requests flow as `serde_json::Value`. Each provider's transform takes raw JSON and maps only what it understands. Provider-specific features use `x-anthropic`, `x-gemini`, `x-openrouter` namespaces.
+
+**OpenRouter is the one passthrough provider.** Every other provider translates the OpenAI-format input *away* to a native dialect; OpenRouter (`src/providers/openrouter.rs`) *is* OpenAI Chat Completions, so its transforms are near-identity — messages, tools, vision (`image_url`), and `response_format` are forwarded unchanged; `reasoning_effort` maps 1:1 to OpenRouter's `reasoning:{effort}` (its effort vocabulary is a superset, so no clamping); `message.reasoning` is normalized to `reasoning_content` on responses. OpenRouter models are **not enumerated** in `src/models.rs` (the catalog is huge and dynamic) — any `openrouter/<vendor>/<model>` slug routes through. `x-openrouter` carries OpenRouter-only controls (`provider`, `models`, `transforms`, `route`, native `reasoning`; plus `http_referer`/`x_title` which become headers). The `middle-out` transform is disabled by default for faithful passthrough. Uses `image_url` (Chat Completions) vision via `vision::to_openai_chat`.
 
 ### Request flow
 
@@ -54,7 +57,7 @@ Every provider implements: `transform_request`, `transform_response`, `transform
 
 ### Router (`src/router.rs`)
 
-Parses `"provider/model"` strings. Auto-infers provider from prefix (`gpt*`/`o*` → openai, `claude*` → anthropic, `gemini*` → gemini, `grok*` → xai). Supports aliases. `Router::from_env()` reads API key env vars.
+Parses `"provider/model"` strings by splitting on the **first** `/` only, so an OpenRouter slug's internal slash survives (`openrouter/anthropic/claude-sonnet-4.5` → provider `openrouter`, model `anthropic/claude-sonnet-4.5`). Auto-infers provider from prefix (`gpt*`/`o*` → openai, `claude*` → anthropic, `gemini*` → gemini, `grok*` → xai); **OpenRouter has no prefix inference** — its slugs collide with everyone's, so it must be addressed explicitly as `openrouter/…`. Supports aliases. `Router::from_env()` reads API key env vars.
 
 ### HTTP Client (`src/client.rs`)
 
@@ -90,6 +93,7 @@ llmshim accepts tools in OpenAI Chat Completions format (nested `function` objec
 - **OpenAI (Responses API):** Tool definitions flattened from `{"type": "function", "function": {"name": ..., "parameters": ...}}` to `{"type": "function", "name": ..., "parameters": ...}`. Assistant messages with `tool_calls` → `function_call` items. `role: "tool"` messages → `function_call_output` items. Streaming function call events (`response.output_item.added`, `response.function_call_arguments.delta`) translated to Chat Completions chunk format.
 - **Anthropic:** Tools translated to `{"name": ..., "description": ..., "input_schema": ...}` format. Tool results translated to Anthropic's `tool_result` content blocks.
 - **xAI:** Same flat format as OpenAI Responses API — `translate_tools()` flattens nested format.
+- **OpenRouter:** No translation — it accepts the Chat Completions nested `{"type":"function","function":{…}}` format directly, so `tools`/`tool_choice`/`tool_calls` pass through unchanged.
 - **Gemini:** Tools wrapped in `functionDeclarations`. Tool results translated to `functionResponse` format.
 
 ### CLI (`src/main.rs`)
