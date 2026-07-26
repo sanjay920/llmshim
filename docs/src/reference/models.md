@@ -126,6 +126,8 @@ the slug's internal slash and `:variant` suffix are preserved. Because its
 slugs collide with other providers' prefixes, OpenRouter has no bare-model
 inference — always address it explicitly as `openrouter/…`.
 
+**Self-hosted vLLM / SGLang** are likewise not enumerated. Set `VLLM_BASE_URL` or `SGLANG_BASE_URL` (with an optional `*_API_KEY`) and address the served model as `vllm/<served-model>` or `sglang/<served-model>` — e.g. `sglang/Qwen/Qwen3.6-35B-A3B-FP8`. Local vs remote is just the base-URL value.
+
 Rust applications can also define one-level Router aliases with
 `Router::alias`. Those aliases are not part of the static registry and are not
 configured by the stock CLI or proxy. See [Models and the Router](../concepts/routing.md).

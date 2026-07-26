@@ -3,6 +3,7 @@ use crate::provider::Provider;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::gemini::Gemini;
 use crate::providers::openai::OpenAi;
+use crate::providers::openai_compat::OpenAiCompatible;
 use crate::providers::openrouter::OpenRouter;
 use crate::providers::xai::Xai;
 use std::collections::HashMap;
@@ -96,6 +97,22 @@ impl Router {
         }
         if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
             router = router.register("openrouter", Box::new(OpenRouter::new(key)));
+        }
+        // Self-hosted OpenAI-compatible servers: the base URL is the config
+        // (local vs remote); the API key is optional. Registered only when the
+        // base URL is set. Address as `vllm/<served-model>` / `sglang/<served-model>`.
+        if let Ok(base) = std::env::var("VLLM_BASE_URL") {
+            let key = std::env::var("VLLM_API_KEY").ok().filter(|k| !k.is_empty());
+            router = router.register("vllm", Box::new(OpenAiCompatible::new("vllm", base, key)));
+        }
+        if let Ok(base) = std::env::var("SGLANG_BASE_URL") {
+            let key = std::env::var("SGLANG_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty());
+            router = router.register(
+                "sglang",
+                Box::new(OpenAiCompatible::new("sglang", base, key)),
+            );
         }
 
         router

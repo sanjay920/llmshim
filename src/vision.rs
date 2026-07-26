@@ -257,3 +257,27 @@ pub fn text_blocks_to_openai(content: &Value) -> Value {
         _ => content.clone(),
     }
 }
+
+/// Translate text blocks to OpenAI Chat Completions format ("text" instead of
+/// the Responses API's "input_text") — for OpenAI-compatible targets like
+/// OpenRouter, vLLM, and SGLang.
+pub fn text_blocks_to_chat(content: &Value) -> Value {
+    match content {
+        Value::Array(blocks) => {
+            let translated: Vec<Value> = blocks
+                .iter()
+                .map(|block| {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("input_text") {
+                        let mut out = block.clone();
+                        out["type"] = Value::String("text".into());
+                        out
+                    } else {
+                        block.clone()
+                    }
+                })
+                .collect();
+            Value::Array(translated)
+        }
+        _ => content.clone(),
+    }
+}
