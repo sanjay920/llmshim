@@ -30,6 +30,7 @@ renamed or reshaped for the selected provider; unsupported controls are omitted.
 | `x-anthropic` | object | Native passthrough/control | Anthropic body fields plus `extra_betas` and `disable_1m_context` controls |
 | `x-gemini` | object | Native passthrough | Gemini body fields; `thinkingConfig` goes under `generationConfig` |
 | `x-openrouter` | object | Native passthrough/control | OpenRouter body fields (`provider`, `models`, `transforms`, `route`, native `reasoning`); `http_referer`/`x_title` become request headers |
+| `x-vllm` / `x-sglang` | object | Native passthrough | Server-specific body params for a self-hosted vLLM/SGLang server (`chat_template_kwargs`, `separate_reasoning`, `guided_json`, `top_k`, `min_p`, …) |
 
 There is no `x-xai` namespace. OpenAI additionally recognizes `store`,
 `prompt_cache_key`, `prompt_cache_retention`, `safety_identifier`, and `speed`.

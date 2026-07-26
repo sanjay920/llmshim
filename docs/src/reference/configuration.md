@@ -13,6 +13,8 @@ set. Therefore **environment variables take precedence over the file**.
 | Google Gemini | `GEMINI_API_KEY` | `keys.gemini` |
 | xAI | `XAI_API_KEY` | `keys.xai` |
 | OpenRouter | `OPENROUTER_API_KEY` | `keys.openrouter` |
+| vLLM (self-hosted) | `VLLM_BASE_URL` (+ optional `VLLM_API_KEY`) | — (env only) |
+| SGLang (self-hosted) | `SGLANG_BASE_URL` (+ optional `SGLANG_API_KEY`) | — (env only) |
 
 The config file shape is:
 
