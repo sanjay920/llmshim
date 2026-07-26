@@ -1,6 +1,6 @@
 {
   "name": "llmshim-linux-x64",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "llmshim proxy binary (Linux x64). Installed automatically as an optional dependency of the `llmshim` package — you should not need to depend on this directly.",
   "os": [
     "linux"
