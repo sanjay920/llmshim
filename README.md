@@ -1,6 +1,6 @@
 # llmshim
 
-A blazing-fast LLM API translation layer written in **pure Rust**. One request format, every provider — OpenAI, Anthropic, Google Gemini, xAI, and OpenRouter.
+A blazing-fast LLM API translation layer written in **pure Rust**. One request format, every provider — OpenAI, Anthropic, Google Gemini, xAI, OpenRouter, and self-hosted vLLM / SGLang.
 
 Send an OpenAI-style request, pick any model, and llmshim translates it to that provider's native API (and translates the response back). Switch providers by changing one string.
 
@@ -55,6 +55,18 @@ Reach any model through [OpenRouter](https://openrouter.ai) by addressing it as
 OpenRouter is OpenAI Chat Completions-compatible, so tools, vision, streaming,
 and `reasoning_effort` all pass through; OpenRouter-only controls (provider
 routing, model fallbacks, transforms) go under an `x-openrouter` key.
+
+Point at a **self-hosted vLLM or SGLang** server (local or remote) by setting its
+base URL — no key needed unless the server was launched with one:
+
+```bash
+export SGLANG_BASE_URL=http://localhost:30000/v1   # or https://your-host/v1
+export VLLM_BASE_URL=http://localhost:8000/v1
+```
+
+Then address the served model as `sglang/<served-model>` or `vllm/<served-model>`
+(e.g. `sglang/Qwen/Qwen3.6-35B-A3B-FP8`). Server-specific knobs go under
+`x-vllm` / `x-sglang`.
 
 Or persist them to the config file (used by all three surfaces):
 
