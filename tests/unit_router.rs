@@ -256,3 +256,26 @@ fn router_provider_keys_empty() {
     let router = Router::new();
     assert!(router.provider_keys().is_empty());
 }
+
+#[test]
+fn parse_openrouter_preserves_slug_with_slash() {
+    // openrouter/<vendor>/<model>: split_once('/') keeps the vendor/model slug
+    // (with its internal slash) intact as the model name.
+    let aliases = HashMap::new();
+    let (provider, model) =
+        parse_model("openrouter/anthropic/claude-sonnet-4.5", &aliases).unwrap();
+    assert_eq!(provider, "openrouter");
+    assert_eq!(model, "anthropic/claude-sonnet-4.5");
+}
+
+#[test]
+fn parse_openrouter_slug_with_variant_suffix() {
+    let aliases = HashMap::new();
+    let (provider, model) = parse_model(
+        "openrouter/meta-llama/llama-3.1-70b-instruct:nitro",
+        &aliases,
+    )
+    .unwrap();
+    assert_eq!(provider, "openrouter");
+    assert_eq!(model, "meta-llama/llama-3.1-70b-instruct:nitro");
+}

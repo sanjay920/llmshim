@@ -9,6 +9,7 @@ different native API and translates only the fields that API understands.
 | Anthropic | Messages API | `claude*` | `x-anthropic` |
 | Google Gemini | `generateContent` / `streamGenerateContent` | `gemini*` | `x-gemini` |
 | xAI | Responses API | `grok*` | none |
+| OpenRouter | Chat Completions (aggregator) | none — address as `openrouter/<vendor>/<model>` | `x-openrouter` |
 
 An explicit address such as `anthropic/claude-sonnet-5` avoids inference.
 The named provider must be registered in the Router—that normally means its
@@ -22,6 +23,7 @@ API key is configured.
 | Anthropic | Messages become Anthropic content blocks; tools use `input_schema`, `tool_use`, and `tool_result` | `max_tokens` defaults to 8192 when absent; supported models receive the 1M-context beta by default; `x-anthropic.extra_betas` appends beta headers and `disable_1m_context` suppresses that automatic header |
 | Gemini | Messages become `contents`; tools use `functionDeclarations`, `functionCall`, and `functionResponse` | Base64 images become `inline_data`, but a remote image URL becomes a text placeholder because Gemini cannot consume it directly; `x-gemini.thinkingConfig` replaces mapped thinking configuration |
 | xAI | System/developer text becomes Responses `instructions`; tools are flattened like OpenAI Responses | Unified reasoning becomes `reasoning: {effort}` where the model accepts it; grok-4.20 reasoning is encoded in the model name; there is no `x-xai` namespace |
+| OpenRouter | Passthrough — messages, tools, `image_url` vision, and `response_format` are already Chat Completions and forwarded unchanged | `reasoning_effort` maps 1:1 to OpenRouter's `reasoning:{effort}` (superset vocabulary, no clamping); `message.reasoning` is normalized to `reasoning_content`; the `middle-out` transform is disabled by default; `x-openrouter` carries `provider`/`models`/`transforms`/`route`/native `reasoning` (and `http_referer`/`x_title` headers) |
 
 OpenAI and xAI do not receive `temperature`, `top_p`, `top_k`, or `stop` from
 the portable top-level request. Anthropic and Gemini do. This is the
