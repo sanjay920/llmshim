@@ -3,6 +3,7 @@ use crate::provider::Provider;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::gemini::Gemini;
 use crate::providers::openai::OpenAi;
+use crate::providers::openrouter::OpenRouter;
 use crate::providers::xai::Xai;
 use std::collections::HashMap;
 
@@ -92,6 +93,9 @@ impl Router {
         }
         if let Ok(key) = std::env::var("XAI_API_KEY") {
             router = router.register("xai", Box::new(Xai::new(key)));
+        }
+        if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+            router = router.register("openrouter", Box::new(OpenRouter::new(key)));
         }
 
         router

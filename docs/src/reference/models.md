@@ -119,6 +119,13 @@ provider with `arbitrary-model-id` unchanged. A bare, unregistered model name
 works only when its prefix identifies a provider (`gpt`, `o1`, `o3`, `o4`,
 `claude`, `gemini`, or `grok`).
 
+**OpenRouter** is intentionally not enumerated above — its catalog is large and
+dynamic. Any `openrouter/<vendor>/<model>` slug routes through (e.g.
+`openrouter/anthropic/claude-sonnet-4.5`, `openrouter/meta-llama/llama-3.1-70b-instruct:nitro`);
+the slug's internal slash and `:variant` suffix are preserved. Because its
+slugs collide with other providers' prefixes, OpenRouter has no bare-model
+inference — always address it explicitly as `openrouter/…`.
+
 Rust applications can also define one-level Router aliases with
 `Router::alias`. Those aliases are not part of the static registry and are not
 configured by the stock CLI or proxy. See [Models and the Router](../concepts/routing.md).
