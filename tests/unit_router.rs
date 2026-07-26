@@ -279,3 +279,14 @@ fn parse_openrouter_slug_with_variant_suffix() {
     assert_eq!(provider, "openrouter");
     assert_eq!(model, "meta-llama/llama-3.1-70b-instruct:nitro");
 }
+
+#[test]
+fn parse_vllm_and_sglang_preserve_hf_slug() {
+    let aliases = HashMap::new();
+    let (p, m) = parse_model("vllm/meta-llama/Llama-3.1-8B-Instruct", &aliases).unwrap();
+    assert_eq!(p, "vllm");
+    assert_eq!(m, "meta-llama/Llama-3.1-8B-Instruct");
+    let (p, m) = parse_model("sglang/Qwen/Qwen3.6-35B-A3B-FP8", &aliases).unwrap();
+    assert_eq!(p, "sglang");
+    assert_eq!(m, "Qwen/Qwen3.6-35B-A3B-FP8");
+}
