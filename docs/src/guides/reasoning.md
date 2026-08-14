@@ -134,7 +134,7 @@ through `x-gemini.thinkingConfig`.
 
 xAI receives the nested native shape `reasoning: {effort}`:
 
-| unified | grok-4.3 | grok-4.5 | grok-4.20-\*-reasoning / -non-reasoning |
+| unified | grok-4.3 | grok-4.5 / grok-4.6 | grok-4.20-\*-reasoning / -non-reasoning |
 |---|---|---|---|
 | `none` | `none` | **`low`** | omitted |
 | `low` | `low` | `low` | omitted |
@@ -143,7 +143,7 @@ xAI receives the nested native shape `reasoning: {effort}`:
 | `xhigh` | `xhigh` | `xhigh` | omitted |
 | `max` | **`xhigh`** | **`xhigh`** | omitted |
 
-grok-4.5 cannot disable reasoning, so `none` clamps to `low`. grok-4.20 models
+grok-4.5 and grok-4.6 cannot disable reasoning, so `none` clamps to `low`. grok-4.20 models
 are name-locked: reasoning on or off is encoded in the model name, and the API
 rejects any reasoning parameter. llmshim therefore omits it for that family.
 

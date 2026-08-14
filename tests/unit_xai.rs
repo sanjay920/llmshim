@@ -667,6 +667,29 @@ fn name_locked_grok_4_20_omits_reasoning_entirely() {
 }
 
 #[test]
+fn reasoning_none_clamps_to_low_for_grok_4_5_and_4_6() {
+    // grok-4.5 and grok-4.6 400 on effort "none" (verified live) — clamp to "low".
+    let p = provider();
+    for model in ["grok-4.5", "grok-4.6"] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none",
+        });
+        let r = p.transform_request(model, &req).unwrap();
+        assert_eq!(r.body["reasoning"]["effort"], "low", "{model} none->low");
+    }
+    // grok-4.3 CAN disable — "none" stays "none".
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let r = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "none");
+}
+
+#[test]
 fn mode_pro_bumps_effort() {
     let p = provider();
     let req = json!({

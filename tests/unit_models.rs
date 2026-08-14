@@ -11,7 +11,7 @@ fn models_registry_has_all_providers() {
 
 #[test]
 fn models_registry_has_expected_count() {
-    assert_eq!(MODELS.len(), 24);
+    assert_eq!(MODELS.len(), 25);
 }
 
 #[test]
@@ -160,6 +160,7 @@ fn reasoning_support_matches_provider_behavior() {
         "openai/gpt-5.6-sol",
         "anthropic/claude-opus-5",
         "anthropic/claude-opus-4-8",
+        "xai/grok-4.6",
         "xai/grok-4.5",
     ] {
         assert_eq!(
