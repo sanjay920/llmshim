@@ -353,6 +353,15 @@ pub const MODELS: &[ModelInfo] = &[
         capabilities: CAPS_STD,
     },
     ModelInfo {
+        id: "xai/grok-4.6",
+        provider: "xai",
+        name: "grok-4.6",
+        label: "Grok 4.6",
+        context_window_tokens: Some(500_000),
+        max_output_tokens: None,
+        capabilities: CAPS_XAI,
+    },
+    ModelInfo {
         id: "xai/grok-4.5",
         provider: "xai",
         name: "grok-4.5",
