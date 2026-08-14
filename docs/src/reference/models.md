@@ -56,6 +56,7 @@ this table in applications.
 
 | ID | Display name |
 |---|---|
+| `xai/grok-4.6` | Grok 4.6 |
 | `xai/grok-4.5` | Grok 4.5 |
 | `xai/grok-4.3` | Grok 4.3 |
 | `xai/grok-4.20-multi-agent-beta-0309` | Grok 4.20 Multi-Agent |
