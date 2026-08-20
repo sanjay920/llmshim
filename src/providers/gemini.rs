@@ -581,11 +581,15 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
     }))
 }
 
-/// Models that cannot turn thinking off: gemini-3.1-pro rejects both
-/// thinkingLevel "minimal" and thinkingBudget 0 ("This model only works in
-/// thinking mode", verified live). Unified effort "none" clamps to "low".
+/// Models that cannot turn thinking off: gemini-3.1-pro and gemini-3.7-flash
+/// reject thinkingLevel "minimal" (and thinkingBudget 0) — verified live.
+/// Unified effort "none" clamps to "low" for them.
 fn cannot_disable_thinking(model: &str) -> bool {
-    model.to_lowercase().contains("3.1-pro")
+    let m = model.to_lowercase();
+    // gemini-3.1-pro and gemini-3.7-flash reject thinkingLevel "minimal" (and
+    // thinkingBudget 0), verified live — unified "none" clamps to "low". Other
+    // flash models (3.5/3.6/3.5-lite) accept "minimal" and can disable thinking.
+    m.contains("3.1-pro") || m.contains("3.7-flash")
 }
 
 impl Provider for Gemini {

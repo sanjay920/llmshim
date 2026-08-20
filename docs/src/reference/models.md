@@ -14,7 +14,7 @@ the ID and display label.
 
 ## Registered catalog
 
-The current registry contains 24 entries, newest first within each provider.
+The current registry contains 26 entries, newest first within each provider.
 This page mirrors `src/models.rs`; use runtime discovery rather than parsing
 this table in applications.
 
@@ -48,9 +48,10 @@ this table in applications.
 
 | ID | Display name |
 |---|---|
+| `gemini/gemini-3.7-flash` | Gemini 3.7 Flash |
+| `gemini/gemini-3.6-flash` | Gemini 3.6 Flash |
 | `gemini/gemini-3.5-flash` | Gemini 3.5 Flash |
-| `gemini/gemini-3.1-pro-preview` | Gemini 3.1 Pro |
-| `gemini/gemini-3-flash-preview` | Gemini 3 Flash |
+| `gemini/gemini-3.5-flash-lite` | Gemini 3.5 Flash Lite |
 
 ### xAI
 

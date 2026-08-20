@@ -117,7 +117,7 @@ token budget scaled from `max_tokens` and floored at 1024:
 Gemini uses the four-rung
 `generationConfig.thinkingConfig.thinkingLevel` enum:
 
-| unified | gemini-3.5-flash / 3-flash-preview / 3.1-flash-lite-preview | gemini-3.1-pro-preview |
+| unified | gemini-3.5-flash / 3.6-flash / 3.5-flash-lite | gemini-3.7-flash (and gemini-3.1-pro) |
 |---|---|---|
 | `none` | `minimal` (zero thinking tokens) | **`low`** (this model cannot disable thinking) |
 | `low` | `low` | `low` |
@@ -126,8 +126,8 @@ Gemini uses the four-rung
 | `xhigh` | **`high`** | **`high`** |
 | `max` | **`high`** | **`high`** |
 
-Gemini 3.1 Pro rejects both `minimal` and `thinkingBudget: 0`, so `none` clamps
-to its `low` floor. The legacy integer `thinkingBudget` remains available only
+Gemini 3.7 Flash and Gemini 3.1 Pro reject both `minimal` and `thinkingBudget: 0`, so `none`
+clamps to their `low` floor (verified live). Other flash models accept `minimal` and can disable thinking. The legacy integer `thinkingBudget` remains available only
 through `x-gemini.thinkingConfig`.
 
 ### xAI Responses API
