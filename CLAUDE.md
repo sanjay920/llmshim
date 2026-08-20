@@ -14,7 +14,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 
 - **OpenAI:** `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano`
 - **Anthropic:** `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
-- **Gemini:** `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`
+- **Gemini:** `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`
 - **xAI:** `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`
 - **OpenRouter:** not enumerated (huge/dynamic catalog) — any `openrouter/<vendor>/<model>` slug routes through, e.g. `openrouter/anthropic/claude-sonnet-4.5`.
 - **vLLM / SGLang:** not enumerated (self-hosted) — any `vllm/<served-model>` or `sglang/<served-model>` routes through to the configured server, e.g. `sglang/Qwen/Qwen3.6-35B-A3B-FP8`.
