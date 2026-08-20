@@ -690,12 +690,49 @@ async fn cmd_gateway() {
     eprintln!(
         "  Priority-queue scheduler · x-llmshim-priority header (higher = sooner, default 0)"
     );
-    eprintln!("  POST /v1/chat · GET /v1/models · GET /health  (streaming not yet queued)");
+    eprintln!("  POST /v1/chat · POST /v1/chat/stream · GET /v1/models · GET /health");
 
-    let state = llmshim::gateway::http::GatewayState::from_env(router, logger);
+    // Distributed (Redis fleet) mode when a Redis URL is configured and the
+    // binary was built with redis coordination; otherwise single-instance.
+    let state = build_gateway_state(router, logger).await;
     let app = llmshim::gateway::http::app(state);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(all(feature = "gateway", feature = "redis-coordination"))]
+async fn build_gateway_state(
+    router: llmshim::router::Router,
+    logger: Option<llmshim::log::Logger>,
+) -> std::sync::Arc<llmshim::gateway::http::GatewayState> {
+    if let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") {
+        eprintln!("  Mode: distributed (shared Redis queue + response bus)");
+        match llmshim::gateway::http::GatewayState::distributed_from_env(router, logger, &url).await
+        {
+            Ok(state) => return state,
+            Err(e) => {
+                eprintln!("  Redis connection failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    eprintln!("  Mode: in-memory (single instance)");
+    llmshim::gateway::http::GatewayState::from_env(router, logger)
+}
+
+#[cfg(all(feature = "gateway", not(feature = "redis-coordination")))]
+async fn build_gateway_state(
+    router: llmshim::router::Router,
+    logger: Option<llmshim::log::Logger>,
+) -> std::sync::Arc<llmshim::gateway::http::GatewayState> {
+    if std::env::var("LLMSHIM_REDIS_URL").is_ok() {
+        eprintln!(
+            "  Note: LLMSHIM_REDIS_URL is set but this binary lacks distributed support; \
+             rebuild with --features gateway-redis. Running in-memory."
+        );
+    }
+    eprintln!("  Mode: in-memory (single instance)");
+    llmshim::gateway::http::GatewayState::from_env(router, logger)
 }
 
 // ============================================================
