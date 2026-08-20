@@ -1549,6 +1549,7 @@ fn reasoning_none_clamps_per_model_disable_capability() {
         "gemini-3.6-flash",
         "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
     ] {
         let r = p.transform_request(m, &req).unwrap();
         assert_eq!(

@@ -117,7 +117,7 @@ token budget scaled from `max_tokens` and floored at 1024:
 Gemini uses the four-rung
 `generationConfig.thinkingConfig.thinkingLevel` enum:
 
-| unified | gemini-3.5-flash / 3.6-flash / 3.5-flash-lite | gemini-3.7-flash (and gemini-3.1-pro) |
+| unified | gemini-3.5-flash / 3.6-flash / 3.5-flash-lite / 3.1-flash-lite | gemini-3.7-flash (and gemini-3.1-pro) |
 |---|---|---|
 | `none` | `minimal` (zero thinking tokens) | **`low`** (this model cannot disable thinking) |
 | `low` | `low` | `low` |
