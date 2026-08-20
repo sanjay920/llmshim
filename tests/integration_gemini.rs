@@ -478,3 +478,23 @@ async fn gemini_3_7_flash_none_clamps_to_low() {
     assert_eq!(resp["object"], "chat.completion");
     println!("gemini-3.7-flash none->low clamp OK");
 }
+
+#[tokio::test]
+#[ignore]
+async fn gemini_3_1_flash_lite_completion() {
+    if std::env::var("GEMINI_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+    let req = json!({
+        "model": "gemini/gemini-3.1-flash-lite",
+        "messages": [{"role": "user", "content": "In one short sentence, what is Rust?"}],
+        "max_tokens": 2000,
+    });
+    let resp = llmshim::completion(&router, &req).await.unwrap();
+    let content = resp["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
+    assert!(!content.is_empty(), "expected a response, got: {resp}");
+    println!("gemini-3.1-flash-lite said: {content}");
+}
