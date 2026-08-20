@@ -28,51 +28,42 @@
 //!   and [`RetryAfter`]; the [`Dispatch`] trait is injected so the scheduler is
 //!   testable without real HTTP.
 //!
-//! Known MVP simplifications (deferred): tier fairness/aging (a flood of
-//! high-tier traffic can starve low tiers), streaming-through-queue, and
-//! distributed queue backends. Priority tier is caller-supplied.
+//! Beyond the basics this also implements: **tier fairness/aging** (a starved
+//! low tier eventually overtakes a high-tier flood — see [`InMemoryQueue`]),
+//! **streaming-through-the-queue** ([`Scheduler::submit_stream`]), and a
+//! **Redis-backed distributed** queue + response bus for a fleet (see the
+//! `distributed` module, feature `gateway-redis`). Priority tier is
+//! caller-supplied. Still deferred: an at-least-once lease (a worker crash
+//! mid-dispatch drops that one distributed request), distributed streaming, and
+//! aging in distributed mode.
 
 pub mod http;
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+#[cfg(feature = "redis-coordination")]
+pub mod distributed;
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::sync::{oneshot, Notify, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::proxy::ratelimit::{RateKey, RateLimiter, RetryAfter};
 
 /// Priority tier: higher dispatches first (e.g. `2` = paying, `0` = free).
 pub type Tier = u8;
 
-/// Ordering key for a queued job: **higher tier first, then FIFO by seqno**.
-///
-/// `BinaryHeap` is a max-heap, so `Ord` returns `Greater` for the job that
-/// should dispatch first — higher `tier`, and for equal tiers the *lower*
-/// `seqno` (enqueued earlier) wins.
+/// Identity of a queued job: its base `tier` and a global monotonic `seqno`
+/// used as the FIFO tie-break (lower seqno = enqueued earlier).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PriorityKey {
     tier: Tier,
     seqno: u64,
-}
-
-impl Ord for PriorityKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.tier
-            .cmp(&other.tier)
-            .then_with(|| other.seqno.cmp(&self.seqno))
-    }
-}
-
-impl PartialOrd for PriorityKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 /// A request submitted to the gateway.
@@ -137,44 +128,60 @@ impl DispatchError {
 #[async_trait]
 pub trait Dispatch: Send + Sync {
     async fn dispatch(&self, provider: &str, payload: Value) -> Result<Value, DispatchError>;
+
+    /// Open a streaming upstream call, yielding raw provider chunks. Defaults to
+    /// unsupported so non-streaming dispatchers need not implement it.
+    async fn dispatch_stream(
+        &self,
+        _provider: &str,
+        _payload: Value,
+    ) -> Result<ChunkStream, DispatchError> {
+        Err(DispatchError::new(
+            "streaming not supported by this dispatcher",
+        ))
+    }
 }
 
-/// A unit of queued work. The `tx` half of a oneshot delivers the result back to
-/// the awaiting [`Scheduler::submit`] caller; if the caller goes away (timeout /
-/// client disconnect) `tx.is_closed()` flips and the dispatcher skips the job
-/// without spending a token.
+/// A streamed chunk (raw provider SSE `data:` payload) or a terminal error.
+pub type StreamChunk = Result<String, GatewayError>;
+
+/// A boxed stream of [`StreamChunk`]s produced by a streaming dispatch.
+pub type ChunkStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamChunk> + Send>>;
+
+/// How a job's result is delivered back to the awaiting caller.
+enum Delivery {
+    /// Non-streaming: a single response value.
+    Unary(oneshot::Sender<Result<Value, GatewayError>>),
+    /// Streaming: once the upstream stream opens, hands back a channel of chunks
+    /// (the dispatcher forwards upstream → this channel, holding the concurrency
+    /// permit for the whole stream so capacity frees only when it ends).
+    Stream(oneshot::Sender<Result<mpsc::Receiver<StreamChunk>, GatewayError>>),
+}
+
+/// A unit of queued work. The `delivery` sender returns the result to the
+/// awaiting [`Scheduler::submit`] / [`Scheduler::submit_stream`] caller; if the
+/// caller goes away (timeout / client disconnect) its receiver drops,
+/// `is_cancelled()` flips, and the dispatcher skips the job without a token.
 pub struct Job {
     key: PriorityKey,
     permits: u32,
     payload: Value,
-    tx: oneshot::Sender<Result<Value, GatewayError>>,
+    delivery: Delivery,
     /// Fires the instant the dispatcher commits to the upstream call, so
-    /// [`Scheduler::submit`]'s `max_wait` bounds only **queue residence** — not
-    /// the (possibly long) upstream call itself.
+    /// `max_wait` bounds only **queue residence** — not the (possibly long)
+    /// upstream call itself.
     started: oneshot::Sender<()>,
+    /// When the job entered the queue — drives anti-starvation aging. Preserved
+    /// across a rate-limit requeue so a job keeps aging while it waits.
+    enqueued_at: Instant,
 }
 
 impl Job {
     fn is_cancelled(&self) -> bool {
-        self.tx.is_closed()
-    }
-}
-
-// Heap ordering is entirely by priority key.
-impl PartialEq for Job {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-impl Eq for Job {}
-impl Ord for Job {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
-    }
-}
-impl PartialOrd for Job {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+        match &self.delivery {
+            Delivery::Unary(tx) => tx.is_closed(),
+            Delivery::Stream(tx) => tx.is_closed(),
+        }
     }
 }
 
@@ -207,20 +214,89 @@ pub trait RequestQueue: Send + Sync {
     fn depth(&self) -> usize;
 }
 
-/// Zero-infra in-memory backend: a priority `BinaryHeap` + a `Notify`.
+/// Zero-infra in-memory backend: **per-tier FIFO deques + aging**, plus a
+/// `Notify`.
+///
+/// Ordering is by *effective* priority: a job's tier plus an aging boost that
+/// grows with how long it has waited (`min(max_boost, wait / aging_step)`).
+/// Because jobs age uniformly and each tier is FIFO, only the **front** of each
+/// tier can be the next winner, so dequeue is `O(#tiers)` — no full re-sort.
+/// With the default large `aging_step`, boost stays 0 under normal load and the
+/// policy is exactly strict-priority-then-FIFO; aging only rescues jobs a
+/// higher tier would otherwise starve.
 pub struct InMemoryQueue {
-    heap: Mutex<BinaryHeap<Job>>,
+    inner: Mutex<QueueInner>,
     notify: Notify,
     max_depth: usize,
+    aging_step: Duration,
+    max_boost: u32,
+}
+
+#[derive(Default)]
+struct QueueInner {
+    /// Base tier → FIFO deque of jobs at that tier.
+    tiers: BTreeMap<Tier, VecDeque<Job>>,
+    len: usize,
 }
 
 impl InMemoryQueue {
     pub fn new(max_depth: usize) -> Self {
+        Self::with_aging(max_depth, Duration::from_secs(5), 16)
+    }
+
+    pub fn with_aging(max_depth: usize, aging_step: Duration, max_boost: u32) -> Self {
         Self {
-            heap: Mutex::new(BinaryHeap::new()),
+            inner: Mutex::new(QueueInner::default()),
             notify: Notify::new(),
             max_depth: max_depth.max(1),
+            // A zero step would divide by zero; treat it as "no aging".
+            aging_step: aging_step.max(Duration::from_millis(1)),
+            max_boost,
         }
+    }
+
+    /// Effective priority of a waiting job = base tier + capped aging boost.
+    fn effective_priority(&self, tier: Tier, enqueued_at: Instant, now: Instant) -> i64 {
+        let waited = now.saturating_duration_since(enqueued_at).as_secs_f64();
+        let boost = (waited / self.aging_step.as_secs_f64()).floor() as i64;
+        tier as i64 + boost.clamp(0, self.max_boost as i64)
+    }
+
+    /// Pop the front job with the highest effective priority (ties → lower
+    /// seqno = earlier), dropping cancelled jobs it encounters. `None` if empty.
+    fn pop_best(&self, inner: &mut QueueInner, now: Instant) -> Option<Job> {
+        let tiers: Vec<Tier> = inner.tiers.keys().copied().collect();
+        let mut best: Option<(i64, u64, Tier)> = None; // (eff_prio, seqno, tier)
+        for tier in tiers {
+            let dq = inner.tiers.get_mut(&tier).unwrap();
+            // Skip cancelled jobs sitting at the front of this tier.
+            while dq.front().map(|j| j.is_cancelled()).unwrap_or(false) {
+                dq.pop_front();
+                inner.len -= 1;
+            }
+            if let Some(front) = dq.front() {
+                let eff = self.effective_priority(tier, front.enqueued_at, now);
+                let seqno = front.key.seqno;
+                let better = match best {
+                    None => true,
+                    Some((be, bs, _)) => eff > be || (eff == be && seqno < bs),
+                };
+                if better {
+                    best = Some((eff, seqno, tier));
+                }
+            }
+        }
+        inner.tiers.retain(|_, dq| !dq.is_empty());
+        let (_, _, tier) = best?;
+        let dq = inner.tiers.get_mut(&tier).unwrap();
+        let job = dq.pop_front();
+        if dq.is_empty() {
+            inner.tiers.remove(&tier);
+        }
+        if job.is_some() {
+            inner.len -= 1;
+        }
+        job
     }
 }
 
@@ -228,11 +304,12 @@ impl InMemoryQueue {
 impl RequestQueue for InMemoryQueue {
     fn enqueue(&self, job: Job) -> Result<(), Job> {
         {
-            let mut heap = self.heap.lock().unwrap();
-            if heap.len() >= self.max_depth {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.len >= self.max_depth {
                 return Err(job);
             }
-            heap.push(job);
+            inner.len += 1;
+            inner.tiers.entry(job.key.tier).or_default().push_back(job);
         }
         // Wake a dispatcher parked on an empty queue or a backoff sleep.
         self.notify.notify_one();
@@ -242,12 +319,9 @@ impl RequestQueue for InMemoryQueue {
     async fn dequeue(&self) -> Job {
         loop {
             {
-                let mut heap = self.heap.lock().unwrap();
-                // Drop cancelled jobs sitting at the top.
-                while heap.peek().map(|j| j.is_cancelled()).unwrap_or(false) {
-                    heap.pop();
-                }
-                if let Some(job) = heap.pop() {
+                let mut inner = self.inner.lock().unwrap();
+                let now = Instant::now();
+                if let Some(job) = self.pop_best(&mut inner, now) {
                     return job;
                 }
             }
@@ -257,8 +331,12 @@ impl RequestQueue for InMemoryQueue {
 
     fn requeue(&self, job: Job) {
         // No depth check and no notify: this is the dispatcher putting back a
-        // job it just took; notifying here would spin the backoff loop.
-        self.heap.lock().unwrap().push(job);
+        // job it just took; notifying here would spin the backoff loop. Front of
+        // its tier — it keeps its original seqno/enqueued_at, so it re-wins its
+        // slot immediately on the next dequeue.
+        let mut inner = self.inner.lock().unwrap();
+        inner.len += 1;
+        inner.tiers.entry(job.key.tier).or_default().push_front(job);
     }
 
     async fn notified(&self) {
@@ -266,7 +344,7 @@ impl RequestQueue for InMemoryQueue {
     }
 
     fn depth(&self) -> usize {
-        self.heap.lock().unwrap().len()
+        self.inner.lock().unwrap().len
     }
 }
 
@@ -282,6 +360,18 @@ pub struct GatewayConfig {
     pub overloaded_retry_after: Duration,
     /// Max concurrent in-flight upstream calls per provider.
     pub max_concurrency_per_provider: usize,
+    /// Anti-starvation aging: a queued job's *effective* tier rises by 1 for
+    /// every `aging_step` it has waited, so a low tier flooded by a high tier
+    /// eventually wins. Large by default → normal traffic stays strictly
+    /// priority-ordered and aging only rescues genuinely starved jobs.
+    pub aging_step: Duration,
+    /// Cap on the aging boost (max effective-tier climb). Bounds worst-case
+    /// starvation to roughly `tier_gap * aging_step`.
+    pub max_boost: u32,
+    /// Distributed mode only: total time the origin instance waits for a
+    /// response over the bus (queue + upstream call) before giving up. The
+    /// in-memory path uses `max_wait` for queue residence instead.
+    pub request_timeout: Duration,
 }
 
 impl Default for GatewayConfig {
@@ -291,6 +381,9 @@ impl Default for GatewayConfig {
             max_wait: Duration::from_secs(30),
             overloaded_retry_after: Duration::from_secs(1),
             max_concurrency_per_provider: 256,
+            aging_step: Duration::from_secs(5),
+            max_boost: 16,
+            request_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -319,6 +412,20 @@ impl GatewayConfig {
                 "LLMSHIM_GATEWAY_MAX_CONCURRENCY",
                 d.max_concurrency_per_provider,
             ),
+            aging_step: std::env::var("LLMSHIM_GATEWAY_AGING_STEP_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(d.aging_step),
+            max_boost: std::env::var("LLMSHIM_GATEWAY_MAX_BOOST")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.max_boost),
+            request_timeout: std::env::var("LLMSHIM_GATEWAY_REQUEST_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(d.request_timeout),
         }
     }
 }
@@ -369,8 +476,9 @@ impl Scheduler {
             },
             permits: req.permits.max(1),
             payload: req.payload,
-            tx,
+            delivery: Delivery::Unary(tx),
             started: started_tx,
+            enqueued_at: Instant::now(),
         };
 
         if queue.enqueue(job).is_err() {
@@ -395,6 +503,45 @@ impl Scheduler {
         }
     }
 
+    /// Like [`submit`](Self::submit) but for a streaming request: enqueues by
+    /// priority and, once dispatched, returns a channel of raw provider chunks.
+    /// `max_wait` bounds queue residence only; the stream itself is unbounded.
+    pub async fn submit_stream(
+        self: &Arc<Self>,
+        req: GatewayRequest,
+    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
+        let queue = self.lane_for(&req.provider);
+        let seqno = self.seq.fetch_add(1, AtomicOrdering::Relaxed);
+        let (result_tx, result_rx) = oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+        let job = Job {
+            key: PriorityKey {
+                tier: req.tier,
+                seqno,
+            },
+            permits: req.permits.max(1),
+            payload: req.payload,
+            delivery: Delivery::Stream(result_tx),
+            started: started_tx,
+            enqueued_at: Instant::now(),
+        };
+
+        if queue.enqueue(job).is_err() {
+            return Err(GatewayError::Overloaded(self.config.overloaded_retry_after));
+        }
+
+        tokio::select! {
+            biased;
+            started = started_rx => match started {
+                Ok(()) | Err(_) => match result_rx.await {
+                    Ok(result) => result,
+                    Err(_) => Err(GatewayError::Shutdown),
+                },
+            },
+            _ = tokio::time::sleep(self.config.max_wait) => Err(GatewayError::Timeout),
+        }
+    }
+
     /// Current queued depth for a provider (0 if the lane doesn't exist yet).
     pub fn queue_depth(&self, provider: &str) -> usize {
         self.lanes
@@ -411,8 +558,11 @@ impl Scheduler {
         if let Some(lane) = lanes.get(provider) {
             return lane.queue.clone();
         }
-        let queue: Arc<dyn RequestQueue> =
-            Arc::new(InMemoryQueue::new(self.config.max_queue_depth));
+        let queue: Arc<dyn RequestQueue> = Arc::new(InMemoryQueue::with_aging(
+            self.config.max_queue_depth,
+            self.config.aging_step,
+            self.config.max_boost,
+        ));
         lanes.insert(
             provider.to_string(),
             Lane {
@@ -436,6 +586,16 @@ impl Drop for Scheduler {
         for handle in self.handles.lock().unwrap().drain(..) {
             handle.abort();
         }
+    }
+}
+
+/// If a dispatch failed with an upstream 429, back the provider's bucket off so
+/// the whole fleet slows together.
+async fn penalize_if_429(limiter: &Arc<dyn RateLimiter>, provider: &str, err: &DispatchError) {
+    if let Some(retry_after) = err.retry_after {
+        limiter
+            .penalize(&RateKey::provider(provider.to_string()), retry_after)
+            .await;
     }
 }
 
@@ -476,7 +636,7 @@ async fn dispatcher_loop(
                 }
                 let Job {
                     payload,
-                    tx,
+                    delivery,
                     started,
                     ..
                 } = job;
@@ -486,18 +646,42 @@ async fn dispatcher_loop(
                 let limiter = limiter.clone();
                 let provider = provider.clone();
                 tokio::spawn(async move {
+                    // Held for the whole call (incl. a stream's full lifetime),
+                    // so per-provider concurrency frees only when it finishes.
                     let _permit = permit;
-                    match dispatch.dispatch(&provider, payload).await {
-                        Ok(value) => {
-                            let _ = tx.send(Ok(value));
-                        }
-                        Err(err) => {
-                            if let Some(retry_after) = err.retry_after {
-                                limiter
-                                    .penalize(&RateKey::provider(provider.clone()), retry_after)
-                                    .await;
+                    match delivery {
+                        Delivery::Unary(tx) => match dispatch.dispatch(&provider, payload).await {
+                            Ok(value) => {
+                                let _ = tx.send(Ok(value));
                             }
-                            let _ = tx.send(Err(GatewayError::Upstream(err.message)));
+                            Err(err) => {
+                                penalize_if_429(&limiter, &provider, &err).await;
+                                let _ = tx.send(Err(GatewayError::Upstream(err.message)));
+                            }
+                        },
+                        Delivery::Stream(tx) => {
+                            match dispatch.dispatch_stream(&provider, payload).await {
+                                Ok(mut upstream) => {
+                                    let (chunk_tx, chunk_rx) = mpsc::channel(16);
+                                    // Hand the receiver to the caller; if it's
+                                    // already gone, abandon the stream.
+                                    if tx.send(Ok(chunk_rx)).is_err() {
+                                        return;
+                                    }
+                                    use futures::StreamExt;
+                                    while let Some(item) = upstream.next().await {
+                                        // Client disconnected → stop pulling
+                                        // upstream and free capacity.
+                                        if chunk_tx.send(item).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    penalize_if_429(&limiter, &provider, &err).await;
+                                    let _ = tx.send(Err(GatewayError::Upstream(err.message)));
+                                }
+                            }
                         }
                     }
                 });
@@ -569,6 +753,18 @@ mod tests {
             self.order.lock().unwrap().push(id);
             Ok(json!({ "id": id }))
         }
+
+        async fn dispatch_stream(
+            &self,
+            _provider: &str,
+            payload: Value,
+        ) -> Result<ChunkStream, DispatchError> {
+            let id = payload["id"].as_u64().unwrap();
+            self.order.lock().unwrap().push(id);
+            // Emit three chunks tagged with the job id.
+            let chunks: Vec<StreamChunk> = (0..3).map(|n| Ok(format!("{id}:{n}"))).collect();
+            Ok(Box::pin(futures::stream::iter(chunks)))
+        }
     }
 
     fn scheduler(
@@ -636,8 +832,9 @@ mod tests {
                 key: PriorityKey { tier, seqno },
                 permits: 1,
                 payload: json!({ "id": seqno }),
-                tx,
+                delivery: Delivery::Unary(tx),
                 started,
+                enqueued_at: Instant::now(),
             },
             rx,
         )
@@ -742,6 +939,51 @@ mod tests {
 
         // tier3 (id2), tier2 (id4), then tier1 FIFO (id1 before id3).
         assert_eq!(*order.lock().unwrap(), vec![2, 4, 1, 3]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aging_rescues_starved_low_tier() {
+        // Defaults: aging_step 5s, max_boost 16. A tier-0 job that has waited
+        // long enough (boost > 5) must overtake a *freshly* arrived tier-5 job.
+        let limiter = Arc::new(FakeLimiter::new(0)); // gated during setup
+        let order = Arc::new(Mutex::new(Vec::new()));
+        // Long max_wait so the aging job doesn't time out before it's rescued.
+        let config = GatewayConfig {
+            max_wait: Duration::from_secs(300),
+            ..Default::default()
+        };
+        let sched = scheduler(limiter.clone(), order.clone(), config);
+
+        // Enqueue one low-tier (tier 0) job and let it age ~31s (boost 6 > 5).
+        let mut handles = enqueue_ordered(&sched, "p", &[(1, 0)]).await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        yield_many().await;
+
+        // Now a fresh high-tier (tier 5) job arrives; the dispatcher is parked
+        // (gated), so depth climbs to 2 without anything dispatching.
+        let hi = {
+            let s = sched.clone();
+            tokio::spawn(async move {
+                s.submit(GatewayRequest {
+                    provider: "p".into(),
+                    tier: 5,
+                    permits: 1,
+                    payload: json!({ "id": 2 }),
+                })
+                .await
+            })
+        };
+        wait_for_depth(&sched, "p", 2).await;
+        handles.push(hi);
+
+        // Release capacity: the aged tier-0 job (eff 6) beats the fresh tier-5.
+        limiter.set("p", 100);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        yield_many().await;
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -894,5 +1136,93 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(GatewayError::Overloaded(_))));
+    }
+
+    // ---- streaming ----------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn submit_stream_delivers_chunks_in_order() {
+        let limiter = Arc::new(FakeLimiter::new(100)); // capacity available
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let sched = scheduler(limiter, order, GatewayConfig::default());
+
+        let mut rx = sched
+            .submit_stream(GatewayRequest {
+                provider: "p".into(),
+                tier: 0,
+                permits: 1,
+                payload: json!({ "id": 7 }),
+            })
+            .await
+            .expect("stream should start");
+
+        let mut got = Vec::new();
+        while let Some(item) = rx.recv().await {
+            got.push(item.unwrap());
+        }
+        assert_eq!(got, vec!["7:0", "7:1", "7:2"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_stops_when_receiver_dropped() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+        // A dispatcher that streams forever, counting every chunk it produces.
+        struct InfiniteStream {
+            emitted: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Dispatch for InfiniteStream {
+            async fn dispatch(&self, _p: &str, _v: Value) -> Result<Value, DispatchError> {
+                Err(DispatchError::new("unary not used"))
+            }
+            async fn dispatch_stream(
+                &self,
+                _p: &str,
+                _v: Value,
+            ) -> Result<ChunkStream, DispatchError> {
+                let emitted = self.emitted.clone();
+                let s = futures::stream::unfold(0u64, move |n| {
+                    let emitted = emitted.clone();
+                    async move {
+                        emitted.fetch_add(1, O::SeqCst);
+                        tokio::task::yield_now().await;
+                        Some((Ok(format!("chunk{n}")), n + 1))
+                    }
+                });
+                Ok(Box::pin(s))
+            }
+        }
+
+        let emitted = Arc::new(AtomicUsize::new(0));
+        let sched = Scheduler::new(
+            GatewayConfig::default(),
+            Arc::new(FakeLimiter::new(100)),
+            Arc::new(InfiniteStream {
+                emitted: emitted.clone(),
+            }),
+        );
+
+        let mut rx = sched
+            .submit_stream(GatewayRequest {
+                provider: "p".into(),
+                tier: 0,
+                permits: 1,
+                payload: json!({ "id": 1 }),
+            })
+            .await
+            .expect("stream should start");
+
+        // Pull a couple chunks, then hang up.
+        assert!(rx.recv().await.is_some());
+        assert!(rx.recv().await.is_some());
+        drop(rx);
+
+        // After the receiver drops, the forwarder's next send errors → it stops.
+        yield_many().await;
+        let a = emitted.load(O::SeqCst);
+        yield_many().await;
+        let b = emitted.load(O::SeqCst);
+        assert_eq!(a, b, "forwarding must stop once the client disconnects");
     }
 }
