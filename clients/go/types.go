@@ -43,6 +43,11 @@ type Message struct {
 
 	// ToolCalls are tool calls made by the assistant.
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+
+	// ReasoningContent carries an assistant turn's thinking/reasoning text.
+	// Set it when replaying a prior assistant reasoning turn in a multi-turn
+	// conversation; leave it nil otherwise.
+	ReasoningContent *string `json:"reasoning_content,omitempty"`
 }
 
 // Config holds provider-agnostic configuration. Fields are pointers so that

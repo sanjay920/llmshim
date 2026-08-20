@@ -43,7 +43,15 @@ module Llmshim
     # @param opts [Hash] see #build_body (max_tokens, temperature, top_p, top_k,
     #   stop, reasoning_effort, config, provider_config, tools, tool_choice, fallback)
     # @return [Llmshim::ChatResponse]
+    # @raise [ArgumentError] if +stream: true+ is passed — /v1/chat would emit
+    #   SSE, which this method cannot parse. Use #stream for streaming.
     def chat(model:, messages:, **opts)
+      if opts[:stream]
+        raise ArgumentError,
+              "chat() returns a single ChatResponse and cannot stream. " \
+              "Use #stream (or Llmshim.stream) for streaming responses."
+      end
+
       body = build_body(model, messages, opts)
       hash = post_json("/v1/chat", body)
       ChatResponse.from_hash(hash)
