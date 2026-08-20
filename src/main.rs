@@ -26,6 +26,7 @@ const MODELS: &[(&str, &str)] = &[
     ("gemini/gemini-3.6-flash", "Gemini 3.6 Flash"),
     ("gemini/gemini-3.5-flash", "Gemini 3.5 Flash"),
     ("gemini/gemini-3.5-flash-lite", "Gemini 3.5 Flash Lite"),
+    ("gemini/gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite"),
     ("xai/grok-4.6", "Grok 4.6"),
     ("xai/grok-4.5", "Grok 4.5"),
     ("xai/grok-4.3", "Grok 4.3"),

@@ -362,6 +362,15 @@ pub const MODELS: &[ModelInfo] = &[
         capabilities: CAPS_STD,
     },
     ModelInfo {
+        id: "gemini/gemini-3.1-flash-lite",
+        provider: "gemini",
+        name: "gemini-3.1-flash-lite",
+        label: "Gemini 3.1 Flash Lite",
+        context_window_tokens: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        capabilities: CAPS_STD,
+    },
+    ModelInfo {
         id: "xai/grok-4.6",
         provider: "xai",
         name: "grok-4.6",
