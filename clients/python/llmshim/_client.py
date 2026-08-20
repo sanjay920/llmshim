@@ -89,6 +89,7 @@ def configure(
     anthropic: Optional[str] = None,
     gemini: Optional[str] = None,
     xai: Optional[str] = None,
+    openrouter: Optional[str] = None,
 ) -> None:
     """Configure API keys. Writes to ~/.llmshim/config.toml.
 
@@ -98,6 +99,19 @@ def configure(
     Usage:
         import llmshim
         llmshim.configure(anthropic="sk-ant-...", openai="sk-...")
+
+    Self-hosted servers (vLLM, SGLang) are configured via environment
+    variables — NOT config.toml — which the auto-spawned proxy inherits from
+    the Python process. Set them before your first call, e.g.::
+
+        import os
+        os.environ["VLLM_BASE_URL"] = "http://localhost:8000/v1"
+        os.environ["VLLM_API_KEY"] = "..."      # optional
+        os.environ["SGLANG_BASE_URL"] = "http://localhost:30000/v1"
+        os.environ["SGLANG_API_KEY"] = "..."    # optional
+
+    Then address them via the model string, e.g. ``vllm/<served-model>`` or
+    ``sglang/<served-model>``.
     """
     config_dir = Path.home() / ".llmshim"
     config_path = config_dir / "config.toml"
@@ -125,6 +139,8 @@ def configure(
         keys["gemini"] = gemini
     if xai is not None:
         keys["xai"] = xai
+    if openrouter is not None:
+        keys["openrouter"] = openrouter
 
     # Write back
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -152,6 +168,8 @@ def configure(
         os.environ["GEMINI_API_KEY"] = gemini
     if xai:
         os.environ["XAI_API_KEY"] = xai
+    if openrouter:
+        os.environ["OPENROUTER_API_KEY"] = openrouter
 
     # If server is already running, it won't pick up new keys until restart.
     # Force restart on next call.

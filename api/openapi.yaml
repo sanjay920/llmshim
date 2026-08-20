@@ -1,15 +1,18 @@
 openapi: 3.1.0
 info:
   title: llmshim API
-  version: 0.1.26
+  version: 0.3.3
   description: |
     Multi-provider LLM API proxy. Send requests in a single format,
     llmshim translates to the native API of whichever provider you choose.
 
-    Supports OpenAI, Anthropic, Google Gemini, and xAI with automatic
-    provider detection from model names.
+    Supports OpenAI, Anthropic, Google Gemini, xAI, OpenRouter (an
+    OpenAI-compatible aggregator), and self-hosted vLLM / SGLang servers.
+    Provider is detected from the model prefix; OpenRouter/vLLM/SGLang are
+    addressed explicitly (e.g. `openrouter/anthropic/claude-sonnet-4.5`,
+    `vllm/<served-model>`, `sglang/<served-model>`).
   license:
-    name: MIT
+    name: MIT OR Apache-2.0
 
 servers:
   - url: http://localhost:3000
@@ -182,13 +185,26 @@ components:
           type: object
           additionalProperties: true
           description: |
-            Raw provider-specific JSON merged into the underlying request.
-            Use this for features like Anthropic thinking, Gemini safety settings, etc.
+            Raw provider-specific JSON merged into the underlying request at the
+            top level. Native/provider-only controls must be namespaced under
+            `x-openai` / `x-anthropic` / `x-gemini` (native passthrough) or
+            `x-openrouter` / `x-vllm` / `x-sglang` (aggregator / self-hosted
+            controls). Also carries `tools`, `response_format`, and
+            `reasoning_summary`.
           examples:
-            - thinking:
-                type: adaptive
-              output_config:
-                effort: high
+            - x-anthropic:
+                thinking:
+                  type: enabled
+                  budget_tokens: 4000
+            - x-openrouter:
+                provider:
+                  sort: throughput
+            - tools:
+                - type: function
+                  function:
+                    name: get_weather
+                    parameters:
+                      type: object
         fallback:
           type: array
           items:
