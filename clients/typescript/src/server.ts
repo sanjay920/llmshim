@@ -183,7 +183,8 @@ export function ensureServer(): Promise<string> {
       if (stderr.includes("No API keys found")) {
         throw new Error(
           "No API keys configured. Set them via environment variables " +
-            "(OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, XAI_API_KEY) " +
+            "(OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, XAI_API_KEY, " +
+            "OPENROUTER_API_KEY, or VLLM_BASE_URL / SGLANG_BASE_URL for self-hosted) " +
             "or `llmshim configure`.",
         );
       }

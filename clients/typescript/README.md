@@ -44,7 +44,149 @@ console.log(await client.models());
 console.log(await client.health());
 ```
 
-## Configuration
+## Providers
+
+Pick a provider by prefixing the model with `provider/`. Auto-detection also
+works for well-known names, but the explicit form is unambiguous. Each provider
+reads its own credentials from the environment (or `llmshim configure`):
+
+| Provider   | Model string                                       | Env vars                                          |
+| ---------- | -------------------------------------------------- | ------------------------------------------------- |
+| OpenAI     | `openai/gpt-5.6-sol`                               | `OPENAI_API_KEY`                                  |
+| Anthropic  | `anthropic/claude-sonnet-5`                        | `ANTHROPIC_API_KEY`                               |
+| Gemini     | `gemini/gemini-3.5-flash`                          | `GEMINI_API_KEY`                                  |
+| xAI        | `xai/grok-4.5`                                     | `XAI_API_KEY`                                     |
+| OpenRouter | `openrouter/anthropic/claude-sonnet-4.5`          | `OPENROUTER_API_KEY`                              |
+| vLLM       | `vllm/<served-model>`                              | `VLLM_BASE_URL` (+ optional `VLLM_API_KEY`)       |
+| SGLang     | `sglang/<served-model>`                            | `SGLANG_BASE_URL` (+ optional `SGLANG_API_KEY`)   |
+
+`vllm`/`sglang` target any self-hosted (local or remote) OpenAI-compatible
+server — point the base URL at it and reference the served model name.
+
+## Request configuration
+
+Every request accepts three optional knobs alongside `model` and `messages`:
+
+### `config` — provider-agnostic settings
+
+llmshim maps these to each provider's native dialect (clamping where a model
+doesn't support a value):
+
+```ts
+const res = await client.chat({
+  model: "openai/gpt-5.6-sol",
+  messages: [{ role: "user", content: "Explain quicksort." }],
+  config: {
+    reasoning_effort: "high", // none | low | medium | high | xhigh | max
+    reasoning_mode: "standard", // standard | pro
+    max_tokens: 1024,
+    temperature: 0.7,
+    top_p: 0.95,
+    top_k: 40,
+    stop: ["\n\n"],
+  },
+});
+```
+
+### `fallback` — try other models on retryable errors
+
+An ordered list tried in turn on retryable upstream failures (429/5xx):
+
+```ts
+await client.chat({
+  model: "anthropic/claude-sonnet-5",
+  messages: [{ role: "user", content: "Hi" }],
+  fallback: ["openai/gpt-5.6-sol", "gemini/gemini-3.5-flash"],
+});
+```
+
+### `provider_config` — raw, provider-native passthrough
+
+Merged into the underlying request at its **root**. Native controls must be
+**namespaced** by provider (`x-anthropic`, `x-openai`, `x-gemini`,
+`x-openrouter`, `x-vllm`, `x-sglang`); `tools`, `response_format`, and
+`reasoning_summary` sit at the top level. Use it for anything `config` doesn't
+cover:
+
+```ts
+await client.chat({
+  model: "anthropic/claude-sonnet-5",
+  messages: [{ role: "user", content: "Think hard about this." }],
+  provider_config: {
+    "x-anthropic": { thinking: { type: "enabled", budget_tokens: 4000 } },
+  },
+});
+
+// OpenRouter routing preferences, for example:
+await client.chat({
+  model: "openrouter/anthropic/claude-sonnet-4.5",
+  messages: [{ role: "user", content: "Hi" }],
+  provider_config: {
+    "x-openrouter": { provider: { sort: "throughput" } }, // also: models, transforms
+  },
+});
+```
+
+## Tools
+
+Send tool definitions through `provider_config.tools` (OpenAI Chat Completions
+format — llmshim translates to each provider's native shape). Read tool calls
+from `message.tool_calls` on a non-streaming response, or from `tool_call`
+events while streaming:
+
+```ts
+const tools = [
+  {
+    type: "function",
+    function: {
+      name: "get_weather",
+      description: "Get the current weather for a city.",
+      parameters: {
+        type: "object",
+        properties: { city: { type: "string" } },
+        required: ["city"],
+      },
+    },
+  },
+];
+
+// Non-streaming
+const res = await client.chat({
+  model: "openai/gpt-5.6-sol",
+  messages: [{ role: "user", content: "What's the weather in Paris?" }],
+  provider_config: { tools },
+});
+for (const call of res.message.tool_calls ?? []) {
+  console.log(call.function?.name, call.function?.arguments); // "get_weather", '{"city":"Paris"}'
+}
+
+// Streaming
+for await (const ev of client.stream({
+  model: "openai/gpt-5.6-sol",
+  messages: [{ role: "user", content: "What's the weather in Paris?" }],
+  provider_config: { tools },
+})) {
+  if (ev.type === "tool_call") console.log(ev.name, ev.arguments);
+}
+```
+
+## Reasoning
+
+Request reasoning with `config.reasoning_effort` / `config.reasoning_mode`
+(above). On a non-streaming response the model's reasoning text is on
+`res.reasoning`; while streaming it arrives as `reasoning` events. To replay a
+model's reasoning back on a later turn, set `reasoning_content` on the assistant
+message you send:
+
+```ts
+messages.push({
+  role: "assistant",
+  content: res.message.content,
+  reasoning_content: res.reasoning ?? undefined,
+});
+```
+
+## Client options
 
 ```ts
 new Client({

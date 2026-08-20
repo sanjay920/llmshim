@@ -35,6 +35,11 @@ export interface Message {
   tool_call_id?: string;
   /** Tool calls made by the assistant. */
   tool_calls?: ToolCall[];
+  /**
+   * Reasoning/thinking text produced by the assistant on a previous turn.
+   * Set it to replay a model's own reasoning back into the conversation.
+   */
+  reasoning_content?: string;
 }
 
 /** Provider-agnostic configuration. */
@@ -49,7 +54,7 @@ export interface Config {
   /**
    * Unified reasoning/thinking depth across all providers. llmshim maps each
    * value to the target provider/model's native control, clamping to the
-   * nearest supported tier (see docs/reasoning.md).
+   * nearest supported tier (see docs/src/guides/reasoning.md).
    */
   reasoning_effort?: ReasoningEffort;
   /** Unified reasoning mode; see {@link ReasoningMode}. Default "standard". */
@@ -77,17 +82,21 @@ export interface ChatRequest {
 
 /** Token usage reported by the provider. */
 export interface Usage {
-  input_tokens?: number;
-  output_tokens?: number;
-  /** Reasoning/thinking tokens used (if applicable). */
+  input_tokens: number;
+  output_tokens: number;
+  /** Reasoning/thinking tokens used (omitted when zero). */
   reasoning_tokens?: number;
-  total_tokens?: number;
+  total_tokens: number;
 }
 
 /** The assistant message inside a ChatResponse. */
 export interface ResponseMessage {
   role: string;
-  content: string | null;
+  /**
+   * Assistant content — a string for plain text, or an array of content
+   * blocks for vision / structured tool output (an arbitrary JSON value).
+   */
+  content: unknown;
   tool_calls?: ToolCall[];
 }
 
@@ -121,19 +130,20 @@ export interface ReasoningEvent {
 /** A tool call emitted during streaming. */
 export interface ToolCallEvent {
   type: "tool_call";
-  id?: string;
-  name?: string;
+  id: string;
+  name: string;
   /** JSON-encoded arguments. */
-  arguments?: string;
+  arguments: string;
 }
 
 /** Final token usage, emitted near the end of a stream. */
 export interface UsageEvent {
   type: "usage";
-  input_tokens?: number;
-  output_tokens?: number;
+  input_tokens: number;
+  output_tokens: number;
+  /** Reasoning/thinking tokens used (omitted when zero). */
   reasoning_tokens?: number;
-  total_tokens?: number;
+  total_tokens: number;
 }
 
 /** Terminal event signalling the stream is complete. */

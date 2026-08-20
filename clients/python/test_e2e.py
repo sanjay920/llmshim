@@ -75,7 +75,7 @@ def _():
 
 @test("Chat: Gemini")
 def _():
-    resp = llmshim.chat("gemini/gemini-3-flash-preview", "Say pong.", max_tokens=200)
+    resp = llmshim.chat("gemini/gemini-3.5-flash", "Say pong.", max_tokens=200)
     assert_true(resp["provider"] == "gemini", f"provider: {resp['provider']}")
 
 
@@ -100,7 +100,7 @@ def _():
     resp = llmshim.chat(
         "claude-sonnet-4-6", "What is 5+3?",
         max_tokens=4000,
-        provider_config={"thinking": {"type": "enabled", "budget_tokens": 2000}},
+        provider_config={"x-anthropic": {"thinking": {"type": "enabled", "budget_tokens": 2000}}},
     )
     assert_true(resp.get("reasoning") is not None, "has reasoning")
     assert_true("8" in str(resp["message"]["content"]), f"answer: {resp['message']['content']}")

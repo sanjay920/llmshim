@@ -19,10 +19,29 @@ llmshim.configure(
     openai="sk-...",
     gemini="AIza...",
     xai="xai-...",
+    openrouter="sk-or-...",
 )
 ```
 
 Or from the CLI: `llmshim configure`
+
+### Self-hosted servers (vLLM / SGLang)
+
+vLLM and SGLang are configured via **environment variables** (not
+`config.toml`) — the auto-spawned proxy inherits them from your Python
+process. Set them before your first call:
+
+```python
+import os
+
+os.environ["VLLM_BASE_URL"] = "http://localhost:8000/v1"
+os.environ["VLLM_API_KEY"] = "..."       # optional
+os.environ["SGLANG_BASE_URL"] = "http://localhost:30000/v1"
+os.environ["SGLANG_API_KEY"] = "..."     # optional
+```
+
+Then address them via the model string — `vllm/<served-model>` or
+`sglang/<served-model>` (see the model table below).
 
 ## Chat
 
@@ -88,15 +107,61 @@ print(f"GPT: {r2['message']['content']}")
 
 ## Reasoning / Thinking
 
+Two provider-agnostic knobs control reasoning; both are clamped to the
+nearest tier the target model supports:
+
+- `reasoning_effort` — `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`
+- `reasoning_mode` — `"standard"` (default) or `"pro"` (requests substantially
+  more model work; native on OpenAI gpt-5.6/-pro, emulated as an effort bump
+  elsewhere)
+
 ```python
 resp = llmshim.chat(
-    "claude-sonnet-4-6",
+    "claude-sonnet-5",
     "Solve: x^2 - 5x + 6 = 0",
     max_tokens=4000,
     reasoning_effort="high",
+    reasoning_mode="pro",
 )
 print(resp["reasoning"])        # thinking content
 print(resp["message"]["content"])  # answer
+```
+
+For full native control, bypass the unified mapping with a namespaced
+`provider_config` (see below), e.g.
+`provider_config={"x-anthropic": {"thinking": {"type": "enabled", "budget_tokens": 4000}}}`.
+
+## Provider-Specific Controls (`provider_config`)
+
+`provider_config` merges into the request **root** and carries anything the
+unified `config` doesn't cover. Native provider controls MUST be **namespaced**
+per provider (`x-anthropic`, `x-openai`, `x-gemini`, `x-openrouter`, `x-vllm`,
+`x-sglang`); it also carries the top-level `tools`, `response_format`, and
+`reasoning_summary` keys.
+
+```python
+resp = llmshim.chat(
+    "anthropic/claude-sonnet-5",
+    "Solve this step by step: 17 * 23",
+    max_tokens=4000,
+    provider_config={
+        # native Anthropic extended-thinking control
+        "x-anthropic": {"thinking": {"type": "enabled", "budget_tokens": 4000}},
+        # structured output
+        "response_format": {"type": "json_object"},
+    },
+)
+```
+
+OpenRouter routing preferences use the `x-openrouter` namespace:
+
+```python
+resp = llmshim.chat(
+    "openrouter/anthropic/claude-sonnet-4.5",
+    "Hello",
+    max_tokens=200,
+    provider_config={"x-openrouter": {"provider": {"sort": "throughput"}}},
+)
 ```
 
 ## Tool Use / Function Calling
@@ -129,7 +194,7 @@ resp = llmshim.chat(
     "anthropic/claude-sonnet-4-6",
     "Hello",
     max_tokens=100,
-    fallback=["openai/gpt-5.5", "gemini/gemini-3-flash-preview"],
+    fallback=["openai/gpt-5.6-sol", "gemini/gemini-3.5-flash"],
 )
 ```
 
@@ -202,9 +267,20 @@ billed provider calls; run it only when you deliberately want to hit real APIs.
 
 | Provider | Models |
 |----------|--------|
-| OpenAI | `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano` |
+| OpenAI | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano` |
 | Anthropic | `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` |
 | Gemini | `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` |
 | xAI | `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning` |
 
 Call `llmshim.models()` for the live list filtered to your configured providers.
+
+### OpenRouter & self-hosted (vLLM / SGLang)
+
+These providers are addressed by the model string plus environment variables —
+any model the upstream serves is reachable, so they aren't in the table above.
+
+| Provider | Address as | Env vars | Native controls |
+|----------|-----------|----------|-----------------|
+| OpenRouter | `openrouter/<vendor>/<model>` (e.g. `openrouter/anthropic/claude-sonnet-4.5`) | `OPENROUTER_API_KEY` (or `llmshim.configure(openrouter=...)`) | `provider_config={"x-openrouter": {...}}` (`provider`, `models`, `transforms`) |
+| vLLM | `vllm/<served-model>` | `VLLM_BASE_URL` (+ optional `VLLM_API_KEY`) | `provider_config={"x-vllm": {...}}` |
+| SGLang | `sglang/<served-model>` | `SGLANG_BASE_URL` (+ optional `SGLANG_API_KEY`) | `provider_config={"x-sglang": {...}}` |

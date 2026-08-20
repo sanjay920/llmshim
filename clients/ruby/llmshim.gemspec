@@ -12,8 +12,8 @@ Gem::Specification.new do |spec|
   spec.description = <<~DESC
     A thin, dependency-free HTTP client for a running llmshim proxy. Send
     OpenAI-style chat requests and let llmshim translate to OpenAI, Anthropic,
-    Google Gemini, or xAI. Supports non-streaming and SSE streaming, model
-    listing, and health checks. Standard library only.
+    Google Gemini, xAI, OpenRouter, vLLM, or SGLang. Supports non-streaming and
+    SSE streaming, model listing, and health checks. Standard library only.
   DESC
   spec.homepage = "https://github.com/sanjay920/llmshim"
   spec.license = "MIT"
