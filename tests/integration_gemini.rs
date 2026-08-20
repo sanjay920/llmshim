@@ -436,3 +436,43 @@ async fn all_three_providers_same_shape() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore]
+async fn gemini_3_7_flash_completion() {
+    if std::env::var("GEMINI_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+    let req = json!({
+        "model": "gemini/gemini-3.7-flash",
+        "messages": [{"role": "user", "content": "In one short sentence, what is Rust?"}],
+        "max_tokens": 2000,
+    });
+    let resp = llmshim::completion(&router, &req).await.unwrap();
+    let content = resp["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    assert!(!content.is_empty(), "expected a response, got: {resp}");
+    println!("gemini-3.7-flash said: {content}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn gemini_3_7_flash_none_clamps_to_low() {
+    // gemini-3.7-flash 400s on thinkingLevel "minimal"; llmshim must clamp
+    // reasoning_effort "none" to "low". Asserts success, not a 400.
+    if std::env::var("GEMINI_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+    let req = json!({
+        "model": "gemini/gemini-3.7-flash",
+        "messages": [{"role": "user", "content": "Say hi."}],
+        "max_tokens": 2000,
+        "reasoning_effort": "none",
+    });
+    let resp = llmshim::completion(&router, &req)
+        .await
+        .expect("none must clamp to low for gemini-3.7-flash, not 400");
+    assert_eq!(resp["object"], "chat.completion");
+    println!("gemini-3.7-flash none->low clamp OK");
+}
