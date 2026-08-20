@@ -1529,3 +1529,31 @@ fn request_strips_foreign_reasoning_signature() {
     assert!(!body.contains("redacted-should-not-leak"));
     assert!(!body.contains("reasoning_signature"));
 }
+
+#[test]
+fn reasoning_none_clamps_per_model_disable_capability() {
+    // gemini-3.7-flash rejects thinkingLevel "minimal" (verified live) -> "none"
+    // clamps to "low". Other flash models accept "minimal" -> "none" stays "minimal".
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let r = p.transform_request("gemini-3.7-flash", &req).unwrap();
+    assert_eq!(
+        r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low",
+        "gemini-3.7-flash cannot disable thinking -> none clamps to low"
+    );
+    for m in [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+    ] {
+        let r = p.transform_request(m, &req).unwrap();
+        assert_eq!(
+            r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "minimal",
+            "{m} can disable thinking -> none maps to minimal"
+        );
+    }
+}
