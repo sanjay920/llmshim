@@ -660,6 +660,44 @@ async fn cmd_proxy() {
     axum::serve(listener, app).await.unwrap();
 }
 
+#[cfg(feature = "gateway")]
+async fn cmd_gateway() {
+    use std::net::SocketAddr;
+
+    let router = llmshim::router::Router::from_env();
+    let providers = router.provider_keys();
+    if providers.is_empty() {
+        eprintln!("No API keys found. Run: llmshim configure");
+        std::process::exit(1);
+    }
+
+    let logger = std::env::var("LLMSHIM_LOG")
+        .ok()
+        .and_then(|path| llmshim::log::Logger::to_file(&path).ok());
+
+    let config = llmshim::config::load();
+    let host = std::env::var("LLMSHIM_HOST").unwrap_or(config.proxy.host);
+    let port: u16 = std::env::var("LLMSHIM_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(config.proxy.port);
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .expect("Invalid address");
+
+    eprintln!("llmshim gateway starting on http://{}", addr);
+    eprintln!("  Providers: {:?}", providers);
+    eprintln!(
+        "  Priority-queue scheduler · x-llmshim-priority header (higher = sooner, default 0)"
+    );
+    eprintln!("  POST /v1/chat · GET /v1/models · GET /health  (streaming not yet queued)");
+
+    let state = llmshim::gateway::http::GatewayState::from_env(router, logger);
+    let app = llmshim::gateway::http::app(state);
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
 // ============================================================
 // Main entrypoint — subcommand dispatch
 // ============================================================
@@ -672,6 +710,7 @@ fn print_global_usage() {
     eprintln!();
     eprintln!("Server:");
     eprintln!("  proxy                 Start HTTP proxy server");
+    eprintln!("  gateway               Start priority-queue gateway (experimental)");
     eprintln!("  docker start          Start proxy in Docker");
     eprintln!("  docker stop           Stop Docker proxy");
     eprintln!("  docker status|logs    Container status and logs");
@@ -932,6 +971,19 @@ async fn main() {
             #[cfg(not(feature = "proxy"))]
             {
                 eprintln!("Proxy not available. Rebuild with: cargo build --features proxy");
+                std::process::exit(1);
+            }
+        }
+        "gateway" => {
+            llmshim::env::load_all();
+            #[cfg(feature = "gateway")]
+            {
+                cmd_gateway().await;
+                return;
+            }
+            #[cfg(not(feature = "gateway"))]
+            {
+                eprintln!("Gateway not available. Rebuild with: cargo build --features gateway");
                 std::process::exit(1);
             }
         }

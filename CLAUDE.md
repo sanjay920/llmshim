@@ -147,6 +147,16 @@ Env config (all optional, safe defaults; when no RPM/TPM limits are set the limi
 
 Topologies: **sidecar / zero-infra** (default in-memory limiter — set limits to `global / N` when running N replicas) vs. **Redis-coordinated fleet** (one shared global limit across all replicas).
 
+### Experimental: priority-queue gateway (`src/gateway/`, feature `gateway`)
+
+An experimental scheduler that inverts the proxy's admission model: instead of *rejecting* when a provider's token bucket is empty, it **enqueues** each request into a per-provider priority queue and dispatches when capacity frees — ordered by **priority tier** (paying customer > free) then **FIFO** within a tier. Built for a fleet doing thousands of req/s that can't fire every call the instant it arrives. `gateway = ["proxy"]` (reuses the `RateLimiter` token buckets, `Backpressure`, and the proxy's request/response converters — `convert`/`error` are `pub(crate)` for this).
+
+- **`Scheduler`** (`src/gateway/mod.rs`) owns one lane (queue + dispatcher task) per provider, so a rate-limited OpenAI queue never blocks a ready Anthropic one. `submit()` enqueues + awaits a oneshot; a client disconnect / `max_wait` timeout cancels the queued job so it never burns a token.
+- **Dispatcher** is event/timer-driven: pops the highest-priority job, acquires a concurrency slot *then* a rate token (so a saturated semaphore never wastes a token), and on a rate-limit miss **requeues** (preserving priority) and sleeps for exactly the `RetryAfter` the limiter reports — waking early on new work. No busy-wait, no `RateLimiter` changes. `max_wait` bounds **queue residence only** (a `started` signal releases it at dispatch), never the upstream call.
+- **`RequestQueue`** trait is the pluggable backend — `InMemoryQueue` (BinaryHeap + `Notify`) is the zero-infra default; SQS / RabbitMQ / NATS slot in behind it for a distributed fleet.
+- **HTTP** (`src/gateway/http.rs`): serves the proxy's `POST /v1/chat` contract routed through the scheduler; tier from the **`x-llmshim-priority`** header (uint, default 0). `RealDispatch` calls `completion_with_logger`, mapping an upstream 429 → bucket penalty. Run: `llmshim gateway` (needs `--features gateway`). Env: `LLMSHIM_GATEWAY_MAX_WAIT_MS`, `LLMSHIM_GATEWAY_QUEUE_DEPTH`, `LLMSHIM_GATEWAY_MAX_CONCURRENCY`, plus all the proxy rate-limit vars.
+- **Deferred:** streaming-through-queue (rejected with 400 for now — use `proxy`), tier fairness/aging (high-tier flood can starve low tiers), distributed queue backends.
+
 ## Client libraries (`clients/`)
 
 Thin clients that speak the proxy's HTTP API. They are faithful to the OpenAPI contract in `api/openapi.yaml` — when you change the proxy's request/response shapes, update that spec and keep the clients in sync. All publish in lockstep with the crate version on every release.
