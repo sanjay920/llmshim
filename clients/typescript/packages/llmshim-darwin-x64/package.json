@@ -1,6 +1,6 @@
 {
   "name": "llmshim-darwin-x64",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "llmshim proxy binary (macOS x64). Installed automatically as an optional dependency of the `llmshim` package — you should not need to depend on this directly.",
   "os": [
     "darwin"

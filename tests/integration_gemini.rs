@@ -450,7 +450,9 @@ async fn gemini_3_7_flash_completion() {
         "max_tokens": 2000,
     });
     let resp = llmshim::completion(&router, &req).await.unwrap();
-    let content = resp["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    let content = resp["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
     assert!(!content.is_empty(), "expected a response, got: {resp}");
     println!("gemini-3.7-flash said: {content}");
 }
