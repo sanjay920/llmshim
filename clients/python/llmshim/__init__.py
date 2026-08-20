@@ -14,6 +14,8 @@ Spec-faithful TypedDicts live in ``llmshim.types`` (also re-exported here) for
 static type-checking of requests, responses, and stream events.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from llmshim import types
 from llmshim._client import LlmShimError, chat, configure, health, models, stream
 from llmshim.types import (
@@ -55,4 +57,7 @@ __all__ = [
     "ToolCall",
     "Usage",
 ]
-__version__ = "0.1.22"
+try:
+    __version__ = version("llmshim")
+except PackageNotFoundError:  # not installed (e.g. running from source tree)
+    __version__ = "0.0.0"

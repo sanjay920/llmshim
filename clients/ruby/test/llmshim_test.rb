@@ -78,8 +78,8 @@ class LlmshimClientTest < Minitest::Test
       reasoning_effort: "high",
       tools: [{ type: "function", function: { name: "f" } }],
       tool_choice: "auto",
-      provider_config: { thinking: { type: "adaptive" } },
-      fallback: ["gemini/gemini-3-flash-preview"]
+      provider_config: { "x-anthropic" => { thinking: { type: "enabled", budget_tokens: 4000 } } },
+      fallback: ["gemini/gemini-3.5-flash"]
     )
 
     assert_equal "gpt-5.5", captured["model"]
@@ -88,8 +88,9 @@ class LlmshimClientTest < Minitest::Test
     assert_in_delta 0.7, captured.dig("config", "temperature")
     assert_equal "high", captured.dig("config", "reasoning_effort")
     assert_equal "auto", captured.dig("provider_config", "tool_choice")
-    assert_equal "adaptive", captured.dig("provider_config", "thinking", "type")
-    assert_equal ["gemini/gemini-3-flash-preview"], captured["fallback"]
+    assert_equal "enabled", captured.dig("provider_config", "x-anthropic", "thinking", "type")
+    assert_equal 4000, captured.dig("provider_config", "x-anthropic", "thinking", "budget_tokens")
+    assert_equal ["gemini/gemini-3.5-flash"], captured["fallback"]
   end
 
   def test_chat_string_message_becomes_user_role
@@ -107,6 +108,14 @@ class LlmshimClientTest < Minitest::Test
 
     client.chat(model: "m", messages: "just a string")
     assert_equal [{ "role" => "user", "content" => "just a string" }], captured["messages"]
+  end
+
+  def test_chat_with_stream_true_raises_argument_error
+    client = Llmshim::Client.new(base_url: "http://localhost:0", timeout: 5)
+    err = assert_raises(ArgumentError) do
+      client.chat(model: "m", messages: "hi", stream: true)
+    end
+    assert_match(/#stream/, err.message)
   end
 
   # --- POST /v1/chat/stream ------------------------------------------------
