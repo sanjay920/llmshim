@@ -97,6 +97,8 @@ enum Backend {
 pub struct GatewayState {
     router: Arc<Router>,
     backend: Backend,
+    keystore: crate::gateway::auth::KeyStore,
+    quota: crate::gateway::quota::TenantQuota,
     /// `Retry-After` suggested when a job's queue wait times out.
     overloaded_retry_after: Duration,
 }
@@ -116,6 +118,8 @@ impl GatewayState {
         Arc::new(Self {
             router,
             backend: Backend::Local(scheduler),
+            keystore: crate::gateway::auth::KeyStore::from_env(),
+            quota: crate::gateway::quota::TenantQuota::new(),
             overloaded_retry_after: config.overloaded_retry_after,
         })
     }
@@ -153,6 +157,8 @@ impl GatewayState {
         Ok(Arc::new(Self {
             router,
             backend: Backend::Distributed(gateway),
+            keystore: crate::gateway::auth::KeyStore::from_env(),
+            quota: crate::gateway::quota::TenantQuota::new(),
             overloaded_retry_after: config.overloaded_retry_after,
         }))
     }
@@ -175,34 +181,84 @@ impl GatewayState {
             Backend::Distributed(gateway) => gateway.submit_stream(req).await,
         }
     }
+
+    /// Refresh the queue-depth gauges just before a metrics scrape.
+    async fn update_queue_depth_gauges(&self) {
+        use crate::gateway::metrics;
+        let depths = match &self.backend {
+            Backend::Local(scheduler) => scheduler.lane_depths(),
+            #[cfg(feature = "redis-coordination")]
+            Backend::Distributed(gateway) => {
+                let providers: Vec<String> = self
+                    .router
+                    .provider_keys()
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                gateway.queue_depths(&providers).await
+            }
+        };
+        for (provider, depth) in depths {
+            metrics::gauge_set(
+                metrics::QUEUE_DEPTH,
+                &[("provider", &provider)],
+                depth as i64,
+            );
+        }
+    }
+
+    /// Enforce the caller's per-tenant quota (no-op in open/dev mode). Over
+    /// quota → 429 + `Retry-After`.
+    fn enforce_quota(
+        &self,
+        identity: &crate::gateway::auth::Identity,
+        provider: &str,
+        permits: u32,
+    ) -> Result<(), ApiError> {
+        if let Err(retry) = self.quota.check(
+            &identity.tenant,
+            provider,
+            identity.rpm,
+            identity.tpm,
+            permits,
+        ) {
+            crate::gateway::metrics::incr(
+                crate::gateway::metrics::REJECTED,
+                &[("provider", provider), ("reason", "tenant_quota")],
+            );
+            return Err(ApiError::RateLimited(retry));
+        }
+        Ok(())
+    }
 }
 
-/// Parse the `x-llmshim-priority` header into a tier (default `0`).
-fn priority_of(headers: &HeaderMap) -> u8 {
-    headers
-        .get("x-llmshim-priority")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u8>().ok())
-        .unwrap_or(0)
-}
-
-/// Resolve the provider (validates the model) and build the queued request.
+/// Authenticate, resolve the provider (validates the model), and build the
+/// queued request. Returns the caller's [`Identity`] so the handler can apply
+/// per-tenant quotas. Tier comes from the identity (the key in enforced mode,
+/// the header in open mode) — never a client header when auth is enforced.
 fn build_request(
     state: &GatewayState,
     headers: &HeaderMap,
     req: &ChatRequest,
-) -> Result<(String, GatewayRequest), ApiError> {
+) -> Result<(String, GatewayRequest, crate::gateway::auth::Identity), ApiError> {
+    let identity = state.keystore.identify(headers).map_err(|_| {
+        crate::gateway::metrics::incr(
+            crate::gateway::metrics::REJECTED,
+            &[("provider", "unknown"), ("reason", "unauthorized")],
+        );
+        ApiError::Unauthorized
+    })?;
     let provider_name = {
         let (provider, _model) = state.router.resolve(&req.model)?;
         provider.name().to_string()
     };
     let gw = GatewayRequest {
         provider: provider_name.clone(),
-        tier: priority_of(headers),
+        tier: identity.tier,
         permits: estimate_request_tokens(req),
         payload: request_to_value(req),
     };
-    Ok((provider_name, gw))
+    Ok((provider_name, gw, identity))
 }
 
 /// Map a non-success gateway outcome to an HTTP error response.
@@ -232,7 +288,8 @@ async fn chat(
         return Ok(chat_stream_inner(state, headers, req).await);
     }
 
-    let (provider_name, gw) = build_request(&state, &headers, &req)?;
+    let (provider_name, gw, identity) = build_request(&state, &headers, &req)?;
+    state.enforce_quota(&identity, &provider_name, gw.permits)?;
     let timer = RequestTimer::start();
     match state.submit(gw).await {
         Ok(resp) => {
@@ -257,10 +314,13 @@ async fn chat_stream_inner(
     headers: HeaderMap,
     req: ChatRequest,
 ) -> Response {
-    let gw = match build_request(&state, &headers, &req) {
-        Ok((_, gw)) => gw,
+    let (provider_name, gw, identity) = match build_request(&state, &headers, &req) {
+        Ok(t) => t,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = state.enforce_quota(&identity, &provider_name, gw.permits) {
+        return e.into_response();
+    }
 
     // Admission (queue + rate) happens up front so a rejection is a proper
     // 429/503 before the SSE response begins, not an SSE error event.
@@ -324,6 +384,20 @@ async fn list_models(State(state): State<Arc<GatewayState>>) -> Json<ModelsRespo
     Json(ModelsResponse { models: entries })
 }
 
+/// GET /metrics — Prometheus text exposition of gateway metrics.
+async fn metrics(State(state): State<Arc<GatewayState>>) -> Response {
+    state.update_queue_depth_gauges().await;
+    let body = crate::gateway::metrics::render();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
 /// GET /health — health check with the configured provider list.
 async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> {
     Json(HealthResponse {
@@ -343,6 +417,7 @@ pub fn app(state: Arc<GatewayState>) -> axum::Router {
         .route("/v1/chat", post(chat))
         .route("/v1/chat/stream", post(chat_stream))
         .route("/v1/models", get(list_models))
+        .route("/metrics", get(metrics))
         .route("/health", get(health))
         .layer(CorsLayer::permissive())
         .with_state(state)

@@ -194,6 +194,17 @@ impl DistributedGateway {
         }))
     }
 
+    /// Waiting-queue depth per provider (for metrics / introspection).
+    pub async fn queue_depths(&self, providers: &[String]) -> Vec<(String, usize)> {
+        let mut conn = self.conn.clone();
+        let mut out = Vec::with_capacity(providers.len());
+        for p in providers {
+            let n: u64 = conn.zcard(queue_key(p)).await.unwrap_or(0);
+            out.push((p.clone(), n as usize));
+        }
+        out
+    }
+
     fn next_id(&self) -> String {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         format!("{:x}-{:x}", self.nonce, n)
