@@ -18,14 +18,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use futures::StreamExt;
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::cors::CorsLayer;
 
 use tokio::sync::mpsc;
@@ -99,6 +101,8 @@ pub struct GatewayState {
     backend: Backend,
     keystore: crate::gateway::auth::KeyStore,
     quota: crate::gateway::quota::TenantQuota,
+    idempotency: crate::gateway::idempotency::IdempotencyCache,
+    idempotency_ttl_secs: u64,
     /// `Retry-After` suggested when a job's queue wait times out.
     overloaded_retry_after: Duration,
 }
@@ -120,6 +124,10 @@ impl GatewayState {
             backend: Backend::Local(scheduler),
             keystore: crate::gateway::auth::KeyStore::from_env(),
             quota: crate::gateway::quota::TenantQuota::new(),
+            idempotency: crate::gateway::idempotency::IdempotencyCache::new(
+                std::time::Duration::from_secs(idem_ttl_secs()),
+            ),
+            idempotency_ttl_secs: idem_ttl_secs(),
             overloaded_retry_after: config.overloaded_retry_after,
         })
     }
@@ -159,6 +167,10 @@ impl GatewayState {
             backend: Backend::Distributed(gateway),
             keystore: crate::gateway::auth::KeyStore::from_env(),
             quota: crate::gateway::quota::TenantQuota::new(),
+            idempotency: crate::gateway::idempotency::IdempotencyCache::new(
+                std::time::Duration::from_secs(idem_ttl_secs()),
+            ),
+            idempotency_ttl_secs: idem_ttl_secs(),
             overloaded_retry_after: config.overloaded_retry_after,
         }))
     }
@@ -207,6 +219,70 @@ impl GatewayState {
         }
     }
 
+    /// Cached response for an `Idempotency-Key`, if any.
+    async fn idem_lookup(&self, key: &str) -> Option<Value> {
+        match &self.backend {
+            Backend::Local(_) => self.idempotency.get(key),
+            #[cfg(feature = "redis-coordination")]
+            Backend::Distributed(gateway) => gateway.idem_get(key).await,
+        }
+    }
+
+    /// Cache a completed response under an `Idempotency-Key`.
+    async fn idem_store(&self, key: &str, value: &Value) {
+        match &self.backend {
+            Backend::Local(_) => self.idempotency.put(key, value.clone()),
+            #[cfg(feature = "redis-coordination")]
+            Backend::Distributed(gateway) => {
+                gateway
+                    .idem_put(key, value, self.idempotency_ttl_secs)
+                    .await
+            }
+        }
+    }
+
+    /// Readiness: in-memory mode is always ready; distributed mode requires
+    /// Redis to answer a PING.
+    async fn ready(&self) -> bool {
+        match &self.backend {
+            Backend::Local(_) => true,
+            #[cfg(feature = "redis-coordination")]
+            Backend::Distributed(gateway) => gateway.ping().await,
+        }
+    }
+
+    /// Introspection snapshot for the admin stats endpoint.
+    async fn stats(&self) -> Value {
+        let providers: Vec<String> = self
+            .router
+            .provider_keys()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let (mode, depths) = match &self.backend {
+            Backend::Local(scheduler) => ("in-memory", scheduler.lane_depths()),
+            #[cfg(feature = "redis-coordination")]
+            Backend::Distributed(gateway) => {
+                ("distributed", gateway.queue_depths(&providers).await)
+            }
+        };
+        let mut lanes = Vec::new();
+        for (provider, depth) in depths {
+            let mut lane = json!({ "provider": provider, "queue_depth": depth });
+            #[cfg(feature = "redis-coordination")]
+            if let Backend::Distributed(gateway) = &self.backend {
+                lane["dead_letter"] = json!(gateway.dead_letter_len(&provider).await);
+            }
+            lanes.push(lane);
+        }
+        json!({
+            "mode": mode,
+            "auth_enforced": self.keystore.is_enforced(),
+            "providers": providers,
+            "lanes": lanes,
+        })
+    }
+
     /// Enforce the caller's per-tenant quota (no-op in open/dev mode). Over
     /// quota → 429 + `Retry-After`.
     fn enforce_quota(
@@ -230,6 +306,14 @@ impl GatewayState {
         }
         Ok(())
     }
+}
+
+/// Idempotency cache TTL (seconds) from the environment (default 300).
+fn idem_ttl_secs() -> u64 {
+    std::env::var("LLMSHIM_GATEWAY_IDEMPOTENCY_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
 }
 
 /// Authenticate, resolve the provider (validates the model), and build the
@@ -288,11 +372,30 @@ async fn chat(
         return Ok(chat_stream_inner(state, headers, req).await);
     }
 
+    let idem_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let (provider_name, gw, identity) = build_request(&state, &headers, &req)?;
     state.enforce_quota(&identity, &provider_name, gw.permits)?;
+
+    // Retry-safety: a repeated Idempotency-Key returns the first result.
+    if let Some(key) = &idem_key {
+        if let Some(cached) = state.idem_lookup(key).await {
+            return Ok((
+                [("idempotency-replayed", "true")],
+                Json(value_to_response(&cached, &provider_name, 0)),
+            )
+                .into_response());
+        }
+    }
+
     let timer = RequestTimer::start();
     match state.submit(gw).await {
         Ok(resp) => {
+            if let Some(key) = &idem_key {
+                state.idem_store(key, &resp).await;
+            }
             let elapsed = timer.elapsed().as_millis() as u64;
             Ok(Json(value_to_response(&resp, &provider_name, elapsed)).into_response())
         }
@@ -398,6 +501,45 @@ async fn metrics(State(state): State<Arc<GatewayState>>) -> Response {
         .into_response()
 }
 
+/// GET /ready — readiness probe (503 when a dependency, e.g. Redis, is down).
+async fn ready(State(state): State<Arc<GatewayState>>) -> Response {
+    if state.ready().await {
+        (StatusCode::OK, "ready\n").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
+    }
+}
+
+/// GET /v1/gateway/stats — queue depths, mode, dead-letter counts.
+async fn stats(State(state): State<Arc<GatewayState>>) -> Json<Value> {
+    Json(state.stats().await)
+}
+
+/// Ensure every request/response carries an `x-request-id` for correlation
+/// (honoring an incoming one, else minting a monotonic id).
+async fn request_id(mut req: Request, next: Next) -> Response {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "gw-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            )
+        });
+    if let Ok(hv) = HeaderValue::from_str(&id) {
+        req.headers_mut().insert("x-request-id", hv.clone());
+        let mut resp = next.run(req).await;
+        resp.headers_mut().insert("x-request-id", hv);
+        return resp;
+    }
+    next.run(req).await
+}
+
 /// GET /health — health check with the configured provider list.
 async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> {
     Json(HealthResponse {
@@ -417,8 +559,11 @@ pub fn app(state: Arc<GatewayState>) -> axum::Router {
         .route("/v1/chat", post(chat))
         .route("/v1/chat/stream", post(chat_stream))
         .route("/v1/models", get(list_models))
+        .route("/v1/gateway/stats", get(stats))
         .route("/metrics", get(metrics))
         .route("/health", get(health))
+        .route("/ready", get(ready))
+        .layer(axum::middleware::from_fn(request_id))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

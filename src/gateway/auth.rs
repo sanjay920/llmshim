@@ -79,6 +79,11 @@ impl KeyStore {
         KeyStore::Enforced(keys)
     }
 
+    /// Whether Bearer auth is required.
+    pub fn is_enforced(&self) -> bool {
+        matches!(self, KeyStore::Enforced(_))
+    }
+
     /// Resolve the caller's identity. Open mode reads the tier from the client
     /// header; enforced mode requires a valid Bearer key and takes tier + tenant
     /// from it (header ignored, so callers can't self-escalate).

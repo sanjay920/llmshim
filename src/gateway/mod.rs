@@ -39,6 +39,7 @@
 
 pub mod auth;
 pub mod http;
+pub mod idempotency;
 pub mod metrics;
 pub mod quota;
 
@@ -380,6 +381,10 @@ pub struct GatewayConfig {
     /// refresh the lease as they run, so set this above your slowest *unary*
     /// call, not your longest stream.
     pub lease_timeout: Duration,
+    /// Distributed mode only: max delivery attempts before a job is sent to the
+    /// dead-letter queue instead of being redelivered (stops a "poison" request
+    /// that keeps crashing workers from looping forever).
+    pub max_attempts: u32,
 }
 
 impl Default for GatewayConfig {
@@ -393,6 +398,7 @@ impl Default for GatewayConfig {
             max_boost: 16,
             request_timeout: Duration::from_secs(120),
             lease_timeout: Duration::from_secs(60),
+            max_attempts: 5,
         }
     }
 }
@@ -440,6 +446,10 @@ impl GatewayConfig {
                 .and_then(|v| v.parse().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(d.lease_timeout),
+            max_attempts: std::env::var("LLMSHIM_GATEWAY_MAX_ATTEMPTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.max_attempts),
         }
     }
 }
