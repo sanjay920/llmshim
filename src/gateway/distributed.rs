@@ -132,6 +132,20 @@ struct JobDescriptor {
     payload: Value,
     #[serde(default)]
     stream: bool,
+    /// Enqueue time (epoch ms) — drives the deadline score and the queue-wait
+    /// metric.
+    #[serde(default)]
+    enqueue_ms: u64,
+}
+
+fn done_key(id: &str) -> String {
+    format!("llmshim:gw:done:{id}")
+}
+fn attempts_key(id: &str) -> String {
+    format!("llmshim:gw:attempts:{id}")
+}
+fn dlq_key(provider: &str) -> String {
+    format!("llmshim:gw:dlq:{provider}")
 }
 
 /// A message on a request's response channel.
@@ -194,6 +208,36 @@ impl DistributedGateway {
         }))
     }
 
+    /// Client-idempotency lookup: cached response for an `Idempotency-Key`.
+    pub async fn idem_get(&self, key: &str) -> Option<Value> {
+        let mut conn = self.conn.clone();
+        let raw: Option<String> = conn
+            .get(format!("llmshim:gw:idem:{key}"))
+            .await
+            .unwrap_or(None);
+        raw.and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    /// Cache a completed response under an `Idempotency-Key`.
+    pub async fn idem_put(&self, key: &str, value: &Value, ttl_secs: u64) {
+        if let Ok(s) = serde_json::to_string(value) {
+            let mut conn = self.conn.clone();
+            let _: Result<(), _> = conn
+                .set_ex(format!("llmshim:gw:idem:{key}"), s, ttl_secs)
+                .await;
+        }
+    }
+
+    /// Liveness check: `PING` Redis (readiness gate for the fleet).
+    pub async fn ping(&self) -> bool {
+        let mut conn = self.conn.clone();
+        redis::cmd("PING")
+            .query_async::<String>(&mut conn)
+            .await
+            .map(|r| r == "PONG")
+            .unwrap_or(false)
+    }
+
     /// Waiting-queue depth per provider (for metrics / introspection).
     pub async fn queue_depths(&self, providers: &[String]) -> Vec<(String, usize)> {
         let mut conn = self.conn.clone();
@@ -224,7 +268,7 @@ impl DistributedGateway {
         if depth as usize >= self.config.max_queue_depth {
             return Err(GatewayError::Overloaded(self.config.overloaded_retry_after));
         }
-        let score = deadline_score(desc.tier, now_ms(), self.aging_step_ms());
+        let score = deadline_score(desc.tier, desc.enqueue_ms, self.aging_step_ms());
         let _: () = conn
             .zadd(&key, &member, score)
             .await
@@ -350,7 +394,45 @@ impl DistributedGateway {
             permits: req.permits.max(1),
             payload: req.payload.clone(),
             stream,
+            enqueue_ms: now_ms(),
         }
+    }
+
+    /// TTL for the done / attempts markers — a few lease windows, long enough to
+    /// outlast redelivery but short enough not to leak keys.
+    fn marker_ttl_secs(&self) -> u64 {
+        (self.config.lease_timeout.as_secs() * 3).max(60)
+    }
+
+    async fn is_done(&self, id: &str) -> bool {
+        let mut conn = self.conn.clone();
+        conn.exists(done_key(id)).await.unwrap_or(false)
+    }
+
+    async fn mark_done(&self, id: &str) {
+        let mut conn = self.conn.clone();
+        let _: Result<(), _> = conn.set_ex(done_key(id), 1, self.marker_ttl_secs()).await;
+    }
+
+    /// Increment and return this job's delivery-attempt count.
+    async fn bump_attempts(&self, id: &str) -> u32 {
+        let mut conn = self.conn.clone();
+        let key = attempts_key(id);
+        let n: u64 = conn.incr(&key, 1).await.unwrap_or(1);
+        let _: Result<bool, _> = conn.expire(&key, self.marker_ttl_secs() as i64).await;
+        n as u32
+    }
+
+    async fn dead_letter(&self, provider: &str, member: &str) {
+        let mut conn = self.conn.clone();
+        let _: Result<i64, _> = conn.lpush(dlq_key(provider), member).await;
+    }
+
+    /// Number of dead-lettered jobs for a provider (introspection).
+    pub async fn dead_letter_len(&self, provider: &str) -> usize {
+        let mut conn = self.conn.clone();
+        let n: u64 = conn.llen(dlq_key(provider)).await.unwrap_or(0);
+        n as usize
     }
 
     async fn remove_from_queue(&self, desc: &JobDescriptor) {
@@ -416,6 +498,28 @@ impl DistributedGateway {
                 }
             };
 
+            // Idempotency: a job that already completed (then got redelivered by
+            // the reaper) is skipped.
+            if self.is_done(&desc.id).await {
+                self.ack_lease(&provider, &member).await;
+                continue;
+            }
+            // Poison-job guard: dead-letter after too many delivery attempts.
+            let attempts = self.bump_attempts(&desc.id).await;
+            if attempts > self.config.max_attempts {
+                eprintln!(
+                    "gateway worker[{provider}]: dead-lettering job {} after {attempts} attempts",
+                    desc.id
+                );
+                self.dead_letter(&provider, &member).await;
+                self.ack_lease(&provider, &member).await;
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::REJECTED,
+                    &[("provider", &provider), ("reason", "dead_letter")],
+                );
+                continue;
+            }
+
             match self.limiter.acquire(&rate_key, desc.permits).await {
                 Ok(()) => {
                     let permit = match sem.clone().acquire_owned().await {
@@ -445,14 +549,25 @@ impl DistributedGateway {
         }
     }
 
-    /// Dispatch a leased job, publish result(s) to its channel, then ack.
+    /// Dispatch a leased job, publish result(s) to its channel, then mark it done
+    /// (idempotency) and ack the lease.
     async fn run_and_publish(&self, desc: JobDescriptor, member: String) {
+        use crate::gateway::metrics;
         let channel = response_channel(&desc.id);
         let provider = desc.provider.clone();
+        let plabels: &[(&str, &str)] = &[("provider", &provider)];
+        let _inflight = metrics::inflight(&provider);
+        metrics::observe_ms(
+            metrics::QUEUE_WAIT,
+            plabels,
+            now_ms().saturating_sub(desc.enqueue_ms) as f64,
+        );
+        let started_at = now_ms();
 
         if desc.stream {
             match self.dispatch.dispatch_stream(&provider, desc.payload).await {
                 Ok(mut upstream) => {
+                    metrics::incr(metrics::DISPATCHED, plabels);
                     use futures::StreamExt;
                     let refresh_every = (self.config.lease_timeout / 3).max(Duration::from_secs(1));
                     let mut next_refresh = now_ms() + refresh_every.as_millis() as u64;
@@ -473,8 +588,17 @@ impl DistributedGateway {
                         }
                     }
                     self.publish(&channel, &BusMessage::End).await;
+                    metrics::observe_ms(
+                        metrics::UPSTREAM_LATENCY,
+                        plabels,
+                        now_ms().saturating_sub(started_at) as f64,
+                    );
                 }
                 Err(err) => {
+                    metrics::incr(
+                        metrics::REJECTED,
+                        &[("provider", &provider), ("reason", "upstream")],
+                    );
                     self.penalize_if_429(&provider, &err).await;
                     self.publish(&channel, &BusMessage::Error(err.message))
                         .await;
@@ -482,8 +606,20 @@ impl DistributedGateway {
             }
         } else {
             let msg = match self.dispatch.dispatch(&provider, desc.payload).await {
-                Ok(value) => BusMessage::Unary(value),
+                Ok(value) => {
+                    metrics::incr(metrics::DISPATCHED, plabels);
+                    metrics::observe_ms(
+                        metrics::UPSTREAM_LATENCY,
+                        plabels,
+                        now_ms().saturating_sub(started_at) as f64,
+                    );
+                    BusMessage::Unary(value)
+                }
                 Err(err) => {
+                    metrics::incr(
+                        metrics::REJECTED,
+                        &[("provider", &provider), ("reason", "upstream")],
+                    );
                     self.penalize_if_429(&provider, &err).await;
                     BusMessage::Error(err.message)
                 }
@@ -491,6 +627,9 @@ impl DistributedGateway {
             self.publish(&channel, &msg).await;
         }
 
+        // Idempotency marker so a late redelivery of this (now-complete) job is
+        // skipped, then release the lease.
+        self.mark_done(&desc.id).await;
         self.ack_lease(&provider, &member).await;
     }
 
@@ -624,6 +763,7 @@ mod tests {
             permits: 42,
             payload: serde_json::json!({"model": "gpt-5.5"}),
             stream: true,
+            enqueue_ms: 1_700_000_000_000,
         };
         let back: JobDescriptor =
             serde_json::from_str(&serde_json::to_string(&desc).unwrap()).unwrap();
@@ -762,6 +902,33 @@ mod tests {
         assert_eq!(plen, 0);
         let score: f64 = conn.zscore(queue_key(provider), member).await.unwrap();
         assert_eq!(score, orig_score);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_dedup_and_dead_letter_markers() {
+        let provider = "itest-dedup";
+        let Some(gw) = test_gateway(provider).await else {
+            return;
+        };
+        let mut conn = gw.conn.clone();
+        for k in [done_key("job-x"), attempts_key("job-y"), dlq_key(provider)] {
+            let _: Result<i64, _> = conn.del(k).await;
+        }
+
+        // Idempotency marker.
+        assert!(!gw.is_done("job-x").await);
+        gw.mark_done("job-x").await;
+        assert!(gw.is_done("job-x").await);
+
+        // Attempt counter increments per delivery.
+        assert_eq!(gw.bump_attempts("job-y").await, 1);
+        assert_eq!(gw.bump_attempts("job-y").await, 2);
+
+        // Dead-letter queue.
+        assert_eq!(gw.dead_letter_len(provider).await, 0);
+        gw.dead_letter(provider, "poison-member").await;
+        assert_eq!(gw.dead_letter_len(provider).await, 1);
     }
 
     #[tokio::test]
