@@ -172,11 +172,7 @@ impl GatewayState {
         match &self.backend {
             Backend::Local(scheduler) => scheduler.submit_stream(req).await,
             #[cfg(feature = "redis-coordination")]
-            Backend::Distributed(_) => Err(GatewayError::Upstream(
-                "streaming is not supported in distributed mode; use a single-instance \
-                 gateway for streaming, or POST /v1/chat (non-streaming)"
-                    .to_string(),
-            )),
+            Backend::Distributed(gateway) => gateway.submit_stream(req).await,
         }
     }
 }

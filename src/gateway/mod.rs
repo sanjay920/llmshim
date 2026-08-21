@@ -32,10 +32,10 @@
 //! low tier eventually overtakes a high-tier flood — see [`InMemoryQueue`]),
 //! **streaming-through-the-queue** ([`Scheduler::submit_stream`]), and a
 //! **Redis-backed distributed** queue + response bus for a fleet (see the
-//! `distributed` module, feature `gateway-redis`). Priority tier is
-//! caller-supplied. Still deferred: an at-least-once lease (a worker crash
-//! mid-dispatch drops that one distributed request), distributed streaming, and
-//! aging in distributed mode.
+//! `distributed` module, feature `gateway-redis`) — with an at-least-once lease
+//! and reaper, distributed streaming, and aging (all three modes). Priority tier
+//! is caller-supplied. Remaining follow-up: an actual AWS deployment; a
+//! redelivered distributed request may run twice (at-least-once semantics).
 
 pub mod http;
 
@@ -372,6 +372,11 @@ pub struct GatewayConfig {
     /// response over the bus (queue + upstream call) before giving up. The
     /// in-memory path uses `max_wait` for queue residence instead.
     pub request_timeout: Duration,
+    /// Distributed mode only: how long a worker may hold a leased job before the
+    /// reaper assumes it crashed and redelivers the job (at-least-once). Streams
+    /// refresh the lease as they run, so set this above your slowest *unary*
+    /// call, not your longest stream.
+    pub lease_timeout: Duration,
 }
 
 impl Default for GatewayConfig {
@@ -384,6 +389,7 @@ impl Default for GatewayConfig {
             aging_step: Duration::from_secs(5),
             max_boost: 16,
             request_timeout: Duration::from_secs(120),
+            lease_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -426,6 +432,11 @@ impl GatewayConfig {
                 .and_then(|v| v.parse().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(d.request_timeout),
+            lease_timeout: std::env::var("LLMSHIM_GATEWAY_LEASE_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(d.lease_timeout),
         }
     }
 }
