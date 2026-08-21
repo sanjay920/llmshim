@@ -657,7 +657,36 @@ async fn cmd_proxy() {
 
     let app = llmshim::proxy::app(router, logger);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+/// Resolve on the first SIGTERM (deploys / autoscaler) or Ctrl-C, so the server
+/// stops accepting connections and drains in-flight requests before exiting.
+#[cfg(feature = "proxy")]
+async fn shutdown_signal() {
+    use tokio::signal;
+    let ctrl_c = async {
+        let _ = signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    eprintln!("shutdown signal received; draining in-flight requests...");
 }
 
 #[cfg(feature = "gateway")]
@@ -697,7 +726,10 @@ async fn cmd_gateway() {
     let state = build_gateway_state(router, logger).await;
     let app = llmshim::gateway::http::app(state);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
 }
 
 #[cfg(all(feature = "gateway", feature = "redis-coordination"))]

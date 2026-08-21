@@ -70,3 +70,8 @@ path = "benchmarks/bench.rs"
 name = "loadtest"
 path = "benchmarks/loadtest.rs"
 required-features = ["proxy"]
+
+[[example]]
+name = "gateway_loadtest"
+path = "benchmarks/gateway_loadtest.rs"
+required-features = ["gateway"]

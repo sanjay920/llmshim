@@ -37,7 +37,10 @@
 //! is caller-supplied. Remaining follow-up: an actual AWS deployment; a
 //! redelivered distributed request may run twice (at-least-once semantics).
 
+pub mod auth;
 pub mod http;
+pub mod metrics;
+pub mod quota;
 
 #[cfg(feature = "redis-coordination")]
 pub mod distributed;
@@ -476,7 +479,9 @@ impl Scheduler {
     /// Enqueue a request and await its result. The queueing is internal: the
     /// caller sees a normal response, an `Overloaded` shed, or a `Timeout`.
     pub async fn submit(self: &Arc<Self>, req: GatewayRequest) -> Result<Value, GatewayError> {
-        let queue = self.lane_for(&req.provider);
+        let provider = req.provider.clone();
+        let tier = req.tier;
+        let queue = self.lane_for(&provider);
         let seqno = self.seq.fetch_add(1, AtomicOrdering::Relaxed);
         let (tx, rx) = oneshot::channel();
         let (started_tx, started_rx) = oneshot::channel();
@@ -493,15 +498,27 @@ impl Scheduler {
         };
 
         if queue.enqueue(job).is_err() {
+            metrics::incr(
+                metrics::REJECTED,
+                &[("provider", &provider), ("reason", "overloaded")],
+            );
             return Err(GatewayError::Overloaded(self.config.overloaded_retry_after));
         }
+        metrics::incr(
+            metrics::REQUESTS,
+            &[
+                ("provider", &provider),
+                ("tier", &tier.to_string()),
+                ("mode", "unary"),
+            ],
+        );
 
         // `max_wait` bounds only how long the job may sit *in the queue*. Once
         // the dispatcher commits (fires `started`), we wait for the full result
         // with no deadline — a slow-but-valid upstream call must not time out.
         // On a queue-wait timeout `rx` drops → `tx.is_closed()` flips → the
         // dispatcher skips the job without spending a token.
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             started = started_rx => match started {
                 // Committed (or the dispatcher dropped it): await the outcome.
@@ -511,7 +528,14 @@ impl Scheduler {
                 },
             },
             _ = tokio::time::sleep(self.config.max_wait) => Err(GatewayError::Timeout),
+        };
+        if matches!(result, Err(GatewayError::Timeout)) {
+            metrics::incr(
+                metrics::REJECTED,
+                &[("provider", &provider), ("reason", "timeout")],
+            );
         }
+        result
     }
 
     /// Like [`submit`](Self::submit) but for a streaming request: enqueues by
@@ -521,7 +545,9 @@ impl Scheduler {
         self: &Arc<Self>,
         req: GatewayRequest,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
-        let queue = self.lane_for(&req.provider);
+        let provider = req.provider.clone();
+        let tier = req.tier;
+        let queue = self.lane_for(&provider);
         let seqno = self.seq.fetch_add(1, AtomicOrdering::Relaxed);
         let (result_tx, result_rx) = oneshot::channel();
         let (started_tx, started_rx) = oneshot::channel();
@@ -538,10 +564,22 @@ impl Scheduler {
         };
 
         if queue.enqueue(job).is_err() {
+            metrics::incr(
+                metrics::REJECTED,
+                &[("provider", &provider), ("reason", "overloaded")],
+            );
             return Err(GatewayError::Overloaded(self.config.overloaded_retry_after));
         }
+        metrics::incr(
+            metrics::REQUESTS,
+            &[
+                ("provider", &provider),
+                ("tier", &tier.to_string()),
+                ("mode", "stream"),
+            ],
+        );
 
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             started = started_rx => match started {
                 Ok(()) | Err(_) => match result_rx.await {
@@ -550,7 +588,24 @@ impl Scheduler {
                 },
             },
             _ = tokio::time::sleep(self.config.max_wait) => Err(GatewayError::Timeout),
+        };
+        if matches!(result, Err(GatewayError::Timeout)) {
+            metrics::incr(
+                metrics::REJECTED,
+                &[("provider", &provider), ("reason", "timeout")],
+            );
         }
+        result
+    }
+
+    /// Snapshot of `(provider, queued depth)` across all active lanes.
+    pub fn lane_depths(&self) -> Vec<(String, usize)> {
+        self.lanes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, lane)| (p.clone(), lane.queue.depth()))
+            .collect()
     }
 
     /// Current queued depth for a provider (0 if the lane doesn't exist yet).
@@ -645,6 +700,12 @@ async fn dispatcher_loop(
                 if job.is_cancelled() {
                     continue; // gave up during the token wait
                 }
+                // Time spent waiting in the queue before this dispatch.
+                metrics::observe_ms(
+                    metrics::QUEUE_WAIT,
+                    &[("provider", &provider)],
+                    job.enqueued_at.elapsed().as_millis() as f64,
+                );
                 let Job {
                     payload,
                     delivery,
@@ -660,12 +721,25 @@ async fn dispatcher_loop(
                     // Held for the whole call (incl. a stream's full lifetime),
                     // so per-provider concurrency frees only when it finishes.
                     let _permit = permit;
+                    let _inflight = metrics::inflight(&provider);
+                    let started_at = Instant::now();
+                    let plabels: &[(&str, &str)] = &[("provider", &provider)];
                     match delivery {
                         Delivery::Unary(tx) => match dispatch.dispatch(&provider, payload).await {
                             Ok(value) => {
+                                metrics::incr(metrics::DISPATCHED, plabels);
+                                metrics::observe_ms(
+                                    metrics::UPSTREAM_LATENCY,
+                                    plabels,
+                                    started_at.elapsed().as_millis() as f64,
+                                );
                                 let _ = tx.send(Ok(value));
                             }
                             Err(err) => {
+                                metrics::incr(
+                                    metrics::REJECTED,
+                                    &[("provider", &provider), ("reason", "upstream")],
+                                );
                                 penalize_if_429(&limiter, &provider, &err).await;
                                 let _ = tx.send(Err(GatewayError::Upstream(err.message)));
                             }
@@ -673,6 +747,7 @@ async fn dispatcher_loop(
                         Delivery::Stream(tx) => {
                             match dispatch.dispatch_stream(&provider, payload).await {
                                 Ok(mut upstream) => {
+                                    metrics::incr(metrics::DISPATCHED, plabels);
                                     let (chunk_tx, chunk_rx) = mpsc::channel(16);
                                     // Hand the receiver to the caller; if it's
                                     // already gone, abandon the stream.
@@ -687,8 +762,17 @@ async fn dispatcher_loop(
                                             break;
                                         }
                                     }
+                                    metrics::observe_ms(
+                                        metrics::UPSTREAM_LATENCY,
+                                        plabels,
+                                        started_at.elapsed().as_millis() as f64,
+                                    );
                                 }
                                 Err(err) => {
+                                    metrics::incr(
+                                        metrics::REJECTED,
+                                        &[("provider", &provider), ("reason", "upstream")],
+                                    );
                                     penalize_if_429(&limiter, &provider, &err).await;
                                     let _ = tx.send(Err(GatewayError::Upstream(err.message)));
                                 }
