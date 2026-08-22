@@ -102,6 +102,7 @@ pub struct GatewayState {
     keystore: crate::gateway::auth::KeyStore,
     quota: crate::gateway::quota::TenantQuota,
     idempotency: crate::gateway::idempotency::IdempotencyCache,
+    #[cfg_attr(not(feature = "redis-coordination"), allow(dead_code))]
     idempotency_ttl_secs: u64,
     /// `Retry-After` suggested when a job's queue wait times out.
     overloaded_retry_after: Duration,
@@ -268,6 +269,7 @@ impl GatewayState {
         };
         let mut lanes = Vec::new();
         for (provider, depth) in depths {
+            #[cfg_attr(not(feature = "redis-coordination"), allow(unused_mut))]
             let mut lane = json!({ "provider": provider, "queue_depth": depth });
             #[cfg(feature = "redis-coordination")]
             if let Backend::Distributed(gateway) = &self.backend {
