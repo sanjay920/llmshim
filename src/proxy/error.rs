@@ -12,6 +12,9 @@ pub enum ApiError {
     RateLimited(Duration),
     /// Instance concurrency queue timed out → HTTP 503 + `Retry-After`.
     Overloaded(Duration),
+    /// Missing or invalid API key → HTTP 401. Constructed by the gateway.
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    Unauthorized,
 }
 
 impl From<crate::error::ShimError> for ApiError {
@@ -45,6 +48,15 @@ impl IntoResponse for ApiError {
                     "Proxy is at capacity; retry after the suggested delay",
                     retry_after,
                 );
+            }
+            ApiError::Unauthorized => {
+                let body = ErrorResponse {
+                    error: ErrorDetail {
+                        code: "unauthorized".to_string(),
+                        message: "Missing or invalid API key".to_string(),
+                    },
+                };
+                return (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
             }
             ApiError::Shim(e) => e,
         };

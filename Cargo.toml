@@ -13,6 +13,10 @@ exclude = ["clients/", "api/", ".claude/", "Dockerfile", ".dockerignore"]
 [features]
 default = []
 proxy = ["dep:axum", "dep:tower", "dep:tower-http", "dep:async-stream", "dep:async-trait"]
+# Experimental priority-queue gateway. Reuses the proxy's RateLimiter/Backpressure.
+gateway = ["proxy"]
+# Gateway + Redis-backed distributed queue & response bus (cross-instance fleet).
+gateway-redis = ["gateway", "redis-coordination"]
 # Opt-in distributed rate-limit coordination via Redis. Keeps the default proxy
 # binary lean — redis is only pulled in when this feature is explicitly enabled.
 redis-coordination = ["proxy", "dep:redis"]
@@ -66,3 +70,8 @@ path = "benchmarks/bench.rs"
 name = "loadtest"
 path = "benchmarks/loadtest.rs"
 required-features = ["proxy"]
+
+[[example]]
+name = "gateway_loadtest"
+path = "benchmarks/gateway_loadtest.rs"
+required-features = ["gateway"]
