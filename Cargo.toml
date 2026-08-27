@@ -8,7 +8,7 @@ repository = "https://github.com/sanjay920/llmshim"
 homepage = "https://github.com/sanjay920/llmshim"
 keywords = ["llm", "openai", "anthropic", "gemini", "ai"]
 categories = ["api-bindings", "web-programming"]
-exclude = ["clients/", "api/", ".claude/", "Dockerfile", ".dockerignore"]
+exclude = ["clients/", "api/", ".claude/", "Dockerfile", ".dockerignore", "gateway-test-ui.html"]
 
 [features]
 default = []
