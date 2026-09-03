@@ -22,6 +22,7 @@ const MODELS: &[(&str, &str)] = &[
     ("anthropic/claude-opus-4-6", "Claude Opus 4.6"),
     ("anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6"),
     ("anthropic/claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+    ("gemini/gemini-3.8-flash", "Gemini 3.8 Flash"),
     ("gemini/gemini-3.7-flash", "Gemini 3.7 Flash"),
     ("gemini/gemini-3.6-flash", "Gemini 3.6 Flash"),
     ("gemini/gemini-3.5-flash", "Gemini 3.5 Flash"),
