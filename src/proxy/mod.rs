@@ -1,5 +1,5 @@
-mod convert;
-mod error;
+pub(crate) mod convert;
+pub(crate) mod error;
 mod handlers;
 pub mod ratelimit;
 pub mod types;

@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>llmshim gateway — test console</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f1115; color: #e6e8ec;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 20px; background: #161922; border-bottom: 1px solid #262b36;
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .spacer { flex: 1; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #555; margin-right: 5px; vertical-align: middle; }
+  .dot.ok { background: #3fb950; } .dot.bad { background: #f85149; }
+  .pill { font-size: 12px; color: #9aa4b2; background: #1c2029; border: 1px solid #262b36; border-radius: 999px; padding: 3px 10px; }
+  input, textarea, select, button {
+    font: inherit; color: inherit; background: #10131a; border: 1px solid #2b3340;
+    border-radius: 8px; padding: 8px 10px;
+  }
+  input:focus, textarea:focus, select:focus { outline: 1px solid #3b82f6; border-color: #3b82f6; }
+  button { background: #2563eb; border-color: #2563eb; cursor: pointer; font-weight: 600; }
+  button:hover { background: #1d4ed8; } button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost { background: #1c2029; border-color: #2b3340; color: #cdd3dc; font-weight: 500; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 20px; max-width: 1200px; margin: 0 auto; }
+  @media (max-width: 900px){ main{ grid-template-columns: 1fr; } }
+  .card { background: #161922; border: 1px solid #262b36; border-radius: 12px; padding: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: #9aa4b2; }
+  .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  .row label { color: #9aa4b2; font-size: 12px; min-width: 66px; }
+  textarea { width: 100%; min-height: 66px; resize: vertical; }
+  .grow { flex: 1; } .full { width: 100%; }
+  pre { background: #0b0d12; border: 1px solid #222834; border-radius: 8px; padding: 12px; overflow: auto; max-height: 320px; white-space: pre-wrap; word-break: break-word; margin: 0; }
+  .muted { color: #7b8494; font-size: 12px; }
+  .badge { display: inline-block; border-radius: 6px; padding: 1px 8px; font-size: 12px; font-weight: 700; }
+  .t-hi { background: #16351f; color: #56d364; border: 1px solid #2a5a34; }
+  .t-lo { background: #33261a; color: #e3a008; border: 1px solid #5c4620; }
+  .timeline { display: flex; flex-direction: column; gap: 6px; }
+  .tl-item { display: flex; align-items: center; gap: 10px; padding: 7px 10px; background: #0b0d12; border: 1px solid #222834; border-radius: 8px; }
+  .tl-item .when { font-variant-numeric: tabular-nums; color: #9aa4b2; min-width: 62px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px,1fr)); gap: 8px; }
+  .stat { background: #0b0d12; border: 1px solid #222834; border-radius: 8px; padding: 8px 10px; }
+  .stat .k { font-size: 11px; color: #7b8494; } .stat .v { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  code { background: #0b0d12; border: 1px solid #222834; border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>llmshim gateway</h1>
+  <span class="pill"><span id="dHealth" class="dot"></span>health</span>
+  <span class="pill"><span id="dReady" class="dot"></span>ready</span>
+  <span id="modePill" class="pill">mode …</span>
+  <span class="spacer"></span>
+  <label class="muted">gateway</label>
+  <input id="base" value="http://localhost:3000" style="width:220px" />
+  <input id="apiKey" placeholder="Bearer key (optional)" style="width:180px" />
+</header>
+
+<main>
+  <!-- Single request -->
+  <section class="card">
+    <h2>Single request</h2>
+    <div class="row">
+      <label>model</label>
+      <select id="model" class="grow">
+        <option>anthropic/claude-haiku-4-5-20251001</option>
+        <option>openai/gpt-5.4-nano</option>
+        <option>anthropic/claude-sonnet-4-6</option>
+        <option>gemini/gemini-3.5-flash</option>
+      </select>
+    </div>
+    <div class="row">
+      <label>priority</label>
+      <input id="prio" type="range" min="0" max="9" value="5" class="grow" oninput="prioOut.textContent=this.value" />
+      <b id="prioOut">5</b>
+      <label style="min-width:auto"><input type="checkbox" id="stream" /> stream</label>
+      <label style="min-width:auto">max_tokens</label>
+      <input id="maxtok" type="number" value="64" style="width:70px" />
+    </div>
+    <textarea id="prompt">Give me one fun fact about octopuses.</textarea>
+    <div class="row" style="margin-top:10px">
+      <button onclick="sendSingle()" id="sendBtn">Send</button>
+      <span id="singleMeta" class="muted"></span>
+    </div>
+    <pre id="singleOut" class="muted">response appears here…</pre>
+  </section>
+
+  <!-- Priority race -->
+  <section class="card">
+    <h2>Priority race</h2>
+    <p class="muted" style="margin-top:0">
+      First drains the provider's rate-limit burst, then sends a wave into the
+      now-throttled queue: <code>low-A</code>, <code>low-B</code>, then
+      <span class="badge t-hi">HIGH-C</span> (sent last). As the RPM bucket
+      refills one token at a time, watch <span class="badge t-hi">HIGH-C</span>
+      get dispatched <b>first</b> — the rate limit is the throttle, priority
+      picks the order. (Tuned via <code>LLMSHIM_RATE_LIMIT_RPM</code>.)
+    </p>
+    <div class="row">
+      <button onclick="runRace()" id="raceBtn">Run race</button>
+      <button class="ghost" onclick="raceTl.innerHTML=''">Clear</button>
+      <span id="raceMeta" class="muted"></span>
+    </div>
+    <div id="raceTl" class="timeline"></div>
+  </section>
+
+  <!-- Live stats -->
+  <section class="card" style="grid-column: 1 / -1">
+    <h2>Live stats <span class="muted" style="text-transform:none">(polls /v1/gateway/stats + /metrics every 2s)</span></h2>
+    <div id="stats" class="stats"></div>
+    <details style="margin-top:12px"><summary class="muted">raw /metrics</summary><pre id="rawMetrics" class="muted"></pre></details>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const base = () => $('base').value.replace(/\/$/, '');
+function headers(extra={}) {
+  const h = { 'content-type': 'application/json', ...extra };
+  const k = $('apiKey').value.trim();
+  if (k) h['authorization'] = 'Bearer ' + k;
+  return h;
+}
+function body(prompt, maxtok) {
+  return JSON.stringify({
+    model: $('model').value,
+    messages: [{ role: 'user', content: prompt }],
+    config: { max_tokens: Number(maxtok) || 64 },
+  });
+}
+
+// ---- health / ready -------------------------------------------------------
+async function poll() {
+  try {
+    const h = await fetch(base() + '/health', { cache: 'no-store' });
+    $('dHealth').className = 'dot ' + (h.ok ? 'ok' : 'bad');
+  } catch { $('dHealth').className = 'dot bad'; }
+  try {
+    const r = await fetch(base() + '/ready', { cache: 'no-store' });
+    $('dReady').className = 'dot ' + (r.ok ? 'ok' : 'bad');
+  } catch { $('dReady').className = 'dot bad'; }
+  try {
+    const s = await (await fetch(base() + '/v1/gateway/stats', { cache: 'no-store' })).json();
+    $('modePill').textContent = 'mode: ' + s.mode + (s.auth_enforced ? ' · auth' : ' · open');
+    renderStats(s);
+  } catch {}
+  try {
+    const m = await (await fetch(base() + '/metrics', { cache: 'no-store' })).text();
+    $('rawMetrics').textContent = m || '(no metrics yet)';
+    renderMetrics(m);
+  } catch {}
+}
+function renderStats(s) {
+  const lanes = (s.lanes || []).map(l =>
+    `<div class="stat"><div class="k">queue: ${l.provider}</div><div class="v">${l.queue_depth}</div></div>` +
+    (l.dead_letter !== undefined ? `<div class="stat"><div class="k">dlq: ${l.provider}</div><div class="v">${l.dead_letter}</div></div>` : '')
+  ).join('');
+  $('stats').dataset.lanes = lanes;
+  paintStats();
+}
+let metricVals = {};
+function renderMetrics(text) {
+  metricVals = {};
+  for (const line of text.split('\n')) {
+    if (line.startsWith('#') || !line.trim()) continue;
+    const m = line.match(/^(\w+)(\{[^}]*\})?\s+([\d.]+)$/);
+    if (!m) continue;
+    const name = m[1];
+    metricVals[name] = (metricVals[name] || 0) + parseFloat(m[3]);
+  }
+  paintStats();
+}
+function paintStats() {
+  const g = n => metricVals[n] !== undefined ? Math.round(metricVals[n]) : '–';
+  const cards = [
+    ['requests', g('llmshim_gateway_requests_total')],
+    ['dispatched', g('llmshim_gateway_dispatched_total')],
+    ['rejected', g('llmshim_gateway_rejected_total')],
+    ['in-flight', g('llmshim_gateway_inflight')],
+  ].map(([k,v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  $('stats').innerHTML = cards + ($('stats').dataset.lanes || '');
+}
+setInterval(poll, 2000); poll();
+
+// ---- single request (unary or streaming) ----------------------------------
+async function sendSingle() {
+  const btn = $('sendBtn'); btn.disabled = true;
+  const out = $('singleOut'); out.className = ''; out.textContent = '';
+  const meta = $('singleMeta'); meta.textContent = 'sending…';
+  const t0 = performance.now();
+  const hdrs = headers({ 'x-llmshim-priority': $('prio').value });
+  try {
+    if ($('stream').checked) {
+      const resp = await fetch(base() + '/v1/chat/stream', { method: 'POST', headers: hdrs, body: body($('prompt').value, $('maxtok').value) });
+      if (!resp.ok) { out.textContent = 'HTTP ' + resp.status + '\n' + await resp.text(); return; }
+      const reader = resp.body.getReader(); const dec = new TextDecoder();
+      let buf = '', text = '';
+      while (true) {
+        const { value, done } = await reader.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const events = buf.split('\n\n'); buf = events.pop();
+        for (const ev of events) {
+          const dl = ev.split('\n').find(l => l.startsWith('data:'));
+          if (!dl) continue;
+          try {
+            const d = JSON.parse(dl.slice(5).trim());
+            if (d.type === 'content') { text += d.text; out.textContent = text; }
+            if (d.type === 'error') { text += '\n[error] ' + d.message; out.textContent = text; }
+          } catch {}
+        }
+      }
+      meta.textContent = `streamed · ${((performance.now()-t0)/1000).toFixed(2)}s · x-request-id: ${resp.headers.get('x-request-id')||'—'}`;
+    } else {
+      const resp = await fetch(base() + '/v1/chat', { method: 'POST', headers: hdrs, body: body($('prompt').value, $('maxtok').value) });
+      const txt = await resp.text();
+      let shown = txt; let content = null;
+      try { const j = JSON.parse(txt); content = j.message?.content; shown = JSON.stringify(j, null, 2); } catch {}
+      out.textContent = content ? content + '\n\n— — —\n' + shown : shown;
+      const replayed = resp.headers.get('idempotency-replayed');
+      meta.textContent = `HTTP ${resp.status} · ${((performance.now()-t0)/1000).toFixed(2)}s${replayed ? ' · REPLAYED' : ''} · x-request-id: ${resp.headers.get('x-request-id')||'—'}`;
+    }
+  } catch (e) { out.textContent = 'fetch failed: ' + e + '\n(is the gateway running? check the URL above)'; }
+  finally { btn.disabled = false; }
+}
+
+// ---- priority race --------------------------------------------------------
+async function runRace() {
+  const btn = $('raceBtn'); btn.disabled = true;
+  const tl = $('raceTl'); tl.innerHTML = '';
+  const fire = tier => fetch(base() + '/v1/chat', {
+    method: 'POST',
+    headers: headers({ 'x-llmshim-priority': String(tier) }),
+    body: body('Reply with only the word: ok', 6),
+  });
+
+  // 1) Drain the rate-limit burst with low-priority traffic so the wave queues.
+  $('raceMeta').textContent = 'draining the rate-limit burst…';
+  await Promise.all(Array.from({ length: 10 }, () => fire(0).then(r => r.text()).catch(() => {})));
+
+  // 2) Wave: submit low-A, low-B, then HIGH-C (last). All queue behind the
+  //    throttle; the refill dispatches them highest-priority-first.
+  $('raceMeta').textContent = 'burst drained — firing wave (low-A, low-B, HIGH-C)…';
+  const t0 = performance.now();
+  const wave = [
+    { tag: 'low-A', tier: 0 }, { tag: 'low-B', tier: 0 }, { tag: 'HIGH-C', tier: 9 },
+  ];
+  await Promise.all(wave.map(async (job, i) => {
+    await new Promise(r => setTimeout(r, i * 250)); // enforce submit order
+    try {
+      const resp = await fire(job.tier); await resp.text();
+      const when = ((performance.now() - t0) / 1000).toFixed(1);
+      const hi = job.tier >= 5;
+      const item = document.createElement('div'); item.className = 'tl-item';
+      item.innerHTML = `<span class="when">t+${when}s</span>
+        <span class="badge ${hi?'t-hi':'t-lo'}">${hi?'HIGH':'low'}</span>
+        <span>dispatched · <code>${job.tag}</code> · tier ${job.tier}</span>`;
+      tl.appendChild(item);
+    } catch (e) {
+      const item = document.createElement('div'); item.className = 'tl-item';
+      item.innerHTML = `<span class="when">—</span><span>${job.tag} failed: ${e}</span>`;
+      tl.appendChild(item);
+    }
+  }));
+  $('raceMeta').textContent = 'done — HIGH-C was submitted last but dispatched first.';
+  btn.disabled = false;
+}
+</script>
+</body>
+</html>
