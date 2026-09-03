@@ -657,7 +657,114 @@ async fn cmd_proxy() {
 
     let app = llmshim::proxy::app(router, logger);
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+/// Resolve on the first SIGTERM (deploys / autoscaler) or Ctrl-C, so the server
+/// stops accepting connections and drains in-flight requests before exiting.
+#[cfg(feature = "proxy")]
+async fn shutdown_signal() {
+    use tokio::signal;
+    let ctrl_c = async {
+        let _ = signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    eprintln!("shutdown signal received; draining in-flight requests...");
+}
+
+#[cfg(feature = "gateway")]
+async fn cmd_gateway() {
+    use std::net::SocketAddr;
+
+    let router = llmshim::router::Router::from_env();
+    let providers = router.provider_keys();
+    if providers.is_empty() {
+        eprintln!("No API keys found. Run: llmshim configure");
+        std::process::exit(1);
+    }
+
+    let logger = std::env::var("LLMSHIM_LOG")
+        .ok()
+        .and_then(|path| llmshim::log::Logger::to_file(&path).ok());
+
+    let config = llmshim::config::load();
+    let host = std::env::var("LLMSHIM_HOST").unwrap_or(config.proxy.host);
+    let port: u16 = std::env::var("LLMSHIM_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(config.proxy.port);
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .expect("Invalid address");
+
+    eprintln!("llmshim gateway starting on http://{}", addr);
+    eprintln!("  Providers: {:?}", providers);
+    eprintln!(
+        "  Priority-queue scheduler · x-llmshim-priority header (higher = sooner, default 0)"
+    );
+    eprintln!("  POST /v1/chat · POST /v1/chat/stream · GET /v1/models · GET /health");
+
+    // Distributed (Redis fleet) mode when a Redis URL is configured and the
+    // binary was built with redis coordination; otherwise single-instance.
+    let state = build_gateway_state(router, logger).await;
+    let app = llmshim::gateway::http::app(state);
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+#[cfg(all(feature = "gateway", feature = "redis-coordination"))]
+async fn build_gateway_state(
+    router: llmshim::router::Router,
+    logger: Option<llmshim::log::Logger>,
+) -> std::sync::Arc<llmshim::gateway::http::GatewayState> {
+    if let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") {
+        eprintln!("  Mode: distributed (shared Redis queue + response bus)");
+        match llmshim::gateway::http::GatewayState::distributed_from_env(router, logger, &url).await
+        {
+            Ok(state) => return state,
+            Err(e) => {
+                eprintln!("  Redis connection failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    eprintln!("  Mode: in-memory (single instance)");
+    llmshim::gateway::http::GatewayState::from_env(router, logger)
+}
+
+#[cfg(all(feature = "gateway", not(feature = "redis-coordination")))]
+async fn build_gateway_state(
+    router: llmshim::router::Router,
+    logger: Option<llmshim::log::Logger>,
+) -> std::sync::Arc<llmshim::gateway::http::GatewayState> {
+    if std::env::var("LLMSHIM_REDIS_URL").is_ok() {
+        eprintln!(
+            "  Note: LLMSHIM_REDIS_URL is set but this binary lacks distributed support; \
+             rebuild with --features gateway-redis. Running in-memory."
+        );
+    }
+    eprintln!("  Mode: in-memory (single instance)");
+    llmshim::gateway::http::GatewayState::from_env(router, logger)
 }
 
 // ============================================================
@@ -672,6 +779,7 @@ fn print_global_usage() {
     eprintln!();
     eprintln!("Server:");
     eprintln!("  proxy                 Start HTTP proxy server");
+    eprintln!("  gateway               Start priority-queue gateway (experimental)");
     eprintln!("  docker start          Start proxy in Docker");
     eprintln!("  docker stop           Stop Docker proxy");
     eprintln!("  docker status|logs    Container status and logs");
@@ -932,6 +1040,19 @@ async fn main() {
             #[cfg(not(feature = "proxy"))]
             {
                 eprintln!("Proxy not available. Rebuild with: cargo build --features proxy");
+                std::process::exit(1);
+            }
+        }
+        "gateway" => {
+            llmshim::env::load_all();
+            #[cfg(feature = "gateway")]
+            {
+                cmd_gateway().await;
+                return;
+            }
+            #[cfg(not(feature = "gateway"))]
+            {
+                eprintln!("Gateway not available. Rebuild with: cargo build --features gateway");
                 std::process::exit(1);
             }
         }

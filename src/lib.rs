@@ -13,6 +13,9 @@ pub mod vision;
 #[cfg(feature = "proxy")]
 pub mod proxy;
 
+#[cfg(feature = "gateway")]
+pub mod gateway;
+
 use client::ShimClient;
 use error::Result;
 pub use fallback::{completion_with_fallback, FallbackConfig};

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: llmshim API
-  version: 0.3.3
+  version: 0.3.4
   description: |
     Multi-provider LLM API proxy. Send requests in a single format,
     llmshim translates to the native API of whichever provider you choose.
@@ -11,6 +11,23 @@ info:
     Provider is detected from the model prefix; OpenRouter/vLLM/SGLang are
     addressed explicitly (e.g. `openrouter/anthropic/claude-sonnet-4.5`,
     `vllm/<served-model>`, `sglang/<served-model>`).
+
+    ## Gateway (experimental)
+
+    `llmshim gateway` serves this same contract (`/v1/chat`, `/v1/chat/stream`,
+    `/v1/models`, `/health`) but routes every request through a priority queue
+    (in-memory or Redis-distributed). It adds request headers and operational
+    endpoints:
+
+    - `Authorization: Bearer <key>` — required when a key file is configured;
+      the caller's tier/tenant come from the key (401 on missing/invalid).
+    - `x-llmshim-priority: <uint>` — priority tier (honored only in open/dev
+      mode; ignored when auth is enforced).
+    - `Idempotency-Key: <string>` — a repeat returns the first response
+      (`idempotency-replayed: true`) instead of making a second call.
+    - `x-request-id` — echoed on every response for correlation.
+    - `GET /metrics` (Prometheus), `GET /ready` (readiness), and
+      `GET /v1/gateway/stats` (queue depths, dead-letter counts).
   license:
     name: MIT OR Apache-2.0
 
