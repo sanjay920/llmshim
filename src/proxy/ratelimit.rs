@@ -633,6 +633,9 @@ impl Backpressure {
     /// Acquire a permit, waiting at most `queue_timeout`. The permit is held for
     /// the upstream call's lifetime and releases a slot when dropped. `Err(())`
     /// means the queue timed out ⇒ shed load with a 503.
+    // The unit error is intentional: the only failure is "timed out / closed",
+    // which the caller maps straight to a 503 — no error detail to carry.
+    #[allow(clippy::result_unit_err)]
     pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, ()> {
         match tokio::time::timeout(self.queue_timeout, self.semaphore.clone().acquire_owned()).await
         {
