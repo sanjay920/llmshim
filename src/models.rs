@@ -326,6 +326,15 @@ pub const MODELS: &[ModelInfo] = &[
         capabilities: CAPS_FULL,
     },
     ModelInfo {
+        id: "gemini/gemini-3.8-flash",
+        provider: "gemini",
+        name: "gemini-3.8-flash",
+        label: "Gemini 3.8 Flash",
+        context_window_tokens: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        capabilities: CAPS_STD,
+    },
+    ModelInfo {
         id: "gemini/gemini-3.7-flash",
         provider: "gemini",
         name: "gemini-3.7-flash",
