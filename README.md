@@ -85,6 +85,14 @@ This applies to both streaming and non-streaming requests.
 
 ## Use it from Rust
 
+Non-streaming OpenAI Responses, xAI Responses, Gemini, and Anthropic results
+require supported terminal metadata. Missing, malformed, or unsupported
+statuses return a `ProviderError` (502) with a fixed diagnostic instead of
+being interpreted as successful completion. Known completion, output-limit,
+filtering and Anthropic tool-call mappings remain available. Additional native
+reasons require an explicit mapping; streaming transforms are unchanged.
+Provider mocks should include the native terminal status/stop reason.
+
 ```bash
 cargo add llmshim tokio serde_json
 ```
