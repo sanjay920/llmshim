@@ -65,6 +65,9 @@ impl ShimClient {
     pub fn new() -> Self {
         Self {
             http: Client::builder()
+                // Prompts and custom provider credentials belong only at the
+                // configured endpoint, never an HTTP Location target.
+                .redirect(reqwest::redirect::Policy::none())
                 .pool_idle_timeout(Duration::from_secs(90))
                 .pool_max_idle_per_host(4)
                 .tcp_keepalive(Duration::from_secs(30))
@@ -669,6 +672,49 @@ mod tests {
     }
 
     // --- Integration (mockito, local only — no provider API calls) ----------
+
+    #[tokio::test]
+    async fn redirects_do_not_forward_prompts_or_credentials() {
+        for status in [301, 302, 303, 307, 308] {
+            for same_origin in [false, true] {
+                let mut origin = mockito::Server::new_async().await;
+                let mut other = mockito::Server::new_async().await;
+                let destination = if same_origin { &mut origin } else { &mut other };
+                let location = format!("{}/moved", destination.url());
+                let forwarded = destination
+                    .mock(if status <= 303 { "GET" } else { "POST" }, "/moved")
+                    .with_status(200)
+                    .with_body("unexpected forwarding")
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let redirect = origin
+                    .mock("POST", "/v1/chat/completions")
+                    .match_header("x-api-key", "test-secret")
+                    .match_body(mockito::Matcher::Json(serde_json::json!({
+                        "messages": [{"role": "user", "content": "private transcript"}]
+                    })))
+                    .with_status(status)
+                    .with_header("location", &location)
+                    .expect(1)
+                    .create_async()
+                    .await;
+                let request = ProviderRequest {
+                    url: format!("{}/v1/chat/completions", origin.url()),
+                    headers: vec![("x-api-key".into(), "test-secret".into())],
+                    body: serde_json::json!({
+                        "messages": [{"role": "user", "content": "private transcript"}]
+                    }),
+                };
+                let result = ShimClient::new().send(&request).await;
+                redirect.assert_async().await;
+                forwarded.assert_async().await;
+                assert!(
+                    matches!(result, Err(ShimError::ProviderError { status: actual, .. }) if actual == status as u16)
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn honors_retry_after_then_succeeds() {

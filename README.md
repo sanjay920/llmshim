@@ -76,6 +76,13 @@ llmshim configure          # interactive prompt
 
 ---
 
+## Endpoint redirects
+
+The shared HTTP client does not follow redirects. Configure the final API URL
+directly: a 3xx response is returned as a provider error instead of forwarding
+the prompt and provider-specific credential headers to another endpoint.
+This applies to both streaming and non-streaming requests.
+
 ## Use it from Rust
 
 ```bash
