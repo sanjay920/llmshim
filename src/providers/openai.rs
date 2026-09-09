@@ -539,14 +539,15 @@ impl Provider for OpenAi {
             message["reasoning_content"] = json!(reasoning);
         }
 
-        let status = response
-            .get("status")
-            .and_then(|s| s.as_str())
-            .unwrap_or("completed");
-        let finish_reason = match status {
-            "completed" => "stop",
-            "incomplete" => "length",
-            _ => "stop",
+        let finish_reason = match response.get("status").and_then(Value::as_str) {
+            Some("completed") => "stop",
+            Some("incomplete") => "length",
+            _ => {
+                return Err(ShimError::ProviderError {
+                    status: 502,
+                    body: "OpenAI response has no supported terminal status".into(),
+                })
+            }
         };
 
         let usage = response.get("usage").cloned().unwrap_or(json!({}));
