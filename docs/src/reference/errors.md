@@ -23,6 +23,18 @@ failure can occur after streaming begins.
 
 ## What the shared client retries
 
+Provider requests do not follow HTTP redirects. A `3xx` response returns a
+`ProviderError` with that status; configure the final endpoint URL directly.
+This keeps prompts and provider authentication headers at the configured
+destination for both completion and streaming requests.
+
+Non-streaming native normalizers require supported terminal metadata. Missing,
+malformed, nonterminal or unrecognized status/finish-reason values produce a
+`ProviderError` with status `502` and a fixed diagnostic, rather than labeling
+partial text as a successful `stop`. The diagnostic excludes response text
+and the provider-supplied reason. Known completion, length, filtering and tool
+mappings remain supported. Streaming transformations are unchanged.
+
 The shared provider client automatically retries:
 
 - transport connect, timeout, request, and body failures;
