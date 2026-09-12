@@ -540,16 +540,17 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
         json!(text_parts.join(""))
     };
 
-    let finish_reason = candidate
-        .get("finishReason")
-        .and_then(|f| f.as_str())
-        .map(|f| match f {
-            "STOP" => "stop",
-            "MAX_TOKENS" => "length",
-            "SAFETY" => "content_filter",
-            _ => "stop",
-        })
-        .unwrap_or("stop");
+    let finish_reason = match candidate.get("finishReason").and_then(Value::as_str) {
+        Some("STOP") => "stop",
+        Some("MAX_TOKENS") => "length",
+        Some("SAFETY") => "content_filter",
+        _ => {
+            return Err(ShimError::ProviderError {
+                status: 502,
+                body: "Gemini response has no supported terminal finish reason".into(),
+            })
+        }
+    };
 
     let usage = resp.get("usageMetadata").cloned().unwrap_or(json!({}));
 
