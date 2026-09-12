@@ -381,7 +381,7 @@ fn translate_tool_choice(tc: &Value) -> Option<Value> {
 
 // -- Response transformation helpers --
 
-fn transform_response_to_openai(model: &str, resp: &Value) -> Value {
+fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
     let content_blocks = resp
         .get("content")
         .and_then(|c| c.as_array())
@@ -438,16 +438,17 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Value {
         json!(text_parts.join(""))
     };
 
-    let stop_reason = resp
-        .get("stop_reason")
-        .and_then(|r| r.as_str())
-        .map(|r| match r {
-            "end_turn" => "stop",
-            "max_tokens" => "length",
-            "tool_use" => "tool_calls",
-            other => other,
-        })
-        .unwrap_or("stop");
+    let stop_reason = match resp.get("stop_reason").and_then(Value::as_str) {
+        Some("end_turn" | "stop_sequence") => "stop",
+        Some("max_tokens") => "length",
+        Some("tool_use") => "tool_calls",
+        _ => {
+            return Err(ShimError::ProviderError {
+                status: 502,
+                body: "Anthropic response has no supported terminal stop reason".into(),
+            })
+        }
+    };
 
     let usage = resp.get("usage").cloned().unwrap_or(json!({}));
     let normalized_usage = normalized_anthropic_usage(&usage);
@@ -472,7 +473,7 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Value {
         message["redacted_reasoning_content"] = json!(data);
     }
 
-    json!({
+    Ok(json!({
         "id": resp.get("id").cloned().unwrap_or(json!("")),
         "object": "chat.completion",
         "model": model,
@@ -482,7 +483,7 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Value {
             "finish_reason": stop_reason,
         }],
         "usage": normalized_usage
-    })
+    }))
 }
 
 /// Normalize a unified reasoning effort (`none|low|medium|high|xhigh|max`,
@@ -770,7 +771,7 @@ impl Provider for Anthropic {
             });
         }
 
-        Ok(transform_response_to_openai(model, &response))
+        transform_response_to_openai(model, &response)
     }
 
     fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {

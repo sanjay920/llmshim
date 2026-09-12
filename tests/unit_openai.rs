@@ -2,6 +2,9 @@ use llmshim::provider::Provider;
 use llmshim::providers::openai::OpenAi;
 use serde_json::{json, Value};
 
+#[path = "support/completion_status.rs"]
+mod completion_status;
+
 fn provider() -> OpenAi {
     OpenAi::new("test-key-123".into())
 }

@@ -58,11 +58,22 @@ llmshim::completion(router, request)
 
 Every provider implements: `transform_request`, `transform_response`, `transform_stream_chunk`.
 
+Non-streaming OpenAI/xAI Responses, Gemini and Anthropic transformations require
+supported terminal metadata. Do not turn absent or unrecognized status into
+`finish_reason: "stop"`. Rejected metadata returns a fixed 502 provider error
+without copying provider-supplied status/content into the diagnostic. Tests
+live in `tests/support/completion_status.rs`, included by `unit_openai`.
+Streaming status handling is separate and is not changed by this policy.
+
 ### Router (`src/router.rs`)
 
 Parses `"provider/model"` strings by splitting on the **first** `/` only, so an OpenRouter slug's internal slash survives (`openrouter/anthropic/claude-sonnet-4.5` → provider `openrouter`, model `anthropic/claude-sonnet-4.5`). Auto-infers provider from prefix (`gpt*`/`o*` → openai, `claude*` → anthropic, `gemini*` → gemini, `grok*` → xai); **OpenRouter, vLLM, and SGLang have no prefix inference** — their slugs collide with everyone's, so address them explicitly (`openrouter/…`, `vllm/…`, `sglang/…`); the first-slash split also preserves HF-style served-model slugs (`vllm/meta-llama/Llama-3.1-8B-Instruct`). Supports aliases. `Router::from_env()` reads API-key env vars, plus `VLLM_BASE_URL` / `SGLANG_BASE_URL` (+ optional `*_API_KEY`) for the self-hosted providers.
 
 ### HTTP Client (`src/client.rs`)
+
+Automatic redirects are disabled on the shared client. Keep prompts and
+provider-specific credential headers at the configured endpoint; 3xx responses
+remain provider errors. Callers must configure the final URL directly.
 
 `ShimClient` with shared connection pool (`LazyLock`), HTTP/2, gzip/brotli/zstd compression, TCP keepalive + nodelay. Automatic retry (3 attempts by default) on transport errors and 429/500/502/503/504/529 status codes. This is the **reactive** layer: on a retryable *response* it honors the server's `Retry-After` header (integer seconds or HTTP-date) and provider reset hints (OpenAI `x-ratelimit-reset-*`, Anthropic `anthropic-ratelimit-*-reset`), clamped to a cap and nudged with a little jitter; when there's no server hint (or a transport error) it falls back to full-jitter exponential backoff (uniform in `[0, min(cap, base·2^attempt)]`) to avoid a thundering herd. Tunable via `LLMSHIM_MAX_RETRIES` and `LLMSHIM_MAX_BACKOFF_SECS`. `warmup()` pre-establishes TCP+TLS connections. `SseStream` buffers bytes, extracts `data:` lines, routes through provider's `transform_stream_chunk`.
 
