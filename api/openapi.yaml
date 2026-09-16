@@ -204,7 +204,7 @@ components:
           description: |
             Raw provider-specific JSON merged into the underlying request at the
             top level. Native/provider-only controls must be namespaced under
-            `x-openai` / `x-anthropic` / `x-gemini` (native passthrough) or
+            `x-openai` / `x-chatgpt` / `x-anthropic` / `x-gemini` (native controls) or
             `x-openrouter` / `x-vllm` / `x-sglang` (aggregator / self-hosted
             controls). Also carries `tools`, `response_format`, and
             `reasoning_summary`.

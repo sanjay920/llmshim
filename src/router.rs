@@ -1,6 +1,7 @@
 use crate::error::{Result, ShimError};
 use crate::provider::Provider;
 use crate::providers::anthropic::Anthropic;
+use crate::providers::chatgpt::{ChatGpt, ChatGptAuth};
 use crate::providers::gemini::Gemini;
 use crate::providers::openai::OpenAi;
 use crate::providers::openai_compat::OpenAiCompatible;
@@ -79,9 +80,14 @@ impl Router {
             .ok_or_else(|| ShimError::UnknownProvider(key.to_string()))
     }
 
-    /// Convenience: build a router from env vars with OpenAI + Anthropic.
+    /// Build a router from provider env vars and a saved ChatGPT login.
     pub fn from_env() -> Self {
         let mut router = Router::new();
+
+        let chatgpt_auth = ChatGptAuth::from_env();
+        if chatgpt_auth.auth_path().is_file() {
+            router = router.register("chatgpt", Box::new(ChatGpt::new(chatgpt_auth)));
+        }
 
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
             router = router.register("openai", Box::new(OpenAi::new(key)));

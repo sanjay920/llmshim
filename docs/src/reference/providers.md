@@ -6,6 +6,7 @@ different native API and translates only the fields that API understands.
 | Provider | Native API | Bare-model inference | Native namespace |
 |---|---|---|---|
 | OpenAI | Responses API | `gpt*`, `o1*`, `o3*`, `o4*` | `x-openai` |
+| ChatGPT subscription | Responses API over OAuth | none — use `chatgpt/<model>` | `x-chatgpt` |
 | Anthropic | Messages API | `claude*` | `x-anthropic` |
 | Google Gemini | `generateContent` / `streamGenerateContent` | `gemini*` | `x-gemini` |
 | xAI | Responses API | `grok*` | none |
@@ -16,6 +17,24 @@ different native API and translates only the fields that API understands.
 An explicit address such as `anthropic/claude-sonnet-5` avoids inference.
 The named provider must be registered in the Router—that normally means its
 API key is configured.
+
+ChatGPT uses a saved device-code login instead: `llmshim login chatgpt`.
+Both normal and streaming calls use upstream SSE. Normal calls aggregate a
+terminal response into Chat Completions JSON; a failed or truncated stream
+returns an error. Tools, image inputs, and reasoning use the Responses
+translator. ChatGPT forces `store: false` and `stream: true` and strips token
+limits, metadata, and sampling fields even from native overrides, following
+[LiteLLM's backend contract](https://docs.litellm.ai/docs/providers/chatgpt).
+It uses a short default instruction when no instructions are supplied.
+Only `chatgpt/gpt-6-astra` and `chatgpt/gpt-5.6-{sol,terra,luna}` are accepted;
+older and unlisted models fail locally before authentication or network calls.
+Access to those models and limits depend on the signed-in account.
+ChatGPT responses preserve the full `chatgpt/<model>` ID, including streaming
+chunks, so server responses identify the subscription provider correctly when
+API-key OpenAI is also configured.
+Streamed function calls are emitted once their arguments are complete. Each
+call includes its ID, name, and full JSON arguments, including in the proxy's
+`tool_call` event; text and reasoning still arrive incrementally.
 
 ## Observable differences
 

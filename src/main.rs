@@ -37,6 +37,22 @@ const MODELS: &[(&str, &str)] = &[
     ),
     ("xai/grok-4.20-beta-0309-reasoning", "Grok 4.20 Reasoning"),
     ("xai/grok-4.20-beta-0309-non-reasoning", "Grok 4.20"),
+    (
+        llmshim::models::CHATGPT_MODELS[0].id,
+        llmshim::models::CHATGPT_MODELS[0].label,
+    ),
+    (
+        llmshim::models::CHATGPT_MODELS[1].id,
+        llmshim::models::CHATGPT_MODELS[1].label,
+    ),
+    (
+        llmshim::models::CHATGPT_MODELS[2].id,
+        llmshim::models::CHATGPT_MODELS[2].label,
+    ),
+    (
+        llmshim::models::CHATGPT_MODELS[3].id,
+        llmshim::models::CHATGPT_MODELS[3].label,
+    ),
 ];
 
 fn print_models(current: &str) {
@@ -407,6 +423,12 @@ fn model_label(id: &str) -> &str {
         .unwrap_or(id)
 }
 
+fn is_chatgpt_model(id: &str) -> bool {
+    llmshim::models::CHATGPT_MODELS
+        .iter()
+        .any(|model| model.id == id)
+}
+
 fn prompt_model_selection(current: &str) -> Option<String> {
     print_models(current);
     print!("  Select model [1-{}]: ", MODELS.len());
@@ -424,7 +446,7 @@ fn prompt_model_selection(current: &str) -> Option<String> {
     }
 
     // Accept model ID directly
-    if MODELS.iter().any(|(id, _)| *id == input) {
+    if MODELS.iter().any(|(id, _)| *id == input) || is_chatgpt_model(input) {
         return Some(input.to_string());
     }
 
@@ -634,7 +656,7 @@ async fn cmd_proxy() {
     let router = llmshim::router::Router::from_env();
     let providers = router.provider_keys();
     if providers.is_empty() {
-        eprintln!("No API keys found. Run: llmshim configure");
+        eprintln!("No providers configured. Run: llmshim configure or llmshim login chatgpt");
         std::process::exit(1);
     }
 
@@ -697,7 +719,7 @@ async fn cmd_gateway() {
     let router = llmshim::router::Router::from_env();
     let providers = router.provider_keys();
     if providers.is_empty() {
-        eprintln!("No API keys found. Run: llmshim configure");
+        eprintln!("No providers configured. Run: llmshim configure or llmshim login chatgpt");
         std::process::exit(1);
     }
 
@@ -787,6 +809,9 @@ fn print_global_usage() {
     eprintln!();
     eprintln!("Config:");
     eprintln!("  configure             Interactive API key setup");
+    eprintln!("  login chatgpt         Sign in with ChatGPT (device code)");
+    eprintln!("  login chatgpt --status Check saved ChatGPT login");
+    eprintln!("  logout chatgpt        Remove saved ChatGPT login");
     eprintln!("  set <key> <value>     Set a config value");
     eprintln!("  get <key>             Get a config value");
     eprintln!("  list                  Show all configured keys");
@@ -977,6 +1002,35 @@ fn docker_build() {
     }
 }
 
+async fn cmd_chatgpt_auth(cmd: &str, status_only: bool) -> llmshim::error::Result<()> {
+    use llmshim::providers::chatgpt::{ChatGptAuth, LoginStatus};
+    let auth = ChatGptAuth::from_env();
+    if cmd == "logout" {
+        auth.logout().await?;
+        println!("Removed the saved ChatGPT login.");
+    } else if status_only {
+        let message = match auth.status()? {
+            LoginStatus::SignedOut => "Not signed in. Run `llmshim login chatgpt`.",
+            LoginStatus::Ready => "ChatGPT login is ready.",
+            LoginStatus::NeedsRefresh => {
+                "ChatGPT login is saved; it will refresh on the next request."
+            }
+            LoginStatus::NeedsLogin => "ChatGPT login has expired. Run `llmshim login chatgpt`.",
+        };
+        println!("{message}");
+    } else {
+        let code = auth.start_login().await?;
+        eprintln!(
+            "Open {} and enter code: {}",
+            code.verification_url, code.user_code
+        );
+        eprintln!("Waiting for ChatGPT sign-in (up to 15 minutes)...");
+        auth.finish_login(code).await?;
+        println!("Signed in with ChatGPT. Use chatgpt/<model>, for example chatgpt/gpt-6-astra.");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -990,6 +1044,21 @@ async fn main() {
     let cmd = cmd.unwrap();
 
     match cmd {
+        "login" | "logout" => {
+            if args.get(2).map(String::as_str) != Some("chatgpt")
+                || args.len() > 4
+                || (args.len() == 4 && (cmd != "login" || args[3] != "--status"))
+            {
+                eprintln!("Usage: llmshim login chatgpt [--status] | llmshim logout chatgpt");
+                std::process::exit(1);
+            }
+            llmshim::env::load_all();
+            if let Err(error) = cmd_chatgpt_auth(cmd, args.len() == 4).await {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         "configure" => {
             cmd_configure();
             return;
@@ -1199,6 +1268,11 @@ async fn main() {
                     }
                 }
                 let lower = query.to_lowercase();
+                if is_chatgpt_model(query) {
+                    current_model = query.to_string();
+                    println!("  Switched to: {}\n", current_model);
+                    continue;
+                }
                 let found = MODELS.iter().find(|(id, label)| {
                     id.to_lowercase().contains(&lower) || label.to_lowercase().contains(&lower)
                 });

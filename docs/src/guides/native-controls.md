@@ -11,6 +11,7 @@ The built-in namespaces are:
 | Namespace | Target |
 |---|---|
 | `x-openai` | OpenAI Responses request fields |
+| `x-chatgpt` | Supported ChatGPT subscription Responses fields |
 | `x-anthropic` | Anthropic Messages fields and llmshim-managed Anthropic header controls |
 | `x-gemini` | Gemini request fields and `thinkingConfig` |
 
@@ -40,6 +41,18 @@ access to the full native reasoning object, including `effort`, `mode`,
 
 The object is native OpenAI configuration. llmshim does not clamp it, so the
 selected model must accept the values.
+
+## ChatGPT subscription
+
+Use `x-chatgpt` in an engine request, or `provider_config["x-chatgpt"]`
+through the proxy. Supported fields are `input`, `instructions`, `include`,
+`tools`, `tool_choice`, `reasoning`, `previous_response_id`, and `truncation`.
+The routed model, `stream: true`, and `store: false` are enforced after native
+overrides; unsupported fields, including all token limits and metadata, are
+removed. `reasoning.encrypted_content` is always included in the upstream
+request. Returned chat history uses llmshim's existing normalized messages;
+it does not preserve opaque encrypted reasoning items. `x-openai` does not
+apply to this provider.
 
 ## Anthropic
 
@@ -130,4 +143,3 @@ If you change the model address to another provider, remove or replace the old
 provider namespace. Keeping `x-openai` in an Anthropic request does not recreate
 the OpenAI behavior. See [Portable core, native edges](../concepts/portability.md)
 for the underlying contract.
-
