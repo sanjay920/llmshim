@@ -87,18 +87,26 @@ would reject it.
 
 Adaptive models use `thinking: {type}` plus `output_config: {effort}`:
 
-| unified | Opus 5, Opus 4.7/4.8, Sonnet 5 | Opus/Sonnet 4.6 |
-|---|---|---|
-| `none` | `thinking: {type: "disabled"}` | `thinking: {type: "disabled"}` |
-| `low` | `adaptive` + `low` | `adaptive` + `low` |
-| `medium` | `adaptive` + `medium` | `adaptive` + `medium` |
-| `high` | `adaptive` + `high` | `adaptive` + `high` |
-| `xhigh` | `adaptive` + `xhigh` | `adaptive` + **`max`** |
-| `max` | `adaptive` + `max` | `adaptive` + `max` |
+| unified | Fable 5 / 5.1 | Opus 5, Opus 4.7/4.8, Sonnet 5 | Opus/Sonnet 4.6 |
+|---|---|---|---|
+| `none` | `adaptive` + **`low`** | `thinking: {type: "disabled"}` | `thinking: {type: "disabled"}` |
+| `low` | `adaptive` + `low` | `adaptive` + `low` | `adaptive` + `low` |
+| `medium` | `adaptive` + `medium` | `adaptive` + `medium` | `adaptive` + `medium` |
+| `high` | `adaptive` + `high` | `adaptive` + `high` | `adaptive` + `high` |
+| `xhigh` | `adaptive` + `xhigh` | `adaptive` + `xhigh` | `adaptive` + **`max`** |
+| `max` | `adaptive` + `max` | `adaptive` + `max` | `adaptive` + `max` |
 
 Adaptive models think by default even when no reasoning config is sent.
-`reasoning_effort: "none"` maps to disabled thinking and is the way to request
-zero thinking tokens.
+On models that can disable thinking, `reasoning_effort: "none"` maps to disabled
+thinking. Fable 5 and 5.1 always use adaptive thinking, so `none` maps to `low`.
+Explicit native `thinking.type: "disabled"` or `"enabled"` is rejected locally
+for Fable. Fable and Opus 5 omit `temperature`, `top_p`, and `top_k` regardless
+of whether a thinking object was explicitly provided.
+
+Fable behavior and its five effort levels follow Anthropic's
+[migration guide](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide)
+and Models API. The low-effort and rejected-parameter paths are also checked
+against the live API in this repository.
 
 Pre-4.6 models such as Haiku 4.5 and Claude 3.7 use enabled thinking with a
 token budget scaled from `max_tokens` and floored at 1024:

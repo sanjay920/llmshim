@@ -26,6 +26,10 @@ impl Anthropic {
         m.contains("4-6") || m.contains("4.6") || m.contains("4_6")
     }
 
+    fn is_fable(model: &str) -> bool {
+        matches!(model, "claude-fable-5" | "claude-fable-5-1")
+    }
+
     /// Newer Claude families (Opus 4.7/4.8, Sonnet 5) that reject the pre-4.6
     /// `thinking.type=enabled` path. Verified against the live API: these
     /// models return HTTP 400 for enabled-thinking and 200 for adaptive.
@@ -37,6 +41,7 @@ impl Anthropic {
             || m.contains("opus-4.8")
             || m.contains("opus-5")
             || m.contains("sonnet-5")
+            || Self::is_fable(&m)
     }
 
     /// Models that must use the adaptive thinking path
@@ -105,7 +110,10 @@ fn text_block(text: &str) -> Value {
     })
 }
 
-fn extract_system_message(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
+fn extract_system_message(
+    messages: &[Value],
+    preserve_later_system: bool,
+) -> (Option<Value>, Vec<Value>) {
     let mut system_parts: Vec<String> = Vec::new();
     let mut system_blocks: Vec<Value> = Vec::new();
     let mut has_block_content = false;
@@ -114,6 +122,14 @@ fn extract_system_message(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
     for msg in messages {
         match msg.get("role").and_then(|r| r.as_str()) {
             Some("system" | "developer") => {
+                // Fable 5.1 supports appended system turns. Hoisting those into
+                // the initial prompt changes the prefix bound to prior thinking.
+                if preserve_later_system && !rest.is_empty() {
+                    let mut message = msg.clone();
+                    message["role"] = json!("system");
+                    rest.push(message);
+                    continue;
+                }
                 if let Some(content) = msg.get("content") {
                     match content {
                         Value::String(text) if !has_block_content => {
@@ -442,6 +458,9 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
         Some("end_turn" | "stop_sequence") => "stop",
         Some("max_tokens") => "length",
         Some("tool_use") => "tool_calls",
+        Some("refusal") if Anthropic::is_fable(model) || model == "claude-opus-5" => {
+            "content_filter"
+        }
         _ => {
             return Err(ShimError::ProviderError {
                 status: 502,
@@ -530,7 +549,7 @@ impl Provider for Anthropic {
                 )))
             })?;
 
-        let (system, user_messages) = extract_system_message(messages);
+        let (system, user_messages) = extract_system_message(messages, model == "claude-fable-5-1");
         let anthropic_messages = transform_messages(&user_messages);
 
         let mut body = json!({
@@ -604,6 +623,11 @@ impl Provider for Anthropic {
                     .map(|m| m == "pro")
                     .unwrap_or(false);
                 let effort = normalize_unified_effort(effort, pro);
+                let effort = if effort == "none" && Self::is_fable(model) {
+                    "low"
+                } else {
+                    effort
+                };
 
                 // Reasoning-summary visibility. Newer models (Sonnet 5, Opus
                 // 4.7/4.8, ...) default `display` to "omitted" — a signed but
@@ -695,6 +719,40 @@ impl Provider for Anthropic {
                 body_obj.remove("temperature");
                 body_obj.remove("top_k");
             }
+        }
+
+        // Fable always thinks, even without an explicit thinking object. Opus 5
+        // also rejects sampling parameters regardless of its thinking setting.
+        if Self::is_fable(model) || model == "claude-opus-5" {
+            for key in ["temperature", "top_p", "top_k"] {
+                body_obj.remove(key);
+            }
+        }
+        if Self::is_fable(model) {
+            if let Some(thinking) = body_obj.get("thinking") {
+                if thinking["type"] != "adaptive" {
+                    return Err(ShimError::ProviderError { status: 400, body:
+                        "Claude Fable requires adaptive thinking; use reasoning_effort to control depth".into() });
+                }
+            }
+            if body_obj
+                .get("messages")
+                .and_then(Value::as_array)
+                .and_then(|messages| messages.last())
+                .is_some_and(|message| message["role"] == "assistant")
+            {
+                return Err(ShimError::ProviderError { status: 400, body:
+                    "Claude Fable does not support assistant prefill; end the request with a user turn".into() });
+            }
+        }
+        if model == "claude-fable-5-1"
+            && body_obj
+                .get("tool_choice")
+                .and_then(|choice| choice["type"].as_str())
+                .is_some_and(|kind| matches!(kind, "any" | "tool"))
+        {
+            return Err(ShimError::ProviderError { status: 400, body:
+                "Claude Fable 5.1 supports only auto or none tool choice; request the desired tool in the prompt".into() });
         }
 
         // Fast mode support: extract "speed" from the request and apply
@@ -929,6 +987,9 @@ impl Provider for Anthropic {
                         "end_turn" => "stop",
                         "max_tokens" => "length",
                         "tool_use" => "tool_calls",
+                        "refusal" if Self::is_fable(model) || model == "claude-opus-5" => {
+                            "content_filter"
+                        }
                         other => other,
                     });
 
