@@ -18,15 +18,15 @@ use llmshim::{completion_with_fallback, FallbackConfig};
 use serde_json::json;
 
 let request = json!({
-    "model": "anthropic/claude-opus-4-8",
+    "model": "anthropic/claude-opus-5",
     "messages": [{"role": "user", "content": "Hello"}],
     "max_tokens": 128
 });
 
 let fallback = FallbackConfig::new(vec![
-    "anthropic/claude-opus-4-8".into(),
+    "anthropic/claude-opus-5".into(),
     "openai/gpt-5.6-sol".into(),
-    "gemini/gemini-3.5-flash".into(),
+    "gemini/gemini-3.8-flash".into(),
 ]);
 
 let response = completion_with_fallback(
@@ -59,12 +59,12 @@ to try afterward:
 
 ```json
 {
-  "model": "anthropic/claude-opus-4-8",
+  "model": "anthropic/claude-opus-5",
   "messages": [{"role": "user", "content": "Hello"}],
   "config": {"max_tokens": 128},
   "fallback": [
     "openai/gpt-5.6-sol",
-    "gemini/gemini-3.5-flash"
+    "gemini/gemini-3.8-flash"
   ]
 }
 ```

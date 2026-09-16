@@ -24,14 +24,14 @@ const client = new Client(); // no baseUrl -> auto-starts the bundled proxy on f
 
 // Non-streaming
 const res = await client.chat({
-  model: "anthropic/claude-sonnet-4-6",
+  model: "anthropic/claude-sonnet-5",
   messages: [{ role: "user", content: "What is Rust in one sentence?" }],
 });
 console.log(res.message.content);
 
 // Streaming — an async iterator of typed events
 for await (const ev of client.stream({
-  model: "gpt-5.5",
+  model: "gpt-5.6-sol",
   messages: [{ role: "user", content: "Write a haiku about the ocean." }],
 })) {
   if (ev.type === "reasoning") process.stdout.write(`\x1b[2m${ev.text}\x1b[0m`);
@@ -54,9 +54,9 @@ reads its own credentials from the environment (or `llmshim configure`):
 | ---------- | -------------------------------------------------- | ------------------------------------------------- |
 | OpenAI     | `openai/gpt-5.6-sol`                               | `OPENAI_API_KEY`                                  |
 | Anthropic  | `anthropic/claude-sonnet-5`                        | `ANTHROPIC_API_KEY`                               |
-| Gemini     | `gemini/gemini-3.5-flash`                          | `GEMINI_API_KEY`                                  |
-| xAI        | `xai/grok-4.5`                                     | `XAI_API_KEY`                                     |
-| OpenRouter | `openrouter/anthropic/claude-sonnet-4.5`          | `OPENROUTER_API_KEY`                              |
+| Gemini     | `gemini/gemini-3.8-flash`                          | `GEMINI_API_KEY`                                  |
+| xAI        | `xai/grok-4.6`                                     | `XAI_API_KEY`                                     |
+| OpenRouter | `openrouter/anthropic/claude-sonnet-5`          | `OPENROUTER_API_KEY`                              |
 | vLLM       | `vllm/<served-model>`                              | `VLLM_BASE_URL` (+ optional `VLLM_API_KEY`)       |
 | SGLang     | `sglang/<served-model>`                            | `SGLANG_BASE_URL` (+ optional `SGLANG_API_KEY`)   |
 
@@ -96,7 +96,7 @@ An ordered list tried in turn on retryable upstream failures (429/5xx):
 await client.chat({
   model: "anthropic/claude-sonnet-5",
   messages: [{ role: "user", content: "Hi" }],
-  fallback: ["openai/gpt-5.6-sol", "gemini/gemini-3.5-flash"],
+  fallback: ["openai/gpt-5.6-sol", "gemini/gemini-3.8-flash"],
 });
 ```
 
@@ -113,13 +113,13 @@ await client.chat({
   model: "anthropic/claude-sonnet-5",
   messages: [{ role: "user", content: "Think hard about this." }],
   provider_config: {
-    "x-anthropic": { thinking: { type: "enabled", budget_tokens: 4000 } },
+    "x-anthropic": { thinking: { type: "adaptive" }, output_config: { effort: "high" } },
   },
 });
 
 // OpenRouter routing preferences, for example:
 await client.chat({
-  model: "openrouter/anthropic/claude-sonnet-4.5",
+  model: "openrouter/anthropic/claude-sonnet-5",
   messages: [{ role: "user", content: "Hi" }],
   provider_config: {
     "x-openrouter": { provider: { sort: "throughput" } }, // also: models, transforms

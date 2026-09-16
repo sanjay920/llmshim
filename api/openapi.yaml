@@ -6,10 +6,10 @@ info:
     Multi-provider LLM API proxy. Send requests in a single format,
     llmshim translates to the native API of whichever provider you choose.
 
-    Supports OpenAI, Anthropic, Google Gemini, xAI, OpenRouter (an
+    Supports OpenAI, ChatGPT subscriptions, Anthropic, Google Gemini, xAI, OpenRouter (an
     OpenAI-compatible aggregator), and self-hosted vLLM / SGLang servers.
-    Provider is detected from the model prefix; OpenRouter/vLLM/SGLang are
-    addressed explicitly (e.g. `openrouter/anthropic/claude-sonnet-4.5`,
+    Provider is detected from the model prefix; ChatGPT/OpenRouter/vLLM/SGLang are
+    addressed explicitly (e.g. `chatgpt/gpt-6-astra`, `openrouter/anthropic/claude-sonnet-5`,
     `vllm/<served-model>`, `sglang/<served-model>`).
 
     ## Gateway (experimental)
@@ -181,12 +181,12 @@ components:
         model:
           type: string
           description: |
-            Model identifier. Use "provider/model" format (e.g., "anthropic/claude-sonnet-4-6")
-            or just the model name for auto-detection (e.g., "claude-sonnet-4-6").
+            Model identifier. Use "provider/model" format (e.g., "anthropic/claude-sonnet-5")
+            or just the model name for auto-detection (e.g., "claude-sonnet-5").
           examples:
-            - anthropic/claude-sonnet-4-6
-            - gpt-5.5
-            - gemini-3-flash-preview
+            - anthropic/claude-sonnet-5
+            - gpt-5.6-sol
+            - gemini-3.8-flash
         messages:
           type: array
           description: Conversation messages
@@ -211,8 +211,9 @@ components:
           examples:
             - x-anthropic:
                 thinking:
-                  type: enabled
-                  budget_tokens: 4000
+                  type: adaptive
+                output_config:
+                  effort: high
             - x-openrouter:
                 provider:
                   sort: throughput
@@ -233,7 +234,7 @@ components:
             backoff before moving to the next model. Fallback applies only to
             non-streaming requests; streaming endpoints ignore this field.
           examples:
-            - ["openai/gpt-5.5", "gemini/gemini-3-flash-preview"]
+            - ["openai/gpt-5.6-sol", "gemini/gemini-3.8-flash"]
 
     Message:
       type: object

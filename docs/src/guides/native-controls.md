@@ -86,16 +86,15 @@ the namespace keeps provider-native fields visibly grouped.
 ## Gemini
 
 `x-gemini.thinkingConfig` replaces the unified Gemini thinking configuration.
-It accepts Gemini's native object, including the legacy integer
-`thinkingBudget`:
+It accepts Gemini's native thinking configuration:
 
 ```json
 {
-  "model": "gemini/gemini-3.5-flash",
+  "model": "gemini/gemini-3.8-flash",
   "messages": [{"role": "user", "content": "Analyze this carefully."}],
   "x-gemini": {
     "thinkingConfig": {
-      "thinkingBudget": 2048,
+      "thinkingLevel": "high",
       "includeThoughts": true
     }
   }

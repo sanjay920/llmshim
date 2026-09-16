@@ -14,9 +14,13 @@ If the model belongs to a provider llmshim does not support yet, stop and use `/
 
 Model to add: **$ARGUMENTS**
 
-## The model registry is duplicated — update BOTH copies
+## One advertised catalog
 
-The canonical list lives in `src/models.rs` (`MODELS: &[ModelInfo]`, used by the library and proxy). The CLI has a **second, hand-maintained copy** in `src/main.rs` (`const MODELS: &[(&str, &str)]`). They must stay in sync or the CLI picker and the proxy disagree.
+The curated list lives in `src/models.rs` (`MODELS: &[ModelInfo]`). The CLI
+imports it directly, and the proxy uses `available_models()`. Advertise only
+the current model in each retained tier; Google entries are stable only.
+Preserve displaced records in private `LEGACY_MODELS` so `spec()` still works
+for explicit historical IDs. Keep legacy transforms and regression tests.
 
 ## Steps
 
@@ -49,12 +53,14 @@ The canonical list lives in `src/models.rs` (`MODELS: &[ModelInfo]`, used by the
      until verified. To set a verified one, chain the const builder, e.g.
      `CAPS_REASONING.with_images(Support::Supported)`.
 
-2. **`src/main.rs`** — add the matching tuple to `const MODELS` in the same order:
-   ```rust
-   ("<provider>/<model-name>", "<Display Label>"),
-   ```
+2. **CLI** — no second model list to edit. Verify the new entry appears through
+   the shared catalog. When replacing a tier's model, move the superseded
+   record to `LEGACY_MODELS` instead of advertising both generations.
 
-3. **`tests/unit_models.rs`** — bump `models_registry_has_expected_count` (the `assert_eq!(MODELS.len(), N)`) by one. This test is the guardrail that catches a forgotten registry edit.
+3. **Tests** — update the advertised count in `tests/unit_models.rs` and the
+   exact CLI/proxy list in `tests/unit_advertised_models.rs`. Keep historical
+   `spec()` and provider behavior tests; pruning discovery does not remove
+   explicit-ID support.
 
 4. **Docs** — update the "Supported models" list in `CLAUDE.md` and the model list in `README.md`. If the id appears in `api/openapi.yaml` examples and is a good representative, you may add it there too (optional).
 

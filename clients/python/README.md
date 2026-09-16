@@ -48,7 +48,7 @@ Then address them via the model string — `vllm/<served-model>` or
 ```python
 import llmshim
 
-resp = llmshim.chat("claude-sonnet-4-6", "What is Rust?")
+resp = llmshim.chat("claude-sonnet-5", "What is Rust?")
 print(resp["message"]["content"])
 ```
 
@@ -56,7 +56,7 @@ With options (all map to the API's provider-agnostic `config`):
 
 ```python
 resp = llmshim.chat(
-    "openai/gpt-5.5",
+    "openai/gpt-5.6-sol",
     "Explain quicksort",
     max_tokens=500,
     temperature=0.7,
@@ -70,7 +70,7 @@ resp = llmshim.chat(
 With message history:
 
 ```python
-resp = llmshim.chat("claude-sonnet-4-6", [
+resp = llmshim.chat("claude-sonnet-5", [
     {"role": "system", "content": "You are a pirate."},
     {"role": "user", "content": "Hello!"},
 ], max_tokens=500)
@@ -79,7 +79,7 @@ resp = llmshim.chat("claude-sonnet-4-6", [
 ## Streaming
 
 ```python
-for event in llmshim.stream("claude-sonnet-4-6", "Write a poem"):
+for event in llmshim.stream("claude-sonnet-5", "Write a poem"):
     if event["type"] == "content":
         print(event["text"], end="", flush=True)
     elif event["type"] == "reasoning":
@@ -95,13 +95,13 @@ Switch models mid-conversation. History carries over.
 ```python
 messages = [{"role": "user", "content": "What is a closure?"}]
 
-r1 = llmshim.chat("claude-sonnet-4-6", messages, max_tokens=500)
+r1 = llmshim.chat("claude-sonnet-5", messages, max_tokens=500)
 print(f"Claude: {r1['message']['content']}")
 
 messages.append({"role": "assistant", "content": r1["message"]["content"]})
 messages.append({"role": "user", "content": "Now explain differently."})
 
-r2 = llmshim.chat("gpt-5.5", messages, max_tokens=500)
+r2 = llmshim.chat("gpt-5.6-sol", messages, max_tokens=500)
 print(f"GPT: {r2['message']['content']}")
 ```
 
@@ -129,7 +129,7 @@ print(resp["message"]["content"])  # answer
 
 For full native control, bypass the unified mapping with a namespaced
 `provider_config` (see below), e.g.
-`provider_config={"x-anthropic": {"thinking": {"type": "enabled", "budget_tokens": 4000}}}`.
+`provider_config={"x-anthropic": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}}`.
 
 ## Provider-Specific Controls (`provider_config`)
 
@@ -145,10 +145,8 @@ resp = llmshim.chat(
     "Solve this step by step: 17 * 23",
     max_tokens=4000,
     provider_config={
-        # native Anthropic extended-thinking control
-        "x-anthropic": {"thinking": {"type": "enabled", "budget_tokens": 4000}},
-        # structured output
-        "response_format": {"type": "json_object"},
+        # native Anthropic adaptive-thinking control
+        "x-anthropic": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
     },
 )
 ```
@@ -157,7 +155,7 @@ OpenRouter routing preferences use the `x-openrouter` namespace:
 
 ```python
 resp = llmshim.chat(
-    "openrouter/anthropic/claude-sonnet-4.5",
+    "openrouter/anthropic/claude-sonnet-5",
     "Hello",
     max_tokens=200,
     provider_config={"x-openrouter": {"provider": {"sort": "throughput"}}},
@@ -180,7 +178,7 @@ tools = [{
     },
 }]
 
-resp = llmshim.chat("claude-sonnet-4-6", "Weather in Tokyo?", max_tokens=500, tools=tools)
+resp = llmshim.chat("claude-sonnet-5", "Weather in Tokyo?", max_tokens=500, tools=tools)
 for tc in resp["message"].get("tool_calls", []):
     print(f"{tc['function']['name']}({tc['function']['arguments']})")
 ```
@@ -191,10 +189,10 @@ Tools are accepted in OpenAI Chat Completions format and auto-translated to each
 
 ```python
 resp = llmshim.chat(
-    "anthropic/claude-sonnet-4-6",
+    "anthropic/claude-sonnet-5",
     "Hello",
     max_tokens=100,
-    fallback=["openai/gpt-5.6-sol", "gemini/gemini-3.5-flash"],
+    fallback=["openai/gpt-5.6-sol", "gemini/gemini-3.8-flash"],
 )
 ```
 
@@ -224,7 +222,7 @@ common ones are re-exported at the top level) for static type-checking:
 ```python
 from llmshim.types import ChatResponse, StreamEvent, Message, Config
 
-resp: ChatResponse = llmshim.chat("claude-sonnet-4-6", "hi")
+resp: ChatResponse = llmshim.chat("claude-sonnet-5", "hi")
 ```
 
 Available: `ChatRequest`, `ChatResponse`, `Config`, `Message`, `ToolCall`,
@@ -263,14 +261,14 @@ pytest tests/
 `test_e2e.py` is a separate LIVE suite that spawns the real binary and makes
 billed provider calls; run it only when you deliberately want to hit real APIs.
 
-## Supported Models
+## Advertised Models
 
 | Provider | Models |
 |----------|--------|
-| OpenAI | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano` |
-| Anthropic | `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` |
-| Gemini | `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` |
-| xAI | `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning` |
+| OpenAI | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
+| Anthropic | `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001` |
+| Gemini | `gemini-3.8-flash`, `gemini-3.5-flash-lite` |
+| xAI | `grok-4.6` |
 
 Call `llmshim.models()` for the live list filtered to your configured providers.
 
@@ -281,6 +279,6 @@ any model the upstream serves is reachable, so they aren't in the table above.
 
 | Provider | Address as | Env vars | Native controls |
 |----------|-----------|----------|-----------------|
-| OpenRouter | `openrouter/<vendor>/<model>` (e.g. `openrouter/anthropic/claude-sonnet-4.5`) | `OPENROUTER_API_KEY` (or `llmshim.configure(openrouter=...)`) | `provider_config={"x-openrouter": {...}}` (`provider`, `models`, `transforms`) |
+| OpenRouter | `openrouter/<vendor>/<model>` (e.g. `openrouter/anthropic/claude-sonnet-5`) | `OPENROUTER_API_KEY` (or `llmshim.configure(openrouter=...)`) | `provider_config={"x-openrouter": {...}}` (`provider`, `models`, `transforms`) |
 | vLLM | `vllm/<served-model>` | `VLLM_BASE_URL` (+ optional `VLLM_API_KEY`) | `provider_config={"x-vllm": {...}}` |
 | SGLang | `sglang/<served-model>` | `SGLANG_BASE_URL` (+ optional `SGLANG_API_KEY`) | `provider_config={"x-sglang": {...}}` |

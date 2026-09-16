@@ -46,9 +46,9 @@ environment variables. The Ruby client never sees your keys — the proxy holds 
 | ---------- | --------------------------------------- | ------------------------------------- |
 | OpenAI     | `openai/gpt-5.6-sol`                    | `OPENAI_API_KEY`                      |
 | Anthropic  | `anthropic/claude-sonnet-5`            | `ANTHROPIC_API_KEY`                   |
-| Gemini     | `gemini/gemini-3.5-flash`              | `GEMINI_API_KEY`                      |
-| xAI        | `xai/grok-4.5`                         | `XAI_API_KEY`                         |
-| OpenRouter | `openrouter/anthropic/claude-sonnet-4.5` | `OPENROUTER_API_KEY`                |
+| Gemini     | `gemini/gemini-3.8-flash`              | `GEMINI_API_KEY`                      |
+| xAI        | `xai/grok-4.6`                         | `XAI_API_KEY`                         |
+| OpenRouter | `openrouter/anthropic/claude-sonnet-5` | `OPENROUTER_API_KEY`                |
 | vLLM       | `vllm/<served-model>`                  | `VLLM_BASE_URL` (+ optional `VLLM_API_KEY`)   |
 | SGLang     | `sglang/<served-model>`                | `SGLANG_BASE_URL` (+ optional `SGLANG_API_KEY`) |
 
@@ -75,7 +75,7 @@ of message hashes:
 
 ```ruby
 resp = client.chat(
-  model: "openai/gpt-5.5",
+  model: "openai/gpt-5.6-sol",
   messages: [
     { role: "system", content: "You are a pirate." },
     { role: "user",   content: "Hello!" }
@@ -99,7 +99,7 @@ A shared default client (base URL from `LLMSHIM_BASE_URL`, else `http://localhos
 ```ruby
 require "llmshim"
 
-resp = Llmshim.chat(model: "gpt-5.5", messages: "Explain quicksort")
+resp = Llmshim.chat(model: "gpt-5.6-sol", messages: "Explain quicksort")
 puts resp.content
 ```
 
@@ -127,7 +127,7 @@ Predicate helpers are available too: `event.content?`, `event.reasoning?`,
 Called without a block, `stream` returns the collected array of events:
 
 ```ruby
-events = client.stream(model: "gpt-5.5", messages: "Hi")
+events = client.stream(model: "gpt-5.6-sol", messages: "Hi")
 text = events.select(&:content?).map(&:text).join
 ```
 
@@ -145,9 +145,9 @@ resp = client.chat(
   ],
   tool_choice: "auto",
   # Provider-specific controls, namespaced under x-<provider> (see below):
-  provider_config: { "x-anthropic" => { thinking: { type: "enabled", budget_tokens: 4000 } } },
+  provider_config: { "x-anthropic" => { thinking: { type: "adaptive" }, output_config: { effort: "high" } } },
   # Try these models if the primary fails with a retryable error:
-  fallback: ["openai/gpt-5.6-sol", "gemini/gemini-3.5-flash"]
+  fallback: ["openai/gpt-5.6-sol", "gemini/gemini-3.8-flash"]
 )
 
 resp.message.tool_calls.each do |tc|
@@ -177,7 +177,7 @@ level is ignored. Use the namespace matching the target provider:
 
 ```ruby
 # Anthropic extended thinking:
-provider_config: { "x-anthropic" => { thinking: { type: "enabled", budget_tokens: 4000 } } }
+provider_config: { "x-anthropic" => { thinking: { type: "adaptive" }, output_config: { effort: "high" } } }
 
 # OpenRouter provider routing (also accepts `models`, `transforms`):
 provider_config: { "x-openrouter" => { provider: { sort: "throughput" } } }

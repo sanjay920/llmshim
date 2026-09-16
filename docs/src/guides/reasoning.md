@@ -70,35 +70,33 @@ clamp rather than a direct name-for-name mapping.
 
 ### OpenAI Responses API
 
-| unified | gpt-5.6-sol/terra/luna | gpt-5.5 | gpt-5.5-pro / gpt-5.4-pro | gpt-5.4 / -mini / -nano |
-|---|---|---|---|---|
-| `none` | `none` | `none` | **`medium`** (pro tier rejects none) | `none` |
-| `low` | `low` | `low` | **`medium`** | `low` |
-| `medium` | `medium` | `medium` | `medium` | `medium` |
-| `high` | `high` | `high` | `high` | `high` |
-| `xhigh` | `xhigh` | `xhigh` | `xhigh` | `xhigh` |
-| `max` | `max` | **`xhigh`** (max is 5.6-only) | **`xhigh`** | **`xhigh`** |
+| unified | GPT-6 Astra | GPT-5.6 Sol / Terra / Luna |
+|---|---|---|
+| `none` | **`low`** | `none` |
+| `low` | `low` | `low` |
+| `medium` | `medium` | `medium` |
+| `high` | `high` | `high` |
+| `xhigh` | `xhigh` | `xhigh` |
+| `max` | `max` | `max` |
 
-OpenAI receives `reasoning.effort`. Legacy `minimal` input is also accepted:
-it remains native on gpt-5.5 and clamps to `low` where other listed families
-would reject it.
+OpenAI receives `reasoning.effort`. Legacy `minimal` input clamps to `low`
+on all four advertised models.
 
 ### Anthropic Messages API
 
 Adaptive models use `thinking: {type}` plus `output_config: {effort}`:
 
-| unified | Fable 5 / 5.1 | Opus 5, Opus 4.7/4.8, Sonnet 5 | Opus/Sonnet 4.6 |
-|---|---|---|---|
-| `none` | `adaptive` + **`low`** | `thinking: {type: "disabled"}` | `thinking: {type: "disabled"}` |
-| `low` | `adaptive` + `low` | `adaptive` + `low` | `adaptive` + `low` |
-| `medium` | `adaptive` + `medium` | `adaptive` + `medium` | `adaptive` + `medium` |
-| `high` | `adaptive` + `high` | `adaptive` + `high` | `adaptive` + `high` |
-| `xhigh` | `adaptive` + `xhigh` | `adaptive` + `xhigh` | `adaptive` + **`max`** |
-| `max` | `adaptive` + `max` | `adaptive` + `max` | `adaptive` + `max` |
+| unified | Fable 5.1 | Opus 5 / Sonnet 5 |
+|---|---|---|
+| `none` | `adaptive` + **`low`** | `thinking: {type: "disabled"}` |
+| `low` | `adaptive` + `low` | `adaptive` + `low` |
+| `medium` | `adaptive` + `medium` | `adaptive` + `medium` |
+| `high` | `adaptive` + `high` | `adaptive` + `high` |
+| `xhigh` | `adaptive` + `xhigh` | `adaptive` + `xhigh` |
+| `max` | `adaptive` + `max` | `adaptive` + `max` |
 
-Adaptive models think by default even when no reasoning config is sent.
 On models that can disable thinking, `reasoning_effort: "none"` maps to disabled
-thinking. Fable 5 and 5.1 always use adaptive thinking, so `none` maps to `low`.
+thinking. Fable 5.1 always uses adaptive thinking, so `none` maps to `low`.
 Explicit native `thinking.type: "disabled"` or `"enabled"` is rejected locally
 for Fable. Fable and Opus 5 omit `temperature`, `top_p`, and `top_k` regardless
 of whether a thinking object was explicitly provided.
@@ -108,8 +106,7 @@ Fable behavior and its five effort levels follow Anthropic's
 and Models API. The low-effort and rejected-parameter paths are also checked
 against the live API in this repository.
 
-Pre-4.6 models such as Haiku 4.5 and Claude 3.7 use enabled thinking with a
-token budget scaled from `max_tokens` and floored at 1024:
+Haiku 4.5 uses enabled thinking with a token budget scaled from `max_tokens` and floored at 1024:
 
 | unified | budget |
 |---|---|
@@ -125,7 +122,7 @@ token budget scaled from `max_tokens` and floored at 1024:
 Gemini uses the four-rung
 `generationConfig.thinkingConfig.thinkingLevel` enum:
 
-| unified | gemini-3.5-flash / 3.6-flash / 3.5-flash-lite / 3.1-flash-lite | gemini-3.7-flash (and gemini-3.1-pro) |
+| unified | Gemini 3.5 Flash-Lite | Gemini 3.8 Flash |
 |---|---|---|
 | `none` | `minimal` (zero thinking tokens) | **`low`** (this model cannot disable thinking) |
 | `low` | `low` | `low` |
@@ -134,9 +131,9 @@ Gemini uses the four-rung
 | `xhigh` | **`high`** | **`high`** |
 | `max` | **`high`** | **`high`** |
 
-Gemini 3.7 Flash and Gemini 3.1 Pro reject both `minimal` and `thinkingBudget: 0`, so `none`
-clamps to their `low` floor (verified live). Other flash models accept `minimal` and can disable thinking. The legacy integer `thinkingBudget` remains available only
-through `x-gemini.thinkingConfig`.
+Gemini 3.8 Flash rejects `minimal` and `thinkingBudget: 0`, so `none` clamps
+to `low`. Gemini 3.5 Flash-Lite accepts `minimal` and can disable thinking.
+Native controls remain available through `x-gemini.thinkingConfig`.
 
 ### ChatGPT subscription
 
@@ -152,29 +149,26 @@ Native `x-chatgpt.reasoning` overrides the unified mapping.
 
 xAI receives the nested native shape `reasoning: {effort}`:
 
-| unified | grok-4.3 | grok-4.5 / grok-4.6 | grok-4.20-\*-reasoning / -non-reasoning |
-|---|---|---|---|
-| `none` | `none` | **`low`** | omitted |
-| `low` | `low` | `low` | omitted |
-| `medium` | `medium` | `medium` | omitted |
-| `high` | `high` | `high` | omitted |
-| `xhigh` | `xhigh` | `xhigh` | omitted |
-| `max` | **`xhigh`** | **`xhigh`** | omitted |
+| unified | Grok 4.6 |
+|---|---|
+| `none` | **`low`** |
+| `low` | `low` |
+| `medium` | `medium` |
+| `high` | `high` |
+| `xhigh` | `xhigh` |
+| `max` | **`xhigh`** |
 
-grok-4.5 and grok-4.6 cannot disable reasoning, so `none` clamps to `low`. grok-4.20 models
-are name-locked: reasoning on or off is encoded in the model name, and the API
-rejects any reasoning parameter. llmshim therefore omits it for that family.
+Grok 4.6 cannot disable reasoning, so `none` clamps to `low`.
 
 ## Mode mapping: `reasoning_mode: "pro"`
 
 | Provider / model | What `pro` does |
 |---|---|
-| OpenAI gpt-5.6 family, gpt-5.5-pro, gpt-5.4-pro | Native `reasoning.mode: "pro"` |
-| OpenAI other models | One-tier effort bump (`low → medium → high → xhigh`) |
+| OpenAI GPT-5.6 family | Native `reasoning.mode: "pro"` |
+| OpenAI GPT-6 Astra | One-tier effort bump (`low → medium → high → xhigh`); explicit `max` stays `max` |
 | Anthropic | One-tier effort bump (`low → medium → high → xhigh → max`) |
 | Gemini | One-tier bump within its four-rung enum, capped at `high` |
-| xAI effort-controlled models | One-tier bump, capped at `xhigh` |
-| xAI grok-4.20 family | No effect because reasoning is name-locked |
+| xAI Grok 4.6 | One-tier bump, capped at `xhigh` |
 
 Rules that hold across providers:
 
@@ -191,9 +185,10 @@ Rules that hold across providers:
    `thinking` and `output_config` in the Rust contract.
 2. Otherwise, unified `reasoning_effort` and `reasoning_mode` are mapped and
    clamped according to the tables above.
-3. With neither, the provider/model default applies. Anthropic adaptive models
-   and Gemini 3.1 Pro think by default; most other families do not.
+3. With neither, the provider/model default applies. The provider decides whether and how
+   much to reason unless an explicit setting is supplied.
 
-The non-obvious boundaries above were live-probed as of July 2026 and are
-pinned by provider unit tests. Provider capabilities can change, so the
+The adapter mappings are pinned by provider unit tests. The tables above
+cover the advertised models; compatibility mappings for explicit older IDs
+remain in the adapters and tests. Provider capabilities can change, so the
 implementation and these tables must move together.
