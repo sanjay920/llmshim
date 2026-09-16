@@ -13,6 +13,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 ## Supported models
 
 - **OpenAI:** `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano`
+- **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-5.6-sol`, `chatgpt/gpt-5.6-terra`, and `chatgpt/gpt-5.6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
 - **Anthropic:** `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
 - **Gemini:** `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`
 - **xAI:** `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`
@@ -40,6 +41,42 @@ API keys: `~/.llmshim/config.toml` (via `llmshim configure`) or env vars `OPENAI
 
 Requests flow as `serde_json::Value`. Each provider's transform takes raw JSON and maps only what it understands. Provider-specific features use `x-anthropic`, `x-gemini`, `x-openrouter`, `x-vllm`, `x-sglang` namespaces.
 
+**ChatGPT OAuth (`src/providers/chatgpt/`).** Run `llmshim login chatgpt` for
+device-code authentication, `login chatgpt --status` for a local check, and
+`logout chatgpt` to remove the selected cache. The independent default cache
+is `~/.llmshim/chatgpt/auth.json`; `CHATGPT_TOKEN_DIR`/`CHATGPT_AUTH_FILE` can
+override it. Never read or overwrite Codex credentials implicitly. The
+object-safe `Provider::prepare_request` hook defaults to `transform_request`;
+ChatGPT uses it to refresh asynchronously with cross-process file locking and
+atomic owner-only token writes. Requests never initiate interactive login.
+
+The subscription backend requires SSE, `stream: true`, and `store: false`.
+ChatGPT reuses the Responses translator, enforces the backend field allowlist
+after `x-chatgpt` overrides, and aggregates a validated terminal event for
+non-streaming callers. EOF or `[DONE]` without a terminal event is an error.
+Preserve `chatgpt/<model>` in normalized responses and chunks: a bare GPT name
+is otherwise misattributed to API-key OpenAI by the proxy/gateway when both
+providers are registered. Astra preserves reasoning effort `max`; `none` and
+`minimal` clamp to `low`.
+For ChatGPT streaming, emit function calls from `response.output_item.done`
+with complete arguments. Forwarding `response.output_item.added` followed by
+argument-only deltas loses arguments at the proxy's `tool_call` boundary.
+Text and reasoning remain incremental.
+
+Offline coverage lives in `tests/unit_chatgpt.rs`. The live server check starts
+its own loopback CLI process and stops it on completion/failure:
+
+```bash
+cargo test --features proxy --test integration_chatgpt_proxy -- --ignored --nocapture
+```
+
+It checks all four models through `/v1/chat` and `/v1/chat/stream`, provider
+identity with API-key OpenAI also registered, model discovery, old-model
+rejection, Astra tool calls (normal and streaming), a tool-result round trip,
+and image input. It uses the saved ChatGPT login and consumes
+subscription usage; it is ignored during offline CI. Mount the whole token
+directory writable for container use so refresh locks and atomic saves work.
+
 **Self-hosted passthrough providers (vLLM / SGLang).** `src/providers/openai_compat.rs` is one generic OpenAI Chat Completions passthrough backing both `vllm` and `sglang` (`OpenAiCompatible::new(name, base_url, api_key: Option)`, registered per env base URL). Two things differ from the hosted providers: the **base URL is configuration** (local `http://localhost:8000/v1` vs remote `https://host/v1`), and **auth is optional** (self-hosted servers are unauthenticated unless launched with `--api-key`, so the `Authorization` header is sent only when a key is set). Passthrough transforms; `reasoning`/`reasoning_content` normalized to `reasoning_content` (vLLM is migrating the field name); `reasoning_effort` forwarded as-is (honored per-model, not clamped); server-specific params go under `x-<name>` (`chat_template_kwargs`, `separate_reasoning`, `guided_json`, `top_k`, …). Note: reasoning/tool parsing are **launch-time server flags** (`--reasoning-parser`, `--tool-call-parser`), so a request only gets that behavior if the server was started for it — llmshim can't enable it per request.
 
 **OpenRouter is the one passthrough provider.** Every other provider translates the OpenAI-format input *away* to a native dialect; OpenRouter (`src/providers/openrouter.rs`) *is* OpenAI Chat Completions, so its transforms are near-identity — messages, tools, vision (`image_url`), and `response_format` are forwarded unchanged; `reasoning_effort` maps 1:1 to OpenRouter's `reasoning:{effort}` (its effort vocabulary is a superset, so no clamping); `message.reasoning` is normalized to `reasoning_content` on responses. OpenRouter models are **not enumerated** in `src/models.rs` (the catalog is huge and dynamic) — any `openrouter/<vendor>/<model>` slug routes through. `x-openrouter` carries OpenRouter-only controls (`provider`, `models`, `transforms`, `route`, native `reasoning`; plus `http_referer`/`x_title` which become headers). The `middle-out` transform is disabled by default for faithful passthrough. Uses `image_url` (Chat Completions) vision via `vision::to_openai_chat`.
@@ -49,7 +86,7 @@ Requests flow as `serde_json::Value`. Each provider's transform takes raw JSON a
 ```
 llmshim::completion(router, request)
   → router.resolve("anthropic/claude-sonnet-4-6")   // parse "provider/model"
-  → provider.transform_request(model, &value)        // OpenAI JSON → provider-native
+  → provider.prepare_request(model, &value).await    // refresh OAuth if needed, then transform
   → client.send(provider_request)                    // HTTP
   → provider.transform_response(model, body)         // provider-native → OpenAI JSON
 ```
@@ -98,7 +135,7 @@ Callers pass provider-specific controls under these keys. Each provider copies w
 
 ### Unified reasoning controls
 
-Two knobs work across every provider: `reasoning_effort` (`none|low|medium|high|xhigh|max`) and `reasoning_mode` (`standard|pro`). A third, `reasoning_summary` (`auto|none`), controls reasoning-text visibility → Anthropic `thinking.display` (`auto`→`summarized`, the default when `reasoning_effort` is present so newer models like Sonnet 5 / Opus 4.7-4.8 return reasoning text instead of the API-default `omitted`; `none`→`omitted` for lower latency). Applies to both the adaptive and pre-4.6 enabled thinking builders; a caller-supplied `thinking` block bypasses it. Each provider transform maps them to its native dialect, **clamping to the nearest tier the target model accepts** (all boundaries verified live — e.g. `max` is native only on OpenAI gpt-5.6; Anthropic 4.6 rejects `xhigh` but has `max`; Gemini's enum tops out at `high`; xAI grok-4.20 models reject any reasoning param). `mode: "pro"` is native on OpenAI gpt-5.6/-pro models (`reasoning.mode`), emulated as a one-tier effort bump elsewhere; explicit `none` always wins. Native passthrough (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) bypasses the mapping entirely and always takes precedence. **Full per-provider mapping tables: `docs/src/guides/reasoning.md`** — update it and the pinning tests in `tests/unit_*.rs` together whenever a mapping changes.
+Two knobs work across every provider: `reasoning_effort` (`none|low|medium|high|xhigh|max`) and `reasoning_mode` (`standard|pro`). A third, `reasoning_summary` (`auto|none`), controls reasoning-text visibility → Anthropic `thinking.display` (`auto`→`summarized`, the default when `reasoning_effort` is present so newer models like Sonnet 5 / Opus 4.7-4.8 return reasoning text instead of the API-default `omitted`; `none`→`omitted` for lower latency). Applies to both the adaptive and pre-4.6 enabled thinking builders; a caller-supplied `thinking` block bypasses it. Each provider transform maps them to its native dialect, **clamping to the nearest tier the target model accepts** (all boundaries verified live — e.g. `max` is native on OpenAI gpt-5.6 and GPT-6 Astra; Anthropic 4.6 rejects `xhigh` but has `max`; Gemini's enum tops out at `high`; xAI grok-4.20 models reject any reasoning param). `mode: "pro"` is native on OpenAI gpt-5.6/-pro models (`reasoning.mode`), emulated as a one-tier effort bump elsewhere; explicit `none` always wins. Native passthrough (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) bypasses the mapping entirely and always takes precedence. **Full per-provider mapping tables: `docs/src/guides/reasoning.md`** — update it and the pinning tests in `tests/unit_*.rs` together whenever a mapping changes.
 
 ### Tool format translation
 

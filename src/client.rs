@@ -166,8 +166,11 @@ impl ShimClient {
         model: &str,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let provider_req = provider.transform_request(model, request)?;
+        let provider_req = provider.prepare_request(model, request).await?;
         let resp = self.send(&provider_req).await?;
+        if provider.name() == "chatgpt" {
+            return crate::providers::chatgpt::collect_response(model, resp).await;
+        }
         let body: serde_json::Value = resp.json().await?;
         provider.transform_response(model, body)
     }
@@ -181,8 +184,11 @@ impl ShimClient {
         let mut req_value = request.clone();
         req_value["stream"] = serde_json::Value::Bool(true);
 
-        let provider_req = provider.transform_request(model, &req_value)?;
+        let provider_req = provider.prepare_request(model, &req_value).await?;
         let resp = self.send(&provider_req).await?;
+        if provider.name() == "chatgpt" {
+            return Ok(crate::providers::chatgpt::response_stream(model, resp));
+        }
         let provider_name = provider.name().to_string();
         let model_str = model.to_string();
 

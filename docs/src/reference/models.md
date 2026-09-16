@@ -9,12 +9,12 @@ curl http://localhost:3000/v1/models
 ```
 
 Both commands filter the built-in registry to providers with configured API
-keys. The proxy returns `id`, `provider`, and unprefixed `name`; the CLI prints
+keys or a saved ChatGPT login. The proxy returns `id`, `provider`, and unprefixed `name`; the CLI prints
 the ID and display label.
 
 ## Registered catalog
 
-The current registry contains 27 entries, newest first within each provider.
+The current registry contains 32 entries, newest first within each provider.
 This page mirrors `src/models.rs`; use runtime discovery rather than parsing
 this table in applications.
 
@@ -48,6 +48,7 @@ this table in applications.
 
 | ID | Display name |
 |---|---|
+| `gemini/gemini-3.8-flash` | Gemini 3.8 Flash |
 | `gemini/gemini-3.7-flash` | Gemini 3.7 Flash |
 | `gemini/gemini-3.6-flash` | Gemini 3.6 Flash |
 | `gemini/gemini-3.5-flash` | Gemini 3.5 Flash |
@@ -64,6 +65,21 @@ this table in applications.
 | `xai/grok-4.20-multi-agent-beta-0309` | Grok 4.20 Multi-Agent |
 | `xai/grok-4.20-beta-0309-reasoning` | Grok 4.20 Reasoning |
 | `xai/grok-4.20-beta-0309-non-reasoning` | Grok 4.20 |
+
+### ChatGPT subscription
+
+| ID | Display name |
+|---|---|
+| `chatgpt/gpt-6-astra` | GPT-6 Astra (ChatGPT) |
+| `chatgpt/gpt-5.6-sol` | GPT-5.6 Sol (ChatGPT) |
+| `chatgpt/gpt-5.6-terra` | GPT-5.6 Terra (ChatGPT) |
+| `chatgpt/gpt-5.6-luna` | GPT-5.6 Luna (ChatGPT) |
+
+The ChatGPT provider accepts only these four model IDs. Older and unlisted
+IDs are rejected locally before authentication or network calls, including
+when selected through a Router alias. The list is not an account entitlement
+check. Context and output limits remain unspecified because they depend on
+the account/backend. Bare GPT names still route to API-key OpenAI.
 
 ## Spec metadata
 
@@ -114,13 +130,16 @@ if let Some(m) = llmshim::models::spec("openai/gpt-5.6-sol") {
 (`"gpt-5.6-sol"`) and returns `None` for unregistered models. These specs are a
 point-in-time snapshot pinned by the crate version, exactly like the list above.
 
-## Catalog is not an allowlist
+## Routing beyond the catalog
 
 The Router does not check explicit model names against this registry. If a
 provider is registered, `provider/arbitrary-model-id` is routed to that
 provider with `arbitrary-model-id` unchanged. A bare, unregistered model name
 works only when its prefix identifies a provider (`gpt`, `o1`, `o3`, `o4`,
 `claude`, `gemini`, or `grok`).
+
+The ChatGPT provider is the exception: it validates requests against the four
+supported subscription models above.
 
 **OpenRouter** is intentionally not enumerated above — its catalog is large and
 dynamic. Any `openrouter/<vendor>/<model>` slug routes through (e.g.
