@@ -5,63 +5,13 @@ use llmshim::log::{LogEntry, Logger, RequestTimer};
 use serde_json::{json, Value};
 use std::io::{self, Write};
 
-const MODELS: &[(&str, &str)] = &[
-    ("openai/gpt-5.6-sol", "GPT-5.6 Sol"),
-    ("openai/gpt-5.6-terra", "GPT-5.6 Terra"),
-    ("openai/gpt-5.6-luna", "GPT-5.6 Luna"),
-    ("openai/gpt-5.5", "GPT-5.5"),
-    ("openai/gpt-5.5-pro", "GPT-5.5 Pro"),
-    ("openai/gpt-5.4", "GPT-5.4"),
-    ("openai/gpt-5.4-pro", "GPT-5.4 Pro"),
-    ("openai/gpt-5.4-mini", "GPT-5.4 Mini"),
-    ("openai/gpt-5.4-nano", "GPT-5.4 Nano"),
-    ("anthropic/claude-fable-5-1", "Claude Fable 5.1"),
-    ("anthropic/claude-fable-5", "Claude Fable 5"),
-    ("anthropic/claude-opus-5", "Claude Opus 5"),
-    ("anthropic/claude-opus-4-8", "Claude Opus 4.8"),
-    ("anthropic/claude-sonnet-5", "Claude Sonnet 5"),
-    ("anthropic/claude-opus-4-7", "Claude Opus 4.7"),
-    ("anthropic/claude-opus-4-6", "Claude Opus 4.6"),
-    ("anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6"),
-    ("anthropic/claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
-    ("gemini/gemini-3.8-flash", "Gemini 3.8 Flash"),
-    ("gemini/gemini-3.7-flash", "Gemini 3.7 Flash"),
-    ("gemini/gemini-3.6-flash", "Gemini 3.6 Flash"),
-    ("gemini/gemini-3.5-flash", "Gemini 3.5 Flash"),
-    ("gemini/gemini-3.5-flash-lite", "Gemini 3.5 Flash Lite"),
-    ("gemini/gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite"),
-    ("xai/grok-4.6", "Grok 4.6"),
-    ("xai/grok-4.5", "Grok 4.5"),
-    ("xai/grok-4.3", "Grok 4.3"),
-    (
-        "xai/grok-4.20-multi-agent-beta-0309",
-        "Grok 4.20 Multi-Agent",
-    ),
-    ("xai/grok-4.20-beta-0309-reasoning", "Grok 4.20 Reasoning"),
-    ("xai/grok-4.20-beta-0309-non-reasoning", "Grok 4.20"),
-    (
-        llmshim::models::CHATGPT_MODELS[0].id,
-        llmshim::models::CHATGPT_MODELS[0].label,
-    ),
-    (
-        llmshim::models::CHATGPT_MODELS[1].id,
-        llmshim::models::CHATGPT_MODELS[1].label,
-    ),
-    (
-        llmshim::models::CHATGPT_MODELS[2].id,
-        llmshim::models::CHATGPT_MODELS[2].label,
-    ),
-    (
-        llmshim::models::CHATGPT_MODELS[3].id,
-        llmshim::models::CHATGPT_MODELS[3].label,
-    ),
-];
+use llmshim::models::MODELS;
 
 fn print_models(current: &str) {
     println!("\n  Available models:");
-    for (i, (id, label)) in MODELS.iter().enumerate() {
-        let marker = if *id == current { " ←" } else { "" };
-        println!("    {}. {} ({}){}", i + 1, label, id, marker);
+    for (i, model) in MODELS.iter().enumerate() {
+        let marker = if model.id == current { " ←" } else { "" };
+        println!("    {}. {} ({}){}", i + 1, model.label, model.id, marker);
     }
     println!();
 }
@@ -418,17 +368,13 @@ fn clipboard_text() -> Option<String> {
 }
 
 fn model_label(id: &str) -> &str {
-    MODELS
-        .iter()
-        .find(|(mid, _)| *mid == id)
-        .map(|(_, label)| *label)
+    llmshim::models::spec(id)
+        .map(|model| model.label)
         .unwrap_or(id)
 }
 
-fn is_chatgpt_model(id: &str) -> bool {
-    llmshim::models::CHATGPT_MODELS
-        .iter()
-        .any(|model| model.id == id)
+fn is_known_model_id(id: &str) -> bool {
+    llmshim::models::spec(id).is_some_and(|model| model.id == id)
 }
 
 fn prompt_model_selection(current: &str) -> Option<String> {
@@ -443,20 +389,20 @@ fn prompt_model_selection(current: &str) -> Option<String> {
     // Accept number
     if let Ok(n) = input.parse::<usize>() {
         if n >= 1 && n <= MODELS.len() {
-            return Some(MODELS[n - 1].0.to_string());
+            return Some(MODELS[n - 1].id.to_string());
         }
     }
 
     // Accept model ID directly
-    if MODELS.iter().any(|(id, _)| *id == input) || is_chatgpt_model(input) {
+    if is_known_model_id(input) {
         return Some(input.to_string());
     }
 
     // Accept partial match
     let lower = input.to_lowercase();
-    for (id, label) in MODELS {
-        if id.to_lowercase().contains(&lower) || label.to_lowercase().contains(&lower) {
-            return Some(id.to_string());
+    for model in MODELS {
+        if model.id.to_lowercase().contains(&lower) || model.label.to_lowercase().contains(&lower) {
+            return Some(model.id.to_string());
         }
     }
 
@@ -1260,7 +1206,7 @@ async fn main() {
                 // Accept number
                 if let Ok(n) = query.parse::<usize>() {
                     if n >= 1 && n <= MODELS.len() {
-                        current_model = MODELS[n - 1].0.to_string();
+                        current_model = MODELS[n - 1].id.to_string();
                         println!(
                             "  Switched to: {} ({})\n",
                             model_label(&current_model),
@@ -1270,16 +1216,17 @@ async fn main() {
                     }
                 }
                 let lower = query.to_lowercase();
-                if is_chatgpt_model(query) {
+                if is_known_model_id(query) {
                     current_model = query.to_string();
                     println!("  Switched to: {}\n", current_model);
                     continue;
                 }
-                let found = MODELS.iter().find(|(id, label)| {
-                    id.to_lowercase().contains(&lower) || label.to_lowercase().contains(&lower)
+                let found = MODELS.iter().find(|model| {
+                    model.id.to_lowercase().contains(&lower)
+                        || model.label.to_lowercase().contains(&lower)
                 });
-                if let Some((id, _)) = found {
-                    current_model = id.to_string();
+                if let Some(model) = found {
+                    current_model = model.id.to_string();
                     println!(
                         "  Switched to: {} ({})\n",
                         model_label(&current_model),

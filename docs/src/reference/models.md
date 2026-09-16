@@ -12,38 +12,28 @@ Both commands filter the built-in registry to providers with configured API
 keys or a saved ChatGPT login. The proxy returns `id`, `provider`, and unprefixed `name`; the CLI prints
 the ID and display label.
 
-## Registered catalog
+## Advertised catalog
 
-The current registry contains 34 entries, newest first within each provider.
-This page mirrors `src/models.rs`; use runtime discovery rather than parsing
-this table in applications.
+The CLI picker, `llmshim models`, and `/v1/models` share this curated set of
+15 routes. It keeps the current model in each retained tier. Google entries
+are stable releases only. Credentials determine which providers are listed.
 
 ### OpenAI
 
 | ID | Display name |
 |---|---|
+| `openai/gpt-6-astra` | GPT-6 Astra |
 | `openai/gpt-5.6-sol` | GPT-5.6 Sol |
 | `openai/gpt-5.6-terra` | GPT-5.6 Terra |
 | `openai/gpt-5.6-luna` | GPT-5.6 Luna |
-| `openai/gpt-5.5` | GPT-5.5 |
-| `openai/gpt-5.5-pro` | GPT-5.5 Pro |
-| `openai/gpt-5.4` | GPT-5.4 |
-| `openai/gpt-5.4-pro` | GPT-5.4 Pro |
-| `openai/gpt-5.4-mini` | GPT-5.4 Mini |
-| `openai/gpt-5.4-nano` | GPT-5.4 Nano |
 
 ### Anthropic
 
 | ID | Display name |
 |---|---|
 | `anthropic/claude-fable-5-1` | Claude Fable 5.1 |
-| `anthropic/claude-fable-5` | Claude Fable 5 |
 | `anthropic/claude-opus-5` | Claude Opus 5 |
-| `anthropic/claude-opus-4-8` | Claude Opus 4.8 |
 | `anthropic/claude-sonnet-5` | Claude Sonnet 5 |
-| `anthropic/claude-opus-4-7` | Claude Opus 4.7 |
-| `anthropic/claude-opus-4-6` | Claude Opus 4.6 |
-| `anthropic/claude-sonnet-4-6` | Claude Sonnet 4.6 |
 | `anthropic/claude-haiku-4-5-20251001` | Claude Haiku 4.5 |
 
 ### Google Gemini
@@ -51,22 +41,13 @@ this table in applications.
 | ID | Display name |
 |---|---|
 | `gemini/gemini-3.8-flash` | Gemini 3.8 Flash |
-| `gemini/gemini-3.7-flash` | Gemini 3.7 Flash |
-| `gemini/gemini-3.6-flash` | Gemini 3.6 Flash |
-| `gemini/gemini-3.5-flash` | Gemini 3.5 Flash |
 | `gemini/gemini-3.5-flash-lite` | Gemini 3.5 Flash Lite |
-| `gemini/gemini-3.1-flash-lite` | Gemini 3.1 Flash Lite |
 
 ### xAI
 
 | ID | Display name |
 |---|---|
 | `xai/grok-4.6` | Grok 4.6 |
-| `xai/grok-4.5` | Grok 4.5 |
-| `xai/grok-4.3` | Grok 4.3 |
-| `xai/grok-4.20-multi-agent-beta-0309` | Grok 4.20 Multi-Agent |
-| `xai/grok-4.20-beta-0309-reasoning` | Grok 4.20 Reasoning |
-| `xai/grok-4.20-beta-0309-non-reasoning` | Grok 4.20 |
 
 ### ChatGPT subscription
 
@@ -102,17 +83,15 @@ parallel table:
 | `capabilities.reasoning` | `Support` | Accepts a reasoning-effort control |
 
 `Support` is tri-state: `Supported`, `Unsupported`, or `Unknown`. **`Unknown` is
-honest, not a bug** — llmshim never guesses a spec to fill a cell. As of the
-2026-07-16 snapshot, context window, output ceiling, and capabilities are
-populated from official provider docs (platform.claude.com, developers.openai.com,
+honest, not a bug** — llmshim never guesses a spec to fill a cell. Context
+window, output ceiling, and capabilities are versioned snapshots populated
+from official provider docs (platform.claude.com, developers.openai.com,
 ai.google.dev, docs.x.ai), and `reasoning` is cross-checked against the provider
 clamp logic. What's deliberately left `Unknown`/`None`:
 
 - `parallel_tool_calls` for most models (providers rarely document it per model);
 - xAI `max_output_tokens` (not published) and per-model streaming.
 
-A few documented exceptions are recorded honestly too — e.g. `gpt-5.5-pro` has
-`streaming: Unsupported` and `gpt-5.4-pro` has `structured_output: Unsupported`.
 Note also that Gemini publishes an input limit rather than a combined total, so
 `context_window_tokens` is the input window with `max_output_tokens` separate.
 
@@ -129,10 +108,16 @@ if let Some(m) = llmshim::models::spec("openai/gpt-5.6-sol") {
 ```
 
 `spec()` accepts a full id (`"openai/gpt-5.6-sol"`) or a bare name
-(`"gpt-5.6-sol"`) and returns `None` for unregistered models. These specs are a
-point-in-time snapshot pinned by the crate version, exactly like the list above.
+(`"gpt-5.6-sol"`). It also retains historical metadata for explicit lookups;
+those models are absent from the advertised list. `None` means no metadata
+is recorded. Specs remain a point-in-time snapshot pinned by the crate version.
 
 ## Routing beyond the catalog
+
+Pruning the advertised list does not remove provider adapters or their
+compatibility behavior. Older explicit IDs still reach their provider, subject
+to upstream availability. Known historical IDs also remain selectable by
+exact ID in the CLI, and `spec()` keeps their metadata.
 
 The Router does not check explicit model names against this registry. If a
 provider is registered, `provider/arbitrary-model-id` is routed to that
@@ -145,7 +130,7 @@ supported subscription models above.
 
 **OpenRouter** is intentionally not enumerated above — its catalog is large and
 dynamic. Any `openrouter/<vendor>/<model>` slug routes through (e.g.
-`openrouter/anthropic/claude-sonnet-4.5`, `openrouter/meta-llama/llama-3.1-70b-instruct:nitro`);
+`openrouter/anthropic/claude-sonnet-5`, `openrouter/meta-llama/llama-3.1-70b-instruct:nitro`);
 the slug's internal slash and `:variant` suffix are preserved. Because its
 slugs collide with other providers' prefixes, OpenRouter has no bare-model
 inference — always address it explicitly as `openrouter/…`.

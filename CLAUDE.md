@@ -10,14 +10,14 @@ A pure Rust LLM API translation layer. Takes OpenAI-format JSON requests, transl
 
 This is a public crate on crates.io. Do NOT make breaking changes to `pub` items in `src/lib.rs`, `src/router.rs`, `src/provider.rs`, `src/error.rs`, `src/fallback.rs`, `src/log.rs`, `src/config.rs`, `src/models.rs`, or `src/vision.rs` without a semver bump.
 
-## Supported models
+## Advertised models
 
-- **OpenAI:** `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano`
+- **OpenAI:** `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`
 - **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-5.6-sol`, `chatgpt/gpt-5.6-terra`, and `chatgpt/gpt-5.6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
-- **Anthropic:** `claude-fable-5-1`, `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
-- **Gemini:** `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`
-- **xAI:** `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`
-- **OpenRouter:** not enumerated (huge/dynamic catalog) — any `openrouter/<vendor>/<model>` slug routes through, e.g. `openrouter/anthropic/claude-sonnet-4.5`.
+- **Anthropic:** `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`
+- **Gemini:** `gemini-3.8-flash`, `gemini-3.5-flash-lite`
+- **xAI:** `grok-4.6`
+- **OpenRouter:** not enumerated (huge/dynamic catalog) — any `openrouter/<vendor>/<model>` slug routes through, e.g. `openrouter/anthropic/claude-sonnet-5`.
 - **vLLM / SGLang:** not enumerated (self-hosted) — any `vllm/<served-model>` or `sglang/<served-model>` routes through to the configured server, e.g. `sglang/Qwen/Qwen3.6-35B-A3B-FP8`.
 
 ## Build & Test
@@ -36,6 +36,20 @@ cargo run --features proxy -- proxy                  # proxy server on :3000
 API keys: `~/.llmshim/config.toml` (via `llmshim configure`) or env vars `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`. Precedence: env vars > config file. Self-hosted servers are configured by **base URL** instead of a key: `VLLM_BASE_URL` / `SGLANG_BASE_URL` (each with an optional `VLLM_API_KEY` / `SGLANG_API_KEY`); the provider registers only when its base URL is set. Local vs remote is just the URL value.
 
 ## Architecture
+
+### Curated discovery
+
+`src/models.rs::MODELS` is the single advertised list, imported directly by
+`src/main.rs` and used by `available_models()` for proxy discovery. Keep the
+current model in each retained tier: four OpenAI, four Anthropic, two stable
+Gemini, one xAI, and four ChatGPT routes. Do not add previews or bring back
+superseded generations without an explicit catalog decision.
+
+Historical metadata lives in private `LEGACY_MODELS` and remains queryable via
+`spec()`. Pruning discovery does not delete legacy transforms, tests, or
+explicit-ID routing. ChatGPT keeps its separately authorized four-ID request
+allowlist. Keep reader-facing model tables and examples current; retain the
+actual model IDs in historical benchmark results and regression fixtures.
 
 ### Value-based transforms, no canonical struct
 
@@ -85,7 +99,7 @@ directory writable for container use so refresh locks and atomic saves work.
 
 ```
 llmshim::completion(router, request)
-  → router.resolve("anthropic/claude-sonnet-4-6")   // parse "provider/model"
+  → router.resolve("anthropic/claude-sonnet-5")   // parse "provider/model"
   → provider.prepare_request(model, &value).await    // refresh OAuth if needed, then transform
   → client.send(provider_request)                    // HTTP
   → provider.transform_response(model, body)         // provider-native → OpenAI JSON
@@ -104,7 +118,7 @@ Streaming status handling is separate and is not changed by this policy.
 
 ### Router (`src/router.rs`)
 
-Parses `"provider/model"` strings by splitting on the **first** `/` only, so an OpenRouter slug's internal slash survives (`openrouter/anthropic/claude-sonnet-4.5` → provider `openrouter`, model `anthropic/claude-sonnet-4.5`). Auto-infers provider from prefix (`gpt*`/`o*` → openai, `claude*` → anthropic, `gemini*` → gemini, `grok*` → xai); **OpenRouter, vLLM, and SGLang have no prefix inference** — their slugs collide with everyone's, so address them explicitly (`openrouter/…`, `vllm/…`, `sglang/…`); the first-slash split also preserves HF-style served-model slugs (`vllm/meta-llama/Llama-3.1-8B-Instruct`). Supports aliases. `Router::from_env()` reads API-key env vars, plus `VLLM_BASE_URL` / `SGLANG_BASE_URL` (+ optional `*_API_KEY`) for the self-hosted providers.
+Parses `"provider/model"` strings by splitting on the **first** `/` only, so an OpenRouter slug's internal slash survives (`openrouter/anthropic/claude-sonnet-5` → provider `openrouter`, model `anthropic/claude-sonnet-5`). Auto-infers provider from prefix (`gpt*`/`o*` → openai, `claude*` → anthropic, `gemini*` → gemini, `grok*` → xai); **OpenRouter, vLLM, and SGLang have no prefix inference** — their slugs collide with everyone's, so address them explicitly (`openrouter/…`, `vllm/…`, `sglang/…`); the first-slash split also preserves HF-style served-model slugs (`vllm/meta-llama/Llama-3.1-8B-Instruct`). Supports aliases. `Router::from_env()` reads API-key env vars, plus `VLLM_BASE_URL` / `SGLANG_BASE_URL` (+ optional `*_API_KEY`) for the self-hosted providers.
 
 ### HTTP Client (`src/client.rs`)
 
@@ -135,8 +149,8 @@ Callers pass provider-specific controls under these keys. Each provider copies w
 
 ### Unified reasoning controls
 
-**Fable 5 / 5.1 (verified September 2026).** Register both catalog and CLI
-entries. Both use always-on adaptive thinking; unified `none` clamps to `low`,
+**Fable compatibility (verified September 2026).** Advertise Fable 5.1;
+retain Fable 5 behavior and metadata for explicit requests. Both use always-on adaptive thinking; unified `none` clamps to `low`,
 and native disabled/manual thinking fails locally. Strip `temperature`,
 `top_p`, and `top_k` for Fable and Opus 5 even without an explicit thinking
 object. Fable 5.1 rejects forced tool selection (`required` / `any` / `tool`);

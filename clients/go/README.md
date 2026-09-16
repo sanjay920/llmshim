@@ -38,7 +38,7 @@ func main() {
 	client := llmshim.New() // defaults to http://localhost:3000
 
 	resp, err := client.Chat(ctx, llmshim.ChatRequest{
-		Model:    "anthropic/claude-sonnet-4-6",
+		Model:    "anthropic/claude-sonnet-5",
 		Messages: []llmshim.Message{{Role: "user", Content: "What is Rust?"}},
 	})
 	if err != nil {
@@ -56,7 +56,7 @@ event with `Err` set.
 
 ```go
 ch, err := client.Stream(ctx, llmshim.ChatRequest{
-	Model:    "anthropic/claude-sonnet-4-6",
+	Model:    "anthropic/claude-sonnet-5",
 	Messages: []llmshim.Message{{Role: "user", Content: "Write a haiku"}},
 })
 if err != nil {
@@ -101,7 +101,7 @@ resp, err := client.Chat(ctx, llmshim.ChatRequest{
 		ReasoningMode: "pro",
 	},
 	// Ordered fallback models tried on retryable errors (429/500/502/503).
-	Fallback: []string{"gemini/gemini-3.5-flash"},
+	Fallback: []string{"gemini/gemini-3.8-flash"},
 })
 ```
 
@@ -114,7 +114,7 @@ the root where no provider reads it and is silently ignored.
 
 Each provider's transform pulls the settings out of its own `x-<provider>`
 namespace and drops the namespace before the request goes upstream. Use
-`x-anthropic`, `x-gemini`, `x-openai`, `x-xai`, `x-openrouter`, `x-vllm`, or
+`x-anthropic`, `x-gemini`, `x-openai`, `x-chatgpt`, `x-openrouter`, `x-vllm`, or
 `x-sglang`. `provider_config` also carries the provider-agnostic keys `tools`,
 `response_format`, and `reasoning_summary` at the root.
 
@@ -125,10 +125,8 @@ resp, err := client.Chat(ctx, llmshim.ChatRequest{
 	// Namespaced under x-anthropic so Anthropic's transform picks it up.
 	ProviderConfig: map[string]any{
 		"x-anthropic": map[string]any{
-			"thinking": map[string]any{
-				"type":          "enabled",
-				"budget_tokens": 4000,
-			},
+			"thinking": map[string]any{"type": "adaptive"},
+			"output_config": map[string]any{"effort": "high"},
 		},
 	},
 })
@@ -218,14 +216,14 @@ from environment variables, and provider-native controls go under its
 | --- | --- | --- | --- |
 | OpenAI | `openai/gpt-5.6-sol` | `OPENAI_API_KEY` | `x-openai` |
 | Anthropic | `anthropic/claude-sonnet-5` | `ANTHROPIC_API_KEY` | `x-anthropic` |
-| Gemini | `gemini/gemini-3.5-flash` | `GEMINI_API_KEY` | `x-gemini` |
-| xAI | `xai/grok-4.5` | `XAI_API_KEY` | `x-xai` |
+| Gemini | `gemini/gemini-3.8-flash` | `GEMINI_API_KEY` | `x-gemini` |
+| xAI | `xai/grok-4.6` | `XAI_API_KEY` | none (unified reasoning controls) |
 | OpenRouter | `openrouter/<vendor>/<model>` | `OPENROUTER_API_KEY` | `x-openrouter` |
 | vLLM | `vllm/<served-model>` | `VLLM_BASE_URL` (+ optional `VLLM_API_KEY`) | `x-vllm` |
 | SGLang | `sglang/<served-model>` | `SGLANG_BASE_URL` (+ optional `SGLANG_API_KEY`) | `x-sglang` |
 
 **OpenRouter** routes to any upstream vendor, e.g.
-`openrouter/anthropic/claude-sonnet-4.5`. Steer routing with `x-openrouter`
+`openrouter/anthropic/claude-sonnet-5`. Steer routing with `x-openrouter`
 controls such as `provider` (e.g. `{"sort": "throughput"}`), `models`, and
 `transforms`:
 

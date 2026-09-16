@@ -16,7 +16,7 @@ Start with a history:
 Send it to another provider by keeping `messages` and changing the address:
 
 ```diff
-- "model": "anthropic/claude-opus-4-8"
+- "model": "anthropic/claude-opus-5"
 + "model": "openai/gpt-5.6-sol"
 ```
 
