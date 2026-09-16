@@ -1,6 +1,6 @@
 # Configure providers
 
-llmshim needs a key only for the provider that handles a request. Configure one
+llmshim needs credentials only for the provider that handles a request. Configure one
 provider to begin; add others when you want to switch models.
 
 > **Availability:** Rust: environment, optional config load · CLI/proxy: environment + config file · Clients: the proxy owns provider keys
@@ -44,6 +44,22 @@ Valid key names are `openai`, `anthropic`, `gemini`, `xai`, `proxy.host`, and
 to `set` may remain in your shell history; the interactive command avoids that
 shell-history exposure.
 
+## Option 3: ChatGPT subscription login
+
+```bash
+llmshim login chatgpt
+```
+
+Open the printed URL, sign in, and enter the device code. Select
+`chatgpt/gpt-6-astra` or one of `chatgpt/gpt-5.6-sol`, `chatgpt/gpt-5.6-terra`,
+and `chatgpt/gpt-5.6-luna`. Only those four models are supported. ChatGPT tokens are
+stored separately from API keys and refreshed automatically. Device login may
+need enabling in ChatGPT security settings or workspace permissions.
+
+`llmshim login chatgpt --status` checks the saved session. See
+[ChatGPT OAuth configuration](../reference/configuration.md#chatgpt-oauth)
+for custom cache paths and container setup.
+
 ## Precedence: environment wins
 
 The CLI and proxy call `llmshim::env::load_all()`. It reads
@@ -66,7 +82,7 @@ wants the same behavior must call `llmshim::env::load_all()` first. See
 llmshim models
 ```
 
-The command lists registry entries only for providers whose keys are available
+The command lists registry entries only for providers whose keys or OAuth cache are available
 after applying the precedence above. Runtime discovery is the canonical way to
 see the current curated model list.
 

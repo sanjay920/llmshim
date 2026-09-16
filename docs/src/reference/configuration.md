@@ -9,6 +9,7 @@ set. Therefore **environment variables take precedence over the file**.
 | Provider | Environment variable | Config key |
 |---|---|---|
 | OpenAI | `OPENAI_API_KEY` | `keys.openai` |
+| ChatGPT subscription | `llmshim login chatgpt` (OAuth cache) | — |
 | Anthropic | `ANTHROPIC_API_KEY` | `keys.anthropic` |
 | Google Gemini | `GEMINI_API_KEY` | `keys.gemini` |
 | xAI | `XAI_API_KEY` | `keys.xai` |
@@ -43,9 +44,39 @@ llmshim path
 Valid `set`/`get` keys are `openai`, `anthropic`, `gemini`, `xai`,
 `proxy.host`, and `proxy.port`. Displayed API keys are masked.
 
-`Router::from_env()` reads environment variables only. A Rust application that
+`Router::from_env()` reads environment variables and discovers the ChatGPT OAuth cache. A Rust application that
 wants the file behavior must call `llmshim::env::load_all()` before constructing
 the Router. See [Models and the Router](../concepts/routing.md).
+
+## ChatGPT OAuth
+
+Run `llmshim login chatgpt` and complete the printed device-code login before
+using `chatgpt/<model>`. `llmshim login chatgpt --status` checks the cache
+locally; `llmshim logout chatgpt` removes it without revoking the upstream
+session. Device-code login may need enabling in ChatGPT security settings or
+workspace permissions. See [OpenAI authentication](https://learn.chatgpt.com/docs/auth).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHATGPT_TOKEN_DIR` | `~/.llmshim/chatgpt` | Writable OAuth cache directory |
+| `CHATGPT_AUTH_FILE` | `auth.json` | Cache filename (an absolute path overrides the directory) |
+| `CHATGPT_API_BASE` | `https://chatgpt.com/backend-api/codex` | Backend base URL; `/responses` is appended |
+| `OPENAI_CHATGPT_API_BASE` | unset | Alias used when `CHATGPT_API_BASE` is unset or empty |
+| `CHATGPT_ORIGINATOR` | `codex_cli_rs` | Backend originator header |
+| `CHATGPT_USER_AGENT` | version/platform string identifying llmshim | User-Agent override |
+| `CHATGPT_USER_AGENT_SUFFIX` | unset | Text appended to User-Agent |
+
+Tokens use LiteLLM's flat JSON format (`access_token`, `refresh_token`,
+`id_token`, `expires_at`, `account_id`). The default cache is separate from
+LiteLLM and Codex. Refreshes are serialized across processes sharing that file
+and saved atomically; new token files have Unix mode `0600`. An expired or
+unreadable session returns an error, never a background interactive login.
+
+The router registers ChatGPT when the selected cache file exists. Create a new
+router or restart the proxy after the first login. Once registered, requests
+read the cache each time, so refreshed or replaced tokens need no restart.
+Container users must mount the cache directory writable, including space for
+its lock and temporary files. The stock Docker helper does not mount it.
 
 ## Proxy listener
 

@@ -39,11 +39,16 @@ explicit address when inference cannot identify the provider.
 Resolution succeeds only when the selected provider key is registered on the
 Router. The built-in `Router::from_env()` registers OpenAI, Anthropic, Gemini,
 and xAI only when their corresponding environment variables are present.
+ChatGPT is registered when its OAuth cache exists; sign in with
+`llmshim login chatgpt` before starting the proxy. Use `chatgpt/<model>` to
+select subscription access. Bare GPT names continue to use OpenAI API keys.
 
 The static model registry powers `llmshim models` and `GET /v1/models`. Those
 commands are discovery aids, filtered to configured providers. The registry is
-not an allowlist: routing does not reject a model merely because it is absent
-from that list.
+not generally an allowlist: most providers accept models absent from that list.
+ChatGPT accepts only `chatgpt/gpt-6-astra` and the three
+`chatgpt/gpt-5.6-{sol,terra,luna}` models. The provider rejects other IDs
+before authentication or network calls, including through aliases.
 
 For that reason, this documentation does not maintain another static model
 table. Use runtime discovery for the current curated list.
@@ -67,9 +72,10 @@ API, or language clients.
 
 ## Environment variables versus `config.toml`
 
-`Router::from_env()` means exactly what its name says: it reads
+`Router::from_env()` reads provider environment variables such as
 `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and `XAI_API_KEY`. It
-does not read `~/.llmshim/config.toml` by itself.
+does not read `~/.llmshim/config.toml` by itself. It also discovers the selected
+ChatGPT OAuth cache, whose default location is `~/.llmshim/chatgpt/auth.json`.
 
 The CLI and proxy call `llmshim::env::load_all()` before constructing their
 Router. That function loads the config file and fills only environment
@@ -84,4 +90,3 @@ let router = llmshim::router::Router::from_env();
 
 Applications that manage secrets themselves can call `Router::from_env()`
 directly or construct a Router by registering provider implementations.
-

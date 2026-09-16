@@ -11,7 +11,7 @@ fn models_registry_has_all_providers() {
 
 #[test]
 fn models_registry_has_expected_count() {
-    assert_eq!(MODELS.len(), 28);
+    assert_eq!(MODELS.len(), 32);
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn available_models_empty_providers_returns_empty() {
 
 #[test]
 fn available_models_all_providers_returns_all() {
-    let registered = vec!["openai", "anthropic", "gemini", "xai"];
+    let registered = vec!["openai", "anthropic", "gemini", "xai", "chatgpt"];
     let models = available_models(&registered);
     assert_eq!(models.len(), MODELS.len());
 }

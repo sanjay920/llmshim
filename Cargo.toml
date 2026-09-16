@@ -35,6 +35,9 @@ chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.28"
 toml = "0.8"
 dirs = "6"
+base64 = "0.22"
+tempfile = "3"
+fs2 = "0.4"
 
 # Proxy dependencies (feature-gated)
 axum = { version = "0.8", features = ["json"], optional = true }

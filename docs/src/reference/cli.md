@@ -12,6 +12,8 @@ print top-level help. Interactive chat starts only with `llmshim chat`.
 | `llmshim chat` | `--log <path>` | Start interactive, streaming chat |
 | `llmshim proxy` | none | Start the HTTP proxy |
 | `llmshim configure` | none | Prompt for four provider keys and proxy host/port |
+| `llmshim login chatgpt` | `--status` | Sign in via device code, or inspect the local cache |
+| `llmshim logout chatgpt` | none | Remove the selected local ChatGPT OAuth cache |
 | `llmshim set` | `<key> <value>` | Write one config value |
 | `llmshim get` | `<key>` | Read one config value; keys are masked |
 | `llmshim list` | none | Show masked keys and proxy settings; alias: `ls` |
@@ -47,6 +49,10 @@ the next route without clearing that history.
 Existing image paths can also appear inline in a prompt. In an interactive
 terminal, Ctrl-V pastes an image when the platform clipboard integration can
 read one; otherwise it pastes text.
+
+After `llmshim login chatgpt`, choose a ChatGPT entry in the picker or enter
+one of the four supported IDs: `chatgpt/gpt-6-astra`, `chatgpt/gpt-5.6-sol`,
+`chatgpt/gpt-5.6-terra`, or `chatgpt/gpt-5.6-luna`. `/model` uses the same list.
 
 `--log <path>` appends JSONL request records. If it is absent, chat checks
 `LLMSHIM_LOG`.

@@ -174,6 +174,74 @@ const CAPS_XAI: ModelCapabilities = ModelCapabilities {
     parallel_tool_calls: Support::Unknown,
     reasoning: Support::Supported,
 };
+/// Supported ChatGPT subscription models; also used for request validation.
+pub const CHATGPT_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "chatgpt/gpt-6-astra",
+        provider: "chatgpt",
+        name: "gpt-6-astra",
+        label: "GPT-6 Astra (ChatGPT)",
+        // Subscription entitlements and limits are account-dependent.
+        context_window_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            tools: Support::Supported,
+            streaming: Support::Supported,
+            images: Support::Supported,
+            reasoning: Support::Supported,
+            ..ModelCapabilities::unknown()
+        },
+    },
+    ModelInfo {
+        id: "chatgpt/gpt-5.6-sol",
+        provider: "chatgpt",
+        name: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol (ChatGPT)",
+        // Subscription entitlements and limits are account-dependent.
+        context_window_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            tools: Support::Supported,
+            streaming: Support::Supported,
+            images: Support::Supported,
+            reasoning: Support::Supported,
+            ..ModelCapabilities::unknown()
+        },
+    },
+    ModelInfo {
+        id: "chatgpt/gpt-5.6-terra",
+        provider: "chatgpt",
+        name: "gpt-5.6-terra",
+        label: "GPT-5.6 Terra (ChatGPT)",
+        // Subscription entitlements and limits are account-dependent.
+        context_window_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            tools: Support::Supported,
+            streaming: Support::Supported,
+            images: Support::Supported,
+            reasoning: Support::Supported,
+            ..ModelCapabilities::unknown()
+        },
+    },
+    ModelInfo {
+        id: "chatgpt/gpt-5.6-luna",
+        provider: "chatgpt",
+        name: "gpt-5.6-luna",
+        label: "GPT-5.6 Luna (ChatGPT)",
+        // Subscription entitlements and limits are account-dependent.
+        context_window_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            tools: Support::Supported,
+            streaming: Support::Supported,
+            images: Support::Supported,
+            reasoning: Support::Supported,
+            ..ModelCapabilities::unknown()
+        },
+    },
+];
+
 pub const MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "openai/gpt-5.6-sol",
@@ -436,9 +504,13 @@ pub const MODELS: &[ModelInfo] = &[
         max_output_tokens: None,
         capabilities: CAPS_XAI.with_reasoning(Support::Unsupported),
     },
+    CHATGPT_MODELS[0],
+    CHATGPT_MODELS[1],
+    CHATGPT_MODELS[2],
+    CHATGPT_MODELS[3],
 ];
 
-/// Get models filtered to only providers that are registered (have API keys).
+/// Get models filtered to only providers that are registered (keys or OAuth).
 pub fn available_models(registered_providers: &[&str]) -> Vec<&'static ModelInfo> {
     MODELS
         .iter()

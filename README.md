@@ -1,6 +1,6 @@
 # llmshim
 
-A blazing-fast LLM API translation layer written in **pure Rust**. One request format, every provider — OpenAI, Anthropic, Google Gemini, xAI, OpenRouter, and self-hosted vLLM / SGLang.
+A blazing-fast LLM API translation layer written in **pure Rust**. One request format, every provider — OpenAI, ChatGPT subscriptions, Anthropic, Google Gemini, xAI, OpenRouter, and self-hosted vLLM / SGLang.
 
 Send an OpenAI-style request, pick any model, and llmshim translates it to that provider's native API (and translates the response back). Switch providers by changing one string.
 
@@ -75,6 +75,54 @@ llmshim configure          # interactive prompt
 ```
 
 ---
+
+## ChatGPT subscription (OAuth)
+
+Sign in once with a ChatGPT account, then use `chatgpt/<model>` from Rust,
+the CLI, or any proxy client. No `OPENAI_API_KEY` is needed for this route.
+The device-code flow follows [LiteLLM's ChatGPT provider](https://docs.litellm.ai/docs/providers/chatgpt).
+
+```bash
+llmshim login chatgpt             # open the printed URL and enter the code
+llmshim login chatgpt --status    # inspect the saved login without network access
+llmshim chat                     # select a ChatGPT model
+# or: llmshim proxy
+```
+
+If needed, enable device-code login in your ChatGPT security settings or
+workspace permissions ([OpenAI authentication docs](https://learn.chatgpt.com/docs/auth#preferred-device-code-authentication-beta)).
+
+```json
+{
+  "model": "chatgpt/gpt-6-astra",
+  "messages": [{"role": "user", "content": "Hello!"}]
+}
+```
+
+Tokens live in `~/.llmshim/chatgpt/auth.json`; expired access tokens refresh
+automatically, with file locking and atomic saves. `CHATGPT_TOKEN_DIR` and
+`CHATGPT_AUTH_FILE` select a different cache (LiteLLM's flat auth-file format
+is supported). This cache is independent of Codex's login. Run
+`llmshim logout chatgpt` to remove the selected local cache; this does not
+revoke the session at OpenAI. Login is explicit, never started inside a proxy
+request. Restart an existing proxy after the first login so it registers the
+provider. For containers, mount the token directory writable and set
+`CHATGPT_TOKEN_DIR` to its container path.
+
+Both completion and streaming calls use the subscription Responses backend.
+Non-streaming calls collect the upstream stream into one normal response.
+Tools, images, and reasoning use the existing Responses translation;
+`x-chatgpt` supplies supported native fields (under `provider_config` in proxy
+requests). The backend requires `store: false` and `stream: true` and rejects
+token limits, sampling fields, and metadata, so these constraints also apply
+to native overrides. Bare `gpt-*` names still route to API-key OpenAI.
+The ChatGPT route supports only `chatgpt/gpt-6-astra`, `chatgpt/gpt-5.6-sol`,
+`chatgpt/gpt-5.6-terra`, and `chatgpt/gpt-5.6-luna`. Older and unlisted model
+IDs return a local error before authentication or an upstream request.
+Access to these models and usage limits depend on the ChatGPT account.
+
+See [provider configuration](docs/src/reference/configuration.md#chatgpt-oauth)
+for endpoint and header overrides.
 
 ## Endpoint redirects
 
@@ -156,6 +204,7 @@ cargo install llmshim --features proxy    # from source (any platform)
 llmshim                     # show help
 llmshim chat                # interactive multi-model chat (streaming, /model to switch)
 llmshim configure           # set API keys
+llmshim login chatgpt        # sign in with a ChatGPT subscription
 llmshim set <key> <value>   # set a config value
 llmshim list                # show configured keys
 llmshim models              # list available models
