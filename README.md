@@ -51,7 +51,7 @@ export OPENROUTER_API_KEY=sk-or-...
 ```
 
 Reach any model through [OpenRouter](https://openrouter.ai) by addressing it as
-`openrouter/<vendor>/<model>` (e.g. `openrouter/anthropic/claude-sonnet-4.5`).
+`openrouter/<vendor>/<model>` (e.g. `openrouter/anthropic/claude-sonnet-5`).
 OpenRouter is OpenAI Chat Completions-compatible, so tools, vision, streaming,
 and `reasoning_effort` all pass through; OpenRouter-only controls (provider
 routing, model fallbacks, transforms) go under an `x-openrouter` key.
@@ -362,7 +362,7 @@ resp = llmshim.chat(
     "anthropic/claude-sonnet-5",
     "Hello",
     max_tokens=100,
-    fallback=["openai/gpt-5.6-sol", "gemini/gemini-3.5-flash"],
+    fallback=["openai/gpt-5.6-sol", "gemini/gemini-3.8-flash"],
 )
 ```
 
@@ -422,16 +422,22 @@ Standard library only. Full docs: [`clients/ruby/README.md`](clients/ruby/README
 
 ---
 
-## Supported models
+## Advertised models
 
 | Provider | Models | Reasoning visible |
 |----------|--------|-------------------|
-| **OpenAI** | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano` | Yes (summaries) |
-| **Anthropic** | `claude-fable-5-1`, `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` | Yes (thinking summaries) |
-| **Google Gemini** | `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` | Yes (thought summaries) |
-| **xAI** | `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning` | No (hidden) |
+| **OpenAI** | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | Yes (summaries) |
+| **Anthropic** | `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001` | Yes (thinking summaries) |
+| **Google Gemini** | `gemini-3.8-flash`, `gemini-3.5-flash-lite` | Yes (thought summaries) |
+| **xAI** | `grok-4.6` | No (hidden) |
 
-Use a bare model name (auto-detected by prefix) or an explicit `provider/model` string.
+The CLI and server advertise these current tiers. ChatGPT subscription access
+uses the same four OpenAI models under `chatgpt/`. OpenRouter and self-hosted
+providers accept caller-selected IDs without a fixed advertised list.
+
+Use a bare model name (auto-detected by prefix) or an explicit `provider/model`
+string. Older explicit IDs retain their provider routing and metadata; the
+ChatGPT route continues to enforce its four-model allowlist.
 
 ## Docker
 

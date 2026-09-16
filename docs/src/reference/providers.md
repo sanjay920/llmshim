@@ -43,7 +43,7 @@ call includes its ID, name, and full JSON arguments, including in the proxy's
 | OpenAI | System/developer text becomes Responses `instructions`; Chat Completions tool definitions are flattened for Responses | `store` defaults to `false`; unified reasoning becomes the native `reasoning` object; `x-openai.reasoning` overrides that mapping |
 | Anthropic | Messages become Anthropic content blocks; tools use `input_schema`, `tool_use`, and `tool_result` | `max_tokens` defaults to 8192 when absent; supported models receive the 1M-context beta by default; `x-anthropic.extra_betas` appends beta headers and `disable_1m_context` suppresses that automatic header |
 | Gemini | Messages become `contents`; tools use `functionDeclarations`, `functionCall`, and `functionResponse` | Base64 images become `inline_data`, but a remote image URL becomes a text placeholder because Gemini cannot consume it directly; `x-gemini.thinkingConfig` replaces mapped thinking configuration |
-| xAI | System/developer text becomes Responses `instructions`; tools are flattened like OpenAI Responses | Unified reasoning becomes `reasoning: {effort}` where the model accepts it; grok-4.20 reasoning is encoded in the model name; there is no `x-xai` namespace |
+| xAI | System/developer text becomes Responses `instructions`; tools are flattened like OpenAI Responses | Unified reasoning becomes `reasoning: {effort}` where the model accepts it; Grok 4.6 clamps `none` to `low` and `max` to `xhigh`; there is no `x-xai` namespace |
 | OpenRouter | Passthrough — messages, tools, `image_url` vision, and `response_format` are already Chat Completions and forwarded unchanged | `reasoning_effort` maps 1:1 to OpenRouter's `reasoning:{effort}` (superset vocabulary, no clamping); `message.reasoning` is normalized to `reasoning_content`; the `middle-out` transform is disabled by default; `x-openrouter` carries `provider`/`models`/`transforms`/`route`/native `reasoning` (and `http_referer`/`x_title` headers) |
 | vLLM / SGLang | Passthrough to a self-hosted server — configured by base URL (local or remote), auth optional | `reasoning`/`reasoning_content` normalized to `reasoning_content`; `reasoning_effort` forwarded (honored per-model); server-specific params (`chat_template_kwargs`, `guided_json`, `top_k`, `separate_reasoning`, …) go under `x-vllm`/`x-sglang`. Reasoning/tool parsing depend on the server's launch flags (`--reasoning-parser`, `--tool-call-parser`) |
 
@@ -54,15 +54,15 @@ forwarded blindly.
 
 ## Tools and multimodal round trips
 
-### Claude Fable 5 and 5.1
+### Claude Fable 5.1
 
-Both Fable models use always-on adaptive thinking, with `low`, `medium`,
+Fable 5.1 uses always-on adaptive thinking, with `low`, `medium`,
 `high`, `xhigh`, and `max` effort. Unified `none` maps to `low`; explicit
 native disabled/manual thinking and assistant prefill return local errors.
-Sampling parameters are omitted for both Fable versions and Opus 5 because
+Sampling parameters are omitted for Fable 5.1 and Opus 5 because
 those models reject them.
 
-Fable 5 accepts forced tool choice. Fable 5.1 accepts only `auto` and `none`:
+Fable 5.1 accepts only `auto` and `none`:
 `required` or a named forced tool returns a local 400 rather than changing the
 request's meaning. Describe the desired tool in the prompt, or use structured
 output when the requirement is a JSON schema. Native `stop_reason: "refusal"`

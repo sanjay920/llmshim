@@ -41,7 +41,7 @@ Provider to add: **$ARGUMENTS**
 
 4. **`src/config.rs`** — if config-file key storage / `llmshim configure` should support it, add the provider there (check how existing providers are wired).
 
-5. **Models** — register the provider's models via `/add-model` (both `src/models.rs` and `src/main.rs`).
+5. **Models** — register the provider's current advertised models via `/add-model` in `src/models.rs`; the CLI imports that catalog directly.
 
 6. **Tests** — add `tests/unit_<key>.rs` covering request/response/stream transforms in the style of `tests/unit_xai.rs`. Add `tests/integration_<key>.rs` with `#[ignore]` tests that need a real API key. Add a `parse_model` case in `tests/unit_router.rs`.
 

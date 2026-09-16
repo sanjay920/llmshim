@@ -9,7 +9,7 @@
 //! guess a number to fill a cell. Specs are a point-in-time snapshot, pinned by
 //! the crate version exactly like the model list itself.
 //!
-//! Spec source (as of 2026-07-16): populated from official provider docs
+//! Specs are versioned snapshots populated from official provider docs
 //! (platform.claude.com, developers.openai.com, ai.google.dev, docs.x.ai).
 //! `reasoning` support is additionally cross-checked against the live-verified
 //! clamp logic in `src/providers/*.rs`. Provider-specific caveats:
@@ -242,7 +242,18 @@ pub const CHATGPT_MODELS: &[ModelInfo] = &[
     },
 ];
 
+/// Curated models advertised in the CLI, proxy discovery, and documentation.
+/// The advertised list keeps the current model in each retained product tier.
 pub const MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "openai/gpt-6-astra",
+        provider: "openai",
+        name: "gpt-6-astra",
+        label: "GPT-6 Astra",
+        context_window_tokens: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_STD,
+    },
     ModelInfo {
         id: "openai/gpt-5.6-sol",
         provider: "openai",
@@ -270,6 +281,79 @@ pub const MODELS: &[ModelInfo] = &[
         max_output_tokens: Some(128_000),
         capabilities: CAPS_STD,
     },
+    ModelInfo {
+        id: "anthropic/claude-fable-5-1",
+        provider: "anthropic",
+        name: "claude-fable-5-1",
+        label: "Claude Fable 5.1",
+        // Anthropic Models API and official model docs, verified 2026-09-15.
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_FULL,
+    },
+    ModelInfo {
+        id: "anthropic/claude-opus-5",
+        provider: "anthropic",
+        name: "claude-opus-5",
+        label: "Claude Opus 5",
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_FULL,
+    },
+    ModelInfo {
+        id: "anthropic/claude-sonnet-5",
+        provider: "anthropic",
+        name: "claude-sonnet-5",
+        label: "Claude Sonnet 5",
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_FULL,
+    },
+    ModelInfo {
+        id: "anthropic/claude-haiku-4-5-20251001",
+        provider: "anthropic",
+        name: "claude-haiku-4-5-20251001",
+        label: "Claude Haiku 4.5",
+        context_window_tokens: Some(200_000),
+        max_output_tokens: Some(64_000),
+        capabilities: CAPS_FULL,
+    },
+    ModelInfo {
+        id: "gemini/gemini-3.8-flash",
+        provider: "gemini",
+        name: "gemini-3.8-flash",
+        label: "Gemini 3.8 Flash",
+        context_window_tokens: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        capabilities: CAPS_STD,
+    },
+    ModelInfo {
+        id: "gemini/gemini-3.5-flash-lite",
+        provider: "gemini",
+        name: "gemini-3.5-flash-lite",
+        label: "Gemini 3.5 Flash Lite",
+        context_window_tokens: Some(1_048_576),
+        max_output_tokens: Some(65_536),
+        capabilities: CAPS_STD,
+    },
+    ModelInfo {
+        id: "xai/grok-4.6",
+        provider: "xai",
+        name: "grok-4.6",
+        label: "Grok 4.6",
+        context_window_tokens: Some(500_000),
+        max_output_tokens: None,
+        capabilities: CAPS_XAI,
+    },
+    CHATGPT_MODELS[0],
+    CHATGPT_MODELS[1],
+    CHATGPT_MODELS[2],
+    CHATGPT_MODELS[3],
+];
+
+/// Historical metadata remains available to explicit `spec()` lookups without
+/// appearing in discovery or model pickers. Routing is provider-owned.
+const LEGACY_MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "openai/gpt-5.5",
         provider: "openai",
@@ -331,16 +415,6 @@ pub const MODELS: &[ModelInfo] = &[
         capabilities: CAPS_STD,
     },
     ModelInfo {
-        id: "anthropic/claude-fable-5-1",
-        provider: "anthropic",
-        name: "claude-fable-5-1",
-        label: "Claude Fable 5.1",
-        // Anthropic Models API and official model docs, verified 2026-09-15.
-        context_window_tokens: Some(1_000_000),
-        max_output_tokens: Some(128_000),
-        capabilities: CAPS_FULL,
-    },
-    ModelInfo {
         id: "anthropic/claude-fable-5",
         provider: "anthropic",
         name: "claude-fable-5",
@@ -351,28 +425,10 @@ pub const MODELS: &[ModelInfo] = &[
         capabilities: CAPS_FULL,
     },
     ModelInfo {
-        id: "anthropic/claude-opus-5",
-        provider: "anthropic",
-        name: "claude-opus-5",
-        label: "Claude Opus 5",
-        context_window_tokens: Some(1_000_000),
-        max_output_tokens: Some(128_000),
-        capabilities: CAPS_FULL,
-    },
-    ModelInfo {
         id: "anthropic/claude-opus-4-8",
         provider: "anthropic",
         name: "claude-opus-4-8",
         label: "Claude Opus 4.8",
-        context_window_tokens: Some(1_000_000),
-        max_output_tokens: Some(128_000),
-        capabilities: CAPS_FULL,
-    },
-    ModelInfo {
-        id: "anthropic/claude-sonnet-5",
-        provider: "anthropic",
-        name: "claude-sonnet-5",
-        label: "Claude Sonnet 5",
         context_window_tokens: Some(1_000_000),
         max_output_tokens: Some(128_000),
         capabilities: CAPS_FULL,
@@ -405,22 +461,49 @@ pub const MODELS: &[ModelInfo] = &[
         capabilities: CAPS_FULL,
     },
     ModelInfo {
-        id: "anthropic/claude-haiku-4-5-20251001",
-        provider: "anthropic",
-        name: "claude-haiku-4-5-20251001",
-        label: "Claude Haiku 4.5",
-        context_window_tokens: Some(200_000),
-        max_output_tokens: Some(64_000),
-        capabilities: CAPS_FULL,
+        id: "xai/grok-4.5",
+        provider: "xai",
+        name: "grok-4.5",
+        label: "Grok 4.5",
+        context_window_tokens: Some(500_000),
+        max_output_tokens: None,
+        capabilities: CAPS_XAI,
     },
     ModelInfo {
-        id: "gemini/gemini-3.8-flash",
-        provider: "gemini",
-        name: "gemini-3.8-flash",
-        label: "Gemini 3.8 Flash",
-        context_window_tokens: Some(1_048_576),
-        max_output_tokens: Some(65_536),
-        capabilities: CAPS_STD,
+        id: "xai/grok-4.3",
+        provider: "xai",
+        name: "grok-4.3",
+        label: "Grok 4.3",
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: None,
+        capabilities: CAPS_XAI,
+    },
+    ModelInfo {
+        id: "xai/grok-4.20-multi-agent-beta-0309",
+        provider: "xai",
+        name: "grok-4.20-multi-agent-beta-0309",
+        label: "Grok 4.20 Multi-Agent",
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: None,
+        capabilities: CAPS_XAI.with_reasoning(Support::Unsupported),
+    },
+    ModelInfo {
+        id: "xai/grok-4.20-beta-0309-reasoning",
+        provider: "xai",
+        name: "grok-4.20-beta-0309-reasoning",
+        label: "Grok 4.20 Reasoning",
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: None,
+        capabilities: CAPS_XAI.with_reasoning(Support::Unsupported),
+    },
+    ModelInfo {
+        id: "xai/grok-4.20-beta-0309-non-reasoning",
+        provider: "xai",
+        name: "grok-4.20-beta-0309-non-reasoning",
+        label: "Grok 4.20",
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: None,
+        capabilities: CAPS_XAI.with_reasoning(Support::Unsupported),
     },
     ModelInfo {
         id: "gemini/gemini-3.7-flash",
@@ -450,15 +533,6 @@ pub const MODELS: &[ModelInfo] = &[
         capabilities: CAPS_FULL,
     },
     ModelInfo {
-        id: "gemini/gemini-3.5-flash-lite",
-        provider: "gemini",
-        name: "gemini-3.5-flash-lite",
-        label: "Gemini 3.5 Flash Lite",
-        context_window_tokens: Some(1_048_576),
-        max_output_tokens: Some(65_536),
-        capabilities: CAPS_STD,
-    },
-    ModelInfo {
         id: "gemini/gemini-3.1-flash-lite",
         provider: "gemini",
         name: "gemini-3.1-flash-lite",
@@ -467,67 +541,6 @@ pub const MODELS: &[ModelInfo] = &[
         max_output_tokens: Some(65_536),
         capabilities: CAPS_STD,
     },
-    ModelInfo {
-        id: "xai/grok-4.6",
-        provider: "xai",
-        name: "grok-4.6",
-        label: "Grok 4.6",
-        context_window_tokens: Some(500_000),
-        max_output_tokens: None,
-        capabilities: CAPS_XAI,
-    },
-    ModelInfo {
-        id: "xai/grok-4.5",
-        provider: "xai",
-        name: "grok-4.5",
-        label: "Grok 4.5",
-        context_window_tokens: Some(500_000),
-        max_output_tokens: None,
-        capabilities: CAPS_XAI,
-    },
-    ModelInfo {
-        id: "xai/grok-4.3",
-        provider: "xai",
-        name: "grok-4.3",
-        label: "Grok 4.3",
-        context_window_tokens: Some(1_000_000),
-        max_output_tokens: None,
-        capabilities: CAPS_XAI,
-    },
-    // grok-4.20-* models are name-locked: reasoning on/off is encoded in the
-    // model name and the API 400s on any reasoning parameter (see
-    // `src/providers/xai.rs::is_reasoning_name_locked`).
-    ModelInfo {
-        id: "xai/grok-4.20-multi-agent-beta-0309",
-        provider: "xai",
-        name: "grok-4.20-multi-agent-beta-0309",
-        label: "Grok 4.20 Multi-Agent",
-        context_window_tokens: Some(1_000_000),
-        max_output_tokens: None,
-        capabilities: CAPS_XAI.with_reasoning(Support::Unsupported),
-    },
-    ModelInfo {
-        id: "xai/grok-4.20-beta-0309-reasoning",
-        provider: "xai",
-        name: "grok-4.20-beta-0309-reasoning",
-        label: "Grok 4.20 Reasoning",
-        context_window_tokens: Some(1_000_000),
-        max_output_tokens: None,
-        capabilities: CAPS_XAI.with_reasoning(Support::Unsupported),
-    },
-    ModelInfo {
-        id: "xai/grok-4.20-beta-0309-non-reasoning",
-        provider: "xai",
-        name: "grok-4.20-beta-0309-non-reasoning",
-        label: "Grok 4.20",
-        context_window_tokens: Some(1_000_000),
-        max_output_tokens: None,
-        capabilities: CAPS_XAI.with_reasoning(Support::Unsupported),
-    },
-    CHATGPT_MODELS[0],
-    CHATGPT_MODELS[1],
-    CHATGPT_MODELS[2],
-    CHATGPT_MODELS[3],
 ];
 
 /// Get models filtered to only providers that are registered (keys or OAuth).
@@ -539,7 +552,11 @@ pub fn available_models(registered_providers: &[&str]) -> Vec<&'static ModelInfo
 }
 
 /// Look up a single model's full spec by full id (`"openai/gpt-5.6-sol"`) or by
-/// bare name (`"gpt-5.6-sol"`). Returns `None` for unregistered models.
+/// bare name (`"gpt-5.6-sol"`), including historical metadata.
+/// Returns `None` when no metadata is recorded for the model.
 pub fn spec(id: &str) -> Option<&'static ModelInfo> {
-    MODELS.iter().find(|m| m.id == id || m.name == id)
+    MODELS
+        .iter()
+        .chain(LEGACY_MODELS)
+        .find(|m| m.id == id || m.name == id)
 }

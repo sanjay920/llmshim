@@ -26,8 +26,12 @@ Valid config keys for `set` and `get` are `openai`, `anthropic`, `gemini`,
 
 ## Interactive chat
 
+The model picker shares the curated catalog used by `llmshim models` and the
+server's `/v1/models` endpoint. An exact historical model ID with recorded
+metadata can still be selected explicitly, but is omitted from the picker.
+
 `llmshim chat` opens a model picker. Pressing Enter without a selection chooses
-`anthropic/claude-sonnet-5`. Every answer streams, requests use
+`openai/gpt-6-astra` (the first advertised entry). Every answer streams, requests use
 `reasoning_effort: "high"`, and reasoning text is rendered dimly before answer
 text.
 
