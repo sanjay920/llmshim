@@ -11,12 +11,23 @@ fn models_registry_has_all_providers() {
 
 #[test]
 fn models_registry_has_expected_count() {
-    assert_eq!(MODELS.len(), 34);
+    assert_eq!(MODELS.len(), 15);
 }
 
 #[test]
-fn models_registry_includes_gpt_5_5() {
-    assert!(MODELS.iter().any(|m| m.id == "openai/gpt-5.5"));
+fn legacy_specs_remain_queryable_without_advertising_old_models() {
+    for id in [
+        "openai/gpt-5.5",
+        "anthropic/claude-fable-5",
+        "gemini/gemini-3.7-flash",
+        "xai/grok-4.5",
+    ] {
+        assert!(spec(id).is_some(), "missing historical metadata for {id}");
+        assert!(
+            !MODELS.iter().any(|model| model.id == id),
+            "still advertising {id}"
+        );
+    }
 }
 
 #[test]

@@ -15,7 +15,7 @@ To send the same conversation to another provider, change one line:
 
 ```diff
 - "model": "openai/gpt-5.6-sol"
-+ "model": "anthropic/claude-opus-4-8"
++ "model": "anthropic/claude-opus-5"
 ```
 
 llmshim selects the provider, translates the request into that provider's native

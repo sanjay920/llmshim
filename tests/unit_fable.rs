@@ -203,7 +203,7 @@ fn refusal_has_a_content_filter_finish_reason_instead_of_success_or_502() {
 }
 
 #[test]
-fn fable_catalog_includes_both_versions_with_verified_limits() {
+fn fable_specs_include_both_versions_with_verified_limits() {
     for model in FABLES {
         let id = format!("anthropic/{model}");
         let entry = llmshim::models::spec(&id).unwrap();

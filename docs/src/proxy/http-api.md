@@ -32,7 +32,7 @@ Both chat endpoints accept the same body:
     "reasoning_effort": "medium"
   },
   "provider_config": {},
-  "fallback": ["openai/gpt-5.4-mini"]
+  "fallback": ["openai/gpt-5.6-terra"]
 }
 ```
 
@@ -145,7 +145,7 @@ consumption patterns, see [Streaming](../guides/streaming.md).
 ```json
 {
   "models": [
-    {"id": "openai/gpt-5.4-mini", "provider": "openai", "name": "gpt-5.4-mini"}
+    {"id": "openai/gpt-5.6-terra", "provider": "openai", "name": "gpt-5.6-terra"}
   ]
 }
 ```

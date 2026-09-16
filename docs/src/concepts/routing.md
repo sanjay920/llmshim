@@ -10,9 +10,9 @@ The most explicit form is `provider/model`:
 
 ```text
 openai/gpt-5.6-sol
-anthropic/claude-opus-4-8
-gemini/gemini-3.5-flash
-xai/grok-4.5
+anthropic/claude-opus-5
+gemini/gemini-3.8-flash
+xai/grok-4.6
 ```
 
 The part before the first slash is the Router registration key. The remainder
@@ -59,7 +59,7 @@ Rust applications can attach a one-level alias while building a Router:
 
 ```rust
 let router = llmshim::router::Router::from_env()
-    .alias("smart", "anthropic/claude-opus-4-8");
+    .alias("smart", "anthropic/claude-opus-5");
 ```
 
 The Router checks an alias before parsing the provider address. An alias target

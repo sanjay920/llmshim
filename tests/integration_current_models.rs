@@ -153,11 +153,13 @@ async fn current_models_proxy_routes() {
         "anthropic/claude-fable-5-1",
         "xai/grok-4.6",
     ] {
-        assert!(catalog["models"]
+        let advertised = catalog["models"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|entry| entry["id"] == model));
+            .any(|entry| entry["id"] == model);
+        // Fable 5 remains callable by explicit ID but is superseded in discovery.
+        assert_eq!(advertised, model != "anthropic/claude-fable-5");
         let response = client.post(format!("{base}/v1/chat")).json(&json!({"model": model,
             "messages": [{"role": "user", "content": "Reply with only pong."}],
             "config": {"reasoning_effort": "none", "max_tokens": 512, "temperature": 0.5, "top_p": 0.8, "top_k": 10}}))
@@ -170,6 +172,6 @@ async fn current_models_proxy_routes() {
             .unwrap()
             .to_lowercase()
             .contains("pong"));
-        println!("PASS {model} real HTTP proxy request and discovery");
+        println!("PASS {model} real HTTP proxy request (advertised: {advertised})");
     }
 }
