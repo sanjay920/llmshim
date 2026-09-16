@@ -14,7 +14,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 
 - **OpenAI:** `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano`
 - **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-5.6-sol`, `chatgpt/gpt-5.6-terra`, and `chatgpt/gpt-5.6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
-- **Anthropic:** `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
+- **Anthropic:** `claude-fable-5-1`, `claude-fable-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
 - **Gemini:** `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`
 - **xAI:** `grok-4.6`, `grok-4.5`, `grok-4.3`, `grok-4.20-multi-agent-beta-0309`, `grok-4.20-beta-0309-reasoning`, `grok-4.20-beta-0309-non-reasoning`
 - **OpenRouter:** not enumerated (huge/dynamic catalog) — any `openrouter/<vendor>/<model>` slug routes through, e.g. `openrouter/anthropic/claude-sonnet-4.5`.
@@ -134,6 +134,35 @@ Callers pass provider-specific controls under these keys. Each provider copies w
 - `x-anthropic.extra_betas` (string array) — extra `anthropic-beta` tokens appended to the auto-managed set (1M-context / fast-mode / cache-TTL), de-duplicated. It's a header control, not a body param (e.g. lets a caller forward Claude Code's `--betas`). Logic + tests: `src/providers/anthropic.rs`, `tests/unit_anthropic.rs`.
 
 ### Unified reasoning controls
+
+**Fable 5 / 5.1 (verified September 2026).** Register both catalog and CLI
+entries. Both use always-on adaptive thinking; unified `none` clamps to `low`,
+and native disabled/manual thinking fails locally. Strip `temperature`,
+`top_p`, and `top_k` for Fable and Opus 5 even without an explicit thinking
+object. Fable 5.1 rejects forced tool selection (`required` / `any` / `tool`);
+do not silently turn it into `auto`. Fable 5 still accepts forced tools.
+Both versions reject assistant prefill. Refusal stop reasons on Fable/Opus 5
+map to `content_filter` in normal and streaming engine responses.
+
+Fable 5.1's thinking signatures are conversation-bound. Preserve appended
+system turns instead of hoisting them into the initial prompt. Keep the
+initial system/tools/message prefix stable during a signed-thinking round
+trip; errors must not become success. Test with the
+`thinking-binding-controls-2026-08-01` beta and
+`thinking.block_binding.prefix_mismatch_behavior: "error"` so older API
+accounts exercise enforcement too. The provider handles incompatible
+thinking on a switch to older models; do not infer signatures from text.
+
+`tests/unit_fable.rs` pins these rules. Live checks for Fable 5, Fable 5.1,
+Opus 5, Gemini 3.8 Flash, and Grok 4.6:
+
+```bash
+cargo test --features proxy --test integration_current_models -- --ignored --nocapture
+```
+
+The live tests consume API usage and are ignored during offline preflight.
+Gemini 3.8 Flash and Opus 5 already had catalog/adapter support; Grok 4.6 is
+the verified xAI model ID. Keep the ChatGPT four-model allowlist independent.
 
 Two knobs work across every provider: `reasoning_effort` (`none|low|medium|high|xhigh|max`) and `reasoning_mode` (`standard|pro`). A third, `reasoning_summary` (`auto|none`), controls reasoning-text visibility → Anthropic `thinking.display` (`auto`→`summarized`, the default when `reasoning_effort` is present so newer models like Sonnet 5 / Opus 4.7-4.8 return reasoning text instead of the API-default `omitted`; `none`→`omitted` for lower latency). Applies to both the adaptive and pre-4.6 enabled thinking builders; a caller-supplied `thinking` block bypasses it. Each provider transform maps them to its native dialect, **clamping to the nearest tier the target model accepts** (all boundaries verified live — e.g. `max` is native on OpenAI gpt-5.6 and GPT-6 Astra; Anthropic 4.6 rejects `xhigh` but has `max`; Gemini's enum tops out at `high`; xAI grok-4.20 models reject any reasoning param). `mode: "pro"` is native on OpenAI gpt-5.6/-pro models (`reasoning.mode`), emulated as a one-tier effort bump elsewhere; explicit `none` always wins. Native passthrough (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) bypasses the mapping entirely and always takes precedence. **Full per-provider mapping tables: `docs/src/guides/reasoning.md`** — update it and the pinning tests in `tests/unit_*.rs` together whenever a mapping changes.
 
