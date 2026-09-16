@@ -130,6 +130,16 @@ Gemini 3.7 Flash and Gemini 3.1 Pro reject both `minimal` and `thinkingBudget: 0
 clamps to their `low` floor (verified live). Other flash models accept `minimal` and can disable thinking. The legacy integer `thinkingBudget` remains available only
 through `x-gemini.thinkingConfig`.
 
+### ChatGPT subscription
+
+GPT-5.6 Sol, Terra, and Luna use the GPT-5.6 mapping above.
+GPT-6 Astra preserves `low`, `medium`, `high`, `xhigh`, and `max`;
+`none` and `minimal` clamp to `low` because Astra cannot disable reasoning.
+The shared Responses translator applies this mapping to Astra through either
+ChatGPT or API-key OpenAI. These effort values follow the
+[official Astra model documentation](https://developers.openai.com/api/docs/models/gpt-6-astra).
+Native `x-chatgpt.reasoning` overrides the unified mapping.
+
 ### xAI Responses API
 
 xAI receives the nested native shape `reasoning: {effort}`:

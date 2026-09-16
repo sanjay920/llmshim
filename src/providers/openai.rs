@@ -267,9 +267,16 @@ fn is_gpt_5_4(model: &str) -> bool {
 
 /// Coerce a caller's effort to a value the target model actually accepts, so a
 /// value the model would 400 on is clamped rather than failing the request.
-/// "max" is gpt-5.6-exclusive (verified live) — clamp to xhigh elsewhere.
+/// GPT-5.6 and GPT-6 Astra support "max"; older families clamp to xhigh.
 fn clamp_reasoning_effort<'a>(model: &str, effort: &'a str) -> &'a str {
-    if is_pro_model(model) {
+    if model == "gpt-6-astra" {
+        // https://developers.openai.com/api/docs/models/gpt-6-astra
+        // Astra supports low/medium/high/xhigh/max and cannot disable reasoning.
+        match effort {
+            "minimal" | "none" => "low",
+            other => other,
+        }
+    } else if is_pro_model(model) {
         // pro tier: only medium/high/xhigh (verified live)
         match effort {
             "minimal" | "low" | "none" => "medium",
@@ -290,7 +297,7 @@ fn clamp_reasoning_effort<'a>(model: &str, effort: &'a str) -> &'a str {
             other => other,
         }
     } else {
-        // gpt-5.5 & unknown models: pass through, but "max" is 5.6-only
+        // Older and unknown models: pass through, but cap "max" at xhigh.
         match effort {
             "max" => "xhigh",
             other => other,
@@ -360,6 +367,7 @@ impl Provider for OpenAi {
         let mode_is_native = is_gpt_5_6(model) || is_pro_model(model);
 
         let effort = match (effort, pro_mode, mode_is_native) {
+            (Some("max"), true, false) if model == "gpt-6-astra" => Some("max"),
             (Some(e), true, false) => Some(bump_effort(e)),
             (None, true, false) => Some("high"), // pro alone ≈ medium, bumped
             (e, _, _) => e,

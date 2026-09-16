@@ -1,5 +1,6 @@
 use crate::error::Result;
 use serde_json::Value;
+use std::{future::Future, pin::Pin};
 
 pub struct ProviderRequest {
     pub url: String,
@@ -15,6 +16,16 @@ pub trait Provider: Send + Sync {
     /// Transform an OpenAI-format request into the provider's native format.
     /// `model` is the raw model string (after prefix stripping).
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest>;
+
+    /// Prepare credentials asynchronously before dispatch. API-key providers
+    /// use the synchronous transform; OAuth providers can refresh here.
+    fn prepare_request<'a>(
+        &'a self,
+        model: &'a str,
+        request: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderRequest>> + Send + 'a>> {
+        Box::pin(async move { self.transform_request(model, request) })
+    }
 
     /// Transform the provider's native response back into OpenAI format.
     fn transform_response(&self, model: &str, response: Value) -> Result<Value>;
