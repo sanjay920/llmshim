@@ -331,6 +331,26 @@ pub const MODELS: &[ModelInfo] = &[
         capabilities: CAPS_STD,
     },
     ModelInfo {
+        id: "anthropic/claude-fable-5-1",
+        provider: "anthropic",
+        name: "claude-fable-5-1",
+        label: "Claude Fable 5.1",
+        // Anthropic Models API and official model docs, verified 2026-09-15.
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_FULL,
+    },
+    ModelInfo {
+        id: "anthropic/claude-fable-5",
+        provider: "anthropic",
+        name: "claude-fable-5",
+        label: "Claude Fable 5",
+        // Anthropic Models API and official model docs, verified 2026-09-15.
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_FULL,
+    },
+    ModelInfo {
         id: "anthropic/claude-opus-5",
         provider: "anthropic",
         name: "claude-opus-5",

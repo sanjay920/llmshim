@@ -54,6 +54,35 @@ forwarded blindly.
 
 ## Tools and multimodal round trips
 
+### Claude Fable 5 and 5.1
+
+Both Fable models use always-on adaptive thinking, with `low`, `medium`,
+`high`, `xhigh`, and `max` effort. Unified `none` maps to `low`; explicit
+native disabled/manual thinking and assistant prefill return local errors.
+Sampling parameters are omitted for both Fable versions and Opus 5 because
+those models reject them.
+
+Fable 5 accepts forced tool choice. Fable 5.1 accepts only `auto` and `none`:
+`required` or a named forced tool returns a local 400 rather than changing the
+request's meaning. Describe the desired tool in the prompt, or use structured
+output when the requirement is a JSON schema. Native `stop_reason: "refusal"`
+maps to `finish_reason: "content_filter"` for Fable and Opus 5.
+
+Fable 5.1 binds thinking blocks to the preceding system prompt, tools, and
+conversation. Keep that prefix unchanged when replaying signed reasoning.
+Appending turns is supported; llmshim preserves appended system/developer
+instructions as system turns for Fable 5.1. If your application edits or
+compacts prior history, remove stale thinking or use Anthropic's explicit
+binding controls under `x-anthropic`. A binding failure remains an error.
+See [Anthropic's migration and history rules](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide).
+
+The raw Rust response exposes normalized thinking signatures for replay.
+The compact proxy response does not expose every native thinking field;
+applications needing native history controls can supply exact messages under
+`provider_config.messages`.
+
+### Shared message formats
+
 Tool calls are normalized back to the OpenAI `tool_calls` shape. Preserve the
 complete assistant tool call when sending the next turn; provider adapters may
 need fields beyond function name and arguments.
