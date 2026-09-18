@@ -3,6 +3,7 @@ pub(crate) mod error;
 mod handlers;
 pub mod ratelimit;
 pub mod types;
+pub mod wire;
 
 use crate::log::Logger;
 use crate::router::Router;
@@ -44,9 +45,12 @@ pub fn app(router: Router, logger: Option<Logger>) -> axum::Router {
 pub fn app_with_state(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
         .route("/v1/chat", post(handlers::chat))
+        .route("/v1/chat/completions", post(handlers::chat))
+        .route("/v1/messages", post(handlers::chat))
         .route("/v1/chat/stream", post(handlers::chat_stream))
         .route("/v1/models", get(handlers::list_models))
         .route("/health", get(handlers::health))
+        .layer(axum::middleware::from_fn(wire::translate))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

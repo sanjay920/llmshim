@@ -21,35 +21,8 @@ impl Anthropic {
         self
     }
 
-    fn is_claude_4_6(model: &str) -> bool {
-        let m = model.to_lowercase();
-        m.contains("4-6") || m.contains("4.6") || m.contains("4_6")
-    }
-
     fn is_fable(model: &str) -> bool {
         matches!(model, "claude-fable-5" | "claude-fable-5-1")
-    }
-
-    /// Newer Claude families (Opus 4.7/4.8, Sonnet 5) that reject the pre-4.6
-    /// `thinking.type=enabled` path. Verified against the live API: these
-    /// models return HTTP 400 for enabled-thinking and 200 for adaptive.
-    fn is_new_adaptive_family(model: &str) -> bool {
-        let m = model.to_lowercase();
-        m.contains("opus-4-7")
-            || m.contains("opus-4.7")
-            || m.contains("opus-4-8")
-            || m.contains("opus-4.8")
-            || m.contains("opus-5")
-            || m.contains("sonnet-5")
-            || Self::is_fable(&m)
-    }
-
-    /// Models that must use the adaptive thinking path
-    /// (`thinking:{type:"adaptive"}` + `output_config:{effort}`) rather than the
-    /// pre-4.6 `thinking:{type:"enabled", budget_tokens}` path. Covers Claude 4.6
-    /// and the newer Opus 4.7/4.8 and Sonnet 5 families.
-    fn uses_adaptive_thinking(model: &str) -> bool {
-        Self::is_claude_4_6(model) || Self::is_new_adaptive_family(model)
     }
 
     /// Models that support the 1M context window beta.
@@ -57,20 +30,6 @@ impl Anthropic {
     fn supports_1m_context(model: &str) -> bool {
         let m = model.to_lowercase();
         m.contains("opus-4") || m.contains("sonnet-4") || m.contains("sonnet-5")
-    }
-
-    fn supports_thinking(model: &str) -> bool {
-        let m = model.to_lowercase();
-        // Claude 3.7 Sonnet and all Claude 4+ models support thinking
-        m.contains("3-7")
-            || m.contains("3.7")
-            || m.contains("3_7")
-            || m.contains("claude-4")
-            || m.contains("claude-sonnet-4")
-            || m.contains("claude-opus-4")
-            || m.contains("claude-haiku-4")
-            || m.contains("claude-sonnet-5")
-            || Self::uses_adaptive_thinking(&m)
     }
 }
 
@@ -86,21 +45,6 @@ fn normalize_anthropic_content_blocks(content: &Value) -> Value {
         }
     }
     translated
-}
-
-fn uses_extended_cache_ttl(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => {
-            object
-                .get("cache_control")
-                .and_then(|cache_control| cache_control.get("ttl"))
-                .and_then(Value::as_str)
-                == Some("1h")
-                || object.values().any(uses_extended_cache_ttl)
-        }
-        Value::Array(items) => items.iter().any(uses_extended_cache_ttl),
-        _ => false,
-    }
 }
 
 fn text_block(text: &str) -> Value {
@@ -178,29 +122,13 @@ fn transform_messages(messages: &[Value]) -> Vec<Value> {
         .map(|msg| {
             let mut out = msg.clone();
 
-            // Capture normalized reasoning fields before sanitizing, so an
-            // assistant turn's thinking block can be reconstructed losslessly
-            // below (symmetric to the tool-call thought_signature round-trip).
-            let role = out.get("role").and_then(|r| r.as_str()).map(str::to_string);
-            let reasoning_content = out
-                .get("reasoning_content")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let reasoning_signature = out
-                .get("reasoning_signature")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let redacted_reasoning = out
-                .get("redacted_reasoning_content")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
+            let role = out.get("role").and_then(Value::as_str).map(str::to_owned);
+            let reasoning_blocks = crate::reasoning::anthropic_blocks(&out);
+            crate::reasoning::strip_fields(&mut out);
 
             // Sanitize cross-provider fields that Anthropic's API rejects.
             // This enables multi-model conversations (e.g., Cursor-style provider switching).
             if let Some(obj) = out.as_object_mut() {
-                obj.remove("reasoning_content"); // our normalized thinking field
-                obj.remove("reasoning_signature"); // reconstructed into a thinking block below
-                obj.remove("redacted_reasoning_content"); // reconstructed into redacted_thinking below
                 obj.remove("annotations"); // OpenAI returns this on every message
                 obj.remove("refusal"); // OpenAI safety refusal field
                 obj.remove("audio"); // OpenAI audio response field
@@ -221,7 +149,8 @@ fn transform_messages(messages: &[Value]) -> Vec<Value> {
             // Transform tool_calls from OpenAI format to Anthropic content blocks
             if let Some(tool_calls) = out.get("tool_calls").cloned() {
                 if let Some(arr) = tool_calls.as_array() {
-                    let mut content_blocks: Vec<Value> = Vec::new();
+                    let mut content_blocks: Vec<Value> =
+                        out["content"].as_array().cloned().unwrap_or_default();
 
                     // Preserve any existing text content
                     if let Some(text) = out.get("content").and_then(|c| c.as_str()) {
@@ -238,12 +167,16 @@ fn transform_messages(messages: &[Value]) -> Vec<Value> {
                             .and_then(|s| serde_json::from_str(s).ok())
                             .unwrap_or(json!({}));
 
-                        content_blocks.push(json!({
+                        let mut block = json!({
                             "type": "tool_use",
                             "id": tc.get("id").cloned().unwrap_or(json!("")),
                             "name": func.get("name").cloned().unwrap_or(json!("")),
                             "input": input,
-                        }));
+                        });
+                        if let Some(cache) = tc.get("cache_control") {
+                            block["cache_control"] = cache.clone();
+                        }
+                        content_blocks.push(block);
                     }
 
                     let obj = out.as_object_mut().unwrap();
@@ -262,6 +195,9 @@ fn transform_messages(messages: &[Value]) -> Vec<Value> {
                     "tool_use_id": tool_use_id,
                     "content": content,
                 });
+                if let Some(is_error) = out.get("is_error").filter(|v| v.is_boolean()) {
+                    tool_result["is_error"] = is_error.clone();
+                }
                 if let Some(cache_control) = out.get("cache_control") {
                     tool_result["cache_control"] = cache_control.clone();
                 }
@@ -278,20 +214,7 @@ fn transform_messages(messages: &[Value]) -> Vec<Value> {
             // we hold the opaque token — a thinking block without its signature is
             // rejected, so absent a signature we leave it stripped (no regression).
             if role.as_deref() == Some("assistant") {
-                let mut thinking_blocks: Vec<Value> = Vec::new();
-                if let (Some(text), Some(sig)) = (&reasoning_content, &reasoning_signature) {
-                    thinking_blocks.push(json!({
-                        "type": "thinking",
-                        "thinking": text,
-                        "signature": sig,
-                    }));
-                }
-                if let Some(data) = &redacted_reasoning {
-                    thinking_blocks.push(json!({
-                        "type": "redacted_thinking",
-                        "data": data,
-                    }));
-                }
+                let mut thinking_blocks = reasoning_blocks;
                 if !thinking_blocks.is_empty() {
                     match out.get("content").cloned() {
                         Some(Value::Array(arr)) => thinking_blocks.extend(arr),
@@ -319,6 +242,7 @@ fn transform_tools(tools: &[Value]) -> Vec<Value> {
                 "description": func.get("description").unwrap_or(&json!("")),
                 "input_schema": func.get("parameters").unwrap_or(&json!({"type": "object", "properties": {}})),
             });
+            if let Some(strict)=func.get("strict").or_else(||tool.get("strict")){out["strict"]=strict.clone();}
             if let Some(cache_control) = tool.get("cache_control") {
                 out["cache_control"] = cache_control.clone();
             }
@@ -364,6 +288,7 @@ fn normalized_anthropic_usage(usage: &Value) -> Value {
         normalized["cache_creation"] = cache_creation_detail.clone();
     }
 
+    crate::usage::normalize_cache(usage, &mut normalized);
     normalized
 }
 
@@ -406,30 +331,11 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
 
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
-    let mut thinking_content: Option<String> = None;
-    // Opaque signature + redacted data so reasoning can round-trip losslessly
-    // (see transform_messages reconstruction). Symmetric to tool thought_signature.
-    let mut thinking_signature: Option<String> = None;
-    let mut redacted_thinking: Option<String> = None;
-
     for block in &content_blocks {
         match block.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
                 if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
                     text_parts.push(t.to_string());
-                }
-            }
-            Some("thinking") => {
-                if let Some(t) = block.get("thinking").and_then(|t| t.as_str()) {
-                    thinking_content = Some(t.to_string());
-                }
-                if let Some(s) = block.get("signature").and_then(|s| s.as_str()) {
-                    thinking_signature = Some(s.to_string());
-                }
-            }
-            Some("redacted_thinking") => {
-                if let Some(d) = block.get("data").and_then(|d| d.as_str()) {
-                    redacted_thinking = Some(d.to_string());
                 }
             }
             Some("tool_use") => {
@@ -479,19 +385,6 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
     if !tool_calls.is_empty() {
         message["tool_calls"] = json!(tool_calls);
     }
-    // Surface thinking content in a way OpenAI SDK consumers can access
-    if let Some(thinking) = thinking_content {
-        message["reasoning_content"] = json!(thinking);
-    }
-    // Surface the opaque signature + redacted data so the reasoning block can be
-    // echoed back losslessly on a follow-up request (see transform_messages).
-    if let Some(sig) = thinking_signature {
-        message["reasoning_signature"] = json!(sig);
-    }
-    if let Some(data) = redacted_thinking {
-        message["redacted_reasoning_content"] = json!(data);
-    }
-
     Ok(json!({
         "id": resp.get("id").cloned().unwrap_or(json!("")),
         "object": "chat.completion",
@@ -536,7 +429,23 @@ impl Provider for Anthropic {
         "anthropic"
     }
 
+    fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
+        crate::reasoning::ReplayTarget::new(
+            self.name(),
+            model,
+            crate::reasoning::WireFormat::AnthropicMessages,
+        )
+        .bind_account(&self.base_url, Some(&self.api_key))
+    }
+
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        let request = crate::schema::prepare_request(request);
+        let request = crate::cache::prepare_request(
+            &request,
+            crate::reasoning::WireFormat::AnthropicMessages,
+        )?;
+        let request = crate::reasoning::prepare_request(&request, &self.replay_target(model));
+        let request = crate::toolcall::prepare_request(&request, &self.replay_target(model))?;
         let obj = request.as_object().ok_or(ShimError::MissingModel)?;
 
         let messages = obj
@@ -572,10 +481,14 @@ impl Provider for Anthropic {
         }
 
         // Standard params passthrough
-        for key in &["temperature", "top_p", "top_k", "stop", "stream"] {
+        for key in &["temperature", "top_p", "top_k", "stream"] {
             if let Some(v) = obj.get(*key) {
                 body_obj.insert(key.to_string(), v.clone());
             }
+        }
+
+        if let Some(stop) = obj.get("stop") {
+            body_obj.insert("stop_sequences".into(), stop.clone());
         }
 
         // Tools
@@ -605,6 +518,7 @@ impl Provider for Anthropic {
         }
 
         // -- Thinking / reasoning support --
+        let reasoning_profile = super::anthropic_reasoning::Profile::for_model(model);
         let has_thinking = obj.contains_key("thinking")
             || obj
                 .get("x-anthropic")
@@ -614,7 +528,7 @@ impl Provider for Anthropic {
         // Handle unified reasoning controls (reasoning_effort + reasoning_mode)
         // -> Anthropic thinking translation. Explicit thinking config always wins.
         if let Some(effort) = obj.get("reasoning_effort").and_then(|e| e.as_str()) {
-            if Self::supports_thinking(model) && !has_thinking {
+            if reasoning_profile.supported() && !has_thinking {
                 // Anthropic has no request-level standard/pro mode; map the
                 // unified mode:"pro" to a one-tier effort bump (docs/src/guides/reasoning.md).
                 let pro = obj
@@ -641,26 +555,19 @@ impl Provider for Anthropic {
                 };
 
                 if effort == "none" {
-                    if Self::uses_adaptive_thinking(model) {
+                    if reasoning_profile.adaptive() {
                         // Adaptive models think by default even with no config;
                         // "disabled" is the only true zero-thinking request
                         // (verified live on sonnet-5, opus-4-8, sonnet-4-6).
                         body_obj.insert("thinking".to_string(), json!({"type": "disabled"}));
                     }
                     // Pre-4.6/Haiku: thinking is opt-in; omitting the key IS "none".
-                } else if Self::uses_adaptive_thinking(model) {
+                } else if reasoning_profile.adaptive() {
                     body_obj.insert(
                         "thinking".to_string(),
                         json!({"type": "adaptive", "display": display}),
                     );
-                    // Opus/Sonnet 4.6 reject "xhigh" (their tiers: low/medium/high/max);
-                    // Opus 4.7/4.8 + Sonnet 5 accept the full low..max range (verified).
-                    let anthropic_effort =
-                        if effort == "xhigh" && !Self::is_new_adaptive_family(model) {
-                            "max"
-                        } else {
-                            effort
-                        };
+                    let anthropic_effort = reasoning_profile.effort(effort);
                     body_obj.insert(
                         "output_config".to_string(),
                         json!({"effort": anthropic_effort}),
@@ -672,14 +579,7 @@ impl Provider for Anthropic {
                         .get("max_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(8192);
-                    let budget = match effort {
-                        "low" => max_tokens / 4,
-                        "medium" => max_tokens / 2,
-                        "high" => max_tokens * 3 / 4,
-                        "xhigh" => max_tokens * 9 / 10,
-                        _ => max_tokens.saturating_sub(1), // "max"
-                    };
-                    let budget = budget.max(1024); // Anthropic minimum
+                    let budget = reasoning_profile.budget(effort, max_tokens)?;
                     body_obj.insert(
                         "thinking".to_string(),
                         json!({
@@ -771,6 +671,17 @@ impl Provider for Anthropic {
             ("content-type".into(), "application/json".into()),
         ];
 
+        crate::schema::normalize_native_tools(crate::schema::Target::Anthropic, &mut body);
+        crate::shim::native_format(
+            &request,
+            crate::reasoning::WireFormat::AnthropicMessages,
+            &mut body,
+        );
+        crate::cache::finish_request(
+            &request,
+            &mut body,
+            crate::reasoning::WireFormat::AnthropicMessages,
+        )?;
         // Collect beta headers
         let mut betas: Vec<String> = Vec::new();
 
@@ -788,7 +699,7 @@ impl Provider for Anthropic {
         if speed.as_deref() == Some("fast") {
             betas.push("fast-mode-2026-02-01".to_string());
         }
-        if uses_extended_cache_ttl(request) {
+        if crate::cache::uses_extended_ttl(&body) {
             betas.push("extended-cache-ttl-2025-04-11".to_string());
         }
 
@@ -813,10 +724,30 @@ impl Provider for Anthropic {
             headers.push(("anthropic-beta".into(), betas.join(",")));
         }
 
+        crate::toolcall::validate_native(&body, &self.replay_target(model))?;
         Ok(ProviderRequest { url, headers, body })
     }
 
     fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
+        let native = response.clone();
+        let mut result = self.transform_response_native(model, response)?;
+        crate::reasoning::capture_response(&self.replay_target(model), &native, &mut result);
+        crate::toolcall::capture_response(&self.replay_target(model), &native, &mut result)?;
+        Ok(result)
+    }
+
+    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        let result = self.transform_stream_chunk_native(model, chunk)?;
+        let native: Value = match serde_json::from_str(chunk) {
+            Ok(v) => v,
+            Err(_) => return Ok(result),
+        };
+        crate::reasoning::capture_stream(&self.replay_target(model), &native, result)
+    }
+}
+
+impl Anthropic {
+    fn transform_response_native(&self, model: &str, response: Value) -> Result<Value> {
         // Check for API error
         if let Some(err) = response.get("error") {
             let msg = err
@@ -831,8 +762,10 @@ impl Provider for Anthropic {
 
         transform_response_to_openai(model, &response)
     }
+}
 
-    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+impl Anthropic {
+    fn transform_stream_chunk_native(&self, model: &str, chunk: &str) -> Result<Option<String>> {
         let trimmed = chunk.trim();
         if trimmed.is_empty() {
             return Ok(None);
@@ -847,7 +780,7 @@ impl Provider for Anthropic {
                     .pointer("/message/id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let chunk = json!({
+                let mut chunk = json!({
                     "id": id,
                     "object": "chat.completion.chunk",
                     "model": model,
@@ -857,6 +790,9 @@ impl Provider for Anthropic {
                         "finish_reason": null,
                     }]
                 });
+                if let Some(usage) = parsed.pointer("/message/usage") {
+                    chunk["usage"] = normalized_anthropic_usage(usage);
+                }
                 Ok(Some(serde_json::to_string(&chunk)?))
             }
             "content_block_delta" => {
@@ -875,109 +811,8 @@ impl Provider for Anthropic {
                         });
                         Ok(Some(serde_json::to_string(&chunk)?))
                     }
-                    Some("thinking_delta") => {
-                        let thinking = delta.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
-                        let chunk = json!({
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": { "reasoning_content": thinking },
-                                "finish_reason": null,
-                            }]
-                        });
-                        Ok(Some(serde_json::to_string(&chunk)?))
-                    }
-                    Some("input_json_delta") => {
-                        let partial = delta
-                            .get("partial_json")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
-                        // Use the content_block index from the Anthropic event so
-                        // parallel tool calls get separate indices in OpenAI format
-                        let block_index = parsed.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-                        let chunk = json!({
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [{
-                                        "index": block_index,
-                                        "function": { "arguments": partial }
-                                    }]
-                                },
-                                "finish_reason": null,
-                            }]
-                        });
-                        Ok(Some(serde_json::to_string(&chunk)?))
-                    }
-                    // signature_delta: emit the opaque signature so a streaming
-                    // consumer can reassemble a complete, round-trippable thinking
-                    // block (fed back via reasoning_signature on the next request).
-                    Some("signature_delta") => {
-                        let signature = delta
-                            .get("signature")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("");
-                        let chunk = json!({
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": { "reasoning_signature": signature },
-                                "finish_reason": null,
-                            }]
-                        });
-                        Ok(Some(serde_json::to_string(&chunk)?))
-                    }
                     _ => Ok(None),
                 }
-            }
-            "content_block_start" => {
-                if let Some(cb) = parsed.get("content_block") {
-                    if cb.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        // Use the content_block index from the Anthropic event
-                        let block_index = parsed.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-                        let chunk = json!({
-                            "object": "chat.completion.chunk",
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [{
-                                        "index": block_index,
-                                        "id": cb.get("id").cloned().unwrap_or(json!("")),
-                                        "type": "function",
-                                        "function": {
-                                            "name": cb.get("name").cloned().unwrap_or(json!("")),
-                                            "arguments": ""
-                                        }
-                                    }]
-                                },
-                                "finish_reason": null,
-                            }]
-                        });
-                        return Ok(Some(serde_json::to_string(&chunk)?));
-                    }
-                    // redacted_thinking arrives whole (no deltas); surface its
-                    // opaque data so it can be echoed back on a later request.
-                    if cb.get("type").and_then(|t| t.as_str()) == Some("redacted_thinking") {
-                        if let Some(data) = cb.get("data").and_then(|d| d.as_str()) {
-                            let chunk = json!({
-                                "object": "chat.completion.chunk",
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": { "redacted_reasoning_content": data },
-                                    "finish_reason": null,
-                                }]
-                            });
-                            return Ok(Some(serde_json::to_string(&chunk)?));
-                        }
-                    }
-                }
-                Ok(None)
             }
             "message_delta" => {
                 let stop = parsed

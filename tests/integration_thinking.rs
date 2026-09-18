@@ -74,7 +74,7 @@ async fn anthropic_thinking_via_direct_param() {
     let content = resp["choices"][0]["message"]["content"].as_str().unwrap();
     assert!(content.contains("12"), "Expected 12, got: {}", content);
 
-    let reasoning = resp["choices"][0]["message"]["reasoning_content"]
+    let reasoning = resp["choices"][0]["message"]["reasoning"][0]["text"]
         .as_str()
         .expect("Expected reasoning_content");
     assert!(!reasoning.is_empty());
@@ -118,7 +118,7 @@ async fn anthropic_thinking_stream() {
             full_text.push_str(text);
         }
         if let Some(reasoning) = parsed
-            .pointer("/choices/0/delta/reasoning_content")
+            .pointer("/choices/0/delta/reasoning/0/text")
             .and_then(|c| c.as_str())
         {
             full_reasoning.push_str(reasoning);
@@ -425,7 +425,7 @@ async fn anthropic_sonnet5_reasoning_summary_default_returns_text_live() {
         "reasoning_effort": "high",
     });
     let resp = llmshim::completion(&router, &req).await.unwrap();
-    let reasoning = resp["choices"][0]["message"]["reasoning_content"]
+    let reasoning = resp["choices"][0]["message"]["reasoning"][0]["text"]
         .as_str()
         .unwrap_or("");
     assert!(
@@ -456,7 +456,7 @@ async fn anthropic_opus_5_reasoning_live() {
     let msg = &resp["choices"][0]["message"];
     let content = msg["content"].as_str().unwrap_or("");
     assert!(!content.is_empty(), "expected an answer, got: {resp}");
-    let reasoning = msg["reasoning_content"].as_str().unwrap_or("");
+    let reasoning = msg["reasoning"][0]["text"].as_str().unwrap_or("");
     assert!(
         !reasoning.is_empty(),
         "expected reasoning text (adaptive + summarized default), got: {resp}"

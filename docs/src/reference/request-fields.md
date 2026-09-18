@@ -52,27 +52,23 @@ are covered in [Native provider controls](../guides/native-controls.md).
 |---|---|---|
 | `role` | string | `system`, `developer`, `user`, `assistant`, or `tool` semantics |
 | `content` | string, array, or null | Text and multimodal content blocks |
-| `tool_calls` | array | Assistant tool requests returned on a previous turn |
+| `tool_calls` | array | Complete assistant tool requests, including owned `id`, `wire_ids`, and any signature object |
 | `tool_call_id` | string | Connects a `role: "tool"` result to its request |
-| `reasoning_content` | string | Provider-returned reasoning carried into a later turn |
-| `reasoning_signature` | string | Opaque provider signature for the reasoning block; echo it back with `reasoning_content` for lossless round-trip |
-| `redacted_reasoning_content` | string | Opaque data for a redacted reasoning block; echo it back to reconstruct it |
+| `reasoning` | array | Ordered typed blocks with origin, text or opaque data, signature/item identity, and original structured payload when needed |
+| `thought_signature` (on a tool call) | object | Opaque `data` plus `origin`; retain the whole object |
+| Legacy reasoning siblings | strings | Migration input only; untracked data is dropped |
 
 Content blocks may use OpenAI `image_url`, Anthropic `image`, or Gemini
 `inline_data` input forms. See [Images and vision](../guides/images.md).
 
 ### Lossless reasoning round-trip
 
-A thinking-capable Anthropic model returns `reasoning_content` **and**
-`reasoning_signature` (streaming emits both incrementally; the signature arrives
-as a `reasoning_signature` delta). Echo the assistant message back verbatim on a
-follow-up request and llmshim reconstructs the provider-native `thinking` block
-(as the first block of the turn) — required for extended-thinking + tool-use
-continuations and for keeping the prompt cache warm. The signature is opaque and
-provider-specific: other providers strip it, so it never leaks in a multi-model
-conversation. Absent a signature, `reasoning_content` is stripped (a thinking
-block without its signature is rejected). Symmetric to the tool-call
-`thought_signature` round-trip.
+Preserve the complete assistant message, including `reasoning[]` and tool-call
+signature objects. llmshim reconstructs native reasoning only when the stored
+origin matches the target family and wire; encrypted data also requires a
+matching issuer binding. Anthropic thinking remains first and ordered, and
+Responses items retain their encrypted payloads. Unknown origins/families are
+never replayed. See [reasoning replay](../guides/reasoning.md#preserve-reasoning-for-replay).
 
 ## Proxy request
 
@@ -84,6 +80,7 @@ block without its signature is rejected). Symmetric to the tool-call
 | `config` | object | Portable | recognized children become top-level engine controls |
 | `provider_config` | object | Passthrough container | each child is merged into the engine request |
 | `fallback` | array of strings | Proxy orchestration | ordered non-streaming backup routes; not sent to a provider |
+| `x-cache` | object | Caller stability annotations | native breakpoints or `prompt_cache_key`; never forwarded verbatim |
 
 The exact `config` children are:
 
@@ -113,3 +110,11 @@ becomes engine fields named `reasoning_effort`, `tools`, and `x-anthropic`.
 Because `provider_config` is merged after `config`, a same-named child there
 overrides the portable value. Prefer the `x-*` namespace for an intentional
 native override; it makes that loss of portability visible.
+
+## Output contracts
+
+`response_format: {type:"json_schema", json_schema:{name?, schema, strict?}}`
+requests validated JSON output. `x-shim` controls `structured_output`
+(`auto|native|forced_tool|prompt`), `tool_calling` (`auto|native|prompt`), and
+`reasoning_capture` (`off|forced_tool`). See [capability shims](../guides/capabilities.md)
+for path selection, bounded repair, streaming behavior, and provenance.

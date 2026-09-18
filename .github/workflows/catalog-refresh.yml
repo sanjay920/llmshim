@@ -1,0 +1,35 @@
+name: Refresh model catalog snapshot
+
+on:
+  schedule:
+    - cron: '19 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: model-catalog-refresh
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Download public catalog
+        run: |
+          curl --fail --silent --show-error --max-time 60 \
+            https://models.dev/api.json -o crates/llmshim-catalog/data/models.dev.json
+      - name: Validate catalog and refresh behavior
+        run: cargo test -p llmshim-catalog
+      - name: Propose snapshot update
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/model-catalog
+          add-paths: crates/llmshim-catalog/data/models.dev.json
+          commit-message: 'chore: refresh public model catalog snapshot'
+          title: 'Refresh public model catalog snapshot'
+          body: 'Updates the vendored models.dev snapshot. Verified builtin assertions and local overrides retain precedence. Catalog and refresh tests passed.'

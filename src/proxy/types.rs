@@ -29,6 +29,12 @@ pub struct ChatRequest {
     /// On retryable errors (429, 500, 502, 503), tries the next model in the list.
     #[serde(default)]
     pub fallback: Option<Vec<String>>,
+    #[serde(default, rename = "x-cache")]
+    pub cache: Option<crate::cache::CachePolicy>,
+    #[serde(default, rename = "x-shim")]
+    pub shim: Option<crate::shim::Config>,
+    #[serde(default)]
+    pub response_format: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -46,6 +52,11 @@ pub struct Message {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Value>,
+    /// Preserve normalized replay metadata and legacy input fields verbatim.
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +80,13 @@ pub struct Config {
 
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(
+        rename = "x-llmshim-served-model",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub served_model: Option<String>,
     pub id: String,
     pub model: String,
     pub provider: String,
@@ -82,9 +100,13 @@ pub struct ChatResponse {
 #[derive(Debug, Serialize)]
 pub struct ResponseMessage {
     pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     pub content: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -94,6 +116,8 @@ pub struct Usage {
     #[serde(skip_serializing_if = "is_zero")]
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -111,20 +135,32 @@ pub enum StreamEvent {
     Content { text: String },
 
     #[serde(rename = "reasoning")]
-    Reasoning { text: String },
+    Reasoning { text: String, blocks: Vec<Value> },
 
     #[serde(rename = "tool_call")]
     ToolCall {
         id: String,
         name: String,
         arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        wire_ids: Option<Value>,
     },
 
     #[serde(rename = "usage")]
     Usage(Usage),
 
     #[serde(rename = "done")]
-    Done {},
+    Done {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+        #[serde(
+            rename = "x-llmshim-served-model",
+            skip_serializing_if = "Option::is_none"
+        )]
+        served_model: Option<String>,
+    },
 
     #[serde(rename = "error")]
     Error { message: String },

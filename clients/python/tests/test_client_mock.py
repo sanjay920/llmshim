@@ -333,3 +333,13 @@ def test_types_are_exported():
         assert hasattr(types, name)
     # Re-exported at top level too.
     assert llmshim.ChatResponse is types.ChatResponse
+
+
+def test_cache_annotations_reach_both_request_surfaces():
+    policy = {"key": "session:branch", "segments": [{"upto_message": 0, "stability": "static"}]}
+    llmshim.chat("claude-sonnet-4-6", "hi", cache=policy, shim={"structured_output":"prompt"}, response_format={"type":"json_schema","json_schema":{"schema":{"type":"integer"}}})
+    assert CAPTURED["body"]["x-cache"] == policy
+    assert CAPTURED["body"]["x-shim"]["structured_output"] == "prompt"
+    assert CAPTURED["body"]["response_format"]["json_schema"]["schema"]["type"] == "integer"
+    list(llmshim.stream("claude-sonnet-4-6", "hi", cache=policy))
+    assert CAPTURED["body"]["x-cache"] == policy

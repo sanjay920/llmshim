@@ -94,61 +94,19 @@ pub async fn completion_with_fallback(
 
         for attempt in 0..=config.max_retries {
             let timer = RequestTimer::start();
-            let provider_req = match provider.transform_request(&model, &req) {
-                Ok(r) => r,
-                Err(e) => {
-                    errors.push(format!("{}: transform error: {}", model_str, e));
-                    break; // don't retry transform errors
-                }
-            };
-
-            match client.send(&provider_req).await {
-                Ok(resp) => {
-                    let body: Value = match resp.json().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            errors.push(format!("{}: json parse error: {}", model_str, e));
-                            break;
-                        }
-                    };
-                    match provider.transform_response(&model, body) {
-                        Ok(result) => {
-                            if let Some(logger) = logger {
-                                logger.log(&LogEntry::from_response(
-                                    provider.name(),
-                                    model_str,
-                                    &result,
-                                    timer.elapsed(),
-                                ));
-                            }
-                            return Ok(result);
-                        }
-                        Err(e) => {
-                            if is_retryable(&e, &config.retryable_statuses)
-                                && attempt < config.max_retries
-                            {
-                                errors.push(format!(
-                                    "{} (attempt {}): {}",
-                                    model_str,
-                                    attempt + 1,
-                                    e
-                                ));
-                                tokio::time::sleep(backoff).await;
-                                backoff *= 2;
-                                continue;
-                            }
-                            if let Some(logger) = logger {
-                                logger.log(&LogEntry::from_error(
-                                    provider.name(),
-                                    model_str,
-                                    &e.to_string(),
-                                    timer.elapsed(),
-                                ));
-                            }
-                            errors.push(format!("{}: {}", model_str, e));
-                            break; // move to next model
-                        }
+            // Keep OAuth preparation, SSE-only providers, reasoning provenance,
+            // and tool normalization identical to an ordinary completion.
+            match client.completion(provider, &model, &req).await {
+                Ok(result) => {
+                    if let Some(logger) = logger {
+                        logger.log(&LogEntry::from_response(
+                            provider.name(),
+                            model_str,
+                            &result,
+                            timer.elapsed(),
+                        ));
                     }
+                    return Ok(result);
                 }
                 Err(e) => {
                     if is_retryable(&e, &config.retryable_statuses) && attempt < config.max_retries

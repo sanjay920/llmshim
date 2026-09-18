@@ -55,7 +55,7 @@ async fn sglang_reasoning() {
     });
     let resp = llmshim::completion(&router, &req).await.unwrap();
     let msg = &resp["choices"][0]["message"];
-    let reasoning = msg["reasoning_content"].as_str().unwrap_or("");
+    let reasoning = msg["reasoning"][0]["text"].as_str().unwrap_or("");
     let content = msg["content"].as_str().unwrap_or("");
     assert!(
         !reasoning.is_empty() || !content.is_empty(),

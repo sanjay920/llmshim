@@ -1,7 +1,8 @@
 # HTTP API
 
 The proxy wraps llmshim's translation engine in a compact JSON API. It has
-four endpoints and two response encodings.
+a compact chat contract plus [native API endpoints](native-apis.md), with JSON
+and SSE responses.
 
 > **Availability:** HTTP JSON: non-streaming chat, models, health · HTTP SSE: streaming chat
 
@@ -44,6 +45,9 @@ Both chat endpoints accept the same body:
 | `config` | object | Portable generation controls |
 | `provider_config` | object | Fields merged into the engine request, including tools and `x-*` namespaces |
 | `fallback` | string array | Ordered backup models for non-streaming requests only |
+| `response_format` | object | Validated JSON output contract |
+| `x-shim` | object | Capability path selection |
+| `x-cache` | object | Stability segments and explicit cache key |
 
 `config` accepts exactly these fields:
 
@@ -62,8 +66,10 @@ mapped and clamped by model family; see [Reasoning controls](../guides/reasoning
 
 Messages require `role`; `content` defaults to `null` and may be text or
 content blocks. Tool turns may also carry `tool_calls` or `tool_call_id`.
-`reasoning_content` is accepted on a message when prior reasoning must be
-round-tripped.
+Assistant messages carry `reasoning[]` blocks with provenance. Preserve the
+complete array and any tool-call `thought_signature` object for replay.
+Legacy reasoning text is accepted only as migration input; untracked blocks
+are dropped.
 
 `provider_config` is merged as top-level engine fields. For example, tools go
 at `provider_config.tools`, while an OpenAI-native override goes at

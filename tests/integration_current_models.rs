@@ -73,10 +73,10 @@ async fn fable_tool_roundtrips_and_history_binding() {
         );
         if model.ends_with("5-1") {
             assert!(
-                assistant["reasoning_signature"]
+                assistant["reasoning"][0]["signature"]
                     .as_str()
                     .is_some_and(|s| !s.is_empty())
-                    || assistant["redacted_reasoning_content"]
+                    || assistant["reasoning"][0]["data"]
                         .as_str()
                         .is_some_and(|s| !s.is_empty()),
                 "missing thinking block on {model}; response fields: {:?}",

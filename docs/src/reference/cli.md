@@ -10,14 +10,15 @@ print top-level help. Interactive chat starts only with `llmshim chat`.
 | Command | Arguments and flags | Purpose |
 |---|---|---|
 | `llmshim chat` | `--log <path>` | Start interactive, streaming chat |
-| `llmshim proxy` | none | Start the HTTP proxy |
+| `llmshim proxy` | `--host <IP>`, `--port <PORT>` | Start the HTTP proxy |
+| `llmshim gateway` | `--host <IP>`, `--port <PORT>` | Start the priority-queue gateway |
 | `llmshim configure` | none | Prompt for four provider keys and proxy host/port |
 | `llmshim login chatgpt` | `--status` | Sign in via device code, or inspect the local cache |
 | `llmshim logout chatgpt` | none | Remove the selected local ChatGPT OAuth cache |
 | `llmshim set` | `<key> <value>` | Write one config value |
 | `llmshim get` | `<key>` | Read one config value; keys are masked |
 | `llmshim list` | none | Show masked keys and proxy settings; alias: `ls` |
-| `llmshim models` | none | List registry models for configured providers |
+| `llmshim models` | `--all`, `--json`, `--refresh` | List registry models for configured providers |
 | `llmshim path` | none | Print the config file path |
 | `llmshim docker` | `<start\|stop\|status\|logs\|build>` | Manage the stock local proxy container |
 
@@ -64,9 +65,16 @@ one of the four supported IDs: `chatgpt/gpt-6-astra`, `chatgpt/gpt-5.6-sol`,
 ## Proxy
 
 `llmshim proxy` loads file-backed keys, requires at least one configured
-provider, and listens using `LLMSHIM_HOST`/`LLMSHIM_PORT` or the config file.
-It accepts no command-line flags. A default-feature Cargo build prints an error;
-install or build with `--features proxy`.
+provider, and listens using `--host`/`--port`, then `LLMSHIM_HOST`/`LLMSHIM_PORT`,
+then saved configuration, in that order. The host must be an IPv4 or IPv6 address.
+`--port 0` asks the OS for an available port; the startup banner prints that port.
+The gateway accepts the same options. A default-feature Cargo build prints an
+error for these server commands; build with `--features proxy` or `--features gateway`.
+
+Every subcommand accepts `--help` without starting a server, loading credentials,
+or entering an interactive prompt. Unknown arguments, missing option values, and
+invalid ports exit with status 2. Bind failures exit with a readable diagnostic
+and status 1 instead of a panic.
 
 See [HTTP API](../proxy/http-api.md) and
 [Deploy the proxy safely](../proxy/deployment.md).

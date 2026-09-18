@@ -240,7 +240,7 @@ fn response_normalizes_reasoning_to_reasoning_content() {
         .transform_response("anthropic/claude-sonnet-4.5", resp)
         .unwrap();
     let msg = &result["choices"][0]["message"];
-    assert_eq!(msg["reasoning_content"], "let me think...");
+    assert_eq!(msg["reasoning"][0]["text"], "let me think...");
     assert_eq!(msg["content"], "42");
     assert_eq!(result["usage"]["total_tokens"], 7);
 }
@@ -260,7 +260,7 @@ fn response_passes_tool_calls_through() {
     });
     let result = p.transform_response("x/y", resp).unwrap();
     let tc = &result["choices"][0]["message"]["tool_calls"][0];
-    assert_eq!(tc["id"], "call_9");
+    assert_eq!(tc["wire_ids"][0]["id"], "call_9");
     assert_eq!(tc["function"]["name"], "search");
     assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
 }
@@ -289,7 +289,7 @@ fn stream_normalizes_reasoning_delta() {
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(
-        parsed["choices"][0]["delta"]["reasoning_content"],
+        parsed["choices"][0]["delta"]["reasoning"][0]["text"],
         "thinking"
     );
 }

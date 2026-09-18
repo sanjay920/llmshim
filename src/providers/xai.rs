@@ -36,11 +36,10 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
 
         match role {
             "assistant" => {
+                result.extend(crate::reasoning::responses_items(msg));
                 let mut out = msg.clone();
+                crate::reasoning::strip_fields(&mut out);
                 if let Some(obj) = out.as_object_mut() {
-                    obj.remove("reasoning_content");
-                    obj.remove("reasoning_signature"); // opaque Anthropic token — never forward
-                    obj.remove("redacted_reasoning_content"); // opaque Anthropic token — never forward
                     obj.remove("annotations");
                     obj.remove("refusal");
                     obj.remove("tool_calls");
@@ -80,12 +79,16 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
                             .and_then(|a| a.as_str())
                             .unwrap_or("{}")
                             .to_string();
-                        result.push(json!({
+                        let mut item = json!({
                             "type": "function_call",
                             "call_id": call_id,
                             "name": name,
                             "arguments": arguments,
-                        }));
+                        });
+                        if let Some(id) = tc.get("_llmshim_item_id") {
+                            item["id"] = id.clone();
+                        }
+                        result.push(item);
                     }
                 }
             }
@@ -108,10 +111,8 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
             }
             _ => {
                 let mut out = msg.clone();
+                crate::reasoning::strip_fields(&mut out);
                 if let Some(obj) = out.as_object_mut() {
-                    obj.remove("reasoning_content");
-                    obj.remove("reasoning_signature"); // opaque Anthropic token — never forward
-                    obj.remove("redacted_reasoning_content"); // opaque Anthropic token — never forward
                     obj.remove("annotations");
                     obj.remove("refusal");
                 }
@@ -204,7 +205,21 @@ impl Provider for Xai {
         "xai"
     }
 
+    fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
+        crate::reasoning::ReplayTarget::new(
+            self.name(),
+            model,
+            crate::reasoning::WireFormat::OpenAiResponses,
+        )
+        .bind_account(&self.base_url, Some(&self.api_key))
+    }
+
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        let request = crate::schema::prepare_request(request);
+        let request =
+            crate::cache::prepare_request(&request, crate::reasoning::WireFormat::OpenAiResponses)?;
+        let request = crate::reasoning::prepare_request(&request, &self.replay_target(model));
+        let request = crate::toolcall::prepare_request(&request, &self.replay_target(model))?;
         let obj = request.as_object().ok_or(ShimError::MissingModel)?;
 
         let messages = obj
@@ -295,6 +310,19 @@ impl Provider for Xai {
 
         let url = format!("{}/responses", self.base_url);
 
+        crate::reasoning::enforce_stateless(&mut body)?;
+        crate::toolcall::validate_native(&body, &self.replay_target(model))?;
+        crate::schema::normalize_native_tools(crate::schema::Target::OpenAiResponses, &mut body);
+        crate::shim::native_format(
+            &request,
+            crate::reasoning::WireFormat::OpenAiResponses,
+            &mut body,
+        );
+        crate::cache::finish_request(
+            &request,
+            &mut body,
+            crate::reasoning::WireFormat::OpenAiResponses,
+        )?;
         Ok(ProviderRequest {
             url,
             headers: vec![
@@ -306,6 +334,25 @@ impl Provider for Xai {
     }
 
     fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
+        let native = response.clone();
+        let mut result = self.transform_response_native(model, response)?;
+        crate::reasoning::capture_response(&self.replay_target(model), &native, &mut result);
+        crate::toolcall::capture_response(&self.replay_target(model), &native, &mut result)?;
+        Ok(result)
+    }
+
+    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        let result = self.transform_stream_chunk_native(model, chunk)?;
+        let native: Value = match serde_json::from_str(chunk) {
+            Ok(v) => v,
+            Err(_) => return Ok(result),
+        };
+        crate::reasoning::capture_stream(&self.replay_target(model), &native, result)
+    }
+}
+
+impl Xai {
+    fn transform_response_native(&self, model: &str, response: Value) -> Result<Value> {
         // Check for error (Responses API returns "error": null on success)
         if let Some(err) = response.get("error") {
             if !err.is_null() {
@@ -329,7 +376,7 @@ impl Provider for Xai {
             })?;
 
         let mut text_content: Option<String> = None;
-        let mut reasoning_content: Option<String> = None;
+        let mut refusal = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
 
         for item in output {
@@ -337,8 +384,13 @@ impl Provider for Xai {
                 Some("message") => {
                     if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
                         for part in content {
+                            if part["type"] == "refusal" {
+                                if let Some(text) = part["refusal"].as_str() {
+                                    refusal.push_str(text);
+                                }
+                            }
                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                text_content = Some(text.to_string());
+                                text_content.get_or_insert_with(String::new).push_str(text);
                             }
                         }
                     }
@@ -353,33 +405,28 @@ impl Provider for Xai {
                         }
                     }));
                 }
-                Some("reasoning") => {
-                    // grok-4.3 returns a real summary here (older models emit
-                    // an empty item); surface it like the OpenAI provider does.
-                    if let Some(summary) = item.get("summary").and_then(|s| s.as_array()) {
-                        let texts: Vec<&str> = summary
-                            .iter()
-                            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                            .collect();
-                        if !texts.is_empty() {
-                            reasoning_content = Some(texts.join("\n"));
-                        }
-                    }
-                }
                 _ => {}
             }
         }
 
         let content = text_content.map(|t| json!(t)).unwrap_or(Value::Null);
         let mut message = json!({"role": "assistant", "content": content});
+        if !refusal.is_empty() {
+            message["refusal"] = json!(refusal);
+        }
         if !tool_calls.is_empty() {
             message["tool_calls"] = json!(tool_calls);
         }
-        if let Some(reasoning) = reasoning_content {
-            message["reasoning_content"] = json!(reasoning);
-        }
 
         let finish_reason = match response.get("status").and_then(Value::as_str) {
+            Some("completed" | "incomplete") if message["refusal"].is_string() => "content_filter",
+            Some("completed")
+                if message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty()) =>
+            {
+                "tool_calls"
+            }
             Some("completed") => "stop",
             Some("incomplete") => "length",
             _ => {
@@ -417,10 +464,13 @@ impl Provider for Xai {
             result["usage"]["reasoning_tokens"] = json!(reasoning_tokens);
         }
 
+        crate::usage::normalize_cache(&usage, &mut result["usage"]);
         Ok(result)
     }
+}
 
-    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+impl Xai {
+    fn transform_stream_chunk_native(&self, model: &str, chunk: &str) -> Result<Option<String>> {
         let trimmed = chunk.trim();
         if trimmed.is_empty() || trimmed == "[DONE]" {
             return Ok(None);
@@ -430,6 +480,7 @@ impl Provider for Xai {
         let event_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         match event_type {
+            "response.refusal.delta" => Ok(Some(json!({"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"refusal":parsed["delta"]},"finish_reason":null}]}).to_string())),
             // Content text deltas
             "response.output_text.delta" => {
                 let delta = parsed.get("delta").and_then(|d| d.as_str()).unwrap_or("");
@@ -442,65 +493,6 @@ impl Provider for Xai {
                     "choices": [{
                         "index": 0,
                         "delta": {"content": delta},
-                        "finish_reason": null,
-                    }]
-                });
-                Ok(Some(serde_json::to_string(&chunk)?))
-            }
-
-            // Function call output item added — emit tool_calls start chunk
-            "response.output_item.added" => {
-                let empty = json!({});
-                let item = parsed.get("item").unwrap_or(&empty);
-                if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
-                    return Ok(None);
-                }
-                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let index = parsed
-                    .get("output_index")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let chunk = json!({
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [{
-                                "index": index,
-                                "id": call_id,
-                                "type": "function",
-                                "function": {"name": name, "arguments": ""},
-                            }]
-                        },
-                        "finish_reason": null,
-                    }]
-                });
-                Ok(Some(serde_json::to_string(&chunk)?))
-            }
-
-            // Function call argument deltas
-            "response.function_call_arguments.delta" => {
-                let delta = parsed.get("delta").and_then(|d| d.as_str()).unwrap_or("");
-                if delta.is_empty() {
-                    return Ok(None);
-                }
-                let index = parsed
-                    .get("output_index")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let chunk = json!({
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [{
-                                "index": index,
-                                "function": {"arguments": delta},
-                            }]
-                        },
                         "finish_reason": null,
                     }]
                 });
@@ -524,7 +516,7 @@ impl Provider for Xai {
                     .pointer("/output_tokens_details/reasoning_tokens")
                     .cloned()
                     .unwrap_or(json!(0));
-                let chunk = json!({
+                let mut chunk = json!({
                     "object": "chat.completion.chunk",
                     "model": model,
                     "choices": [{
@@ -538,6 +530,7 @@ impl Provider for Xai {
                         "reasoning_tokens": reasoning_tokens,
                     }
                 });
+                crate::usage::normalize_cache(&usage, &mut chunk["usage"]);
                 Ok(Some(serde_json::to_string(&chunk)?))
             }
 

@@ -173,6 +173,10 @@ impl ChatGptAuth {
         &self.path
     }
 
+    pub(super) fn replay_account(&self) -> Option<String> {
+        self.read().ok().flatten().and_then(|t| t.account_id)
+    }
+
     fn read(&self) -> Result<Option<Tokens>> {
         let data = match std::fs::read(&self.path) {
             Ok(data) => data,
