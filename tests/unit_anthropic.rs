@@ -198,7 +198,7 @@ fn request_passes_standard_params() {
     assert_eq!(result.body["temperature"], 0.5);
     assert_eq!(result.body["top_p"], 0.9);
     assert_eq!(result.body["top_k"], 40);
-    assert_eq!(result.body["stop"], json!(["END"]));
+    assert_eq!(result.body["stop_sequences"], json!(["END"]));
     assert_eq!(result.body["stream"], true);
 }
 
@@ -332,7 +332,7 @@ fn request_transforms_tool_calls_in_messages() {
 #[test]
 fn request_transforms_assistant_with_text_and_tool_calls() {
     let p = provider();
-    let req = json!({
+    let mut req = json!({
         "model": "x",
         "messages": [{
             "role": "assistant",
@@ -347,6 +347,17 @@ fn request_transforms_assistant_with_text_and_tool_calls() {
             }]
         }],
     });
+    let call_id = req["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|m| m["tool_calls"][0]["id"].as_str())
+        .unwrap()
+        .to_owned();
+    req["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"tool","tool_call_id":call_id,"content":"result"}));
     let result = p.transform_request("x", &req).unwrap();
     let messages = result.body["messages"].as_array().unwrap();
     let content = messages[0]["content"].as_array().unwrap();
@@ -536,7 +547,7 @@ fn response_tool_use() {
     assert_eq!(msg["content"], "Let me check.");
     let tool_calls = msg["tool_calls"].as_array().unwrap();
     assert_eq!(tool_calls.len(), 1);
-    assert_eq!(tool_calls[0]["id"], "tu_123");
+    assert_eq!(tool_calls[0]["wire_ids"][0]["id"], "tu_123");
     assert_eq!(tool_calls[0]["type"], "function");
     assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
 
@@ -636,36 +647,47 @@ fn stream_text_delta() {
 #[test]
 fn stream_tool_use_start() {
     let p = provider();
-    let chunk = json!({
-        "type": "content_block_start",
-        "content_block": {"type": "tool_use", "id": "tu_s1", "name": "get_weather"}
-    });
-    let result = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+    let mut stream = p.stream_normalizer("claude-sonnet-4-6");
+    assert!(stream.push(&json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_x","name":"read","input":{}}}).to_string()).unwrap().is_none());
+    stream
+        .push(&json!({"type":"content_block_stop","index":2}).to_string())
+        .unwrap();
+    let result = stream
+        .push(
+            &json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}})
+                .to_string(),
+        )
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
-    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(tc["id"], "tu_s1");
-    assert_eq!(tc["function"]["name"], "get_weather");
+    let call = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(call["wire_ids"][0]["id"], "toolu_x");
+    assert_eq!(call["index"], 2);
+    assert_eq!(call["function"]["arguments"], "{}");
 }
 
 #[test]
 fn stream_tool_json_delta() {
     let p = provider();
-    let chunk = json!({
-        "type": "content_block_delta",
-        "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}
-    });
-    let result = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+    let mut stream = p.stream_normalizer("claude-sonnet-4-6");
+    stream.push(&json!({"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_x","name":"read","input":{}}}).to_string()).unwrap();
+    for fragment in ["{\"city\":", "\"Paris\"}"] {
+        assert!(stream.push(&json!({"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":fragment}}).to_string()).unwrap().is_none());
+    }
+    stream
+        .push(&json!({"type":"content_block_stop","index":3}).to_string())
+        .unwrap();
+    let result = stream
+        .push(
+            &json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{}})
+                .to_string(),
+        )
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
-    assert_eq!(
-        parsed["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
-        "{\"city\":"
-    );
+    let call = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(call["index"], 3);
 }
 
 #[test]
@@ -1069,7 +1091,7 @@ fn response_with_thinking_block() {
     let msg = &result["choices"][0]["message"];
     assert_eq!(msg["content"], "The answer is 42.");
     assert_eq!(
-        msg["reasoning_content"],
+        msg["reasoning"][0]["text"],
         "Let me reason step by step...\n1. First...\n2. Then..."
     );
     assert_eq!(msg["role"], "assistant");
@@ -1104,7 +1126,7 @@ fn response_thinking_only_no_text() {
     let result = p.transform_response("x", resp).unwrap();
     let msg = &result["choices"][0]["message"];
     assert!(msg["content"].is_null());
-    assert_eq!(msg["reasoning_content"], "Reasoning here...");
+    assert_eq!(msg["reasoning"][0]["text"], "Reasoning here...");
 }
 
 // ============================================================
@@ -1124,7 +1146,7 @@ fn stream_thinking_delta() {
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(
-        parsed["choices"][0]["delta"]["reasoning_content"],
+        parsed["choices"][0]["delta"]["reasoning"][0]["text"],
         "Step 1: analyze..."
     );
     assert!(parsed["choices"][0]["finish_reason"].is_null());
@@ -1145,7 +1167,7 @@ fn stream_signature_delta_emits_signature() {
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(
-        parsed["choices"][0]["delta"]["reasoning_signature"],
+        parsed["choices"][0]["delta"]["reasoning"][0]["signature"],
         "EqoBCkgIAxgC..."
     );
 }
@@ -1602,8 +1624,8 @@ fn response_surfaces_reasoning_signature() {
     });
     let result = p.transform_response("claude-opus-4-8", resp).unwrap();
     let msg = &result["choices"][0]["message"];
-    assert_eq!(msg["reasoning_content"], "Let me think...");
-    assert_eq!(msg["reasoning_signature"], "sig-abc123");
+    assert_eq!(msg["reasoning"][0]["text"], "Let me think...");
+    assert_eq!(msg["reasoning"][0]["signature"], "sig-abc123");
     assert_eq!(msg["content"], "The answer is 42.");
 }
 
@@ -1621,7 +1643,7 @@ fn response_surfaces_redacted_reasoning() {
     });
     let result = p.transform_response("claude-opus-4-8", resp).unwrap();
     assert_eq!(
-        result["choices"][0]["message"]["redacted_reasoning_content"],
+        result["choices"][0]["message"]["reasoning"][0]["data"],
         "encrypted-blob-xyz"
     );
 }
@@ -1629,12 +1651,13 @@ fn response_surfaces_redacted_reasoning() {
 #[test]
 fn request_reconstructs_thinking_block_first_with_tool_calls() {
     let p = provider();
-    let req = json!({
+    let mut req = json!({
         "model": "claude-opus-4-8",
         "messages": [
             {"role": "user", "content": "weather?"},
             {
                 "role": "assistant",
+            "reasoning_origin": p.replay_target("claude-opus-4-8").origin(),
                 "content": "",
                 "reasoning_content": "I should call the tool.",
                 "reasoning_signature": "sig-xyz",
@@ -1646,6 +1669,17 @@ fn request_reconstructs_thinking_block_first_with_tool_calls() {
             }
         ]
     });
+    let call_id = req["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|m| m["tool_calls"][0]["id"].as_str())
+        .unwrap()
+        .to_owned();
+    req["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"tool","tool_call_id":call_id,"content":"result"}));
     let result = p.transform_request("claude-opus-4-8", &req).unwrap();
     let content = &result.body["messages"][1]["content"];
     // Thinking block must be FIRST (with signature), before the tool_use block.
@@ -1669,6 +1703,7 @@ fn request_reconstructs_thinking_block_plain_text() {
         "model": "claude-opus-4-8",
         "messages": [{
             "role": "assistant",
+            "reasoning_origin": p.replay_target("claude-opus-4-8").origin(),
             "content": "Final answer.",
             "reasoning_content": "thinking...",
             "reasoning_signature": "sig-1"
@@ -1689,6 +1724,7 @@ fn request_reconstructs_redacted_thinking() {
         "model": "claude-opus-4-8",
         "messages": [{
             "role": "assistant",
+            "reasoning_origin": p.replay_target("claude-opus-4-8").origin(),
             "content": "ok",
             "redacted_reasoning_content": "blob-1"
         }]
@@ -1730,7 +1766,7 @@ fn stream_signature_delta_emits_reasoning_signature() {
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(
-        parsed["choices"][0]["delta"]["reasoning_signature"],
+        parsed["choices"][0]["delta"]["reasoning"][0]["signature"],
         "sig-stream-1"
     );
 }
@@ -1749,7 +1785,7 @@ fn stream_redacted_thinking_block_start_emits() {
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(
-        parsed["choices"][0]["delta"]["redacted_reasoning_content"],
+        parsed["choices"][0]["delta"]["reasoning"][0]["data"],
         "blob-stream"
     );
 }

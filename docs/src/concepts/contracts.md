@@ -22,7 +22,7 @@ let request = serde_json::json!({
 
 A non-streaming result uses an OpenAI Chat Completions-style shape. The answer
 is normally at `choices[0].message.content`; translated tool calls live beside
-it, and provider-returned reasoning uses `reasoning_content` when available.
+it, and provider-returned reasoning uses an ordered `reasoning[]` array with provenance.
 
 Rust streaming yields JSON strings in the normalized Chat Completions chunk
 shape. It does not yield the proxy's typed event objects.

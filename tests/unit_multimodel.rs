@@ -161,7 +161,7 @@ fn anthropic_tool_response_format_works_for_openai() {
         "messages": [
             {"role": "user", "content": "search for rust"},
             normalized["choices"][0]["message"],
-            {"role": "tool", "tool_call_id": "tu_456", "content": "Results: ..."},
+            {"role": "tool", "tool_call_id": normalized["choices"][0]["message"]["tool_calls"][0]["id"], "content": "Results: ..."},
             {"role": "user", "content": "summarize"},
         ],
     });
@@ -170,10 +170,16 @@ fn anthropic_tool_response_format_works_for_openai() {
     // Assistant tool_calls are translated to Responses API function_call items.
     assert_eq!(input[1]["type"], "function_call");
     assert_eq!(input[1]["name"], "search");
-    assert_eq!(input[1]["call_id"], "tu_456");
+    assert_eq!(
+        input[1]["call_id"],
+        normalized["choices"][0]["message"]["tool_calls"][0]["id"]
+    );
     // Tool result is translated to function_call_output.
     assert_eq!(input[2]["type"], "function_call_output");
-    assert_eq!(input[2]["call_id"], "tu_456");
+    assert_eq!(
+        input[2]["call_id"],
+        normalized["choices"][0]["message"]["tool_calls"][0]["id"]
+    );
 }
 
 // ============================================================
@@ -242,7 +248,7 @@ fn round_trip_openai_anthropic_openai() {
         .transform_response("claude-sonnet-4-6", anthropic_resp)
         .unwrap();
     assert_eq!(
-        normalized_resp["choices"][0]["message"]["reasoning_content"],
+        normalized_resp["choices"][0]["message"]["reasoning"][0]["text"],
         "Let me think of a joke..."
     );
 

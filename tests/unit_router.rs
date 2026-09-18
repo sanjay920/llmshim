@@ -290,3 +290,30 @@ fn parse_vllm_and_sglang_preserve_hf_slug() {
     assert_eq!(p, "sglang");
     assert_eq!(m, "Qwen/Qwen3.6-35B-A3B-FP8");
 }
+
+#[test]
+fn router_resolves_catalog_spellings_without_rerouting_reseller_models() {
+    let router = Router::new()
+        .register("anthropic", Box::new(Anthropic::new("test".into())))
+        .register(
+            "gemini",
+            Box::new(llmshim::providers::gemini::Gemini::new("test".into())),
+        )
+        .register(
+            "openrouter",
+            Box::new(llmshim::providers::openrouter::OpenRouter::new(
+                "test".into(),
+            )),
+        );
+    let (p, name) = router.resolve("anthropic/claude-haiku-4.5").unwrap();
+    assert_eq!(p.name(), "anthropic");
+    assert_eq!(name, "claude-haiku-4-5");
+    let (p, name) = router.resolve("google/gemini-3.8-flash").unwrap();
+    assert_eq!(p.name(), "gemini");
+    assert_eq!(name, "gemini-3.8-flash");
+    let (p, name) = router
+        .resolve("openrouter/anthropic/claude-haiku-4.5")
+        .unwrap();
+    assert_eq!(p.name(), "openrouter");
+    assert_eq!(name, "anthropic/claude-haiku-4.5");
+}

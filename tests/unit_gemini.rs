@@ -2,6 +2,10 @@ use llmshim::provider::Provider;
 use llmshim::providers::gemini::Gemini;
 use serde_json::{json, Value};
 
+fn signature(data: &str) -> Value {
+    json!({"data": data, "origin": provider().replay_target("gemini-3.8-flash").origin()})
+}
+
 fn provider() -> Gemini {
     Gemini::new("test-key".into())
 }
@@ -291,7 +295,7 @@ fn request_tool_calls_in_history() {
                     "id": "call_1",
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
-                    "thought_signature": "test-sig"
+                    "thought_signature": signature("test-sig")
                 }]
             },
             {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 22}"},
@@ -338,7 +342,7 @@ fn request_tool_result_array_wrapped_as_object() {
                     "id": "call_0",
                     "type": "function",
                     "function": {"name": "list_items", "arguments": "{}"},
-                    "thought_signature": "test-sig"
+                    "thought_signature": signature("test-sig")
                 }]
             },
             {"role": "tool", "tool_call_id": "call_0", "content": "[\"a\", \"b\", \"c\"]"},
@@ -366,7 +370,7 @@ fn request_tool_result_plain_string_wrapped() {
                     "id": "call_0",
                     "type": "function",
                     "function": {"name": "echo", "arguments": "{}"},
-                    "thought_signature": "test-sig"
+                    "thought_signature": signature("test-sig")
                 }]
             },
             {"role": "tool", "tool_call_id": "call_0", "content": "hello world"},
@@ -533,7 +537,8 @@ fn stream_function_call() {
         "usageMetadata": {},
     });
     let result = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&chunk).unwrap())
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
@@ -620,7 +625,7 @@ fn response_with_thought_parts() {
         "The answer is 42."
     );
     assert_eq!(
-        result["choices"][0]["message"]["reasoning_content"],
+        result["choices"][0]["message"]["reasoning"][0]["text"],
         "Let me think about this..."
     );
 }
@@ -639,7 +644,7 @@ fn response_thought_only_no_text() {
         .unwrap();
     assert!(result["choices"][0]["message"]["content"].is_null());
     assert_eq!(
-        result["choices"][0]["message"]["reasoning_content"],
+        result["choices"][0]["message"]["reasoning"][0]["text"],
         "Just thinking..."
     );
 }
@@ -684,7 +689,7 @@ fn stream_thought_part() {
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(
-        parsed["choices"][0]["delta"]["reasoning_content"],
+        parsed["choices"][0]["delta"]["reasoning"][0]["text"],
         "Thinking..."
     );
     assert!(parsed["choices"][0]["delta"].get("content").is_none());
@@ -709,7 +714,7 @@ fn stream_text_and_thought_in_same_chunk() {
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(
-        parsed["choices"][0]["delta"]["reasoning_content"],
+        parsed["choices"][0]["delta"]["reasoning"][0]["text"],
         "Reasoning here"
     );
     assert_eq!(parsed["choices"][0]["delta"]["content"], "Answer here");
@@ -742,7 +747,7 @@ fn response_preserves_thought_signature_on_tool_calls() {
         .unwrap();
     let tc = &result["choices"][0]["message"]["tool_calls"][0];
     assert_eq!(tc["function"]["name"], "get_quote");
-    assert_eq!(tc["thought_signature"], "abc123-sig");
+    assert_eq!(tc["thought_signature"]["data"], "abc123-sig");
 }
 
 #[test]
@@ -759,7 +764,7 @@ fn request_echoes_thought_signature_in_function_call_parts() {
                     "id": "call_0",
                     "type": "function",
                     "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"},
-                    "thought_signature": "abc123-sig"
+                    "thought_signature": signature("abc123-sig")
                 }]
             },
             {"role": "tool", "tool_call_id": "call_0", "name": "get_quote", "content": "{\"price\": 150}"},
@@ -778,7 +783,7 @@ fn request_echoes_thought_signature_in_function_call_parts() {
 }
 
 #[test]
-fn request_without_thought_signature_strips_function_calls() {
+fn request_rejects_missing_current_turn_signature() {
     // functionCall without thought_signature should be stripped by enforce_gemini_turn_order
     let p = provider();
     let req = json!({
@@ -797,23 +802,7 @@ fn request_without_thought_signature_strips_function_calls() {
             {"role": "tool", "tool_call_id": "call_0", "name": "get_quote", "content": "{}"},
         ],
     });
-    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
-    let contents = result.body["contents"].as_array().unwrap();
-    // The functionCall+functionResponse pair should be stripped (missing thought_signature)
-    // Only the user turn should remain
-    for turn in contents {
-        let parts = turn["parts"].as_array().unwrap();
-        for part in parts {
-            assert!(
-                part.get("functionCall").is_none(),
-                "functionCall without thought_signature should be stripped"
-            );
-            assert!(
-                part.get("functionResponse").is_none(),
-                "orphaned functionResponse should be stripped"
-            );
-        }
-    }
+    assert!(p.transform_request("gemini-3-flash-preview", &req).is_err());
 }
 
 #[test]
@@ -833,16 +822,14 @@ fn stream_preserves_thought_signature_on_tool_calls() {
         "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
     });
     let result = p
-        .transform_stream_chunk(
-            "gemini-3-flash-preview",
-            &serde_json::to_string(&chunk).unwrap(),
-        )
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&chunk).unwrap())
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
     let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
     assert_eq!(tc["function"]["name"], "get_quote");
-    assert_eq!(tc["thought_signature"], "stream-sig-xyz");
+    assert_eq!(tc["thought_signature"]["data"], "stream-sig-xyz");
 }
 
 // ============================================================
@@ -851,46 +838,25 @@ fn stream_preserves_thought_signature_on_tool_calls() {
 
 #[test]
 fn stream_parallel_tool_calls_each_get_unique_index() {
-    // Gemini sends each parallel tool call as a separate SSE chunk.
-    // Each chunk arrives with its own parts containing functionCall.
-    // The llmshim transform_stream_chunk assigns incrementing indices.
     let p = provider();
-
-    // First tool call chunk
-    let chunk1 = json!({
-        "candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "get_quote", "args": {"symbol": "AAPL"}}, "thoughtSignature": "sig1"}
-        ], "role": "model"}}],
-        "usageMetadata": {},
-    });
-    let result1 = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk1).unwrap())
+    let mut stream = p.stream_normalizer("gemini-3-flash-preview");
+    for (name, sig) in [("get_quote", "sig1"), ("get_news", "sig2")] {
+        stream.push(&json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":name,"args":{}},"thoughtSignature":sig}]}}]}).to_string()).unwrap();
+    }
+    let result = stream
+        .push(&json!({"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}).to_string())
         .unwrap()
         .unwrap();
-    let parsed1: Value = serde_json::from_str(&result1).unwrap();
-    let tc1 = &parsed1["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(tc1["function"]["name"], "get_quote");
-    assert_eq!(tc1["index"], 0);
-    assert_eq!(tc1["thought_signature"], "sig1");
-
-    // Second tool call chunk (same SSE stream, would arrive separately)
-    let chunk2 = json!({
-        "candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "get_news", "args": {"count": 5}}, "thoughtSignature": "sig2"}
-        ], "role": "model"}}],
-        "usageMetadata": {},
-    });
-    let result2 = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk2).unwrap())
-        .unwrap()
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let calls = parsed["choices"][0]["delta"]["tool_calls"]
+        .as_array()
         .unwrap();
-    let parsed2: Value = serde_json::from_str(&result2).unwrap();
-    let tc2 = &parsed2["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(tc2["function"]["name"], "get_news");
-    // Each chunk is independently transformed — index starts at 0 within the chunk.
-    // The client's streaming runner handles deduplication across chunks.
-    assert_eq!(tc2["index"], 0);
-    assert_eq!(tc2["thought_signature"], "sig2");
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0]["id"], calls[1]["id"]);
+    assert_eq!(calls[0]["index"], 0);
+    assert_eq!(calls[1]["index"], 1);
+    assert_eq!(calls[0]["thought_signature"]["data"], "sig1");
+    assert_eq!(calls[1]["thought_signature"]["data"], "sig2");
 }
 
 #[test]
@@ -905,7 +871,8 @@ fn stream_multiple_tool_calls_in_single_chunk() {
         "usageMetadata": {},
     });
     let result = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&chunk).unwrap())
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
@@ -915,10 +882,10 @@ fn stream_multiple_tool_calls_in_single_chunk() {
     assert_eq!(tcs.len(), 2);
     assert_eq!(tcs[0]["function"]["name"], "get_quote");
     assert_eq!(tcs[0]["index"], 0);
-    assert_eq!(tcs[0]["thought_signature"], "sig1");
+    assert_eq!(tcs[0]["thought_signature"]["data"], "sig1");
     assert_eq!(tcs[1]["function"]["name"], "get_news");
     assert_eq!(tcs[1]["index"], 1);
-    assert_eq!(tcs[1]["thought_signature"], "sig2");
+    assert_eq!(tcs[1]["thought_signature"]["data"], "sig2");
 }
 
 #[test]
@@ -932,7 +899,8 @@ fn stream_empty_args_produces_empty_json_object() {
         "usageMetadata": {},
     });
     let result = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&chunk).unwrap())
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
@@ -956,7 +924,8 @@ fn stream_null_args_produces_empty_json_object() {
         "usageMetadata": {},
     });
     let result = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&chunk).unwrap())
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
@@ -970,29 +939,15 @@ fn stream_null_args_produces_empty_json_object() {
 }
 
 #[test]
-fn stream_no_name_function_call_skipped() {
+fn stream_rejects_unnamed_function_call() {
     let p = provider();
-    // functionCall with empty name should be skipped entirely
-    let chunk = json!({
-        "candidates": [{"content": {"parts": [
-            {"functionCall": {"name": "", "args": {"x": 1}}}
-        ], "role": "model"}, "finishReason": "STOP"}],
-        "usageMetadata": {},
-    });
-    let result = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
-        .unwrap()
-        .unwrap();
-    let parsed: Value = serde_json::from_str(&result).unwrap();
-    // Should not have tool_calls since the only functionCall had empty name
-    assert!(
-        parsed["choices"][0]["delta"].get("tool_calls").is_none(),
-        "functionCall with empty name should be skipped"
-    );
+    let mut stream = p.stream_normalizer("gemini-3-flash-preview");
+    let chunk = json!({"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":1}}}]},"finishReason":"STOP"}]});
+    assert!(stream.push(&chunk.to_string()).is_err());
 }
 
 #[test]
-fn stream_no_name_function_call_skipped_but_valid_ones_kept() {
+fn stream_rejects_an_incomplete_tool_batch() {
     let p = provider();
     // Mix of empty-name and valid functionCalls
     let chunk = json!({
@@ -1002,16 +957,10 @@ fn stream_no_name_function_call_skipped_but_valid_ones_kept() {
         ], "role": "model"}, "finishReason": "STOP"}],
         "usageMetadata": {},
     });
-    let result = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
-        .unwrap()
-        .unwrap();
-    let parsed: Value = serde_json::from_str(&result).unwrap();
-    let tcs = parsed["choices"][0]["delta"]["tool_calls"]
-        .as_array()
-        .unwrap();
-    assert_eq!(tcs.len(), 1, "Only valid functionCalls should be included");
-    assert_eq!(tcs[0]["function"]["name"], "get_quote");
+    assert!(p
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&chunk.to_string())
+        .is_err());
 }
 
 #[test]
@@ -1037,7 +986,7 @@ fn response_empty_args_produces_empty_json_object() {
 }
 
 #[test]
-fn response_no_name_function_call_skipped() {
+fn response_rejects_unnamed_function_call() {
     let p = provider();
     let resp = json!({
         "candidates": [{"content": {"parts": [
@@ -1045,22 +994,13 @@ fn response_no_name_function_call_skipped() {
         ], "role": "model"}, "finishReason": "STOP"}],
         "usageMetadata": {},
     });
-    let result = p
+    assert!(p
         .transform_response("gemini-3-flash-preview", resp)
-        .unwrap();
-    // No tool_calls should be present
-    assert!(
-        result["choices"][0]["message"].get("tool_calls").is_none(),
-        "functionCall with empty name should be skipped"
-    );
+        .is_err());
 }
 
-// ============================================================
-// Session history: turn ordering enforcement
-// ============================================================
-
 #[test]
-fn session_history_orphaned_tool_calls_stripped() {
+fn session_history_rejects_orphaned_tool_calls() {
     // Simulate session history where assistant made tool calls but the session
     // was cut short — no tool results followed. Gemini should not see the functionCall.
     let p = provider();
@@ -1082,21 +1022,7 @@ fn session_history_orphaned_tool_calls_stripped() {
             {"role": "user", "content": "Check the news again"},
         ],
     });
-    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
-    let contents = result.body["contents"].as_array().unwrap();
-
-    // The model turn should NOT have functionCall parts (orphaned)
-    for turn in contents {
-        if turn["role"] == "model" {
-            let parts = turn["parts"].as_array().unwrap();
-            for part in parts {
-                assert!(
-                    part.get("functionCall").is_none(),
-                    "Orphaned functionCall should be stripped"
-                );
-            }
-        }
-    }
+    assert!(p.transform_request("gemini-3-flash-preview", &req).is_err());
 }
 
 #[test]
@@ -1114,7 +1040,7 @@ fn session_history_valid_tool_roundtrip_preserved() {
                     "id": "call_1",
                     "type": "function",
                     "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"},
-                    "thought_signature": "valid-sig"
+                    "thought_signature": signature("valid-sig")
                 }]
             },
             {"role": "tool", "tool_call_id": "call_1", "name": "get_quote", "content": "{\"price\":150}"},
@@ -1204,48 +1130,7 @@ fn session_history_compacted_starts_with_model_tool_call() {
             {"role": "user", "content": "Check news again"},
         ],
     });
-    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
-    let contents = result.body["contents"].as_array().unwrap();
-
-    // All orphaned functionCall/functionResponse pairs must be stripped.
-    // No functionCall should appear without a preceding user turn.
-    // No functionResponse should appear without a preceding functionCall.
-    for (i, turn) in contents.iter().enumerate() {
-        let parts = turn["parts"].as_array().unwrap();
-
-        let has_fc = parts.iter().any(|p| p.get("functionCall").is_some());
-        let has_fr = parts.iter().any(|p| p.get("functionResponse").is_some());
-
-        if has_fc {
-            assert!(i > 0, "functionCall at position 0 is invalid");
-            assert_eq!(
-                contents[i - 1]["role"],
-                "user",
-                "functionCall at position {i} must follow a user turn"
-            );
-            // Must be followed by functionResponse
-            assert!(
-                contents.get(i + 1).is_some_and(|next| {
-                    next["parts"]
-                        .as_array()
-                        .map(|p| p.iter().any(|part| part.get("functionResponse").is_some()))
-                        .unwrap_or(false)
-                }),
-                "functionCall at position {i} must be followed by functionResponse"
-            );
-        }
-
-        if has_fr {
-            assert!(i > 0, "functionResponse at position 0 is invalid");
-            assert!(
-                contents[i - 1]["parts"]
-                    .as_array()
-                    .map(|p| p.iter().any(|part| part.get("functionCall").is_some()))
-                    .unwrap_or(false),
-                "functionResponse at position {i} must follow a functionCall"
-            );
-        }
-    }
+    assert!(p.transform_request("gemini-3-flash-preview", &req).is_err());
 }
 
 #[test]
@@ -1304,17 +1189,15 @@ fn full_roundtrip_thought_signature_preserved() {
         "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
     });
     let chunk_result = p
-        .transform_stream_chunk(
-            "gemini-3-flash-preview",
-            &serde_json::to_string(&stream_chunk).unwrap(),
-        )
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&stream_chunk).unwrap())
         .unwrap()
         .unwrap();
     let chunk_parsed: Value = serde_json::from_str(&chunk_result).unwrap();
 
     // Extract tool call from the transformed chunk (what a streaming client would accumulate)
     let tc = &chunk_parsed["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(tc["thought_signature"], "roundtrip-sig-abc");
+    assert_eq!(tc["thought_signature"]["data"], "roundtrip-sig-abc");
 
     // Step 2: Simulate a client building the assistant message with accumulated tool calls
     // This is what a client's streaming runner does after accumulation
@@ -1328,7 +1211,8 @@ fn full_roundtrip_thought_signature_preserved() {
                 "name": tc["function"]["name"].as_str().unwrap(),
                 "arguments": tc["function"]["arguments"].as_str().unwrap(),
             },
-            "thought_signature": tc["thought_signature"].clone()
+            "thought_signature": tc["thought_signature"].clone(),
+            "wire_ids": tc["wire_ids"].clone()
         }]
     });
 
@@ -1394,7 +1278,7 @@ fn full_roundtrip_thought_signature_preserved() {
 }
 
 #[test]
-fn full_roundtrip_without_thought_signature_gets_stripped() {
+fn past_completed_tool_turn_survives_without_signature() {
     // When a client does NOT preserve thought_signature (the bug scenario),
     // enforce_gemini_turn_order strips the functionCall pair, breaking Gemini
     let p = provider();
@@ -1422,25 +1306,17 @@ fn full_roundtrip_without_thought_signature_gets_stripped() {
         .unwrap();
     let contents = result.body["contents"].as_array().unwrap();
 
-    // Without thought_signature, the functionCall pair gets stripped
-    for turn in contents {
-        let parts = turn["parts"].as_array().unwrap();
-        for part in parts {
-            assert!(
-                part.get("functionCall").is_none(),
-                "functionCall without thought_signature should be stripped by enforce_gemini_turn_order"
-            );
-            assert!(
-                part.get("functionResponse").is_none(),
-                "orphaned functionResponse should be stripped"
-            );
-        }
-    }
+    assert!(contents.iter().any(|t| t["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p.get("functionCall").is_some())));
+    assert!(contents.iter().any(|t| t["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p.get("functionResponse").is_some())));
 }
-
-// ============================================================
-// Unified reasoning — six-tier efforts + reasoning_mode
-// ============================================================
 
 #[test]
 fn effort_none_disables_thinking_via_minimal() {

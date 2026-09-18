@@ -1,11 +1,14 @@
 # frozen_string_literal: true
 
+require "json"
+
 module Llmshim
   # Token accounting returned with a chat response or a usage stream event.
   #
   # Mirrors the +Usage+ schema in api/openapi.yaml.
   Usage = Struct.new(
     :input_tokens, :output_tokens, :reasoning_tokens, :total_tokens,
+    :cache_read_tokens, :cache_write_tokens,
     keyword_init: true
   ) do
     def self.from_hash(hash)
@@ -15,7 +18,9 @@ module Llmshim
         input_tokens: hash["input_tokens"],
         output_tokens: hash["output_tokens"],
         reasoning_tokens: hash["reasoning_tokens"],
-        total_tokens: hash["total_tokens"]
+        total_tokens: hash["total_tokens"],
+        cache_read_tokens: hash.fetch("cache_read_tokens", 0),
+        cache_write_tokens: hash.fetch("cache_write_tokens", 0)
       )
     end
   end
@@ -24,9 +29,13 @@ module Llmshim
   #
   # +function+ is a plain Hash with "name" and "arguments" (JSON-encoded string)
   # to match the wire format exactly.
-  ToolCall = Struct.new(:id, :type, :function, keyword_init: true) do
+  ToolCall = Struct.new(:id, :type, :function, :thought_signature, :wire_ids, keyword_init: true) do
     def self.from_hash(hash)
-      new(id: hash["id"], type: hash["type"], function: hash["function"])
+      new(id: hash["id"], type: hash["type"], function: hash["function"], thought_signature: hash["thought_signature"], wire_ids: hash["wire_ids"])
+    end
+
+    def to_json(*args)
+      to_h.reject { |_key, value| value.nil? }.to_json(*args)
     end
 
     # Convenience accessor for the tool name.
@@ -41,10 +50,14 @@ module Llmshim
   end
 
   # The assistant message inside a ChatResponse.
-  ResponseMessage = Struct.new(:role, :content, :tool_calls, keyword_init: true) do
+  ResponseMessage = Struct.new(:role, :content, :tool_calls, :reasoning, :refusal, keyword_init: true) do
     def self.from_hash(hash)
       calls = (hash["tool_calls"] || []).map { |c| ToolCall.from_hash(c) }
-      new(role: hash["role"], content: hash["content"], tool_calls: calls)
+      new(role: hash["role"], content: hash["content"], tool_calls: calls, reasoning: hash["reasoning"], refusal: hash["refusal"])
+    end
+
+    def to_json(*args)
+      to_h.reject { |key, value| value.nil? && !%i[role content].include?(key) }.to_json(*args)
     end
   end
 
@@ -52,7 +65,7 @@ module Llmshim
   #
   # +raw+ retains the original parsed Hash for forward compatibility.
   ChatResponse = Struct.new(
-    :id, :model, :provider, :message, :reasoning, :usage, :latency_ms, :raw,
+    :id, :model, :provider, :message, :reasoning, :usage, :latency_ms, :raw, :served_model, :finish_reason,
     keyword_init: true
   ) do
     def self.from_hash(hash)
@@ -64,7 +77,9 @@ module Llmshim
         reasoning: hash["reasoning"],
         usage: Usage.from_hash(hash["usage"]),
         latency_ms: hash["latency_ms"],
-        raw: hash
+        raw: hash,
+        served_model: hash["x-llmshim-served-model"],
+        finish_reason: hash["finish_reason"]
       )
     end
 
@@ -120,8 +135,20 @@ module Llmshim
       type == "usage"
     end
 
+    def finish_reason
+      raw["finish_reason"]
+    end
+
+    def served_model
+      raw["x-llmshim-served-model"]
+    end
+
     def done?
       type == "done"
+    end
+
+    def error_details
+      raw["error"]
     end
 
     def error?
@@ -131,6 +158,19 @@ module Llmshim
     # content / reasoning events
     def text
       raw["text"]
+    end
+
+    # Reasoning delta blocks retain signatures, opaque data, and provenance.
+    def blocks
+      raw["blocks"]
+    end
+
+    def thought_signature
+      raw["thought_signature"]
+    end
+
+    def wire_ids
+      raw["wire_ids"]
     end
 
     # tool_call events

@@ -73,10 +73,14 @@ fn request_with_fallback() {
 #[test]
 fn response_with_tool_calls() {
     let resp = ChatResponse {
+        finish_reason: None,
+        served_model: None,
         id: "r1".into(),
         model: "gpt-5.4".into(),
         provider: "openai".into(),
         message: ResponseMessage {
+            refusal: None,
+            reasoning: None,
             role: "assistant".into(),
             content: Value::Null,
             tool_calls: Some(json!([{
@@ -90,6 +94,8 @@ fn response_with_tool_calls() {
             input_tokens: 10,
             output_tokens: 5,
             reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 15,
         },
         latency_ms: 500,
@@ -105,10 +111,14 @@ fn response_with_tool_calls() {
 #[test]
 fn response_with_reasoning_tokens() {
     let resp = ChatResponse {
+        finish_reason: None,
+        served_model: None,
         id: "r2".into(),
         model: "gpt-5.4".into(),
         provider: "openai".into(),
         message: ResponseMessage {
+            refusal: None,
+            reasoning: None,
             role: "assistant".into(),
             content: json!("42"),
             tool_calls: None,
@@ -118,6 +128,8 @@ fn response_with_reasoning_tokens() {
             input_tokens: 10,
             output_tokens: 5,
             reasoning_tokens: 50,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 65,
         },
         latency_ms: 1000,
@@ -142,6 +154,7 @@ fn stream_event_content_has_type() {
 #[test]
 fn stream_event_reasoning_has_type() {
     let e = StreamEvent::Reasoning {
+        blocks: vec![],
         text: "think".into(),
     };
     let v: Value = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
@@ -151,6 +164,8 @@ fn stream_event_reasoning_has_type() {
 #[test]
 fn stream_event_tool_call_has_all_fields() {
     let e = StreamEvent::ToolCall {
+        wire_ids: None,
+        thought_signature: None,
         id: "c1".into(),
         name: "fn1".into(),
         arguments: "{\"a\":1}".into(),
@@ -168,6 +183,8 @@ fn stream_event_usage_has_tokens() {
         input_tokens: 10,
         output_tokens: 5,
         reasoning_tokens: 3,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         total_tokens: 18,
     });
     let v: Value = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
@@ -178,7 +195,10 @@ fn stream_event_usage_has_tokens() {
 
 #[test]
 fn stream_event_done_is_minimal() {
-    let e = StreamEvent::Done {};
+    let e = StreamEvent::Done {
+        finish_reason: None,
+        served_model: None,
+    };
     let v: Value = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
     assert_eq!(v["type"], "done");
     assert_eq!(v.as_object().unwrap().len(), 1); // only "type"

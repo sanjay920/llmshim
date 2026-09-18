@@ -114,10 +114,14 @@ fn chat_request_with_tool_calls() {
 #[test]
 fn chat_response_serializes() {
     let resp = ChatResponse {
+        finish_reason: None,
+        served_model: None,
         id: "msg_123".into(),
         model: "claude-sonnet-4-6".into(),
         provider: "anthropic".into(),
         message: ResponseMessage {
+            refusal: None,
+            reasoning: None,
             role: "assistant".into(),
             content: json!("Hello!"),
             tool_calls: None,
@@ -127,6 +131,8 @@ fn chat_response_serializes() {
             input_tokens: 10,
             output_tokens: 5,
             reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 15,
         },
         latency_ms: 1200,
@@ -145,10 +151,14 @@ fn chat_response_serializes() {
 #[test]
 fn chat_response_no_reasoning() {
     let resp = ChatResponse {
+        finish_reason: None,
+        served_model: None,
         id: "r1".into(),
         model: "gpt-5.4".into(),
         provider: "openai".into(),
         message: ResponseMessage {
+            refusal: None,
+            reasoning: None,
             role: "assistant".into(),
             content: json!("Hi"),
             tool_calls: None,
@@ -158,6 +168,8 @@ fn chat_response_no_reasoning() {
             input_tokens: 5,
             output_tokens: 2,
             reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 7,
         },
         latency_ms: 500,
@@ -184,6 +196,7 @@ fn stream_event_content() {
 #[test]
 fn stream_event_reasoning() {
     let event = StreamEvent::Reasoning {
+        blocks: vec![],
         text: "Thinking...".into(),
     };
     let json = serde_json::to_string(&event).unwrap();
@@ -195,6 +208,8 @@ fn stream_event_reasoning() {
 #[test]
 fn stream_event_tool_call() {
     let event = StreamEvent::ToolCall {
+        wire_ids: None,
+        thought_signature: None,
         id: "call_1".into(),
         name: "search".into(),
         arguments: r#"{"q":"rust"}"#.into(),
@@ -211,6 +226,8 @@ fn stream_event_usage() {
         input_tokens: 100,
         output_tokens: 50,
         reasoning_tokens: 20,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         total_tokens: 170,
     });
     let json = serde_json::to_string(&event).unwrap();
@@ -222,7 +239,10 @@ fn stream_event_usage() {
 
 #[test]
 fn stream_event_done() {
-    let event = StreamEvent::Done {};
+    let event = StreamEvent::Done {
+        finish_reason: None,
+        served_model: None,
+    };
     let json = serde_json::to_string(&event).unwrap();
     let parsed: Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["type"], "done");

@@ -53,12 +53,11 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
 
         match role {
             "assistant" => {
+                result.extend(crate::reasoning::responses_items(msg));
                 // Emit the assistant message (content part).
                 let mut out = msg.clone();
+                crate::reasoning::strip_fields(&mut out);
                 if let Some(obj) = out.as_object_mut() {
-                    obj.remove("reasoning_content");
-                    obj.remove("reasoning_signature"); // opaque Anthropic token — never forward
-                    obj.remove("redacted_reasoning_content"); // opaque Anthropic token — never forward
                     obj.remove("annotations");
                     obj.remove("refusal");
                     obj.remove("tool_calls"); // Handled separately below.
@@ -100,12 +99,16 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
                             .and_then(|a| a.as_str())
                             .unwrap_or("{}")
                             .to_string();
-                        result.push(json!({
+                        let mut item = json!({
                             "type": "function_call",
                             "call_id": call_id,
                             "name": name,
                             "arguments": arguments,
-                        }));
+                        });
+                        if let Some(id) = tc.get("_llmshim_item_id") {
+                            item["id"] = id.clone();
+                        }
+                        result.push(item);
                     }
                 }
             }
@@ -130,10 +133,8 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
             _ => {
                 // user, system, developer — standard sanitization.
                 let mut out = msg.clone();
+                crate::reasoning::strip_fields(&mut out);
                 if let Some(obj) = out.as_object_mut() {
-                    obj.remove("reasoning_content");
-                    obj.remove("reasoning_signature"); // opaque Anthropic token — never forward
-                    obj.remove("redacted_reasoning_content"); // opaque Anthropic token — never forward
                     obj.remove("annotations");
                     obj.remove("refusal");
                 }
@@ -241,6 +242,7 @@ fn normalized_openai_usage(usage: &Value) -> Value {
         }
     }
 
+    crate::usage::normalize_cache(usage, &mut normalized);
     normalized
 }
 
@@ -322,7 +324,226 @@ impl Provider for OpenAi {
         "openai"
     }
 
+    fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
+        crate::reasoning::ReplayTarget::new(
+            self.name(),
+            model,
+            crate::reasoning::WireFormat::OpenAiResponses,
+        )
+        .bind_account(&self.base_url, Some(&self.api_key))
+    }
+
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        self.transform_request_for_target(model, request, &self.replay_target(model))
+    }
+
+    fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
+        let native = response.clone();
+        let mut result = self.transform_response_native(model, response)?;
+        crate::reasoning::capture_response(&self.replay_target(model), &native, &mut result);
+        crate::toolcall::capture_response(&self.replay_target(model), &native, &mut result)?;
+        Ok(result)
+    }
+
+    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        let result = self.transform_stream_chunk_native(model, chunk)?;
+        let native: Value = match serde_json::from_str(chunk) {
+            Ok(v) => v,
+            Err(_) => return Ok(result),
+        };
+        crate::reasoning::capture_stream(&self.replay_target(model), &native, result)
+    }
+}
+
+impl OpenAi {
+    fn transform_response_native(&self, model: &str, response: Value) -> Result<Value> {
+        // Check for error (Responses API returns "error": null on success)
+        if let Some(err) = response.get("error") {
+            if !err.is_null() {
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                return Err(ShimError::ProviderError {
+                    status: 400,
+                    body: msg.to_string(),
+                });
+            }
+        }
+
+        let output = response
+            .get("output")
+            .and_then(|o| o.as_array())
+            .ok_or_else(|| ShimError::ProviderError {
+                status: 500,
+                body: "no output in response".to_string(),
+            })?;
+
+        // Extract reasoning summary
+        let mut text_content: Option<String> = None;
+        let mut refusal = String::new();
+        let mut tool_calls: Vec<Value> = Vec::new();
+
+        for item in output {
+            match item.get("type").and_then(|t| t.as_str()) {
+                Some("message") => {
+                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                        for part in content {
+                            if part["type"] == "refusal" {
+                                if let Some(text) = part["refusal"].as_str() {
+                                    refusal.push_str(text);
+                                }
+                            }
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                text_content.get_or_insert_with(String::new).push_str(text);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    tool_calls.push(json!({
+                        "id": item.get("call_id").cloned().unwrap_or(json!("")),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name").cloned().unwrap_or(json!("")),
+                            "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        let content = text_content.map(|t| json!(t)).unwrap_or(Value::Null);
+
+        let mut message = json!({
+            "role": "assistant",
+            "content": content,
+        });
+        if !refusal.is_empty() {
+            message["refusal"] = json!(refusal);
+        }
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = json!(tool_calls);
+        }
+
+        let finish_reason = match response.get("status").and_then(Value::as_str) {
+            Some("completed" | "incomplete") if message["refusal"].is_string() => "content_filter",
+            Some("completed")
+                if message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty()) =>
+            {
+                "tool_calls"
+            }
+            Some("completed") => "stop",
+            Some("incomplete") => "length",
+            _ => {
+                return Err(ShimError::ProviderError {
+                    status: 502,
+                    body: "OpenAI response has no supported terminal status".into(),
+                })
+            }
+        };
+
+        let usage = response.get("usage").cloned().unwrap_or(json!({}));
+        let normalized_usage = normalized_openai_usage(&usage);
+
+        Ok(json!({
+            "id": response.get("id").cloned().unwrap_or(json!("")),
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }],
+            "usage": normalized_usage
+        }))
+    }
+}
+
+impl OpenAi {
+    fn transform_stream_chunk_native(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        let trimmed = chunk.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return Ok(None);
+        }
+
+        let parsed: Value = serde_json::from_str(trimmed)?;
+        let event_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match event_type {
+            "response.refusal.delta" => Ok(Some(json!({"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"refusal":parsed["delta"]},"finish_reason":null}]}).to_string())),
+            // Content text deltas
+            "response.output_text.delta" => {
+                let delta = parsed.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+                if delta.is_empty() {
+                    return Ok(None);
+                }
+                let chunk = json!({
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": delta},
+                        "finish_reason": null,
+                    }]
+                });
+                Ok(Some(serde_json::to_string(&chunk)?))
+            }
+
+            // Response completed — emit finish
+            "response.completed" => {
+                let resp = &parsed["response"];
+                let status = resp
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("completed");
+                let finish_reason = match status {
+                    "completed" => "stop",
+                    "incomplete" => "length",
+                    _ => "stop",
+                };
+                let usage = resp.get("usage").cloned().unwrap_or(json!({}));
+                let reasoning_tokens = usage
+                    .pointer("/output_tokens_details/reasoning_tokens")
+                    .cloned()
+                    .unwrap_or(json!(0));
+                let mut usage_out = normalized_openai_usage(&usage);
+                if usage_out.get("reasoning_tokens").is_none() {
+                    usage_out["reasoning_tokens"] = reasoning_tokens;
+                }
+                let chunk = json!({
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish_reason,
+                    }],
+                    "usage": usage_out
+                });
+                Ok(Some(serde_json::to_string(&chunk)?))
+            }
+
+            // All other events: skip
+            _ => Ok(None),
+        }
+    }
+}
+
+impl OpenAi {
+    pub(crate) fn transform_request_for_target(
+        &self,
+        model: &str,
+        request: &Value,
+        target: &crate::reasoning::ReplayTarget,
+    ) -> Result<ProviderRequest> {
+        let request = crate::schema::prepare_request(request);
+        let request = crate::cache::prepare_request(&request, target.wire)?;
+        let request = crate::reasoning::prepare_request(&request, target);
+        let request = crate::toolcall::prepare_request(&request, target)?;
         let obj = request.as_object().ok_or(ShimError::MissingModel)?;
 
         let messages = obj
@@ -413,6 +634,7 @@ impl Provider for OpenAi {
         }
 
         for key in [
+            "include",
             "prompt_cache_key",
             "prompt_cache_retention",
             "safety_identifier",
@@ -460,6 +682,19 @@ impl Provider for OpenAi {
 
         let url = format!("{}/responses", self.base_url);
 
+        crate::reasoning::enforce_stateless(&mut body)?;
+        crate::toolcall::validate_native(&body, target)?;
+        crate::schema::normalize_native_tools(crate::schema::Target::OpenAiResponses, &mut body);
+        crate::shim::native_format(
+            &request,
+            crate::reasoning::WireFormat::OpenAiResponses,
+            &mut body,
+        );
+        crate::cache::finish_request(
+            &request,
+            &mut body,
+            crate::reasoning::WireFormat::OpenAiResponses,
+        )?;
         Ok(ProviderRequest {
             url,
             headers: vec![
@@ -468,253 +703,5 @@ impl Provider for OpenAi {
             ],
             body,
         })
-    }
-
-    fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
-        // Check for error (Responses API returns "error": null on success)
-        if let Some(err) = response.get("error") {
-            if !err.is_null() {
-                let msg = err
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error");
-                return Err(ShimError::ProviderError {
-                    status: 400,
-                    body: msg.to_string(),
-                });
-            }
-        }
-
-        let output = response
-            .get("output")
-            .and_then(|o| o.as_array())
-            .ok_or_else(|| ShimError::ProviderError {
-                status: 500,
-                body: "no output in response".to_string(),
-            })?;
-
-        // Extract reasoning summary
-        let mut reasoning_content: Option<String> = None;
-        let mut text_content: Option<String> = None;
-        let mut tool_calls: Vec<Value> = Vec::new();
-
-        for item in output {
-            match item.get("type").and_then(|t| t.as_str()) {
-                Some("reasoning") => {
-                    if let Some(summary) = item.get("summary").and_then(|s| s.as_array()) {
-                        let texts: Vec<&str> = summary
-                            .iter()
-                            .filter_map(|s| s.get("text").and_then(|t| t.as_str()))
-                            .collect();
-                        if !texts.is_empty() {
-                            reasoning_content = Some(texts.join("\n"));
-                        }
-                    }
-                }
-                Some("message") => {
-                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
-                        for part in content {
-                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                text_content = Some(text.to_string());
-                            }
-                        }
-                    }
-                }
-                Some("function_call") => {
-                    tool_calls.push(json!({
-                        "id": item.get("call_id").cloned().unwrap_or(json!("")),
-                        "type": "function",
-                        "function": {
-                            "name": item.get("name").cloned().unwrap_or(json!("")),
-                            "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
-                        }
-                    }));
-                }
-                _ => {}
-            }
-        }
-
-        let content = text_content.map(|t| json!(t)).unwrap_or(Value::Null);
-
-        let mut message = json!({
-            "role": "assistant",
-            "content": content,
-        });
-        if !tool_calls.is_empty() {
-            message["tool_calls"] = json!(tool_calls);
-        }
-        if let Some(reasoning) = reasoning_content {
-            message["reasoning_content"] = json!(reasoning);
-        }
-
-        let finish_reason = match response.get("status").and_then(Value::as_str) {
-            Some("completed") => "stop",
-            Some("incomplete") => "length",
-            _ => {
-                return Err(ShimError::ProviderError {
-                    status: 502,
-                    body: "OpenAI response has no supported terminal status".into(),
-                })
-            }
-        };
-
-        let usage = response.get("usage").cloned().unwrap_or(json!({}));
-        let normalized_usage = normalized_openai_usage(&usage);
-
-        Ok(json!({
-            "id": response.get("id").cloned().unwrap_or(json!("")),
-            "object": "chat.completion",
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason,
-            }],
-            "usage": normalized_usage
-        }))
-    }
-
-    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
-        let trimmed = chunk.trim();
-        if trimmed.is_empty() || trimmed == "[DONE]" {
-            return Ok(None);
-        }
-
-        let parsed: Value = serde_json::from_str(trimmed)?;
-        let event_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-        match event_type {
-            // Reasoning summary deltas → reasoning_content
-            "response.reasoning_summary_text.delta" => {
-                let delta = parsed.get("delta").and_then(|d| d.as_str()).unwrap_or("");
-                if delta.is_empty() {
-                    return Ok(None);
-                }
-                let chunk = json!({
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"reasoning_content": delta},
-                        "finish_reason": null,
-                    }]
-                });
-                Ok(Some(serde_json::to_string(&chunk)?))
-            }
-
-            // Content text deltas
-            "response.output_text.delta" => {
-                let delta = parsed.get("delta").and_then(|d| d.as_str()).unwrap_or("");
-                if delta.is_empty() {
-                    return Ok(None);
-                }
-                let chunk = json!({
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": delta},
-                        "finish_reason": null,
-                    }]
-                });
-                Ok(Some(serde_json::to_string(&chunk)?))
-            }
-
-            // Function call output item added — emit tool_calls start chunk
-            "response.output_item.added" => {
-                let empty = json!({});
-                let item = parsed.get("item").unwrap_or(&empty);
-                if item.get("type").and_then(|t| t.as_str()) != Some("function_call") {
-                    return Ok(None);
-                }
-                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let index = parsed
-                    .get("output_index")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let chunk = json!({
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [{
-                                "index": index,
-                                "id": call_id,
-                                "type": "function",
-                                "function": {"name": name, "arguments": ""},
-                            }]
-                        },
-                        "finish_reason": null,
-                    }]
-                });
-                Ok(Some(serde_json::to_string(&chunk)?))
-            }
-
-            // Function call argument deltas
-            "response.function_call_arguments.delta" => {
-                let delta = parsed.get("delta").and_then(|d| d.as_str()).unwrap_or("");
-                if delta.is_empty() {
-                    return Ok(None);
-                }
-                let index = parsed
-                    .get("output_index")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let chunk = json!({
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "tool_calls": [{
-                                "index": index,
-                                "function": {"arguments": delta},
-                            }]
-                        },
-                        "finish_reason": null,
-                    }]
-                });
-                Ok(Some(serde_json::to_string(&chunk)?))
-            }
-
-            // Response completed — emit finish
-            "response.completed" => {
-                let resp = &parsed["response"];
-                let status = resp
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("completed");
-                let finish_reason = match status {
-                    "completed" => "stop",
-                    "incomplete" => "length",
-                    _ => "stop",
-                };
-                let usage = resp.get("usage").cloned().unwrap_or(json!({}));
-                let reasoning_tokens = usage
-                    .pointer("/output_tokens_details/reasoning_tokens")
-                    .cloned()
-                    .unwrap_or(json!(0));
-                let mut usage_out = normalized_openai_usage(&usage);
-                if usage_out.get("reasoning_tokens").is_none() {
-                    usage_out["reasoning_tokens"] = reasoning_tokens;
-                }
-                let chunk = json!({
-                    "object": "chat.completion.chunk",
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": finish_reason,
-                    }],
-                    "usage": usage_out
-                });
-                Ok(Some(serde_json::to_string(&chunk)?))
-            }
-
-            // All other events: skip
-            _ => Ok(None),
-        }
     }
 }

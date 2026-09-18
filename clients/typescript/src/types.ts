@@ -15,8 +15,53 @@ export type ReasoningMode = "standard" | "pro";
 /** Role of a conversation message. */
 export type Role = "system" | "user" | "assistant" | "tool" | "developer";
 
+/** Provenance recorded when a reasoning block was received. */
+export interface ReasoningOrigin {
+  provider: string;
+  model: string;
+  family: string | null;
+  wire: "anthropic-messages" | "openai-responses" | "openai-chat" | "google-generate-content";
+  received_at: string;
+  account?: string;
+}
+
+/** Preserve the complete object when recording or replaying a conversation. */
+export interface ReasoningBlock {
+  kind: "text" | "redacted" | "encrypted";
+  text?: string;
+  data?: string;
+  signature?: string;
+  item_id?: string;
+  origin: ReasoningOrigin;
+  payload?: unknown;
+  source_field?: string;
+}
+
+export interface ReasoningDelta extends ReasoningBlock {
+  index?: number | string;
+  replace?: boolean;
+}
+
+export interface ThoughtSignature {
+  data: string;
+  origin: ReasoningOrigin;
+}
+
+/** Persist this mapping with the call; id is the wire correlation id. */
+export interface WireToolId {
+  signature_field?: string;
+  provider: string;
+  wire: ReasoningOrigin["wire"];
+  scope: string;
+  part_id: string;
+  id: string | null;
+  item_id?: string;
+}
+
 /** A tool call made by the assistant. */
 export interface ToolCall {
+  wire_ids?: WireToolId[];
+  thought_signature?: ThoughtSignature;
   id?: string;
   type?: "function";
   function?: {
@@ -35,9 +80,10 @@ export interface Message {
   tool_call_id?: string;
   /** Tool calls made by the assistant. */
   tool_calls?: ToolCall[];
+  reasoning?: ReasoningBlock[];
   /**
-   * Reasoning/thinking text produced by the assistant on a previous turn.
-   * Set it to replay a model's own reasoning back into the conversation.
+   * @deprecated Legacy input only. Untracked reasoning is dropped; preserve
+   * the full reasoning array from the previous assistant message instead.
    */
   reasoning_content?: string;
 }
@@ -61,8 +107,31 @@ export interface Config {
   reasoning_mode?: ReasoningMode;
 }
 
+export interface CacheSegment {
+  upto_message: number;
+  label?: string;
+  stability: "static" | "session" | "turn";
+}
+export interface CachePolicy {
+  segments?: CacheSegment[];
+  key?: string;
+}
+
+export interface ShimConfig {
+  structured_output?: "auto" | "native" | "forced_tool" | "prompt";
+  tool_calling?: "auto" | "native" | "prompt";
+  reasoning_capture?: "off" | "forced_tool";
+}
+export type ResponseFormat = {
+  type: "json_schema";
+  json_schema: { name?: string; schema: unknown; strict?: boolean };
+} | { type: "json_object" };
+
 /** Request body for POST /v1/chat and POST /v1/chat/stream. */
 export interface ChatRequest {
+  "x-cache"?: CachePolicy;
+  "x-shim"?: ShimConfig;
+  response_format?: ResponseFormat;
   /**
    * Model identifier. Use "provider/model" (e.g. "anthropic/claude-sonnet-4-6")
    * or just the model name for auto-detection (e.g. "claude-sonnet-4-6").
@@ -87,10 +156,14 @@ export interface Usage {
   /** Reasoning/thinking tokens used (omitted when zero). */
   reasoning_tokens?: number;
   total_tokens: number;
+  /** Cache input tokens (absent on servers older than 0.4). */
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
 }
 
 /** The assistant message inside a ChatResponse. */
 export interface ResponseMessage {
+  refusal?: string;
   role: string;
   /**
    * Assistant content — a string for plain text, or an array of content
@@ -98,10 +171,13 @@ export interface ResponseMessage {
    */
   content: unknown;
   tool_calls?: ToolCall[];
+  reasoning?: ReasoningBlock[];
 }
 
 /** Response body from POST /v1/chat (non-streaming). */
 export interface ChatResponse {
+  finish_reason?: string;
+  "x-llmshim-served-model"?: string;
   /** Response ID from the provider. */
   id: string;
   model: string;
@@ -123,12 +199,15 @@ export interface ContentEvent {
 
 /** A chunk of reasoning/thinking text. */
 export interface ReasoningEvent {
+  blocks?: ReasoningDelta[];
   type: "reasoning";
   text: string;
 }
 
 /** A tool call emitted during streaming. */
 export interface ToolCallEvent {
+  wire_ids?: WireToolId[];
+  thought_signature?: ThoughtSignature;
   type: "tool_call";
   id: string;
   name: string;
@@ -144,10 +223,15 @@ export interface UsageEvent {
   /** Reasoning/thinking tokens used (omitted when zero). */
   reasoning_tokens?: number;
   total_tokens: number;
+  /** Cache input tokens (absent on servers older than 0.4). */
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
 }
 
 /** Terminal event signalling the stream is complete. */
 export interface DoneEvent {
+  finish_reason?: string;
+  "x-llmshim-served-model"?: string;
   type: "done";
 }
 
@@ -155,6 +239,13 @@ export interface DoneEvent {
 export interface ErrorEvent {
   type: "error";
   message: string;
+  error?: {
+    message: string;
+    type?: string;
+    code: unknown;
+    param: unknown;
+    status?: number;
+  };
 }
 
 /** Discriminated union of all SSE events emitted during streaming. */

@@ -118,14 +118,14 @@ fn request_passes_prompt_cache_controls() {
     let req = json!({
         "model": "x",
         "messages": [{"role": "user", "content": "hi"}],
-        "prompt_cache_key": "rcode-workspace-model",
+        "prompt_cache_key": "example-workspace-model",
         "prompt_cache_retention": "24h",
         "x-openai": {
             "safety_identifier": "user-hash"
         }
     });
     let result = p.transform_request("gpt-5.5", &req).unwrap();
-    assert_eq!(result.body["prompt_cache_key"], "rcode-workspace-model");
+    assert_eq!(result.body["prompt_cache_key"], "example-workspace-model");
     assert_eq!(result.body["prompt_cache_retention"], "24h");
     assert_eq!(result.body["safety_identifier"], "user-hash");
 }
@@ -491,15 +491,16 @@ fn request_tool_result_message_becomes_function_call_output() {
         "model": "x",
         "messages": [
             {"role": "user", "content": "hi"},
+            {"role":"assistant","tool_calls":[{"id":"call_abc","function":{"name":"read","arguments":"{}"}}]},
             {"role": "tool", "tool_call_id": "call_abc", "content": "result data"},
         ],
     });
     let result = p.transform_request("gpt-5.4", &req).unwrap();
     let input = result.body["input"].as_array().unwrap();
-    assert_eq!(input[1]["type"], "function_call_output");
-    assert_eq!(input[1]["call_id"], "call_abc");
-    assert_eq!(input[1]["output"], "result data");
-    assert!(input[1].get("role").is_none());
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["call_id"], "call_abc");
+    assert_eq!(input[2]["output"], "result data");
+    assert!(input[2].get("role").is_none());
 }
 
 #[test]
@@ -582,7 +583,7 @@ fn response_with_reasoning_summary() {
     let result = p.transform_response("gpt-5.4", resp).unwrap();
     assert_eq!(result["choices"][0]["message"]["content"], "42");
     assert_eq!(
-        result["choices"][0]["message"]["reasoning_content"],
+        result["choices"][0]["message"]["reasoning"][0]["text"],
         "Thinking step by step..."
     );
 }
@@ -639,7 +640,7 @@ fn response_function_call() {
     });
     let result = p.transform_response("gpt-5.4", resp).unwrap();
     let tc = &result["choices"][0]["message"]["tool_calls"];
-    assert_eq!(tc[0]["id"], "call_abc");
+    assert_eq!(tc[0]["wire_ids"][0]["id"], "call_abc");
     assert_eq!(tc[0]["function"]["name"], "get_weather");
     let args: Value =
         serde_json::from_str(tc[0]["function"]["arguments"].as_str().unwrap()).unwrap();
@@ -671,7 +672,7 @@ fn stream_reasoning_summary_delta() {
     let parsed: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(parsed["object"], "chat.completion.chunk");
     assert_eq!(
-        parsed["choices"][0]["delta"]["reasoning_content"],
+        parsed["choices"][0]["delta"]["reasoning"][0]["text"],
         "Thinking about..."
     );
 }
@@ -719,24 +720,28 @@ fn stream_response_completed() {
 #[test]
 fn stream_function_call_output_item_added() {
     let p = provider();
-    let chunk = json!({
-        "type": "response.output_item.added",
-        "output_index": 1,
-        "item": {
-            "type": "function_call",
-            "call_id": "call_xyz",
-            "name": "get_weather",
-        },
-    });
-    let result = p
-        .transform_stream_chunk("gpt-5.4", &serde_json::to_string(&chunk).unwrap())
+    let mut stream = p.stream_normalizer("gpt-5.4");
+    let start = json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_xyz","name":"get_weather","arguments":""}});
+    assert!(stream.push(&start.to_string()).unwrap().is_none());
+    stream
+        .push(
+            &json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{}"})
+                .to_string(),
+        )
+        .unwrap();
+    let result = stream
+        .push(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                .to_string(),
+        )
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
-    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(tc["id"], "call_xyz");
-    assert_eq!(tc["function"]["name"], "get_weather");
-    assert_eq!(tc["index"], 1);
+    let call = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert!(call["id"].as_str().unwrap().starts_with("call_ls_"));
+    assert_eq!(call["wire_ids"][0]["id"], "call_xyz");
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(call["index"], 1);
 }
 
 #[test]
@@ -756,19 +761,22 @@ fn stream_function_call_non_function_item_skipped() {
 #[test]
 fn stream_function_call_arguments_delta() {
     let p = provider();
-    let chunk = json!({
-        "type": "response.function_call_arguments.delta",
-        "output_index": 0,
-        "delta": "{\"city\":",
-    });
-    let result = p
-        .transform_stream_chunk("gpt-5.4", &serde_json::to_string(&chunk).unwrap())
+    let mut stream = p.stream_normalizer("gpt-5.4");
+    stream.push(&json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","call_id":"call_xyz","name":"get_weather","arguments":""}}).to_string()).unwrap();
+    for fragment in ["{\"city\":", "\"Paris\"}"] {
+        assert!(stream.push(&json!({"type":"response.function_call_arguments.delta","output_index":2,"delta":fragment}).to_string()).unwrap().is_none());
+    }
+    let result = stream
+        .push(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                .to_string(),
+        )
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
-    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(tc["function"]["arguments"], "{\"city\":");
-    assert_eq!(tc["index"], 0);
+    let call = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(call["index"], 2);
 }
 
 #[test]

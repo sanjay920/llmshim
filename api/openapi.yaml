@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: llmshim API
-  version: 0.3.7
+  version: 0.4.0
   description: |
     Multi-provider LLM API proxy. Send requests in a single format,
     llmshim translates to the native API of whichever provider you choose.
@@ -36,6 +36,48 @@ servers:
     description: Local development
 
 paths:
+  /v1/chat/completions:
+    post:
+      operationId: nativeChatCompletions
+      summary: OpenAI Chat Completions compatibility endpoint
+      description: Uses the shared engine and admission path; n must be 1. Stream responses use OpenAI chunks and DONE.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NativeChatRequest'
+      responses:
+        '200':
+          description: Native Chat Completions JSON or SSE
+          content:
+            application/json:
+              schema: {type: object}
+            text/event-stream:
+              schema: {type: string}
+        default:
+          description: Native error with preserved HTTP status and Retry-After when applicable
+  /v1/messages:
+    post:
+      operationId: nativeMessages
+      summary: Anthropic Messages compatibility endpoint
+      description: Accepts custom function tools. Uses the shared engine and admission path. The gateway accepts x-api-key authentication.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NativeMessagesRequest'
+      responses:
+        '200':
+          description: Native Messages JSON or SSE
+          content:
+            application/json:
+              schema: {type: object}
+            text/event-stream:
+              schema: {type: string}
+        default:
+          description: Native error with preserved HTTP status and Retry-After when applicable
   /v1/chat:
     post:
       operationId: chat
@@ -174,6 +216,32 @@ paths:
 
 components:
   schemas:
+    NativeChatRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: true
+      properties:
+        model: {type: string}
+        messages:
+          type: array
+          items: {type: object}
+        stream: {type: boolean, default: false}
+        n: {type: integer, enum: [1]}
+    NativeMessagesRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: true
+      properties:
+        model: {type: string}
+        max_tokens: {type: integer, minimum: 1}
+        system:
+          oneOf:
+            - {type: string}
+            - {type: array, items: {type: object}}
+        messages:
+          type: array
+          items: {type: object}
+        stream: {type: boolean, default: false}
     ChatRequest:
       type: object
       required: [model, messages]
@@ -235,6 +303,71 @@ components:
             non-streaming requests; streaming endpoints ignore this field.
           examples:
             - ["openai/gpt-5.6-sol", "gemini/gemini-3.8-flash"]
+        x-cache:
+          $ref: '#/components/schemas/CachePolicy'
+        x-shim:
+          $ref: '#/components/schemas/ShimConfig'
+        response_format:
+          type: object
+          required: [type]
+          allOf:
+            - if:
+                properties:
+                  type: {const: json_schema}
+              then:
+                required: [json_schema]
+          properties:
+            type:
+              type: string
+              enum: [json_schema, json_object]
+            json_schema:
+              type: object
+              required: [schema]
+              properties:
+                name:
+                  type: string
+                schema: {}
+                strict:
+                  type: boolean
+                  default: true
+
+    ShimConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        structured_output:
+          type: string
+          enum: [auto, native, forced_tool, prompt]
+          default: auto
+        tool_calling:
+          type: string
+          enum: [auto, native, prompt]
+          default: auto
+        reasoning_capture:
+          type: string
+          enum: [off, forced_tool]
+          default: off
+
+    CachePolicy:
+      type: object
+      properties:
+        key:
+          type: string
+          description: Explicit Responses prompt-cache affinity key
+        segments:
+          type: array
+          items:
+            type: object
+            required: [upto_message, stability]
+            properties:
+              upto_message:
+                type: integer
+                minimum: 0
+              label:
+                type: string
+              stability:
+                type: string
+                enum: [static, session, turn]
 
     Message:
       type: object
@@ -261,7 +394,12 @@ components:
             $ref: '#/components/schemas/ToolCall'
         reasoning_content:
           type: string
-          description: Provider-returned reasoning carried into a later turn
+          deprecated: true
+          description: Legacy input. Reasoning without provenance is dropped.
+        reasoning:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReasoningBlock'
 
     Config:
       type: object
@@ -310,6 +448,10 @@ components:
       type: object
       required: [id, model, provider, message, usage, latency_ms]
       properties:
+        finish_reason: {type: string}
+        x-llmshim-served-model:
+          type: string
+          description: Best-effort signature observation; never changes message provenance.
         id:
           type: string
           description: Response ID from the provider
@@ -334,6 +476,13 @@ components:
       type: object
       required: [role, content]
       properties:
+        refusal:
+          type: string
+          description: Provider refusal; no schema repair is attempted.
+        reasoning:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReasoningBlock'
         role:
           type: string
         content:
@@ -349,6 +498,18 @@ components:
     ToolCall:
       type: object
       properties:
+        wire_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/WireToolId'
+        thought_signature:
+          type: object
+          required: [data, origin]
+          properties:
+            data:
+              type: string
+            origin:
+              $ref: '#/components/schemas/ReasoningOrigin'
         id:
           type: string
         type:
@@ -363,9 +524,88 @@ components:
               type: string
               description: JSON-encoded arguments
 
+    WireToolId:
+      type: object
+      required: [provider, wire, scope, part_id, id]
+      properties:
+        provider:
+          type: string
+        wire:
+          type: string
+          enum: [anthropic-messages, openai-responses, openai-chat, google-generate-content]
+        scope:
+          type: string
+        part_id:
+          type: string
+        id:
+          type: [string, 'null']
+          description: Native correlation id; null preserves its original absence
+        item_id:
+          type: string
+          description: Responses item id, distinct from its call_id
+        signature_field:
+          type: string
+          description: Original wire container for a tool signature
+
+    ReasoningOrigin:
+      type: object
+      required: [provider, model, family, wire, received_at]
+      properties:
+        provider:
+          type: string
+        model:
+          type: string
+        family:
+          type: [string, 'null']
+          description: Unknown families never authorize replay
+        wire:
+          type: string
+          enum: [anthropic-messages, openai-responses, openai-chat, google-generate-content]
+        received_at:
+          type: string
+          format: date-time
+        account:
+          type: string
+          description: Non-secret issuer binding for encrypted replay
+
+    ReasoningBlock:
+      type: object
+      required: [kind, origin]
+      properties:
+        kind:
+          type: string
+          enum: [text, redacted, encrypted]
+        text:
+          type: string
+        data:
+          type: string
+          description: Opaque data; preserve verbatim
+        signature:
+          type: string
+        item_id:
+          type: string
+        origin:
+          $ref: '#/components/schemas/ReasoningOrigin'
+        payload:
+          description: Original structured reasoning item, preserved for replay
+        source_field:
+          type: string
+        index:
+          type: [integer, string]
+          description: Streaming delta part index; omit from stored blocks
+        replace:
+          type: boolean
+          description: Streaming snapshot replaces the assembled part
+
     Usage:
       type: object
       properties:
+        cache_read_tokens:
+          type: integer
+          description: Input tokens served from a provider cache (zero when not reported)
+        cache_write_tokens:
+          type: integer
+          description: Input tokens written to a provider cache (zero when not reported)
         input_tokens:
           type: integer
         output_tokens:
@@ -392,6 +632,10 @@ components:
             type:
               type: string
               const: reasoning
+            blocks:
+              type: array
+              items:
+                $ref: '#/components/schemas/ReasoningBlock'
             text:
               type: string
         - type: object
@@ -399,6 +643,18 @@ components:
             type:
               type: string
               const: tool_call
+            wire_ids:
+              type: array
+              items:
+                $ref: '#/components/schemas/WireToolId'
+            thought_signature:
+              type: object
+              required: [data, origin]
+              properties:
+                data:
+                  type: string
+                origin:
+                  $ref: '#/components/schemas/ReasoningOrigin'
             id:
               type: string
             name:
@@ -423,6 +679,10 @@ components:
             type:
               type: string
               const: done
+            finish_reason:
+              type: string
+            x-llmshim-served-model:
+              type: string
         - type: object
           properties:
             type:
@@ -430,6 +690,16 @@ components:
               const: error
             message:
               type: string
+              description: Human-readable message with internal display prefixes removed
+            error:
+              type: object
+              description: Optional source error metadata
+              properties:
+                message: {type: string}
+                type: {type: string}
+                code: {}
+                param: {}
+                status: {type: integer}
 
     ModelsResponse:
       type: object

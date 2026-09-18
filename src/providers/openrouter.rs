@@ -67,9 +67,6 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
         .map(|msg| {
             let mut out = msg.clone();
             if let Some(obj) = out.as_object_mut() {
-                obj.remove("reasoning_content"); // llmshim-normalized; OpenRouter uses reasoning_details
-                obj.remove("reasoning_signature"); // opaque Anthropic token — never forward
-                obj.remove("redacted_reasoning_content"); // opaque Anthropic token — never forward
                 obj.remove("annotations");
                 obj.remove("refusal");
             }
@@ -115,7 +112,21 @@ impl Provider for OpenRouter {
         "openrouter"
     }
 
+    fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
+        crate::reasoning::ReplayTarget::new(
+            self.name(),
+            model,
+            crate::reasoning::WireFormat::OpenAiChat,
+        )
+        .bind_account(&self.base_url, Some(&self.api_key))
+    }
+
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        let request = crate::schema::prepare_request(request);
+        let request =
+            crate::cache::prepare_request(&request, crate::reasoning::WireFormat::OpenAiChat)?;
+        let request = crate::reasoning::prepare_request(&request, &self.replay_target(model));
+        let request = crate::toolcall::prepare_request(&request, &self.replay_target(model))?;
         let obj = request.as_object().ok_or(ShimError::MissingModel)?;
         let messages = obj
             .get("messages")
@@ -209,10 +220,47 @@ impl Provider for OpenRouter {
         }
 
         let url = format!("{}/chat/completions", self.base_url);
+        crate::toolcall::validate_native(&body, &self.replay_target(model))?;
+        crate::schema::normalize_native_tools(crate::schema::Target::OpenAiChat, &mut body);
+        crate::shim::native_format(
+            &request,
+            crate::reasoning::WireFormat::OpenAiChat,
+            &mut body,
+        );
+        crate::cache::finish_request(
+            &request,
+            &mut body,
+            crate::reasoning::WireFormat::OpenAiChat,
+        )?;
         Ok(ProviderRequest { url, headers, body })
     }
 
-    fn transform_response(&self, _model: &str, mut response: Value) -> Result<Value> {
+    fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
+        let native = response.clone();
+        let mut result = self.transform_response_native(model, response)?;
+        crate::reasoning::capture_response(&self.replay_target(model), &native, &mut result);
+        crate::toolcall::capture_response(&self.replay_target(model), &native, &mut result)?;
+        Ok(result)
+    }
+
+    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        let result = self.transform_stream_chunk_native(model, chunk)?;
+        let native: Value = match serde_json::from_str(chunk) {
+            Ok(v) => v,
+            Err(_) => return Ok(result),
+        };
+        crate::reasoning::capture_stream(&self.replay_target(model), &native, result)
+    }
+}
+
+impl OpenRouter {
+    fn transform_response_native(&self, _model: &str, mut response: Value) -> Result<Value> {
+        if !response.is_object() {
+            return Err(ShimError::ProviderError {
+                status: 502,
+                body: "invalid upstream response shape".into(),
+            });
+        }
         // Non-stream errors usually surface via HTTP status, but a body-level
         // `error` object can also appear — turn it into a ProviderError.
         if let Some(err) = response.get("error") {
@@ -230,29 +278,13 @@ impl Provider for OpenRouter {
             }
         }
 
-        // The response is already Chat Completions-shaped. Normalize OpenRouter's
-        // `message.reasoning` into llmshim's `reasoning_content` convention.
-        if let Some(choices) = response.get_mut("choices").and_then(|c| c.as_array_mut()) {
-            for choice in choices {
-                if let Some(msg) = choice.get_mut("message").and_then(|m| m.as_object_mut()) {
-                    if !msg.contains_key("reasoning_content") {
-                        if let Some(r) = msg
-                            .get("reasoning")
-                            .and_then(|r| r.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                        {
-                            msg.insert("reasoning_content".to_string(), json!(r));
-                        }
-                    }
-                }
-            }
-        }
-
+        crate::usage::normalize_response(&mut response);
         Ok(response)
     }
+}
 
-    fn transform_stream_chunk(&self, _model: &str, chunk: &str) -> Result<Option<String>> {
+impl OpenRouter {
+    fn transform_stream_chunk_native(&self, _model: &str, chunk: &str) -> Result<Option<String>> {
         // OpenRouter's SSE chunks are OpenAI-delta shaped. Parse, normalize the
         // reasoning delta, and forward. Unparseable payloads (e.g. stray
         // keepalive text) are skipped. `data: [DONE]` and `:`-comment keepalives
@@ -262,22 +294,9 @@ impl Provider for OpenRouter {
             Err(_) => return Ok(None),
         };
 
-        if let Some(choices) = parsed.get_mut("choices").and_then(|c| c.as_array_mut()) {
-            for choice in choices {
-                if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) {
-                    if !delta.contains_key("reasoning_content") {
-                        if let Some(r) = delta
-                            .get("reasoning")
-                            .and_then(|r| r.as_str())
-                            .map(str::to_string)
-                        {
-                            delta.insert("reasoning_content".to_string(), json!(r));
-                        }
-                    }
-                }
-            }
+        if parsed.get("usage").is_some_and(Value::is_object) {
+            crate::usage::normalize_response(&mut parsed);
         }
-
         Ok(Some(serde_json::to_string(&parsed)?))
     }
 }

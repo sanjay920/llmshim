@@ -2,8 +2,28 @@ package llmshim
 
 import "fmt"
 
+// CachePolicy declares stability; the library only places native markers.
+type CacheSegment struct {
+	UptoMessage int    `json:"upto_message"`
+	Label       string `json:"label,omitempty"`
+	Stability   string `json:"stability"`
+}
+type CachePolicy struct {
+	Segments []CacheSegment `json:"segments,omitempty"`
+	Key      *string        `json:"key,omitempty"`
+}
+
+type ShimConfig struct {
+	StructuredOutput string `json:"structured_output,omitempty"`
+	ToolCalling      string `json:"tool_calling,omitempty"`
+	ReasoningCapture string `json:"reasoning_capture,omitempty"`
+}
+
 // ChatRequest is the request body for POST /v1/chat and POST /v1/chat/stream.
 type ChatRequest struct {
+	Cache          *CachePolicy   `json:"x-cache,omitempty"`
+	Shim           *ShimConfig    `json:"x-shim,omitempty"`
+	ResponseFormat map[string]any `json:"response_format,omitempty"`
 	// Model identifier: "provider/model" (e.g. "anthropic/claude-sonnet-4-6")
 	// or just the model name for auto-detection (e.g. "claude-sonnet-4-6").
 	Model string `json:"model"`
@@ -28,6 +48,47 @@ type ChatRequest struct {
 	Fallback []string `json:"fallback,omitempty"`
 }
 
+// ReasoningOrigin binds opaque reasoning to its producing family and wire.
+type ReasoningOrigin struct {
+	Provider   string  `json:"provider"`
+	Model      string  `json:"model"`
+	Family     *string `json:"family"`
+	Wire       string  `json:"wire"`
+	ReceivedAt string  `json:"received_at"`
+	Account    string  `json:"account,omitempty"`
+}
+
+// ReasoningBlock must be retained in full for safe conversation replay.
+// Index and Replace are present only on streaming delta fragments.
+type ReasoningBlock struct {
+	Kind        string          `json:"kind"`
+	Text        *string         `json:"text,omitempty"`
+	Data        *string         `json:"data,omitempty"`
+	Signature   *string         `json:"signature,omitempty"`
+	ItemID      string          `json:"item_id,omitempty"`
+	Origin      ReasoningOrigin `json:"origin"`
+	Payload     any             `json:"payload,omitempty"`
+	SourceField string          `json:"source_field,omitempty"`
+	Index       any             `json:"index,omitempty"`
+	Replace     bool            `json:"replace,omitempty"`
+}
+
+type ThoughtSignature struct {
+	Data   string          `json:"data"`
+	Origin ReasoningOrigin `json:"origin"`
+}
+
+// WireToolID preserves a provider correlation id separately from a Responses item id.
+type WireToolID struct {
+	SignatureField string  `json:"signature_field,omitempty"`
+	Provider       string  `json:"provider"`
+	Wire           string  `json:"wire"`
+	Scope          string  `json:"scope"`
+	PartID         string  `json:"part_id"`
+	ID             *string `json:"id"`
+	ItemID         string  `json:"item_id,omitempty"`
+}
+
 // Message is a single conversation message.
 type Message struct {
 	// Role is one of: system, user, assistant, tool, developer.
@@ -42,11 +103,10 @@ type Message struct {
 	ToolCallID string `json:"tool_call_id,omitempty"`
 
 	// ToolCalls are tool calls made by the assistant.
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	ToolCalls []ToolCall       `json:"tool_calls,omitempty"`
+	Reasoning []ReasoningBlock `json:"reasoning,omitempty"`
 
-	// ReasoningContent carries an assistant turn's thinking/reasoning text.
-	// Set it when replaying a prior assistant reasoning turn in a multi-turn
-	// conversation; leave it nil otherwise.
+	// Deprecated: untracked legacy text is dropped. Retain Reasoning instead.
 	ReasoningContent *string `json:"reasoning_content,omitempty"`
 }
 
@@ -71,10 +131,12 @@ type Config struct {
 
 // ChatResponse is the response body from POST /v1/chat.
 type ChatResponse struct {
-	ID       string          `json:"id"`
-	Model    string          `json:"model"`
-	Provider string          `json:"provider"`
-	Message  ResponseMessage `json:"message"`
+	FinishReason *string         `json:"finish_reason,omitempty"`
+	ServedModel  *string         `json:"x-llmshim-served-model,omitempty"`
+	ID           string          `json:"id"`
+	Model        string          `json:"model"`
+	Provider     string          `json:"provider"`
+	Message      ResponseMessage `json:"message"`
 	// Reasoning is the model's thinking content, if any.
 	Reasoning *string `json:"reasoning,omitempty"`
 	Usage     Usage   `json:"usage"`
@@ -84,16 +146,20 @@ type ChatResponse struct {
 // ResponseMessage is the assistant message in a ChatResponse. Content is a
 // string or null.
 type ResponseMessage struct {
-	Role      string     `json:"role"`
-	Content   any        `json:"content"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Refusal   *string          `json:"refusal,omitempty"`
+	Role      string           `json:"role"`
+	Content   any              `json:"content"`
+	ToolCalls []ToolCall       `json:"tool_calls,omitempty"`
+	Reasoning []ReasoningBlock `json:"reasoning,omitempty"`
 }
 
 // ToolCall is a function tool call.
 type ToolCall struct {
-	ID       string           `json:"id,omitempty"`
-	Type     string           `json:"type,omitempty"`
-	Function ToolCallFunction `json:"function"`
+	WireIDs          []WireToolID      `json:"wire_ids,omitempty"`
+	ThoughtSignature *ThoughtSignature `json:"thought_signature,omitempty"`
+	ID               string            `json:"id,omitempty"`
+	Type             string            `json:"type,omitempty"`
+	Function         ToolCallFunction  `json:"function"`
 }
 
 // ToolCallFunction is the function payload of a ToolCall.
@@ -105,10 +171,12 @@ type ToolCallFunction struct {
 
 // Usage reports token counts for a request.
 type Usage struct {
-	InputTokens     int `json:"input_tokens"`
-	OutputTokens    int `json:"output_tokens"`
-	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
-	TotalTokens     int `json:"total_tokens"`
+	InputTokens      int `json:"input_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
+	TotalTokens      int `json:"total_tokens"`
+	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 }
 
 // StreamEventType enumerates the SSE event types.
@@ -136,7 +204,12 @@ const (
 // If a transport or parse error occurs while reading the stream, Err is set
 // and the channel is then closed.
 type StreamEvent struct {
-	Type StreamEventType `json:"type"`
+	FinishReason     *string           `json:"finish_reason,omitempty"`
+	ServedModel      *string           `json:"x-llmshim-served-model,omitempty"`
+	WireIDs          []WireToolID      `json:"wire_ids,omitempty"`
+	ThoughtSignature *ThoughtSignature `json:"thought_signature,omitempty"`
+	Blocks           []ReasoningBlock  `json:"blocks,omitempty"`
+	Type             StreamEventType   `json:"type"`
 
 	// content, reasoning
 	Text string `json:"text,omitempty"`
@@ -147,13 +220,16 @@ type StreamEvent struct {
 	Arguments string `json:"arguments,omitempty"`
 
 	// usage
-	InputTokens     int `json:"input_tokens,omitempty"`
-	OutputTokens    int `json:"output_tokens,omitempty"`
-	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
-	TotalTokens     int `json:"total_tokens,omitempty"`
+	InputTokens      int `json:"input_tokens,omitempty"`
+	OutputTokens     int `json:"output_tokens,omitempty"`
+	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
+	TotalTokens      int `json:"total_tokens,omitempty"`
+	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 
 	// error
-	Message string `json:"message,omitempty"`
+	Message      string         `json:"message,omitempty"`
+	ErrorDetails map[string]any `json:"error,omitempty"`
 
 	// Err is set for client-side transport or parse errors (not part of the
 	// wire format).

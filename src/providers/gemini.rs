@@ -83,10 +83,11 @@ fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
                 } else {
                     json!({"result": parsed})
                 };
-                contents.push(json!({
-                    "role": "user",
-                    "parts": [{"functionResponse": {"name": name, "response": response}}]
-                }));
+                let mut part = json!({"functionResponse":{"name":name,"response":response}});
+                if let Some(id) = msg.get("_llmshim_wire_id").filter(|v| v.is_string()) {
+                    part["functionResponse"]["id"] = id.clone();
+                }
+                contents.push(json!({"role":"user","parts":[part]}));
             }
             _ => {
                 // "user" and anything else
@@ -108,144 +109,23 @@ fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
     };
 
     // Post-process: enforce Gemini's strict turn ordering requirements.
-    let contents = enforce_gemini_turn_order(contents);
+    let contents = merge_same_role(contents);
 
     (system_instruction, contents)
-}
-
-/// Gemini requires:
-/// 1. Strict alternation between "user" and "model" roles (no consecutive same-role turns)
-/// 2. A model turn with functionCall parts must be immediately followed by a user turn
-///    with functionResponse parts
-///
-/// This function merges consecutive same-role turns and strips orphaned functionCall parts
-/// that have no matching functionResponse.
-/// Remove functionCall and thoughtSignature parts from a turn, leaving text parts.
-fn strip_function_calls(turn: &mut Value) {
-    if let Some(parts) = turn.get_mut("parts").and_then(|p| p.as_array_mut()) {
-        parts.retain(|p| p.get("functionCall").is_none() && p.get("thoughtSignature").is_none());
-        if parts.is_empty() {
-            parts.push(json!({"text": ""}));
-        }
-    }
-}
-
-fn enforce_gemini_turn_order(contents: Vec<Value>) -> Vec<Value> {
-    if contents.is_empty() {
-        return contents;
-    }
-
-    // Initial merge of consecutive same-role turns
-    let mut merged = merge_same_role(contents);
-
-    // Iteratively fix violations until stable — each pass may create new ones
-    for _ in 0..20 {
-        let mut changed = false;
-
-        // Strip functionCalls that are invalid:
-        // - No preceding user turn
-        // - No following functionResponse turn
-        // - Missing thoughtSignature (required by Gemini for tool roundtrips)
-        for i in 0..merged.len() {
-            let has_fc = merged[i]
-                .get("parts")
-                .and_then(|p| p.as_array())
-                .map(|parts| parts.iter().any(|p| p.get("functionCall").is_some()))
-                .unwrap_or(false);
-            if !has_fc {
-                continue;
-            }
-
-            let prev_ok =
-                i > 0 && merged[i - 1].get("role").and_then(|r| r.as_str()) == Some("user");
-            let next_ok = merged.get(i + 1).is_some_and(|next| {
-                next.get("parts")
-                    .and_then(|p| p.as_array())
-                    .map(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
-                    .unwrap_or(false)
-            });
-
-            // Check if any functionCall part is missing thoughtSignature
-            let missing_sig = merged[i]
-                .get("parts")
-                .and_then(|p| p.as_array())
-                .map(|parts| {
-                    parts.iter().any(|p| {
-                        p.get("functionCall").is_some() && p.get("thoughtSignature").is_none()
-                    })
-                })
-                .unwrap_or(false);
-
-            if !prev_ok || !next_ok || missing_sig {
-                strip_function_calls(&mut merged[i]);
-                changed = true;
-            }
-        }
-
-        // Remove functionResponse turns without preceding functionCall
-        let before = merged.len();
-        let mut i = 0;
-        while i < merged.len() {
-            let has_fr = merged[i]
-                .get("parts")
-                .and_then(|p| p.as_array())
-                .map(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
-                .unwrap_or(false);
-            if has_fr {
-                let prev_fc = i > 0
-                    && merged[i - 1]
-                        .get("parts")
-                        .and_then(|p| p.as_array())
-                        .map(|parts| parts.iter().any(|p| p.get("functionCall").is_some()))
-                        .unwrap_or(false);
-                if !prev_fc {
-                    merged.remove(i);
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        if merged.len() != before {
-            changed = true;
-        }
-
-        // Remove empty turns
-        let before = merged.len();
-        merged.retain(|turn| {
-            turn.get("parts")
-                .and_then(|p| p.as_array())
-                .map(|parts| {
-                    parts.iter().any(|p| {
-                        p.get("text")
-                            .and_then(|t| t.as_str())
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(true)
-                    })
-                })
-                .unwrap_or(true)
-        });
-        if merged.len() != before {
-            changed = true;
-        }
-
-        // Re-merge consecutive same-role turns
-        let before = merged.len();
-        merged = merge_same_role(merged);
-        if merged.len() != before {
-            changed = true;
-        }
-
-        if !changed {
-            break;
-        }
-    }
-
-    merged
 }
 
 fn merge_same_role(turns: Vec<Value>) -> Vec<Value> {
     let mut merged: Vec<Value> = Vec::new();
     for turn in turns {
+        if turn["role"] == "model"
+            && turn["parts"].as_array().is_some_and(|parts| {
+                parts.iter().all(|p| {
+                    p.as_object().is_some_and(|o| o.len() == 1) && p["text"].as_str() == Some("")
+                })
+            })
+        {
+            continue;
+        }
         let role = turn.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let last_role = merged
             .last()
@@ -269,7 +149,7 @@ fn merge_same_role(turns: Vec<Value>) -> Vec<Value> {
 
 /// Build parts array from an OpenAI message.
 fn build_parts(msg: &Value) -> Vec<Value> {
-    let mut parts = Vec::new();
+    let mut parts = crate::reasoning::gemini_parts(msg);
 
     // Text content (string or array of content blocks)
     match msg.get("content") {
@@ -307,6 +187,9 @@ fn build_parts(msg: &Value) -> Vec<Value> {
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or(json!({}));
                 let mut fc_part = json!({"functionCall": {"name": name, "args": args}});
+                if let Some(id) = tc.get("_llmshim_wire_id").filter(|v| v.is_string()) {
+                    fc_part["functionCall"]["id"] = id.clone();
+                }
                 // Echo thought_signature back — Gemini requires it for tool roundtrips
                 if let Some(sig) = tc.get("thought_signature") {
                     fc_part["thoughtSignature"] = sig.clone();
@@ -348,102 +231,14 @@ fn transform_tools(tools: &[Value]) -> Value {
             let name = source.get("name")?;
             let description = source.get("description").unwrap_or(&empty);
             let parameters = source.get("parameters").unwrap_or(&default_params).clone();
-            let sanitized = sanitize_schema(parameters);
             Some(json!({
                 "name": name,
                 "description": description,
-                "parameters": sanitized,
+                "parameters": parameters,
             }))
         })
         .collect();
     json!([{ "functionDeclarations": declarations }])
-}
-
-/// Sanitize a JSON Schema for Gemini compatibility.
-/// - Resolves `$ref` / `$defs` by inlining referenced definitions
-/// - Strips `$schema` (Gemini doesn't accept it)
-/// - Converts `"type": ["string", "null"]` → `"type": "string"` (Gemini requires single type)
-fn sanitize_schema(mut schema: Value) -> Value {
-    // Extract $defs before recursing so we can resolve $ref
-    let defs = schema
-        .as_object_mut()
-        .and_then(|obj| obj.remove("$defs").or_else(|| obj.remove("definitions")));
-
-    if let Some(defs_val) = &defs {
-        resolve_refs(&mut schema, defs_val);
-    }
-
-    clean_schema_fields(&mut schema);
-    schema
-}
-
-/// Recursively resolve `$ref` pointers by inlining from defs.
-fn resolve_refs(value: &mut Value, defs: &Value) {
-    match value {
-        Value::Object(obj) => {
-            if let Some(ref_val) = obj.remove("$ref") {
-                if let Some(ref_str) = ref_val.as_str() {
-                    // Parse "#/$defs/Foo" or "#/definitions/Foo"
-                    let def_name = ref_str
-                        .strip_prefix("#/$defs/")
-                        .or_else(|| ref_str.strip_prefix("#/definitions/"));
-                    if let Some(name) = def_name {
-                        if let Some(def) = defs.get(name) {
-                            let mut inlined = def.clone();
-                            resolve_refs(&mut inlined, defs);
-                            clean_schema_fields(&mut inlined);
-                            *value = inlined;
-                            return;
-                        }
-                    }
-                }
-            }
-            for v in obj.values_mut() {
-                resolve_refs(v, defs);
-            }
-        }
-        Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                resolve_refs(v, defs);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Remove Gemini-incompatible fields and normalize type arrays.
-fn clean_schema_fields(value: &mut Value) {
-    match value {
-        Value::Object(obj) => {
-            obj.remove("$schema");
-            obj.remove("$defs");
-            obj.remove("definitions");
-            obj.remove("$ref"); // stale refs after resolution
-            obj.remove("additionalProperties");
-            obj.remove("default");
-
-            // Convert "type": ["string", "null"] → "type": "string"
-            if let Some(type_val) = obj.get_mut("type") {
-                if let Some(arr) = type_val.as_array().cloned() {
-                    let non_null: Vec<&Value> =
-                        arr.iter().filter(|v| v.as_str() != Some("null")).collect();
-                    if non_null.len() == 1 {
-                        *type_val = non_null[0].clone();
-                    }
-                }
-            }
-
-            for v in obj.values_mut() {
-                clean_schema_fields(v);
-            }
-        }
-        Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                clean_schema_fields(v);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Translate OpenAI tool_choice to Gemini toolConfig.
@@ -469,6 +264,16 @@ fn translate_tool_choice(tc: &Value) -> Option<Value> {
 
 // -- Response transformation helpers --
 
+fn normalized_gemini_usage(usage: &Value) -> Value {
+    let mut result = json!({
+        "prompt_tokens": usage.get("promptTokenCount").cloned().unwrap_or(json!(0)),
+        "completion_tokens": usage.get("candidatesTokenCount").cloned().unwrap_or(json!(0)),
+        "total_tokens": usage.get("totalTokenCount").cloned().unwrap_or(json!(0)),
+    });
+    crate::usage::normalize_cache(usage, &mut result);
+    result
+}
+
 fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
     let candidate = resp
         .get("candidates")
@@ -486,7 +291,6 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
         .unwrap_or_default();
 
     let mut text_parts: Vec<String> = Vec::new();
-    let mut thought_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
 
     for part in &parts {
@@ -495,12 +299,8 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
             .and_then(|t| t.as_bool())
             .unwrap_or(false);
         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-            if !text.is_empty() {
-                if is_thought {
-                    thought_parts.push(text.to_string());
-                } else {
-                    text_parts.push(text.to_string());
-                }
+            if !text.is_empty() && !is_thought {
+                text_parts.push(text.to_string());
             }
         }
         if let Some(fc) = part.get("functionCall") {
@@ -561,11 +361,8 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
     if !tool_calls.is_empty() {
         message["tool_calls"] = json!(tool_calls);
     }
-    if !thought_parts.is_empty() {
-        message["reasoning_content"] = json!(thought_parts.join("\n"));
-    }
 
-    Ok(json!({
+    let result = json!({
         "id": resp.get("responseId").cloned().unwrap_or(json!("")),
         "object": "chat.completion",
         "model": model,
@@ -574,12 +371,9 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
             "message": message,
             "finish_reason": finish_reason,
         }],
-        "usage": {
-            "prompt_tokens": usage.get("promptTokenCount").cloned().unwrap_or(json!(0)),
-            "completion_tokens": usage.get("candidatesTokenCount").cloned().unwrap_or(json!(0)),
-            "total_tokens": usage.get("totalTokenCount").cloned().unwrap_or(json!(0)),
-        }
-    }))
+        "usage": normalized_gemini_usage(&usage)
+    });
+    Ok(result)
 }
 
 /// Models that cannot turn thinking off: gemini-3.1-pro, gemini-3.7-flash, and
@@ -599,7 +393,23 @@ impl Provider for Gemini {
         "gemini"
     }
 
+    fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
+        crate::reasoning::ReplayTarget::new(
+            self.name(),
+            model,
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+        )
+        .bind_account(&self.base_url, Some(&self.api_key))
+    }
+
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        let request = crate::schema::prepare_request(request);
+        let request = crate::cache::prepare_request(
+            &request,
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+        )?;
+        let request = crate::reasoning::prepare_request(&request, &self.replay_target(model));
+        let request = crate::toolcall::prepare_request(&request, &self.replay_target(model))?;
         let obj = request.as_object().ok_or(ShimError::MissingModel)?;
 
         let messages = obj
@@ -742,6 +552,18 @@ impl Provider for Gemini {
             url.push_str("&alt=sse");
         }
 
+        crate::toolcall::validate_native(&body, &self.replay_target(model))?;
+        crate::schema::normalize_native_tools(crate::schema::Target::Google, &mut body);
+        crate::shim::native_format(
+            &request,
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+            &mut body,
+        );
+        crate::cache::finish_request(
+            &request,
+            &mut body,
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+        )?;
         Ok(ProviderRequest {
             url,
             headers: vec![("Content-Type".into(), "application/json".into())],
@@ -750,6 +572,25 @@ impl Provider for Gemini {
     }
 
     fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
+        let native = response.clone();
+        let mut result = self.transform_response_native(model, response)?;
+        crate::reasoning::capture_response(&self.replay_target(model), &native, &mut result);
+        crate::toolcall::capture_response(&self.replay_target(model), &native, &mut result)?;
+        Ok(result)
+    }
+
+    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        let result = self.transform_stream_chunk_native(model, chunk)?;
+        let native: Value = match serde_json::from_str(chunk) {
+            Ok(v) => v,
+            Err(_) => return Ok(result),
+        };
+        crate::reasoning::capture_stream(&self.replay_target(model), &native, result)
+    }
+}
+
+impl Gemini {
+    fn transform_response_native(&self, model: &str, response: Value) -> Result<Value> {
         if let Some(err) = response.get("error") {
             let msg = err
                 .get("message")
@@ -763,8 +604,10 @@ impl Provider for Gemini {
         }
         transform_response_to_openai(model, &response)
     }
+}
 
-    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+impl Gemini {
+    fn transform_stream_chunk_native(&self, model: &str, chunk: &str) -> Result<Option<String>> {
         let trimmed = chunk.trim();
         if trimmed.is_empty() {
             return Ok(None);
@@ -783,7 +626,16 @@ impl Provider for Gemini {
             .and_then(|a| a.first())
         {
             Some(c) => c,
-            None => return Ok(None),
+            None => {
+                return Ok(parsed
+                    .get("usageMetadata")
+                    .filter(|u| u.is_object())
+                    .map(|usage| {
+                        json!({"object":"chat.completion.chunk", "model":model, "choices":[],
+                        "usage":normalized_gemini_usage(usage)})
+                        .to_string()
+                    }));
+            }
         };
 
         let parts = candidate
@@ -794,9 +646,6 @@ impl Provider for Gemini {
 
         // Extract text, thoughts, and tool calls from parts
         let mut text = String::new();
-        let mut thought_text = String::new();
-        let mut has_function_call = false;
-        let mut tool_calls: Vec<Value> = Vec::new();
 
         for part in &parts {
             let is_thought = part
@@ -804,45 +653,9 @@ impl Provider for Gemini {
                 .and_then(|t| t.as_bool())
                 .unwrap_or(false);
             if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                if !t.is_empty() {
-                    if is_thought {
-                        thought_text.push_str(t);
-                    } else {
-                        text.push_str(t);
-                    }
+                if !t.is_empty() && !is_thought {
+                    text.push_str(t);
                 }
-            }
-            if let Some(fc) = part.get("functionCall") {
-                // Skip functionCall parts that have no name — these are incomplete
-                // chunks from Gemini streaming that will be followed by a complete one
-                let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if name.is_empty() {
-                    continue;
-                }
-                has_function_call = true;
-                let id = fc
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
-                let args_str = fc
-                    .get("args")
-                    .filter(|a| !a.is_null())
-                    .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string()))
-                    .unwrap_or_else(|| "{}".to_string());
-                let mut tc = json!({
-                    "index": tool_calls.len(),
-                    "id": id,
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": args_str,
-                    }
-                });
-                if let Some(sig) = part.get("thoughtSignature") {
-                    tc["thought_signature"] = sig.clone();
-                }
-                tool_calls.push(tc);
             }
         }
 
@@ -859,14 +672,8 @@ impl Provider for Gemini {
 
         // Build delta
         let mut delta = json!({});
-        if !thought_text.is_empty() {
-            delta["reasoning_content"] = json!(thought_text);
-        }
         if !text.is_empty() {
             delta["content"] = json!(text);
-        }
-        if has_function_call {
-            delta["tool_calls"] = json!(tool_calls);
         }
 
         // Skip chunks with no useful content (e.g., thoughtSignature-only)
@@ -884,14 +691,8 @@ impl Provider for Gemini {
             }]
         });
 
-        // Add usage on final chunk
-        if finish_reason.is_some() {
-            if let Some(usage) = parsed.get("usageMetadata") {
-                chunk_json["usage"] = json!({
-                    "prompt_tokens": usage.get("promptTokenCount").cloned().unwrap_or(json!(0)),
-                    "completion_tokens": usage.get("candidatesTokenCount").cloned().unwrap_or(json!(0)),
-                });
-            }
+        if let Some(usage) = parsed.get("usageMetadata").filter(|u| u.is_object()) {
+            chunk_json["usage"] = normalized_gemini_usage(usage);
         }
 
         Ok(Some(serde_json::to_string(&chunk_json)?))

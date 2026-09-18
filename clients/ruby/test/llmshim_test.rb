@@ -3,6 +3,26 @@
 require_relative "test_helper"
 
 class LlmshimClientTest < Minitest::Test
+  def test_reasoning_and_signature_provenance_survive_typed_projection
+    origin = {"provider" => "gemini", "model" => "gemini-3.8-flash", "family" => "gemini",
+              "wire" => "google-generate-content", "received_at" => "2026-09-16T00:00:00Z"}
+    blocks = [{"kind" => "text", "text" => "thought", "origin" => origin}]
+    signature = {"data" => "opaque+/=", "origin" => origin}
+    message = Llmshim::ResponseMessage.from_hash({"role" => "assistant", "content" => "answer",
+      "reasoning" => blocks, "tool_calls" => [{"id" => "c1", "thought_signature" => signature}]})
+    assert_equal blocks, message.reasoning
+    assert_equal signature, message.tool_calls.first.thought_signature
+  end
+
+  def test_typed_messages_serialize_all_wire_identity_fields
+    message = {"role" => "assistant", "content" => nil, "tool_calls" => [{
+      "id" => "call_ls_example", "type" => "function", "function" => {"name" => "read", "arguments" => "{}"},
+      "wire_ids" => [{"provider" => "gemini", "wire" => "google-generate-content", "scope" => "r", "part_id" => "0", "id" => nil}]
+    }]}
+    typed = Llmshim::ResponseMessage.from_hash(message)
+    assert_equal message, JSON.parse(JSON.generate(typed))
+  end
+
   def teardown
     @proxy&.shutdown
   end
@@ -73,6 +93,9 @@ class LlmshimClientTest < Minitest::Test
     client.chat(
       model: "gpt-5.5",
       messages: [{ "role" => "user", "content" => "Hi" }],
+      shim: { structured_output: "prompt" },
+      response_format: { type: "json_schema", json_schema: { schema: { type: "integer" } } },
+      cache: { key: "session:branch", segments: [{ upto_message: 0, stability: "static" }] },
       max_tokens: 100,
       temperature: 0.7,
       reasoning_effort: "high",
@@ -84,6 +107,10 @@ class LlmshimClientTest < Minitest::Test
 
     assert_equal "gpt-5.5", captured["model"]
     assert_equal [{ "role" => "user", "content" => "Hi" }], captured["messages"]
+    assert_equal "session:branch", captured.dig("x-cache", "key")
+    assert_equal "prompt", captured.dig("x-shim", "structured_output")
+    assert_equal "integer", captured.dig("response_format", "json_schema", "schema", "type")
+    assert_equal "static", captured.dig("x-cache", "segments", 0, "stability")
     assert_equal 100, captured.dig("config", "max_tokens")
     assert_in_delta 0.7, captured.dig("config", "temperature")
     assert_equal "high", captured.dig("config", "reasoning_effort")

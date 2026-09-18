@@ -19,6 +19,26 @@ fn token_record(expired: bool) -> Value {
         "expires_at": if expired { 1 } else { chrono::Utc::now().timestamp() + 3600 }})
 }
 
+#[test]
+fn subscription_cache_key_and_native_schema_overrides_are_normalized() {
+    let (_dir, auth) = auth_fixture(token_record(false));
+    let p = ChatGpt::new(auth);
+    let mut req = request();
+    req["x-cache"] = json!({"key":"session:branch"});
+    req["x-chatgpt"] = json!({"prompt_cache_key":"old","tools":[{"type":"function","name":"f","strict":true,"parameters":{"type":"object","properties":{"optional":{"type":"string","default":"a"}}}}]});
+    let body = p.transform_request("gpt-6-astra", &req).unwrap().body;
+    assert_eq!(body["prompt_cache_key"], "session:branch");
+    assert!(body.get("x-cache").is_none());
+    assert_eq!(
+        body["tools"][0]["parameters"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        body["tools"][0]["parameters"]["required"],
+        json!(["optional"])
+    );
+}
+
 fn auth_fixture(record: Value) -> (TempDir, ChatGptAuth) {
     let dir = tempfile::tempdir().unwrap();
     let auth = ChatGptAuth::new(dir.path().join("auth.json"));
@@ -466,6 +486,32 @@ async fn completion_collects_sse_and_preserves_usage_and_all_text() {
 }
 
 #[tokio::test]
+async fn fallback_collects_subscription_sse_and_keeps_its_wire_identity() {
+    let mut server = Server::new_async().await;
+    let (_dir, auth) = auth_fixture(token_record(false));
+    let mock=server.mock("POST","/responses").match_header("chatgpt-account-id","test-account")
+        .with_body(sse(vec![terminal(json!([{"type":"function_call","id":"fc_item","call_id":"native_call","name":"weather","arguments":"{}"}]))])).create_async().await;
+    let router = Router::new().register(
+        "chatgpt",
+        Box::new(ChatGpt::new(auth).with_base_url(server.url())),
+    );
+    let config = llmshim::FallbackConfig::new(vec![
+        "unconfigured/model".into(),
+        "chatgpt/gpt-6-astra".into(),
+    ])
+    .max_retries(0);
+    let result = llmshim::completion_with_fallback(&router, &request(), &config, None)
+        .await
+        .unwrap();
+    assert_eq!(result["model"], "chatgpt/gpt-6-astra");
+    let call = &result["choices"][0]["message"]["tool_calls"][0];
+    assert!(call["id"].as_str().unwrap().starts_with("call_ls_"));
+    assert_eq!(call["wire_ids"][0]["provider"], "chatgpt");
+    assert_eq!(call["wire_ids"][0]["item_id"], "fc_item");
+    mock.assert_async().await;
+}
+
+#[tokio::test]
 async fn empty_terminal_output_recovers_text_and_function_items() {
     let mut server = Server::new_async().await;
     let (_dir, auth) = auth_fixture(token_record(false));
@@ -483,7 +529,7 @@ async fn empty_terminal_output_recovers_text_and_function_items() {
     let result = llmshim::completion(&router, &request()).await.unwrap();
     assert_eq!(result["choices"][0]["message"]["content"], "Checking.");
     assert_eq!(
-        result["choices"][0]["message"]["tool_calls"][0]["id"],
+        result["choices"][0]["message"]["tool_calls"][0]["wire_ids"][0]["id"],
         "call_1"
     );
     assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
@@ -515,25 +561,25 @@ async fn streaming_emits_reasoning_tools_and_terminal_usage() {
         .into_iter()
         .map(|c| serde_json::from_str(&c.unwrap()).unwrap())
         .collect();
-    assert_eq!(chunks.len(), 4);
+    assert_eq!(chunks.len(), 3);
     assert!(chunks
         .iter()
         .all(|chunk| chunk["model"] == "chatgpt/gpt-6-astra"));
     assert_eq!(
-        chunks[0]["choices"][0]["delta"]["reasoning_content"],
+        chunks[0]["choices"][0]["delta"]["reasoning"][0]["text"],
         "Thinking"
     );
     assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "Hello");
     assert_eq!(
-        chunks[2]["choices"][0]["delta"]["tool_calls"][0]["id"],
+        chunks[2]["choices"][0]["delta"]["tool_calls"][0]["wire_ids"][0]["id"],
         "call_1"
     );
     assert_eq!(
         chunks[2]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
         "{}"
     );
-    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "tool_calls");
-    assert_eq!(chunks[3]["usage"]["total_tokens"], 14);
+    assert_eq!(chunks[2]["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(chunks[2]["usage"]["total_tokens"], 14);
     response.assert_async().await;
 }
 
@@ -761,7 +807,7 @@ async fn proxy_stream_preserves_complete_function_arguments() {
     let calls: Vec<_> = events.iter().filter(|e| e["type"] == "tool_call").collect();
     assert_eq!(calls.len(), 2, "{events:?}");
     for (id, city) in [("a", "Paris"), ("b", "Rome")] {
-        let call = calls.iter().find(|c| c["id"] == id).unwrap();
+        let call = calls.iter().find(|c| c["wire_ids"][0]["id"] == id).unwrap();
         assert_eq!(call["name"], "weather");
         let args: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["city"], city);

@@ -152,7 +152,7 @@ fn response_normalizes_reasoning_field_to_reasoning_content() {
     });
     let result = p.transform_response("m", resp).unwrap();
     assert_eq!(
-        result["choices"][0]["message"]["reasoning_content"],
+        result["choices"][0]["message"]["reasoning"][0]["text"],
         "think"
     );
 }
@@ -166,7 +166,7 @@ fn response_keeps_native_reasoning_content() {
     });
     let result = p.transform_response("m", resp).unwrap();
     assert_eq!(
-        result["choices"][0]["message"]["reasoning_content"],
+        result["choices"][0]["message"]["reasoning"][0]["text"],
         "native"
     );
 }
@@ -178,7 +178,10 @@ fn response_passes_tool_calls_and_errors() {
         "choices": [{"index": 0, "message": {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}]
     });
     let result = p.transform_response("m", resp).unwrap();
-    assert_eq!(result["choices"][0]["message"]["tool_calls"][0]["id"], "c1");
+    assert_eq!(
+        result["choices"][0]["message"]["tool_calls"][0]["wire_ids"][0]["id"],
+        "c1"
+    );
 
     let err_resp = json!({"error": {"code": 404, "message": "model not found"}});
     assert!(p.transform_response("m", err_resp).is_err());
@@ -194,7 +197,7 @@ fn stream_normalizes_reasoning_delta() {
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(parsed["choices"][0]["delta"]["reasoning_content"], "th");
+    assert_eq!(parsed["choices"][0]["delta"]["reasoning"][0]["text"], "th");
 }
 
 #[test]

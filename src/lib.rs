@@ -1,4 +1,9 @@
+pub mod cache;
 pub mod client;
+pub mod schema;
+pub mod shim;
+/// Offline-first model catalog, also available as the standalone `llmshim-catalog` crate.
+pub use llmshim_catalog as catalog;
 pub mod config;
 pub mod env;
 pub mod error;
@@ -7,7 +12,11 @@ pub mod log;
 pub mod models;
 pub mod provider;
 pub mod providers;
+pub mod reasoning;
 pub mod router;
+pub mod streaming;
+pub mod toolcall;
+pub mod usage;
 pub mod vision;
 
 #[cfg(feature = "proxy")]
@@ -104,7 +113,7 @@ pub async fn stream(
         .and_then(|m| m.as_str())
         .ok_or(error::ShimError::MissingModel)?;
 
-    let (provider, model) = router.resolve(model_str)?;
+    let (provider, model) = router.resolve_owned(model_str)?;
     let client = &*SHARED_CLIENT;
-    client.stream(provider, &model, request).await
+    client.stream_owned(provider, &model, request).await
 }
