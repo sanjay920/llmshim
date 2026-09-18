@@ -1,0 +1,28 @@
+[package]
+name = "llmshim-catalog"
+version = "0.1.0"
+edition = "2021"
+description = "Offline-first model metadata with verified defaults, models.dev, and local overrides"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sanjay920/llmshim"
+readme = "README.md"
+keywords = ["llm", "models", "catalog", "ai"]
+categories = ["api-bindings", "data-structures"]
+include = ["src/**", "data/**", "tests/**", "README.md", "LICENSE-*"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+dirs = "6"
+thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt", "sync", "fs"] }
+tempfile = "3"
+fs2 = "0.4"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+mockito = "1"

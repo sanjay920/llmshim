@@ -40,7 +40,7 @@ pub fn parse_model(model: &str, aliases: &HashMap<String, String>) -> Result<(St
 
 /// Registry of configured providers.
 pub struct Router {
-    providers: HashMap<String, Box<dyn Provider>>,
+    providers: HashMap<String, std::sync::Arc<dyn Provider>>,
     pub aliases: HashMap<String, String>,
 }
 
@@ -59,7 +59,7 @@ impl Router {
     }
 
     pub fn register(mut self, key: &str, provider: Box<dyn Provider>) -> Self {
-        self.providers.insert(key.to_string(), provider);
+        self.providers.insert(key.to_string(), provider.into());
         self
     }
 
@@ -83,6 +83,12 @@ impl Router {
     /// Build a router from provider env vars and a saved ChatGPT login.
     pub fn from_env() -> Self {
         let mut router = Router::new();
+
+        // Only startup's local snapshot is synchronous. No catalog HTTP fetch
+        // is ever awaited by a model request.
+        if let Ok(catalog) = crate::catalog::global() {
+            catalog.refresh_in_background();
+        }
 
         let chatgpt_auth = ChatGptAuth::from_env();
         if chatgpt_auth.auth_path().is_file() {
@@ -126,8 +132,38 @@ impl Router {
 
     /// Resolve model string to (provider, model_name).
     pub fn resolve(&self, model: &str) -> Result<(&dyn Provider, String)> {
-        let (provider_key, model_name) = parse_model(model, &self.aliases)?;
-        let provider = self.get(&provider_key)?;
-        Ok((provider, model_name))
+        let (key, model) = self.resolve_key(model)?;
+        Ok((self.get(&key)?, model))
+    }
+
+    pub fn resolve_owned(&self, model: &str) -> Result<(std::sync::Arc<dyn Provider>, String)> {
+        let (key, model) = self.resolve_key(model)?;
+        let provider = self
+            .providers
+            .get(&key)
+            .cloned()
+            .ok_or(ShimError::UnknownProvider(key))?;
+        Ok((provider, model))
+    }
+
+    fn resolve_key(&self, model: &str) -> Result<(String, String)> {
+        crate::catalog::global().map_err(|error| ShimError::ProviderError {
+            status: 400,
+            body: format!("invalid model catalog configuration: {error}"),
+        })?;
+        let requested = self.aliases.get(model).map(String::as_str).unwrap_or(model);
+        let metadata = crate::catalog::resolve(requested).filter(|m| {
+            requested.split_once('/').is_none_or(|(prefix, _)| {
+                prefix == m.provider
+                    || crate::catalog::aliases::PROVIDER_ALIASES
+                        .iter()
+                        .any(|(alias, canonical)| prefix == *alias && m.provider == *canonical)
+            })
+        });
+        let (provider_key, model_name) = match metadata {
+            Some(m) => (m.provider.clone(), m.name.clone()),
+            None => parse_model(model, &self.aliases)?,
+        };
+        Ok((provider_key, model_name))
     }
 }

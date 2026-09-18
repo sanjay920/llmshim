@@ -212,3 +212,17 @@ test("custom headers are sent", async () => {
   await client.health();
   assert.equal(seenAuth, "Bearer test");
 });
+
+
+test("chat() forwards cache annotations without provider-specific logic", async () => {
+  let seen;
+  handler = async (req, res) => {
+    seen = await readBody(req);
+    json(res, 200, { id: "x", model: "m", provider: "p", message: { role: "assistant", content: "ok" }, usage: {}, latency_ms: 1 });
+  };
+  const policy = { key: "session:branch", segments: [{ upto_message: 0, stability: "static" }] };
+  await new Client({ baseUrl }).chat({ model: "m", messages: [{ role: "user", content: "hi" }], "x-cache": policy, "x-shim": {structured_output: "prompt"}, response_format: {type: "json_schema", json_schema: {schema: {type: "integer"}}} });
+  assert.deepEqual(seen["x-cache"], policy);
+  assert.equal(seen["x-shim"].structured_output, "prompt");
+  assert.equal(seen.response_format.json_schema.schema.type, "integer");
+});

@@ -2,7 +2,8 @@ use crate::error::{Result, ShimError};
 use crate::provider::{Provider, ProviderRequest};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::Stream;
+use eventsource_stream::Eventsource;
+use futures::{Stream, StreamExt};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use std::pin::Pin;
@@ -50,6 +51,7 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok()?.trim().parse().ok()
 }
 
+#[derive(Clone)]
 pub struct ShimClient {
     http: Client,
     retry: RetryConfig,
@@ -166,13 +168,60 @@ impl ShimClient {
         model: &str,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        let plan = crate::shim::Plan::new(
+            provider.name(),
+            model,
+            provider.replay_target(model).wire,
+            request,
+        )?;
+        let mut rendered = plan.render()?;
+        rendered["stream"] = serde_json::json!(false);
+        let mut usage = serde_json::json!({});
+        for attempt in 0..2 {
+            let (mut result, target) = self
+                .completion_once(provider, model, &rendered)
+                .await
+                .map_err(|e| plan.dispatch_error(e))?;
+            crate::shim::add_usage(&mut usage, &result);
+            match plan.finish(&mut result, &target) {
+                Ok(()) => {
+                    if attempt > 0 {
+                        result["usage"] = usage;
+                    }
+                    return Ok(result);
+                }
+                Err(feedback) if attempt == 0 && plan.can_repair(&result) => {
+                    rendered = plan.repair(&feedback)?;
+                    rendered["stream"] = serde_json::json!(false);
+                }
+                Err(_) => return Err(crate::shim::failed()),
+            }
+        }
+        unreachable!()
+    }
+
+    async fn completion_once(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<(serde_json::Value, crate::reasoning::ReplayTarget)> {
         let provider_req = provider.prepare_request(model, request).await?;
+        let target = provider.request_replay_target(model, &provider_req);
         let resp = self.send(&provider_req).await?;
-        if provider.name() == "chatgpt" {
-            return crate::providers::chatgpt::collect_response(model, resp).await;
+        if provider.name() == "chatgpt"
+            && target.wire == crate::reasoning::WireFormat::OpenAiResponses
+        {
+            let mut result = crate::providers::chatgpt::collect_response(model, resp).await?;
+            crate::reasoning::bind_response_context(&mut result, &target);
+            crate::toolcall::bind_response_context(&mut result, &target);
+            return Ok((result, target));
         }
         let body: serde_json::Value = resp.json().await?;
-        provider.transform_response(model, body)
+        let mut result = provider.transform_response(model, body)?;
+        crate::reasoning::bind_response_context(&mut result, &target);
+        crate::toolcall::bind_response_context(&mut result, &target);
+        Ok((result, target))
     }
 
     pub async fn stream(
@@ -181,25 +230,121 @@ impl ShimClient {
         model: &str,
         request: &serde_json::Value,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        let plan = crate::shim::Plan::new(
+            provider.name(),
+            model,
+            provider.replay_target(model).wire,
+            request,
+        )?;
+        let mut rendered = plan.render()?;
+        if !plan.buffered() {
+            return self
+                .stream_once(provider, model, &rendered)
+                .await
+                .map(|(stream, _)| stream);
+        }
+        let mut usage = serde_json::json!({});
+        for attempt in 0..2 {
+            let (stream, target) = self
+                .stream_once(provider, model, &rendered)
+                .await
+                .map_err(|e| plan.dispatch_error(e))?;
+            let mut result = crate::shim::collect(stream)
+                .await
+                .map_err(|e| plan.dispatch_error(e))?;
+            crate::shim::add_usage(&mut usage, &result);
+            match plan.finish(&mut result, &target) {
+                Ok(()) => {
+                    if attempt > 0 {
+                        result["usage"] = usage;
+                    }
+                    return Ok(Box::pin(futures::stream::iter(crate::shim::chunks(result))));
+                }
+                Err(feedback) if attempt == 0 && plan.can_repair(&result) => {
+                    rendered = plan.repair(&feedback)?
+                }
+                Err(_) => return Err(crate::shim::failed()),
+            }
+        }
+        unreachable!()
+    }
+
+    /// Owned provider variant opens the first response before returning, then
+    /// buffers managed output inside the stream. HTTP frontends can send headers
+    /// and keepalives while validation and a possible repair are in progress.
+    pub async fn stream_owned(
+        &self,
+        provider: std::sync::Arc<dyn Provider>,
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        let plan = crate::shim::Plan::new(
+            provider.name(),
+            model,
+            provider.replay_target(model).wire,
+            request,
+        )?;
+        let rendered = plan.render()?;
+        let (first, target) = self
+            .stream_once(provider.as_ref(), model, &rendered)
+            .await
+            .map_err(|e| plan.dispatch_error(e))?;
+        if !plan.buffered() {
+            return Ok(first);
+        }
+        let client = self.clone();
+        let model = model.to_owned();
+        Ok(Box::pin(futures::stream::once(async move {
+            let mut result = crate::shim::collect(first)
+                .await
+                .map_err(|e| plan.dispatch_error(e))?;
+            let mut usage = serde_json::json!({});
+            crate::shim::add_usage(&mut usage, &result);
+            if let Err(feedback) = plan.finish(&mut result, &target) {
+                if !plan.can_repair(&result) {
+                    return Err(crate::shim::failed());
+                }
+                let rendered = plan.repair(&feedback)?;
+                let (second, target) = client
+                    .stream_once(provider.as_ref(), &model, &rendered)
+                    .await
+                    .map_err(|e| plan.dispatch_error(e))?;
+                result = crate::shim::collect(second)
+                    .await
+                    .map_err(|e| plan.dispatch_error(e))?;
+                crate::shim::add_usage(&mut usage, &result);
+                plan.finish(&mut result, &target)
+                    .map_err(|_| crate::shim::failed())?;
+                result["usage"] = usage;
+            }
+            crate::shim::chunks(result).pop().unwrap()
+        })))
+    }
+
+    async fn stream_once(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<(
+        Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
+        crate::reasoning::ReplayTarget,
+    )> {
         let mut req_value = request.clone();
         req_value["stream"] = serde_json::Value::Bool(true);
 
         let provider_req = provider.prepare_request(model, &req_value).await?;
+        let target = provider.request_replay_target(model, &provider_req);
         let resp = self.send(&provider_req).await?;
-        if provider.name() == "chatgpt" {
-            return Ok(crate::providers::chatgpt::response_stream(model, resp));
-        }
-        let provider_name = provider.name().to_string();
-        let model_str = model.to_string();
+        let events = native_events(resp.bytes_stream());
 
-        let byte_stream = resp.bytes_stream();
-
-        Ok(Box::pin(SseStream {
-            inner: Box::pin(byte_stream),
-            buffer: String::new(),
-            provider_name,
-            model: model_str,
-        }))
+        Ok((
+            Box::pin(SseStream {
+                inner: events,
+                normalizer: crate::streaming::StreamNormalizer::new(target.clone()),
+            }),
+            target,
+        ))
     }
 }
 
@@ -378,95 +523,49 @@ fn rand_u64() -> u64 {
     x ^ (x >> 31)
 }
 
+fn native_events(
+    stream: impl Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static,
+) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
+    Box::pin(stream.eventsource().map(|event| {
+        event
+            .map(|e| e.data)
+            .map_err(|_| ShimError::Stream("could not read upstream SSE".into()))
+    }))
+}
+
 struct SseStream {
-    inner: Pin<Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>,
-    buffer: String,
-    provider_name: String,
-    model: String,
+    inner: Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
+    normalizer: crate::streaming::StreamNormalizer,
 }
 
 impl Stream for SseStream {
     type Item = Result<String>;
-
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         use std::task::Poll;
-
         loop {
-            // Try to extract a complete SSE event from the buffer
-            if let Some(chunk) = extract_sse_data(&mut self.buffer) {
-                let transformed = match self.provider_name.as_str() {
-                    "anthropic" => {
-                        let p = crate::providers::anthropic::Anthropic {
-                            api_key: String::new(),
-                            base_url: String::new(),
-                        };
-                        p.transform_stream_chunk(&self.model, &chunk)
-                    }
-                    "gemini" => {
-                        let p = crate::providers::gemini::Gemini {
-                            api_key: String::new(),
-                            base_url: String::new(),
-                        };
-                        p.transform_stream_chunk(&self.model, &chunk)
-                    }
-                    "xai" => {
-                        let p = crate::providers::xai::Xai {
-                            api_key: String::new(),
-                            base_url: String::new(),
-                        };
-                        p.transform_stream_chunk(&self.model, &chunk)
-                    }
-                    _ => {
-                        let p = crate::providers::openai::OpenAi {
-                            api_key: String::new(),
-                            base_url: String::new(),
-                        };
-                        p.transform_stream_chunk(&self.model, &chunk)
-                    }
-                };
-
-                match transformed {
-                    Ok(Some(data)) => return Poll::Ready(Some(Ok(data))),
-                    Ok(None) => continue, // skip this chunk, try next
-                    Err(e) => return Poll::Ready(Some(Err(e))),
-                }
+            if self.normalizer.is_finished() {
+                return Poll::Ready(None);
             }
-
-            // Need more data from the HTTP stream
-            match self.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    self.buffer.push_str(&text);
+            let data = match self.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(data))) => data,
+                Poll::Ready(Some(Err(error))) => {
+                    self.normalizer.abort();
+                    return Poll::Ready(Some(Err(error)));
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(ShimError::Http(e))));
-                }
-                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(None) => return Poll::Ready(self.normalizer.finish().transpose()),
                 Poll::Pending => return Poll::Pending,
+            };
+            match self.normalizer.push(&data) {
+                Ok(Some(chunk)) => return Poll::Ready(Some(Ok(chunk))),
+                Ok(None) => continue,
+                Err(error) => {
+                    self.normalizer.abort();
+                    return Poll::Ready(Some(Err(error)));
+                }
             }
-        }
-    }
-}
-
-/// Extract the next complete SSE "data:" payload from the buffer.
-fn extract_sse_data(buffer: &mut String) -> Option<String> {
-    loop {
-        let newline_pos = buffer.find('\n')?;
-        let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
-        buffer.drain(..=newline_pos);
-
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data == "[DONE]" {
-                return None;
-            }
-            return Some(data.to_string());
-        }
-        // Skip non-data lines (event:, id:, retry:, empty lines)
-        if buffer.is_empty() {
-            return None;
         }
     }
 }
@@ -476,6 +575,83 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn fragmented_sse(
+        provider: &dyn Provider,
+        model: &str,
+        wire: String,
+        keep_open: bool,
+    ) -> SseStream {
+        let bytes: Vec<_> = wire
+            .as_bytes()
+            .iter()
+            .map(|b| Ok(Bytes::copy_from_slice(&[*b])))
+            .collect();
+        let tail = if keep_open {
+            Box::pin(futures::stream::pending())
+                as Pin<Box<dyn Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>
+        } else {
+            Box::pin(futures::stream::empty())
+        };
+        SseStream {
+            inner: native_events(futures::stream::iter(bytes).chain(tail)),
+            normalizer: provider.stream_normalizer(model),
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_reasoning_survives_utf8_byte_splits_multiline_sse_and_crlf() {
+        let p = crate::providers::anthropic::Anthropic::new("key".into());
+        let events = [
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"é雪🙂"}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque+/="}}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}),
+        ];
+        let mut wire = String::from(": keepalive\r\n\r\n");
+        for e in events {
+            let json = e.to_string();
+            let (first, rest) = json.split_once(',').unwrap();
+            wire.push_str(&format!("data: {first},\r\ndata: {rest}\r\n\r\n"));
+        }
+        let chunks: Vec<_> = fragmented_sse(&p, "claude-sonnet-4-6", wire, false)
+            .collect()
+            .await;
+        let mut acc = crate::reasoning::ReasoningAccumulator::default();
+        for c in chunks {
+            acc.push(
+                &serde_json::from_str::<serde_json::Value>(&c.unwrap()).unwrap()["choices"][0]
+                    ["delta"],
+            );
+        }
+        assert_eq!(acc.blocks()[0]["text"], "é雪🙂");
+        assert_eq!(acc.blocks()[0]["signature"], "opaque+/=");
+    }
+
+    #[tokio::test]
+    async fn done_closes_chat_stream_after_late_usage_without_waiting_for_http_eof() {
+        let p = crate::providers::openai_compat::OpenAiCompatible::new("custom", "", None);
+        let wire="data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_cache_hit_tokens\":7}}\n\ndata: [DONE]\n\n";
+        let chunks: Vec<_> = tokio::time::timeout(
+            Duration::from_secs(1),
+            fragmented_sse(&p, "model", wire.into(), true).collect(),
+        )
+        .await
+        .unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(chunks.last().unwrap().as_ref().unwrap()).unwrap();
+        assert_eq!(last["usage"]["cache_read_tokens"], 7);
+        assert_eq!(last["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn done_without_a_terminal_chunk_is_an_error() {
+        let p = crate::providers::openai_compat::OpenAiCompatible::new("custom", "", None);
+        let chunks: Vec<_> = fragmented_sse(&p, "model", "data: [DONE]\n\n".into(), true)
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0], Err(ShimError::Stream(_))));
+    }
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();

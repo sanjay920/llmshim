@@ -1,3 +1,8 @@
+#[cfg(feature = "proxy")]
+mod normalize;
+#[cfg(feature = "proxy")]
+pub(crate) use normalize::{normalize_error, NormalizedError};
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]

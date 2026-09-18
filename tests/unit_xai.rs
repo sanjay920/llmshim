@@ -301,7 +301,7 @@ fn response_function_call() {
     });
     let result = p.transform_response("grok-4.3", resp).unwrap();
     let tc = &result["choices"][0]["message"]["tool_calls"][0];
-    assert_eq!(tc["id"], "call_1");
+    assert_eq!(tc["wire_ids"][0]["id"], "call_1");
     assert_eq!(tc["function"]["name"], "search");
     let args: Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
     assert_eq!(args["q"], "rust");
@@ -406,43 +406,49 @@ fn stream_output_item_added_non_function_call_skipped() {
 #[test]
 fn stream_output_item_added_function_call() {
     let p = provider();
-    let chunk = json!({
-        "type": "response.output_item.added",
-        "item": {
-            "type": "function_call",
-            "call_id": "call_abc",
-            "name": "get_quote",
-            "arguments": "",
-        },
-        "output_index": 0,
-    });
-    let result = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+    let mut stream = p.stream_normalizer("grok-4.3");
+    let start = json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_xyz","name":"get_weather","arguments":""}});
+    assert!(stream.push(&start.to_string()).unwrap().is_none());
+    stream
+        .push(
+            &json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{}"})
+                .to_string(),
+        )
+        .unwrap();
+    let result = stream
+        .push(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                .to_string(),
+        )
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
-    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(tc["id"], "call_abc");
-    assert_eq!(tc["function"]["name"], "get_quote");
-    assert_eq!(tc["index"], 0);
+    let call = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert!(call["id"].as_str().unwrap().starts_with("call_ls_"));
+    assert_eq!(call["wire_ids"][0]["id"], "call_xyz");
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(call["index"], 1);
 }
 
 #[test]
 fn stream_function_call_arguments_delta() {
     let p = provider();
-    let chunk = json!({
-        "type": "response.function_call_arguments.delta",
-        "delta": "{\"symbols\":[\"AAPL\"]}",
-        "output_index": 0,
-    });
-    let result = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+    let mut stream = p.stream_normalizer("grok-4.3");
+    stream.push(&json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","call_id":"call_xyz","name":"get_weather","arguments":""}}).to_string()).unwrap();
+    for fragment in ["{\"city\":", "\"Paris\"}"] {
+        assert!(stream.push(&json!({"type":"response.function_call_arguments.delta","output_index":2,"delta":fragment}).to_string()).unwrap().is_none());
+    }
+    let result = stream
+        .push(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                .to_string(),
+        )
         .unwrap()
         .unwrap();
     let parsed: Value = serde_json::from_str(&result).unwrap();
-    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(tc["function"]["arguments"], "{\"symbols\":[\"AAPL\"]}");
-    assert_eq!(tc["index"], 0);
+    let call = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(call["index"], 2);
 }
 
 #[test]
@@ -462,39 +468,26 @@ fn stream_function_call_arguments_delta_empty_skipped() {
 #[test]
 fn stream_function_call_multiple_tools_indices() {
     let p = provider();
-    // First tool at index 0
-    let chunk0 = json!({
-        "type": "response.output_item.added",
-        "item": {"type": "function_call", "call_id": "call_1", "name": "get_quote", "arguments": ""},
-        "output_index": 0,
-    });
-    let result0 = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk0).unwrap())
+    let mut stream = p.stream_normalizer("grok-4.3");
+    for index in [4, 1] {
+        stream.push(&json!({"type":"response.output_item.added","output_index":index,"item":{"type":"function_call","call_id":format!("call_{index}"),"name":"read","arguments":"{}"}}).to_string()).unwrap();
+    }
+    let result = stream
+        .push(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                .to_string(),
+        )
         .unwrap()
         .unwrap();
-    let parsed0: Value = serde_json::from_str(&result0).unwrap();
-    assert_eq!(parsed0["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
-
-    // Second tool at index 1
-    let chunk1 = json!({
-        "type": "response.output_item.added",
-        "item": {"type": "function_call", "call_id": "call_2", "name": "get_technicals", "arguments": ""},
-        "output_index": 1,
-    });
-    let result1 = p
-        .transform_stream_chunk("x", &serde_json::to_string(&chunk1).unwrap())
-        .unwrap()
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let calls = parsed["choices"][0]["delta"]["tool_calls"]
+        .as_array()
         .unwrap();
-    let parsed1: Value = serde_json::from_str(&result1).unwrap();
-    assert_eq!(parsed1["choices"][0]["delta"]["tool_calls"][0]["index"], 1);
-    assert_eq!(
-        parsed1["choices"][0]["delta"]["tool_calls"][0]["id"],
-        "call_2"
-    );
-    assert_eq!(
-        parsed1["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
-        "get_technicals"
-    );
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["index"], 1);
+    assert_eq!(calls[1]["index"], 4);
+    assert_eq!(calls[0]["wire_ids"][0]["id"], "call_1");
+    assert_eq!(calls[1]["wire_ids"][0]["id"], "call_4");
 }
 
 #[test]
@@ -717,7 +710,7 @@ fn response_surfaces_reasoning_summary() {
     });
     let result = p.transform_response("grok-4.3", resp).unwrap();
     assert_eq!(
-        result["choices"][0]["message"]["reasoning_content"],
+        result["choices"][0]["message"]["reasoning"][0]["text"],
         "thought about it"
     );
     assert_eq!(result["choices"][0]["message"]["content"], "hi there");

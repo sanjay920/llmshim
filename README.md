@@ -16,26 +16,58 @@ The Rust crate is the engine. The CLI and proxy wrap it. The Python package is a
 
 ## Benchmarks
 
-Median of 5 runs, each p50 over 20 warm requests. Same prompt, same models, same machine.
+Measured on **2026-09-18 UTC** (September 17 Pacific), Apple M5 Pro,
+macOS 26.4.1, Rust 1.97.0, llmshim 0.4.0 in release mode. These are measurements
+of the current Rust implementation.
 
-| Metric | llmshim | litellm | langchain |
-|---|---|---|---|
-| Anthropic (p50) | 999ms | 981ms | **973ms** |
-| OpenAI (p50) | **511ms** | 613ms | 602ms |
-| Streaming TTFT | 1,023ms | **906ms** | 1,249ms |
-| Memory (RSS) | **12 MB** | 281 MB | 281 MB |
-| Transform overhead | **1.5µs** | — | — |
+The API run used `claude-sonnet-4-6` and `gpt-5.4`, the prompt
+`Say 'benchmark' and nothing else.`, a 50-token output cap, no tools, and
+`reasoning_effort: none`. Each warm row summarizes 20 complete responses from
+one run; p50 uses the upper median. The streaming row is one completed stream.
 
-All three libraries hit the same APIs (Responses API for OpenAI, Messages API for Anthropic), so latency is dominated by the network round-trip — llmshim's own translation work is ~1.5µs, roughly a millionth of the request time.[^bench] The differences between libraries on any single latency row are within network noise and reshuffle run-to-run; the durable wins are memory footprint (~24× leaner than the Python stacks) and near-zero startup/overhead.
+| Metric | Measured result |
+|---|---:|
+| Anthropic first request, after connection warmup | 1426.84 ms |
+| Anthropic warm p50 / mean | 934.64 / 1111.58 ms |
+| OpenAI warm p50 / mean | 731.79 / 790.89 ms |
+| Anthropic streaming time to first visible text | 872.01 ms |
+| Process RSS after API calls, before the tool sweep | 85.48 MiB |
 
-[^bench]: Because latency is >99.9% network, per-request p50s vary by more between runs of the same library than between libraries, which is why these are medians of 5 full runs rather than a single sample. Numbers were measured with `gpt-5.4` and `claude-sonnet-4-6`; your absolute values will differ by region and time of day.
+A separate local benchmark measures request transformation with distinct tool
+parameter schemas reused across 10,000 iterations. It includes request copying,
+replay/cache policy, schema handling, and native translation. HTTP serialization,
+dispatch, and the higher-level capability plan are outside this measurement.
+The full synthetic fixture is in [`benchmarks/bench.rs`](benchmarks/bench.rs).
+
+| Tools | Schema cache disabled | Warm schema cache |
+|---:|---:|---:|
+| 0 | 6.48 µs | 5.88 µs |
+| 1 | 17.09 µs | 10.01 µs |
+| 5 | 61.44 µs | 25.55 µs |
+| 10 | 116.74 µs | 45.03 µs |
+| 25 | 277.37 µs | 106.01 µs |
+| 50 | 559.19 µs | 210.39 µs |
+
+CPU values are means from separate runs; small differences, including the
+zero-tool row, reflect run-to-run variation.
+
+At 50 tools, memoization makes this full transform **2.66× faster**.
+The remaining 210.39 µs includes hashing and copying; caching removes repeated
+schema walking and validation compilation. For scale, that is about
+**0.023%** of the measured one-word, zero-tool Anthropic response time above.
+End-to-end latency includes network and model work, and varies with payload,
+provider load, region, and time of day.
 
 Run it yourself:
 
 ```bash
-cargo run --release --example bench        # Rust (llmshim)
-uv run --with litellm --with langchain-anthropic --with langchain-openai \
-  python benchmarks/bench_python.py        # Python (litellm + langchain)
+# Reads ANTHROPIC_API_KEY and OPENAI_API_KEY from env or ~/.llmshim/config.toml.
+# Makes 43 logical model requests; the normal client retry policy applies.
+cargo run --release --example bench
+
+# Local CPU measurements; no keys or HTTP requests.
+cargo run --release --example bench -- --transforms-only
+LLMSHIM_NO_SCHEMA_CACHE=1 cargo run --release --example bench -- --transforms-only
 ```
 
 ## Configure API keys

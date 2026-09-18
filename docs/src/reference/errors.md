@@ -71,7 +71,8 @@ Before streaming begins, proxy errors use an HTTP status and a stable envelope:
 |---|---:|---|
 | Missing model | `400` | `missing_model` |
 | Unknown provider/model | `400` | `unknown_provider` |
-| Provider error | provider status when valid | `provider_error` |
+| Local request validation | `400` | `invalid_request` |
+| Provider error | provider status when valid | Original code/type when available; otherwise `invalid_request` for `400`, `provider_error` for other statuses |
 | Provider HTTP transport failure | `502` | `http_error` |
 | JSON conversion failure | `500` | `json_error` |
 | Stream setup/translation failure | `500` | `stream_error` |
@@ -95,8 +96,21 @@ failure is a final typed event:
 
 ```text
 event: error
-data: {"type":"error","message":"stream error: ..."}
+data: {"type":"error","message":"API key is invalid."}
 ```
 
 Do not expect an HTTP status change after headers have been sent. Consumers
 must handle both the initial HTTP response and `error` events in the stream.
+
+JSON and SSE messages on the proxy, gateway, and native endpoints share one
+normalizer. Recognized upstream error envelopes are unwrapped, and internal
+`provider error (NNN):`, `stream error:`, and `upstream error:` display prefixes
+are removed. Ordinary text and malformed envelopes retain their content. Nested
+JSON unwrapping is bounded to four levels. Fallback failures summarize each
+provider's readable message.
+
+SSE errors may also include an optional `error` object with the original message,
+type, code, parameter and status. `message` remains the display field. Native
+endpoints retain this metadata when constructing their own error envelope.
+Malformed `tool_calls` must be an array or null; other shapes return local HTTP `400`
+before upstream dispatch, including requests to the streaming endpoints.

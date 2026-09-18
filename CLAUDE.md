@@ -37,6 +37,62 @@ API keys: `~/.llmshim/config.toml` (via `llmshim configure`) or env vars `OPENAI
 
 ## Architecture
 
+### Catalog and usage normalization (local 0.4 development)
+
+`llmshim-catalog` is a standalone workspace member. Its `builtin` module owns
+the curated/historical constants; `src/models.rs` reexports the legacy borrowed
+API. Owned metadata and snapshots live in `llmshim::catalog`. Keep the curated
+15-route discovery and four-entry ChatGPT allowlist distinct from catalog
+coverage. Local policy > provider capabilities > verified builtin assertions >
+models.dev, per field; unknowns never erase assertions. Provider APIs never
+contribute pricing. See `crates/llmshim-catalog/README.md` for cache and override
+paths, offline behavior, aliases, and publication order. Never await catalog
+refresh in a completion; hold a snapshot for decisions that must agree.
+
+`usage.cache_read_tokens` and `usage.cache_write_tokens` are always present on
+normalized responses and usage chunks, logs, and proxy usage. Native token
+fields remain readable. `src/usage.rs` owns extraction; the streaming client
+merges Anthropic's start/delta usage before normalizing terminal counts.
+The native Chat Completions streams must use their own parser in the client;
+passing them to the Responses parser silently drops all events.
+
+Offline checks for this work:
+
+```sh
+LLMSHIM_CATALOG_OFFLINE=1 cargo test --workspace --features proxy --tests
+cargo test -p llmshim-catalog
+cargo clippy --workspace --features proxy -- -D warnings
+cargo package -p llmshim-catalog --allow-dirty
+```
+
+The root package is 0.4.0 because log/proxy usage structs gain fields; no
+release has been performed. Future release workflows must publish the catalog
+dependency before llmshim. Public code, fixtures, artifacts, and docs must use
+generic examples and contain no private consumer identities or context.
+
+### Cache annotations and shared schema normalization
+
+`src/cache.rs` translates caller `x-cache` segments into native Anthropic
+breakpoints and an explicit Responses prompt_cache_key. It never infers
+stability. Last eligible boundaries win within the four-slot budget; existing
+explicit markers consume slots. Managed segments supersede automatic caching.
+One-hour markers must precede five-minute markers. Marker scans inspect actual
+cache locations, not arbitrary schema/default JSON. Without annotations, native
+passthrough remains unchanged. `ProviderRequest::can_continue_from` checks
+endpoint, headers, settings (including include/store/reasoning) and input prefix;
+there is no stored/delta continuation engine. See the caching guide.
+
+`src/schema/` owns the single schema walker and local resource resolver. Every
+adapter normalizes native tool schemas after overrides. MCP inputSchema is
+normalized on ingest and raw MCP tool definitions are accepted. Keep literal
+values/property names separate from schema-node traversal, preserve meaningful
+stripped constraints in descriptions, and never fetch an external reference.
+Cycles, unresolved resources, incompatible residues and expansion-budget failures
+fall back per tool. Only successful enforcement permits strict:true. Global
+bypass flags: LLMSHIM_NO_SCHEMA_NORMALIZATION and LLMSHIM_NO_STRICT. OutputSchema
+provides a reversible non-object wrapper; generated-instance validation and
+repair remain a separate concern. See `docs/src/guides/schemas.md`.
+
 ### Curated discovery
 
 `src/models.rs::MODELS` is the single advertised list, imported directly by
@@ -72,10 +128,11 @@ Preserve `chatgpt/<model>` in normalized responses and chunks: a bare GPT name
 is otherwise misattributed to API-key OpenAI by the proxy/gateway when both
 providers are registered. Astra preserves reasoning effort `max`; `none` and
 `minimal` clamp to `low`.
-For ChatGPT streaming, emit function calls from `response.output_item.done`
-with complete arguments. Forwarding `response.output_item.added` followed by
-argument-only deltas loses arguments at the proxy's `tool_call` boundary.
-Text and reasoning remain incremental.
+For ChatGPT streaming, use the same `StreamNormalizer`/`ToolStream` as other
+transports. Do not reintroduce a separate completed-call emitter: it used to
+lose or duplicate argument fragments at the proxy boundary. Text and reasoning
+remain incremental; callable tools are complete and emitted once at termination.
+
 
 Offline coverage lives in `tests/unit_chatgpt.rs`. The live server check starts
 its own loopback CLI process and stops it on completion/failure:
@@ -91,9 +148,9 @@ and image input. It uses the saved ChatGPT login and consumes
 subscription usage; it is ignored during offline CI. Mount the whole token
 directory writable for container use so refresh locks and atomic saves work.
 
-**Self-hosted passthrough providers (vLLM / SGLang).** `src/providers/openai_compat.rs` is one generic OpenAI Chat Completions passthrough backing both `vllm` and `sglang` (`OpenAiCompatible::new(name, base_url, api_key: Option)`, registered per env base URL). Two things differ from the hosted providers: the **base URL is configuration** (local `http://localhost:8000/v1` vs remote `https://host/v1`), and **auth is optional** (self-hosted servers are unauthenticated unless launched with `--api-key`, so the `Authorization` header is sent only when a key is set). Passthrough transforms; `reasoning`/`reasoning_content` normalized to `reasoning_content` (vLLM is migrating the field name); `reasoning_effort` forwarded as-is (honored per-model, not clamped); server-specific params go under `x-<name>` (`chat_template_kwargs`, `separate_reasoning`, `guided_json`, `top_k`, …). Note: reasoning/tool parsing are **launch-time server flags** (`--reasoning-parser`, `--tool-call-parser`), so a request only gets that behavior if the server was started for it — llmshim can't enable it per request.
+**Self-hosted passthrough providers (vLLM / SGLang).** `src/providers/openai_compat.rs` is one generic OpenAI Chat Completions passthrough backing both `vllm` and `sglang` (`OpenAiCompatible::new(name, base_url, api_key: Option)`, registered per env base URL). Two things differ from the hosted providers: the **base URL is configuration** (local `http://localhost:8000/v1` vs remote `https://host/v1`), and **auth is optional** (self-hosted servers are unauthenticated unless launched with `--api-key`, so the `Authorization` header is sent only when a key is set). Passthrough transforms; reasoning normalized to typed `reasoning[]` with provenance (vLLM is migrating the field name); `reasoning_effort` forwarded as-is (honored per-model, not clamped); server-specific params go under `x-<name>` (`chat_template_kwargs`, `separate_reasoning`, `guided_json`, `top_k`, …). Note: reasoning/tool parsing are **launch-time server flags** (`--reasoning-parser`, `--tool-call-parser`), so a request only gets that behavior if the server was started for it — llmshim can't enable it per request.
 
-**OpenRouter is the one passthrough provider.** Every other provider translates the OpenAI-format input *away* to a native dialect; OpenRouter (`src/providers/openrouter.rs`) *is* OpenAI Chat Completions, so its transforms are near-identity — messages, tools, vision (`image_url`), and `response_format` are forwarded unchanged; `reasoning_effort` maps 1:1 to OpenRouter's `reasoning:{effort}` (its effort vocabulary is a superset, so no clamping); `message.reasoning` is normalized to `reasoning_content` on responses. OpenRouter models are **not enumerated** in `src/models.rs` (the catalog is huge and dynamic) — any `openrouter/<vendor>/<model>` slug routes through. `x-openrouter` carries OpenRouter-only controls (`provider`, `models`, `transforms`, `route`, native `reasoning`; plus `http_referer`/`x_title` which become headers). The `middle-out` transform is disabled by default for faithful passthrough. Uses `image_url` (Chat Completions) vision via `vision::to_openai_chat`.
+**OpenRouter is the one passthrough provider.** Every other provider translates the OpenAI-format input *away* to a native dialect; OpenRouter (`src/providers/openrouter.rs`) *is* OpenAI Chat Completions, so its transforms are near-identity — messages, tools, vision (`image_url`), and `response_format` are forwarded unchanged; `reasoning_effort` maps 1:1 to OpenRouter's `reasoning:{effort}` (its effort vocabulary is a superset, so no clamping); reasoning is normalized to typed `reasoning[]` with provenance on responses. OpenRouter models are **not enumerated** in `src/models.rs` (the catalog is huge and dynamic) — any `openrouter/<vendor>/<model>` slug routes through. `x-openrouter` carries OpenRouter-only controls (`provider`, `models`, `transforms`, `route`, native `reasoning`; plus `http_referer`/`x_title` which become headers). The `middle-out` transform is disabled by default for faithful passthrough. Uses `image_url` (Chat Completions) vision via `vision::to_openai_chat`.
 
 ### Request flow
 
@@ -126,7 +183,7 @@ Automatic redirects are disabled on the shared client. Keep prompts and
 provider-specific credential headers at the configured endpoint; 3xx responses
 remain provider errors. Callers must configure the final URL directly.
 
-`ShimClient` with shared connection pool (`LazyLock`), HTTP/2, gzip/brotli/zstd compression, TCP keepalive + nodelay. Automatic retry (3 attempts by default) on transport errors and 429/500/502/503/504/529 status codes. This is the **reactive** layer: on a retryable *response* it honors the server's `Retry-After` header (integer seconds or HTTP-date) and provider reset hints (OpenAI `x-ratelimit-reset-*`, Anthropic `anthropic-ratelimit-*-reset`), clamped to a cap and nudged with a little jitter; when there's no server hint (or a transport error) it falls back to full-jitter exponential backoff (uniform in `[0, min(cap, base·2^attempt)]`) to avoid a thundering herd. Tunable via `LLMSHIM_MAX_RETRIES` and `LLMSHIM_MAX_BACKOFF_SECS`. `warmup()` pre-establishes TCP+TLS connections. `SseStream` buffers bytes, extracts `data:` lines, routes through provider's `transform_stream_chunk`.
+`ShimClient` with shared connection pool (`LazyLock`), HTTP/2, gzip/brotli/zstd compression, TCP keepalive + nodelay. Automatic retry (3 attempts by default) on transport errors and 429/500/502/503/504/529 status codes. This is the **reactive** layer: on a retryable *response* it honors the server's `Retry-After` header (integer seconds or HTTP-date) and provider reset hints (OpenAI `x-ratelimit-reset-*`, Anthropic `anthropic-ratelimit-*-reset`), clamped to a cap and nudged with a little jitter; when there's no server hint (or a transport error) it falls back to full-jitter exponential backoff (uniform in `[0, min(cap, base·2^attempt)]`) to avoid a thundering herd. Tunable via `LLMSHIM_MAX_RETRIES` and `LLMSHIM_MAX_BACKOFF_SECS`. `warmup()` pre-establishes TCP+TLS connections. `SseStream` decodes bytes with eventsource-stream and feeds one per-response `StreamNormalizer`; do not restore lossy UTF-8 line buffering.
 
 ### Fallback chains (`src/fallback.rs`)
 
@@ -138,7 +195,23 @@ Image content blocks are translated between providers automatically. Users can s
 
 ### Multi-model conversations
 
-Each provider sanitizes messages from other providers in `transform_request`. OpenAI's `annotations`/`refusal` stripped for Anthropic/Gemini. `reasoning_content` is stripped by other providers, but **Anthropic reconstructs a native `thinking` block** from `reasoning_content` + `reasoning_signature` (and `redacted_thinking` from `redacted_reasoning_content`) as the first block of the assistant turn, so extended-thinking + tool-use round-trips losslessly (surfaced on responses incl. streaming; opaque signatures are stripped by other providers so they never leak cross-provider; no signature → still stripped). Symmetric to the tool-call `thought_signature` round-trip. Tool calls normalized to OpenAI format in responses, translated back per-provider on input.
+`src/reasoning.rs` owns the single replay policy, typed blocks, signature origins,
+issuer bindings, and drop counters. Every adapter filters before serialization
+and captures from the original response to preserve ordered blocks and encrypted
+Responses items. The shared HTTP client binds origins to the actual request
+(including refreshed OAuth account headers). Unknown provenance/families fail
+closed; matching family+wire permits replay, with same-account binding also
+required for encrypted blocks. Never route by inspecting opaque bytes.
+
+New outputs use `message.reasoning[]` and `thought_signature:{data,origin}`.
+Legacy sibling readers exist for one migration release and drop untracked data.
+Native overrides cannot bypass this filter or enable provider-side Responses
+storage. The CLI and proxy retain the whole message; streaming consumers use
+`ReasoningAccumulator` and must preserve signatures and completed item snapshots.
+The shared SSE reader handles split UTF-8, CRLF, multiline events, late usage,
+and terminal markers; do not restore the old per-byte lossy string buffer.
+Tests: `tests/unit_reasoning.rs`, the client SSE tests, and provider regressions.
+See `docs/src/guides/reasoning.md` for the full shape and migration contract.
 
 ### Provider extension namespaces (`x-anthropic`, `x-gemini`)
 
@@ -179,6 +252,30 @@ Gemini 3.8 Flash and Opus 5 already had catalog/adapter support; Grok 4.6 is
 the verified xAI model ID. Keep the ChatGPT four-model allowlist independent.
 
 Two knobs work across every provider: `reasoning_effort` (`none|low|medium|high|xhigh|max`) and `reasoning_mode` (`standard|pro`). A third, `reasoning_summary` (`auto|none`), controls reasoning-text visibility → Anthropic `thinking.display` (`auto`→`summarized`, the default when `reasoning_effort` is present so newer models like Sonnet 5 / Opus 4.7-4.8 return reasoning text instead of the API-default `omitted`; `none`→`omitted` for lower latency). Applies to both the adaptive and pre-4.6 enabled thinking builders; a caller-supplied `thinking` block bypasses it. Each provider transform maps them to its native dialect, **clamping to the nearest tier the target model accepts** (all boundaries verified live — e.g. `max` is native on OpenAI gpt-5.6 and GPT-6 Astra; Anthropic 4.6 rejects `xhigh` but has `max`; Gemini's enum tops out at `high`; xAI grok-4.20 models reject any reasoning param). `mode: "pro"` is native on OpenAI gpt-5.6/-pro models (`reasoning.mode`), emulated as a one-tier effort bump elsewhere; explicit `none` always wins. Native passthrough (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) bypasses the mapping entirely and always takes precedence. **Full per-provider mapping tables: `docs/src/guides/reasoning.md`** — update it and the pinning tests in `tests/unit_*.rs` together whenever a mapping changes.
+
+### Owned tool identities and stream state
+
+`src/toolcall.rs` owns `WireToolId`, the bidirectional map, request projection,
+and central call/result validation. Canonical ids are minted as `call_ls_*` and
+never use a provider id directly. `wire_ids` must remain on persisted calls;
+Responses `item_id` is distinct from correlation `id`. Source wire ids (including
+Gemini's missing id) are restored on both calls/results, preserving signed
+prefixes. Legacy input ids remain readable, but an owned id without its mapping
+is an error. Never drop invalid tool history to make a request succeed.
+
+`src/toolcall/streaming.rs` parses native events into `ToolDelta` and assembles
+JSON arguments once. `src/streaming.rs::StreamNormalizer` is the public stateful
+entry point used by HTTP streaming and manual SSE readers. Stateless provider
+chunk methods no longer expose partial callable records. Tool signatures can
+arrive after names/arguments; preserve their exact data/origin and original wire
+container. Parallel choices close independently. The single-message proxy
+projects choice zero; Rust retains choice indices.
+
+Google's current Generate Content contract requires a signature on the first
+function call of each current Gemini 3 batch, not every parallel call. Validate
+that rule after filtering, preserve additional signatures exactly where present,
+and retain optional native function ids on both sides. `unit_toolcall` covers
+paired replay, order, signatures, invalid history, and transport delta sequences.
 
 ### Tool format translation
 
@@ -292,3 +389,96 @@ Common maintenance workflows are packaged as [skills](https://code.claude.com/do
 - `/add-provider key Name` — wire up a brand-new upstream provider.
 - `/preflight` — run the fmt + clippy + test trio CI enforces.
 - `/release 0.1.22` — bump version and tag so CI publishes.
+
+### Capability plans and instance validation
+
+`src/shim.rs::Plan` owns catalog-driven structured output, prompt tool calling,
+and optional brief-rationale capture. `ShimClient` applies the same plan on
+completion, stream, and fallback paths; direct provider transforms only support
+native response-format translation. Never emit hidden synthetic calls, native
+deliberation about those calls, or invalid attempts to logs/streams. Managed
+streams buffer with a 32 MiB bound; top-level streaming uses an Arc-owned provider
+so HTTP headers/keepalives can proceed while output is validated.
+
+Validate generated data against the ORIGINAL schema with the network/filesystem
+retriever disabled (`schema::validate`). Schema compile budgets are 96 levels,
+32,768 JSON values and 8 MiB strings/keys. Only complete invalid answers receive
+one repair; refusals and incomplete responses do not. Preserve both attempts'
+reported usage. Unknown catalog fields remain unknown; `forced_tool_choice` is
+independent of tools, with the verified Fable 5.1 prohibition overriding auto.
+Keep synthetic schemas/instructions deterministic so unchanged requests preserve
+prefix caching. Tests: `unit_shim`, proxy conversion tests, client request mocks.
+
+### Signature observations and reasoning profiles
+
+`providers/anthropic_signature.rs` has the default-on `signature-introspection`
+feature and Option-only stub. Never use decoded metadata to change provenance,
+messages, replay, routing, fallback, or caches. Synthetic fixtures only. Capture
+one metric observation per response/terminal stream; logs read the observation
+without incrementing it. `x-llmshim-served-model` belongs at response/event level.
+
+`providers/anthropic_reasoning.rs::Profile` consumes catalog effort/budget unions
+once per provider transform. Builtin verified options win over community data;
+local/provider overrides retain documented precedence. Keep historical fallback
+entries explicit in `catalog::builtin::anthropic_reasoning_options`, rather than
+guessing support for new model names. Preserve mandatory native model constraints
+(e.g. Fable adaptive-only and forbidden forced choices) separately.
+
+### Native inbound facades
+
+`proxy::wire` translates `/v1/messages` and `/v1/chat/completions` through the
+existing chat handlers on both proxy and gateway. Do not create another dispatch,
+auth, quota, or queue path. Gateway authenticates before receipt lookup and again
+in its ordinary admission path; x-api-key maps to Bearer only when Authorization
+is absent. Native idempotency keys include credential and protocol scope.
+
+The native facade persists issued replay metadata in private atomic local files,
+configured by `LLMSHIM_REPLAY_RECEIPTS_DIR`. Clients must preserve the native
+message/ID and server receipts across restarts. Never stamp unknown native thinking
+with current-target provenance. Receipts restore original blocks, then the common
+replay filter decides eligibility. Missing owned IDs and edited calls error.
+Text remains incremental; complete reasoning/tool blocks follow once metadata is
+ready. Status/Retry-After and gateway request IDs survive error translation.
+`src/error/normalize.rs` owns error unwrapping for compact JSON/SSE, gateway,
+and native endpoints. Keep display messages readable and source type/code/param
+metadata separate; do not move this logic back into a wire-only formatter.
+JSON responses carry native metadata in response extensions, and SSE errors carry
+an optional structured error object so native rendering remains lossless.
+Tests: `unit_wire`, gateway `http::native_tests`. Use a temporary receipt directory
+in tests; never put real signatures, credentials, or conversations in fixtures.
+
+### Provider and CLI regression gates
+
+`tests/unit_provider_contracts.rs` discovers Provider implementations from the
+Rust AST and requires a fixture for each. New adapters must preserve compatible
+reasoning, drop foreign/untracked blocks and signatures, and reject invalid tool
+history before serialization. Tool-call containers accept arrays or null only.
+HTTP handlers validate canonical history before committing to an SSE response.
+
+`src/cli.rs` validates arguments before side effects. Server options override env
+and saved host/port; help must not start a service. Bind errors are returned to
+main for a clean exit. Tests use ephemeral loopback ports and never touch an
+existing server. Run unit_cli, unit_provider_contracts, unit_wire and gateway
+HTTP tests when changing these boundaries.
+
+### Schema memoization and benchmark receipts
+
+`src/schema/memo.rs` caches only schema inputs/results and `Normalization` reports.
+The process-local cache is bounded to 512 entries/16 MiB estimated owned bytes,
+uses LRU eviction, verifies input/options after a hash hit, and performs expensive
+normalization outside the lock. Key all effective Options, including budgets.
+Resolve environment overrides before lookup. Preserve object order and signed
+zero: semantically equal numbers can produce different spilled descriptions.
+No-op hits can retain the input value only after exact input/output comparison.
+
+`LLMSHIM_NO_SCHEMA_CACHE=1` bypasses memoization while keeping normalization active.
+Tests cover collisions, eviction, concurrency, returned-value independence,
+report/fallback fidelity, environment changes and fresh tool metadata.
+
+`cargo run --release --example bench` loads the two configured native API keys and
+makes 43 logical requests plus client retries. Missing keys fail before network
+calls with setup instructions. Provider errors must never print credentials.
+`--transforms-only` needs no keys or HTTP calls; use it for cache-on/off comparison.
+Keep README measurements dated, name the actual models/host/build/workload, and
+separate API latency, full-transform CPU time, and RSS. Do not mix fresh Rust
+figures with old Python results or claim unmeasured network-only latency shares.

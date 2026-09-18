@@ -29,6 +29,23 @@ llmshim is a translation layer, not a security boundary. Its posture:
   output is a bug, not a vulnerability — an ordinary public issue is perfect for
   those.
 
+## Outbound network activity
+
+llmshim contacts one host you did not configure.
+
+- **`models.dev` on startup.** `Router::from_env` kicks off a model-catalog fetch so that
+  context windows, capability flags and pricing are current rather than compiled in. The request
+  carries no prompt content, no API keys, and no identifying information — it is an unauthenticated
+  GET of a public catalog — but it is an outbound connection, and you should know about it before
+  deploying into a restricted network.
+- **Disable it with `LLMSHIM_CATALOG_OFFLINE=1`.** Offline mode makes the catalog use its
+  vendored snapshot and performs no catalog or provider-discovery HTTP at all. A cached
+  catalog on disk is also ignored in this mode.
+- **Everything else is a provider call you asked for.** Requests go to the provider implied by
+  the model you addressed, at its documented endpoint or a base URL you set yourself.
+
+llmshim sends no telemetry, analytics, crash reports, or usage statistics anywhere.
+
 ## Supported versions
 
 The latest release and `main`. We do not backport fixes to older releases.

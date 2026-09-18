@@ -143,9 +143,9 @@ fn fable_rejects_assistant_prefill_but_accepts_tool_results() {
             error,
             ShimError::ProviderError { status: 400, .. }
         ));
-        let req = provider().transform_request(model, &json!({"messages": [{"role": "tool", "tool_call_id": "call", "content": "Sunny"}]})).unwrap();
-        assert_eq!(req.body["messages"][0]["role"], "user");
-        assert_eq!(req.body["messages"][0]["content"][0]["type"], "tool_result");
+        let req = provider().transform_request(model, &json!({"messages": [{"role":"user","content":"Weather?"},{"role":"assistant","tool_calls":[{"id":"call","function":{"name":"weather","arguments":"{}"}}]},{"role": "tool", "tool_call_id": "call", "content": "Sunny"}]})).unwrap();
+        assert_eq!(req.body["messages"][2]["role"], "user");
+        assert_eq!(req.body["messages"][2]["content"][0]["type"], "tool_result");
     }
 }
 
@@ -154,7 +154,7 @@ fn fable51_keeps_appended_system_turns_out_of_the_bound_initial_prompt() {
     let messages = json!([
         {"role": "system", "content": "Initial instruction"},
         {"role": "user", "content": "First question"},
-        {"role": "assistant", "content": "Answer", "reasoning_content": "", "reasoning_signature": "opaque-signed-block"},
+        {"role": "assistant", "content": "Answer", "reasoning_content": "", "reasoning_signature": "opaque-signed-block", "reasoning_origin": provider().replay_target("claude-fable-5-1").origin()},
         {"role": "developer", "content": "Instruction for this turn"},
         {"role": "user", "content": "Second question"}
     ]);

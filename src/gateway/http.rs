@@ -334,6 +334,7 @@ fn build_request(
         );
         ApiError::Unauthorized
     })?;
+    crate::proxy::convert::validate_request(req)?;
     let provider_name = {
         let (provider, _model) = state.router.resolve(&req.model)?;
         provider.name().to_string()
@@ -446,7 +447,7 @@ async fn chat_stream_inner(
                     }
                 }
                 Err(e) => {
-                    let error_event = StreamEvent::Error { message: e.to_string() };
+                    let error_event = crate::proxy::error::stream_error(&e.to_string());
                     if let Ok(data) = serde_json::to_string(&error_event) {
                         yield Ok(Event::default().event("error").data(data));
                     }
@@ -559,13 +560,167 @@ async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> 
 pub fn app(state: Arc<GatewayState>) -> axum::Router {
     axum::Router::new()
         .route("/v1/chat", post(chat))
+        .route("/v1/chat/completions", post(chat))
+        .route("/v1/messages", post(chat))
         .route("/v1/chat/stream", post(chat_stream))
         .route("/v1/models", get(list_models))
         .route("/v1/gateway/stats", get(stats))
         .route("/metrics", get(metrics))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            native_translate,
+        ))
         .layer(axum::middleware::from_fn(request_id))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+async fn native_translate(
+    State(state): State<Arc<GatewayState>>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let wire = match request.uri().path() {
+        "/v1/messages" => Some(crate::proxy::wire::Wire::Messages),
+        "/v1/chat/completions" => Some(crate::proxy::wire::Wire::Chat),
+        _ => None,
+    };
+    if let Some(wire) = wire {
+        crate::proxy::wire::normalize_auth(request.headers_mut());
+        if state.keystore.identify(request.headers()).is_err() {
+            return crate::proxy::wire::fail(
+                wire,
+                StatusCode::UNAUTHORIZED,
+                "Missing or invalid API key",
+            );
+        }
+    }
+    crate::proxy::wire::translate(request, next).await
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        Extension,
+    };
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    fn configured_state(base_url: &str) -> Arc<GatewayState> {
+        let router = Arc::new(Router::new().register(
+            "local",
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                "local", base_url, None,
+            )),
+        ));
+        let config = GatewayConfig::default();
+        let limiter = Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+        ));
+        let scheduler = Scheduler::new(
+            config.clone(),
+            limiter,
+            Arc::new(RealDispatch {
+                router: router.clone(),
+                logger: None,
+            }),
+        );
+        let keys = std::collections::HashMap::from([(
+            "test-key".into(),
+            crate::gateway::auth::Identity {
+                tenant: "test-tenant".into(),
+                tier: 1,
+                rpm: None,
+                tpm: None,
+            },
+        )]);
+        let state = Arc::new(GatewayState {
+            router,
+            backend: Backend::Local(scheduler),
+            keystore: crate::gateway::auth::KeyStore::enforced(keys),
+            quota: crate::gateway::quota::TenantQuota::new(),
+            idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
+                30,
+            )),
+            idempotency_ttl_secs: 30,
+            overloaded_retry_after: config.overloaded_retry_after,
+        });
+        state
+    }
+
+    #[tokio::test]
+    async fn native_routes_preserve_auth_queue_and_protocol_scoped_idempotency() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream=server.mock("POST","/chat/completions").with_body(json!({"id":"r","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{}}).to_string()).expect(2).create_async().await;
+        let state = configured_state(&server.url());
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["/v1/messages", "/v1/chat/completions"] {
+            let app = app(state.clone()).layer(Extension(Arc::new(
+                crate::proxy::wire::Receipts::new(dir.path().to_owned()),
+            )));
+            let rejected = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+            let error: Value =
+                serde_json::from_slice(&to_bytes(rejected.into_body(), 10000).await.unwrap())
+                    .unwrap();
+            assert_eq!(error["error"]["type"], "authentication_error");
+            let response=app.oneshot(Request::builder().method("POST").uri(path).header("content-type","application/json").header("x-api-key","test-key").header("x-llmshim-priority","255").header("idempotency-key","same-client-key").body(Body::from(json!({"model":"local/test","messages":[{"role":"user","content":"hi"}]}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().contains_key("x-request-id"));
+            let body = to_bytes(response.into_body(), 10000).await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("hello"));
+        }
+        upstream.assert_async().await;
+    }
+    #[tokio::test]
+    async fn all_gateway_surfaces_normalize_upstream_errors_and_reject_bad_history() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server.mock("POST", "/chat/completions").with_status(401)
+            .with_body(json!({"error":{"type":"invalid_request_error","code":"invalid_api_key","message":"API key is invalid.","param":null}}).to_string())
+            .expect(5).create_async().await;
+        let state = configured_state(&server.url());
+        let application = app(state);
+        for (path, stream) in [
+            ("/v1/chat", false),
+            ("/v1/chat", true),
+            ("/v1/chat/stream", true),
+            ("/v1/messages", false),
+            ("/v1/chat/completions", false),
+        ] {
+            let response = application.clone().oneshot(Request::builder().method("POST").uri(path)
+                .header("content-type","application/json").header("authorization","Bearer test-key")
+                .body(Body::from(json!({"model":"local/test","messages":[{"role":"user","content":"hi"}],"stream":stream}).to_string())).unwrap()).await.unwrap();
+            assert!(response.status().is_server_error());
+            let data = to_bytes(response.into_body(), 100000).await.unwrap();
+            let body: Value = serde_json::from_slice(&data).unwrap();
+            assert_eq!(body["error"]["message"], "API key is invalid.");
+            if path == "/v1/messages" {
+                assert_eq!(body["error"]["type"], "authentication_error");
+            } else {
+                assert_eq!(body["error"]["code"], "invalid_api_key");
+            }
+        }
+        for path in ["/v1/chat", "/v1/chat/stream", "/v1/chat/completions"] {
+            let response = application.clone().oneshot(Request::builder().method("POST").uri(path)
+                .header("content-type","application/json").header("authorization","Bearer test-key")
+                .body(Body::from(json!({"model":"local/test","messages":[{"role":"assistant","content":"answer","tool_calls":{}}]}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        upstream.assert_async().await;
+    }
 }

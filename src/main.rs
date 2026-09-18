@@ -1,3 +1,5 @@
+mod cli;
+
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use futures::StreamExt;
@@ -587,8 +589,34 @@ fn cmd_list() {
     println!("  {:12} {}", "port", cfg.proxy.port);
 }
 
-fn cmd_models() {
+async fn cmd_models(args: &[String]) {
     llmshim::env::load_all();
+    let catalog = match llmshim::catalog::global() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+    if args.iter().any(|arg| arg == "--refresh") {
+        let outcome = catalog.refresh(true).await;
+        eprintln!("Catalog refresh: {outcome:?}");
+        if matches!(outcome, llmshim::catalog::RefreshOutcome::Stale { .. }) {
+            std::process::exit(1);
+        }
+    }
+    if args.iter().any(|arg| arg == "--all") {
+        let snapshot = catalog.snapshot();
+        let models: Vec<_> = snapshot.models().collect();
+        if args.iter().any(|arg| arg == "--json") {
+            println!("{}", serde_json::to_string_pretty(&models).unwrap());
+        } else {
+            for model in models {
+                println!("  {} ({})", model.id, model.label);
+            }
+        }
+        return;
+    }
     let router = llmshim::router::Router::from_env();
     let keys = router.provider_keys();
     let models = llmshim::models::available_models(&keys);
@@ -598,9 +626,7 @@ fn cmd_models() {
 }
 
 #[cfg(feature = "proxy")]
-async fn cmd_proxy() {
-    use std::net::SocketAddr;
-
+async fn cmd_proxy(options: &cli::ServerOptions) -> Result<(), String> {
     let router = llmshim::router::Router::from_env();
     let providers = router.provider_keys();
     if providers.is_empty() {
@@ -618,20 +644,21 @@ async fn cmd_proxy() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(config.proxy.port);
-    let addr: SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .expect("Invalid address");
+    let requested = options.address(&host, port)?;
+    let listener = cli::bind(requested).await?;
+    let addr = listener
+        .local_addr()
+        .map_err(|error| format!("cannot read listener address: {error}"))?;
 
     eprintln!("llmshim proxy starting on http://{}", addr);
     eprintln!("  Providers: {:?}", providers);
-    eprintln!("  POST /v1/chat · POST /v1/chat/stream · GET /v1/models · GET /health");
+    eprintln!("  POST /v1/chat · POST /v1/chat/stream · POST /v1/messages · POST /v1/chat/completions · GET /v1/models · GET /health");
 
     let app = llmshim::proxy::app(router, logger);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .unwrap();
+        .map_err(|error| format!("server failed: {error}"))
 }
 
 /// Resolve on the first SIGTERM (deploys / autoscaler) or Ctrl-C, so the server
@@ -661,9 +688,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(feature = "gateway")]
-async fn cmd_gateway() {
-    use std::net::SocketAddr;
-
+async fn cmd_gateway(options: &cli::ServerOptions) -> Result<(), String> {
     let router = llmshim::router::Router::from_env();
     let providers = router.provider_keys();
     if providers.is_empty() {
@@ -681,26 +706,27 @@ async fn cmd_gateway() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(config.proxy.port);
-    let addr: SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .expect("Invalid address");
+    let requested = options.address(&host, port)?;
+    let listener = cli::bind(requested).await?;
+    let addr = listener
+        .local_addr()
+        .map_err(|error| format!("cannot read listener address: {error}"))?;
 
     eprintln!("llmshim gateway starting on http://{}", addr);
     eprintln!("  Providers: {:?}", providers);
     eprintln!(
         "  Priority-queue scheduler · x-llmshim-priority header (higher = sooner, default 0)"
     );
-    eprintln!("  POST /v1/chat · POST /v1/chat/stream · GET /v1/models · GET /health");
+    eprintln!("  POST /v1/chat · POST /v1/chat/stream · POST /v1/messages · POST /v1/chat/completions · GET /v1/models · GET /health");
 
     // Distributed (Redis fleet) mode when a Redis URL is configured and the
     // binary was built with redis coordination; otherwise single-instance.
     let state = build_gateway_state(router, logger).await;
     let app = llmshim::gateway::http::app(state);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .unwrap();
+        .map_err(|error| format!("server failed: {error}"))
 }
 
 #[cfg(all(feature = "gateway", feature = "redis-coordination"))]
@@ -749,8 +775,8 @@ fn print_global_usage() {
     eprintln!("  chat                  Interactive multi-model chat");
     eprintln!();
     eprintln!("Server:");
-    eprintln!("  proxy                 Start HTTP proxy server");
-    eprintln!("  gateway               Start priority-queue gateway (experimental)");
+    eprintln!("  proxy                 Start HTTP proxy server (--host IP, --port PORT)");
+    eprintln!("  gateway               Start priority-queue gateway (--host IP, --port PORT)");
     eprintln!("  docker start          Start proxy in Docker");
     eprintln!("  docker stop           Stop Docker proxy");
     eprintln!("  docker status|logs    Container status and logs");
@@ -763,7 +789,10 @@ fn print_global_usage() {
     eprintln!("  set <key> <value>     Set a config value");
     eprintln!("  get <key>             Get a config value");
     eprintln!("  list                  Show all configured keys");
-    eprintln!("  models                List available models");
+    eprintln!("  models [--refresh]    List available models; refresh catalog on demand");
+    eprintln!(
+        "    --all [--json]      Show full catalog metadata (includes unconfigured providers)"
+    );
     eprintln!();
     eprintln!("Get started:");
     eprintln!("  llmshim configure     Set up API keys");
@@ -982,6 +1011,21 @@ async fn cmd_chatgpt_auth(cmd: &str, status_only: bool) -> llmshim::error::Resul
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let options = match cli::parse(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    if options.help {
+        if let Some(usage) = cli::usage(args.get(1).map(String::as_str).unwrap_or("help")) {
+            println!("{usage}");
+        } else {
+            print_global_usage();
+        }
+        return;
+    }
     let cmd = args.get(1).map(|s| s.as_str());
 
     // No subcommand → show help
@@ -1032,7 +1076,7 @@ async fn main() {
             return;
         }
         "models" => {
-            cmd_models();
+            cmd_models(&args[2..]).await;
             return;
         }
         "path" => {
@@ -1052,7 +1096,10 @@ async fn main() {
             llmshim::env::load_all();
             #[cfg(feature = "proxy")]
             {
-                cmd_proxy().await;
+                if let Err(error) = cmd_proxy(&options.server).await {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
                 return;
             }
             #[cfg(not(feature = "proxy"))]
@@ -1065,7 +1112,10 @@ async fn main() {
             llmshim::env::load_all();
             #[cfg(feature = "gateway")]
             {
-                cmd_gateway().await;
+                if let Err(error) = cmd_gateway(&options.server).await {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
                 return;
             }
             #[cfg(not(feature = "gateway"))]
@@ -1295,24 +1345,29 @@ async fn main() {
         match llmshim::stream(&router, &request).await {
             Ok(mut stream) => {
                 let mut full_text = String::new();
+                let mut reasoning = llmshim::reasoning::ReasoningAccumulator::default();
+                let mut stream_failed = false;
                 let mut in_reasoning = false;
                 let mut final_usage: Option<Value> = None;
+                let mut served_model: Option<Value> = None;
 
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(data) => {
                             let parsed: Value = serde_json::from_str(&data).unwrap_or_default();
 
-                            // Reasoning tokens — dim grey
-                            if let Some(reasoning) = parsed
-                                .pointer("/choices/0/delta/reasoning_content")
-                                .and_then(|c| c.as_str())
-                            {
+                            if let Some(served) = parsed.get("x-llmshim-served-model") {
+                                served_model = Some(served.clone());
+                            }
+                            let delta = &parsed["choices"][0]["delta"];
+                            reasoning.push(delta);
+                            let reasoning_text = llmshim::reasoning::reasoning_text(delta);
+                            if !reasoning_text.is_empty() {
                                 if !in_reasoning {
-                                    print!("\x1b[2m\x1b[90m"); // dim + grey
+                                    print!("\x1b[2m\x1b[90m");
                                     in_reasoning = true;
                                 }
-                                print!("{}", reasoning);
+                                print!("{}", reasoning_text);
                                 io::stdout().flush().ok();
                             }
 
@@ -1336,6 +1391,7 @@ async fn main() {
                             }
                         }
                         Err(e) => {
+                            stream_failed = true;
                             eprintln!("\n  Stream error: {}", e);
                             if let Some(ref logger) = logger {
                                 logger.log(&LogEntry::from_error(
@@ -1351,6 +1407,10 @@ async fn main() {
                 }
                 if in_reasoning {
                     print!("\x1b[0m");
+                }
+
+                if stream_failed {
+                    continue;
                 }
 
                 let elapsed = timer.elapsed();
@@ -1383,7 +1443,7 @@ async fn main() {
 
                 // Log to file
                 if let Some(ref logger) = logger {
-                    let log_resp = json!({"usage": usage, "id": ""});
+                    let log_resp = json!({"usage": usage, "id": "", "x-llmshim-served-model":served_model, "choices":[{"message":{"reasoning":reasoning.blocks()}}]});
                     logger.log(&LogEntry::from_response(
                         provider_name,
                         &current_model,
@@ -1393,8 +1453,13 @@ async fn main() {
                 }
 
                 // Add assistant response to history
-                if !full_text.is_empty() {
-                    messages.push(json!({"role": "assistant", "content": full_text}));
+                let blocks = reasoning.blocks();
+                if !full_text.is_empty() || !blocks.is_empty() {
+                    let mut message = json!({"role":"assistant","content":full_text});
+                    if !blocks.is_empty() {
+                        message["reasoning"] = json!(blocks);
+                    }
+                    messages.push(message);
                 }
             }
             Err(e) => {

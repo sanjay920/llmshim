@@ -69,6 +69,7 @@ pub async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
+    convert::validate_request(&req)?;
     if req.stream {
         // Delegate to streaming (which runs its own admission control).
         return Ok(chat_stream_inner(state, req).await);
@@ -126,6 +127,9 @@ pub async fn chat_stream(
 }
 
 async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
+    if let Err(error) = convert::validate_request(&req) {
+        return ApiError::from(error).into_response();
+    }
     // Admission control up front: reject with 429/503 (+ Retry-After) before we
     // commit to a stream, rather than emitting a rejection as an SSE event.
     let admission = match admit(&state, &req).await {
@@ -164,9 +168,7 @@ async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
                             }
                         }
                         Err(e) => {
-                            let error_event = StreamEvent::Error {
-                                message: e.to_string(),
-                            };
+                            let error_event = super::error::stream_error(&e.to_string());
                             if let Ok(data) = serde_json::to_string(&error_event) {
                                 yield Ok(Event::default().event("error").data(data));
                             }
@@ -176,9 +178,7 @@ async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
                 }
             }
             Err(e) => {
-                let error_event = StreamEvent::Error {
-                    message: e.to_string(),
-                };
+                let error_event = super::error::stream_error(&e.to_string());
                 if let Ok(data) = serde_json::to_string(&error_event) {
                     yield Ok(Event::default().event("error").data(data));
                 }

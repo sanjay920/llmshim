@@ -74,7 +74,12 @@ impl IntoResponse for ApiError {
             ),
             crate::error::ShimError::ProviderError { status, body } => {
                 let http_status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-                (http_status, "provider_error", body.clone())
+                let code = if *status == 400 {
+                    "invalid_request"
+                } else {
+                    "provider_error"
+                };
+                (http_status, code, body.clone())
             }
             crate::error::ShimError::Http(e) => (
                 StatusCode::BAD_GATEWAY,
@@ -92,18 +97,30 @@ impl IntoResponse for ApiError {
             crate::error::ShimError::AllFailed(errors) => (
                 StatusCode::BAD_GATEWAY,
                 "all_failed",
-                format!("All providers failed: {:?}", errors),
+                format!(
+                    "All providers failed: {}",
+                    errors
+                        .iter()
+                        .map(|error| crate::error::normalize_error(error).message)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
             ),
         };
 
+        let mut normalized = crate::error::normalize_error(&message);
+        normalized.status = normalized.status.or(Some(status.as_u16()));
         let body = ErrorResponse {
             error: ErrorDetail {
-                code: code.to_string(),
-                message,
+                code: normalized.public_code(code).to_owned(),
+                message: normalized.message.clone(),
             },
         };
-
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        // Native facades share this response in-process. Keep typed source
+        // metadata separate from the public, human-readable message.
+        response.extensions_mut().insert(normalized);
+        response
     }
 }
 
@@ -123,4 +140,36 @@ fn error_with_retry_after(
     resp.headers_mut()
         .insert(header::RETRY_AFTER, retry_after_header(retry_after));
     resp
+}
+
+/// Keep flat `type`/`message` for existing clients. The nested `error` deliberately
+/// repeats the message alongside source metadata for lossless native rendering.
+pub(crate) fn stream_error(message: &str) -> serde_json::Value {
+    let error = crate::error::normalize_error(message);
+    serde_json::json!({"type":"error","message":error.message,"error":error})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn fallback_error_summaries_unwrap_each_provider_message() {
+        let source =
+            serde_json::json!({"error":{"message":"Invalid key.","type":"authentication_error"}});
+        let response = ApiError::from(crate::error::ShimError::AllFailed(vec![
+            format!("provider error (401): {source}"),
+            "stream error: Connection closed.".into(),
+        ]))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), 10000)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "all_failed");
+        assert_eq!(
+            body["error"]["message"],
+            "All providers failed: Invalid key.; Connection closed."
+        );
+    }
 }

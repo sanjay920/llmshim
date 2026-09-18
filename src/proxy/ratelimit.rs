@@ -669,11 +669,19 @@ pub fn estimate_request_tokens(req: &ChatRequest) -> u32 {
     }
     let input_tokens = (input_chars / 4) as u64;
     let output_tokens = req
-        .config
+        .provider_config
         .as_ref()
-        .and_then(|c| c.max_tokens)
+        .and_then(|config| {
+            config
+                .get("max_tokens")
+                .or_else(|| config.get("max_completion_tokens"))
+        })
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| req.config.as_ref().and_then(|c| c.max_tokens))
         .unwrap_or(DEFAULT_MAX_TOKENS_ESTIMATE);
-    (input_tokens + output_tokens).clamp(1, u32::MAX as u64) as u32
+    input_tokens
+        .saturating_add(output_tokens)
+        .clamp(1, u32::MAX as u64) as u32
 }
 
 /// Character length of a message `content` field, which may be a plain string

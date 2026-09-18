@@ -23,6 +23,9 @@
 
 - [Streaming](guides/streaming.md)
 - [Tool use](guides/tools.md)
+- [Tool schemas](guides/schemas.md)
+- [Capability shims](guides/capabilities.md)
+- [Prompt caching](guides/caching.md)
 - [Images and vision](guides/images.md)
 - [Reasoning controls](guides/reasoning.md)
 - [Fallback chains](guides/fallbacks.md)
@@ -31,6 +34,7 @@
 # Proxy and operations
 
 - [HTTP API](proxy/http-api.md)
+- [Native API endpoints](proxy/native-apis.md)
 - [Deploy the proxy safely](proxy/deployment.md)
 - [Scaling and rate limits](proxy/scaling.md)
 
@@ -44,4 +48,3 @@
 - [CLI reference](reference/cli.md)
 - [Errors and retries](reference/errors.md)
 - [API references](reference/api.md)
-
