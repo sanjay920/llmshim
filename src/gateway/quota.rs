@@ -184,6 +184,23 @@ impl Default for SpendCap {
     }
 }
 
+/// Why a budgeted request was refused.
+///
+/// The two are kept apart because the correct answer to the caller differs.
+/// `Exhausted` is a wait — the window resets and the same request succeeds.
+/// `Unpriceable` is a deployment fact: the catalog has no price for this target,
+/// so the cap cannot be enforced against it and no amount of retrying changes
+/// that. Collapsing them into one 429 would tell an operator to wait for a
+/// condition that never clears.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BudgetRefusal {
+    /// The window's spend has reached the cap. Carries the time until reset.
+    Exhausted(Duration),
+    /// The catalog cannot price this target, and the identity has not opted in
+    /// to running unpriced under a cap.
+    Unpriceable,
+}
+
 impl SpendCap {
     /// A cap governing this instance only.
     pub fn in_memory() -> Self {
@@ -206,28 +223,65 @@ impl SpendCap {
         )
     }
 
-    /// A no-op when the identity carries no budget. `Err(retry_after)` once the
-    /// window's spend has reached the cap, where the wait is the window reset.
-    pub async fn check(&self, identity: &crate::gateway::auth::Identity) -> Result<(), Duration> {
+    /// A no-op when the identity carries no budget.
+    ///
+    /// Two ways a budgeted request is refused, and they are not the same event:
+    /// [`BudgetRefusal::Exhausted`] is temporary and clears at the window reset;
+    /// [`BudgetRefusal::Unpriceable`] never clears on its own, because the
+    /// catalog has no price for the target and retrying changes nothing.
+    pub async fn check(
+        &self,
+        identity: &crate::gateway::auth::Identity,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), BudgetRefusal> {
         // `budget_usd: 0` freezes the key rather than unlimiting it: an
         // operator typing zero means "spend nothing", and the opposite reading
         // is the expensive one to be wrong about.
         let Some(budget) = identity.budget_usd else {
             return Ok(());
         };
+
+        // A response the catalog cannot price is spend the ledger never sees.
+        // Allowing it under a cap does not merely lose one charge — it makes the
+        // cap stop binding for every later request too, silently. Refusing is the
+        // only outcome that keeps "a budget is set" and "the budget is enforced"
+        // the same statement.
+        if !crate::cost::is_priceable(provider, model) && !identity.budget_allow_unpriced {
+            return Err(BudgetRefusal::Unpriceable);
+        }
+
         let window = Self::window(identity);
         if self.store.spent(&identity.tenant, window).await >= budget {
-            return Err(window_reset(window));
+            return Err(BudgetRefusal::Exhausted(window_reset(window)));
         }
         Ok(())
     }
 
+    /// Whether this request is about to run unpriced under a cap.
+    ///
+    /// True only when the operator opted in. Callers report it so an accepted
+    /// risk stays measurable instead of becoming an assumption.
+    #[must_use]
+    pub fn is_unpriced_under_cap(
+        identity: &crate::gateway::auth::Identity,
+        provider: &str,
+        model: &str,
+    ) -> bool {
+        identity.budget_usd.is_some() && !crate::cost::is_priceable(provider, model)
+    }
+
     /// Charge a completed response.
     ///
-    /// `None` means the catalog could not price the model. That spend is
+    /// `None` means the catalog could not price the model, and that spend is
     /// **not** recorded — charging zero would quietly let an unpriced model run
-    /// forever under a budget. Operators who need a hard cap must ensure their
-    /// models are priced; `cost_usd: null` in the response is the signal.
+    /// forever under a budget.
+    ///
+    /// This used to be the whole story, and it was a hole: the cap silently
+    /// stopped binding and the only signal was a `null` in a response body an
+    /// operator had to notice. [`SpendCap::check`] now refuses unpriceable
+    /// targets under a budget before they run, so reaching here with `None`
+    /// means the operator set `budget_allow_unpriced` and accepted it.
     pub async fn record(&self, identity: &crate::gateway::auth::Identity, usd: Option<f64>) {
         let Some(usd) = usd.filter(|u| *u > 0.0) else {
             return;
@@ -280,27 +334,115 @@ mod tests {
             tpm: None,
             budget_usd: Some(budget),
             budget_window_secs: Some(3600),
+            budget_allow_unpriced: false,
         }
     }
+
+    /// A target the catalog prices. Asserted rather than assumed: if the catalog
+    /// stops pricing it, these tests must fail loudly rather than quietly start
+    /// exercising the unpriceable path instead of the budget path.
+    const PRICED: (&str, &str) = ("anthropic", "claude-sonnet-4-6");
+
+    /// A model the catalog does not price. Deliberately implausible so it cannot
+    /// start being priced by a catalog refresh and quietly neuter these tests.
+    const UNPRICED: &str = "definitely-not-a-model-xyz";
 
     #[tokio::test]
     async fn a_budget_trips_once_the_window_is_spent() {
         let cap = SpendCap::in_memory();
         let acme = capped("acme", 1.0);
 
-        assert!(cap.check(&acme).await.is_ok(), "under budget admits");
-        cap.record(&acme, Some(0.75)).await;
-        assert!(cap.check(&acme).await.is_ok(), "still under budget");
-        cap.record(&acme, Some(0.30)).await;
-
-        let retry = cap.check(&acme).await.expect_err("over budget must reject");
         assert!(
-            retry > Duration::ZERO,
-            "rejection must say when to come back"
+            crate::cost::is_priceable(PRICED.0, PRICED.1),
+            "test fixture must be priced or this tests the wrong path"
         );
 
+        let (p, m) = PRICED;
+        assert!(cap.check(&acme, p, m).await.is_ok(), "under budget admits");
+        cap.record(&acme, Some(0.75)).await;
+        assert!(cap.check(&acme, p, m).await.is_ok(), "still under budget");
+        cap.record(&acme, Some(0.30)).await;
+
+        match cap.check(&acme, p, m).await {
+            Err(BudgetRefusal::Exhausted(retry)) => assert!(
+                retry > Duration::ZERO,
+                "rejection must say when to come back"
+            ),
+            other => panic!("over budget must reject as Exhausted, got {other:?}"),
+        }
+
         // Another tenant's ledger is its own.
-        assert!(cap.check(&capped("other", 1.0)).await.is_ok());
+        assert!(cap.check(&capped("other", 1.0), p, m).await.is_ok());
+    }
+
+    /// A target with no catalog price cannot be charged. Under a cap that is not
+    /// a lost charge, it is a cap that stops binding — so it must be refused, and
+    /// refused *differently* from being out of budget.
+    #[tokio::test]
+    async fn an_unpriceable_model_is_refused_under_a_budget() {
+        let cap = SpendCap::in_memory();
+        let acme = capped("acme", 100.0);
+        assert!(
+            !crate::cost::is_priceable("anthropic", UNPRICED),
+            "fixture must be unpriced or this tests nothing"
+        );
+
+        let refusal = cap
+            .check(&acme, "anthropic", UNPRICED)
+            .await
+            .expect_err("an unpriceable model under a cap must be refused");
+        assert_eq!(
+            refusal,
+            BudgetRefusal::Unpriceable,
+            "must not masquerade as Exhausted: retrying never clears this"
+        );
+
+        // The budget is nowhere near spent — the refusal is about priceability.
+        assert!(cap.check(&acme, PRICED.0, PRICED.1).await.is_ok());
+    }
+
+    /// Opting in is allowed, because a new model can outrun the catalog. It is
+    /// explicit, per-key, and defaults to off.
+    #[tokio::test]
+    async fn an_operator_can_opt_in_to_running_unpriced() {
+        let cap = SpendCap::in_memory();
+        let mut acme = capped("acme", 100.0);
+        acme.budget_allow_unpriced = true;
+
+        assert!(
+            cap.check(&acme, "anthropic", UNPRICED).await.is_ok(),
+            "explicit opt-in must admit"
+        );
+        assert!(
+            SpendCap::is_unpriced_under_cap(&acme, "anthropic", UNPRICED),
+            "and the caller must be able to see it, so the hole stays measurable"
+        );
+        assert!(
+            !SpendCap::is_unpriced_under_cap(&acme, PRICED.0, PRICED.1),
+            "a priced target is not a hole"
+        );
+    }
+
+    /// With no cap there is nothing to enforce, so priceability is irrelevant.
+    /// Refusing here would break every unbudgeted key the moment a model is new.
+    #[tokio::test]
+    async fn without_a_budget_an_unpriceable_model_is_fine() {
+        let cap = SpendCap::in_memory();
+        let free = crate::gateway::auth::Identity {
+            tenant: "free".into(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: None,
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+        };
+        assert!(cap.check(&free, "anthropic", UNPRICED).await.is_ok());
+        assert!(!SpendCap::is_unpriced_under_cap(
+            &free,
+            "anthropic",
+            UNPRICED
+        ));
     }
 
     #[tokio::test]
@@ -308,7 +450,10 @@ mod tests {
         let cap = SpendCap::in_memory();
         let frozen = capped("frozen", 0.0);
         assert!(
-            cap.check(&frozen).await.is_err(),
+            matches!(
+                cap.check(&frozen, PRICED.0, PRICED.1).await,
+                Err(BudgetRefusal::Exhausted(_))
+            ),
             "budget_usd: 0 must mean spend nothing, not spend anything"
         );
     }
@@ -323,10 +468,11 @@ mod tests {
             tpm: None,
             budget_usd: None,
             budget_window_secs: None,
+            budget_allow_unpriced: false,
         };
         for _ in 0..100 {
             cap.record(&uncapped, Some(1_000.0)).await;
-            assert!(cap.check(&uncapped).await.is_ok());
+            assert!(cap.check(&uncapped, PRICED.0, PRICED.1).await.is_ok());
         }
 
         // An unpriceable response cannot be charged; it must not read as free
@@ -337,7 +483,7 @@ mod tests {
             cap.store.spent("acme", Duration::from_secs(3600)).await,
             0.0
         );
-        assert!(cap.check(&acme).await.is_ok());
+        assert!(cap.check(&acme, PRICED.0, PRICED.1).await.is_ok());
     }
 
     #[tokio::test(start_paused = true)]

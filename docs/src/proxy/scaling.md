@@ -107,9 +107,30 @@ buckets. A gateway key's identity may carry `budget_usd` and an optional
 ```
 
 Cost is only knowable after a response, so the cap is checked before dispatch
-and charged after: one in-flight request can overshoot. A response the catalog
-cannot price (`cost_usd: null`) is **not** charged — recording zero would let an
-unpriced model run forever under a budget, so a hard cap requires priced models.
+and charged after: one in-flight request can overshoot.
+
+A response the catalog cannot price is **not** charged — recording zero would let
+an unpriced model run forever under a budget. So that a cap cannot silently stop
+binding, a request whose target has **no catalog price is refused before it runs**
+when a budget is set:
+
+```
+400 {"error":{"code":"unpriceable_under_budget","param":"model", …}}
+```
+
+It is deliberately not a `429`: retrying never clears it. Three ways forward —
+use a priced model, add a local price override in the catalog, or accept the risk
+explicitly per key:
+
+```json
+{"sk-example": {"tenant": "acme", "budget_usd": 100, "budget_allow_unpriced": true}}
+```
+
+`budget_allow_unpriced` defaults to `false`. With it set, those requests run and
+are not charged, and each one logs a warning and increments
+`llmshim_gateway_unpriced_under_cap_total{provider,model}` — a non-zero counter
+means the budget is not binding for that target. An accepted risk should stay
+measurable rather than become an assumption.
 
 ## One replica or a coordinated fleet
 
