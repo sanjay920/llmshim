@@ -17,6 +17,10 @@ pub const REQUESTS: &str = "llmshim_gateway_requests_total";
 pub const DISPATCHED: &str = "llmshim_gateway_dispatched_total";
 /// Requests that did not dispatch (labels: provider, reason).
 pub const REJECTED: &str = "llmshim_gateway_rejected_total";
+
+/// Requests permitted to run without a price while a spend cap is configured.
+/// Non-zero means a budget is not binding for that provider/model.
+pub const UNPRICED_UNDER_CAP: &str = "llmshim_gateway_unpriced_under_cap_total";
 /// In-flight upstream calls (gauge, label: provider).
 pub const INFLIGHT: &str = "llmshim_gateway_inflight";
 /// Time a job waited in the queue before dispatch (histogram, label: provider).

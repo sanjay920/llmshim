@@ -80,6 +80,14 @@ pub fn cost_usd(provider: &str, model: &str, usage: &Value) -> Option<f64> {
     price(usage, &for_target(provider, model)?)
 }
 
+/// Whether this target can be priced at all, asked *before* the request runs.
+///
+/// Pricing after the fact cannot enforce a budget: by then the money is spent.
+/// A cap therefore needs this question answered up front.
+pub fn is_priceable(provider: &str, model: &str) -> bool {
+    for_target(provider, model).is_some()
+}
+
 /// Read a cost already stamped onto a normalized usage object. A stamped
 /// `null` and an unstamped body both mean "not known".
 pub fn stamped(usage: &Value) -> Option<f64> {
