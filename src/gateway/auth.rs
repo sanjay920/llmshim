@@ -35,6 +35,15 @@ pub struct Identity {
     /// Window the cap applies to, in seconds. Defaults to one day.
     #[serde(default)]
     pub budget_window_secs: Option<u64>,
+    /// Permit requests the catalog cannot price while a budget is set.
+    ///
+    /// Defaults to **false**, which refuses them. An unpriced response cannot be
+    /// charged, so under a cap it is spend the ledger never sees — the budget
+    /// silently stops binding and nothing says so. Setting this to `true` is an
+    /// operator accepting that risk knowingly; the requests are still counted and
+    /// reported so the hole is visible rather than assumed absent.
+    #[serde(default)]
+    pub budget_allow_unpriced: bool,
 }
 
 /// Authentication failure — both map to HTTP 401.
@@ -103,6 +112,7 @@ impl KeyStore {
                 tpm: None,
                 budget_usd: None,
                 budget_window_secs: None,
+                budget_allow_unpriced: false,
             }),
             KeyStore::Enforced(map) => {
                 let key = bearer_token(headers).ok_or(AuthError::MissingKey)?;
@@ -171,6 +181,7 @@ mod tests {
                 tpm: None,
                 budget_usd: None,
                 budget_window_secs: None,
+                budget_allow_unpriced: false,
             },
         );
         let store = KeyStore::enforced(keys);
