@@ -7,6 +7,7 @@
 //! 2. `~/.llmshim/config.toml`
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// The full config file structure.
@@ -17,6 +18,34 @@ pub struct Config {
 
     #[serde(default)]
     pub proxy: ProxyConfig,
+
+    /// Named routes, addressed as `route/<name>` in a request's `model`.
+    #[serde(default)]
+    pub routes: BTreeMap<String, Route>,
+}
+
+/// A caller-named route: one model plus request settings.
+///
+/// The name is arbitrary and llmshim never interprets it. A harness is free to
+/// call a route `compaction`, `advisor` or `cheap`; llmshim only knows the name
+/// maps to a model. Teaching the shim a fixed vocabulary of roles would pull
+/// harness concepts below the abstraction they belong to — the harness decides
+/// what `compaction` means, llmshim provides the mechanism.
+///
+/// ```toml
+/// [routes.compaction]
+/// model = "anthropic/claude-haiku-4-5-20251001"
+/// reasoning_effort = "low"
+/// max_tokens = 4096
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Route {
+    /// The model this route resolves to, in any spelling the router accepts.
+    pub model: String,
+    /// Request settings applied when the request does not set them itself, so a
+    /// per-request value always wins over the route's default.
+    #[serde(flatten, default)]
+    pub settings: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -73,7 +102,17 @@ pub fn load() -> Config {
         return Config::default();
     }
     match std::fs::read_to_string(&path) {
-        Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+        // A malformed file must be loud. Falling back silently would drop the
+        // caller's API keys as well as the section they mistyped, and surface
+        // only as "unknown provider" with nothing pointing at the real cause.
+        Ok(contents) => toml::from_str(&contents).unwrap_or_else(|error| {
+            eprintln!(
+                "warning: {} is not valid TOML and was ignored ({error}); \
+                 API keys and routes from it are not in effect",
+                path.display()
+            );
+            Config::default()
+        }),
         Err(_) => Config::default(),
     }
 }

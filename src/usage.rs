@@ -9,8 +9,86 @@ fn counter(usage: &Value, paths: &[&str]) -> u64 {
         .unwrap_or(0)
 }
 
+/// One cache-read dialect: where the count lives, which field carries the prompt
+/// total it belongs to, and whether that total already counts it.
+///
+/// The dialects disagree and the disagreement is load-bearing for pricing.
+/// Anthropic's `input_tokens` excludes `cache_read_input_tokens`; the OpenAI
+/// Responses, Chat Completions and Gemini totals all include their cached
+/// counts. Reading the convention off the field that actually matched keeps the
+/// decision on wire evidence rather than a provider-name table.
+struct CacheReadDialect {
+    path: &'static str,
+    prompt: &'static str,
+    prompt_includes_read: bool,
+}
+
+const CACHE_READ_DIALECTS: &[CacheReadDialect] = &[
+    // An already-normalized body re-entering (OpenRouter / OpenAI-compatible
+    // servers normalize their own Chat Completions bodies).
+    CacheReadDialect {
+        path: "/cache_read_tokens",
+        prompt: "/prompt_tokens",
+        prompt_includes_read: true,
+    },
+    CacheReadDialect {
+        path: "/cache_read_input_tokens",
+        prompt: "/input_tokens",
+        prompt_includes_read: false,
+    },
+    CacheReadDialect {
+        path: "/input_tokens_details/cached_tokens",
+        prompt: "/input_tokens",
+        prompt_includes_read: true,
+    },
+    CacheReadDialect {
+        path: "/prompt_tokens_details/cached_tokens",
+        prompt: "/prompt_tokens",
+        prompt_includes_read: true,
+    },
+    CacheReadDialect {
+        path: "/cachedContentTokenCount",
+        prompt: "/promptTokenCount",
+        prompt_includes_read: true,
+    },
+    CacheReadDialect {
+        path: "/prompt_cache_hit_tokens",
+        prompt: "/prompt_tokens",
+        prompt_includes_read: true,
+    },
+];
+
+/// Prompt totals to fall back on when no cache-read field was reported at all.
+/// With a zero cache read the two conventions agree, so the order is arbitrary.
+const PROMPT_TOTALS: &[&str] = &["/input_tokens", "/prompt_tokens", "/promptTokenCount"];
+
+/// Tokens billed at the full input rate: the prompt total minus whatever cache
+/// read the provider already counted inside it. Never negative, and never
+/// silently dialect-guessed — an unreported cache read leaves the prompt whole.
+fn uncached_input(native: &Value) -> u64 {
+    match CACHE_READ_DIALECTS
+        .iter()
+        .find_map(|d| Some((d, native.pointer(d.path)?.as_u64()?)))
+    {
+        Some((dialect, read)) => {
+            let prompt = counter(native, &[dialect.prompt]);
+            if dialect.prompt_includes_read {
+                prompt.saturating_sub(read)
+            } else {
+                prompt
+            }
+        }
+        None => counter(native, PROMPT_TOTALS),
+    }
+}
+
 /// Add normalized read/write counts without changing other token semantics.
 /// Zero means no cache tokens were reported. It is not a pricing assertion.
+///
+/// `uncached_input_tokens` is added alongside them so cost accounting has one
+/// unambiguous input count: the providers disagree on whether their prompt
+/// total already includes the cache read, and only the transport boundary still
+/// knows which convention the body used.
 pub fn normalize_cache(native: &Value, normalized: &mut Value) {
     if !normalized.is_object() {
         *normalized = json!({});
@@ -34,6 +112,7 @@ pub fn normalize_cache(native: &Value, normalized: &mut Value) {
             "/prompt_tokens_details/cache_write_tokens",
         ]
     ));
+    normalized["uncached_input_tokens"] = json!(uncached_input(native));
 }
 
 pub(crate) fn normalize_response(response: &mut Value) {

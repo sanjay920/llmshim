@@ -118,6 +118,9 @@ pub struct Usage {
     pub total_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// USD charged for this response. `null` means the catalog carries no price
+    /// for the model — it never means free. See `llmshim::cost`.
+    pub cost_usd: Option<f64>,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -170,9 +173,35 @@ pub enum StreamEvent {
 // Models endpoint
 // ============================================================
 
+/// `GET /v1/models` answers two audiences from one body.
+///
+/// An OpenAI SDK reads `object` + `data` and ignores everything else, so
+/// `client.models.list()` works against llmshim unmodified. The bundled
+/// Python/TS/Go/Ruby clients read `models`, which is byte-for-byte what they
+/// read before. There is no second path to split on — both audiences issue the
+/// same `GET /v1/models` — so the union is the split.
 #[derive(Debug, Serialize)]
 pub struct ModelsResponse {
+    /// Always `"list"`, per the OpenAI list envelope.
+    pub object: &'static str,
+    /// OpenAI-shaped entries.
+    pub data: Vec<ModelObject>,
+    /// llmshim's own shape. Unchanged; existing clients keep reading this.
     pub models: Vec<ModelEntry>,
+}
+
+/// One entry in the OpenAI `data` array. `id` is the routing id llmshim
+/// accepts back as `model`, so a listed id is directly requestable.
+#[derive(Debug, Serialize)]
+pub struct ModelObject {
+    pub id: String,
+    /// Always `"model"`.
+    pub object: &'static str,
+    /// Release date as a Unix timestamp, or `0` when the catalog has none.
+    /// OpenAI clients type this as an integer, so it is never null.
+    pub created: i64,
+    /// The provider serving the model.
+    pub owned_by: String,
 }
 
 #[derive(Debug, Serialize)]

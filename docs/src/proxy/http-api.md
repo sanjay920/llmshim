@@ -146,15 +146,27 @@ consumption patterns, see [Streaming](../guides/streaming.md).
 
 ## Models and health
 
-`GET /v1/models` returns the registry entries for configured providers:
+`GET /v1/models` returns the registry entries for configured providers, in two
+shapes from one body:
 
 ```json
 {
+  "object": "list",
+  "data": [
+    {"id": "openai/gpt-5.6-terra", "object": "model", "created": 0, "owned_by": "openai"}
+  ],
   "models": [
     {"id": "openai/gpt-5.6-terra", "provider": "openai", "name": "gpt-5.6-terra"}
   ]
 }
 ```
+
+`object` + `data` is the OpenAI list envelope, so an OpenAI SDK's
+`client.models.list()` works against llmshim unmodified. `models` is llmshim's
+own shape and is unchanged. Both audiences issue the same `GET /v1/models`, so
+there is no second path to split on. A `data[].id` is the routing id and can be
+sent straight back as `model`; `created` is the catalog release date as a Unix
+timestamp, or `0` when unknown.
 
 This is discovery, not an allowlist: an arbitrary provider model ID can still
 be routed explicitly. See [Model discovery](../reference/models.md).

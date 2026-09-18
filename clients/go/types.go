@@ -177,6 +177,9 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+	// CostUSD is the USD charged for this response. A nil pointer means the
+	// server could not price the model — it never means free.
+	CostUSD *float64 `json:"cost_usd,omitempty"`
 }
 
 // StreamEventType enumerates the SSE event types.
@@ -226,6 +229,8 @@ type StreamEvent struct {
 	TotalTokens      int `json:"total_tokens,omitempty"`
 	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+	// CostUSD is nil when the server could not price the model, never 0.
+	CostUSD *float64 `json:"cost_usd,omitempty"`
 
 	// error
 	Message      string         `json:"message,omitempty"`

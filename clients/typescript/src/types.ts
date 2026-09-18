@@ -159,6 +159,11 @@ export interface Usage {
   /** Cache input tokens (absent on servers older than 0.4). */
   cache_read_tokens?: number;
   cache_write_tokens?: number;
+  /**
+   * USD charged for this response. `null` means the server could not price the
+   * model — it never means free. Absent on servers older than 0.4.
+   */
+  cost_usd?: number | null;
 }
 
 /** The assistant message inside a ChatResponse. */
@@ -226,6 +231,8 @@ export interface UsageEvent {
   /** Cache input tokens (absent on servers older than 0.4). */
   cache_read_tokens?: number;
   cache_write_tokens?: number;
+  /** `null` when the server could not price the model, never `0`. */
+  cost_usd?: number | null;
 }
 
 /** Terminal event signalling the stream is complete. */
