@@ -106,11 +106,18 @@ buckets. A gateway key's identity may carry `budget_usd` and an optional
 {"sk-example": {"tenant": "acme", "tier": 1, "budget_usd": 100, "budget_window_secs": 86400}}
 ```
 
-Cost is only knowable after a response, so the cap is checked before dispatch
-and charged after: one in-flight request can overshoot.
+Cost is only knowable after a response, so the cap is checked before dispatch and
+charged after. Everything admitted between the last charge and the next check
+passes, so the overshoot bound is **admitted concurrency × the most expensive
+request**, multiplied again across replicas that have not yet shared their
+ledger. Size a cap with that headroom in mind rather than as a hard ceiling.
 
-A response the catalog cannot price is **not** charged — recording zero would let
-an unpriced model run forever under a budget. So that a cap cannot silently stop
+A response the catalog cannot price at all is **not** charged — recording zero
+would let an unpriced model run forever under a budget. A model that prices only
+*some* token classes is charged at its highest published rate for the rest, so a
+partial price bounds the charge from above instead of voiding it: 2,537 of the
+7,461 priced models in the catalog publish no `cache_read` rate, and voiding
+those would have reopened this same hole one layer down. So that a cap cannot silently stop
 binding, a request whose target has **no catalog price is refused before it runs**
 when a budget is set:
 
