@@ -325,15 +325,55 @@ impl GatewayState {
         &self,
         identity: &crate::gateway::auth::Identity,
         provider: &str,
+        model: &str,
     ) -> Result<(), ApiError> {
-        match self.spend.check(identity).await {
-            Ok(()) => Ok(()),
-            Err(retry) => {
+        use crate::gateway::quota::BudgetRefusal;
+        match self.spend.check(identity, provider, model).await {
+            Ok(()) => {
+                // An operator who opted in still gets told, every time. An
+                // accepted risk that stops being visible becomes an assumption.
+                if crate::gateway::quota::SpendCap::is_unpriced_under_cap(identity, provider, model)
+                {
+                    crate::gateway::metrics::incr(
+                        crate::gateway::metrics::UNPRICED_UNDER_CAP,
+                        &[("provider", provider), ("model", model)],
+                    );
+                    eprintln!(
+                        "gateway: tenant {} running {provider}/{model} unpriced under a spend \
+                         cap; this spend is NOT charged against the budget \
+                         (budget_allow_unpriced is set)",
+                        identity.tenant
+                    );
+                }
+                Ok(())
+            }
+            Err(BudgetRefusal::Exhausted(retry)) => {
                 crate::gateway::metrics::incr(
                     crate::gateway::metrics::REJECTED,
                     &[("provider", provider), ("reason", "tenant_budget")],
                 );
                 Err(ApiError::RateLimited(retry))
+            }
+            Err(BudgetRefusal::Unpriceable) => {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::REJECTED,
+                    &[
+                        ("provider", provider),
+                        ("reason", "unpriceable_under_budget"),
+                    ],
+                );
+                // Not a 429: retrying never clears this. The catalog has no
+                // price for the target, so the cap cannot be enforced against it.
+                Err(ApiError::Shim(crate::error::ShimError::ProviderError {
+                    status: 400,
+                    body: format!(
+                        "{{\"error\":{{\"message\":\"no catalog price for '{provider}/{model}', \
+                         so it cannot be charged against this key's spend budget. Use a priced \
+                         model, add a local price override, or set budget_allow_unpriced on the \
+                         key to run it uncharged.\",\"type\":\"invalid_request_error\",\
+                         \"param\":\"model\",\"code\":\"unpriceable_under_budget\"}}}}"
+                    ),
+                }))
             }
         }
     }
@@ -410,7 +450,10 @@ async fn chat(
         .map(str::to_string);
     let (provider_name, gw, identity) = build_request(&state, &headers, &req)?;
     state.enforce_quota(&identity, &provider_name, gw.permits)?;
-    state.enforce_budget(&identity, &provider_name).await?;
+    let (_, budget_model) = state.router.resolve(&req.model)?;
+    state
+        .enforce_budget(&identity, &provider_name, &budget_model)
+        .await?;
 
     // Retry-safety: a repeated Idempotency-Key returns the first result.
     if let Some(key) = &idem_key {
@@ -461,7 +504,14 @@ async fn chat_stream_inner(
     if let Err(e) = state.enforce_quota(&identity, &provider_name, gw.permits) {
         return e.into_response();
     }
-    if let Err(e) = state.enforce_budget(&identity, &provider_name).await {
+    let budget_model = match state.router.resolve(&req.model) {
+        Ok((_, m)) => m,
+        Err(e) => return ApiError::from(e).into_response(),
+    };
+    if let Err(e) = state
+        .enforce_budget(&identity, &provider_name, &budget_model)
+        .await
+    {
         return e.into_response();
     }
 
@@ -673,6 +723,7 @@ mod native_tests {
                 tpm: None,
                 budget_usd: None,
                 budget_window_secs: None,
+                budget_allow_unpriced: false,
             },
         )]);
         let state = Arc::new(GatewayState {
