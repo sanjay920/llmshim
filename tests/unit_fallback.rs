@@ -122,3 +122,83 @@ fn fallback_config_custom_backoff() {
     let config = FallbackConfig::new(vec!["a".into()]).initial_backoff(Duration::from_secs(5));
     assert_eq!(config.initial_backoff, Duration::from_secs(5));
 }
+
+/// A chain must stop dialling a provider whose circuit is open, rather than
+/// spending its retry budget on a target it already knows is dead. The proof is
+/// that the dead upstream sees only the first call's attempts and no more.
+#[tokio::test]
+async fn a_chain_skips_a_provider_with_an_open_circuit() {
+    use llmshim::breaker::{BreakerConfig, ProviderBreaker};
+    use llmshim::providers::openai_compat::OpenAiCompatible;
+    use std::time::Duration;
+
+    // Default chain retries (2, so three attempts per model) with a breaker
+    // that trips on the first failure: the dead upstream must see exactly one
+    // chain attempt's worth of transport retries and nothing more. The shared
+    // HTTP client applies its own reactive retries underneath, so derive the
+    // expected request count rather than hard-coding it.
+    let config = FallbackConfig::new(vec!["dead/m".into(), "alive/m".into()])
+        .initial_backoff(Duration::from_millis(1));
+    assert_eq!(config.max_retries, 2, "this test relies on chain retries");
+    let transport_attempts = 1 + std::env::var("LLMSHIM_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(3);
+
+    let mut dead = mockito::Server::new_async().await;
+    let mut alive = mockito::Server::new_async().await;
+    let down = dead
+        .mock("POST", "/chat/completions")
+        .with_status(503)
+        .with_body("upstream down")
+        .expect(transport_attempts)
+        .create_async()
+        .await;
+    let up = alive
+        .mock("POST", "/chat/completions")
+        .with_body(
+            serde_json::json!({
+                "id": "r", "model": "good",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {}
+            })
+            .to_string(),
+        )
+        .expect(2)
+        .create_async()
+        .await;
+
+    let router = llmshim::router::Router::new()
+        .register(
+            "dead",
+            Box::new(OpenAiCompatible::new("dead", dead.url(), None)),
+        )
+        .register(
+            "alive",
+            Box::new(OpenAiCompatible::new("alive", alive.url(), None)),
+        )
+        .with_breaker(std::sync::Arc::new(ProviderBreaker::with_config(
+            BreakerConfig {
+                window: Duration::from_secs(60),
+                trip_threshold: 1,
+                cooldown: Duration::from_secs(300),
+            },
+        )));
+
+    let request = serde_json::json!({
+        "model": "dead/m",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+
+    for _ in 0..2 {
+        let result = llmshim::completion_with_fallback(&router, &request, &config, None).await;
+        assert!(
+            result.is_ok(),
+            "the chain must still succeed via the healthy provider"
+        );
+    }
+
+    // This expectation fails if the second call dialled the dead provider again.
+    down.assert_async().await;
+    up.assert_async().await;
+}

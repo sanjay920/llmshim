@@ -710,6 +710,35 @@ fn redis_err(e: &dyn std::fmt::Display) -> GatewayError {
     GatewayError::Upstream(format!("distributed gateway: {e}"))
 }
 
+/// Fleet-wide spend ledger: one counter per `(tenant, window)` in the same
+/// Redis the queue uses, so a dollar cap is global rather than per replica.
+/// A Redis failure loses the charge rather than the request — the same
+/// fail-open posture the shared rate limiter takes.
+#[async_trait::async_trait]
+impl crate::gateway::quota::SpendStore for DistributedGateway {
+    async fn spent(&self, tenant: &str, window: Duration) -> f64 {
+        let mut conn = self.conn.clone();
+        let raw: Option<String> = conn.get(spend_key(tenant, window)).await.unwrap_or(None);
+        raw.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0)
+    }
+
+    async fn record(&self, tenant: &str, window: Duration, usd: f64) {
+        let key = spend_key(tenant, window);
+        let mut conn = self.conn.clone();
+        let _: Result<f64, _> = conn.incr(&key, usd).await;
+        // Two windows of slack so a late charge still lands on its own window.
+        let ttl = window.as_millis().saturating_mul(2).min(u64::MAX as u128) as u64;
+        let _: Result<(), _> = conn.pexpire(&key, ttl as i64).await;
+    }
+}
+
+fn spend_key(tenant: &str, window: Duration) -> String {
+    format!(
+        "llmshim:spend:{tenant}:{}",
+        crate::gateway::quota::window_index(window)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

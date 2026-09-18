@@ -46,6 +46,19 @@ Every response and usage event reports `cache_read_tokens` and
 add repeated streaming snapshots together. Zero means no cache tokens were
 reported, not that the request was free.
 
+They are joined by `uncached_input_tokens` — the prompt minus whatever cache
+read the provider already counted inside it. Providers disagree on that:
+Anthropic's `input_tokens` excludes the cache read, while the OpenAI Responses,
+Chat Completions and Gemini prompt totals include it. llmshim resolves the
+disagreement at the transport boundary so one counter means one thing.
+
+`cost_usd` is the USD charged for the response: uncached input, output, cache
+reads and cache writes each at their own catalog rate, so a cached prompt is
+never billed twice. **`null` means the catalog carries no price for the model —
+it never means free.** A model priced for input but not for the cache reads a
+response actually used also yields `null`, rather than a partial sum that would
+read as a complete one.
+
 `ProviderRequest::can_continue_from` compares endpoint, credential headers,
 settings and the full prior input prefix. `include`, `store`, `reasoning`, tool
 schemas and other settings participate. The library sends full stateless

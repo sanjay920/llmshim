@@ -729,6 +729,9 @@ pub(crate) fn add_usage(total: &mut Value, response: &Value) {
         "total_tokens",
         "cache_read_tokens",
         "cache_write_tokens",
+        // Cost is charged on this, so a repaired answer that drops it would be
+        // priced on the whole prompt and double-charge its cached input.
+        "uncached_input_tokens",
         "reasoning_tokens",
     ] {
         if let Some(count) = response["usage"][key].as_u64() {

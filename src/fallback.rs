@@ -78,9 +78,17 @@ pub async fn completion_with_fallback(
     let client = &*SHARED_CLIENT;
 
     for model_str in &models {
-        // Build request with this model
+        // Build request with this model. A named route expands to its model and
+        // settings here, so a chain entry may itself be a `route/<name>`.
         let mut req = request.clone();
         req["model"] = Value::String(model_str.clone());
+        let req = match router.expand_route(&req) {
+            Ok(expanded) => expanded.into_owned(),
+            Err(e) => {
+                errors.push(format!("{}: {}", model_str, e));
+                continue;
+            }
+        };
 
         let (provider, model) = match router.resolve(model_str) {
             Ok(r) => r,
@@ -93,10 +101,28 @@ pub async fn completion_with_fallback(
         let mut backoff = config.initial_backoff;
 
         for attempt in 0..=config.max_retries {
+            // Provider health, not rate-limit backoff. Checked per attempt, not
+            // once per chain entry: the attempt that opens a circuit is usually
+            // this loop's own, and continuing to retry past it is exactly the
+            // "retrying into a known-dead target" the breaker exists to stop.
+            if !router.breaker().admit(provider.name()).await {
+                errors.push(format!(
+                    "{}: circuit open for provider {}",
+                    model_str,
+                    provider.name()
+                ));
+                break; // move to next model
+            }
+
             let timer = RequestTimer::start();
             // Keep OAuth preparation, SSE-only providers, reasoning provenance,
             // and tool normalization identical to an ordinary completion.
-            match client.completion(provider, &model, &req).await {
+            let outcome = client.completion(provider, &model, &req).await;
+            router
+                .breaker()
+                .observe(provider.name(), outcome.as_ref().map(|_| ()))
+                .await;
+            match outcome {
                 Ok(result) => {
                     if let Some(logger) = logger {
                         logger.log(&LogEntry::from_response(

@@ -28,6 +28,13 @@ pub struct Identity {
     pub rpm: Option<u32>,
     #[serde(default)]
     pub tpm: Option<u32>,
+    /// Optional USD spend cap per window, enforced by
+    /// [`crate::gateway::quota::SpendCap`] alongside the rate buckets.
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
+    /// Window the cap applies to, in seconds. Defaults to one day.
+    #[serde(default)]
+    pub budget_window_secs: Option<u64>,
 }
 
 /// Authentication failure — both map to HTTP 401.
@@ -94,6 +101,8 @@ impl KeyStore {
                 tier: header_tier(headers),
                 rpm: None,
                 tpm: None,
+                budget_usd: None,
+                budget_window_secs: None,
             }),
             KeyStore::Enforced(map) => {
                 let key = bearer_token(headers).ok_or(AuthError::MissingKey)?;
@@ -160,6 +169,8 @@ mod tests {
                 tier: 5,
                 rpm: Some(100),
                 tpm: None,
+                budget_usd: None,
+                budget_window_secs: None,
             },
         );
         let store = KeyStore::enforced(keys);
@@ -195,5 +206,11 @@ mod tests {
         assert_eq!(full.tier, 3);
         assert_eq!(full.rpm, Some(50));
         assert_eq!(full.tpm, Some(9000));
+        assert!(id.budget_usd.is_none(), "no budget unless the key sets one");
+        let capped: Identity =
+            serde_json::from_str(r#"{"tenant":"t","budget_usd":25.0,"budget_window_secs":3600}"#)
+                .unwrap();
+        assert_eq!(capped.budget_usd, Some(25.0));
+        assert_eq!(capped.budget_window_secs, Some(3600));
     }
 }

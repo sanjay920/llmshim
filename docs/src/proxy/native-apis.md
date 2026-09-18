@@ -33,7 +33,18 @@ its standard message/function shapes and `response_format`; JSON-object mode als
 gets object validation. Generation fields supported by the destination retain
 their ordinary adapter behavior. The facade supports one completion (`n:1`) and
 custom function tools; it rejects provider-hosted tool definitions rather than
-turning them into client-executed functions. Provider-specific endpoints such as
+turning them into client-executed functions. `n > 1` is refused rather than
+emulated — the OpenAI backend is the Responses API, which has no `n`, and
+neither do Anthropic Messages or Gemini; fanning out N requests would change
+the cost, rate-limit footprint and cache behavior of what was asked for. The
+refusal is a properly shaped OpenAI error naming the parameter:
+
+```json
+{"error": {"message": "Unsupported value: 'n' must be 1. …",
+           "type": "invalid_request_error", "param": "n",
+           "code": "unsupported_parameter"}}
+```
+ Provider-specific endpoints such as
 batches, token counting, uploads and Responses are not served by these aliases.
 
 With `stream:true`, text arrives incrementally. Chat Completions emits

@@ -1,3 +1,4 @@
+pub mod breaker;
 pub mod cache;
 pub mod client;
 pub mod schema;
@@ -5,6 +6,7 @@ pub mod shim;
 /// Offline-first model catalog, also available as the standalone `llmshim-catalog` crate.
 pub use llmshim_catalog as catalog;
 pub mod config;
+pub mod cost;
 pub mod env;
 pub mod error;
 pub mod fallback;
@@ -68,6 +70,9 @@ pub async fn completion_with_logger(
     request: &Value,
     logger: Option<&Logger>,
 ) -> Result<Value> {
+    // A named route resolves to its model and settings before dispatch.
+    let request = router.expand_route(request)?;
+    let request = request.as_ref();
     let model_str = request
         .get("model")
         .and_then(|m| m.as_str())
@@ -77,7 +82,15 @@ pub async fn completion_with_logger(
     let client = &*SHARED_CLIENT;
     let timer = RequestTimer::start();
 
-    match client.completion(provider, &model, request).await {
+    // Ordinary traffic feeds provider health too, so a chain's first fallback
+    // decision is not the first thing that ever noticed a provider is down.
+    let result = client.completion(provider, &model, request).await;
+    router
+        .breaker()
+        .observe(provider.name(), result.as_ref().map(|_| ()))
+        .await;
+
+    match result {
         Ok(resp) => {
             if let Some(logger) = logger {
                 logger.log(&LogEntry::from_response(
@@ -108,12 +121,24 @@ pub async fn stream(
     router: &Router,
     request: &Value,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    let request = router.expand_route(request)?;
+    let request = request.as_ref();
     let model_str = request
         .get("model")
         .and_then(|m| m.as_str())
         .ok_or(error::ShimError::MissingModel)?;
 
     let (provider, model) = router.resolve_owned(model_str)?;
+    // Observed but not gated: a single-target call has no alternative, so
+    // refusing here would only convert an upstream failure into a local one.
+    // The breaker refuses where there is somewhere else to go — `fallback.rs`.
     let client = &*SHARED_CLIENT;
-    client.stream_owned(provider, &model, request).await
+    let opened = client.stream_owned(provider.clone(), &model, request).await;
+    // A stream's health verdict is whether it opened; per-chunk failures are
+    // the transport's business, not the breaker's.
+    router
+        .breaker()
+        .observe(provider.name(), opened.as_ref().map(|_| ()))
+        .await;
+    opened
 }

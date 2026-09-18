@@ -11,7 +11,7 @@ the module stays compatible with Python 3.9 (no ``typing.NotRequired``).
 
 from __future__ import annotations
 
-from typing import Any, List, Literal, TypedDict, Union
+from typing import Any, List, Literal, Optional, TypedDict, Union
 
 __all__ = [
     "Role",
@@ -190,6 +190,9 @@ class Usage(TypedDict, total=False):
     total_tokens: int
     cache_read_tokens: int
     cache_write_tokens: int
+    #: USD charged for this response. ``None`` means the server could not price
+    #: the model — it never means free.
+    cost_usd: Optional[float]
 
 
 class _ResponseMessageBase(TypedDict):
@@ -285,6 +288,8 @@ class UsageEvent(TypedDict, total=False):
     total_tokens: int
     cache_read_tokens: int
     cache_write_tokens: int
+    #: ``None`` when the server could not price the model, never ``0.0``.
+    cost_usd: Optional[float]
 
 
 class _DoneBase(TypedDict):
