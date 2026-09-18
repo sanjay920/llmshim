@@ -29,6 +29,27 @@ fn charge(tokens: u64, rate: Option<f64>) -> Option<f64> {
     Some(tokens as f64 * rate? / PER_MILLION)
 }
 
+/// The highest rate this model publishes, used where a class has none of its own.
+///
+/// Catalogs price partially and often: **2,537 of 7,461 priced models in the
+/// vendored snapshot carry no `cache_read` rate and 5,892 no `cache_write`**,
+/// including `gpt-5-pro` and `o3-pro`, priced `{input, output}` only. Returning
+/// `None` for those made the whole response unpriceable the moment it reported a
+/// cached token — and a discarded charge is a spend cap that silently stops
+/// binding, which is the failure this crate exists to prevent.
+///
+/// Substituting the highest published rate can only over-estimate, never under.
+/// For a cap that is the safe direction: it spends a budget slightly early, where
+/// under-estimating spends it forever.
+fn highest_published_rate(cost: &Cost) -> Option<f64> {
+    [cost.input, cost.output, cost.cache_read, cost.cache_write]
+        .into_iter()
+        .flatten()
+        .fold(None, |best: Option<f64>, rate| {
+            Some(best.map_or(rate, |b| b.max(rate)))
+        })
+}
+
 /// Price one normalized usage object.
 ///
 /// Input is charged on `uncached_input_tokens` — the prompt minus whatever
@@ -53,11 +74,17 @@ pub fn price(usage: &Value, cost: &Cost) -> Option<f64> {
         return None;
     }
 
+    // A class the model does not price falls back to its highest published rate
+    // rather than voiding the total. See `highest_published_rate`: the result is
+    // an upper bound, which is the only safe direction for a budget.
+    let ceiling = highest_published_rate(cost);
+    let rate_for = |own: Option<f64>| own.or(ceiling);
+
     Some(
-        charge(input, cost.input)?
-            + charge(count(usage, "completion_tokens"), cost.output)?
-            + charge(cache_read, cost.cache_read)?
-            + charge(cache_write, cost.cache_write)?,
+        charge(input, rate_for(cost.input))?
+            + charge(count(usage, "completion_tokens"), rate_for(cost.output))?
+            + charge(cache_read, rate_for(cost.cache_read))?
+            + charge(cache_write, rate_for(cost.cache_write))?,
     )
 }
 
@@ -221,14 +248,21 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_cache_rate_poisons_the_total_only_when_it_is_used() {
+    fn a_missing_cache_rate_is_charged_at_the_models_highest_rate() {
+        // This replaced an assertion that a used-but-unpriced class voids the
+        // total. That instinct was right — never under-report — but the remedy
+        // was wrong: `None` is discarded by `SpendCap::record`, so a spend cap
+        // silently stopped binding for the 2,537 catalogued models that publish
+        // no `cache_read` rate. An upper bound honours the same principle
+        // without the hole.
         let partial = Cost {
             input: Some(3.0),
             output: Some(15.0),
             cache_read: None,
             cache_write: None,
         };
-        // No cache tokens: the missing rates are irrelevant.
+
+        // No cache tokens: the missing rates never come into play.
         close(
             price(
                 &json!({"uncached_input_tokens": 1_000_000, "completion_tokens": 0, "cache_read_tokens": 0}),
@@ -236,14 +270,26 @@ mod tests {
             ),
             3.0,
         );
-        // Cache tokens actually used, with no rate to charge them at.
-        assert_eq!(
+
+        // Cache tokens used with no rate of their own: charged at 15.0, the
+        // highest rate this model publishes — an over-estimate, never an under.
+        close(
             price(
-                &json!({"uncached_input_tokens": 1_000_000, "cache_read_tokens": 1}),
+                &json!({"uncached_input_tokens": 1_000_000, "cache_read_tokens": 1_000_000}),
                 &partial,
             ),
-            None,
-            "an unpriced bucket that was used must not round down to a partial sum"
+            18.0,
+        );
+
+        // The bound must never fall below what a complete price would charge.
+        let complete = Cost {
+            cache_read: Some(0.3),
+            ..partial
+        };
+        let usage = json!({"uncached_input_tokens": 1_000_000, "cache_read_tokens": 1_000_000});
+        assert!(
+            price(&usage, &partial).unwrap() >= price(&usage, &complete).unwrap(),
+            "a fallback rate must bound the real one from above, or a cap under-charges"
         );
     }
 

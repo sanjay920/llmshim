@@ -119,7 +119,12 @@ pub struct Usage {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     /// USD charged for this response. `null` means the catalog carries no price
-    /// for the model — it never means free. See `llmshim::cost`.
+    /// for the model at all — it never means free.
+    ///
+    /// Where a model prices some token classes and not others, the unpriced ones
+    /// are charged at its highest published rate, so this is an **upper bound**
+    /// rather than `null`. Under-reporting would let a spend cap stop binding;
+    /// over-reporting merely spends a budget slightly early. See `llmshim::cost`.
     pub cost_usd: Option<f64>,
 }
 
