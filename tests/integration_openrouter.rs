@@ -73,7 +73,7 @@ async fn openrouter_reasoning() {
     };
     let msg = &resp["choices"][0]["message"];
     // A reasoning model's reasoning is normalized into reasoning_content.
-    let reasoning = msg["reasoning_content"].as_str().unwrap_or("");
+    let reasoning = msg["reasoning"][0]["text"].as_str().unwrap_or("");
     let content = msg["content"].as_str().unwrap_or("");
     assert!(
         !reasoning.is_empty() || !content.is_empty(),

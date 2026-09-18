@@ -15,8 +15,11 @@ pub struct LogEntry {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub total_tokens: u64,
     pub status: String,
+    pub gateway_integrity: crate::providers::anthropic_signature::Integrity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,6 +60,15 @@ impl LogEntry {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             status: "ok".to_string(),
+            gateway_integrity: match response["x-llmshim-served-model"].as_str() {
+                Some(served) => crate::providers::anthropic_signature::Integrity::Mismatch {
+                    requested: model.into(),
+                    served: served.split(',').map(str::to_owned).collect(),
+                },
+                None => crate::providers::anthropic_signature::inspect(response, model),
+            },
+            cache_read_tokens: usage["cache_read_tokens"].as_u64().unwrap_or(0),
+            cache_write_tokens: usage["cache_write_tokens"].as_u64().unwrap_or(0),
             error: None,
             request_id: response
                 .get("id")
@@ -79,8 +91,11 @@ impl LogEntry {
             input_tokens: 0,
             output_tokens: 0,
             reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             total_tokens: 0,
             status: "error".to_string(),
+            gateway_integrity: crate::providers::anthropic_signature::Integrity::Unknown,
             error: Some(error.to_string()),
             request_id: None,
         }

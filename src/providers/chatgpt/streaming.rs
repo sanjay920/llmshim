@@ -107,39 +107,11 @@ pub(crate) async fn collect_response(model: &str, response: reqwest::Response) -
     Err(stream_error("missing terminal response"))
 }
 
-pub(super) fn transform_chunk(model: &str, chunk: &str) -> Result<Option<String>> {
+pub(crate) fn transform_chunk(model: &str, chunk: &str) -> Result<Option<String>> {
     if chunk.trim().is_empty() || chunk.trim() == "[DONE]" {
         return Ok(None);
     }
     let event: Value = serde_json::from_str(chunk).map_err(|_| stream_error("invalid SSE JSON"))?;
-    // The proxy's tool_call event carries id/name/arguments together. Emit each
-    // ChatGPT function call once its arguments are complete; forwarding the
-    // Responses argument-only deltas loses them at that public API boundary.
-    match event["type"].as_str() {
-        Some("response.function_call_arguments.delta") => return Ok(None),
-        Some("response.output_item.added") if event["item"]["type"] == "function_call" => {
-            return Ok(None)
-        }
-        Some("response.output_item.done") if event["item"]["type"] == "function_call" => {
-            let item = &event["item"];
-            let field = |name: &str| {
-                item[name]
-                    .as_str()
-                    .ok_or_else(|| stream_error("invalid completed function call"))
-            };
-            let call_id = field("call_id")?;
-            let name = field("name")?;
-            let arguments = field("arguments")?;
-            return Ok(Some(json!({
-                "object": "chat.completion.chunk", "model": format!("chatgpt/{model}"),
-                "choices": [{"index": 0, "delta": {"tool_calls": [{
-                    "index": event["output_index"].as_u64().unwrap_or(0),
-                    "id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}
-                }]}, "finish_reason": null}]
-            }).to_string()));
-        }
-        _ => {}
-    }
     if terminal(&event)? {
         let mut response = event["response"].clone();
         if !response["output"].is_array() {
@@ -153,53 +125,4 @@ pub(super) fn transform_chunk(model: &str, chunk: &str) -> Result<Option<String>
         }).to_string()));
     }
     translator().transform_stream_chunk(&format!("chatgpt/{model}"), chunk)
-}
-
-pub(crate) fn response_stream(
-    model: &str,
-    response: reqwest::Response,
-) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
-    let model = model.to_owned();
-    Box::pin(futures::stream::unfold(
-        (native_stream(response), model, false),
-        |(mut events, model, mut has_tools)| async move {
-            loop {
-                let event = match events.next().await? {
-                    Ok(event) => event,
-                    Err(e) => return Some((Err(e), (events, model, has_tools))),
-                };
-                if matches!(
-                    event["type"].as_str(),
-                    Some("response.output_item.added" | "response.output_item.done")
-                ) && event["item"]["type"] == "function_call"
-                {
-                    has_tools = true;
-                }
-                match transform_chunk(&model, &event.to_string()) {
-                    Ok(Some(chunk)) => {
-                        let chunk = if has_tools && event["type"] == "response.completed" {
-                            let mut parsed: Value =
-                                serde_json::from_str(&chunk).expect("generated chunk");
-                            parsed["choices"][0]["finish_reason"] = json!("tool_calls");
-                            parsed.to_string()
-                        } else {
-                            chunk
-                        };
-                        return Some((Ok(chunk), (events, model, has_tools)));
-                    }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        return Some((
-                            Err(e),
-                            (
-                                Box::pin(futures::stream::empty()) as NativeStream,
-                                model,
-                                has_tools,
-                            ),
-                        ))
-                    }
-                }
-            }
-        },
-    ))
 }

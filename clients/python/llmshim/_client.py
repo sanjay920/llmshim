@@ -194,6 +194,9 @@ def _build_body(
     tools: Optional[List[dict]],
     tool_choice: Optional[Any],
     provider_config: Optional[dict],
+    cache: Optional[dict] = None,
+    shim: Optional[dict] = None,
+    response_format: Optional[dict] = None,
     fallback: Optional[List[str]],
     stream: bool = False,
 ) -> dict[str, Any]:
@@ -235,6 +238,12 @@ def _build_body(
     if pc:
         body["provider_config"] = pc
 
+    if shim is not None:
+        body["x-shim"] = shim
+    if response_format is not None:
+        body["response_format"] = response_format
+    if cache is not None:
+        body["x-cache"] = cache
     if fallback is not None:
         body["fallback"] = fallback
 
@@ -255,6 +264,9 @@ def chat(
     tools: Optional[List[dict]] = None,
     tool_choice: Optional[Any] = None,
     provider_config: Optional[dict] = None,
+    cache: Optional[dict] = None,
+    shim: Optional[dict] = None,
+    response_format: Optional[dict] = None,
     fallback: Optional[List[str]] = None,
 ) -> ChatResponse:
     """Send a chat completion request.
@@ -300,6 +312,9 @@ def chat(
         tools=tools,
         tool_choice=tool_choice,
         provider_config=provider_config,
+        cache=cache,
+        shim=shim,
+        response_format=response_format,
         fallback=fallback,
     )
 
@@ -322,6 +337,9 @@ def stream(
     tools: Optional[List[dict]] = None,
     tool_choice: Optional[Any] = None,
     provider_config: Optional[dict] = None,
+    cache: Optional[dict] = None,
+    shim: Optional[dict] = None,
+    response_format: Optional[dict] = None,
     fallback: Optional[List[str]] = None,
 ) -> Generator[StreamEvent, None, None]:
     """Stream a chat completion. Yields typed event dicts.
@@ -352,6 +370,9 @@ def stream(
         tools=tools,
         tool_choice=tool_choice,
         provider_config=provider_config,
+        cache=cache,
+        shim=shim,
+        response_format=response_format,
         fallback=fallback,
     )
 

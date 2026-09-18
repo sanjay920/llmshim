@@ -1,6 +1,6 @@
 [package]
 name = "llmshim"
-version = "0.3.7"
+version = "0.4.0"
 edition = "2021"
 description = "Blazing fast LLM API translation layer in pure Rust"
 license = "MIT OR Apache-2.0"
@@ -11,7 +11,8 @@ categories = ["api-bindings", "web-programming"]
 exclude = ["clients/", "api/", ".claude/", "Dockerfile", ".dockerignore", "gateway-test-ui.html"]
 
 [features]
-default = []
+default = ["signature-introspection"]
+signature-introspection = []
 proxy = ["dep:axum", "dep:tower", "dep:tower-http", "dep:async-stream", "dep:async-trait"]
 # Experimental priority-queue gateway. Reuses the proxy's RateLimiter/Backpressure.
 gateway = ["proxy"]
@@ -22,10 +23,14 @@ gateway-redis = ["gateway", "redis-coordination"]
 redis-coordination = ["proxy", "dep:redis"]
 
 [dependencies]
+llmshim-catalog = { version = "0.1.0", path = "crates/llmshim-catalog" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "gzip", "brotli", "zstd", "deflate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+jsonschema = { version = "0.46", default-features = false }
 futures = "0.3"
 thiserror = "2"
 bytes = "1"
@@ -50,6 +55,7 @@ async-trait = { version = "0.1", optional = true }
 redis = { version = "1", default-features = false, features = ["tokio-rustls-comp", "connection-manager", "script"], optional = true }
 
 [dev-dependencies]
+syn = { version = "2", features = ["full", "visit"] }
 tokio-test = "0.4"
 mockito = "1"
 
@@ -78,3 +84,8 @@ required-features = ["proxy"]
 name = "gateway_loadtest"
 path = "benchmarks/gateway_loadtest.rs"
 required-features = ["gateway"]
+
+[workspace]
+members = ["crates/llmshim-catalog"]
+exclude = ["clients/python"]
+resolver = "2"

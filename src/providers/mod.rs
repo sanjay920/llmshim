@@ -1,4 +1,6 @@
 pub mod anthropic;
+pub mod anthropic_reasoning;
+pub mod anthropic_signature;
 pub mod chatgpt;
 pub mod gemini;
 pub mod openai;

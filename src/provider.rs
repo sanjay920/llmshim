@@ -8,10 +8,40 @@ pub struct ProviderRequest {
     pub body: Value,
 }
 
+impl ProviderRequest {
+    /// Check endpoint, credentials, settings and prefix for a continuation.
+    /// Dispatch still sends a full stateless request.
+    pub fn can_continue_from(&self, previous: &Self) -> bool {
+        self.url == previous.url
+            && self.headers == previous.headers
+            && crate::cache::continuation_matches(&previous.body, &self.body)
+    }
+}
+
 /// Core trait every provider implements.
 /// Takes OpenAI-format JSON in, emits provider-native JSON out, and back again.
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
+
+    /// Native wire and issuer used by shared reasoning replay. Custom
+    /// Chat-Completions adapters inherit a conservative unbound account.
+    fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
+        crate::reasoning::ReplayTarget::new(
+            self.name(),
+            model,
+            crate::reasoning::WireFormat::OpenAiChat,
+        )
+    }
+
+    /// Capture the identity of the request actually sent, including native
+    /// model overrides and refreshed OAuth account headers.
+    fn request_replay_target(
+        &self,
+        model: &str,
+        request: &ProviderRequest,
+    ) -> crate::reasoning::ReplayTarget {
+        self.replay_target(request.body["model"].as_str().unwrap_or(model))
+    }
 
     /// Transform an OpenAI-format request into the provider's native format.
     /// `model` is the raw model string (after prefix stripping).
@@ -30,7 +60,13 @@ pub trait Provider: Send + Sync {
     /// Transform the provider's native response back into OpenAI format.
     fn transform_response(&self, model: &str, response: Value) -> Result<Value>;
 
-    /// Transform a single SSE chunk from the provider's stream into OpenAI format.
-    /// Returns None if the chunk should be skipped (e.g. provider-specific keepalives).
+    /// Create per-response streaming state. Use this when manually consuming
+    /// SSE; tool ids, JSON arguments and trailing signatures require state.
+    fn stream_normalizer(&self, model: &str) -> crate::streaming::StreamNormalizer {
+        crate::streaming::StreamNormalizer::new(self.replay_target(model))
+    }
+
+    /// Low-level stateless content/reasoning parser. Tool events are consumed by
+    /// `stream_normalizer`, not emitted as incomplete callable tool records.
     fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>>;
 }

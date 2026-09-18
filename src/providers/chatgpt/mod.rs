@@ -3,7 +3,8 @@ mod auth;
 mod streaming;
 
 pub use auth::{ChatGptAuth, DeviceCode, LoginStatus};
-pub(crate) use streaming::{collect_response, response_stream};
+pub(crate) use streaming::collect_response;
+pub(crate) use streaming::transform_chunk as parse_stream_chunk;
 
 use crate::{
     error::Result,
@@ -79,6 +80,7 @@ impl ChatGpt {
     fn request(&self, model: &str, request: &Value, tokens: Tokens) -> Result<ProviderRequest> {
         // Isolate ChatGPT's native namespace from API-key OpenAI extensions.
         let mut input = request.clone();
+        crate::reasoning::sanitize_extensions(&mut input);
         let obj = input
             .as_object_mut()
             .ok_or(crate::error::ShimError::MissingModel)?;
@@ -98,7 +100,13 @@ impl ChatGpt {
                 }
             }
         }
-        let mut req = translator().transform_request(model, &input)?;
+        let target = crate::reasoning::ReplayTarget::new(
+            "chatgpt",
+            model,
+            crate::reasoning::WireFormat::OpenAiResponses,
+        )
+        .bind_account(&self.base_url, tokens.account_id.as_deref());
+        let mut req = translator().transform_request_for_target(model, &input, &target)?;
         let body = req.body.as_object_mut().unwrap();
         if let Some(ext) = request.get("x-chatgpt").and_then(Value::as_object) {
             body.extend(ext.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -114,11 +122,14 @@ impl ChatGpt {
                     | "stream"
                     | "store"
                     | "include"
+                    | "text"
                     | "tools"
                     | "tool_choice"
                     | "reasoning"
                     | "previous_response_id"
                     | "truncation"
+                    | "prompt_cache_key"
+                    | "prompt_cache_retention"
             )
         });
         body.insert("model".into(), json!(model));
@@ -142,7 +153,23 @@ impl ChatGpt {
                 *choice = json!({"type": "function", "name": choice["function"]["name"]});
             }
         }
+        crate::schema::normalize_native_tools(
+            crate::schema::Target::OpenAiResponses,
+            &mut req.body,
+        );
+        crate::shim::native_format(
+            request,
+            crate::reasoning::WireFormat::OpenAiResponses,
+            &mut req.body,
+        );
+        crate::cache::finish_request(
+            request,
+            &mut req.body,
+            crate::reasoning::WireFormat::OpenAiResponses,
+        )?;
         req.url = format!("{}/responses", self.base_url.trim_end_matches('/'));
+        crate::reasoning::enforce_stateless(&mut req.body)?;
+        crate::toolcall::validate_native(&req.body, &target)?;
         req.headers = vec![
             (
                 "Authorization".into(),
@@ -165,6 +192,33 @@ impl Provider for ChatGpt {
         "chatgpt"
     }
 
+    fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
+        crate::reasoning::ReplayTarget::new(
+            "chatgpt",
+            model,
+            crate::reasoning::WireFormat::OpenAiResponses,
+        )
+        .bind_account(&self.base_url, self.auth.replay_account().as_deref())
+    }
+
+    fn request_replay_target(
+        &self,
+        model: &str,
+        request: &ProviderRequest,
+    ) -> crate::reasoning::ReplayTarget {
+        let account = request
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("chatgpt-account-id"))
+            .map(|(_, v)| v.as_str());
+        crate::reasoning::ReplayTarget::new(
+            "chatgpt",
+            model,
+            crate::reasoning::WireFormat::OpenAiResponses,
+        )
+        .bind_account(&self.base_url, account)
+    }
+
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
         validate_model(model)?;
         self.request(model, request, self.auth.cached_credentials()?)
@@ -182,11 +236,19 @@ impl Provider for ChatGpt {
     }
 
     fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
-        transform_response(model, response)
+        let native = response.clone();
+        let mut result = transform_response(model, response)?;
+        crate::reasoning::capture_response(&self.replay_target(model), &native, &mut result);
+        crate::toolcall::capture_response(&self.replay_target(model), &native, &mut result)?;
+        Ok(result)
     }
 
     fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
-        streaming::transform_chunk(model, chunk)
+        let result = streaming::transform_chunk(model, chunk)?;
+        let Ok(native) = serde_json::from_str(chunk) else {
+            return Ok(result);
+        };
+        crate::reasoning::capture_stream(&self.replay_target(model), &native, result)
     }
 }
 

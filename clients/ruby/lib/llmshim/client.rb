@@ -120,6 +120,9 @@ module Llmshim
       provider_config["tool_choice"] = opts[:tool_choice] unless opts[:tool_choice].nil?
       body["provider_config"] = provider_config unless provider_config.empty?
 
+      body["x-cache"] = stringify(opts[:cache]) unless opts[:cache].nil?
+      body["x-shim"] = stringify(opts[:shim]) unless opts[:shim].nil?
+      body["response_format"] = stringify(opts[:response_format]) unless opts[:response_format].nil?
       body["fallback"] = opts[:fallback] unless opts[:fallback].nil?
       body["stream"] = opts[:stream] unless opts[:stream].nil?
 

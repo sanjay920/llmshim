@@ -10,7 +10,7 @@ The useful distinction is: **same semantic events, two encodings.**
 | Signal | Rust chunk | Proxy/client event |
 |---|---|---|
 | Answer text | `choices[0].delta.content` | `content` |
-| Provider-returned reasoning | `choices[0].delta.reasoning_content` | `reasoning` |
+| Provider-returned reasoning | `choices[0].delta.reasoning` | `reasoning` |
 | Tool call | `choices[0].delta.tool_calls` | `tool_call` |
 | Token counts | top-level `usage` | `usage` |
 | Completion | `finish_reason` | `done` |
@@ -19,25 +19,25 @@ The useful distinction is: **same semantic events, two encodings.**
 ## Rust: normalized Chat Completions chunks
 
 `llmshim::stream` returns a stream whose items are JSON strings. Each provider
-adapter has already translated its native event into an OpenAI Chat
-Completions-style delta.
+adapter and the shared per-response normalizer have translated native events
+into Chat Completions-style deltas. Tool calls are complete records emitted once
+at termination, after their argument and signature fragments have been assembled.
+Retain each call's `wire_ids` when storing it or sending its result back.
 
 ```rust
 use futures::StreamExt;
 use std::io::{self, Write};
 
 let mut stream = llmshim::stream(&router, &request).await?;
+let mut reasoning = llmshim::reasoning::ReasoningAccumulator::default();
 
 while let Some(chunk) = stream.next().await {
     let chunk = chunk?;
     let parsed: serde_json::Value = serde_json::from_str(&chunk)?;
 
-    if let Some(reasoning) = parsed
-        .pointer("/choices/0/delta/reasoning_content")
-        .and_then(|value| value.as_str())
-    {
-        eprint!("{reasoning}");
-    }
+    let delta = &parsed["choices"][0]["delta"];
+    reasoning.push(delta);
+    eprint!("{}", llmshim::reasoning::reasoning_text(delta));
 
     if let Some(text) = parsed
         .pointer("/choices/0/delta/content")
@@ -50,7 +50,10 @@ while let Some(chunk) = stream.next().await {
 ```
 
 Not every chunk contains text. Inspect only the fields your application needs,
-and keep handling `Err` items until the stream ends.
+and keep handling `Err` items until the stream ends. Store `reasoning.blocks()`
+with the final assistant message only after successful completion. An EOF or
+`[DONE]` without a terminal provider chunk is an error. Cache usage events are
+cumulative snapshots; use the latest values, rather than summing events.
 
 The [Rust quickstart](../start/rust.md#3-stream-content) contains a complete
 runnable program.

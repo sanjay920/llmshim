@@ -12,6 +12,29 @@ Both commands filter the built-in registry to providers with configured API
 keys or a saved ChatGPT login. The proxy returns `id`, `provider`, and unprefixed `name`; the CLI prints
 the ID and display label.
 
+The standalone `llmshim-catalog` crate supplies broader metadata without
+changing this curated discovery list:
+
+```bash
+llmshim models --all --json
+llmshim models --refresh
+LLMSHIM_CATALOG_OFFLINE=1 llmshim models --all
+```
+
+Its owned `ModelInfo` adds model family, pricing, reasoning effort/budget
+options, modalities, dates, and field-level sources. `llmshim::catalog::resolve`
+reads the resident catalog; `llmshim::models::spec` retains the borrowed,
+compile-time API for curated and historical facts.
+
+Startup reads the vendored floor, cached data, and local overrides without
+waiting for network. Refresh uses ETags and a 24-hour TTL; errors keep the old
+snapshot available. Offline mode uses only vendored and local layers. User
+overrides live in `~/.config/llmshim/models.toml`, project overrides in
+`.llmshim/models.toml`, and cached data in `~/.cache/llmshim/models.dev.json`.
+Local overrides win; verified builtin assertions win over models.dev data.
+Provider discovery is explicit, accepts capability facts, and never supplies
+pricing. Catalog entries do not imply credentials or account entitlement.
+
 ## Advertised catalog
 
 The CLI picker, `llmshim models`, and `/v1/models` share this curated set of

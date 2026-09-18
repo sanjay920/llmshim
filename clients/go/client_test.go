@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -67,6 +68,15 @@ func TestChatWithConfigAndProviderConfig(t *testing.T) {
 		if err := json.Unmarshal(body, &raw); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
+		if raw["x-cache"].(map[string]any)["key"] != "session:branch" {
+			t.Error("cache annotation was dropped")
+		}
+		if raw["x-shim"].(map[string]any)["structured_output"] != "prompt" {
+			t.Error("shim option dropped")
+		}
+		if raw["response_format"].(map[string]any)["type"] != "json_schema" {
+			t.Error("response format dropped")
+		}
 		cfg, ok := raw["config"].(map[string]any)
 		if !ok || cfg["reasoning_effort"] != "high" {
 			t.Errorf("config not sent correctly: %v", raw["config"])
@@ -88,11 +98,15 @@ func TestChatWithConfigAndProviderConfig(t *testing.T) {
 	defer srv.Close()
 
 	maxTok := 256
+	cacheKey := "session:branch"
 	c := New(WithBaseURL(srv.URL))
 	_, err := c.Chat(context.Background(), ChatRequest{
-		Model:    "anthropic/claude-sonnet-4-6",
-		Messages: []Message{{Role: "user", Content: "hi"}},
-		Config:   &Config{MaxTokens: &maxTok, ReasoningEffort: "high"},
+		Shim:           &ShimConfig{StructuredOutput: "prompt"},
+		ResponseFormat: map[string]any{"type": "json_schema", "json_schema": map[string]any{"schema": map[string]any{"type": "integer"}}},
+		Cache:          &CachePolicy{Key: &cacheKey},
+		Model:          "anthropic/claude-sonnet-4-6",
+		Messages:       []Message{{Role: "user", Content: "hi"}},
+		Config:         &Config{MaxTokens: &maxTok, ReasoningEffort: "high"},
 		ProviderConfig: map[string]any{
 			"thinking": map[string]any{"type": "adaptive"},
 		},
@@ -333,5 +347,49 @@ func TestWithHeader(t *testing.T) {
 	c := New(WithBaseURL(srv.URL), WithHeader("Authorization", "Bearer secret"))
 	if _, err := c.Health(context.Background()); err != nil {
 		t.Fatalf("Health: %v", err)
+	}
+}
+
+func TestReasoningProvenanceSurvivesTypedRoundTrip(t *testing.T) {
+	raw := `{"role":"assistant","content":null,"reasoning":[{"kind":"encrypted","data":"opaque+/=","item_id":"rs_1","origin":{"provider":"openai","model":"gpt-6-astra","family":"gpt","wire":"openai-responses","received_at":"2026-09-16T00:00:00Z","account":"issuer"},"payload":{"type":"reasoning","summary":[],"encrypted_content":"opaque+/="}}],"tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"},"thought_signature":{"data":"sig","origin":{"provider":"gemini","model":"gemini-3.8-flash","family":"gemini","wire":"google-generate-content","received_at":"2026-09-16T00:00:00Z"}}}]}`
+	var message ResponseMessage
+	if err := json.Unmarshal([]byte(raw), &message); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before, after any
+	if err := json.Unmarshal([]byte(raw), &before); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &after); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("metadata was lost: %s", encoded)
+	}
+}
+
+func TestWireIDsSurviveTypedRoundTrip(t *testing.T) {
+	raw := `{"role":"assistant","content":null,"tool_calls":[{"id":"call_ls_example","type":"function","function":{"name":"read","arguments":"{}"},"wire_ids":[{"provider":"google-compatible","wire":"openai-chat","scope":"r1","part_id":"0","id":"native_call","signature_field":"extra_content.google.thought_signature"},{"provider":"gemini","wire":"google-generate-content","scope":"r2","part_id":"1","id":null},{"provider":"openai","wire":"openai-responses","scope":"r3","part_id":"2","id":"call_1","item_id":"fc_1"}]}]}`
+	var message ResponseMessage
+	if err := json.Unmarshal([]byte(raw), &message); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before, after any
+	if err := json.Unmarshal([]byte(raw), &before); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(encoded, &after); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("wire identity was lost: %s", encoded)
 	}
 }

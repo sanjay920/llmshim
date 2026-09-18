@@ -36,10 +36,54 @@ In the proxy contract, put them under `config`:
 }
 ```
 
-Provider-returned reasoning is normalized as `reasoning_content` in Rust
-responses and chunks, and as `reasoning` or a typed `reasoning` event through
-the proxy. A provider or model may keep its reasoning hidden or return only a
-summary.
+## Preserve reasoning for replay
+
+Responses carry an ordered `message.reasoning` array. Every block has `kind`
+(`text`, `redacted`, or `encrypted`) and `origin`: provider, upstream model,
+coarse model family, wire format, receipt time, and an optional issuer binding.
+Text blocks carry `text`; opaque blocks carry `data`. Signatures, Responses
+item ids, original structured payloads and container identity are retained when
+present. Preserve the complete assistant message when building the next request.
+The proxy exposes the same array inside `message`; its top-level `reasoning`
+string remains a display-only convenience.
+
+One replay policy applies to all adapters and fallback attempts: the target
+family and wire must match, and encrypted blocks also require the same provider
+and account binding. Unknown families and missing origins fail closed. Signed
+Anthropic blocks precede text and tools in their original order. Responses
+requests use `store:false`, include encrypted reasoning, and replay those items
+locally. Native overrides cannot turn storage on or bypass reasoning provenance.
+OpenAI and xAI use this stateless Responses path; see
+[xAI's encrypted reasoning contract](https://docs.x.ai/developers/model-capabilities/text/reasoning).
+
+API-key account bindings hash the endpoint and credential; they conservatively
+stop matching after key rotation. OAuth bindings use the account identifier
+captured from the actual request. No credential or raw account identifier is
+emitted. Rejected replay is silent and increments a bounded-reason counter,
+available through `llmshim::reasoning::replay_counters()`.
+
+Gemini tool-call signatures are objects containing `data` and `origin`. Keep
+that entire object on the tool call. Legacy `reasoning_content`,
+`reasoning_signature`, `redacted_reasoning_content`, and string tool signatures
+are read for one migration release, but untracked data is dropped. An explicit
+`reasoning_origin` can accompany legacy message fields during migration; new
+writers emit only the block array. Models absent from the catalog need a local
+family assertion before their reasoning can be replayed.
+
+Streaming reasoning uses the same blocks with a part `index` and an optional
+`replace:true` flag for completed item snapshots. `ReasoningAccumulator` assembles
+fragments and removes stream framing before storage:
+
+```rust
+let mut reasoning = llmshim::reasoning::ReasoningAccumulator::default();
+// For each normalized chunk:
+reasoning.push(&chunk["choices"][0]["delta"]);
+// When the stream has completed successfully:
+assistant["reasoning"] = serde_json::json!(reasoning.blocks());
+```
+
+Use `reasoning_text(&message_or_delta)` for display without inspecting opaque
+data. A provider may expose only a summary or no readable reasoning at all.
 
 ## Portable intent or native control
 
@@ -192,3 +236,32 @@ The adapter mappings are pinned by provider unit tests. The tables above
 cover the advertised models; compatibility mappings for explicit older IDs
 remain in the adapters and tests. Provider capabilities can change, so the
 implementation and these tables must move together.
+
+## Signature observations
+
+The default `signature-introspection` feature makes a best-effort read of an
+undocumented Anthropic signature header. Its public decoder,
+`providers::anthropic_signature::serving_model_from_signature`, returns `Option`;
+unknown formats (including headers without a model), malformed data, and the
+feature-disabled stub return `None`. Tests use synthetic protobufs only.
+
+This never changes `origin.model`, a stored message, replay eligibility, routing,
+fallback, or cache decisions. The decoded value is unverified metadata, not
+authentication or proof of which model ran. Dotted/dashed spellings and dated
+snapshots compare as the same model line; an unrecognized internal codename may
+be reported as a mismatch. Logs record `gateway_integrity` as `ok`, `mismatch`
+(with requested/served names), or `unknown`. Unknowns produce no warning.
+
+A mismatch increments `providers::anthropic_signature::mismatch_count()` and adds
+`x-llmshim-served-model` outside the assistant message. Streaming adds it to the
+terminal canonical chunk or the proxy's `done` event. Multiple observed names
+are comma separated. Disable inspection with `--no-default-features`; model
+requests and stored message contents remain identical, while observation fields
+and metrics can differ.
+
+Anthropic effort and budget selection now comes from catalog `reasoning_options`.
+An effort entry selects adaptive thinking and clamps to an advertised tier; a
+budget entry selects enabled thinking and respects its minimum, maximum, and
+`max_tokens - 1`. An impossible budget fails before HTTP dispatch. Verified
+builtin entries preserve the established mappings; a bounded table of historical
+model lines supplies missing metadata. Unknown future names are not guessed.
