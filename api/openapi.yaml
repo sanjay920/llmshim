@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: llmshim API
-  version: 0.4.0
+  version: 0.5.0
   description: |
     Multi-provider LLM API proxy. Send requests in a single format,
     llmshim translates to the native API of whichever provider you choose.
@@ -606,6 +606,12 @@ components:
         cache_write_tokens:
           type: integer
           description: Input tokens written to a provider cache (zero when not reported)
+        cost_usd:
+          type: [number, 'null']
+          description: >-
+            USD charged for this response, from the catalog's per-million-token
+            prices. `null` means the catalog carries no price for the model —
+            it never means free.
         input_tokens:
           type: integer
         output_tokens:
@@ -666,6 +672,13 @@ components:
             type:
               type: string
               const: usage
+            cache_read_tokens:
+              type: integer
+            cache_write_tokens:
+              type: integer
+            cost_usd:
+              type: [number, 'null']
+              description: USD charged; `null` when the model has no catalog price
             input_tokens:
               type: integer
             output_tokens:
@@ -702,9 +715,35 @@ components:
                 status: {type: integer}
 
     ModelsResponse:
+      description: >-
+        Served to two audiences from one body. An OpenAI SDK reads `object` +
+        `data` (so `client.models.list()` works unmodified); llmshim's own
+        clients read `models`. Both audiences issue the same `GET /v1/models`,
+        so the shapes are unioned rather than split across routes.
       type: object
-      required: [models]
+      required: [object, data, models]
       properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, object, created, owned_by]
+            properties:
+              id:
+                type: string
+                description: Routing id, accepted back as `model` on a request
+              object:
+                type: string
+                const: model
+              created:
+                type: integer
+                description: Release date as a Unix timestamp, or 0 when unknown
+              owned_by:
+                type: string
+                description: Provider key serving the model
         models:
           type: array
           items:

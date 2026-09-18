@@ -53,6 +53,35 @@ refresh in a completion; hold a snapshot for decisions that must agree.
 normalized responses and usage chunks, logs, and proxy usage. Native token
 fields remain readable. `src/usage.rs` owns extraction; the streaming client
 merges Anthropic's start/delta usage before normalizing terminal counts.
+`usage.uncached_input_tokens` joins them: the providers disagree on whether
+their prompt total already includes the cache read (Anthropic's excludes it,
+OpenAI/Chat Completions/Gemini include it), and only the transport boundary
+still knows which convention the body used. The convention is read off the
+cache-read field that actually matched, never a provider-name table.
+
+### USD cost accounting
+
+`src/cost.rs` is the only thing that multiplies a catalog `Cost` (USD per
+million tokens) by those counters. Input is charged on `uncached_input_tokens`
+so a cached prompt is never billed twice; cache reads and writes are charged at
+their own rates; reasoning tokens are already inside `completion_tokens`.
+**An absent price is `None`, never `0.0`** — a positive count in a bucket with
+no rate poisons the whole total rather than producing a partial sum that reads
+as a complete one. `client.rs` stamps `usage.cost_usd` at the transport
+boundary (the last place that knows the dispatch target) for completions and
+for whichever stream chunk carries usage; `log.rs`, `proxy::types::Usage`, both
+native facades and the four bundled clients carry it through as a nullable
+field. `null` means unknown, not free.
+
+`src/gateway/quota.rs` adds a per-identity dollar cap beside the RPM/TPM
+buckets: `budget_usd` + `budget_window_secs` on an `Identity`, checked before
+dispatch and charged after (cost is only knowable once a response exists, so
+one in-flight request can overshoot). Windows tumble rather than slide, because
+the fleet-wide store is one counter per window. `SpendCap::with_store` takes the
+Redis-backed `DistributedGateway` in distributed mode so `$100/day` means one
+hundred dollars fleet-wide, not per replica. **A response the catalog cannot
+price is not charged** — recording zero would let an unpriced model run forever
+under a budget; `cost_usd: null` is the signal that a price is missing.
 The native Chat Completions streams must use their own parser in the client;
 passing them to the Responses parser silently drops all events.
 
@@ -189,6 +218,49 @@ remain provider errors. Callers must configure the final URL directly.
 
 `FallbackConfig` defines an ordered list of models to try. On retryable errors (429, 500, 502, 503, 529), retries with exponential backoff then falls through to the next model. `completion_with_fallback()` is the top-level API. The proxy supports this via `"fallback": ["model1", "model2"]` in the request body.
 
+### Provider health (`src/breaker.rs`, `src/proxy/health.rs`)
+
+**Health is not rate-limit backoff.** The token buckets already slow a provider
+down after a 429 — a 429 means the provider is alive and asking for less. The
+breaker counts what retrying cannot fix: 5xx (500/502/503/504/529) and
+transport failures. Adapted from `rcode-provider`'s `ProviderBreaker`, which we
+own: sliding failure window, open state, and a single half-open probe admitted
+after the cooldown. Config: `LLMSHIM_BREAKER_WINDOW_SECS` (60),
+`LLMSHIM_BREAKER_TRIP_THRESHOLD` (3; `0` disables), `LLMSHIM_BREAKER_COOLDOWN_SECS` (30).
+
+The breaker hangs on the `Router` (`Router::breaker()` / `with_breaker`). Every
+dispatch path *observes* outcomes so health accrues from ordinary traffic; only
+`fallback.rs` *refuses*, and it checks before every attempt rather than once per
+chain entry — the attempt that opens a circuit is usually the chain's own, so a
+per-entry check would still retry into a target it just watched die. A single-target call is still dispatched:
+with no alternative, refusing would only convert an upstream failure into a
+local one. `proxy::health::build_breaker()` attaches a Redis-coordinated
+`SharedHealth` (failure ZSET + open marker + `SET NX` probe) when
+`LLMSHIM_REDIS_URL` is set and `redis-coordination` is compiled in, mirroring
+`build_limiter`. Every shared operation **fails open**.
+
+### Named routes (`src/config.rs`, `src/router.rs`)
+
+A caller-defined name maps to a model plus request settings:
+
+```toml
+[routes.compaction]
+model = "anthropic/claude-haiku-4-5-20251001"
+reasoning_effort = "low"
+max_tokens = 4096
+```
+
+Addressed as `"model": "route/compaction"`, so a route travels through the
+existing `provider/model` grammar — an OpenAI SDK, the CLI and the proxy's
+admission control all handle it without learning a new field. `resolve_key`
+resolves the indirection, so rate limiting never sees an unrecognized string.
+
+**llmshim must not learn harness vocabulary.** The name is opaque: a harness may
+call a route `compaction`, `advisor` or `webSearch`, and llmshim only knows it
+maps to a model. Route settings are defaults — a per-request key always wins —
+and an unknown name is a 400, never a silent fall back to the default model.
+Routes do not chain.
+
 ### Vision (`src/vision.rs`)
 
 Image content blocks are translated between providers automatically. Users can send images in any format (OpenAI `image_url`, Anthropic `image`, Gemini `inline_data`) and the correct provider sees its native format. Base64 data URIs and plain URLs are both handled. Gemini falls back to a text placeholder for URL images (only supports `inline_data`).
@@ -303,7 +375,13 @@ HTTP proxy with our own API spec (not OpenAI-compatible). Built on axum.
 Endpoints:
 - `POST /v1/chat` — non-streaming (or streaming if `stream: true`)
 - `POST /v1/chat/stream` — always SSE streaming with typed events (`content`, `reasoning`, `tool_call`, `usage`, `done`, `error`)
-- `GET /v1/models` — list available models (filtered to configured providers)
+- `GET /v1/models` — list available models (filtered to configured providers).
+  Serves two audiences from one body: an OpenAI SDK reads the `object: "list"` /
+  `data[]` envelope (so `client.models.list()` works unmodified), llmshim's own
+  clients read `models[]`. Both issue the same request, so there is no path to
+  split on — the union *is* the split. `data[].id` is the routing id, requestable
+  back as `model`. Built once in `proxy::convert::models_response`, shared with
+  the gateway.
 - `GET /health` — health check with provider list
 
 Request format uses `config` for provider-agnostic settings and `provider_config` for raw passthrough. OpenAPI 3.1 spec at `api/openapi.yaml`.
@@ -444,6 +522,11 @@ and native endpoints. Keep display messages readable and source type/code/param
 metadata separate; do not move this logic back into a wire-only formatter.
 JSON responses carry native metadata in response extensions, and SSE errors carry
 an optional structured error object so native rendering remains lossless.
+`n > 1` is refused rather than emulated: the OpenAI backend is the Responses
+API (no `n`), Anthropic Messages and Gemini have no `n` either, and the
+single-message proxy projects choice zero. The refusal is a correctly shaped
+`{"error":{type,message,param:"n",code:"unsupported_parameter"}}`, carried
+through `normalize_error` so both facades render it natively.
 Tests: `unit_wire`, gateway `http::native_tests`. Use a temporary receipt directory
 in tests; never put real signatures, credentials, or conversations in fixtures.
 

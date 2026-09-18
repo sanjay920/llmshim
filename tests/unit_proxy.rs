@@ -134,6 +134,7 @@ fn chat_response_serializes() {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             total_tokens: 15,
+            cost_usd: None,
         },
         latency_ms: 1200,
     };
@@ -171,6 +172,7 @@ fn chat_response_no_reasoning() {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             total_tokens: 7,
+            cost_usd: None,
         },
         latency_ms: 500,
     };
@@ -229,6 +231,7 @@ fn stream_event_usage() {
         cache_read_tokens: 0,
         cache_write_tokens: 0,
         total_tokens: 170,
+        cost_usd: None,
     });
     let json = serde_json::to_string(&event).unwrap();
     let parsed: Value = serde_json::from_str(&json).unwrap();
@@ -266,6 +269,13 @@ fn stream_event_error() {
 #[test]
 fn models_response_serializes() {
     let resp = ModelsResponse {
+        object: "list",
+        data: vec![ModelObject {
+            id: "openai/gpt-5.4".into(),
+            object: "model",
+            created: 0,
+            owned_by: "openai".into(),
+        }],
         models: vec![
             ModelEntry {
                 id: "openai/gpt-5.4".into(),
@@ -282,6 +292,56 @@ fn models_response_serializes() {
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["models"].as_array().unwrap().len(), 2);
     assert_eq!(json["models"][0]["id"], "openai/gpt-5.4");
+    // The OpenAI list envelope an SDK's `models.list()` parses.
+    assert_eq!(json["object"], "list");
+    assert_eq!(json["data"][0]["object"], "model");
+    assert_eq!(json["data"][0]["id"], "openai/gpt-5.4");
+    assert_eq!(json["data"][0]["owned_by"], "openai");
+    assert!(
+        json["data"][0]["created"].is_i64(),
+        "OpenAI clients type `created` as an integer, never null"
+    );
+}
+
+/// The live endpoint must satisfy an OpenAI SDK and llmshim's own clients from
+/// one body: both call `GET /v1/models`, so there is no path to split on.
+#[tokio::test]
+async fn models_endpoint_serves_both_shapes_from_one_route() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let router = llmshim::router::Router::new().register(
+        "openai",
+        Box::new(llmshim::providers::openai::OpenAi::new("test-key".into())),
+    );
+    let response = llmshim::proxy::app(router, None)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(body["object"], "list");
+    let data = body["data"].as_array().expect("OpenAI `data` array");
+    let models = body["models"].as_array().expect("llmshim `models` array");
+    assert!(!data.is_empty(), "a registered provider must list models");
+    assert_eq!(data.len(), models.len(), "both views list the same models");
+    for (entry, own) in data.iter().zip(models) {
+        assert_eq!(entry["object"], "model");
+        // A listed id must be requestable back as `model`.
+        assert_eq!(entry["id"], own["id"]);
+        assert_eq!(entry["owned_by"], own["provider"]);
+        assert!(entry["created"].is_i64());
+    }
 }
 
 // ============================================================

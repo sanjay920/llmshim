@@ -1,3 +1,5 @@
+use crate::breaker::ProviderBreaker;
+use crate::config::Route;
 use crate::error::{Result, ShimError};
 use crate::provider::Provider;
 use crate::providers::anthropic::Anthropic;
@@ -7,7 +9,9 @@ use crate::providers::openai::OpenAi;
 use crate::providers::openai_compat::OpenAiCompatible;
 use crate::providers::openrouter::OpenRouter;
 use crate::providers::xai::Xai;
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// Parses "provider/model" into (provider_key, model_name).
 /// Falls back to checking aliases, then defaults.
@@ -38,10 +42,21 @@ pub fn parse_model(model: &str, aliases: &HashMap<String, String>) -> Result<(St
     }
 }
 
+/// Reserved pseudo-provider prefix for named routes: `route/<name>`.
+///
+/// It reuses the existing `provider/model` grammar, so a named route travels
+/// through every caller — an OpenAI SDK, the CLI, the proxy's admission control
+/// — without any of them learning a new field.
+pub const ROUTE_PREFIX: &str = "route/";
+
 /// Registry of configured providers.
 pub struct Router {
     providers: HashMap<String, std::sync::Arc<dyn Provider>>,
     pub aliases: HashMap<String, String>,
+    /// Caller-defined named routes. llmshim never interprets a name.
+    routes: BTreeMap<String, Route>,
+    /// Provider health. Separate from rate-limit backoff: see `crate::breaker`.
+    breaker: Arc<ProviderBreaker>,
 }
 
 impl Default for Router {
@@ -55,6 +70,8 @@ impl Router {
         Self {
             providers: HashMap::new(),
             aliases: HashMap::new(),
+            routes: BTreeMap::new(),
+            breaker: Arc::new(ProviderBreaker::from_env()),
         }
     }
 
@@ -66,6 +83,85 @@ impl Router {
     pub fn alias(mut self, from: &str, to: &str) -> Self {
         self.aliases.insert(from.to_string(), to.to_string());
         self
+    }
+
+    /// Register a named route. The name is opaque to llmshim.
+    pub fn route(mut self, name: &str, route: Route) -> Self {
+        self.routes.insert(name.to_string(), route);
+        self
+    }
+
+    /// Replace the provider-health breaker — how the proxy attaches a
+    /// fleet-wide (Redis-coordinated) one to a router built from the env.
+    pub fn with_breaker(mut self, breaker: Arc<ProviderBreaker>) -> Self {
+        self.breaker = breaker;
+        self
+    }
+
+    /// The provider-health breaker governing this router's dispatches.
+    pub fn breaker(&self) -> &Arc<ProviderBreaker> {
+        &self.breaker
+    }
+
+    /// Names of the configured routes.
+    pub fn route_names(&self) -> Vec<&str> {
+        self.routes.keys().map(String::as_str).collect()
+    }
+
+    /// The model a `route/<name>` string resolves to, or `None` when the string
+    /// is not a named route.
+    ///
+    /// An unknown name is an **error**. Falling back to a default model would
+    /// send traffic somewhere the caller never asked for, which is exactly the
+    /// failure a named route exists to prevent.
+    pub fn route_target(&self, model: &str) -> Result<Option<&Route>> {
+        let Some(name) = model.strip_prefix(ROUTE_PREFIX) else {
+            return Ok(None);
+        };
+        let route = self
+            .routes
+            .get(name)
+            .ok_or_else(|| ShimError::ProviderError {
+                status: 400,
+                body: format!(
+                    "unknown named route: {name:?} (configured: {:?})",
+                    self.route_names()
+                ),
+            })?;
+        if route.model.starts_with(ROUTE_PREFIX) {
+            return Err(ShimError::ProviderError {
+                status: 400,
+                body: format!("named route {name:?} targets another route; routes do not chain"),
+            });
+        }
+        Ok(Some(route))
+    }
+
+    /// Expand a request addressed to `route/<name>` into its model plus the
+    /// route's settings. Settings the request already carries are left alone —
+    /// a route is a default, not an override — so a caller can pick the route
+    /// and still raise `reasoning_effort` for one call.
+    ///
+    /// Requests that name no route are returned borrowed and untouched.
+    pub fn expand_route<'a>(
+        &self,
+        request: &'a serde_json::Value,
+    ) -> Result<Cow<'a, serde_json::Value>> {
+        let Some(model) = request.get("model").and_then(serde_json::Value::as_str) else {
+            return Ok(Cow::Borrowed(request));
+        };
+        let Some(route) = self.route_target(model)? else {
+            return Ok(Cow::Borrowed(request));
+        };
+        let mut expanded = request.clone();
+        for (key, value) in &route.settings {
+            if key == "model" || expanded.get(key).is_some() {
+                continue;
+            }
+            expanded[key.clone()] = value.clone();
+        }
+        expanded["model"] = serde_json::json!(route.model);
+        Ok(Cow::Owned(expanded))
     }
 
     /// Returns the keys of all registered providers.
@@ -89,6 +185,10 @@ impl Router {
         if let Ok(catalog) = crate::catalog::global() {
             catalog.refresh_in_background();
         }
+
+        // Named routes are configuration, not discovery: they come from
+        // ~/.llmshim/config.toml and nothing synthesizes a default set.
+        router.routes = crate::config::load().routes;
 
         let chatgpt_auth = ChatGptAuth::from_env();
         if chatgpt_auth.auth_path().is_file() {
@@ -147,6 +247,12 @@ impl Router {
     }
 
     fn resolve_key(&self, model: &str) -> Result<(String, String)> {
+        // A named route resolves to its model before anything else, so every
+        // caller of `resolve` — including the proxy's admission control — sees
+        // the real provider rather than skipping rate limiting on an
+        // unrecognized string.
+        let routed = self.route_target(model)?.map(|route| route.model.clone());
+        let model = routed.as_deref().unwrap_or(model);
         crate::catalog::global().map_err(|error| ShimError::ProviderError {
             status: 400,
             body: format!("invalid model catalog configuration: {error}"),

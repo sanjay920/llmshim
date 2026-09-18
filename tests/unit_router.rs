@@ -317,3 +317,118 @@ fn router_resolves_catalog_spellings_without_rerouting_reseller_models() {
     assert_eq!(p.name(), "openrouter");
     assert_eq!(name, "anthropic/claude-haiku-4.5");
 }
+
+// ============================================================
+// Named routes
+// ============================================================
+
+fn route(model: &str, settings: &[(&str, serde_json::Value)]) -> llmshim::config::Route {
+    llmshim::config::Route {
+        model: model.into(),
+        settings: settings
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect(),
+    }
+}
+
+#[test]
+fn a_named_route_resolves_to_its_model_and_stays_opaque_to_llmshim() {
+    // "compaction" is the harness's word. llmshim only knows it maps to a
+    // model — there is no role vocabulary anywhere below this line.
+    let router = Router::new()
+        .register("anthropic", Box::new(Anthropic::new("k".into())))
+        .route(
+            "compaction",
+            route(
+                "anthropic/claude-haiku-4-5-20251001",
+                &[("reasoning_effort", serde_json::json!("low"))],
+            ),
+        );
+
+    let (provider, model) = router.resolve("route/compaction").unwrap();
+    assert_eq!(provider.name(), "anthropic");
+    assert_eq!(model, "claude-haiku-4-5-20251001");
+    assert_eq!(router.route_names(), vec!["compaction"]);
+}
+
+#[test]
+fn an_unknown_route_is_an_error_not_a_silent_default() {
+    let router = Router::new().register("anthropic", Box::new(Anthropic::new("k".into())));
+    let err = match router.resolve("route/nope") {
+        Ok(_) => panic!("an unknown route must not resolve"),
+        Err(e) => e,
+    };
+    match err {
+        ShimError::ProviderError { status, ref body } => {
+            assert_eq!(status, 400);
+            assert!(body.contains("unknown named route"), "{body}");
+        }
+        other => panic!("expected a 400, got {other}"),
+    }
+}
+
+#[test]
+fn routes_do_not_chain() {
+    let router = Router::new().route("a", route("route/b", &[]));
+    assert!(router.resolve("route/a").is_err());
+    assert!(router
+        .expand_route(&serde_json::json!({"model": "route/a"}))
+        .is_err());
+}
+
+#[test]
+fn route_settings_are_defaults_and_the_request_wins() {
+    let router = Router::new()
+        .register("anthropic", Box::new(Anthropic::new("k".into())))
+        .route(
+            "cheap",
+            route(
+                "anthropic/claude-haiku-4-5-20251001",
+                &[
+                    ("reasoning_effort", serde_json::json!("low")),
+                    ("max_tokens", serde_json::json!(4096)),
+                ],
+            ),
+        );
+
+    let request = serde_json::json!({
+        "model": "route/cheap",
+        "messages": [{"role": "user", "content": "hi"}],
+        // The caller overrides one of the route's settings for this call.
+        "reasoning_effort": "high",
+    });
+    let expanded = router.expand_route(&request).unwrap();
+    assert_eq!(expanded["model"], "anthropic/claude-haiku-4-5-20251001");
+    assert_eq!(expanded["reasoning_effort"], "high", "request overrides");
+    assert_eq!(expanded["max_tokens"], 4096, "route fills the rest");
+    assert_eq!(expanded["messages"], request["messages"]);
+
+    // A request that names no route is untouched and not cloned.
+    let plain = serde_json::json!({"model": "anthropic/claude-sonnet-5"});
+    assert!(matches!(
+        router.expand_route(&plain).unwrap(),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}
+
+#[test]
+fn routes_are_configuration_and_parse_from_the_config_file() {
+    let config: llmshim::config::Config = toml::from_str(
+        r#"
+        [routes.compaction]
+        model = "anthropic/claude-haiku-4-5-20251001"
+        reasoning_effort = "low"
+        max_tokens = 4096
+        "#,
+    )
+    .unwrap();
+    let route = &config.routes["compaction"];
+    assert_eq!(route.model, "anthropic/claude-haiku-4-5-20251001");
+    assert_eq!(route.settings["reasoning_effort"], "low");
+    assert_eq!(route.settings["max_tokens"], 4096);
+    assert!(
+        !route.settings.contains_key("model"),
+        "the target is not a setting"
+    );
+}

@@ -18,6 +18,9 @@ pub struct LogEntry {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub total_tokens: u64,
+    /// USD charged for this response, or `null` when the catalog cannot price
+    /// the model. Never `0.0` for an unknown price — see `crate::cost`.
+    pub cost_usd: Option<f64>,
     pub status: String,
     pub gateway_integrity: crate::providers::anthropic_signature::Integrity,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +72,11 @@ impl LogEntry {
             },
             cache_read_tokens: usage["cache_read_tokens"].as_u64().unwrap_or(0),
             cache_write_tokens: usage["cache_write_tokens"].as_u64().unwrap_or(0),
+            // Priced at the transport boundary, which is the only place that
+            // still knows the dispatch target. Fall back to pricing here when a
+            // caller hands us an unstamped response.
+            cost_usd: crate::cost::stamped(&usage)
+                .or_else(|| crate::cost::cost_usd(provider, model, &usage)),
             error: None,
             request_id: response
                 .get("id")
@@ -94,6 +102,7 @@ impl LogEntry {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             total_tokens: 0,
+            cost_usd: None,
             status: "error".to_string(),
             gateway_integrity: crate::providers::anthropic_signature::Integrity::Unknown,
             error: Some(error.to_string()),

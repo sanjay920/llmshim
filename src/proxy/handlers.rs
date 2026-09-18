@@ -5,7 +5,6 @@ use super::types::*;
 use super::AppState;
 use crate::error::ShimError;
 use crate::log::RequestTimer;
-use crate::models;
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -194,21 +193,11 @@ async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
     Sse::new(pin_item(event_stream)).into_response()
 }
 
-/// GET /v1/models — list available models
+/// GET /v1/models — list available models in both the OpenAI list shape
+/// (`object`/`data`, which is what an OpenAI SDK's `models.list()` parses) and
+/// llmshim's own `models` array, which existing clients keep reading.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
-    let provider_keys = state.router.provider_keys();
-    let available = models::available_models(&provider_keys);
-
-    let entries = available
-        .into_iter()
-        .map(|m| ModelEntry {
-            id: m.id.to_string(),
-            provider: m.provider.to_string(),
-            name: m.name.to_string(),
-        })
-        .collect();
-
-    Json(ModelsResponse { models: entries })
+    Json(convert::models_response(&state.router.provider_keys()))
 }
 
 /// GET /health — health check

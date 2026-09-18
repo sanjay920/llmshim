@@ -1,6 +1,7 @@
 pub(crate) mod convert;
 pub(crate) mod error;
 mod handlers;
+pub mod health;
 pub mod ratelimit;
 pub mod types;
 pub mod wire;
@@ -26,6 +27,9 @@ impl AppState {
     /// Construct proxy state, reading rate-limit + backpressure config from the
     /// environment (all optional with safe defaults).
     pub fn from_env(router: Router, logger: Option<Logger>) -> Self {
+        // Provider health is coordinated the same way rate limits are, so a
+        // fleet agrees on which providers are down.
+        let router = router.with_breaker(health::build_breaker());
         Self {
             router,
             logger,

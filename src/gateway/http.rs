@@ -38,11 +38,10 @@ use crate::gateway::{
     StreamChunk,
 };
 use crate::log::{Logger, RequestTimer};
-use crate::models;
 use crate::proxy::convert::{chunk_to_events, request_to_value, value_to_response};
 use crate::proxy::error::ApiError;
 use crate::proxy::ratelimit::{build_limiter, estimate_request_tokens, penalty_duration};
-use crate::proxy::types::{ChatRequest, HealthResponse, ModelEntry, ModelsResponse, StreamEvent};
+use crate::proxy::types::{ChatRequest, HealthResponse, ModelsResponse, StreamEvent};
 use crate::router::Router;
 
 /// The [`Dispatch`] that actually fires upstream LLM calls once the scheduler
@@ -101,6 +100,8 @@ pub struct GatewayState {
     backend: Backend,
     keystore: crate::gateway::auth::KeyStore,
     quota: crate::gateway::quota::TenantQuota,
+    /// Per-identity USD cap, checked before dispatch and charged after.
+    spend: crate::gateway::quota::SpendCap,
     idempotency: crate::gateway::idempotency::IdempotencyCache,
     #[cfg_attr(not(feature = "redis-coordination"), allow(dead_code))]
     idempotency_ttl_secs: u64,
@@ -114,7 +115,8 @@ impl GatewayState {
     /// proxy, plus `LLMSHIM_GATEWAY_*`).
     pub fn from_env(router: Router, logger: Option<Logger>) -> Arc<Self> {
         let config = GatewayConfig::from_env();
-        let router = Arc::new(router);
+        // Same fleet-wide provider health the proxy uses.
+        let router = Arc::new(router.with_breaker(crate::proxy::health::build_breaker()));
         let dispatch = Arc::new(RealDispatch {
             router: router.clone(),
             logger,
@@ -125,6 +127,7 @@ impl GatewayState {
             backend: Backend::Local(scheduler),
             keystore: crate::gateway::auth::KeyStore::from_env(),
             quota: crate::gateway::quota::TenantQuota::new(),
+            spend: crate::gateway::quota::SpendCap::in_memory(),
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(
                 std::time::Duration::from_secs(idem_ttl_secs()),
             ),
@@ -143,7 +146,8 @@ impl GatewayState {
         redis_url: &str,
     ) -> Result<Arc<Self>, String> {
         let config = GatewayConfig::from_env();
-        let router = Arc::new(router);
+        // Same fleet-wide provider health the proxy uses.
+        let router = Arc::new(router.with_breaker(crate::proxy::health::build_breaker()));
         let dispatch = Arc::new(RealDispatch {
             router: router.clone(),
             logger,
@@ -163,11 +167,15 @@ impl GatewayState {
             .map(String::from)
             .collect();
         gateway.spawn_workers(providers);
+        // Spend is shared through the same Redis the queue uses, so a dollar
+        // cap means the same thing on every replica.
+        let spend = crate::gateway::quota::SpendCap::with_store(gateway.clone());
         Ok(Arc::new(Self {
             router,
             backend: Backend::Distributed(gateway),
             keystore: crate::gateway::auth::KeyStore::from_env(),
             quota: crate::gateway::quota::TenantQuota::new(),
+            spend,
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(
                 std::time::Duration::from_secs(idem_ttl_secs()),
             ),
@@ -310,6 +318,27 @@ impl GatewayState {
     }
 }
 
+impl GatewayState {
+    /// Reject a caller that has already spent its window's budget. Dollars are
+    /// fungible across providers, so the ledger is keyed by tenant alone.
+    async fn enforce_budget(
+        &self,
+        identity: &crate::gateway::auth::Identity,
+        provider: &str,
+    ) -> Result<(), ApiError> {
+        match self.spend.check(identity).await {
+            Ok(()) => Ok(()),
+            Err(retry) => {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::REJECTED,
+                    &[("provider", provider), ("reason", "tenant_budget")],
+                );
+                Err(ApiError::RateLimited(retry))
+            }
+        }
+    }
+}
+
 /// Idempotency cache TTL (seconds) from the environment (default 300).
 fn idem_ttl_secs() -> u64 {
     std::env::var("LLMSHIM_GATEWAY_IDEMPOTENCY_TTL_SECS")
@@ -381,6 +410,7 @@ async fn chat(
         .map(str::to_string);
     let (provider_name, gw, identity) = build_request(&state, &headers, &req)?;
     state.enforce_quota(&identity, &provider_name, gw.permits)?;
+    state.enforce_budget(&identity, &provider_name).await?;
 
     // Retry-safety: a repeated Idempotency-Key returns the first result.
     if let Some(key) = &idem_key {
@@ -399,6 +429,10 @@ async fn chat(
             if let Some(key) = &idem_key {
                 state.idem_store(key, &resp).await;
             }
+            state
+                .spend
+                .record(&identity, crate::cost::stamped(&resp["usage"]))
+                .await;
             let elapsed = timer.elapsed().as_millis() as u64;
             Ok(Json(value_to_response(&resp, &provider_name, elapsed)).into_response())
         }
@@ -427,6 +461,9 @@ async fn chat_stream_inner(
     if let Err(e) = state.enforce_quota(&identity, &provider_name, gw.permits) {
         return e.into_response();
     }
+    if let Err(e) = state.enforce_budget(&identity, &provider_name).await {
+        return e.into_response();
+    }
 
     // Admission (queue + rate) happens up front so a rejection is a proper
     // 429/503 before the SSE response begins, not an SSE error event.
@@ -435,11 +472,16 @@ async fn chat_stream_inner(
         Err(err) => return gateway_err_to_api(&state, err).into_response(),
     };
 
+    let ledger = state.clone();
     let event_stream = async_stream::stream! {
         while let Some(item) = rx.recv().await {
             match item {
                 Ok(chunk) => {
                     for event in chunk_to_events(&chunk) {
+                        // A stream's cost arrives with its terminal usage event.
+                        if let crate::proxy::types::StreamEvent::Usage(usage) = &event {
+                            ledger.spend.record(&identity, usage.cost_usd).await;
+                        }
                         let event_type = stream_event_type(&event);
                         if let Ok(data) = serde_json::to_string(&event) {
                             yield Ok(Event::default().event(event_type).data(data));
@@ -478,16 +520,9 @@ fn stream_event_type(event: &StreamEvent) -> &'static str {
 
 /// GET /v1/models — models filtered to configured providers.
 async fn list_models(State(state): State<Arc<GatewayState>>) -> Json<ModelsResponse> {
-    let provider_keys = state.router.provider_keys();
-    let entries = models::available_models(&provider_keys)
-        .into_iter()
-        .map(|m| ModelEntry {
-            id: m.id.to_string(),
-            provider: m.provider.to_string(),
-            name: m.name.to_string(),
-        })
-        .collect();
-    Json(ModelsResponse { models: entries })
+    Json(crate::proxy::convert::models_response(
+        &state.router.provider_keys(),
+    ))
 }
 
 /// GET /metrics — Prometheus text exposition of gateway metrics.
@@ -636,6 +671,8 @@ mod native_tests {
                 tier: 1,
                 rpm: None,
                 tpm: None,
+                budget_usd: None,
+                budget_window_secs: None,
             },
         )]);
         let state = Arc::new(GatewayState {
@@ -643,6 +680,7 @@ mod native_tests {
             backend: Backend::Local(scheduler),
             keystore: crate::gateway::auth::KeyStore::enforced(keys),
             quota: crate::gateway::quota::TenantQuota::new(),
+            spend: crate::gateway::quota::SpendCap::in_memory(),
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
                 30,
             )),
