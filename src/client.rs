@@ -188,6 +188,9 @@ impl ShimClient {
                     if attempt > 0 {
                         result["usage"] = usage;
                     }
+                    // Price after the repair path has settled the final usage,
+                    // so a repaired answer is costed on both attempts' tokens.
+                    crate::cost::stamp(provider.name(), model, &mut result);
                     return Ok(result);
                 }
                 Err(feedback) if attempt == 0 && plan.can_repair(&result) => {
@@ -258,6 +261,7 @@ impl ShimClient {
                     if attempt > 0 {
                         result["usage"] = usage;
                     }
+                    crate::cost::stamp(provider.name(), model, &mut result);
                     return Ok(Box::pin(futures::stream::iter(crate::shim::chunks(result))));
                 }
                 Err(feedback) if attempt == 0 && plan.can_repair(&result) => {
@@ -317,6 +321,7 @@ impl ShimClient {
                     .map_err(|_| crate::shim::failed())?;
                 result["usage"] = usage;
             }
+            crate::cost::stamp(provider.name(), &model, &mut result);
             crate::shim::chunks(result).pop().unwrap()
         })))
     }
@@ -337,14 +342,18 @@ impl ShimClient {
         let target = provider.request_replay_target(model, &provider_req);
         let resp = self.send(&provider_req).await?;
         let events = native_events(resp.bytes_stream());
+        let sse = SseStream {
+            inner: events,
+            normalizer: crate::streaming::StreamNormalizer::new(target.clone()),
+        };
 
-        Ok((
-            Box::pin(SseStream {
-                inner: events,
-                normalizer: crate::streaming::StreamNormalizer::new(target.clone()),
-            }),
-            target,
-        ))
+        // Cost rides on whichever chunk carries usage, the same way the cache
+        // counters do. Chunks without usage are passed through untouched.
+        let (name, model) = (provider.name().to_owned(), model.to_owned());
+        let priced =
+            sse.map(move |item| item.map(|chunk| crate::cost::stamp_chunk(&name, &model, chunk)));
+
+        Ok((Box::pin(priced), target))
     }
 }
 

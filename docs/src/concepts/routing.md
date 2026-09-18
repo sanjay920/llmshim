@@ -70,11 +70,57 @@ perform the second lookup.
 Aliases are not currently configurable through the CLI, config file, proxy
 API, or language clients.
 
+## Named routes
+
+An alias renames a model. A **named route** goes further: it maps a
+caller-defined name to a model *plus* request settings, configured in
+`~/.llmshim/config.toml`.
+
+```toml
+[routes.compaction]
+model = "anthropic/claude-haiku-4-5-20251001"
+reasoning_effort = "low"
+max_tokens = 4096
+```
+
+Address it as a model:
+
+```json
+{"model": "route/compaction", "messages": [{"role": "user", "content": "…"}]}
+```
+
+Because it reuses the `provider/model` grammar, a route works everywhere a
+model address does — the Rust API, the CLI, the proxy, the native endpoints and
+an unmodified OpenAI SDK.
+
+The name is **opaque to llmshim**. A harness may call a route `compaction`,
+`advisor` or `webSearch`; llmshim never interprets it and has no built-in role
+vocabulary. The harness decides what a name means; llmshim provides only the
+mechanism.
+
+Three rules:
+
+- **Settings are defaults.** A key the request already carries wins, so a
+  caller can pick a route and still raise `reasoning_effort` for one call.
+- **An unknown name is an error** (HTTP 400), never a silent fall back to a
+  default model.
+- **Routes do not chain.** A route's `model` may not be another `route/…`.
+
+A Rust application can register routes directly:
+
+```rust
+use llmshim::config::Route;
+
+let router = llmshim::router::Router::new()
+    .route("compaction", Route { model: "anthropic/claude-haiku-4-5-20251001".into(), ..Default::default() });
+```
+
 ## Environment variables versus `config.toml`
 
 `Router::from_env()` reads provider environment variables such as
 `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and `XAI_API_KEY`. It
-does not read `~/.llmshim/config.toml` by itself. It also discovers the selected
+does not read API keys from `~/.llmshim/config.toml` by itself; it does read
+that file's `[routes]` table, which has no environment equivalent. It also discovers the selected
 ChatGPT OAuth cache, whose default location is `~/.llmshim/chatgpt/auth.json`.
 
 The CLI and proxy call `llmshim::env::load_all()` before constructing their

@@ -553,3 +553,54 @@ async fn malformed_tool_calls_are_rejected_before_http_or_sse_dispatch() {
     }
     upstream.assert_async().await;
 }
+
+#[tokio::test]
+async fn unsupported_n_is_refused_in_the_openai_error_shape() {
+    // An OpenAI SDK surfaces `param`/`code`; a bare message string leaves the
+    // caller guessing which parameter it has to drop.
+    let (status, body) = post(
+        app(Router::new(), None),
+        "/v1/chat/completions",
+        json!({"model":"local/test","messages":[{"role":"user","content":"hi"}],"n":2}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["param"], "n");
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("'n'"),
+        "the message must name the parameter: {body}"
+    );
+    assert!(
+        body["error"]["message"].as_str().unwrap().len() < 200,
+        "no JSON envelope should leak into the message: {body}"
+    );
+
+    // `n: 1` is the OpenAI default: it must pass translation and fail later on
+    // the unresolvable provider, not on the parameter.
+    let (_, body) = post(
+        app(Router::new(), None),
+        "/v1/chat/completions",
+        json!({"model":"local/test","messages":[{"role":"user","content":"hi"}],"n":1}),
+    )
+    .await;
+    assert_ne!(
+        body["error"]["code"], "unsupported_parameter",
+        "n=1 must not be refused: {body}"
+    );
+}
+
+#[tokio::test]
+async fn native_error_shape_survives_the_anthropic_facade_too() {
+    let (status, body) = post(
+        app(Router::new(), None),
+        "/v1/messages",
+        json!({"model":"local/test","messages":[{"role":"user","content":"hi"}],"n":2}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(body["error"]["message"].as_str().unwrap().contains("'n'"));
+}

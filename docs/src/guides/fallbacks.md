@@ -89,7 +89,19 @@ address. A success returns immediately. If every address fails, Rust returns
 `all_failed` error response.
 
 Each fallback model must resolve to a provider registered on the Router. A
-chain can cross providers, but only when their keys are configured.
+chain can cross providers, but only when their keys are configured. A chain
+entry may also be a [named route](../concepts/routing.md#named-routes).
+
+## Open circuits are skipped, not retried
+
+A chain also consults provider health, before every attempt rather than once per
+entry — the attempt that opens a circuit is usually the chain's own. When a
+provider's circuit is open, because of too many `5xx`/transport failures in the
+window, the chain abandons that entry, records `circuit open for provider …`
+among the collected errors, and moves to the next address instead of spending
+the rest of its retry budget on a target it already knows is dead. A `429` never
+opens a circuit; that is rate limiting, handled by backoff. See
+[Scaling and rate limits](../proxy/scaling.md#provider-health) for the knobs.
 
 ## Fallback is non-streaming only
 

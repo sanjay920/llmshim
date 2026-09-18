@@ -75,6 +75,42 @@ When neither RPM nor TPM is set, proactive rate limiting is disabled;
 concurrency backpressure still applies. Token permits are estimates based on
 request size and requested output, not provider billing measurements.
 
+## Provider health
+
+Rate limiting and health are different questions. A `429` means the provider is
+alive and asking for less, and the token buckets already slow it down. A
+circuit breaker counts what retrying cannot fix — `500`, `502`, `503`, `504`,
+`529` and transport failures — over a sliding window, opens the circuit at the
+threshold, and admits a single probe after the cooldown.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `LLMSHIM_BREAKER_WINDOW_SECS` | `60` | Sliding window over which failures are counted |
+| `LLMSHIM_BREAKER_TRIP_THRESHOLD` | `3` | Failures that open a circuit; `0` disables the breaker |
+| `LLMSHIM_BREAKER_COOLDOWN_SECS` | `30` | Time an open circuit waits before admitting a probe |
+
+Every dispatch path *observes* outcomes, so health accrues from ordinary
+traffic. Only a [fallback chain](../guides/fallbacks.md) *refuses*: it skips a
+provider with an open circuit instead of spending its retry budget on a target
+it already knows is dead. A single-target request is still dispatched — with no
+alternative, refusing would only convert an upstream failure into a local one.
+
+## Spend caps
+
+The experimental gateway enforces a per-identity USD cap beside the RPM/TPM
+buckets. A gateway key's identity may carry `budget_usd` and an optional
+`budget_window_secs` (default one day); over budget is a `429` with
+`Retry-After` set to the window reset.
+
+```json
+{"sk-example": {"tenant": "acme", "tier": 1, "budget_usd": 100, "budget_window_secs": 86400}}
+```
+
+Cost is only knowable after a response, so the cap is checked before dispatch
+and charged after: one in-flight request can overshoot. A response the catalog
+cannot price (`cost_usd: null`) is **not** charged — recording zero would let an
+unpriced model run forever under a budget, so a hard cap requires priced models.
+
 ## One replica or a coordinated fleet
 
 The default buckets are in memory. With `N` replicas, each replica enforces
@@ -88,8 +124,10 @@ cargo install llmshim --features redis-coordination
 LLMSHIM_REDIS_URL=redis://redis.internal:6379 llmshim proxy
 ```
 
-`redis-coordination` includes the `proxy` feature. Redis is used for rate-limit
-coordination; connection pools and concurrency limits remain per process. If
+`redis-coordination` includes the `proxy` feature. Redis coordinates rate-limit
+buckets, provider health and — on the gateway — spend, so a shared limit, a
+dead provider and a dollar cap all mean the same thing on every replica;
+connection pools and concurrency limits remain per process. If
 Redis becomes unavailable at runtime, limiting fails open so requests continue.
 If the Redis client cannot be initialized—or the binary lacks the feature—the
 proxy warns and falls back to in-memory buckets.

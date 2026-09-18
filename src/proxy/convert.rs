@@ -64,6 +64,42 @@ pub(crate) fn validate_request(req: &ChatRequest) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Release date as a Unix timestamp. The OpenAI list shape types `created` as
+/// an integer, so an undated model reports `0` rather than a null.
+fn released_at(id: &str) -> i64 {
+    crate::catalog::resolve(id)
+        .and_then(|info| info.release_date)
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|at| at.and_utc().timestamp())
+        .unwrap_or(0)
+}
+
+/// Build the shared `GET /v1/models` body: the OpenAI list envelope plus
+/// llmshim's own array. Proxy and gateway serve the identical shape.
+pub(crate) fn models_response(provider_keys: &[&str]) -> super::types::ModelsResponse {
+    let available = crate::models::available_models(provider_keys);
+    super::types::ModelsResponse {
+        object: "list",
+        data: available
+            .iter()
+            .map(|m| super::types::ModelObject {
+                id: m.id.to_string(),
+                object: "model",
+                created: released_at(m.id),
+                owned_by: m.provider.to_string(),
+            })
+            .collect(),
+        models: available
+            .into_iter()
+            .map(|m| super::types::ModelEntry {
+                id: m.id.to_string(),
+                provider: m.provider.to_string(),
+                name: m.name.to_string(),
+            })
+            .collect(),
+    }
+}
+
 /// Convert the OpenAI-format Value response from lib.rs into our ChatResponse.
 pub fn value_to_response(v: &Value, provider: &str, latency_ms: u64) -> ChatResponse {
     let choice = &v["choices"][0];
@@ -129,6 +165,7 @@ pub fn extract_usage(usage: &Value) -> Usage {
         total_tokens: total,
         cache_read_tokens: usage["cache_read_tokens"].as_u64().unwrap_or(0),
         cache_write_tokens: usage["cache_write_tokens"].as_u64().unwrap_or(0),
+        cost_usd: crate::cost::stamped(usage),
     }
 }
 

@@ -55,6 +55,18 @@ fn import_call(call: &Value, receipts: &Receipts, scope: &str) -> Result<Value> 
     }
     Ok(native_call(call))
 }
+/// An OpenAI-shaped `unsupported_parameter` refusal, carried through
+/// `normalize_error` so the client sees `param` and `code`, not a bare string.
+fn unsupported_parameter(param: &str, message: &str) -> String {
+    json!({"error":{
+        "message": message,
+        "type": "invalid_request_error",
+        "param": param,
+        "code": "unsupported_parameter",
+    }})
+    .to_string()
+}
+
 fn message_key(message: &Value) -> Value {
     json!({"content":message["content"],"reasoning_content":message["reasoning_content"],"reasoning":message["reasoning"],"reasoning_details":message["reasoning_details"],"thinking_blocks":message["thinking_blocks"]})
 }
@@ -71,7 +83,17 @@ pub fn request_to_chat(
         .filter(|s| !s.is_empty())
         .ok_or("model is required")?;
     if native.get("n").is_some_and(|n| n != 1) {
-        return Err("this endpoint supports one completion per request".into());
+        // Rejected rather than emulated: llmshim's OpenAI backend is the
+        // Responses API, which has no `n`, and neither do Anthropic Messages or
+        // Gemini generateContent. Emulation would mean N fan-out requests whose
+        // cost, rate-limit footprint and cache behaviour all differ from what
+        // the caller asked for, and the single-message proxy projects choice
+        // zero regardless. A correctly shaped refusal is more useful than a
+        // silently different execution model.
+        return Err(unsupported_parameter(
+            "n",
+            "Unsupported value: 'n' must be 1. This endpoint returns one completion per request.",
+        ));
     }
     if let Some(tools) = native.get("tools") {
         for tool in array(tools, "tools")? {
@@ -286,7 +308,7 @@ pub fn response_from_chat(
             exported["reasoning_content"] = json!(crate::reasoning::reasoning_text(message));
             receipts.put(scope, "reasoning", &message_key(&exported), reasoning)?;
         }
-        json!({"id":response["id"],"object":"chat.completion","created":response.get("created").cloned().unwrap_or(json!(chrono::Utc::now().timestamp())),"model":response["model"],"choices":[{"index":0,"message":exported,"finish_reason":finish}],"usage":{"prompt_tokens":usage["input_tokens"],"completion_tokens":usage["output_tokens"],"total_tokens":usage["total_tokens"],"cache_read_tokens":usage["cache_read_tokens"],"cache_write_tokens":usage["cache_write_tokens"],"prompt_tokens_details":{"cached_tokens":usage["cache_read_tokens"]}}})
+        json!({"id":response["id"],"object":"chat.completion","created":response.get("created").cloned().unwrap_or(json!(chrono::Utc::now().timestamp())),"model":response["model"],"choices":[{"index":0,"message":exported,"finish_reason":finish}],"usage":{"prompt_tokens":usage["input_tokens"],"completion_tokens":usage["output_tokens"],"total_tokens":usage["total_tokens"],"cache_read_tokens":usage["cache_read_tokens"],"cache_write_tokens":usage["cache_write_tokens"],"cost_usd":usage["cost_usd"],"prompt_tokens_details":{"cached_tokens":usage["cache_read_tokens"]}}})
     } else {
         let mut content = Vec::new();
         for block in message["reasoning"].as_array().into_iter().flatten() {
@@ -312,7 +334,7 @@ pub fn response_from_chat(
             let parsed = call_content(&call)?;
             content.push(json!({"type":"tool_use","id":parsed["id"],"name":parsed["name"],"input":parsed["arguments"]}));
         }
-        json!({"id":response["id"],"type":"message","role":"assistant","model":response["model"],"content":content,"stop_reason":match finish{"tool_calls"=>"tool_use","length"=>"max_tokens","content_filter"=>"refusal",_=>"end_turn"},"stop_sequence":null,"usage":{"input_tokens":usage["input_tokens"],"output_tokens":usage["output_tokens"],"cache_read_input_tokens":usage["cache_read_tokens"],"cache_creation_input_tokens":usage["cache_write_tokens"]}})
+        json!({"id":response["id"],"type":"message","role":"assistant","model":response["model"],"content":content,"stop_reason":match finish{"tool_calls"=>"tool_use","length"=>"max_tokens","content_filter"=>"refusal",_=>"end_turn"},"stop_sequence":null,"usage":{"input_tokens":usage["input_tokens"],"output_tokens":usage["output_tokens"],"cache_read_input_tokens":usage["cache_read_tokens"],"cache_creation_input_tokens":usage["cache_write_tokens"],"cost_usd":usage["cost_usd"]}})
     };
     if let Some(served) = response.get("x-llmshim-served-model") {
         out["x-llmshim-served-model"] = served.clone();
