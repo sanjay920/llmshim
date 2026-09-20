@@ -28,7 +28,10 @@ compile-time API for curated and historical facts.
 
 Startup reads the vendored floor, cached data, and local overrides without
 waiting for network. Refresh uses ETags and a 24-hour TTL; errors keep the old
-snapshot available. Offline mode uses only vendored and local layers. User
+snapshot available. `Router::from_env()` schedules one such refresh;
+`Router::from_env_without_catalog_refresh()` schedules none and leaves it to
+`Router::refresh_catalog_in_background()`. Offline mode uses only vendored and
+local layers. User
 overrides live in `~/.config/llmshim/models.toml`, project overrides in
 `.llmshim/models.toml`, and cached data in `~/.cache/llmshim/models.dev.json`.
 Local overrides win; verified builtin assertions win over models.dev data.

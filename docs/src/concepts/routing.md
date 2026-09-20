@@ -136,3 +136,25 @@ let router = llmshim::router::Router::from_env();
 
 Applications that manage secrets themselves can call `Router::from_env()`
 directly or construct a Router by registering provider implementations.
+
+## Catalog refresh is the daemon's default, not the embedder's
+
+`Router::from_env()` also schedules one background fetch of the model catalog
+(prices, context windows, capabilities). That is right for the proxy, which
+starts once and runs for days. A program that starts many times a day, or runs
+air-gapped, should build its router with
+`Router::from_env_without_catalog_refresh()` — identical, except that
+constructing it makes no network call — and refresh only when it decides to:
+
+```rust
+let router = llmshim::router::Router::from_env_without_catalog_refresh();
+if user_asked_for_it {
+    // Rides the caller's Tokio runtime; `None` when there is none, when
+    // LLMSHIM_CATALOG_OFFLINE=1 is set, or when the local catalog is invalid.
+    router.refresh_catalog_in_background();
+}
+```
+
+The offline router still resolves and prices every model in the vendored
+snapshot, any earlier cached download, and the local override files; its data
+is simply never newer than the disk.

@@ -432,3 +432,63 @@ fn routes_are_configuration_and_parse_from_the_config_file() {
         "the target is not a setting"
     );
 }
+
+// ============================================================
+// from_env / from_env_without_catalog_refresh
+// ============================================================
+
+fn alive_tasks() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
+}
+
+fn catalog_offline() -> bool {
+    std::env::var("LLMSHIM_CATALOG_OFFLINE").is_ok_and(|v| v == "1")
+}
+
+/// The refresh's one observable is the task it spawns. On a current-thread
+/// runtime that task cannot run until this test yields, and the test never
+/// does, so the fetch never starts even without `LLMSHIM_CATALOG_OFFLINE`.
+///
+/// Under CI's `LLMSHIM_CATALOG_OFFLINE=1` neither constructor may spawn, so
+/// only the first assertion discriminates there; the `from_env` half is live
+/// when a developer runs the tests without the variable.
+#[tokio::test(flavor = "current_thread")]
+async fn offline_constructor_spawns_no_refresh_and_from_env_still_does() {
+    let before = alive_tasks();
+    let router = Router::from_env_without_catalog_refresh();
+    assert_eq!(
+        alive_tasks(),
+        before,
+        "constructing the router spawned a task"
+    );
+
+    let expected = usize::from(!catalog_offline());
+    let scheduled = router.refresh_catalog_in_background();
+    assert_eq!(scheduled.is_some(), !catalog_offline());
+    assert_eq!(alive_tasks(), before + expected);
+    if let Some(task) = scheduled {
+        task.abort();
+    }
+
+    let before = alive_tasks();
+    let _ = Router::from_env();
+    assert_eq!(
+        alive_tasks(),
+        before + expected,
+        "from_env no longer refreshes"
+    );
+}
+
+/// No refresh still means a catalog: the vendored snapshot resolves without
+/// any network having happened.
+#[test]
+fn offline_constructor_resolves_a_bundled_model() {
+    let router = Router::from_env_without_catalog_refresh()
+        .register("anthropic", Box::new(Anthropic::new("test".into())));
+    let (provider, model) = router.resolve("anthropic/claude-sonnet-5").unwrap();
+    assert_eq!(provider.name(), "anthropic");
+    assert_eq!(model, "claude-sonnet-5");
+    assert!(llmshim::catalog::resolve("anthropic/claude-sonnet-5").is_some());
+}
