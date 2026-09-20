@@ -217,3 +217,56 @@ fn every_provider_filters_reasoning_and_validates_tools_before_serialization() {
         }
     }
 }
+
+/// Two same-role messages side by side — what a harness produces when it
+/// compacts a window and the summary lands beside a kept assistant turn. Only
+/// a wire that rejects adjacency may fold them (Gemini does); everywhere else
+/// the boundary is the caller's and must survive the transform. The inventory
+/// check above means a new adapter has to declare which side it is on.
+#[test]
+fn same_role_adjacency_is_merged_only_where_the_wire_rejects_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let auth = ChatGptAuth::new(dir.path().join("auth.json"));
+    std::fs::write(auth.auth_path(),json!({"access_token":"test-access","refresh_token":"test-refresh","account_id":"test-account","expires_at":chrono::Utc::now().timestamp()+3600}).to_string()).unwrap();
+    let request = json!({"messages":[
+        {"role":"user","content":"question"},
+        {"role":"assistant","content":"first"},
+        {"role":"assistant","content":"second"},
+        {"role":"user","content":"continue"}]});
+
+    for (name, model, provider) in providers(&auth) {
+        let wire = provider.replay_target(model).wire;
+        let body = provider.transform_request(model, &request).unwrap().body;
+        let (turns, assistant) = match wire {
+            WireFormat::GoogleGenerateContent => (&body["contents"], "model"),
+            WireFormat::OpenAiResponses => (&body["input"], "assistant"),
+            WireFormat::AnthropicMessages | WireFormat::OpenAiChat => {
+                (&body["messages"], "assistant")
+            }
+        };
+        let assistant_turns: Vec<_> = turns
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|turn| turn["role"] == assistant)
+            .collect();
+        let text = body.to_string();
+        assert!(
+            text.contains("first") && text.contains("second"),
+            "{name} lost a message's content"
+        );
+        if wire == WireFormat::GoogleGenerateContent {
+            assert_eq!(
+                assistant_turns.len(),
+                1,
+                "{name} must fold adjacent turns; its wire rejects them"
+            );
+        } else {
+            assert_eq!(
+                assistant_turns.len(),
+                2,
+                "{name} must keep the caller's message boundaries; its wire accepts them"
+            );
+        }
+    }
+}

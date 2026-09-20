@@ -40,6 +40,16 @@ impl OpenAiCompatible {
 /// Strip llmshim-normalized / foreign-provider fields and normalize content
 /// blocks to Chat Completions form. Messages, `tool_calls`, and `role: "tool"`
 /// stay in Chat Completions shape (the target format).
+///
+/// Same-role adjacency passes through unchanged, and here the answer is
+/// genuinely the served model's. vLLM and SGLang render `messages` through the
+/// tokenizer's Jinja chat template (or `--chat-template`), so acceptance is a
+/// property of that template: most current ones accept adjacent turns, some
+/// older ones raise — Mistral-7B-Instruct-v0.1's template errors with
+/// "conversation roles must alternate user/assistant/user/assistant/...".
+/// llmshim cannot see the template, so it does not merge; a strict template's
+/// rejection surfaces as the server's own 400. No `x-vllm` / `x-sglang`
+/// parameter changes this.
 fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()

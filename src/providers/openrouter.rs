@@ -61,6 +61,14 @@ fn normalize_openrouter_effort(effort: &str, pro: bool) -> &'static str {
 /// llmshim-normalized / foreign-provider fields so multi-model conversations
 /// don't leak them, and normalize vision blocks to OpenAI form. Messages,
 /// `tool_calls`, and `role: "tool"` all stay in Chat Completions shape.
+///
+/// Same-role adjacency passes through unchanged. OpenRouter is an aggregator:
+/// its own API is Chat Completions and documents no alternation rule
+/// (openrouter.ai/docs, API reference and parameters). Whether the vendor
+/// behind a given slug rejects adjacent turns is unknown from here and is
+/// OpenRouter's to reconcile; a faithful passthrough does not pre-empt it by
+/// merging, which would destroy message boundaries for the vendors that
+/// accept them.
 fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()

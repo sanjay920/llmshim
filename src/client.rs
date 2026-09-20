@@ -1,3 +1,4 @@
+use crate::breaker::ProviderBreaker;
 use crate::error::{Result, ShimError};
 use crate::provider::{Provider, ProviderRequest};
 use bytes::Bytes;
@@ -7,6 +8,7 @@ use futures::{Stream, StreamExt};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Retry bounds, resolved once from the environment (with defaults) at
@@ -55,6 +57,9 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
 pub struct ShimClient {
     http: Client,
     retry: RetryConfig,
+    /// Provider health, fed by every dispatch this client makes. `None` means
+    /// this client reports to nobody — see [`ShimClient::with_breaker`].
+    breaker: Option<Arc<ProviderBreaker>>,
 }
 
 impl Default for ShimClient {
@@ -77,6 +82,36 @@ impl ShimClient {
                 .build()
                 .expect("failed to build HTTP client"),
             retry: RetryConfig::from_env(),
+            breaker: None,
+        }
+    }
+
+    /// Report every dispatch's outcome to `breaker`.
+    ///
+    /// The breaker lives on the [`Router`](crate::router::Router), so a caller
+    /// that resolves a provider itself and comes straight here has to hand it
+    /// over: `ShimClient::new().with_breaker(router.breaker().clone())`. The
+    /// crate's own entry points (`llmshim::completion`, `stream`,
+    /// `completion_with_fallback`) bind the router's breaker this way, so this
+    /// is the one place a dispatch is counted — whichever door it came in by.
+    ///
+    /// Cheap: the HTTP connection pool is shared by clone, so binding a breaker
+    /// per call costs an `Arc` clone, not a new pool.
+    pub fn with_breaker(mut self, breaker: Arc<ProviderBreaker>) -> Self {
+        self.breaker = Some(breaker);
+        self
+    }
+
+    /// Record one dispatch against the attached breaker, if any. Called once
+    /// per public entry point on its *final* result — after transport retries
+    /// and any output-contract repair — so one caller-visible call is one
+    /// observation, never one per attempt.
+    ///
+    /// Takes the projected outcome rather than the result itself so a stream's
+    /// non-`Sync` body is never borrowed across the await.
+    async fn observe(&self, provider: &dyn Provider, outcome: std::result::Result<(), &ShimError>) {
+        if let Some(breaker) = &self.breaker {
+            breaker.observe(provider.name(), outcome).await;
         }
     }
 
@@ -168,6 +203,17 @@ impl ShimClient {
         model: &str,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        let result = self.completion_unobserved(provider, model, request).await;
+        self.observe(provider, result.as_ref().map(|_| ())).await;
+        result
+    }
+
+    async fn completion_unobserved(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let plan = crate::shim::Plan::new(
             provider.name(),
             model,
@@ -233,6 +279,19 @@ impl ShimClient {
         model: &str,
         request: &serde_json::Value,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        // A stream's health verdict is whether it opened; per-chunk failures
+        // are the transport's business, not the breaker's.
+        let opened = self.stream_unobserved(provider, model, request).await;
+        self.observe(provider, opened.as_ref().map(|_| ())).await;
+        opened
+    }
+
+    async fn stream_unobserved(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
         let plan = crate::shim::Plan::new(
             provider.name(),
             model,
@@ -278,7 +337,23 @@ impl ShimClient {
     /// and keepalives while validation and a possible repair are in progress.
     pub async fn stream_owned(
         &self,
-        provider: std::sync::Arc<dyn Provider>,
+        provider: Arc<dyn Provider>,
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        // Observed on the open only. A buffered plan's repair re-opens inside
+        // the returned stream; that second dial is not a separate verdict.
+        let opened = self
+            .stream_owned_unobserved(provider.clone(), model, request)
+            .await;
+        self.observe(provider.as_ref(), opened.as_ref().map(|_| ()))
+            .await;
+        opened
+    }
+
+    async fn stream_owned_unobserved(
+        &self,
+        provider: Arc<dyn Provider>,
         model: &str,
         request: &serde_json::Value,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {

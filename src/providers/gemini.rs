@@ -114,6 +114,12 @@ fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
     (system_instruction, contents)
 }
 
+/// Gemini's own repair, not a shared one. This is the only wire in the crate
+/// known to reject adjacent same-role turns, so it is the only adapter that
+/// folds them together. Every other adapter passes adjacency through — each
+/// says why on its own message pass — because a merge destroys message
+/// boundaries a caller may depend on, and only a wire that would otherwise
+/// fail the request earns that.
 fn merge_same_role(turns: Vec<Value>) -> Vec<Value> {
     let mut merged: Vec<Value> = Vec::new();
     for turn in turns {

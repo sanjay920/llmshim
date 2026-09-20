@@ -22,7 +22,14 @@ llmshim translates the declaration into the provider's caching mechanism.
 }
 ```
 
-`upto_message` is a zero-based index into the supplied messages. Labels are
+`upto_message` is a zero-based index into the `messages` array exactly as you
+sent it — system and developer messages count, and each `role: "tool"` result
+counts as its own entry — not into the provider-native array (Anthropic hoists
+the system prompt out, so native numbering differs). A caller whose own message
+model expands into more wire messages than it holds must remap before copying
+an index across. On Anthropic an index past the end is rejected with a 400,
+and one that lands too early silently caches less than intended; on every
+other provider segments are parsed but neither checked nor placed. Labels are
 informational and are never used to guess prompt semantics. Keep stable sections
 before volatile sections. The proxy accepts the same top-level `x-cache` field;
 Python and Ruby provide a `cache=`/`cache:` keyword, Go has `ChatRequest.Cache`,

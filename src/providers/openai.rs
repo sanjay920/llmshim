@@ -46,6 +46,13 @@ fn strip_cache_control(value: &mut Value) {
 /// - Assistant messages with tool_calls → split into the assistant message +
 ///   separate `function_call` items
 /// - `role: "tool"` messages → `function_call_output` items
+///
+/// Same-role adjacency passes through. `input` is a flat item list, and the
+/// Responses reference documents roles and their precedence but no ordering or
+/// alternation rule (developers.openai.com, Responses API, `input`); this
+/// adapter already emits several `function_call_output` items in a row for
+/// parallel tool calls. Two adjacent assistant messages stay two items. The
+/// ChatGPT adapter goes through this same translator and inherits the stance.
 fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
     let mut result = Vec::new();
     for msg in messages {
