@@ -10,20 +10,75 @@ use std::collections::BTreeMap;
 
 pub const ANTHROPIC_BREAKPOINT_LIMIT: usize = 4;
 
+/// How long the caller expects a prefix to stay byte-stable. Only the caller
+/// knows; llmshim never infers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stability {
+    /// Stable across sessions — a one-hour breakpoint on Anthropic.
     Static,
+    /// Stable for this session — a five-minute breakpoint on Anthropic.
     Session,
+    /// The volatile tail. Places no marker; it exists so a caller can name
+    /// where stability ends.
     Turn,
 }
+
+/// One caller-declared stability boundary: every message up to and including
+/// `upto_message` is expected to stay byte-stable for as long as `stability`
+/// says.
+///
+/// **`upto_message` indexes the request's own `messages` array, exactly as the
+/// caller sent it.** Zero-based, and every entry counts — `system` and
+/// `developer` messages included, and each `role: "tool"` result as its own
+/// entry — because the annotation is applied before any adapter hoists the
+/// system prompt out or reshapes tool results into native turns. It is *not*
+/// an index into the provider-native array Anthropic receives, where the
+/// system message is gone and the numbering has shifted.
+///
+/// A caller whose own message model is richer than the wire's — one entry that
+/// expands into a leading system message plus one wire message per tool
+/// result, say — must remap to the index of the wire message it actually sent.
+/// Copied across unchanged, the boundary lands on the wrong message: too far
+/// and the request is rejected (`400 invalid x-cache: segment message index is
+/// out of range`); too near and less of the prefix is cached than was hashed,
+/// with nothing to say so.
+///
+/// llmshim's own insertions never move this index. A managed-output
+/// instruction merges into an existing system message, and when it has to
+/// prepend one it renumbers every segment itself (`shim.rs`,
+/// `prepend_instruction`).
+///
+/// Honoured on the Anthropic Messages wire only, where it becomes a
+/// `cache_control` breakpoint on the last block of that message (or the last
+/// tool call, or the tool result itself) — unless that last block is a
+/// thinking block, in which case the segment is skipped without a marker.
+/// The bounds check is Anthropic-only too: on every other wire the policy is
+/// still parsed (malformed `x-cache` fails everywhere), but a segment's index
+/// is neither checked nor placed — an out-of-range index there is silently
+/// ignored, not rejected. `label` is the caller's own tag; llmshim never
+/// reads it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheSegment {
+    /// Index into the request's `messages` as sent — see the type-level note.
     pub upto_message: usize,
     #[serde(default)]
     pub label: String,
     pub stability: Stability,
 }
+
+/// The caller's `x-cache` annotation: stability boundaries plus an optional
+/// cache identity. Read once per request and never forwarded to a provider.
+///
+/// The two halves land on different wires. `segments` are Anthropic-only —
+/// see [`CacheSegment`] for the index convention and the no-op rule elsewhere.
+/// `key` is not: on the OpenAI Responses wire it becomes `prompt_cache_key`,
+/// and is ignored on the others. A request may carry both; each wire takes the
+/// half it can use.
+///
+/// Explicit segments supersede any request-level `cache_control` the caller
+/// placed, and Anthropic's four-breakpoint budget is spent from the end of the
+/// request backwards, so the boundaries nearest the tail are the ones kept.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CachePolicy {
     #[serde(default)]

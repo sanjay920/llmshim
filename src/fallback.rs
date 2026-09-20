@@ -1,7 +1,6 @@
 use crate::error::{Result, ShimError};
 use crate::log::{LogEntry, Logger, RequestTimer};
 use crate::router::Router;
-use crate::SHARED_CLIENT;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -75,7 +74,9 @@ pub async fn completion_with_fallback(
     };
 
     let mut errors: Vec<String> = Vec::new();
-    let client = &*SHARED_CLIENT;
+    // Every attempt below is counted by the client against this router's
+    // breaker; the loop only asks `admit` before dialling.
+    let client = crate::bound_client(router);
 
     for model_str in &models {
         // Build request with this model. A named route expands to its model and
@@ -118,10 +119,6 @@ pub async fn completion_with_fallback(
             // Keep OAuth preparation, SSE-only providers, reasoning provenance,
             // and tool normalization identical to an ordinary completion.
             let outcome = client.completion(provider, &model, &req).await;
-            router
-                .breaker()
-                .observe(provider.name(), outcome.as_ref().map(|_| ()))
-                .await;
             match outcome {
                 Ok(result) => {
                     if let Some(logger) = logger {

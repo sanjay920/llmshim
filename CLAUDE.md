@@ -228,8 +228,16 @@ own: sliding failure window, open state, and a single half-open probe admitted
 after the cooldown. Config: `LLMSHIM_BREAKER_WINDOW_SECS` (60),
 `LLMSHIM_BREAKER_TRIP_THRESHOLD` (3; `0` disables), `LLMSHIM_BREAKER_COOLDOWN_SECS` (30).
 
-The breaker hangs on the `Router` (`Router::breaker()` / `with_breaker`). Every
-dispatch path *observes* outcomes so health accrues from ordinary traffic; only
+The breaker hangs on the `Router` (`Router::breaker()` / `with_breaker`), but
+the *counting* happens in `ShimClient`: `ShimClient::with_breaker` attaches one,
+and `completion` / `stream` / `stream_owned` observe their final result exactly
+once. The top-level entry points bind the router's breaker to the shared client
+per call (`lib.rs::bound_client`), so `llmshim::completion`, `stream`,
+`completion_with_fallback` and a caller that resolves its own provider and dials
+`ShimClient` directly all feed the same breaker — the last one only if it opted
+in with `ShimClient::new().with_breaker(router.breaker().clone())`; a bare
+`ShimClient::new()` reports to nobody. Do not add a second `.observe` around a
+client call: one call, one observation (`tests/unit_client_breaker.rs`). Only
 `fallback.rs` *refuses*, and it checks before every attempt rather than once per
 chain entry — the attempt that opens a circuit is usually the chain's own, so a
 per-entry check would still retry into a target it just watched die. A single-target call is still dispatched:

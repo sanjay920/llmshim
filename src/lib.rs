@@ -79,16 +79,13 @@ pub async fn completion_with_logger(
         .ok_or(error::ShimError::MissingModel)?;
 
     let (provider, model) = router.resolve(model_str)?;
-    let client = &*SHARED_CLIENT;
+    let client = bound_client(router);
     let timer = RequestTimer::start();
 
     // Ordinary traffic feeds provider health too, so a chain's first fallback
     // decision is not the first thing that ever noticed a provider is down.
+    // The client does the counting; see `ShimClient::with_breaker`.
     let result = client.completion(provider, &model, request).await;
-    router
-        .breaker()
-        .observe(provider.name(), result.as_ref().map(|_| ()))
-        .await;
 
     match result {
         Ok(resp) => {
@@ -132,13 +129,13 @@ pub async fn stream(
     // Observed but not gated: a single-target call has no alternative, so
     // refusing here would only convert an upstream failure into a local one.
     // The breaker refuses where there is somewhere else to go — `fallback.rs`.
-    let client = &*SHARED_CLIENT;
-    let opened = client.stream_owned(provider.clone(), &model, request).await;
-    // A stream's health verdict is whether it opened; per-chunk failures are
-    // the transport's business, not the breaker's.
-    router
-        .breaker()
-        .observe(provider.name(), opened.as_ref().map(|_| ()))
-        .await;
-    opened
+    bound_client(router)
+        .stream_owned(provider, &model, request)
+        .await
+}
+
+/// The shared HTTP client, reporting to this router's breaker. The pool is
+/// shared by clone; only the breaker handle is per call.
+pub(crate) fn bound_client(router: &Router) -> ShimClient {
+    SHARED_CLIENT.clone().with_breaker(router.breaker().clone())
 }

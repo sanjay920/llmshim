@@ -116,6 +116,17 @@ fn extract_system_message(
     (system, rest)
 }
 
+/// One Chat Completions message in, one Anthropic message out — a `role:
+/// "tool"` result included, which becomes its own `user` message even when it
+/// sits beside another.
+///
+/// Same-role adjacency is deliberately left alone. The Messages API accepts
+/// it: its reference states that consecutive `user` or `assistant` turns in a
+/// request are combined into a single turn server-side (platform.claude.com,
+/// Messages API, `messages` parameter), and parallel tool results already
+/// reach it here as back-to-back `user` messages. Merging locally would only
+/// destroy message boundaries a caller may key on. Gemini is the one wire in
+/// this crate that rejects adjacency, and it merges in its own adapter.
 fn transform_messages(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()

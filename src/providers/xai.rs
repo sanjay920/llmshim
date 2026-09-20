@@ -29,6 +29,13 @@ impl Xai {
 /// - Assistant messages with tool_calls → split into the assistant message +
 ///   separate `function_call` items
 /// - `role: "tool"` messages → `function_call_output` items
+///
+/// Same-role adjacency passes through unchanged. xAI's API is OpenAI
+/// Responses-shaped and its documentation (docs.x.ai, chat guide and API
+/// reference) states no ordering or alternation rule — but silence is not a
+/// verified acceptance, and this has not been checked live. Nothing is merged
+/// here because merging would destroy message boundaries a caller may depend
+/// on; if xAI ever rejects adjacency the rejection arrives as its own 400.
 fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
     let mut result = Vec::new();
     for msg in messages {
