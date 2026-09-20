@@ -223,6 +223,9 @@ jobs:
           else
             npm publish --access public --provenance
           fi
+      - name: Verify npm serves llmshim-darwin-arm64
+        working-directory: clients/typescript/packages/llmshim-darwin-arm64
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
       - name: Publish llmshim-darwin-x64
         working-directory: clients/typescript/packages/llmshim-darwin-x64
         run: |
@@ -234,6 +237,9 @@ jobs:
           else
             npm publish --access public --provenance
           fi
+      - name: Verify npm serves llmshim-darwin-x64
+        working-directory: clients/typescript/packages/llmshim-darwin-x64
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
 
   npm-linux-x64-binary:
     needs: test
@@ -274,6 +280,9 @@ jobs:
           else
             npm publish --access public --provenance
           fi
+      - name: Verify npm serves llmshim-linux-x64
+        working-directory: clients/typescript/packages/llmshim-linux-x64
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
 
   # Native arm64 runner (GA, free on public repos) — no cross-compilation needed.
   npm-linux-arm64-binary:
@@ -315,6 +324,9 @@ jobs:
           else
             npm publish --access public --provenance
           fi
+      - name: Verify npm serves llmshim-linux-arm64
+        working-directory: clients/typescript/packages/llmshim-linux-arm64
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
 
   npm-windows-binary:
     needs: test
@@ -358,6 +370,10 @@ jobs:
           else
             npm publish --access public --provenance
           fi
+      - name: Verify npm serves llmshim-win32-x64
+        shell: bash
+        working-directory: clients/typescript/packages/llmshim-win32-x64
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
 
   # --- Publish TypeScript client to npm ---
   # First release must be published manually once (npm's trusted-publisher UI
@@ -410,6 +426,8 @@ jobs:
           else
             npm publish --access public --provenance
           fi
+      - name: Verify npm serves the TypeScript client
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
 
   # --- Publish Ruby client to RubyGems ---
   # Uses a "pending trusted publisher" — configurable on rubygems.org before

@@ -176,15 +176,35 @@ impl Router {
             .ok_or_else(|| ShimError::UnknownProvider(key.to_string()))
     }
 
-    /// Build a router from provider env vars and a saved ChatGPT login.
+    /// Build a router from provider env vars and a saved ChatGPT login, and
+    /// schedule one background refresh of the model catalog.
+    ///
+    /// This is the daemon's constructor. The proxy starts once and serves for
+    /// days, so a single fetch at startup is what keeps its prices and
+    /// capabilities current for the rest of its life. A process that starts
+    /// many times a day, or must run air-gapped, wants
+    /// [`Router::from_env_without_catalog_refresh`] instead and decides for
+    /// itself when — or whether — to call
+    /// [`Router::refresh_catalog_in_background`].
     pub fn from_env() -> Self {
-        let mut router = Router::new();
+        let router = Self::from_env_without_catalog_refresh();
+        router.refresh_catalog_in_background();
+        router
+    }
 
-        // Only startup's local snapshot is synchronous. No catalog HTTP fetch
-        // is ever awaited by a model request.
-        if let Ok(catalog) = crate::catalog::global() {
-            catalog.refresh_in_background();
-        }
+    /// [`Router::from_env`] minus the catalog refresh: building a router makes
+    /// no network call.
+    ///
+    /// The catalog is still there — the vendored snapshot, whatever an earlier
+    /// refresh cached on disk, and the local override files — so `resolve` and
+    /// pricing work exactly as they do after `from_env`; the data is simply
+    /// never newer than the disk. For a short-lived embedder that is the right
+    /// default: a CLI that phones home for a price list before the user has
+    /// typed anything is doing something nobody asked for, and a machine with
+    /// no route out should not have to discover `LLMSHIM_CATALOG_OFFLINE` to
+    /// stop it. The fetch becomes something the caller asks for.
+    pub fn from_env_without_catalog_refresh() -> Self {
+        let mut router = Router::new();
 
         // Named routes are configuration, not discovery: they come from
         // ~/.llmshim/config.toml and nothing synthesizes a default set.
@@ -228,6 +248,22 @@ impl Router {
         }
 
         router
+    }
+
+    /// Refresh the shared model catalog from the network, detached from every
+    /// request: only startup's local snapshot is synchronous, and no catalog
+    /// HTTP fetch is ever awaited by a model request.
+    ///
+    /// The refresh rides the caller's Tokio runtime and never creates one, so
+    /// `None` means nothing was scheduled: there is no runtime on this thread,
+    /// `LLMSHIM_CATALOG_OFFLINE=1` is set, or the local catalog configuration
+    /// is invalid. The catalog is process-wide — it is what every router in
+    /// the process resolves against — so refreshing through one router
+    /// refreshes it for all of them.
+    pub fn refresh_catalog_in_background(
+        &self,
+    ) -> Option<tokio::task::JoinHandle<crate::catalog::RefreshOutcome>> {
+        crate::catalog::global().ok()?.refresh_in_background()
     }
 
     /// Resolve model string to (provider, model_name).
