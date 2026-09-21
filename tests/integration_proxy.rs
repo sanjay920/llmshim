@@ -49,7 +49,7 @@ async fn health_endpoint() {
         .unwrap();
 
     assert_eq!(resp["status"], "ok");
-    assert!(resp["providers"].as_array().unwrap().len() > 0);
+    assert!(!resp["providers"].as_array().unwrap().is_empty());
 }
 
 // ============================================================
@@ -72,7 +72,7 @@ async fn models_endpoint() {
         .unwrap();
 
     let models = resp["models"].as_array().unwrap();
-    assert!(models.len() > 0);
+    assert!(!models.is_empty());
 
     // Each model should have id, provider, name
     for model in models {
@@ -250,8 +250,7 @@ async fn stream_anthropic() {
     // Parse content events
     let mut full_text = String::new();
     for line in text.lines() {
-        if line.starts_with("data: ") {
-            let data = &line[6..];
+        if let Some(data) = line.strip_prefix("data: ") {
             if let Ok(parsed) = serde_json::from_str::<Value>(data) {
                 if parsed["type"] == "content" {
                     full_text.push_str(parsed["text"].as_str().unwrap_or(""));

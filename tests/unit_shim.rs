@@ -338,7 +338,7 @@ async fn structured_completion_repairs_once_and_counts_both_attempts() {
         .expect(1)
         .create_async()
         .await;
-    let provider = OpenAiCompatible::new("local", &server.url(), None);
+    let provider = OpenAiCompatible::new("local", server.url(), None);
     let mut req = request("prompt", json!({"type":"integer","minimum":3}));
     req["stream"] = json!(true);
     let before = req.clone();
@@ -364,7 +364,7 @@ async fn repair_limit_and_refusal_without_repair() {
         .expect(2)
         .create_async()
         .await;
-    let provider = OpenAiCompatible::new("local", &server.url(), None);
+    let provider = OpenAiCompatible::new("local", server.url(), None);
     let client = llmshim::client::ShimClient::new();
     let req = request("prompt", json!({"type":"integer"}));
     let error = client
@@ -421,7 +421,7 @@ async fn stream_buffers_invalid_attempt_and_emits_only_valid_output_with_total_u
         .await;
     let router = llmshim::router::Router::new().register(
         "local",
-        Box::new(OpenAiCompatible::new("local", &server.url(), None)),
+        Box::new(OpenAiCompatible::new("local", server.url(), None)),
     );
     let req = request("prompt", json!({"type":"integer"}));
     let mut stream = llmshim::stream(&router, &req).await.unwrap();
