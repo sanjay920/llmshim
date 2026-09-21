@@ -46,12 +46,14 @@ fn invalid(message: &str) -> ShimError {
     ShimError::ProviderError {
         status: 400,
         body: message.into(),
+        retry_after: None,
     }
 }
 pub(crate) fn failed() -> ShimError {
     ShimError::ProviderError {
         status: 502,
         body: "response did not satisfy the requested output contract".into(),
+        retry_after: None,
     }
 }
 fn target(wire: WireFormat) -> Target {
@@ -233,9 +235,14 @@ impl Plan {
             return error;
         }
         match error {
-            ShimError::ProviderError { status, .. } => ShimError::ProviderError {
+            ShimError::ProviderError {
+                status,
+                retry_after,
+                ..
+            } => ShimError::ProviderError {
                 status,
                 body: "provider could not complete the requested output contract".into(),
+                retry_after,
             },
             ShimError::Stream(_) => ShimError::Stream(
                 "provider could not complete the requested output contract".into(),

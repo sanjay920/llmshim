@@ -304,6 +304,7 @@ mod tests {
         ShimError::ProviderError {
             status: 503,
             body: "down".into(),
+            retry_after: None,
         }
     }
 
@@ -327,17 +328,20 @@ mod tests {
         assert!(!counts_toward_health(&ShimError::ProviderError {
             status: 429,
             body: "slow down".into(),
+            retry_after: None,
         }));
         for status in [500, 502, 503, 504, 529] {
             assert!(counts_toward_health(&ShimError::ProviderError {
                 status,
                 body: String::new(),
+                retry_after: None,
             }));
         }
         for status in [400, 401, 403, 404, 422] {
             assert!(!counts_toward_health(&ShimError::ProviderError {
                 status,
                 body: String::new(),
+                retry_after: None,
             }));
         }
         assert!(!counts_toward_health(&ShimError::MissingModel));

@@ -18,12 +18,14 @@ pub(crate) fn invalid(message: &str) -> ShimError {
     ShimError::ProviderError {
         status: 400,
         body: format!("invalid tool history: {message}"),
+        retry_after: None,
     }
 }
 pub(crate) fn upstream(message: &str) -> ShimError {
     ShimError::ProviderError {
         status: 502,
         body: format!("invalid upstream tool call: {message}"),
+        retry_after: None,
     }
 }
 

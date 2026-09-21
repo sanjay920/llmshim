@@ -107,5 +107,6 @@ fn invalid() -> ShimError {
     ShimError::ProviderError {
         status: 400,
         body: "max_tokens cannot accommodate the configured reasoning budget".into(),
+        retry_after: None,
     }
 }
