@@ -739,8 +739,12 @@ pub(crate) fn add_usage(total: &mut Value, response: &Value) {
         }
     }
 }
-/// Buffered, validated output uses the same normalized chunk shape as native streams.
-pub(crate) fn chunks(response: Value) -> Vec<Result<String>> {
+/// Re-frame one buffered, validated `chat.completion` as the single
+/// `chat.completion.chunk` a native stream would have delivered — the message
+/// becomes the delta and its assembled `reasoning[]` blocks ride along whole.
+/// Public so an embedder folding streams and buffered answers through one
+/// path can produce the buffered shape itself instead of mirroring this.
+pub fn chunks(response: Value) -> Vec<Result<String>> {
     let mut chunk = response;
     chunk["object"] = json!("chat.completion.chunk");
     if let Some(choices) = chunk["choices"].as_array_mut() {
@@ -753,9 +757,12 @@ pub(crate) fn chunks(response: Value) -> Vec<Result<String>> {
     vec![Ok(chunk.to_string())]
 }
 
-/// Collect already-normalized chunks; native tool arguments are assembled only
-/// by ToolStream, never a second time here.
-pub(crate) async fn collect(
+/// Fold already-normalized `chat.completion.chunk` strings — a native stream
+/// or the one chunk [`chunks`] frames — back into a `chat.completion`. Reasoning
+/// fragments assemble through [`crate::reasoning::ReasoningAccumulator`];
+/// native tool arguments are assembled only by ToolStream, never a second time
+/// here. Public for embedders that need the whole answer after the stream ends.
+pub async fn collect(
     mut stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<String>> + Send>>,
 ) -> Result<Value> {
     use futures::StreamExt;
