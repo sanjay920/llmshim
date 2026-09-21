@@ -65,6 +65,21 @@ impl Default for Router {
     }
 }
 
+/// One self-hosted server from `<NAME>_BASE_URL`, `<NAME>_API_KEY` and
+/// `<NAME>_WIRE`. `None` when no base URL is set.
+fn self_hosted_from_env(name: &str) -> Option<OpenAiCompatible> {
+    let upper = name.to_ascii_uppercase();
+    let base = std::env::var(format!("{upper}_BASE_URL")).ok()?;
+    let key = std::env::var(format!("{upper}_API_KEY"))
+        .ok()
+        .filter(|k| !k.is_empty());
+    let wire = match std::env::var(format!("{upper}_WIRE")).as_deref() {
+        Ok("responses") => crate::reasoning::WireFormat::OpenAiResponses,
+        _ => crate::reasoning::WireFormat::OpenAiChat,
+    };
+    Some(OpenAiCompatible::new(name, base, key).with_wire(wire))
+}
+
 impl Router {
     pub fn new() -> Self {
         Self {
@@ -233,18 +248,12 @@ impl Router {
         // Self-hosted OpenAI-compatible servers: the base URL is the config
         // (local vs remote); the API key is optional. Registered only when the
         // base URL is set. Address as `vllm/<served-model>` / `sglang/<served-model>`.
-        if let Ok(base) = std::env::var("VLLM_BASE_URL") {
-            let key = std::env::var("VLLM_API_KEY").ok().filter(|k| !k.is_empty());
-            router = router.register("vllm", Box::new(OpenAiCompatible::new("vllm", base, key)));
-        }
-        if let Ok(base) = std::env::var("SGLANG_BASE_URL") {
-            let key = std::env::var("SGLANG_API_KEY")
-                .ok()
-                .filter(|k| !k.is_empty());
-            router = router.register(
-                "sglang",
-                Box::new(OpenAiCompatible::new("sglang", base, key)),
-            );
+        // `<NAME>_WIRE=responses` speaks the Responses API to a server that
+        // serves it; anything else is Chat Completions.
+        for name in ["vllm", "sglang"] {
+            if let Some(provider) = self_hosted_from_env(name) {
+                router = router.register(name, Box::new(provider));
+            }
         }
 
         router

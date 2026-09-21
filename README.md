@@ -100,6 +100,18 @@ Then address the served model as `sglang/<served-model>` or `vllm/<served-model>
 (e.g. `sglang/Qwen/Qwen3.6-35B-A3B-FP8`). Server-specific knobs go under
 `x-vllm` / `x-sglang`.
 
+A server that also serves `/v1/responses` (SGLang does) can be spoken to on
+that wire with `SGLANG_WIRE=responses` (or `VLLM_WIRE=responses`). Reasoning
+then comes back as an item with its own id rather than bare `reasoning_content`,
+and is replayed as that item. Replay is gated on a known model family on every
+wire, and the public catalog does not know a served model: declare it once in
+`.llmshim/models.toml` —
+
+```toml
+[models."sglang/<served-model>"]
+family = "qwen"
+```
+
 Or persist them to the config file (used by all three surfaces):
 
 ```bash

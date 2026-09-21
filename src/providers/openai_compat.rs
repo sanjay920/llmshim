@@ -1,5 +1,7 @@
 use crate::error::{Result, ShimError};
 use crate::provider::{Provider, ProviderRequest};
+use crate::providers::openai::OpenAi;
+use crate::reasoning::{ReplayTarget, WireFormat};
 use crate::vision;
 use serde_json::{json, Value};
 
@@ -17,10 +19,18 @@ use serde_json::{json, Value};
 /// `name` (e.g. `"vllm"` / `"sglang"`) is both the provider key and the
 /// extension namespace: server-specific params (`chat_template_kwargs`,
 /// `separate_reasoning`, `guided_json`, `top_k`, …) go under `x-<name>`.
+///
+/// The wire is Chat Completions unless [`OpenAiCompatible::with_wire`] selects
+/// the Responses API, which SGLang also serves at `<base>/responses`. On that
+/// wire reasoning comes back as an item with its own id, so it can be replayed
+/// as a keyed block instead of bare `reasoning_content`; the request and
+/// response translation is the OpenAI adapter's, with this server's URL, its
+/// optional auth, and its `x-<name>` namespace.
 pub struct OpenAiCompatible {
     pub name: String,
     pub base_url: String,
     pub api_key: Option<String>,
+    wire: WireFormat,
 }
 
 impl OpenAiCompatible {
@@ -33,7 +43,66 @@ impl OpenAiCompatible {
             name: name.into(),
             base_url: base_url.into(),
             api_key,
+            wire: WireFormat::OpenAiChat,
         }
+    }
+
+    /// Select the wire this server is spoken to on: `OpenAiChat` (the
+    /// default, `<base>/chat/completions`) or `OpenAiResponses`
+    /// (`<base>/responses`). The other wires are not OpenAI-compatible and
+    /// are a caller error.
+    pub fn with_wire(mut self, wire: WireFormat) -> Self {
+        assert!(
+            matches!(wire, WireFormat::OpenAiChat | WireFormat::OpenAiResponses),
+            "an OpenAI-compatible server speaks Chat Completions or Responses, not {wire:?}"
+        );
+        self.wire = wire;
+        self
+    }
+
+    pub fn wire(&self) -> WireFormat {
+        self.wire
+    }
+
+    /// Auth is optional — self-hosted servers are unauthenticated unless
+    /// launched with --api-key.
+    fn headers(&self) -> Vec<(String, String)> {
+        let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        if let Some(key) = self.api_key.as_deref().filter(|k| !k.is_empty()) {
+            headers.push(("Authorization".to_string(), format!("Bearer {key}")));
+        }
+        headers
+    }
+
+    /// The OpenAI adapter pointed at this server, for the Responses wire. Its
+    /// translation is reused whole; only the URL, the auth and the extension
+    /// namespace are this server's.
+    fn responses_adapter(&self) -> OpenAi {
+        OpenAi::new(self.api_key.clone().unwrap_or_default())
+            .with_base_url(self.base_url.trim_end_matches('/').to_string())
+    }
+
+    fn transform_request_responses(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        // The OpenAI adapter reads its overrides from `x-openai`, and applies
+        // them before the stateless and native-tool passes. Moving `x-<name>`
+        // there keeps that order, so an override cannot re-enable storage.
+        let mut request = request.clone();
+        let namespace = format!("x-{}", self.name);
+        if let Some(ext) = request
+            .as_object_mut()
+            .and_then(|obj| obj.remove(&namespace))
+            .and_then(|ext| ext.as_object().cloned())
+        {
+            let target = request["x-openai"].as_object().cloned().unwrap_or_default();
+            request["x-openai"] = Value::Object(target.into_iter().chain(ext).collect());
+        }
+        let mut sent = self.responses_adapter().transform_request_for_target(
+            model,
+            &request,
+            &self.replay_target(model),
+        )?;
+        sent.headers = self.headers();
+        Ok(sent)
     }
 }
 
@@ -76,16 +145,15 @@ impl Provider for OpenAiCompatible {
         &self.name
     }
 
-    fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
-        crate::reasoning::ReplayTarget::new(
-            self.name(),
-            model,
-            crate::reasoning::WireFormat::OpenAiChat,
-        )
-        .bind_account(&self.base_url, self.api_key.as_deref())
+    fn replay_target(&self, model: &str) -> ReplayTarget {
+        ReplayTarget::new(self.name(), model, self.wire)
+            .bind_account(&self.base_url, self.api_key.as_deref())
     }
 
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        if self.wire == WireFormat::OpenAiResponses {
+            return self.transform_request_responses(model, request);
+        }
         let request = crate::schema::prepare_request(request);
         let request =
             crate::cache::prepare_request(&request, crate::reasoning::WireFormat::OpenAiChat)?;
@@ -140,14 +208,7 @@ impl Provider for OpenAiCompatible {
             }
         }
 
-        let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-        // Auth is optional — self-hosted servers are unauthenticated unless
-        // launched with --api-key.
-        if let Some(key) = &self.api_key {
-            if !key.is_empty() {
-                headers.push(("Authorization".to_string(), format!("Bearer {key}")));
-            }
-        }
+        let headers = self.headers();
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         crate::toolcall::validate_native(&body, &self.replay_target(model))?;
@@ -167,14 +228,26 @@ impl Provider for OpenAiCompatible {
 
     fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
         let native = response.clone();
-        let mut result = self.transform_response_native(model, response)?;
+        let mut result = match self.wire {
+            WireFormat::OpenAiResponses => self
+                .responses_adapter()
+                .transform_response_native(model, response)?,
+            _ => self.transform_response_native(model, response)?,
+        };
+        // Captured against this server's target, not the OpenAI adapter's, so
+        // the block's origin names the provider that actually issued it.
         crate::reasoning::capture_response(&self.replay_target(model), &native, &mut result);
         crate::toolcall::capture_response(&self.replay_target(model), &native, &mut result)?;
         Ok(result)
     }
 
     fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
-        let result = self.transform_stream_chunk_native(model, chunk)?;
+        let result = match self.wire {
+            WireFormat::OpenAiResponses => self
+                .responses_adapter()
+                .transform_stream_chunk_native(model, chunk)?,
+            _ => self.transform_stream_chunk_native(model, chunk)?,
+        };
         let native: Value = match serde_json::from_str(chunk) {
             Ok(v) => v,
             Err(_) => return Ok(result),
