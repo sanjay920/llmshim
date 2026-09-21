@@ -352,11 +352,21 @@ pub struct ReasoningAccumulator {
 }
 impl ReasoningAccumulator {
     pub fn push(&mut self, message: &Value) {
-        for fragment in message["reasoning"].as_array().into_iter().flatten() {
-            let key = fragment["item_id"]
-                .as_str()
-                .map(|s| format!("item:{s}"))
-                .unwrap_or_else(|| format!("index:{}", fragment.get("index").unwrap_or(&json!(0))));
+        for (position, fragment) in message["reasoning"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            // A fragment carrying neither key is a whole block already: a buffered
+            // answer's blocks lose their stream index when they are assembled. Its
+            // position in this message keys it, or every unkeyed block would merge
+            // into one and an encrypted block could swallow a readable one.
+            let key = match (fragment["item_id"].as_str(), fragment.get("index")) {
+                (Some(id), _) => format!("item:{id}"),
+                (None, Some(index)) => format!("index:{index}"),
+                (None, None) => format!("index:{position}"),
+            };
             if !self.parts.contains_key(&key) {
                 self.order.push(key.clone());
             }

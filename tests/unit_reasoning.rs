@@ -321,3 +321,65 @@ fn completed_responses_item_replaces_summary_fragments_without_duplication() {
         .unwrap();
     assert_eq!(req.body["input"][1], item);
 }
+
+/// A buffered answer arrives with whole blocks that carry neither an item id
+/// nor a stream index. Two such blocks — one readable, one encrypted — must
+/// stay two: merged under one key, the encrypted one swallowed the text.
+#[test]
+fn unkeyed_blocks_in_one_message_stay_separate_blocks() {
+    let origin = ReplayTarget::new(
+        "anthropic",
+        "claude-sonnet-5",
+        WireFormat::AnthropicMessages,
+    )
+    .origin();
+    let mut acc = ReasoningAccumulator::default();
+    acc.push(&json!({"reasoning": [
+        {"kind": "text", "text": "first thought", "origin": origin},
+        {"kind": "encrypted", "data": "opaque", "origin": origin},
+    ]}));
+    let blocks = acc.blocks();
+    assert_eq!(blocks.len(), 2, "two unkeyed blocks in, two blocks out");
+    assert_eq!(blocks[0]["text"], "first thought");
+    assert!(blocks[0].get("data").is_none());
+    assert_eq!(blocks[1]["data"], "opaque");
+    assert!(blocks[1].get("text").is_none());
+}
+
+/// Streamed bare fragments still merge: each carries the index the transport
+/// stamped, so successive chunks of one block land under one key as before.
+#[test]
+fn indexed_fragments_across_chunks_still_assemble_one_block() {
+    let mut acc = ReasoningAccumulator::default();
+    acc.push(&json!({"reasoning": [{"index": 0, "text": "the file "}]}));
+    acc.push(&json!({"reasoning": [{"index": 0, "text": "needs replacing"}]}));
+    let blocks = acc.blocks();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["text"], "the file needs replacing");
+}
+
+/// The buffered path end to end: `shim::chunks` frames an assembled answer as
+/// one chunk whose blocks have no index, and folding that chunk through the
+/// accumulator gives the blocks back unmerged.
+#[test]
+fn a_buffered_chunk_folds_back_into_its_separate_blocks() {
+    let origin = ReplayTarget::new(
+        "anthropic",
+        "claude-sonnet-5",
+        WireFormat::AnthropicMessages,
+    )
+    .origin();
+    let response = json!({"object": "chat.completion", "choices": [{"index": 0, "message": {
+        "role": "assistant", "content": "writing it now",
+        "reasoning": [
+            {"kind": "text", "text": "first thought", "origin": origin},
+            {"kind": "encrypted", "data": "opaque", "origin": origin},
+        ]}, "finish_reason": "stop"}]});
+    let chunks = llmshim::shim::chunks(response);
+    assert_eq!(chunks.len(), 1);
+    let chunk: Value = serde_json::from_str(chunks[0].as_ref().unwrap()).unwrap();
+    assert_eq!(chunk["object"], "chat.completion.chunk");
+    let mut acc = ReasoningAccumulator::default();
+    acc.push(&chunk["choices"][0]["delta"]);
+    assert_eq!(acc.blocks().len(), 2);
+}
