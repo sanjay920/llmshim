@@ -50,14 +50,28 @@ fn structured_block(
     Some(b)
 }
 
+/// The readable text of a Responses `reasoning` item. OpenAI's hosted models
+/// put it in `summary[]`; a server returning the model's own reasoning puts it
+/// in `content[]` as `reasoning_text` and leaves the summary empty. The summary
+/// is preferred when both exist; the content is the fallback, or the item's
+/// completed snapshot would replace every streamed delta with nothing.
 fn summary_text(payload: &Value) -> String {
-    payload["summary"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|p| p["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let joined = |field: &str, kind: &str| {
+        payload[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["type"] == kind)
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let summary = joined("summary", "summary_text");
+    if summary.is_empty() {
+        joined("content", "reasoning_text")
+    } else {
+        summary
+    }
 }
 
 pub(super) fn chat_blocks(message: &Value, origin: &ReasoningOrigin) -> Vec<ReasoningBlock> {

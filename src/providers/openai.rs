@@ -363,7 +363,7 @@ impl Provider for OpenAi {
 }
 
 impl OpenAi {
-    fn transform_response_native(&self, model: &str, response: Value) -> Result<Value> {
+    pub(crate) fn transform_response_native(&self, model: &str, response: Value) -> Result<Value> {
         // Check for error (Responses API returns "error": null on success)
         if let Some(err) = response.get("error") {
             if !err.is_null() {
@@ -471,7 +471,11 @@ impl OpenAi {
 }
 
 impl OpenAi {
-    fn transform_stream_chunk_native(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+    pub(crate) fn transform_stream_chunk_native(
+        &self,
+        model: &str,
+        chunk: &str,
+    ) -> Result<Option<String>> {
         let trimmed = chunk.trim();
         if trimmed.is_empty() || trimmed == "[DONE]" {
             return Ok(None);

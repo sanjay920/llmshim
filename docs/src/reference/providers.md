@@ -11,8 +11,8 @@ different native API and translates only the fields that API understands.
 | Google Gemini | `generateContent` / `streamGenerateContent` | `gemini*` | `x-gemini` |
 | xAI | Responses API | `grok*` | none |
 | OpenRouter | Chat Completions (aggregator) | none — address as `openrouter/<vendor>/<model>` | `x-openrouter` |
-| vLLM | Chat Completions (self-hosted, `VLLM_BASE_URL`) | none — address as `vllm/<served-model>` | `x-vllm` |
-| SGLang | Chat Completions (self-hosted, `SGLANG_BASE_URL`) | none — address as `sglang/<served-model>` | `x-sglang` |
+| vLLM | Chat Completions (self-hosted, `VLLM_BASE_URL`); Responses API with `VLLM_WIRE=responses` | none — address as `vllm/<served-model>` | `x-vllm` |
+| SGLang | Chat Completions (self-hosted, `SGLANG_BASE_URL`); Responses API with `SGLANG_WIRE=responses` | none — address as `sglang/<served-model>` | `x-sglang` |
 
 An explicit address such as `anthropic/claude-sonnet-5` avoids inference.
 The named provider must be registered in the Router—that normally means its
