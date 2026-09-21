@@ -56,19 +56,21 @@ fn structured_block(
 /// is preferred when both exist; the content is the fallback, or the item's
 /// completed snapshot would replace every streamed delta with nothing.
 fn summary_text(payload: &Value) -> String {
-    let joined = |field: &str, kind: &str| {
+    let joined = |field: &str, kind: Option<&str>| {
         payload[field]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|p| p["type"] == kind)
+            .filter(|p| kind.is_none_or(|kind| p["type"] == kind))
             .filter_map(|p| p["text"].as_str())
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let summary = joined("summary", "summary_text");
+    // Every summary part is read, as before; only the content fallback is
+    // typed, because a content part can be something other than reasoning.
+    let summary = joined("summary", None);
     if summary.is_empty() {
-        joined("content", "reasoning_text")
+        joined("content", Some("reasoning_text"))
     } else {
         summary
     }
