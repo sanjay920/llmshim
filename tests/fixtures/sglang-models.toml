@@ -1,0 +1,6 @@
+# A self-hosted model the public catalog has never heard of. Replay is gated
+# on a known model family, so a served model must be declared before its
+# reasoning can be sent back — this is that declaration, for the fixtures.
+[models."sglang/qwen3.8-27b-nvfp4"]
+label = "Qwen served by SGLang (fixture)"
+family = "qwen"
