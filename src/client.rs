@@ -169,10 +169,15 @@ impl ShimClient {
                         tokio::time::sleep(wait).await;
                         continue;
                     }
+                    // Read before the body is consumed: the header is the
+                    // server's own wait, and a caller with its own backoff
+                    // above this client gets to honour it too.
+                    let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text().await.unwrap_or_default();
                     return Err(ShimError::ProviderError {
                         status: status_code,
                         body,
+                        retry_after,
                     });
                 }
                 // Transport errors carry no headers: always jittered backoff.

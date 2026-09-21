@@ -288,6 +288,7 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
         .ok_or_else(|| ShimError::ProviderError {
             status: 500,
             body: format!("no candidates in response: {}", resp),
+            retry_after: None,
         })?;
 
     let parts = candidate
@@ -354,6 +355,7 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
             return Err(ShimError::ProviderError {
                 status: 502,
                 body: "Gemini response has no supported terminal finish reason".into(),
+                retry_after: None,
             })
         }
     };
@@ -606,6 +608,7 @@ impl Gemini {
             return Err(ShimError::ProviderError {
                 status: code,
                 body: msg.to_string(),
+                retry_after: None,
             });
         }
         transform_response_to_openai(model, &response)

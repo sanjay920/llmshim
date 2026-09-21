@@ -456,6 +456,7 @@ async fn fallback_replays_each_target_from_the_unchanged_canonical_history() {
             Err(ShimError::ProviderError {
                 status: 503,
                 body: "synthetic failure".into(),
+                retry_after: None,
             })
         }
         fn transform_response(&self, m: &str, r: Value) -> Result<Value> {

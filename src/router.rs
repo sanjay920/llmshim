@@ -142,11 +142,13 @@ impl Router {
                     "unknown named route: {name:?} (configured: {:?})",
                     self.route_names()
                 ),
+                retry_after: None,
             })?;
         if route.model.starts_with(ROUTE_PREFIX) {
             return Err(ShimError::ProviderError {
                 status: 400,
                 body: format!("named route {name:?} targets another route; routes do not chain"),
+                retry_after: None,
             });
         }
         Ok(Some(route))
@@ -301,6 +303,7 @@ impl Router {
         crate::catalog::global().map_err(|error| ShimError::ProviderError {
             status: 400,
             body: format!("invalid model catalog configuration: {error}"),
+            retry_after: None,
         })?;
         let requested = self.aliases.get(model).map(String::as_str).unwrap_or(model);
         let metadata = crate::catalog::resolve(requested).filter(|m| {

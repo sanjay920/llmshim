@@ -55,7 +55,9 @@ pub struct RealDispatch {
 impl RealDispatch {
     fn map_err(err: ShimError) -> DispatchError {
         match err {
-            ShimError::ProviderError { status: 429, body } => DispatchError {
+            ShimError::ProviderError {
+                status: 429, body, ..
+            } => DispatchError {
                 message: body,
                 retry_after: Some(penalty_duration()),
             },
@@ -373,6 +375,7 @@ impl GatewayState {
                          key to run it uncharged.\",\"type\":\"invalid_request_error\",\
                          \"param\":\"model\",\"code\":\"unpriceable_under_budget\"}}}}"
                     ),
+                    retry_after: None,
                 }))
             }
         }
@@ -425,10 +428,12 @@ fn gateway_err_to_api(state: &GatewayState, err: GatewayError) -> ApiError {
         GatewayError::Shutdown => ApiError::from(ShimError::ProviderError {
             status: 503,
             body: "gateway shutting down".to_string(),
+            retry_after: None,
         }),
         GatewayError::Upstream(message) => ApiError::from(ShimError::ProviderError {
             status: 502,
             body: message,
+            retry_after: None,
         }),
     }
 }

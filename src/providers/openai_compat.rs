@@ -262,6 +262,7 @@ impl OpenAiCompatible {
             return Err(ShimError::ProviderError {
                 status: 502,
                 body: "invalid upstream response shape".into(),
+                retry_after: None,
             });
         }
         if let Some(err) = response.get("error") {
@@ -275,6 +276,7 @@ impl OpenAiCompatible {
                 return Err(ShimError::ProviderError {
                     status,
                     body: message,
+                    retry_after: None,
                 });
             }
         }
