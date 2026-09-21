@@ -360,7 +360,9 @@ fn an_unknown_route_is_an_error_not_a_silent_default() {
         Err(e) => e,
     };
     match err {
-        ShimError::ProviderError { status, ref body } => {
+        ShimError::ProviderError {
+            status, ref body, ..
+        } => {
             assert_eq!(status, 400);
             assert!(body.contains("unknown named route"), "{body}");
         }

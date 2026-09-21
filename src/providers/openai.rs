@@ -374,6 +374,7 @@ impl OpenAi {
                 return Err(ShimError::ProviderError {
                     status: 400,
                     body: msg.to_string(),
+                    retry_after: None,
                 });
             }
         }
@@ -384,6 +385,7 @@ impl OpenAi {
             .ok_or_else(|| ShimError::ProviderError {
                 status: 500,
                 body: "no output in response".to_string(),
+                retry_after: None,
             })?;
 
         // Extract reasoning summary
@@ -449,6 +451,7 @@ impl OpenAi {
                 return Err(ShimError::ProviderError {
                     status: 502,
                     body: "OpenAI response has no supported terminal status".into(),
+                    retry_after: None,
                 })
             }
         };

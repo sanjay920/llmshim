@@ -19,8 +19,16 @@ pub enum ShimError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// A non-success response from the provider. `retry_after` is the
+    /// server's own `Retry-After` (delay-seconds or HTTP-date, parsed at
+    /// receipt), so a caller with its own backoff can wait what was asked
+    /// instead of guessing; `None` when the header was absent or unparseable.
     #[error("provider error ({status}): {body}")]
-    ProviderError { status: u16, body: String },
+    ProviderError {
+        status: u16,
+        body: String,
+        retry_after: Option<std::time::Duration>,
+    },
 
     #[error("stream error: {0}")]
     Stream(String),

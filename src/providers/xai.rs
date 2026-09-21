@@ -370,6 +370,7 @@ impl Xai {
                 return Err(ShimError::ProviderError {
                     status: 400,
                     body: msg.to_string(),
+                    retry_after: None,
                 });
             }
         }
@@ -380,6 +381,7 @@ impl Xai {
             .ok_or_else(|| ShimError::ProviderError {
                 status: 500,
                 body: "no output in response".to_string(),
+                retry_after: None,
             })?;
 
         let mut text_content: Option<String> = None;
@@ -440,6 +442,7 @@ impl Xai {
                 return Err(ShimError::ProviderError {
                     status: 502,
                     body: "xAI response has no supported terminal status".into(),
+                    retry_after: None,
                 });
             }
         };

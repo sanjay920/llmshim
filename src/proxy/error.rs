@@ -72,7 +72,7 @@ impl IntoResponse for ApiError {
                 "unknown_provider",
                 format!("Unknown provider or model: {}", p),
             ),
-            crate::error::ShimError::ProviderError { status, body } => {
+            crate::error::ShimError::ProviderError { status, body, .. } => {
                 let http_status = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
                 let code = if *status == 400 {
                     "invalid_request"
