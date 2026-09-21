@@ -382,6 +382,7 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
             return Err(ShimError::ProviderError {
                 status: 502,
                 body: "Anthropic response has no supported terminal stop reason".into(),
+                retry_after: None,
             })
         }
     };
@@ -643,7 +644,7 @@ impl Provider for Anthropic {
             if let Some(thinking) = body_obj.get("thinking") {
                 if thinking["type"] != "adaptive" {
                     return Err(ShimError::ProviderError { status: 400, body:
-                        "Claude Fable requires adaptive thinking; use reasoning_effort to control depth".into() });
+                        "Claude Fable requires adaptive thinking; use reasoning_effort to control depth".into(), retry_after: None });
                 }
             }
             if body_obj
@@ -653,7 +654,7 @@ impl Provider for Anthropic {
                 .is_some_and(|message| message["role"] == "assistant")
             {
                 return Err(ShimError::ProviderError { status: 400, body:
-                    "Claude Fable does not support assistant prefill; end the request with a user turn".into() });
+                    "Claude Fable does not support assistant prefill; end the request with a user turn".into(), retry_after: None });
             }
         }
         if model == "claude-fable-5-1"
@@ -663,7 +664,7 @@ impl Provider for Anthropic {
                 .is_some_and(|kind| matches!(kind, "any" | "tool"))
         {
             return Err(ShimError::ProviderError { status: 400, body:
-                "Claude Fable 5.1 supports only auto or none tool choice; request the desired tool in the prompt".into() });
+                "Claude Fable 5.1 supports only auto or none tool choice; request the desired tool in the prompt".into(), retry_after: None });
         }
 
         // Fast mode support: extract "speed" from the request and apply
@@ -768,6 +769,7 @@ impl Anthropic {
             return Err(ShimError::ProviderError {
                 status: 400,
                 body: msg.to_string(),
+                retry_after: None,
             });
         }
 

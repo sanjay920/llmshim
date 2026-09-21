@@ -267,6 +267,7 @@ impl OpenRouter {
             return Err(ShimError::ProviderError {
                 status: 502,
                 body: "invalid upstream response shape".into(),
+                retry_after: None,
             });
         }
         // Non-stream errors usually surface via HTTP status, but a body-level
@@ -282,6 +283,7 @@ impl OpenRouter {
                 return Err(ShimError::ProviderError {
                     status,
                     body: message,
+                    retry_after: None,
                 });
             }
         }

@@ -91,6 +91,7 @@ fn invalid(message: &str) -> ShimError {
     ShimError::ProviderError {
         status: 400,
         body: format!("invalid x-cache: {message}"),
+        retry_after: None,
     }
 }
 fn policy(request: &Value) -> Result<Option<CachePolicy>> {

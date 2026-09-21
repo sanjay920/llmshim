@@ -571,6 +571,7 @@ pub(crate) fn enforce_stateless(body: &mut Value) -> crate::error::Result<()> {
             .ok_or_else(|| crate::error::ShimError::ProviderError {
                 status: 400,
                 body: "include must be an array".into(),
+                retry_after: None,
             })?;
     if !include.iter().any(|v| v == "reasoning.encrypted_content") {
         include.push(json!("reasoning.encrypted_content"));

@@ -23,6 +23,7 @@ pub(super) fn auth_error(status: u16, message: &str) -> ShimError {
     ShimError::ProviderError {
         status,
         body: format!("ChatGPT: {message}"),
+        retry_after: None,
     }
 }
 

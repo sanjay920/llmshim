@@ -33,6 +33,7 @@ pub fn compile(schema: &Value) -> Result<jsonschema::Validator> {
             return Err(ShimError::ProviderError {
                 status: 400,
                 body: "JSON schema exceeds validation limits".into(),
+                retry_after: None,
             });
         }
     }
@@ -43,6 +44,7 @@ pub fn compile(schema: &Value) -> Result<jsonschema::Validator> {
         .map_err(|_| ShimError::ProviderError {
             status: 400,
             body: "invalid or unresolved JSON schema".into(),
+            retry_after: None,
         })
 }
 
