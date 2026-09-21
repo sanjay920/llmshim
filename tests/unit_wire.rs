@@ -136,7 +136,7 @@ async fn both_native_http_endpoints_use_shared_completion_and_retain_usage() {
     let router = || {
         Router::new().register(
             "local",
-            Box::new(OpenAiCompatible::new("local", &server.url(), None)),
+            Box::new(OpenAiCompatible::new("local", server.url(), None)),
         )
     };
     for (path, wire) in [
@@ -175,7 +175,7 @@ async fn native_sse_has_complete_frames_and_no_internal_event_types() {
     for path in ["/v1/messages", "/v1/chat/completions"] {
         let router = Router::new().register(
             "local",
-            Box::new(OpenAiCompatible::new("local", &server.url(), None)),
+            Box::new(OpenAiCompatible::new("local", server.url(), None)),
         );
         let app =
             app(router, None).layer(Extension(Arc::new(Receipts::new(dir.path().to_owned()))));
@@ -257,7 +257,7 @@ async fn native_text_is_forwarded_before_upstream_completion() {
         "local",
         Box::new(OpenAiCompatible::new(
             "local",
-            &format!("http://{addr}"),
+            format!("http://{addr}"),
             None,
         )),
     );
@@ -346,7 +346,7 @@ async fn upstream_http_errors_become_native_messages_with_inner_types_and_codes(
     let dir = tempfile::tempdir().unwrap();
     let router = Router::new().register(
         "local",
-        Box::new(OpenAiCompatible::new("local", &server.url(), None)),
+        Box::new(OpenAiCompatible::new("local", server.url(), None)),
     );
     let application =
         app(router, None).layer(Extension(Arc::new(Receipts::new(dir.path().to_owned()))));
@@ -452,7 +452,7 @@ async fn upstream_authentication_failure_is_readable_in_native_sse() {
         .expect(2).create_async().await;
     let router = Router::new().register(
         "local",
-        Box::new(OpenAiCompatible::new("local", &server.url(), None)),
+        Box::new(OpenAiCompatible::new("local", server.url(), None)),
     );
     let application = app(router, None);
     for path in ["/v1/messages", "/v1/chat/completions"] {
@@ -489,7 +489,7 @@ async fn first_class_json_and_sse_errors_have_human_readable_messages() {
         .await;
     let router = Router::new().register(
         "local",
-        Box::new(OpenAiCompatible::new("local", &server.url(), None)),
+        Box::new(OpenAiCompatible::new("local", server.url(), None)),
     );
     let application = app(router, None);
     for (path, stream) in [
@@ -535,7 +535,7 @@ async fn malformed_tool_calls_are_rejected_before_http_or_sse_dispatch() {
         .await;
     let router = Router::new().register(
         "local",
-        Box::new(OpenAiCompatible::new("local", &server.url(), None)),
+        Box::new(OpenAiCompatible::new("local", server.url(), None)),
     );
     let application = app(router, None);
     for path in ["/v1/chat", "/v1/chat/stream", "/v1/chat/completions"] {

@@ -14,7 +14,7 @@ fn make_large_payload(model: &str) -> Value {
         lines.push(format!(
             "Data point {}: measurement={:.4}, status=active, category=alpha",
             i,
-            i as f64 * 3.14159
+            i as f64 * std::f64::consts::PI
         ));
     }
     let big_text = lines.join("\n");
@@ -150,7 +150,11 @@ async fn openai_large_context_succeeds() {
     // Use a smaller payload for OpenAI to avoid rate limits / cost
     let mut lines = Vec::with_capacity(10000);
     for i in 0..10000 {
-        lines.push(format!("Entry {}: value={:.2}", i, i as f64 * 2.71828));
+        lines.push(format!(
+            "Entry {}: value={:.2}",
+            i,
+            i as f64 * std::f64::consts::E
+        ));
     }
     let text = lines.join("\n");
 

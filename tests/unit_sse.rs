@@ -1,6 +1,6 @@
-/// Tests for the SSE buffer parser (extract_sse_data).
-/// Since extract_sse_data is private, we test it indirectly through a helper
-/// that reimplements the same logic for validation.
+// Tests for the SSE buffer parser (extract_sse_data).
+// Since extract_sse_data is private, we test it indirectly through a helper
+// that reimplements the same logic for validation.
 
 fn extract_sse_data(buffer: &mut String) -> Option<String> {
     loop {
