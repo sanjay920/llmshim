@@ -7,12 +7,10 @@
 //! — 5xx and transport failures — and the answer to that is to stop sending,
 //! not to send more slowly.
 //!
-//! Adapted from `rcode-provider`'s `ProviderBreaker`, which we own: sliding
-//! failure window, an open state, and a single half-open probe admitted after
-//! the cooldown. The differences here are that failures are classified from
-//! [`ShimError`] rather than rcode's richer failure type, and that the local
-//! registry can be paired with a [`SharedHealth`] backend so a fleet agrees on
-//! which providers are down.
+//! The breaker uses a sliding failure window, an open state, and a single
+//! half-open probe admitted after the cooldown. Failures are classified from
+//! [`ShimError`], and the local registry can be paired with a [`SharedHealth`]
+//! backend so a fleet agrees on which providers are down.
 
 use crate::error::ShimError;
 use std::collections::{HashMap, VecDeque};

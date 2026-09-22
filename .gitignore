@@ -1,4 +1,5 @@
 /target
+/private/
 .env
 *.local.md
 .claude/rules/
