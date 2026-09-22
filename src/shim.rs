@@ -650,6 +650,8 @@ impl Plan {
         Ok(result)
     }
 }
+pub(crate) const JSON_COMPLEXITY_ERROR: &str = "answer exceeds JSON complexity limit";
+
 fn parse_json(text: Option<&str>) -> std::result::Result<Value, Vec<String>> {
     match crate::json_bounds::parse_str(
         text.ok_or_else(|| vec!["missing JSON answer".into()])?,
@@ -659,9 +661,7 @@ fn parse_json(text: Option<&str>) -> std::result::Result<Value, Vec<String>> {
         Err(crate::json_bounds::ParseError::Malformed(_)) => {
             Err(vec!["answer is not valid JSON".into()])
         }
-        Err(crate::json_bounds::ParseError::Complexity) => {
-            Err(vec!["answer exceeds JSON complexity limit".into()])
-        }
+        Err(crate::json_bounds::ParseError::Complexity) => Err(vec![JSON_COMPLEXITY_ERROR.into()]),
     }
 }
 fn prepend_instruction(request: &mut Value, instruction: &str) -> Result<()> {

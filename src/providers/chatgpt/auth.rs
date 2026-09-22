@@ -39,7 +39,11 @@ fn claims(token: &str) -> Option<Value> {
     // Claims are hints for expiry/account routing, not local proof of identity.
     // The upstream validates the token. Never print token contents on errors.
     let payload = token.split('.').nth(1)?.trim_end_matches('=');
-    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()
+    crate::json_bounds::parse_slice(
+        &URL_SAFE_NO_PAD.decode(payload).ok()?,
+        crate::json_bounds::Limits::OAUTH,
+    )
+    .ok()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -430,10 +434,26 @@ async fn oauth_json(response: reqwest::Response, message: &str) -> Result<Value>
         // OAuth bodies can echo credentials. Return only status + fixed context.
         return Err(auth_error(response.status().as_u16(), message));
     }
-    response
-        .json()
-        .await
-        .map_err(|_| auth_error(502, "invalid OAuth JSON response"))
+    use futures::StreamExt;
+    let mut chunks = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| auth_error(502, "invalid OAuth JSON response"))?;
+        if chunk.len() > (1024 * 1024_usize).saturating_sub(bytes.len()) {
+            return Err(auth_error(502, "OAuth JSON response exceeds size limit"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    match crate::json_bounds::parse_slice(&bytes, crate::json_bounds::Limits::OAUTH) {
+        Ok(value) => Ok(value),
+        Err(crate::json_bounds::ParseError::Malformed(_)) => {
+            Err(auth_error(502, "invalid OAuth JSON response"))
+        }
+        Err(crate::json_bounds::ParseError::Complexity) => Err(auth_error(
+            502,
+            "OAuth JSON response exceeds complexity limit",
+        )),
+    }
 }
 
 #[cfg(test)]
