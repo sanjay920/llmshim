@@ -69,6 +69,14 @@ pub(super) fn owners_key(protocol: QueueProtocol, provider: &str) -> String {
     )
 }
 
+pub(super) fn dlq_key(protocol: QueueProtocol, provider: &str) -> String {
+    format!(
+        "{}:dlq:{}:{provider}",
+        lifecycle_prefix(),
+        protocol.scope_name()
+    )
+}
+
 pub(super) fn response_channel(protocol: QueueProtocol, id: &str) -> String {
     format!("{}:resp:{}:{id}", lifecycle_prefix(), protocol.scope_name())
 }
@@ -140,11 +148,14 @@ const RESERVE_LUA: &str = r#"
 const ACTIVATE_LUA: &str = r#"
     if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1]
         or redis.call('HGET', KEYS[1], 'state') ~= 'pending_origin' then return 0 end
+    local waiting = 0
+    for index = 3, 8 do waiting = waiting + redis.call('ZCARD', KEYS[index]) end
+    if waiting >= tonumber(ARGV[6]) then return -1 end
     local redis_time = redis.call('TIME')
     local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
     redis.call('HSET', KEYS[1], 'state', 'waiting')
     redis.call('ZADD', KEYS[3], ARGV[3], ARGV[2])
-    redis.call('ZADD', KEYS[4], now_ms + tonumber(ARGV[4]), ARGV[2])
+    redis.call('ZADD', KEYS[9], now_ms + tonumber(ARGV[4]), ARGV[2])
     redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]) + tonumber(ARGV[5]))
     redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[4]) + tonumber(ARGV[5]))
     return 1
@@ -161,7 +172,7 @@ const CANCEL_LUA: &str = r#"
     if state == 'pending_origin' or state == 'waiting' then
         redis.call('ZREM', KEYS[3], ARGV[2])
         redis.call('SET', KEYS[2], ARGV[5])
-        redis.call('HSET', KEYS[1], 'state', 'terminal', 'terminal_charge', string.len(ARGV[5]))
+        redis.call('HSET', KEYS[1], 'state', 'terminal', 'terminal_charge', '0')
         local redis_time = redis.call('TIME')
         local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
         redis.call('ZADD', KEYS[4], now_ms + tonumber(ARGV[3]), ARGV[2])
@@ -188,6 +199,7 @@ const CLEANUP_LUA: &str = r#"
                 local provider = redis.call('HGET', meta, 'provider')
                 if scope and provider then
                     redis.call('ZREM', ARGV[2] .. ':q:' .. scope .. ':' .. provider, member)
+                    redis.call('ZREM', ARGV[2] .. ':dlq:' .. scope .. ':' .. provider, member)
                 end
                 local base_charge = redis.call('HGET', KEYS[2], member)
                 if base_charge and redis.call('HDEL', KEYS[2], member) == 1 then
@@ -196,6 +208,9 @@ const CLEANUP_LUA: &str = r#"
                     local terminal_charge = tonumber(redis.call('HGET', meta, 'terminal_charge') or '0')
                     if terminal_charge > 0 then
                         redis.call('HINCRBY', KEYS[3], 'terminal_bytes', -terminal_charge)
+                    end
+                    if state == 'dlq' then
+                        redis.call('HINCRBY', KEYS[3], 'dlq_bytes', -tonumber(base_charge))
                     end
                 end
                 redis.call('DEL', meta, ARGV[2] .. ':job:' .. id .. ':payload',
@@ -249,12 +264,28 @@ const CACHE_GET_LUA: &str = r#"
     return value
 "#;
 
+const EXTEND_TERMINAL_LUA: &str = r#"
+    if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1]
+        or redis.call('HGET', KEYS[1], 'state') ~= 'terminal' then return 0 end
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    redis.call('ZADD', KEYS[4], 'GT', now_ms + tonumber(ARGV[2]), ARGV[3])
+    local hard_ttl = tonumber(ARGV[2]) + tonumber(ARGV[4])
+    for index = 1, 3 do
+        local current_ttl = redis.call('PTTL', KEYS[index])
+        if current_ttl < hard_ttl then redis.call('PEXPIRE', KEYS[index], hard_ttl) end
+    end
+    return 1
+"#;
+
 static RESERVE: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(RESERVE_LUA));
 static ACTIVATE: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(ACTIVATE_LUA));
 static CANCEL: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(CANCEL_LUA));
 static CLEANUP: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(CLEANUP_LUA));
 static CACHE_PUT: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(CACHE_PUT_LUA));
 static CACHE_GET: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(CACHE_GET_LUA));
+static EXTEND_TERMINAL: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(EXTEND_TERMINAL_LUA));
 
 #[derive(Clone, Copy)]
 pub(super) struct Limits {
@@ -275,6 +306,39 @@ impl Default for Limits {
             stream_terminal_bytes: DEFAULT_STREAM_TERMINAL_BYTES,
         }
     }
+}
+
+impl Limits {
+    pub(super) fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            max_jobs: positive_env("LLMSHIM_GATEWAY_RETAINED_JOBS", defaults.max_jobs),
+            max_base_bytes: positive_env(
+                "LLMSHIM_GATEWAY_RETAINED_BASE_BYTES",
+                defaults.max_base_bytes,
+            ),
+            max_terminal_bytes: positive_env(
+                "LLMSHIM_GATEWAY_RETAINED_TERMINAL_BYTES",
+                defaults.max_terminal_bytes,
+            ),
+            unary_terminal_bytes: positive_env(
+                "LLMSHIM_GATEWAY_UNARY_TERMINAL_BYTES",
+                defaults.unary_terminal_bytes,
+            ),
+            stream_terminal_bytes: positive_env(
+                "LLMSHIM_GATEWAY_STREAM_TERMINAL_BYTES",
+                defaults.stream_terminal_bytes,
+            ),
+        }
+    }
+}
+
+fn positive_env(name: &str, fallback: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
 }
 
 pub(super) struct ReservedJob {
@@ -346,6 +410,7 @@ pub(super) async fn reserve(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn activate(
     connection: &mut ConnectionManager,
     protocol: QueueProtocol,
@@ -354,27 +419,40 @@ pub(super) async fn activate(
     reserved: &ReservedJob,
     priority_score: f64,
     waiting_ttl: Duration,
+    maximum_waiting: usize,
+    capacity_queue_keys: [&str; 5],
 ) -> redis::RedisResult<bool> {
-    let activated: i64 = ACTIVATE
-        .key(meta_key(id))
+    let mut invocation = ACTIVATE.key(meta_key(id));
+    invocation
         .key(payload_key(id))
         .key(queue_key(protocol, provider))
-        .key(expiry_key())
+        .key(capacity_queue_keys[0])
+        .key(capacity_queue_keys[1])
+        .key(capacity_queue_keys[2])
+        .key(capacity_queue_keys[3])
+        .key(capacity_queue_keys[4])
+        .key(expiry_key());
+    invocation
         .arg(&reserved.generation)
         .arg(&reserved.member)
         .arg(priority_score)
         .arg(duration_millis(waiting_ttl))
         .arg(CLEANUP_GRACE_MS)
-        .invoke_async(connection)
-        .await?;
+        .arg(maximum_waiting);
+    let activated: i64 = invocation.invoke_async(connection).await?;
     Ok(activated == 1)
 }
 
 pub(super) async fn read_terminal(
     connection: &mut ConnectionManager,
     id: &str,
+    expected_generation: &str,
 ) -> redis::RedisResult<Option<BusMessage>> {
     use redis::AsyncCommands;
+    let actual_generation: Option<String> = connection.hget(meta_key(id), "generation").await?;
+    if actual_generation.as_deref() != Some(expected_generation) {
+        return Ok(None);
+    }
     let serialized: Option<Vec<u8>> = connection.get(terminal_key(id)).await?;
     Ok(serialized.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
 }
@@ -506,6 +584,27 @@ pub(super) async fn scoped_pointer_get(
         .await
 }
 
+pub(super) async fn extend_terminal_retention(
+    connection: &mut ConnectionManager,
+    id: &str,
+    generation: &str,
+    ttl_secs: u64,
+) -> redis::RedisResult<bool> {
+    let member = format!("{id}:{generation}");
+    let extended: i64 = EXTEND_TERMINAL
+        .key(meta_key(id))
+        .key(terminal_key(id))
+        .key(payload_key(id))
+        .key(expiry_key())
+        .arg(generation)
+        .arg(ttl_secs.saturating_mul(1_000))
+        .arg(member)
+        .arg(CLEANUP_GRACE_MS)
+        .invoke_async(connection)
+        .await?;
+    Ok(extended == 1)
+}
+
 pub(super) fn serialize_bounded<T: Serialize>(
     value: &T,
     maximum_bytes: usize,
@@ -574,6 +673,13 @@ mod tests {
             format!("old:3:p:{old_provider}"),
             format!("old:4:q:{old_provider}"),
             format!("old:4:p:{old_provider}"),
+        ];
+        let capacity_keys = [
+            old_keys[0].as_str(),
+            old_keys[1].as_str(),
+            old_keys[2].as_str(),
+            old_keys[3].as_str(),
+            old_keys[4].as_str(),
         ];
         for key in [
             generation_key(),
@@ -666,6 +772,8 @@ mod tests {
             &first,
             1.0,
             Duration::from_secs(60),
+            10,
+            capacity_keys,
         )
         .await
         .unwrap());
@@ -698,6 +806,8 @@ mod tests {
             &first,
             1.0,
             Duration::from_secs(60),
+            10,
+            capacity_keys,
         )
         .await
         .unwrap());
@@ -709,6 +819,8 @@ mod tests {
             &replacement,
             1.0,
             Duration::from_secs(60),
+            10,
+            capacity_keys,
         )
         .await
         .unwrap());

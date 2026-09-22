@@ -321,6 +321,45 @@ redelivery can still make another external call; lease fencing prevents stale
 local publication and cleanup but cannot make an external provider exactly
 once.
 
+New distributed submissions use lifecycle-v1 storage. Queue and processing
+indexes contain only an opaque job ID plus a Redis-owned generation; the exact
+serialized request is stored once and Lua never decodes or rewrites it. Reserve
+and activate are separate state transitions, so an uncertain reserve is not
+dispatchable until its matching generation activates. Delayed operations from
+an older generation cannot resurrect or mutate a replacement job.
+
+Lifecycle storage defaults to 10,000 retained jobs, 512 MiB of request/metadata
+bytes, and a separate 512 MiB terminal pool. Environment overrides are
+`LLMSHIM_GATEWAY_RETAINED_JOBS`, `LLMSHIM_GATEWAY_RETAINED_BASE_BYTES`, and
+`LLMSHIM_GATEWAY_RETAINED_TERMINAL_BYTES`. Workers reserve terminal capacity
+before provider dispatch: 64 MiB for unary and 128 KiB for stream terminal
+state, configurable with `LLMSHIM_GATEWAY_UNARY_TERMINAL_BYTES` and
+`LLMSHIM_GATEWAY_STREAM_TERMINAL_BYTES`.
+
+The 64 MiB unary value is a distributed-service limit on the serialized
+normalized terminal envelope. It is distinct from the 32 MiB decoded raw
+upstream limit because normalization and JSON escaping can expand data. A
+bounded serializer stops before allocating beyond the limit. An over-limit
+normalized result becomes a fixed size error; ordinary shared-capacity pressure
+cannot discard an otherwise valid paid result because the full headroom was
+reserved before send.
+
+Terminal envelopes are retained durably for bus-loss readback. Scoped
+idempotency stores a bounded pointer to that single terminal copy instead of a
+second response. The deprecated generic Redis cache is separately bounded to
+100,000 entries, 1 MiB per value, 64 MiB total, and at most one day of TTL.
+Expired lifecycle records are removed in fixed-size batches; state movement
+between waiting, processing, requeue, terminal, and DLQ does not double-count
+request bytes. New DLQ retention is limited to 1,000 entries, 64 MiB and 24
+hours.
+
+Lifecycle-v1 ingress remains disabled while any known older waiting or
+processing namespace is nonempty. Stop old ingress and let matching old workers
+drain those fixed keys; lifecycle startup does not scan, migrate, or delete old
+members. Historical DLQ lists and deprecated generic-cache keys are not covered
+by the new bound until an operator explicitly inventories and removes them.
+Legacy scoped response-cache keys expire after their configured cutover TTL.
+
 For a rolling upgrade, first stop old ingress. Keep the matching old workers
 until both the waiting and processing sorted sets in each released namespace
 are empty for every provider, then remove those workers. Old work retains its

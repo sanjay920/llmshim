@@ -89,6 +89,7 @@ fn protocol_key(protocol: QueueProtocol, kind: &str, identifier: &str) -> String
         "proc" => lifecycle::processing_key(protocol, identifier),
         "leased" => lifecycle::leased_key(protocol, identifier),
         "owners" => lifecycle::owners_key(protocol, identifier),
+        "dlq" => lifecycle::dlq_key(protocol, identifier),
         "resp" => lifecycle::response_channel(protocol, identifier),
         _ => format!(
             "llmshim:gw:lifecycle:v1:{}:{kind}:{identifier}",
@@ -165,6 +166,14 @@ fn generic_idempotency_key(client_key: &str) -> String {
 // processing, leased, owners, lifecycle counters. ARGV: lease_duration_ms,
 // owner_token, terminal pool max, unary headroom, stream headroom, job prefix.
 const LEASE_LUA: &str = r#"
+    if not ARGV[6] then
+        local legacy_top = redis.call('ZPOPMIN', KEYS[1], 1)
+        if #legacy_top == 0 then return false end
+        redis.call('ZADD', KEYS[2], ARGV[1], legacy_top[1])
+        redis.call('HSET', KEYS[3], legacy_top[1], legacy_top[2])
+        redis.call('HSET', KEYS[4], legacy_top[1], ARGV[2])
+        return {legacy_top[1], legacy_top[2]}
+    end
     local top = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
     if #top == 0 then return false end
     local m = top[1]
@@ -182,7 +191,9 @@ const LEASE_LUA: &str = r#"
     local terminal_charge = tonumber(ARGV[4])
     if redis.call('HGET', meta, 'stream') == '1' then terminal_charge = tonumber(ARGV[5]) end
     local terminal_bytes = tonumber(redis.call('HGET', KEYS[5], 'terminal_bytes') or '0')
-    if terminal_bytes + terminal_charge > tonumber(ARGV[3]) then return false end
+    local existing_charge = tonumber(redis.call('HGET', meta, 'terminal_charge') or '0')
+    if existing_charge > 0 then terminal_charge = existing_charge
+    elseif terminal_bytes + terminal_charge > tonumber(ARGV[3]) then return false end
     local payload = redis.call('GET', payload_key)
     if not payload then return false end
     local redis_time = redis.call('TIME')
@@ -191,7 +202,7 @@ const LEASE_LUA: &str = r#"
     redis.call('ZADD', KEYS[2], now_ms + ARGV[1], m)
     redis.call('HSET', KEYS[3], m, s)
     redis.call('HSET', KEYS[4], m, ARGV[2])
-    redis.call('HINCRBY', KEYS[5], 'terminal_bytes', terminal_charge)
+    if existing_charge == 0 then redis.call('HINCRBY', KEYS[5], 'terminal_bytes', terminal_charge) end
     redis.call('HSET', meta, 'state', 'processing', 'owner', ARGV[2],
         'terminal_charge', terminal_charge)
     return {m, s, payload}
@@ -324,7 +335,8 @@ const TERMINAL_PUBLISH_COMPLETE_LUA: &str = r#"
 
 // Move only the caller's delivery to the bounded lifecycle DLQ. KEYS:
 // processing, leased, owners, dlq, counters, metadata, expiry, reservations,
-// payload. ARGV: member, owner_token, generation, ttl_ms, max_count, max_bytes.
+// payload, terminal. ARGV: member, owner_token, generation, ttl_ms, max_count,
+// max_bytes, terminal_ttl_ms, channel, terminal envelope.
 const DEAD_LETTER_LUA: &str = r#"
     if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 0 end
     if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
@@ -337,14 +349,13 @@ const DEAD_LETTER_LUA: &str = r#"
     if terminal_charge > 0 then
         redis.call('HINCRBY', KEYS[5], 'terminal_bytes', -terminal_charge)
     end
+    redis.call('SET', KEYS[10], ARGV[9])
     if overflow then
-        if redis.call('HDEL', KEYS[8], ARGV[1]) == 1 then
-            redis.call('HINCRBY', KEYS[5], 'jobs', -1)
-            redis.call('HINCRBY', KEYS[5], 'base_bytes', -base_charge)
-        end
         redis.call('HINCRBY', KEYS[5], 'dlq_overflow', 1)
-        redis.call('DEL', KEYS[6], KEYS[9])
-        redis.call('ZREM', KEYS[7], ARGV[1])
+        redis.call('HSET', KEYS[6], 'state', 'terminal', 'terminal_charge', '0')
+        local redis_time = redis.call('TIME')
+        local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+        redis.call('ZADD', KEYS[7], now_ms + tonumber(ARGV[7]), ARGV[1])
     else
         local redis_time = redis.call('TIME')
         local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
@@ -353,6 +364,7 @@ const DEAD_LETTER_LUA: &str = r#"
         redis.call('HINCRBY', KEYS[5], 'dlq_bytes', base_charge)
         redis.call('HSET', KEYS[6], 'state', 'dlq', 'terminal_charge', '0')
     end
+    redis.call('PUBLISH', ARGV[8], ARGV[9])
     redis.call('ZREM', KEYS[1], ARGV[1])
     redis.call('HDEL', KEYS[2], ARGV[1])
     redis.call('HDEL', KEYS[3], ARGV[1])
@@ -557,7 +569,14 @@ impl DistributedGateway {
         attempt_coordinator: Option<Arc<crate::gateway::attempt::AttemptCoordinator>>,
     ) -> redis::RedisResult<Arc<Self>> {
         let client = redis::Client::open(redis_url)?;
-        let conn = ConnectionManager::new(client.clone()).await?;
+        let conn = tokio::time::timeout(
+            Duration::from_secs(5),
+            ConnectionManager::new(client.clone()),
+        )
+        .await
+        .map_err(|_| {
+            redis::RedisError::from((redis::ErrorKind::Io, "Redis connection timed out"))
+        })??;
         let nonce = uuid::Uuid::new_v4().as_u128();
         let configured_redis_operation_timeout = positive_duration_from_env(
             "LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS",
@@ -591,7 +610,7 @@ impl DistributedGateway {
             bump_attempts_script: redis::Script::new(BUMP_ATTEMPTS_LUA),
             redis_operation_timeout,
             worker_job_timeout,
-            lifecycle_limits: lifecycle::Limits::default(),
+            lifecycle_limits: lifecycle::Limits::from_env(),
             #[cfg(test)]
             terminal_operation_delay: Duration::ZERO,
         }))
@@ -601,11 +620,15 @@ impl DistributedGateway {
     #[deprecated(note = "gateway HTTP replay uses credential-scoped idempotency")]
     pub async fn idem_get(&self, key: &str) -> Option<Value> {
         let mut connection = self.conn.clone();
-        lifecycle::generic_cache_get(&mut connection, &generic_idempotency_key(key))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|value| serde_json::from_slice(&value).ok())
+        tokio::time::timeout(
+            self.redis_operation_timeout,
+            lifecycle::generic_cache_get(&mut connection, &generic_idempotency_key(key)),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .and_then(|value| serde_json::from_slice(&value).ok())
     }
 
     /// Generic Redis cache insertion retained for API compatibility.
@@ -613,11 +636,14 @@ impl DistributedGateway {
     pub async fn idem_put(&self, key: &str, value: &Value, ttl_secs: u64) {
         if let Ok(serialized_value) = serde_json::to_string(value) {
             let mut connection = self.conn.clone();
-            let _ = lifecycle::generic_cache_put(
-                &mut connection,
-                &generic_idempotency_key(key),
-                serialized_value.as_bytes(),
-                ttl_secs,
+            let _ = tokio::time::timeout(
+                self.redis_operation_timeout,
+                lifecycle::generic_cache_put(
+                    &mut connection,
+                    &generic_idempotency_key(key),
+                    serialized_value.as_bytes(),
+                    ttl_secs,
+                ),
             )
             .await;
         }
@@ -629,12 +655,14 @@ impl DistributedGateway {
         context: &crate::gateway::idempotency::IdempotencyContext,
     ) -> crate::gateway::idempotency::IdempotencyLookup {
         let mut connection = self.conn.clone();
-        let Some(serialized_pointer) =
-            lifecycle::scoped_pointer_get(&mut connection, &scoped_idempotency_key(context))
-                .await
-                .ok()
-                .flatten()
-        else {
+        let Some(serialized_pointer) = tokio::time::timeout(
+            self.redis_operation_timeout,
+            lifecycle::scoped_pointer_get(&mut connection, &scoped_idempotency_key(context)),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten() else {
             return crate::gateway::idempotency::IdempotencyLookup::Miss;
         };
         let Ok(pointer) = serde_json::from_slice::<ScopedIdempotencyPointer>(&serialized_pointer)
@@ -644,8 +672,13 @@ impl DistributedGateway {
         if pointer.request_fingerprint != context.request_fingerprint() {
             return crate::gateway::idempotency::IdempotencyLookup::Conflict;
         }
-        match lifecycle::read_terminal(&mut connection, &pointer.job_id).await {
-            Ok(Some(BusMessage::Unary(value))) => {
+        match tokio::time::timeout(
+            self.redis_operation_timeout,
+            lifecycle::read_terminal(&mut connection, &pointer.job_id, &pointer.generation),
+        )
+        .await
+        {
+            Ok(Ok(Some(BusMessage::Unary(value)))) => {
                 crate::gateway::idempotency::IdempotencyLookup::Replay(value)
             }
             _ => crate::gateway::idempotency::IdempotencyLookup::Miss,
@@ -666,11 +699,29 @@ impl DistributedGateway {
         };
         if let Ok(serialized_pointer) = serde_json::to_vec(&pointer) {
             let mut connection = self.conn.clone();
-            let _ = lifecycle::scoped_pointer_put(
-                &mut connection,
-                &scoped_idempotency_key(context),
-                &serialized_pointer,
-                ttl_secs,
+            if !matches!(
+                tokio::time::timeout(
+                    self.redis_operation_timeout,
+                    lifecycle::extend_terminal_retention(
+                        &mut connection,
+                        &lifecycle_reference.job_id,
+                        &lifecycle_reference.generation,
+                        ttl_secs,
+                    ),
+                )
+                .await,
+                Ok(Ok(true))
+            ) {
+                return;
+            }
+            let _ = tokio::time::timeout(
+                self.redis_operation_timeout,
+                lifecycle::scoped_pointer_put(
+                    &mut connection,
+                    &scoped_idempotency_key(context),
+                    &serialized_pointer,
+                    ttl_secs,
+                ),
             )
             .await;
         }
@@ -679,11 +730,14 @@ impl DistributedGateway {
     /// Liveness check: `PING` Redis (readiness gate for the fleet).
     pub async fn ping(&self) -> bool {
         let mut conn = self.conn.clone();
-        redis::cmd("PING")
-            .query_async::<String>(&mut conn)
-            .await
-            .map(|r| r == "PONG")
-            .unwrap_or(false)
+        matches!(
+            tokio::time::timeout(
+                self.redis_operation_timeout,
+                redis::cmd("PING").query_async::<String>(&mut conn),
+            )
+            .await,
+            Ok(Ok(response)) if response == "PONG"
+        )
     }
 
     #[cfg(test)]
@@ -712,12 +766,22 @@ impl DistributedGateway {
                 .zcard(released_queue_key(QueueProtocol::ScopedV1, p))
                 .await
                 .unwrap_or(0);
+            let l1_unscoped: u64 = conn
+                .zcard(l1_protocol_key(QueueProtocol::LegacyUnscoped, "q", p))
+                .await
+                .unwrap_or(0);
+            let l1_scoped: u64 = conn
+                .zcard(l1_protocol_key(QueueProtocol::ScopedV1, "q", p))
+                .await
+                .unwrap_or(0);
             out.push((
                 p.clone(),
                 legacy
                     .saturating_add(scoped)
                     .saturating_add(released_unscoped)
-                    .saturating_add(released_scoped) as usize,
+                    .saturating_add(released_scoped)
+                    .saturating_add(l1_unscoped)
+                    .saturating_add(l1_scoped) as usize,
             ));
         }
         out
@@ -752,19 +816,23 @@ impl DistributedGateway {
             l1_protocol_key(QueueProtocol::ScopedV1, "q", &descriptor.provider),
             l1_protocol_key(QueueProtocol::ScopedV1, "proc", &descriptor.provider),
         ];
-        let reserved = lifecycle::reserve(
-            &mut connection,
-            prepared_submission.protocol,
-            &descriptor.id,
-            &prepared_submission.reservation_nonce,
-            &prepared_submission.serialized_payload,
-            &descriptor.provider,
-            descriptor.stream,
-            priority_score,
-            self.lifecycle_limits,
-            old_keys.each_ref().map(|key| key.as_str()),
+        let reserved = tokio::time::timeout(
+            self.redis_operation_timeout,
+            lifecycle::reserve(
+                &mut connection,
+                prepared_submission.protocol,
+                &descriptor.id,
+                &prepared_submission.reservation_nonce,
+                &prepared_submission.serialized_payload,
+                &descriptor.provider,
+                descriptor.stream,
+                priority_score,
+                self.lifecycle_limits,
+                old_keys.each_ref().map(|key| key.as_str()),
+            ),
         )
         .await
+        .map_err(|_| GatewayError::Upstream("distributed gateway lifecycle timed out".into()))?
         .map_err(|failure| match failure {
             lifecycle::ReserveFailure::Capacity => {
                 GatewayError::Overloaded(self.config.overloaded_retry_after)
@@ -779,19 +847,37 @@ impl DistributedGateway {
                 GatewayError::Upstream("distributed gateway lifecycle unavailable".into())
             }
         })?;
-        let activated = lifecycle::activate(
-            &mut connection,
-            prepared_submission.protocol,
-            &descriptor.provider,
-            &descriptor.id,
-            &reserved,
-            priority_score,
-            self.config.request_timeout,
+        let activated = tokio::time::timeout(
+            self.redis_operation_timeout,
+            lifecycle::activate(
+                &mut connection,
+                prepared_submission.protocol,
+                &descriptor.provider,
+                &descriptor.id,
+                &reserved,
+                priority_score,
+                self.config.request_timeout,
+                self.config.max_queue_depth,
+                [
+                    &protocol_queue_key(
+                        match prepared_submission.protocol {
+                            QueueProtocol::LegacyUnscoped => QueueProtocol::ScopedV1,
+                            QueueProtocol::ScopedV1 => QueueProtocol::LegacyUnscoped,
+                        },
+                        &descriptor.provider,
+                    ),
+                    &released_queue_key(QueueProtocol::LegacyUnscoped, &descriptor.provider),
+                    &released_queue_key(QueueProtocol::ScopedV1, &descriptor.provider),
+                    &l1_protocol_key(QueueProtocol::LegacyUnscoped, "q", &descriptor.provider),
+                    &l1_protocol_key(QueueProtocol::ScopedV1, "q", &descriptor.provider),
+                ],
+            ),
         )
         .await
+        .map_err(|_| GatewayError::Upstream("distributed gateway activation timed out".into()))?
         .map_err(|error| redis_err(&error))?;
         if !activated {
-            return Err(GatewayError::Shutdown);
+            return Err(GatewayError::Overloaded(self.config.overloaded_retry_after));
         }
         prepared_submission.member = reserved.member;
         Ok(())
@@ -841,14 +927,16 @@ impl DistributedGateway {
         let channel = protocol_response_channel(prepared.protocol, &prepared.descriptor.id);
 
         // Subscribe BEFORE enqueue so we can't miss the (fire-and-forget) publish.
-        let mut pubsub = self
-            .client
-            .get_async_pubsub()
+        let mut pubsub =
+            tokio::time::timeout(self.redis_operation_timeout, self.client.get_async_pubsub())
+                .await
+                .map_err(|_| {
+                    GatewayError::Upstream("distributed response subscription timed out".into())
+                })?
+                .map_err(|e| redis_err(&e))?;
+        tokio::time::timeout(self.redis_operation_timeout, pubsub.subscribe(&channel))
             .await
-            .map_err(|e| redis_err(&e))?;
-        pubsub
-            .subscribe(&channel)
-            .await
+            .map_err(|_| GatewayError::Upstream("distributed response subscribe timed out".into()))?
             .map_err(|e| redis_err(&e))?;
         self.enqueue_prepared(&mut prepared).await?;
         Ok(AcceptedSubmission { prepared, pubsub })
@@ -891,9 +979,15 @@ impl DistributedGateway {
             Ok(None) => Err(GatewayError::Shutdown),
             Err(_) => {
                 let mut connection = self.conn.clone();
-                if let Ok(Some(terminal)) =
-                    lifecycle::read_terminal(&mut connection, &accepted.prepared.descriptor.id)
-                        .await
+                if let Ok(Ok(Some(terminal))) = tokio::time::timeout(
+                    self.redis_operation_timeout,
+                    lifecycle::read_terminal(
+                        &mut connection,
+                        &accepted.prepared.descriptor.id,
+                        &lifecycle_reference.generation,
+                    ),
+                )
+                .await
                 {
                     return match terminal {
                         BusMessage::Unary(value) => Ok((value, lifecycle_reference)),
@@ -933,14 +1027,14 @@ impl DistributedGateway {
     ) -> mpsc::Receiver<StreamChunk> {
         let (chunk_tx, chunk_rx) = mpsc::channel(16);
         let request_timeout = self.config.request_timeout;
-        let key = protocol_queue_key(
-            accepted.prepared.protocol,
-            &accepted.prepared.descriptor.provider,
-        );
         let member = accepted.prepared.member;
         let request_id = accepted.prepared.descriptor.id;
         let request_provider = accepted.prepared.descriptor.provider;
         let request_protocol = accepted.prepared.protocol;
+        let request_generation = member
+            .rsplit_once(':')
+            .map(|(_, generation)| generation.to_string())
+            .unwrap_or_default();
         let conn = self.conn.clone();
 
         tokio::spawn(async move {
@@ -983,8 +1077,15 @@ impl DistributedGateway {
                     Ok(None) => break,
                     Err(_) => {
                         let mut terminal_connection = conn.clone();
-                        if let Ok(Some(terminal)) =
-                            lifecycle::read_terminal(&mut terminal_connection, &request_id).await
+                        if let Ok(Ok(Some(terminal))) = tokio::time::timeout(
+                            request_timeout.min(Duration::from_secs(5)),
+                            lifecycle::read_terminal(
+                                &mut terminal_connection,
+                                &request_id,
+                                &request_generation,
+                            ),
+                        )
+                        .await
                         {
                             match terminal {
                                 BusMessage::End => break,
@@ -1094,29 +1195,22 @@ impl DistributedGateway {
             .saturating_add(released_scoped) as usize
     }
 
-    async fn remove_from_queue(&self, prepared: &PreparedSubmission) {
-        let mut conn = self.conn.clone();
-        let _: Result<i64, _> = conn
-            .zrem(
-                protocol_queue_key(prepared.protocol, &prepared.descriptor.provider),
-                &prepared.member,
-            )
-            .await;
-    }
-
     async fn cancel_prepared(&self, prepared: &PreparedSubmission) {
         let Some((_, generation)) = prepared.member.rsplit_once(':') else {
             return;
         };
         let mut connection = self.conn.clone();
-        let _ = lifecycle::cancel(
-            &mut connection,
-            prepared.protocol,
-            &prepared.descriptor.provider,
-            &prepared.descriptor.id,
-            generation,
-            &prepared.member,
-            Duration::from_secs(10 * 60),
+        let _ = tokio::time::timeout(
+            self.redis_operation_timeout,
+            lifecycle::cancel(
+                &mut connection,
+                prepared.protocol,
+                &prepared.descriptor.provider,
+                &prepared.descriptor.id,
+                generation,
+                &prepared.member,
+                Duration::from_secs(10 * 60),
+            ),
         )
         .await;
     }
@@ -1452,12 +1546,9 @@ impl DistributedGateway {
                     if !policy_gated {
                         self.penalize_if_429(&provider, &err).await;
                     }
-                    if !self
+                    let _ = self
                         .terminal_owned(ownership, &desc.id, true, &BusMessage::Error(err.message))
-                        .await
-                    {
-                        return;
-                    }
+                        .await;
                 }
             }
         } else {
@@ -1490,9 +1581,7 @@ impl DistributedGateway {
                     BusMessage::Error(err.message)
                 }
             };
-            if !self.terminal_owned(ownership, &desc.id, false, &msg).await {
-                return;
-            }
+            let _ = self.terminal_owned(ownership, &desc.id, false, &msg).await;
         }
     }
 
@@ -1524,11 +1613,13 @@ impl DistributedGateway {
         } as usize;
         let payload = match lifecycle::serialize_bounded(message, maximum_bytes) {
             Ok(payload) => payload,
-            Err(_) => lifecycle::serialize_bounded(
+            Err(_) => match lifecycle::serialize_bounded(
                 &BusMessage::Error("normalized response exceeds distributed terminal limit".into()),
                 maximum_bytes,
-            )
-            .expect("fixed distributed terminal error fits configured limit"),
+            ) {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            },
         };
         let Some((_, generation)) = ownership.id_and_generation() else {
             return false;
@@ -1546,11 +1637,11 @@ impl DistributedGateway {
             .key(lifecycle::counters())
             .key(lifecycle::meta_key(id))
             .key(lifecycle::terminal_key(id))
-            .key(format!("llmshim:gw:lifecycle:v1:expiry"))
+            .key(lifecycle::expiry())
             .key(lifecycle::payload_key(id))
             .arg(&ownership.member)
             .arg(&ownership.owner_token)
-            .arg(self.marker_ttl_secs())
+            .arg(10 * 60_u64)
             .arg(channel)
             .arg(payload)
             .arg(generation)
@@ -1698,12 +1789,21 @@ impl DistributedGateway {
             .key(lifecycle::expiry())
             .key(lifecycle::reservations())
             .key(lifecycle::payload_key(id))
+            .key(lifecycle::terminal_key(id))
             .arg(&ownership.member)
             .arg(&ownership.owner_token)
             .arg(generation)
             .arg(24 * 60 * 60 * 1000_u64)
             .arg(1_000_u64)
-            .arg(64 * 1024 * 1024_u64);
+            .arg(64 * 1024 * 1024_u64)
+            .arg(10 * 60 * 1000_u64)
+            .arg(protocol_response_channel(ownership.protocol, id))
+            .arg(
+                serde_json::to_vec(&BusMessage::Error(
+                    "distributed job moved to dead letter retention".into(),
+                ))
+                .expect("fixed dead-letter envelope serializes"),
+            );
         let operation = invocation.invoke_async::<i64>(&mut connection);
         matches!(
             tokio::time::timeout(self.redis_operation_timeout, operation).await,
@@ -1903,8 +2003,9 @@ mod tests {
         let serialized = serde_json::to_string(&desc).unwrap();
         assert!(!serialized.contains("server-owned"));
         let prepared = PreparedSubmission::new(desc).unwrap();
-        assert_eq!(prepared.member, serialized);
-        let prepared_descriptor: JobDescriptor = serde_json::from_str(&prepared.member).unwrap();
+        assert_eq!(prepared.serialized_payload, serialized);
+        let prepared_descriptor: JobDescriptor =
+            serde_json::from_str(&prepared.serialized_payload).unwrap();
         assert_eq!(prepared_descriptor.id, "abc-1");
         assert!(prepared_descriptor.stream);
 
@@ -2135,7 +2236,7 @@ mod tests {
         }
         let prepare_submission = |request_id: &str, tier: u8| {
             PreparedSubmission::new(JobDescriptor {
-                id: request_id.to_owned(),
+                id: format!("{provider_name}-{request_id}"),
                 provider: provider_name.clone(),
                 tier,
                 permits: 1,
@@ -2172,13 +2273,16 @@ mod tests {
         assert_eq!(queued_members.len(), 2);
         for (result, prepared) in results.iter().zip(prepared_submissions.iter()) {
             if result.is_ok() {
-                assert_eq!(queued_members[0], prepared.member);
+                assert!(queued_members
+                    .iter()
+                    .any(|member| member.starts_with(&format!("{}:", prepared.descriptor.id))));
             } else {
                 assert!(matches!(result, Err(GatewayError::Overloaded(_))));
-                assert!(!queued_members.contains(&prepared.member));
             }
         }
-        assert_eq!(queued_members[1], existing_submission.member);
+        assert!(queued_members
+            .iter()
+            .any(|member| member.starts_with(&format!("{}:", existing_submission.descriptor.id))));
     }
 
     #[tokio::test]
@@ -2256,10 +2360,8 @@ mod tests {
             .unwrap();
         let (scoped_result, legacy_result) =
             tokio::join!(first.enqueue(&scoped), second.enqueue(&competing_legacy));
-        assert_eq!(
-            usize::from(scoped_result.is_ok()) + usize::from(legacy_result.is_ok()),
-            1
-        );
+        assert!(matches!(scoped_result, Err(GatewayError::Upstream(_))));
+        assert!(matches!(legacy_result, Err(GatewayError::Upstream(_))));
         let legacy_depth: u64 = connection
             .zcard(protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider))
             .await
@@ -2269,7 +2371,7 @@ mod tests {
             .await
             .unwrap();
         let released_depth: u64 = connection.zcard(&released_queue).await.unwrap();
-        assert_eq!(legacy_depth + scoped_depth, 1);
+        assert_eq!(legacy_depth + scoped_depth, 0);
         assert_eq!(released_depth, 1);
         for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
             let _: i64 = connection
@@ -2298,7 +2400,7 @@ mod tests {
         .await
         .unwrap();
         let prepared_submission = PreparedSubmission::new(JobDescriptor {
-            id: "refused".into(),
+            id: format!("refused-{}", uuid::Uuid::new_v4().simple()),
             provider: provider_name.clone(),
             tier: 0,
             permits: 1,
@@ -2389,8 +2491,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prepared.protocol, QueueProtocol::ScopedV1);
-        assert!(!prepared.member.contains(&raw_tenant));
-        let released: ReleasedJobDescriptor = serde_json::from_str(&prepared.member).unwrap();
+        assert!(!prepared.serialized_payload.contains(&raw_tenant));
+        let released: ReleasedJobDescriptor =
+            serde_json::from_str(&prepared.serialized_payload).unwrap();
         assert!(released.policy_scope.is_some());
 
         let mut connection = gateway.conn.clone();
@@ -2447,7 +2550,7 @@ mod tests {
             .invoke_async(&mut connection)
             .await
             .unwrap();
-        assert!(scoped_lease.is_some());
+        let (scoped_member, _) = scoped_lease.expect("scoped job should lease");
         assert_eq!(
             gateway
                 .reap_once_protocol(QueueProtocol::LegacyUnscoped, &provider)
@@ -2462,7 +2565,7 @@ mod tests {
             1
         );
         let _: usize = connection
-            .zadd(&scoped_processing, &prepared.member, 0_u64)
+            .zadd(&scoped_processing, &scoped_member, 0_u64)
             .await
             .unwrap();
         assert_eq!(
@@ -2651,6 +2754,148 @@ mod tests {
         assert_eq!(response["request"], "quiet unary");
         for worker_handle in worker_handles {
             worker_handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_terminal_capacity_refuses_before_dispatch() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("terminal-capacity-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let release_dispatches = Arc::new(Semaphore::new(0));
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(LatchBlockedDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started,
+                release_dispatches,
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(300),
+                request_timeout: Duration::from_millis(120),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut gateway).unwrap().lifecycle_limits = lifecycle::Limits {
+            max_jobs: 100_000,
+            max_base_bytes: 512 * 1024 * 1024,
+            max_terminal_bytes: 63,
+            unary_terminal_bytes: 64,
+            stream_terminal_bytes: 16,
+        };
+        let workers = gateway.spawn_workers(vec![provider.clone()]);
+        let result = gateway
+            .submit(GatewayRequest {
+                provider,
+                tier: 0,
+                permits: 1,
+                payload: serde_json::json!({"request":"no paid send"}),
+            })
+            .await;
+        assert!(
+            matches!(&result, Err(GatewayError::Timeout))
+                || matches!(
+                    &result,
+                    Err(GatewayError::Upstream(message))
+                        if message == "distributed origin canceled"
+                ),
+            "unexpected capacity result: {result:?}"
+        );
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        for worker in workers {
+            worker.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_processing_cancellation_drops_work_without_requeue() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("lifecycle-cancel-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let dispatch_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_dropped = Arc::new(tokio::sync::Notify::new());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(PendingDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: dispatch_started.clone(),
+                dispatch_drops: dispatch_drops.clone(),
+                dispatch_dropped: dispatch_dropped.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(300),
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let workers = gateway.spawn_workers(vec![provider.clone()]);
+        let first_dispatch_started = dispatch_started.notified();
+        let dropped = dispatch_dropped.notified();
+        let submission_gateway = gateway.clone();
+        let submission_provider = provider.clone();
+        let submission = tokio::spawn(async move {
+            submission_gateway
+                .submit(GatewayRequest {
+                    provider: submission_provider,
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"cancel active"}),
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), first_dispatch_started)
+            .await
+            .expect("dispatch should start");
+        let mut connection = gateway.conn.clone();
+        let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
+        let members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
+        assert_eq!(members.len(), 1);
+        let (id, generation) = members[0].rsplit_once(':').unwrap();
+        assert_eq!(
+            lifecycle::cancel(
+                &mut connection,
+                QueueProtocol::LegacyUnscoped,
+                &provider,
+                id,
+                generation,
+                &members[0],
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        tokio::time::timeout(Duration::from_secs(1), dropped)
+            .await
+            .expect("heartbeat cancellation should drop dispatch");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), submission)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(GatewayError::Upstream(message)) if message == "distributed origin canceled"
+        ));
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(dispatch_drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider,))
+                .await
+                .unwrap(),
+            0
+        );
+        for worker in workers {
+            worker.abort();
         }
     }
 
@@ -2873,7 +3118,7 @@ mod tests {
         let members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
         assert_eq!(members.len(), 1);
         let member = &members[0];
-        let descriptor: JobDescriptor = serde_json::from_str(member).unwrap();
+        let job_id = member.rsplit_once(':').unwrap().0.to_string();
         let _: () = connection
             .hset(&owners, member, "replacement-owner")
             .await
@@ -2904,10 +3149,7 @@ mod tests {
             0
         );
         assert!(!connection
-            .exists::<_, bool>(protocol_done_key(
-                QueueProtocol::LegacyUnscoped,
-                &descriptor.id,
-            ))
+            .exists::<_, bool>(protocol_done_key(QueueProtocol::LegacyUnscoped, &job_id,))
             .await
             .unwrap());
         submission.abort();
@@ -2960,25 +3202,31 @@ mod tests {
         let owners = protocol_owners_key(protocol, &provider);
         let owner_token = "cancel-owner";
         let mut connection = gateway.conn.clone();
-        let leased_delivery: Option<(String, String)> = gateway
+        let leased_delivery: Option<(String, String, String)> = gateway
             .lease
             .key(&queue)
             .key(&processing)
             .key(&leased)
             .key(&owners)
+            .key(lifecycle::counters())
             .arg(2_000_u64)
             .arg(owner_token)
+            .arg(gateway.lifecycle_limits.max_terminal_bytes)
+            .arg(gateway.lifecycle_limits.unary_terminal_bytes)
+            .arg(gateway.lifecycle_limits.stream_terminal_bytes)
+            .arg(lifecycle::job_prefix())
             .invoke_async(&mut connection)
             .await
             .unwrap();
-        let (member, original_score) = leased_delivery.expect("job should lease");
+        let (member, original_score, serialized_payload) =
+            leased_delivery.expect("job should lease");
         let ownership = LeaseOwnership {
             protocol,
             provider: provider.clone(),
             member: member.clone(),
             original_score,
             owner_token: owner_token.into(),
-            serialized_payload: "{}".into(),
+            serialized_payload,
         };
         let first_dispatch_started = dispatch_started.notified();
         let dropped = dispatch_dropped.notified();
@@ -3317,18 +3565,24 @@ mod tests {
         let owner_token = "coordinator-time-owner";
         let mut connection = gateway.conn.clone();
         let server_before_lease = redis_server_time_ms(&mut connection).await;
-        let leased_delivery: Option<(String, String)> = gateway
+        let leased_delivery: Option<(String, String, String)> = gateway
             .lease
             .key(&queue)
             .key(&processing)
             .key(&leased)
             .key(&owners)
+            .key(lifecycle::counters())
             .arg(500_u64)
             .arg(owner_token)
+            .arg(gateway.lifecycle_limits.max_terminal_bytes)
+            .arg(gateway.lifecycle_limits.unary_terminal_bytes)
+            .arg(gateway.lifecycle_limits.stream_terminal_bytes)
+            .arg(lifecycle::job_prefix())
             .invoke_async(&mut connection)
             .await
             .unwrap();
-        let (member, original_score) = leased_delivery.expect("job should lease");
+        let (member, original_score, serialized_payload) =
+            leased_delivery.expect("job should lease");
         let server_after_lease = redis_server_time_ms(&mut connection).await;
         let lease_deadline = connection
             .zscore::<_, _, f64>(&processing, &member)
@@ -3343,7 +3597,7 @@ mod tests {
             member: member.clone(),
             original_score,
             owner_token: owner_token.into(),
-            serialized_payload: "{}".into(),
+            serialized_payload,
         };
         let simulated_behind_client = server_before_lease.saturating_sub(86_400_000);
         let simulated_ahead_client = server_after_lease.saturating_add(86_400_000);
@@ -3404,38 +3658,49 @@ mod tests {
         let owners = protocol_owners_key(protocol, &provider);
         let mut connection = gateway.conn.clone();
         let first_token = "first-owner";
-        let first_lease: Option<(String, String)> = gateway
+        let first_lease: Option<(String, String, String)> = gateway
             .lease
             .key(&queue)
             .key(&processing)
             .key(&leased)
             .key(&owners)
+            .key(lifecycle::counters())
             .arg(400_u64)
             .arg(first_token)
+            .arg(gateway.lifecycle_limits.max_terminal_bytes)
+            .arg(gateway.lifecycle_limits.unary_terminal_bytes)
+            .arg(gateway.lifecycle_limits.stream_terminal_bytes)
+            .arg(lifecycle::job_prefix())
             .invoke_async(&mut connection)
             .await
             .unwrap();
-        let (member, original_score) = first_lease.expect("first delivery should lease");
+        let (member, original_score, serialized_payload) =
+            first_lease.expect("first delivery should lease");
         let stale_ownership = LeaseOwnership {
             protocol,
             provider: provider.clone(),
             member: member.clone(),
             original_score: original_score.clone(),
             owner_token: first_token.into(),
-            serialized_payload: "{}".into(),
+            serialized_payload,
         };
 
         tokio::time::sleep(Duration::from_millis(450)).await;
         assert_eq!(gateway.reap_once_protocol(protocol, &provider).await, 1);
         let replacement_token = "replacement-owner";
-        let replacement_lease: Option<(String, String)> = gateway
+        let replacement_lease: Option<(String, String, String)> = gateway
             .lease
             .key(&queue)
             .key(&processing)
             .key(&leased)
             .key(&owners)
+            .key(lifecycle::counters())
             .arg(1_000_u64)
             .arg(replacement_token)
+            .arg(gateway.lifecycle_limits.max_terminal_bytes)
+            .arg(gateway.lifecycle_limits.unary_terminal_bytes)
+            .arg(gateway.lifecycle_limits.stream_terminal_bytes)
+            .arg(lifecycle::job_prefix())
             .invoke_async(&mut connection)
             .await
             .unwrap();
@@ -3573,7 +3838,7 @@ mod tests {
 
         // Dead-letter queue.
         assert_eq!(gw.dead_letter_len(provider).await, 0);
-        let poison_member = "poison-member";
+        let poison_member = "poison-job:1";
         let poison_ownership = LeaseOwnership {
             protocol: QueueProtocol::LegacyUnscoped,
             provider: provider.into(),
@@ -3604,6 +3869,38 @@ mod tests {
                 poison_member,
                 "poison-owner",
             )
+            .await
+            .unwrap();
+        let _: () = redis::cmd("HSET")
+            .arg(lifecycle::meta_key("poison-job"))
+            .arg("generation")
+            .arg("1")
+            .arg("state")
+            .arg("processing")
+            .arg("base_charge")
+            .arg(16_u64)
+            .arg("terminal_charge")
+            .arg(8_u64)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = conn
+            .hset(lifecycle::reservations(), poison_member, 16_u64)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("HSET")
+            .arg(lifecycle::counters())
+            .arg("jobs")
+            .arg(1_u64)
+            .arg("base_bytes")
+            .arg(16_u64)
+            .arg("terminal_bytes")
+            .arg(8_u64)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = conn
+            .set(lifecycle::payload_key("poison-job"), "{}")
             .await
             .unwrap();
         assert!(gw.dead_letter_owned(&poison_ownership).await);
@@ -3667,6 +3964,15 @@ mod tests {
                 })))
                 .unwrap(),
             )
+            .await
+            .unwrap();
+        let _: () = redis::cmd("HSET")
+            .arg(lifecycle::meta_key(&lifecycle_reference.job_id))
+            .arg("generation")
+            .arg(&lifecycle_reference.generation)
+            .arg("state")
+            .arg("terminal")
+            .query_async(&mut connection)
             .await
             .unwrap();
         gateway
@@ -3755,7 +4061,7 @@ mod tests {
             gateway.idem_get(&client_key).await,
             Some(serde_json::json!({"generic": true}))
         );
-        assert!(connection.exists::<_, bool>(&generic_key).await.unwrap());
+        assert!(!connection.exists::<_, bool>(&generic_key).await.unwrap());
         assert!(!connection
             .exists::<_, bool>(&unsafe_legacy_key)
             .await

@@ -55,6 +55,7 @@ impl IdempotencyContext {
     pub fn storage_key(&self) -> &str {
         &self.storage_key
     }
+    #[cfg_attr(not(feature = "redis-coordination"), allow(dead_code))]
     pub fn request_fingerprint(&self) -> &str {
         &self.request_fingerprint
     }
