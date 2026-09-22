@@ -930,6 +930,7 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
                         AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
                     }),
                 AttemptEvent::Finished(outcome) => {
+                    self.coordinator.release(attempt.id());
                     self.coordinator
                         .rates
                         .finish(&self.scope, attempt.id(), outcome)
@@ -937,7 +938,6 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
                         .map_err(|_| {
                             AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
                         })?;
-                    self.coordinator.release(attempt.id());
                     Ok(())
                 }
                 AttemptEvent::Usage { usage } => self
@@ -1679,6 +1679,49 @@ use redis_rates::RedisAttemptRates;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::AttemptKind;
+
+    struct PendingFinishRates;
+
+    #[async_trait::async_trait]
+    impl AttemptRates for PendingFinishRates {
+        async fn acquire(
+            &self,
+            _provider: &str,
+            _scope: &TrustedPolicyScope,
+            _permits: u32,
+            _attempt_id: uuid::Uuid,
+            _quote: Option<crate::gateway::budget::BudgetQuote>,
+        ) -> Result<(), RateRefusal> {
+            Ok(())
+        }
+
+        async fn penalize(&self, _provider: &str, _duration: Duration) -> Result<(), ()> {
+            Ok(())
+        }
+
+        async fn observe_usage(
+            &self,
+            _scope: &TrustedPolicyScope,
+            _attempt_id: uuid::Uuid,
+            _observation: crate::gateway::budget::SpendObservation,
+        ) -> Result<(), ()> {
+            Ok(())
+        }
+
+        async fn finish(
+            &self,
+            _scope: &TrustedPolicyScope,
+            _attempt_id: uuid::Uuid,
+            _outcome: AttemptOutcome,
+        ) -> Result<(), ()> {
+            futures::future::pending().await
+        }
+
+        async fn budget_total(&self, _scope: &TrustedPolicyScope) -> Option<u64> {
+            None
+        }
+    }
 
     fn scope(name: &str, rpm: Option<u32>, tpm: Option<u32>) -> TrustedPolicyScope {
         TrustedPolicyScope {
@@ -1689,6 +1732,43 @@ mod tests {
             budget: None,
             legacy_spend_floor: None,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_permit_releases_before_remote_finish_settlement() {
+        let coordinator = Arc::new(AttemptCoordinator {
+            rates: Arc::new(PendingFinishRates),
+            concurrency_limit: 1,
+            concurrency_wait: Duration::from_secs(1),
+            semaphores: Mutex::new(HashMap::new()),
+            active_permits: Mutex::new(HashMap::new()),
+        });
+        let context = coordinator.context(scope("finish-timeout", None, None));
+        let target = crate::reasoning::ReplayTarget::new(
+            "test-provider",
+            "test-model",
+            crate::reasoning::WireFormat::OpenAiChat,
+        );
+        let mut tracker = context
+            .acquire(
+                AttemptKind::Completion,
+                "test-provider/test-model",
+                &target,
+                "http://127.0.0.1/provider",
+                &serde_json::json!({"model": "test-model", "messages": []}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(coordinator.active_permits.lock().unwrap().len(), 1);
+        let outcome = AttemptOutcome::Completed {
+            accounting: crate::policy::AttemptAccounting::NoUsageReported,
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), tracker.finish(outcome))
+                .await
+                .is_err()
+        );
+        assert!(coordinator.active_permits.lock().unwrap().is_empty());
     }
 
     fn budget_scope(name: &str, limit_nanos: u64) -> TrustedPolicyScope {

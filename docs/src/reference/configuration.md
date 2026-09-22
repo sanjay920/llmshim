@@ -109,6 +109,30 @@ requests without one are unchanged.
 The retry policy is resolved when the shared client is initialized. See
 [Errors and retries](errors.md).
 
+## Upstream attempt deadlines
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `LLMSHIM_UPSTREAM_CONNECT_TIMEOUT_MS` | `30000` | TCP/TLS connect timeout |
+| `LLMSHIM_UPSTREAM_HEADER_TIMEOUT_MS` | `600000` | Response-header timeout for each physical send |
+| `LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS` | `10000` | Timeout for each trusted attempt-policy callback |
+| `LLMSHIM_UPSTREAM_ERROR_BODY_IDLE_TIMEOUT_MS` | `10000` | Idle timeout while reading a provider error body |
+| `LLMSHIM_UPSTREAM_ERROR_BODY_TOTAL_TIMEOUT_MS` | `30000` | Total provider error-body read time |
+| `LLMSHIM_UPSTREAM_UNARY_IDLE_TIMEOUT_MS` | `300000` | Idle timeout while reading a successful unary body |
+| `LLMSHIM_UPSTREAM_UNARY_ATTEMPT_TIMEOUT_MS` | `1800000` | Total unary physical-attempt lifetime |
+| `LLMSHIM_UPSTREAM_STREAM_IDLE_TIMEOUT_MS` | `300000` | Idle time between complete, non-empty SSE data events |
+| `LLMSHIM_UPSTREAM_STREAM_ATTEMPT_TIMEOUT_MS` | `7200000` | Total streaming physical-attempt lifetime |
+
+Values are resolved when `ShimClient` is created. Zero, invalid, and
+unrepresentable values retain the finite default. Rust callers can instead pass
+checked `AttemptDeadlines` through `ShimClient::with_attempt_deadlines`.
+
+These clocks bound a physical provider send, its response body, normalization,
+accounting, and attempt-policy callbacks. They do not bound the lifetime of an
+HTTP response body after a proxy or gateway frontend has taken ownership of it.
+The distributed gateway's existing 120-second request timeout is unchanged and
+may be the narrower boundary.
+
 ## Proxy admission and rate limits
 
 | Variable | Default | Meaning |
