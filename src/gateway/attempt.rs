@@ -1007,11 +1007,23 @@ mod redis_rates {
         local window_index = math.floor(math.floor(now / 1000) / window_secs)
         local budget_ttl = math.max(1,
             ((window_index + 1) * window_secs + retention_secs) * 1000 - now)
-        local legacy_raw = redis.call('GET', KEYS[1] .. window_index)
+        local function extend_global_freeze()
+            local existing_freeze_ttl = redis.call('PTTL', KEYS[4])
+            if existing_freeze_ttl == -2 or
+                    (existing_freeze_ttl >= 0 and existing_freeze_ttl < budget_ttl) then
+                redis.call('SET', KEYS[4], 1, 'PX', budget_ttl)
+            end
+        end
+        local legacy_raw = redis.pcall('GET', KEYS[1] .. window_index)
+        if type(legacy_raw) == 'table' and legacy_raw.err ~= nil then
+            extend_global_freeze()
+            return {-1, window_index, 0}
+        end
         local legacy_usd = 0
         if legacy_raw ~= false then
             legacy_usd = tonumber(legacy_raw)
             if legacy_usd == nil or legacy_usd ~= legacy_usd or legacy_usd < 0 then
+                extend_global_freeze()
                 return {-1, window_index, 0}
             end
         end
@@ -1039,10 +1051,7 @@ mod redis_rates {
                 redis.call('ZADD', KEYS[3], 'NX', now + budget_ttl, known_floor_key)
                 floor_is_indexed = true
             else
-                local existing_freeze_ttl = redis.call('PTTL', KEYS[4])
-                if existing_freeze_ttl < budget_ttl then
-                    redis.call('SET', KEYS[4], 1, 'PX', budget_ttl)
-                end
+                extend_global_freeze()
                 return {0, window_index, known_floor}
             end
         end
@@ -3395,20 +3404,152 @@ mod tests {
             Err(RateRefusal::Budget(_))
         ));
 
-        let _: () = connection.set(&legacy_key, "not-a-number").await.unwrap();
-        assert!(rates
-            .retain_legacy_spend_floor(&tenant, &TrustedPolicyScope::from_identity(&identity))
-            .await
-            .is_err());
-        assert_eq!(
-            connection.get::<_, u64>(&known_floor_key).await.unwrap(),
-            95
-        );
-
         let _: i64 = connection
             .del((legacy_key, known_floor_key, index_key))
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_invalid_origin_state_freezes_stale_descriptors_with_bounded_state() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        for wrong_type in [false, true] {
+            let namespace = uuid::Uuid::new_v4();
+            let tenant = format!("origin-invalid-{namespace}");
+            let provider = format!("origin-invalid-{namespace}");
+            let index_key = format!("llmshim:test:origin-invalid-index:{namespace}");
+            let freeze_key = format!("{index_key}:frozen");
+            let rates = RedisAttemptRates::with_accounting_limits(
+                &redis_url,
+                RateLimitConfig::with_global(Some(1), None),
+                10,
+                60,
+                index_key.clone(),
+            )
+            .unwrap();
+            let identity = Identity {
+                tenant: tenant.clone(),
+                tier: 0,
+                rpm: None,
+                tpm: None,
+                budget_usd: Some(0.000_000_1),
+                budget_window_secs: Some(3_600),
+                budget_allow_unpriced: false,
+            };
+            let mut connection = rates.connection().await.unwrap();
+            let redis_time: (u64, u64) = redis::cmd("TIME")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            let window_index = redis_time.0 / 3_600;
+            let legacy_key = format!("llmshim:spend:{tenant}:{window_index}");
+            let mut stale_scope = TrustedPolicyScope::from_identity(&identity);
+
+            let _: () = connection.set(&legacy_key, "0.00000005").await.unwrap();
+            let stale_floor = rates
+                .retain_legacy_spend_floor(&tenant, &stale_scope)
+                .await
+                .unwrap();
+            stale_scope.set_legacy_spend_floor(stale_floor.window_index, stale_floor.amount_nanos);
+            if wrong_type {
+                let _: i64 = connection.del(&legacy_key).await.unwrap();
+                let _: usize = connection.rpush(&legacy_key, "wrong-type").await.unwrap();
+            } else {
+                let _: () = connection.set(&legacy_key, "not-a-number").await.unwrap();
+            }
+
+            assert!(rates
+                .retain_legacy_spend_floor(&tenant, &TrustedPolicyScope::from_identity(&identity))
+                .await
+                .is_err());
+            assert!(connection.exists::<_, bool>(&freeze_key).await.unwrap());
+            assert_eq!(connection.zcard::<_, usize>(&index_key).await.unwrap(), 1);
+            let total_key = format!(
+                "{}{window_index}",
+                RedisAttemptRates::budget_total_prefix(&stale_scope)
+            );
+            let known_floor_key = format!("{total_key}:legacy-known-floor");
+            assert_eq!(
+                connection.get::<_, u64>(&known_floor_key).await.unwrap(),
+                50
+            );
+            assert!(!connection.exists::<_, bool>(&total_key).await.unwrap());
+            assert!(!connection
+                .exists::<_, bool>(format!("{total_key}:legacy-floor"))
+                .await
+                .unwrap());
+            let stale_attempt = uuid::Uuid::new_v4();
+            assert!(matches!(
+                rates
+                    .acquire(&provider, &stale_scope, 1, stale_attempt, Some(quote(20)),)
+                    .await,
+                Err(RateRefusal::Unavailable)
+            ));
+            assert!(!connection
+                .exists::<_, bool>(RedisAttemptRates::budget_attempt_key(
+                    &stale_scope,
+                    stale_attempt,
+                ))
+                .await
+                .unwrap());
+            assert!(!connection.exists::<_, bool>(&total_key).await.unwrap());
+            rates
+                .acquire(
+                    &provider,
+                    &scope(&format!("origin-invalid-rate-{namespace}"), None, None),
+                    1,
+                    uuid::Uuid::new_v4(),
+                    None,
+                )
+                .await
+                .expect("invalid-state refusal must not debit the provider rate bucket");
+
+            let _: () = redis::cmd("PSETEX")
+                .arg(&freeze_key)
+                .arg(200_000_000_u64)
+                .arg("longer-freeze")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            let longer_ttl_before: i64 = redis::cmd("PTTL")
+                .arg(&freeze_key)
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            assert!(rates
+                .retain_legacy_spend_floor(&tenant, &TrustedPolicyScope::from_identity(&identity))
+                .await
+                .is_err());
+            let longer_ttl_after: i64 = redis::cmd("PTTL")
+                .arg(&freeze_key)
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            assert_eq!(
+                connection.get::<_, String>(&freeze_key).await.unwrap(),
+                "longer-freeze"
+            );
+            assert!(longer_ttl_after <= longer_ttl_before);
+            assert!(longer_ttl_after > longer_ttl_before - 1_000);
+            assert_eq!(connection.zcard::<_, usize>(&index_key).await.unwrap(), 1);
+
+            let _: i64 = connection
+                .del((
+                    legacy_key,
+                    known_floor_key,
+                    index_key,
+                    freeze_key,
+                    format!("llmshim:rl:{provider}:rpm"),
+                ))
+                .await
+                .unwrap();
+        }
     }
 
     #[cfg(feature = "redis-coordination")]
