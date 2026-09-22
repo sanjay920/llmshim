@@ -150,6 +150,23 @@ struct JobDescriptor {
     enqueue_ms: u64,
 }
 
+pub(crate) struct PreparedSubmission {
+    descriptor: JobDescriptor,
+    member: String,
+}
+
+pub(crate) struct AcceptedSubmission {
+    prepared: PreparedSubmission,
+    pubsub: redis::aio::PubSub,
+}
+
+impl PreparedSubmission {
+    fn new(descriptor: JobDescriptor) -> Result<Self, GatewayError> {
+        let member = serde_json::to_string(&descriptor).map_err(|error| redis_err(&error))?;
+        Ok(Self { descriptor, member })
+    }
+}
+
 fn done_key(id: &str) -> String {
     format!("llmshim:gw:done:{id}")
 }
@@ -340,17 +357,20 @@ impl DistributedGateway {
 
     /// Enqueue a descriptor onto its provider's priority queue, first shedding
     /// with `Overloaded` if the waiting queue is at capacity.
-    async fn enqueue(&self, desc: &JobDescriptor) -> Result<(), GatewayError> {
-        let member = serde_json::to_string(desc).map_err(|e| redis_err(&e))?;
-        let key = queue_key(&desc.provider);
+    async fn enqueue(&self, prepared: &PreparedSubmission) -> Result<(), GatewayError> {
+        let key = queue_key(&prepared.descriptor.provider);
         let mut conn = self.conn.clone();
         let depth: u64 = conn.zcard(&key).await.map_err(|e| redis_err(&e))?;
         if depth as usize >= self.config.max_queue_depth {
             return Err(GatewayError::Overloaded(self.config.overloaded_retry_after));
         }
-        let score = deadline_score(desc.tier, desc.enqueue_ms, self.aging_step_ms());
+        let score = deadline_score(
+            prepared.descriptor.tier,
+            prepared.descriptor.enqueue_ms,
+            self.aging_step_ms(),
+        );
         let _: () = conn
-            .zadd(&key, &member, score)
+            .zadd(&key, &prepared.member, score)
             .await
             .map_err(|e| redis_err(&e))?;
         Ok(())
@@ -358,21 +378,32 @@ impl DistributedGateway {
 
     /// Origin side (unary): enqueue by priority and await the result over the bus.
     pub async fn submit(&self, req: GatewayRequest) -> Result<Value, GatewayError> {
-        let desc = self.descriptor(&req, false, None);
-        self.submit_descriptor(desc).await
+        let prepared = self.prepare_submission(req, false, None)?;
+        self.submit_prepared(prepared).await
     }
 
-    pub(crate) async fn submit_with_policy(
+    pub(crate) fn prepare_with_policy(
         &self,
         req: GatewayRequest,
+        stream: bool,
         policy_scope: crate::gateway::attempt::TrustedPolicyScope,
-    ) -> Result<Value, GatewayError> {
-        let desc = self.descriptor(&req, false, Some(policy_scope));
-        self.submit_descriptor(desc).await
+    ) -> Result<PreparedSubmission, GatewayError> {
+        self.prepare_submission(req, stream, Some(policy_scope))
     }
 
-    async fn submit_descriptor(&self, desc: JobDescriptor) -> Result<Value, GatewayError> {
-        let channel = response_channel(&desc.id);
+    pub(crate) async fn submit_prepared(
+        &self,
+        prepared: PreparedSubmission,
+    ) -> Result<Value, GatewayError> {
+        let accepted = self.accept_prepared(prepared).await?;
+        self.await_accepted(accepted).await
+    }
+
+    pub(crate) async fn accept_prepared(
+        &self,
+        prepared: PreparedSubmission,
+    ) -> Result<AcceptedSubmission, GatewayError> {
+        let channel = response_channel(&prepared.descriptor.id);
 
         // Subscribe BEFORE enqueue so we can't miss the (fire-and-forget) publish.
         let mut pubsub = self
@@ -384,10 +415,16 @@ impl DistributedGateway {
             .subscribe(&channel)
             .await
             .map_err(|e| redis_err(&e))?;
-        self.enqueue(&desc).await?;
+        self.enqueue(&prepared).await?;
+        Ok(AcceptedSubmission { prepared, pubsub })
+    }
 
+    pub(crate) async fn await_accepted(
+        &self,
+        mut accepted: AcceptedSubmission,
+    ) -> Result<Value, GatewayError> {
         use futures::StreamExt;
-        let mut messages = pubsub.on_message();
+        let mut messages = accepted.pubsub.on_message();
         match tokio::time::timeout(self.config.request_timeout, messages.next()).await {
             Ok(Some(msg)) => {
                 let payload: String = msg.get_payload().map_err(|e| redis_err(&e))?;
@@ -402,7 +439,7 @@ impl DistributedGateway {
             }
             Ok(None) => Err(GatewayError::Shutdown),
             Err(_) => {
-                self.remove_from_queue(&desc).await;
+                self.remove_from_queue(&accepted.prepared).await;
                 Err(GatewayError::Timeout)
             }
         }
@@ -414,48 +451,31 @@ impl DistributedGateway {
         &self,
         req: GatewayRequest,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
-        let desc = self.descriptor(&req, true, None);
-        self.submit_stream_descriptor(req.provider, desc).await
+        let prepared = self.prepare_submission(req, true, None)?;
+        self.submit_stream_prepared(prepared).await
     }
 
-    pub(crate) async fn submit_stream_with_policy(
+    pub(crate) async fn submit_stream_prepared(
         &self,
-        req: GatewayRequest,
-        policy_scope: crate::gateway::attempt::TrustedPolicyScope,
+        prepared: PreparedSubmission,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
-        let provider = req.provider.clone();
-        let desc = self.descriptor(&req, true, Some(policy_scope));
-        self.submit_stream_descriptor(provider, desc).await
+        let accepted = self.accept_prepared(prepared).await?;
+        Ok(self.stream_accepted(accepted))
     }
 
-    async fn submit_stream_descriptor(
+    pub(crate) fn stream_accepted(
         &self,
-        provider: String,
-        desc: JobDescriptor,
-    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
-        let channel = response_channel(&desc.id);
-
-        let mut pubsub = self
-            .client
-            .get_async_pubsub()
-            .await
-            .map_err(|e| redis_err(&e))?;
-        pubsub
-            .subscribe(&channel)
-            .await
-            .map_err(|e| redis_err(&e))?;
-        // Depth-shed happens here so the caller can return 429/503 before SSE.
-        self.enqueue(&desc).await?;
-
+        mut accepted: AcceptedSubmission,
+    ) -> mpsc::Receiver<StreamChunk> {
         let (chunk_tx, chunk_rx) = mpsc::channel(16);
         let request_timeout = self.config.request_timeout;
-        let key = queue_key(&provider);
-        let member = serde_json::to_string(&desc).map_err(|e| redis_err(&e))?;
+        let key = queue_key(&accepted.prepared.descriptor.provider);
+        let member = accepted.prepared.member;
         let conn = self.conn.clone();
 
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut messages = pubsub.on_message();
+            let mut messages = accepted.pubsub.on_message();
             let mut first = true;
             loop {
                 match tokio::time::timeout(request_timeout, messages.next()).await {
@@ -494,25 +514,26 @@ impl DistributedGateway {
             }
         });
 
-        Ok(chunk_rx)
+        chunk_rx
     }
 
-    fn descriptor(
+    fn prepare_submission(
         &self,
-        req: &GatewayRequest,
+        req: GatewayRequest,
         stream: bool,
         policy_scope: Option<crate::gateway::attempt::TrustedPolicyScope>,
-    ) -> JobDescriptor {
-        JobDescriptor {
+    ) -> Result<PreparedSubmission, GatewayError> {
+        let descriptor = JobDescriptor {
             id: self.next_id(),
-            provider: req.provider.clone(),
+            provider: req.provider,
             tier: req.tier,
             permits: req.permits.max(1),
-            payload: req.payload.clone(),
+            payload: req.payload,
             policy_scope,
             stream,
             enqueue_ms: now_ms(),
-        }
+        };
+        PreparedSubmission::new(descriptor)
     }
 
     /// TTL for the done / attempts markers — a few lease windows, long enough to
@@ -552,11 +573,11 @@ impl DistributedGateway {
         n as usize
     }
 
-    async fn remove_from_queue(&self, desc: &JobDescriptor) {
-        if let Ok(member) = serde_json::to_string(desc) {
-            let mut conn = self.conn.clone();
-            let _: Result<i64, _> = conn.zrem(queue_key(&desc.provider), member).await;
-        }
+    async fn remove_from_queue(&self, prepared: &PreparedSubmission) {
+        let mut conn = self.conn.clone();
+        let _: Result<i64, _> = conn
+            .zrem(queue_key(&prepared.descriptor.provider), &prepared.member)
+            .await;
     }
 
     /// Spawn one worker loop per provider plus a reaper for redelivery.
@@ -586,6 +607,10 @@ impl DistributedGateway {
         let mut conn = self.conn.clone();
 
         loop {
+            let preparation_permit = match sem.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
             let deadline = now_ms() + self.config.lease_timeout.as_millis() as u64;
             let leased: Option<(String, String)> = match self
                 .lease
@@ -598,12 +623,14 @@ impl DistributedGateway {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    drop(preparation_permit);
                     eprintln!("gateway worker[{provider}]: lease error: {e}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             };
             let Some((member, score)) = leased else {
+                drop(preparation_permit);
                 tokio::time::sleep(IDLE_POLL).await; // queue empty
                 continue;
             };
@@ -645,21 +672,14 @@ impl DistributedGateway {
             };
             match rate_admission {
                 Ok(()) => {
-                    let permit = if policy_gated {
-                        None
-                    } else {
-                        match sem.clone().acquire_owned().await {
-                            Ok(permit) => Some(permit),
-                            Err(_) => break,
-                        }
-                    };
                     let me = self.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
+                        let _preparation_permit = preparation_permit;
                         me.run_and_publish(desc, member).await;
                     });
                 }
                 Err(RetryAfter(wait)) => {
+                    drop(preparation_permit);
                     // Release the lease back to the queue (priority preserved).
                     let _: Result<i64, _> = self
                         .release
@@ -975,6 +995,11 @@ mod tests {
         assert!(back.policy_scope.is_some());
         let serialized = serde_json::to_string(&desc).unwrap();
         assert!(!serialized.contains("server-owned"));
+        let prepared = PreparedSubmission::new(desc).unwrap();
+        assert_eq!(prepared.member, serialized);
+        let prepared_descriptor: JobDescriptor = serde_json::from_str(&prepared.member).unwrap();
+        assert_eq!(prepared_descriptor.id, "abc-1");
+        assert!(prepared_descriptor.stream);
 
         for msg in [
             BusMessage::Unary(serde_json::json!({"a": 1})),
@@ -1007,6 +1032,27 @@ mod tests {
         ) -> Result<super::super::ChunkStream, DispatchError> {
             let chunks: Vec<StreamChunk> = vec![Ok("a".into()), Ok("b".into()), Ok("c".into())];
             Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    struct LatchBlockedDispatch {
+        dispatch_starts: Arc<std::sync::atomic::AtomicUsize>,
+        dispatch_started: Arc<tokio::sync::Notify>,
+        release_dispatches: Arc<Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl Dispatch for LatchBlockedDispatch {
+        async fn dispatch(&self, _provider: &str, payload: Value) -> Result<Value, DispatchError> {
+            self.dispatch_starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.dispatch_started.notify_one();
+            self.release_dispatches
+                .acquire()
+                .await
+                .expect("test release semaphore remains open")
+                .forget();
+            Ok(payload)
         }
     }
 
@@ -1076,6 +1122,124 @@ mod tests {
             got.push(item.expect("chunk"));
         }
         assert_eq!(got, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_worker_leases_only_available_preparation_capacity() {
+        let Some(redis_url) = std::env::var("LLMSHIM_REDIS_URL").ok() else {
+            return;
+        };
+        let provider = format!(
+            "itest-preparation-capacity-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let client = redis::Client::open(redis_url.clone()).unwrap();
+        let mut connection = ConnectionManager::new(client).await.unwrap();
+        for key in [
+            queue_key(&provider),
+            processing_key(&provider),
+            leased_key(&provider),
+        ] {
+            let _: i64 = connection.del(key).await.unwrap();
+        }
+
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let first_dispatch_started = dispatch_started.notified();
+        let release_dispatches = Arc::new(Semaphore::new(0));
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(LatchBlockedDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: dispatch_started.clone(),
+                release_dispatches: release_dispatches.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                max_concurrency_per_provider: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut submissions = Vec::new();
+        for id in 0..3 {
+            let gateway = gateway.clone();
+            let provider = provider.clone();
+            submissions.push(tokio::spawn(async move {
+                gateway
+                    .submit(GatewayRequest {
+                        provider,
+                        tier: 0,
+                        permits: 1,
+                        payload: serde_json::json!({"id": id}),
+                    })
+                    .await
+            }));
+        }
+        for _ in 0..1_000 {
+            let queued: u64 = connection.zcard(queue_key(&provider)).await.unwrap();
+            if queued == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(queue_key(&provider))
+                .await
+                .unwrap(),
+            3
+        );
+
+        let worker_handles = gateway.spawn_workers(vec![provider.clone()]);
+        tokio::time::timeout(Duration::from_secs(2), first_dispatch_started)
+            .await
+            .expect("first leased dispatch should start");
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(processing_key(&provider))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .hlen::<_, u64>(leased_key(&provider))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(queue_key(&provider))
+                .await
+                .unwrap(),
+            2
+        );
+
+        release_dispatches.add_permits(3);
+        for submission in submissions {
+            tokio::time::timeout(Duration::from_secs(2), submission)
+                .await
+                .expect("bounded dispatch should complete")
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        for worker_handle in worker_handles {
+            worker_handle.abort();
+        }
+        for key in [
+            queue_key(&provider),
+            processing_key(&provider),
+            leased_key(&provider),
+        ] {
+            let _: i64 = connection.del(key).await.unwrap();
+        }
     }
 
     #[tokio::test]
