@@ -316,6 +316,32 @@ impl AttemptCoordinator {
         }))
     }
 
+    #[cfg(test)]
+    pub(crate) fn unavailable_for_test(
+        concurrency_limit: usize,
+        concurrency_wait: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            rates: Arc::new(UnavailableAttemptRates),
+            concurrency_limit: concurrency_limit.max(1),
+            concurrency_wait,
+            semaphores: Mutex::new(HashMap::new()),
+            active_permits: Mutex::new(HashMap::new()),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_provider_for_test(&self, provider: &str) -> OwnedSemaphorePermit {
+        let semaphore = {
+            let mut semaphores = self.semaphores.lock().unwrap();
+            semaphores
+                .entry(provider.to_owned())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.concurrency_limit)))
+                .clone()
+        };
+        semaphore.acquire_owned().await.unwrap()
+    }
+
     async fn acquire(
         &self,
         attempt: &PreparedAttempt<'_>,
@@ -335,7 +361,7 @@ impl AttemptCoordinator {
             .and_then(Result::ok)
             .ok_or_else(|| {
                 AttemptPolicyRefusal::new(
-                    AttemptPolicyRefusalKind::ProviderLimit,
+                    AttemptPolicyRefusalKind::CoordinatorUnavailable,
                     Some(self.concurrency_wait),
                 )
             })?;
@@ -365,6 +391,26 @@ impl AttemptCoordinator {
 
     fn release(&self, attempt_id: uuid::Uuid) {
         self.active_permits.lock().unwrap().remove(&attempt_id);
+    }
+}
+
+#[cfg(test)]
+struct UnavailableAttemptRates;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl AttemptRates for UnavailableAttemptRates {
+    async fn acquire(
+        &self,
+        _provider: &str,
+        _scope: &TrustedPolicyScope,
+        _permits: u32,
+    ) -> Result<(), RateRefusal> {
+        Err(RateRefusal::Unavailable)
+    }
+
+    async fn penalize(&self, _provider: &str, _duration: Duration) -> Result<(), ()> {
+        Err(())
     }
 }
 

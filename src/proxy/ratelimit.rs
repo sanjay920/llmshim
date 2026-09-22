@@ -852,17 +852,7 @@ fn estimate_native_attempt_tokens(
             .and_then(|value| value.as_u64()),
     }
     .unwrap_or_default();
-    let default_output = crate::catalog::resolve(&format!("{provider}/{model}"))
-        .or_else(|| crate::catalog::resolve(model))
-        .and_then(|model| model.max_output_tokens)
-        .map(u64::from)
-        .unwrap_or_else(|| match provider {
-            "anthropic" => 8_192,
-            "gemini" => 65_536,
-            "openai" | "chatgpt" | "xai" => 128_000,
-            "openrouter" => 1_048_576,
-            _ => 1_024,
-        });
+    let default_output = omitted_native_output_budget(provider, model, native_body);
     prompt_tokens
         .saturating_add(
             explicit_output
@@ -870,6 +860,38 @@ fn estimate_native_attempt_tokens(
                 .max(reasoning_output),
         )
         .clamp(1, u32::MAX as u64) as u32
+}
+
+fn catalog_output_budget(provider: &str, model: &str) -> Option<u64> {
+    crate::catalog::lookup_id(&format!("{provider}/{model}"))
+        .or_else(|| crate::catalog::lookup_id(model))
+        .and_then(|model| model.max_output_tokens)
+        .map(u64::from)
+}
+
+fn omitted_native_output_budget(
+    provider: &str,
+    model: &str,
+    native_body: &serde_json::Value,
+) -> u64 {
+    let primary_budget = catalog_output_budget(provider, model).unwrap_or(match provider {
+        "anthropic" => 8_192,
+        "gemini" => 65_536,
+        "openai" | "chatgpt" | "xai" => 128_000,
+        "openrouter" => 1_048_576,
+        _ => 1_024,
+    });
+    if provider != "openrouter" {
+        return primary_budget;
+    }
+    native_body
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|routed_model| catalog_output_budget("openrouter", routed_model).unwrap_or(1_048_576))
+        .fold(primary_budget, u64::max)
 }
 
 fn active_native_prompt_characters(prepared: &PreparedRequest) -> usize {
@@ -1855,6 +1877,53 @@ mod tests {
         assert!(openai >= 7_000);
         assert!(anthropic >= 6_000);
         assert!(gemini >= 5_000);
+    }
+
+    #[test]
+    fn native_openrouter_routing_uses_every_final_body_model_ceiling() {
+        let unknown_routing_body = serde_json::json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{"role": "user", "content": "short"}],
+            "models": ["anthropic/claude-sonnet-5", "vendor/unknown-model"]
+        });
+        let serialized_prompt_tokens =
+            serde_json::to_string(&unknown_routing_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "openrouter",
+                "anthropic/claude-sonnet-5",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &unknown_routing_body,
+            ),
+            serialized_prompt_tokens.saturating_add(1_048_576) as u32
+        );
+
+        let base_budget = catalog_output_budget("openrouter", "openai/gpt-oss-20b")
+            .expect("vendored OpenRouter model metadata");
+        assert_eq!(
+            catalog_output_budget("openrouter", "openai/gpt-oss-20b:nitro"),
+            Some(base_budget),
+            "known OpenRouter variants must use their base model metadata"
+        );
+
+        let explicit_limit_body = serde_json::json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [],
+            "models": ["vendor/unknown-model"],
+            "max_tokens": 4_096
+        });
+        let explicit_prompt_tokens =
+            serde_json::to_string(&explicit_limit_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "openrouter",
+                "anthropic/claude-sonnet-5",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &explicit_limit_body,
+            ),
+            explicit_prompt_tokens.saturating_add(4_096) as u32,
+            "an explicit final-body limit remains authoritative"
+        );
     }
 
     // --- Trait object dispatch ----------------------------------------------
