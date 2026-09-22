@@ -964,13 +964,15 @@ mod tests {
             ],
             "x-shim": {"tool_calling":"prompt"}
         });
-        let mut limits = BudgetLimits::default();
-        limits.validators = 1;
+        let budget_limits = BudgetLimits {
+            validators: 1,
+            ..BudgetLimits::default()
+        };
         let error = Plan::with_capabilities_and_budget_limits(
             WireFormat::OpenAiChat,
             &request,
             ModelCapabilities::unknown(),
-            limits,
+            budget_limits,
         )
         .err()
         .expect("the second validator must be rejected");
@@ -984,13 +986,15 @@ mod tests {
             "response_format": {"type":"json_schema","json_schema":{"schema":{"type":"object"}}},
             "x-shim": {"structured_output":"prompt"}
         });
-        let mut limits = BudgetLimits::default();
-        limits.prompt_bytes = 1;
+        let budget_limits = BudgetLimits {
+            prompt_bytes: 1,
+            ..BudgetLimits::default()
+        };
         let error = Plan::with_capabilities_and_budget_limits(
             WireFormat::OpenAiChat,
             &request,
             ModelCapabilities::unknown(),
-            limits,
+            budget_limits,
         )
         .err()
         .expect("prompt serialization must be rejected before rendering");
@@ -1004,9 +1008,11 @@ mod tests {
             "tools":[{"type":"function","name":"tool","parameters":{"type":"object"}}],
             "text":{"format":{"type":"json_schema","schema":{"type":"object"}}}
         });
-        let mut limits = BudgetLimits::default();
-        limits.schema_copies = 1;
-        let mut budget = RequestBudget::with_limits(limits);
+        let budget_limits = BudgetLimits {
+            schema_copies: 1,
+            ..BudgetLimits::default()
+        };
+        let mut budget = RequestBudget::with_limits(budget_limits);
         let error = native_format(
             &request,
             WireFormat::OpenAiResponses,
