@@ -1,6 +1,6 @@
 #![cfg(feature = "proxy")]
 
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use llmshim::provider::{Provider, ProviderRequest};
 use llmshim::proxy::ratelimit::{Backpressure, InMemoryRateLimiter, RateLimitConfig};
@@ -60,20 +60,18 @@ impl Provider for LatchBlockedProvider {
     }
 }
 
-async fn post_chat(application: axum::Router) -> axum::http::Response<Body> {
+async fn post_json(
+    application: axum::Router,
+    path: &str,
+    payload: Value,
+) -> axum::http::Response<Body> {
     application
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/chat")
+                .uri(path)
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "model": "blocked/model",
-                        "messages": [{"role": "user", "content": "hi"}]
-                    })
-                    .to_string(),
-                ))
+                .body(Body::from(payload.to_string()))
                 .unwrap(),
         )
         .await
@@ -99,23 +97,71 @@ async fn preparation_backpressure_bounds_concurrent_http_requests_before_network
         backpressure: Backpressure::new(1, Duration::from_millis(30)),
     });
     let application = app_with_state(state);
+    let canonical_request = || {
+        serde_json::json!({
+            "model": "blocked/model",
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+    };
 
-    let first_request = tokio::spawn(post_chat(application.clone()));
+    let first_request = tokio::spawn(post_json(
+        application.clone(),
+        "/v1/chat",
+        canonical_request(),
+    ));
     tokio::time::timeout(Duration::from_secs(1), first_preparation_started)
         .await
         .expect("first request should enter provider preparation");
     assert_eq!(preparation_starts.load(Ordering::SeqCst), 1);
 
-    let second_request = tokio::spawn(post_chat(application.clone()));
-    let third_request = tokio::spawn(post_chat(application));
-    assert_eq!(
-        second_request.await.unwrap().status(),
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-    assert_eq!(
-        third_request.await.unwrap().status(),
-        StatusCode::SERVICE_UNAVAILABLE
-    );
+    let canonical_stream =
+        post_json(application.clone(), "/v1/chat/stream", canonical_request()).await;
+    assert_eq!(canonical_stream.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(canonical_stream.headers().contains_key("retry-after"));
+
+    let native_unary = post_json(
+        application.clone(),
+        "/v1/chat/completions",
+        canonical_request(),
+    )
+    .await;
+    assert_eq!(native_unary.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(native_unary.headers().contains_key("retry-after"));
+    let native_unary_body: Value =
+        serde_json::from_slice(&to_bytes(native_unary.into_body(), 10_000).await.unwrap()).unwrap();
+    assert_eq!(native_unary_body["error"]["type"], "api_error");
+
+    let native_stream = post_json(
+        application.clone(),
+        "/v1/messages",
+        serde_json::json!({
+            "model": "blocked/model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(native_stream.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(native_stream.headers().contains_key("retry-after"));
+    let native_stream_body: Value =
+        serde_json::from_slice(&to_bytes(native_stream.into_body(), 10_000).await.unwrap())
+            .unwrap();
+    assert_eq!(native_stream_body["error"]["type"], "overloaded_error");
     assert_eq!(preparation_starts.load(Ordering::SeqCst), 1);
     first_request.abort();
+
+    let released_response = tokio::time::timeout(
+        Duration::from_secs(1),
+        post_json(
+            application,
+            "/v1/chat",
+            serde_json::json!({
+                "model": "unknown/model",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        ),
+    )
+    .await
+    .expect("cancellation should release ingress preparation capacity");
+    assert_eq!(released_response.status(), StatusCode::BAD_REQUEST);
 }

@@ -1009,6 +1009,27 @@ mod tests {
         }
     }
 
+    struct LatchBlockedDispatch {
+        dispatch_starts: Arc<std::sync::atomic::AtomicUsize>,
+        dispatch_started: Arc<tokio::sync::Notify>,
+        release_dispatches: Arc<Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl Dispatch for LatchBlockedDispatch {
+        async fn dispatch(&self, _provider: &str, payload: Value) -> Result<Value, DispatchError> {
+            self.dispatch_starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.dispatch_started.notify_one();
+            self.release_dispatches
+                .acquire()
+                .await
+                .expect("test release semaphore remains open")
+                .forget();
+            Ok(payload)
+        }
+    }
+
     fn unlimited() -> Arc<dyn RateLimiter> {
         Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default()))
     }
@@ -1075,6 +1096,124 @@ mod tests {
             got.push(item.expect("chunk"));
         }
         assert_eq!(got, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_worker_leases_only_available_preparation_capacity() {
+        let Some(redis_url) = std::env::var("LLMSHIM_REDIS_URL").ok() else {
+            return;
+        };
+        let provider = format!(
+            "itest-preparation-capacity-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let client = redis::Client::open(redis_url.clone()).unwrap();
+        let mut connection = ConnectionManager::new(client).await.unwrap();
+        for key in [
+            queue_key(&provider),
+            processing_key(&provider),
+            leased_key(&provider),
+        ] {
+            let _: i64 = connection.del(key).await.unwrap();
+        }
+
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let first_dispatch_started = dispatch_started.notified();
+        let release_dispatches = Arc::new(Semaphore::new(0));
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(LatchBlockedDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: dispatch_started.clone(),
+                release_dispatches: release_dispatches.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                max_concurrency_per_provider: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut submissions = Vec::new();
+        for id in 0..3 {
+            let gateway = gateway.clone();
+            let provider = provider.clone();
+            submissions.push(tokio::spawn(async move {
+                gateway
+                    .submit(GatewayRequest {
+                        provider,
+                        tier: 0,
+                        permits: 1,
+                        payload: serde_json::json!({"id": id}),
+                    })
+                    .await
+            }));
+        }
+        for _ in 0..1_000 {
+            let queued: u64 = connection.zcard(queue_key(&provider)).await.unwrap();
+            if queued == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(queue_key(&provider))
+                .await
+                .unwrap(),
+            3
+        );
+
+        let worker_handles = gateway.spawn_workers(vec![provider.clone()]);
+        tokio::time::timeout(Duration::from_secs(2), first_dispatch_started)
+            .await
+            .expect("first leased dispatch should start");
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(processing_key(&provider))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .hlen::<_, u64>(leased_key(&provider))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(queue_key(&provider))
+                .await
+                .unwrap(),
+            2
+        );
+
+        release_dispatches.add_permits(3);
+        for submission in submissions {
+            tokio::time::timeout(Duration::from_secs(2), submission)
+                .await
+                .expect("bounded dispatch should complete")
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        for worker_handle in worker_handles {
+            worker_handle.abort();
+        }
+        for key in [
+            queue_key(&provider),
+            processing_key(&provider),
+            leased_key(&provider),
+        ] {
+            let _: i64 = connection.del(key).await.unwrap();
+        }
     }
 
     #[tokio::test]
