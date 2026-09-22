@@ -285,8 +285,7 @@ impl Provider for OpenAiCompatible {
         };
         // Captured against this server's target, not the OpenAI adapter's, so
         // the block's origin names the provider that actually issued it.
-        crate::reasoning::capture_response(&self.replay_target(model), &native, &mut result);
-        crate::toolcall::capture_response(&self.replay_target(model), &native, &mut result)?;
+        crate::derived_response::capture_unary(&self.replay_target(model), &native, &mut result)?;
         Ok(result)
     }
 
