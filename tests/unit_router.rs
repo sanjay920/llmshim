@@ -320,7 +320,7 @@ fn router_resolves_catalog_spellings_without_rerouting_reseller_models() {
 
 #[test]
 fn router_resolve_keeps_an_openrouter_variant_suffix_on_the_wire_model() {
-    // MOH-240 guard: the catalog carries a row for the base id
+    // The catalog carries a row for the base id
     // (`deepseek/deepseek-v4.1-flash`), which is exactly the case that could
     // tempt `resolve_key` into a catalog hit that replaces the returned
     // model with the catalog's un-suffixed spelling. It must not — the

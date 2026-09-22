@@ -41,6 +41,13 @@ struct Part {
     ended: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartStringField {
+    Name,
+    WireId,
+    Arguments,
+}
+
 /// Per-response stream state. Complete calls are exposed only after terminal
 /// metadata, so no caller executes partial JSON or misses a trailing signature.
 pub struct ToolStream {
@@ -48,13 +55,31 @@ pub struct ToolStream {
     scope: String,
     parts: BTreeMap<String, Part>,
     gemini_last: BTreeMap<u64, (String, u64, usize)>,
-    gemini_by_id: BTreeMap<(u64, String), String>,
+    gemini_by_id: BTreeMap<u64, BTreeMap<String, String>>,
     frame: u64,
     gemini_next: BTreeMap<u64, u64>,
     emitted: BTreeSet<u64>,
+    budget: crate::stream_retention::RetainedBudget,
+    retained: crate::stream_retention::RetainedFootprint,
+    #[cfg(test)]
+    gemini_id_index_operations: usize,
 }
 impl ToolStream {
     pub fn new(target: ReplayTarget) -> Self {
+        let limits = crate::stream_retention::StreamRetentionLimits::default();
+        Self::with_budget(
+            target,
+            crate::stream_retention::RetainedBudget::new(
+                limits.normalizer_bytes,
+                limits.normalizer_entries,
+            ),
+        )
+    }
+
+    pub(crate) fn with_budget(
+        target: ReplayTarget,
+        budget: crate::stream_retention::RetainedBudget,
+    ) -> Self {
         Self {
             target,
             scope: uuid::Uuid::new_v4().to_string(),
@@ -64,53 +89,81 @@ impl ToolStream {
             frame: 0,
             gemini_next: BTreeMap::new(),
             emitted: BTreeSet::new(),
+            budget,
+            retained: crate::stream_retention::RetainedFootprint::default(),
+            #[cfg(test)]
+            gemini_id_index_operations: 0,
         }
     }
 
     pub fn apply(&mut self, delta: ToolDelta) -> Result<()> {
+        let result = self.apply_inner(delta);
+        if result.is_err() {
+            self.clear();
+        }
+        result
+    }
+
+    fn apply_inner(&mut self, delta: ToolDelta) -> Result<()> {
         if self.emitted.contains(&delta.choice) {
             return Err(upstream("tool data arrived after completion"));
         }
         if !self.parts.contains_key(&delta.part_id) {
-            self.parts.insert(
-                delta.part_id.clone(),
-                Part {
-                    id: mint(),
-                    choice: delta.choice,
-                    index: delta.index,
-                    name: String::new(),
-                    wire_id: None,
-                    item_id: None,
-                    arguments: String::new(),
-                    initial: false,
-                    signature: None,
-                    signature_field: None,
-                    ended: false,
-                },
-            );
+            let new_part = Part {
+                id: mint(),
+                choice: delta.choice,
+                index: delta.index,
+                name: String::new(),
+                wire_id: None,
+                item_id: None,
+                arguments: String::new(),
+                initial: false,
+                signature: None,
+                signature_field: None,
+                ended: false,
+            };
+            let footprint = part_footprint(&delta.part_id, &new_part);
+            self.reserve(footprint)?;
+            self.parts.insert(delta.part_id.clone(), new_part);
+        }
+        match &delta.update {
+            ToolUpdate::NameFragment(fragment) => {
+                return self.append_fragment(&delta.part_id, PartStringField::Name, fragment, false)
+            }
+            ToolUpdate::WireIdFragment(fragment) => {
+                return self.append_fragment(
+                    &delta.part_id,
+                    PartStringField::WireId,
+                    fragment,
+                    false,
+                )
+            }
+            ToolUpdate::ArgumentsFragment(fragment) => {
+                let part = self.parts.get(&delta.part_id).unwrap();
+                if part.ended {
+                    return Err(upstream("argument delta followed a completed tool part"));
+                }
+                return self.append_fragment(
+                    &delta.part_id,
+                    PartStringField::Arguments,
+                    fragment,
+                    part.initial,
+                );
+            }
+            _ => {}
         }
         let part = self.parts.get_mut(&delta.part_id).unwrap();
+        let previous_footprint = part_footprint(&delta.part_id, part);
         match delta.update {
             ToolUpdate::Name(v) => part.name = v,
-            ToolUpdate::NameFragment(v) => part.name.push_str(&v),
+            ToolUpdate::NameFragment(_)
+            | ToolUpdate::WireIdFragment(_)
+            | ToolUpdate::ArgumentsFragment(_) => unreachable!("fragments handled above"),
             ToolUpdate::WireId(v) => part.wire_id = Some(v),
-            ToolUpdate::WireIdFragment(v) => {
-                part.wire_id.get_or_insert_with(String::new).push_str(&v)
-            }
             ToolUpdate::ItemId(v) => part.item_id = Some(v),
             ToolUpdate::ArgumentsStart(v) => {
                 part.arguments = v;
                 part.initial = true;
-            }
-            ToolUpdate::ArgumentsFragment(v) => {
-                if part.ended {
-                    return Err(upstream("argument delta followed a completed tool part"));
-                }
-                if part.initial {
-                    part.arguments.clear();
-                    part.initial = false;
-                }
-                part.arguments.push_str(&v);
             }
             ToolUpdate::Arguments(v) => {
                 if part.arguments != v {
@@ -131,6 +184,77 @@ impl ToolStream {
                 part.ended = true;
             }
         }
+        let replacement_footprint = part_footprint(&delta.part_id, part);
+        self.budget
+            .replace(previous_footprint, replacement_footprint)?;
+        self.retained.bytes = self
+            .retained
+            .bytes
+            .saturating_sub(previous_footprint.bytes)
+            .saturating_add(replacement_footprint.bytes);
+        self.retained.entries = self
+            .retained
+            .entries
+            .saturating_sub(previous_footprint.entries)
+            .saturating_add(replacement_footprint.entries);
+        Ok(())
+    }
+
+    fn append_fragment(
+        &mut self,
+        part_id: &str,
+        field: PartStringField,
+        fragment: &str,
+        replace_initial: bool,
+    ) -> Result<()> {
+        let part = self.parts.get(part_id).unwrap();
+        let current_length = part_string_length(part, field);
+        let current_capacity = part_string_capacity(part, field);
+        let base_length = if replace_initial { 0 } else { current_length };
+        let final_length = base_length
+            .checked_add(fragment.len())
+            .ok_or_else(crate::stream_retention::retention_error)?;
+        let projected_capacity = if replace_initial {
+            final_length
+        } else {
+            current_capacity.max(final_length)
+        };
+        let previous_footprint = part_footprint(part_id, part);
+        let projected_footprint =
+            part_footprint_with_capacity(part_id, part, field, projected_capacity);
+        self.replace(previous_footprint, projected_footprint)?;
+
+        if replace_initial {
+            let mut replacement = String::new();
+            if replacement.try_reserve_exact(fragment.len()).is_err() {
+                self.replace(projected_footprint, previous_footprint)?;
+                return Err(crate::stream_retention::retention_error());
+            }
+            let actual_footprint = part_footprint_with_capacity(
+                part_id,
+                self.parts.get(part_id).unwrap(),
+                field,
+                replacement.capacity(),
+            );
+            self.replace(projected_footprint, actual_footprint)?;
+            replacement.push_str(fragment);
+            let part = self.parts.get_mut(part_id).unwrap();
+            part.arguments = replacement;
+            part.initial = false;
+            return Ok(());
+        }
+
+        let allocation_result = {
+            let part = self.parts.get_mut(part_id).unwrap();
+            part_string_mut(part, field).try_reserve_exact(fragment.len())
+        };
+        if allocation_result.is_err() {
+            self.replace(projected_footprint, previous_footprint)?;
+            return Err(crate::stream_retention::retention_error());
+        }
+        let actual_footprint = part_footprint(part_id, self.parts.get(part_id).unwrap());
+        self.replace(projected_footprint, actual_footprint)?;
+        part_string_mut(self.parts.get_mut(part_id).unwrap(), field).push_str(fragment);
         Ok(())
     }
 
@@ -355,9 +479,9 @@ impl ToolStream {
                             .get(&choice)
                             .cloned()
                             .filter(|(_, frame, slot)| *frame != self.frame || *slot == position);
-                        let known = call["id"].as_str().and_then(|id| {
-                            self.gemini_by_id.get(&(choice, id.to_owned())).cloned()
-                        });
+                        let known = call["id"]
+                            .as_str()
+                            .and_then(|id| self.gemini_id_mapping(choice, id));
                         let key = known.or_else(|| {
                             prior.as_ref().and_then(|(key, _, _)| {
                                 self.parts
@@ -369,12 +493,117 @@ impl ToolStream {
                         let (key, index) = if let Some(key) = key {
                             (key.clone(), self.parts[&key].index)
                         } else {
-                            let index = self.next_gemini(choice);
+                            let index = self.next_gemini(choice)?;
                             (format!("gemini:{choice}:{index}"), index)
                         };
                         if let Some(id) = call["id"].as_str() {
-                            self.gemini_by_id.insert((choice, id.into()), key.clone());
+                            #[cfg(test)]
+                            {
+                                self.gemini_id_index_operations += 1;
+                            }
+                            let existing_mapping = self
+                                .gemini_by_id
+                                .get(&choice)
+                                .and_then(|mappings| mappings.get_key_value(id));
+                            let stored_id_capacity =
+                                existing_mapping.map(|(stored_id, _)| stored_id.capacity());
+                            let previous_mapping = existing_mapping
+                                .map(|(stored_id, value)| {
+                                    crate::stream_retention::RetainedFootprint::record(
+                                        stored_id.capacity().saturating_add(value.capacity()),
+                                    )
+                                })
+                                .unwrap_or_default();
+                            let mapping_exists = previous_mapping.entries != 0;
+                            let choice_exists = self.gemini_by_id.contains_key(&choice);
+                            if !choice_exists {
+                                self.reserve(crate::stream_retention::RetainedFootprint::record(
+                                    0,
+                                ))?;
+                            }
+                            let replacement_mapping =
+                                crate::stream_retention::RetainedFootprint::record(
+                                    id.len().saturating_add(key.len()),
+                                );
+                            if let Err(error) = self.replace(previous_mapping, replacement_mapping)
+                            {
+                                if !choice_exists {
+                                    self.release(
+                                        crate::stream_retention::RetainedFootprint::record(0),
+                                    );
+                                }
+                                return Err(error);
+                            }
+                            let owned_value = match fallible_string(&key) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    self.replace(replacement_mapping, previous_mapping)?;
+                                    if !choice_exists {
+                                        self.release(
+                                            crate::stream_retention::RetainedFootprint::record(0),
+                                        );
+                                    }
+                                    return Err(error);
+                                }
+                            };
+                            if mapping_exists {
+                                let actual_mapping =
+                                    crate::stream_retention::RetainedFootprint::record(
+                                        stored_id_capacity
+                                            .unwrap()
+                                            .saturating_add(owned_value.capacity()),
+                                    );
+                                self.replace(replacement_mapping, actual_mapping)?;
+                                #[cfg(test)]
+                                {
+                                    self.gemini_id_index_operations += 1;
+                                }
+                                *self
+                                    .gemini_by_id
+                                    .get_mut(&choice)
+                                    .unwrap()
+                                    .get_mut(id)
+                                    .unwrap() = owned_value;
+                            } else {
+                                let owned_id = match fallible_string(id) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        self.replace(replacement_mapping, previous_mapping)?;
+                                        if !choice_exists {
+                                            self.release(
+                                                crate::stream_retention::RetainedFootprint::record(
+                                                    0,
+                                                ),
+                                            );
+                                        }
+                                        return Err(error);
+                                    }
+                                };
+                                let actual_mapping =
+                                    crate::stream_retention::RetainedFootprint::record(
+                                        owned_id.capacity().saturating_add(owned_value.capacity()),
+                                    );
+                                self.replace(replacement_mapping, actual_mapping)?;
+                                #[cfg(test)]
+                                {
+                                    self.gemini_id_index_operations += 1;
+                                }
+                                self.gemini_by_id
+                                    .entry(choice)
+                                    .or_default()
+                                    .insert(owned_id, owned_value);
+                            }
                         }
+                        let previous_last = self
+                            .gemini_last
+                            .get(&choice)
+                            .map(|value| {
+                                crate::stream_retention::RetainedFootprint::record(value.0.len())
+                            })
+                            .unwrap_or_default();
+                        let replacement_last =
+                            crate::stream_retention::RetainedFootprint::record(key.len());
+                        self.replace(previous_last, replacement_last)?;
                         self.gemini_last
                             .insert(choice, (key.clone(), self.frame, position));
                         if let Some(id) = call["id"].as_str() {
@@ -408,11 +637,14 @@ impl ToolStream {
         Ok(())
     }
 
-    fn next_gemini(&mut self, choice: u64) -> u64 {
+    fn next_gemini(&mut self, choice: u64) -> Result<u64> {
+        if !self.gemini_next.contains_key(&choice) {
+            self.reserve(crate::stream_retention::RetainedFootprint::record(0))?;
+        }
         let next = self.gemini_next.entry(choice).or_default();
         let n = *next;
         *next += 1;
-        n
+        Ok(n)
     }
     fn response_item(&mut self, key: &str, index: u64, item: &Value, done: bool) -> Result<()> {
         if let Some(id) = item["call_id"].as_str() {
@@ -492,24 +724,64 @@ impl ToolStream {
             }
             result.entry(part.choice).or_default().push(call);
         }
-        self.emitted.insert(choice);
+        if !self.emitted.contains(&choice) {
+            self.reserve(crate::stream_retention::RetainedFootprint::record(0))?;
+            self.emitted.insert(choice);
+        }
+        let completed_keys: Vec<_> = self
+            .parts
+            .iter()
+            .filter(|(_, part)| part.choice == choice)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in completed_keys {
+            if let Some(part) = self.parts.remove(&key) {
+                self.release(part_footprint(&key, &part));
+            }
+        }
+        if let Some(last) = self.gemini_last.remove(&choice) {
+            self.release(crate::stream_retention::RetainedFootprint::record(
+                last.0.len(),
+            ));
+        }
+        if let Some(mappings) = self.gemini_by_id.remove(&choice) {
+            for (id, value) in mappings {
+                self.release(crate::stream_retention::RetainedFootprint::record(
+                    id.capacity().saturating_add(value.capacity()),
+                ));
+            }
+            self.release(crate::stream_retention::RetainedFootprint::record(0));
+        }
+        if self.gemini_next.remove(&choice).is_some() {
+            self.release(crate::stream_retention::RetainedFootprint::record(0));
+        }
         Ok(result)
     }
 
-    pub(crate) fn finish(&self) -> Result<()> {
-        if self
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        let incomplete = self
             .parts
             .values()
-            .any(|p| !self.emitted.contains(&p.choice))
-        {
-            return Err(upstream("stream ended before all tool choices completed"));
+            .any(|p| !self.emitted.contains(&p.choice));
+        self.clear();
+        if incomplete {
+            Err(upstream("stream ended before all tool choices completed"))
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     /// Consume one native event plus its already-normalized ordinary fields.
     /// Provider tool conversions are discarded: this is their sole replacement.
     pub fn push(&mut self, event: &Value, chunk: Option<String>) -> Result<Option<String>> {
+        let result = self.push_inner(event, chunk);
+        if result.is_err() {
+            self.clear();
+        }
+        result
+    }
+
+    fn push_inner(&mut self, event: &Value, chunk: Option<String>) -> Result<Option<String>> {
         self.parse(event)?;
         let had_chunk = chunk.is_some();
         let mut value: Value = match chunk {
@@ -590,5 +862,197 @@ impl ToolStream {
                 })
             });
         Ok((useful && (had_chunk || terminal)).then(|| value.to_string()))
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.parts.clear();
+        self.gemini_last.clear();
+        self.gemini_by_id.clear();
+        self.gemini_next.clear();
+        self.emitted.clear();
+        self.budget.release(self.retained);
+        self.retained = crate::stream_retention::RetainedFootprint::default();
+    }
+
+    fn reserve(&mut self, footprint: crate::stream_retention::RetainedFootprint) -> Result<()> {
+        self.budget.reserve(footprint)?;
+        self.retained = self
+            .retained
+            .checked_add(footprint)
+            .ok_or_else(crate::stream_retention::retention_error)?;
+        Ok(())
+    }
+
+    fn replace(
+        &mut self,
+        previous: crate::stream_retention::RetainedFootprint,
+        replacement: crate::stream_retention::RetainedFootprint,
+    ) -> Result<()> {
+        self.budget.replace(previous, replacement)?;
+        self.retained.bytes = self
+            .retained
+            .bytes
+            .saturating_sub(previous.bytes)
+            .saturating_add(replacement.bytes);
+        self.retained.entries = self
+            .retained
+            .entries
+            .saturating_sub(previous.entries)
+            .saturating_add(replacement.entries);
+        Ok(())
+    }
+
+    fn release(&mut self, footprint: crate::stream_retention::RetainedFootprint) {
+        self.budget.release(footprint);
+        self.retained.bytes = self.retained.bytes.saturating_sub(footprint.bytes);
+        self.retained.entries = self.retained.entries.saturating_sub(footprint.entries);
+    }
+
+    fn gemini_id_mapping(&mut self, choice: u64, id: &str) -> Option<String> {
+        #[cfg(test)]
+        {
+            self.gemini_id_index_operations += 1;
+        }
+        self.gemini_by_id
+            .get(&choice)
+            .and_then(|mappings| mappings.get(id))
+            .cloned()
+    }
+}
+
+fn part_footprint(key: &str, part: &Part) -> crate::stream_retention::RetainedFootprint {
+    part_footprint_with_capacity(key, part, PartStringField::Name, part.name.capacity())
+}
+
+fn part_footprint_with_capacity(
+    key: &str,
+    part: &Part,
+    field: PartStringField,
+    replacement_capacity: usize,
+) -> crate::stream_retention::RetainedFootprint {
+    let capacity = |candidate: PartStringField, actual: usize| {
+        if candidate == field {
+            replacement_capacity
+        } else {
+            actual
+        }
+    };
+    let mut bytes = std::mem::size_of::<Part>()
+        .saturating_add(key.len())
+        .saturating_add(part.id.capacity())
+        .saturating_add(capacity(PartStringField::Name, part.name.capacity()))
+        .saturating_add(capacity(
+            PartStringField::Arguments,
+            part.arguments.capacity(),
+        ))
+        .saturating_add(capacity(
+            PartStringField::WireId,
+            part.wire_id.as_ref().map_or(0, String::capacity),
+        ));
+    for value in [part.item_id.as_ref(), part.signature_field.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        bytes = bytes.saturating_add(value.capacity());
+    }
+    if let Some(signature) = &part.signature {
+        bytes = bytes
+            .saturating_add(signature.data.capacity())
+            .saturating_add(signature.origin.provider.capacity())
+            .saturating_add(signature.origin.model.capacity());
+    }
+    crate::stream_retention::RetainedFootprint::record(bytes)
+}
+
+fn part_string_length(part: &Part, field: PartStringField) -> usize {
+    match field {
+        PartStringField::Name => part.name.len(),
+        PartStringField::WireId => part.wire_id.as_ref().map_or(0, String::len),
+        PartStringField::Arguments => part.arguments.len(),
+    }
+}
+
+fn part_string_capacity(part: &Part, field: PartStringField) -> usize {
+    match field {
+        PartStringField::Name => part.name.capacity(),
+        PartStringField::WireId => part.wire_id.as_ref().map_or(0, String::capacity),
+        PartStringField::Arguments => part.arguments.capacity(),
+    }
+}
+
+fn part_string_mut(part: &mut Part, field: PartStringField) -> &mut String {
+    match field {
+        PartStringField::Name => &mut part.name,
+        PartStringField::WireId => part.wire_id.get_or_insert_with(String::new),
+        PartStringField::Arguments => &mut part.arguments,
+    }
+}
+
+fn fallible_string(value: &str) -> Result<String> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| crate::stream_retention::retention_error())?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn fragment_refusal_drops_every_partial_string() {
+        for update in [
+            ToolUpdate::NameFragment("x".repeat(64)),
+            ToolUpdate::WireIdFragment("x".repeat(64)),
+            ToolUpdate::ArgumentsFragment("x".repeat(64)),
+        ] {
+            let budget = crate::stream_retention::RetainedBudget::new(768, 64);
+            let mut stream = ToolStream::with_budget(
+                ReplayTarget::new("custom", "model", WireFormat::OpenAiChat),
+                budget.clone(),
+            );
+            let error = (0..32)
+                .find_map(|_| {
+                    stream
+                        .apply(ToolDelta {
+                            part_id: "part".into(),
+                            choice: 0,
+                            index: 0,
+                            update: update.clone(),
+                        })
+                        .err()
+                })
+                .expect("capacity growth must reach the injected limit");
+            assert_eq!(
+                error.to_string(),
+                format!("stream error: {}", crate::stream_retention::RETENTION_ERROR)
+            );
+            assert!(stream.parts.is_empty());
+            assert_eq!(budget.retained(), Default::default());
+        }
+    }
+
+    #[test]
+    fn gemini_id_index_uses_a_fixed_number_of_logarithmic_operations() {
+        let mut stream = ToolStream::new(ReplayTarget::new(
+            "gemini",
+            "gemini-2.5-pro",
+            WireFormat::GoogleGenerateContent,
+        ));
+        let identifiers = 256_u64;
+        for index in 0..identifiers {
+            stream
+                .parse(&json!({"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"id":format!("id-{index}"),"name":"read","args":{}}}]}}]}))
+                .unwrap();
+        }
+        stream
+            .parse(&json!({"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"id":"id-128","args":{"replacement":true}}}]}}]}))
+            .unwrap();
+
+        assert_eq!(stream.gemini_by_id[&0].len(), identifiers as usize);
+        assert!(stream.gemini_id_index_operations <= 3 * (identifiers as usize + 1));
+        assert_eq!(stream.gemini_by_id[&0]["id-128"], "gemini:0:128");
     }
 }
