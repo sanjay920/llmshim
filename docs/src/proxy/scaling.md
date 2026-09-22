@@ -94,6 +94,12 @@ the serialized native prompt and schema material, recognized native reasoning
 budgets, and the effective native output limit.
 For Chat Completions, a null `max_completion_tokens` does not hide a numeric
 `max_tokens` limit; a numeric `max_completion_tokens` retains precedence.
+Recognized output limits must use unsigned JSON integers or null for TPM
+estimation. Other representations, including quoted integers and floats that
+a backend may coerce, reserve the maximum token estimate instead of silently
+falling back to an omitted-limit default. This affects TPM admission only;
+the forwarded request is unchanged. Use integer JSON values for bounded
+output allowances.
 For native Chat Completions bodies, OpenAI's `n` is treated as a generated
 candidate count; Gemini `generationConfig.candidateCount` is treated the same
 way. The output allowance is multiplied by the final wire candidate count. The
