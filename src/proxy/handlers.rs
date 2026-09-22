@@ -52,6 +52,11 @@ pub async fn chat(
         // Delegate to streaming (which runs its own admission control).
         return Ok(chat_stream_inner(state, req).await);
     }
+    let _preparation_permit = state
+        .backpressure
+        .acquire_preparation()
+        .await
+        .map_err(|_| ApiError::Overloaded(state.backpressure.queue_timeout()))?;
     let prepared_request = convert::prepare_request(&state.router, &req)?;
     if let Some(fallback_models) = &req.fallback {
         convert::validate_resolvable_fallbacks(
@@ -120,6 +125,10 @@ pub async fn chat_stream(
 }
 
 async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
+    let preparation_permit = match state.backpressure.acquire_preparation().await {
+        Ok(permit) => permit,
+        Err(()) => return ApiError::Overloaded(state.backpressure.queue_timeout()).into_response(),
+    };
     let prepared_request = match convert::prepare_request(&state.router, &req) {
         Ok(prepared_request) => prepared_request,
         Err(error) => return ApiError::from(error).into_response(),
@@ -138,6 +147,7 @@ async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
     }
 
     let event_stream = async_stream::stream! {
+        let _preparation_permit = preparation_permit;
         match stream_result {
             Ok(mut upstream_stream) => {
                 while let Some(chunk) = upstream_stream.next().await {

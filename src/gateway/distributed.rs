@@ -586,6 +586,10 @@ impl DistributedGateway {
         let mut conn = self.conn.clone();
 
         loop {
+            let preparation_permit = match sem.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
             let deadline = now_ms() + self.config.lease_timeout.as_millis() as u64;
             let leased: Option<(String, String)> = match self
                 .lease
@@ -598,12 +602,14 @@ impl DistributedGateway {
             {
                 Ok(v) => v,
                 Err(e) => {
+                    drop(preparation_permit);
                     eprintln!("gateway worker[{provider}]: lease error: {e}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             };
             let Some((member, score)) = leased else {
+                drop(preparation_permit);
                 tokio::time::sleep(IDLE_POLL).await; // queue empty
                 continue;
             };
@@ -645,21 +651,14 @@ impl DistributedGateway {
             };
             match rate_admission {
                 Ok(()) => {
-                    let permit = if policy_gated {
-                        None
-                    } else {
-                        match sem.clone().acquire_owned().await {
-                            Ok(permit) => Some(permit),
-                            Err(_) => break,
-                        }
-                    };
                     let me = self.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
+                        let _preparation_permit = preparation_permit;
                         me.run_and_publish(desc, member).await;
                     });
                 }
                 Err(RetryAfter(wait)) => {
+                    drop(preparation_permit);
                     // Release the lease back to the queue (priority preserved).
                     let _: Result<i64, _> = self
                         .release
