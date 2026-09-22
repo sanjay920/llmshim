@@ -66,6 +66,8 @@ let relayServer: HttpServer | null = null;
 let relayBaseUrl: string | null = null;
 let startingRelay: Promise<string> | null = null;
 let cleanupRegistered = false;
+let managedStartupDelayForTestsMs = 0;
+let pinnedRequestObserverForTests: (() => void) | null = null;
 
 /** Maps Node's platform and architecture to the optional binary package. */
 export function platformPackageName(): string {
@@ -247,6 +249,7 @@ function pinnedRequest(
   path: string,
   headers: IncomingHttpHeaders = {},
 ) {
+  pinnedRequestObserverForTests?.();
   const forwardedHeaders: IncomingHttpHeaders = {};
   for (const [name, value] of Object.entries(headers)) {
     const lowerName = name.toLowerCase();
@@ -324,6 +327,9 @@ function startManagedChild(): Promise<ManagedChild> {
       childProcess.stdout?.destroy();
       const child: ManagedChild = { process: childProcess, ...material };
       await waitForAuthenticatedHealth(child);
+      if (managedStartupDelayForTestsMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, managedStartupDelayForTestsMs));
+      }
       childProcess.once("exit", () => {
         if (managedChild?.process === childProcess) managedChild = null;
       });
@@ -407,39 +413,51 @@ function startRelay(): Promise<string> {
       return;
     }
     const targetPath = parsed.pathname.slice(prefix.length) + parsed.search;
+    let downstreamCancelled = incoming.aborted || incoming.destroyed || outgoing.destroyed;
+    let relayFinished = false;
+    let upstream: ReturnType<typeof pinnedRequest> | null = null;
+    let upstreamResponse: IncomingMessage | null = null;
+    const cancelRelayRequest = () => {
+      if (relayFinished || downstreamCancelled) return;
+      downstreamCancelled = true;
+      upstreamResponse?.destroy();
+      upstream?.destroy();
+    };
+    const requestClosedBeforeForward = () =>
+      downstreamCancelled || incoming.aborted || incoming.destroyed || outgoing.destroyed;
+    const requestCancelledAfterForward = () => downstreamCancelled || outgoing.destroyed;
+    outgoing.once("close", cancelRelayRequest);
+    outgoing.once("finish", () => {
+      relayFinished = true;
+    });
+    incoming.once("aborted", cancelRelayRequest);
+
     let child: ManagedChild;
     try {
       child = await ensureManagedChild();
     } catch (error) {
+      if (requestClosedBeforeForward()) return;
       const message = error instanceof Error ? error.message : String(error);
       const payload = JSON.stringify({ error: { code: "managed_proxy_unavailable", message } });
       outgoing.writeHead(502, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
       outgoing.end(payload);
       return;
     }
+    if (requestClosedBeforeForward()) return;
 
-    const upstream = pinnedRequest(child, incoming.method ?? "GET", targetPath, relayHeaders(incoming.headers));
-    let upstreamResponse: IncomingMessage | null = null;
-    let upstreamFinished = false;
-    let upstreamCancelled = false;
-    const cancelUpstream = () => {
-      if (upstreamFinished || upstreamCancelled) return;
-      upstreamCancelled = true;
-      upstreamResponse?.destroy();
-      upstream.destroy();
-    };
-    outgoing.once("close", cancelUpstream);
-    outgoing.once("finish", () => {
-      upstreamFinished = true;
-    });
+    upstream = pinnedRequest(child, incoming.method ?? "GET", targetPath, relayHeaders(incoming.headers));
     let responseStarted = false;
     upstream.once("response", (response) => {
+      if (requestCancelledAfterForward()) {
+        response.destroy();
+        upstream?.destroy();
+        return;
+      }
       responseStarted = true;
       upstreamResponse = response;
-      response.once("end", () => {
-        upstreamFinished = true;
+      response.once("error", (error) => {
+        if (!requestCancelledAfterForward()) outgoing.destroy(error);
       });
-      response.once("error", (error) => outgoing.destroy(error));
       const headers: IncomingHttpHeaders = {};
       for (const [name, value] of Object.entries(response.headers)) {
         if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) headers[name] = value;
@@ -448,6 +466,7 @@ function startRelay(): Promise<string> {
       response.pipe(outgoing);
     });
     upstream.once("error", (error) => {
+      if (requestCancelledAfterForward()) return;
       if (responseStarted || outgoing.headersSent) {
         outgoing.destroy(error);
         return;
@@ -458,7 +477,10 @@ function startRelay(): Promise<string> {
       outgoing.writeHead(502, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
       outgoing.end(payload);
     });
-    incoming.once("aborted", cancelUpstream);
+    if (requestCancelledAfterForward()) {
+      cancelRelayRequest();
+      return;
+    }
     incoming.pipe(upstream);
   });
   configureRelayLimits(server, DEFAULT_RELAY_LIMITS);
@@ -533,6 +555,12 @@ export const __testing = {
   pinnedRequest,
   readReadiness,
   configureRelayLimits,
+  setManagedStartupDelay: (delayMs: number) => {
+    managedStartupDelayForTestsMs = delayMs;
+  },
+  setPinnedRequestObserver: (observer: (() => void) | null) => {
+    pinnedRequestObserverForTests = observer;
+  },
   managedChildSnapshot: () => managedChild,
   stopManagedChild: () => {
     const child = managedChild;

@@ -102,6 +102,15 @@ async function waitForProcessGone(pid, timeoutMs = 3_000) {
   throw new Error(`process ${pid} survived cleanup`);
 }
 
+async function waitForCondition(predicate, message, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(message);
+}
+
 async function readPidFile(path, timeoutMs = 3_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -418,6 +427,82 @@ test(
       if (childPid && processExists(childPid)) process.kill(childPid, "SIGKILL");
       if (fixture.exitCode === null && fixture.signalCode === null) fixture.kill("SIGKILL");
       await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "caller cancellation during replacement startup opens no retained child request",
+  { skip: !process.env.LLMSHIM_TEST_BINARY },
+  async () => {
+    const binary = process.env.LLMSHIM_TEST_BINARY;
+    process.env.PATH = `${dirname(binary)}${delimiter}${process.env.PATH ?? ""}`;
+    let providerRequests = 0;
+    const provider = createHttpServer((request, response) => {
+      providerRequests += 1;
+      request.resume();
+      response.writeHead(500).end();
+    });
+    await new Promise((resolve, reject) => {
+      provider.once("error", reject);
+      provider.listen(0, "127.0.0.1", resolve);
+    });
+    const providerAddress = provider.address();
+    assert.ok(providerAddress && typeof providerAddress === "object");
+    process.env.VLLM_BASE_URL = `http://127.0.0.1:${providerAddress.port}/v1`;
+    const relayUrl = await ensureServer();
+    const previousChild = __testing.stopManagedChild();
+    if (previousChild?.process.exitCode === null) {
+      await new Promise((resolve) => previousChild.process.once("exit", resolve));
+    }
+
+    let pinnedRequests = 0;
+    __testing.setManagedStartupDelay(500);
+    __testing.setPinnedRequestObserver(() => {
+      pinnedRequests += 1;
+    });
+    const relay = new URL(relayUrl);
+    const caller = createConnection({ host: relay.hostname, port: Number(relay.port) });
+    try {
+      await new Promise((resolve, reject) => {
+        caller.once("connect", resolve);
+        caller.once("error", reject);
+      });
+      const body = JSON.stringify({
+        model: "vllm/test",
+        messages: [{ role: "user", content: "cancel during startup" }],
+      });
+      caller.write(
+        `POST ${relay.pathname}/v1/chat HTTP/1.1\r\n` +
+          `Host: ${relay.host}\r\n` +
+          "Content-Type: application/json\r\n" +
+          `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+          "Connection: close\r\n\r\n" +
+          body,
+      );
+      await waitForCondition(
+        () => pinnedRequests === 1,
+        "replacement child did not reach authenticated startup",
+      );
+      caller.destroy();
+      await new Promise((resolve) => setTimeout(resolve, 650));
+
+      assert.equal(providerRequests, 0);
+      assert.equal(pinnedRequests, 1);
+      const replacementChild = __testing.managedChildSnapshot();
+      assert.ok(replacementChild);
+      assert.equal((await new Client().health()).status, "ok");
+      assert.equal(__testing.managedChildSnapshot()?.process, replacementChild.process);
+      assert.equal(pinnedRequests, 2);
+    } finally {
+      caller.destroy();
+      __testing.setManagedStartupDelay(0);
+      __testing.setPinnedRequestObserver(null);
+      const child = __testing.stopManagedChild();
+      if (child?.process.exitCode === null) {
+        await new Promise((resolve) => child.process.once("exit", resolve));
+      }
+      await new Promise((resolve) => provider.close(resolve));
     }
   },
 );
