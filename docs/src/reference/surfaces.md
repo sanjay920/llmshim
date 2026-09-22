@@ -64,8 +64,8 @@ All language clients expose reasoning blocks and the tool-call signature object
 The engine limits ordinary JSON completion bodies to 32 MiB and provider error
 bodies to 64 KiB, measured after HTTP decompression. It checks decoded chunks
 before adding them to its body buffer. Oversized final bodies return a fixed
-502 error without including a truncated provider response. Retry bodies are
-read only up to the error-body limit, then dropped before another attempt.
+502 error without including a truncated provider response. Retry bodies use the
+same error-body buffer limit; oversized bodies are dropped before another attempt.
 
 These limits apply through the Rust completion API, CLI, proxy, and gateway.
 They bound decoded body bytes; JSON allocations and process memory have
