@@ -744,6 +744,221 @@ async fn an_upstream_body_matching_a_policy_message_keeps_upstream_provenance() 
 }
 
 #[tokio::test]
+async fn fallback_skips_same_target_retries_after_local_request_build_failure() {
+    let mut invalid_server = mockito::Server::new_async().await;
+    let mut secondary_server = mockito::Server::new_async().await;
+    let invalid_upstream = invalid_server
+        .mock("POST", "/never")
+        .expect(0)
+        .create_async()
+        .await;
+    let secondary_upstream = secondary_server
+        .mock("POST", "/chat/completions")
+        .with_body(response(json!("ok")))
+        .expect(1)
+        .create_async()
+        .await;
+    let router = llmshim::router::Router::new()
+        .register(
+            "invalid-header",
+            Box::new(InvalidHeaderProvider {
+                endpoint: format!("{}/never", invalid_server.url()),
+            }),
+        )
+        .register(
+            "secondary",
+            Box::new(OpenAiCompatible::new(
+                "secondary",
+                secondary_server.url(),
+                None,
+            )),
+        );
+    let policy = Arc::new(RecordingPolicy::default());
+    let fallback = llmshim::FallbackConfig::new(vec![
+        "invalid-header/first".to_owned(),
+        "secondary/second".to_owned(),
+    ])
+    .max_retries(3);
+
+    let result = llmshim::completion_with_fallback_and_policy(
+        &router,
+        &request("ignored/model"),
+        &fallback,
+        None,
+        &context(policy.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["choices"][0]["message"]["content"], "ok");
+    invalid_upstream.assert_async().await;
+    secondary_upstream.assert_async().await;
+    let acquired_providers: Vec<_> = policy
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            RecordedEvent::Acquired { provider_name, .. } => Some(provider_name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acquired_providers, vec!["secondary"]);
+}
+
+#[tokio::test]
+async fn fallback_moves_directly_after_local_repair_exhaustion() {
+    let mut primary_server = mockito::Server::new_async().await;
+    let mut secondary_server = mockito::Server::new_async().await;
+    let primary_upstream = primary_server
+        .mock("POST", "/chat/completions")
+        .with_body(response(json!("1")))
+        .expect(2)
+        .create_async()
+        .await;
+    let secondary_upstream = secondary_server
+        .mock("POST", "/chat/completions")
+        .with_body(response(json!("3")))
+        .expect(1)
+        .create_async()
+        .await;
+    let router = llmshim::router::Router::new()
+        .register(
+            "primary",
+            Box::new(OpenAiCompatible::new("primary", primary_server.url(), None)),
+        )
+        .register(
+            "secondary",
+            Box::new(OpenAiCompatible::new(
+                "secondary",
+                secondary_server.url(),
+                None,
+            )),
+        );
+    let policy = Arc::new(RecordingPolicy::default());
+    let fallback = llmshim::FallbackConfig::new(vec![
+        "primary/first".to_owned(),
+        "secondary/second".to_owned(),
+    ])
+    .max_retries(3);
+
+    let result = llmshim::completion_with_fallback_and_policy(
+        &router,
+        &structured_request("ignored/model"),
+        &fallback,
+        None,
+        &context(policy.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["choices"][0]["message"]["content"], "3");
+    primary_upstream.assert_async().await;
+    secondary_upstream.assert_async().await;
+    let acquired_providers: Vec<_> = policy
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            RecordedEvent::Acquired { provider_name, .. } => Some(provider_name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acquired_providers, vec!["primary", "primary", "secondary"]);
+}
+
+#[tokio::test]
+async fn provider_limit_skips_same_provider_retries_and_models() {
+    let mut primary_server = mockito::Server::new_async().await;
+    let mut secondary_server = mockito::Server::new_async().await;
+    let primary_upstream = primary_server
+        .mock("POST", "/chat/completions")
+        .expect(0)
+        .create_async()
+        .await;
+    let secondary_upstream = secondary_server
+        .mock("POST", "/chat/completions")
+        .with_body(response(json!("ok")))
+        .expect(1)
+        .create_async()
+        .await;
+    let router = llmshim::router::Router::new()
+        .register(
+            "primary",
+            Box::new(OpenAiCompatible::new("primary", primary_server.url(), None)),
+        )
+        .register(
+            "secondary",
+            Box::new(OpenAiCompatible::new(
+                "secondary",
+                secondary_server.url(),
+                None,
+            )),
+        );
+    let policy = Arc::new(RecordingPolicy::refusing_with_kind(
+        1,
+        AttemptPolicyRefusalKind::ProviderLimit,
+    ));
+    let fallback = llmshim::FallbackConfig::new(vec![
+        "primary/first".to_owned(),
+        "primary/second".to_owned(),
+        "secondary/third".to_owned(),
+    ])
+    .max_retries(3);
+
+    let result = llmshim::completion_with_fallback_and_policy(
+        &router,
+        &request("ignored/model"),
+        &fallback,
+        None,
+        &context(policy.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result["choices"][0]["message"]["content"], "ok");
+    primary_upstream.assert_async().await;
+    secondary_upstream.assert_async().await;
+    let acquired_providers: Vec<_> = policy
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            RecordedEvent::Acquired { provider_name, .. } => Some(provider_name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acquired_providers, vec!["primary", "secondary"]);
+
+    let no_distinct_policy = Arc::new(RecordingPolicy::refusing_with_kind(
+        1,
+        AttemptPolicyRefusalKind::ProviderLimit,
+    ));
+    let no_distinct_fallback = llmshim::FallbackConfig::new(vec![
+        "primary/first".to_owned(),
+        "primary/second".to_owned(),
+    ])
+    .max_retries(3);
+    let error = llmshim::completion_with_fallback_and_policy(
+        &router,
+        &request("ignored/model"),
+        &no_distinct_fallback,
+        None,
+        &context(no_distinct_policy.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("provider attempt limit exceeded"));
+    assert_eq!(
+        no_distinct_policy
+            .events()
+            .iter()
+            .filter(|event| matches!(event, RecordedEvent::Acquired { .. }))
+            .count(),
+        1
+    );
+    primary_upstream.assert_async().await;
+}
+
+#[tokio::test]
 async fn failed_repair_observes_each_usage_before_returning_the_error() {
     let mut server = mockito::Server::new_async().await;
     let upstream = server

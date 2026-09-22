@@ -238,6 +238,8 @@ pub enum AttemptEvent<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttemptPolicyRefusalKind {
+    /// Provider-wide capacity refusal. Fallback may only advance to a target
+    /// resolved to a different provider.
     ProviderLimit,
     TenantLimit,
     Budget,
