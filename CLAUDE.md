@@ -547,6 +547,14 @@ configured by `LLMSHIM_REPLAY_RECEIPTS_DIR`. Clients must preserve the native
 message/ID and server receipts across restarts. Never stamp unknown native thinking
 with current-target provenance. Receipts restore original blocks, then the common
 replay filter decides eligibility. Missing owned IDs and edited calls error.
+New receipts use cross-process locked retention with 100,000-entry, 256 MiB, and
+30-day defaults. Legacy files are counted once but have no fabricated expiry;
+incomplete legacy accounting freezes new growth until an explicit operator rescan.
+Do not run old and retention-aware binaries against the same receipt directory.
+Proxy and gateway apps install one shared default store and bounded ingress/egress
+blocking admission with reserved egress capacity; explicit `Arc<Receipts>`
+extensions win. Never perform receipt filesystem operations directly on async
+runtime workers or let ingress consume all egress capacity.
 Text remains incremental; complete reasoning/tool blocks follow once metadata is
 ready. Status/Retry-After and gateway request IDs survive error translation.
 `src/error/normalize.rs` owns error unwrapping for compact JSON/SSE, gateway,
