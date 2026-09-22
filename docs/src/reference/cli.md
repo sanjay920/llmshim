@@ -36,6 +36,12 @@ metadata can still be selected explicitly, but is omitted from the picker.
 `reasoning_effort: "high"`, and reasoning text is rendered dimly before answer
 text.
 
+Chat output, provider errors, pasted-text echoes, and plain-text catalog listings
+render terminal control characters as visible escapes. Newlines, tabs, and
+ordinary Unicode remain readable. This display protection preserves the original
+conversation content and JSON data; provider text cannot supply terminal commands
+such as clipboard updates or cursor movement.
+
 The chat process owns and resends its current history. Switching models changes
 the next route without clearing that history.
 
