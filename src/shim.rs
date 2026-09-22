@@ -745,6 +745,18 @@ pub(crate) fn add_usage(total: &mut Value, response: &Value) {
             total[key] = json!(total[key].as_u64().unwrap_or(0).saturating_add(count));
         }
     }
+    // A provider-reported bill is money, not a counter: two attempts are two
+    // charges, so they add. Dropping it here would silently demote a repaired
+    // OpenRouter answer back to the catalog estimate, which is the one
+    // direction `crate::cost` exists to prevent.
+    if let Some(usd) = crate::cost::reported(&response["usage"]) {
+        total["cost"] = json!(total["cost"].as_f64().unwrap_or(0.0) + usd);
+    }
+    // Whose key was billed does not accumulate; it is the same account both
+    // times, so the later answer simply restates it.
+    if let Some(byok) = response["usage"]["is_byok"].as_bool() {
+        total["is_byok"] = json!(byok);
+    }
 }
 /// Re-frame one buffered, validated `chat.completion` as the single
 /// `chat.completion.chunk` a native stream would have delivered — the message
@@ -791,7 +803,18 @@ pub async fn collect(
             ));
         }
         let chunk: Value = serde_json::from_str(&data)?;
-        for field in ["id", "created", "model", "usage", "system_fingerprint"] {
+        // `provider` is an aggregator's statement of which upstream actually
+        // served the call (OpenRouter sends it on every chunk). Rebuilding a
+        // buffered response without it loses the only record of that, so it is
+        // carried like `model`.
+        for field in [
+            "id",
+            "created",
+            "model",
+            "provider",
+            "usage",
+            "system_fingerprint",
+        ] {
             if let Some(value) = chunk.get(field) {
                 response[field] = value.clone();
             }
@@ -844,4 +867,43 @@ pub async fn collect(
     }
     response["choices"] = json!(output);
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repair_bills_both_attempts_rather_than_reverting_to_the_catalog() {
+        // Two dispatches are two charges. `add_usage` sums the counters across
+        // a repair; a reported bill it dropped would leave the whole answer
+        // priced from the catalog instead — an under-report, which is the one
+        // direction that lets a spend cap stop binding.
+        let attempt = json!({"usage": {
+            "prompt_tokens": 47, "completion_tokens": 61, "uncached_input_tokens": 47,
+            "cost": 0.0000873, "is_byok": false,
+        }});
+        let mut total = json!({});
+        add_usage(&mut total, &attempt);
+        add_usage(&mut total, &attempt);
+
+        assert_eq!(total["prompt_tokens"], 94);
+        assert_eq!(total["completion_tokens"], 122);
+        assert_eq!(total["cost"], 0.0001746);
+        assert_eq!(total["is_byok"], false);
+
+        let mut response = json!({"usage": total});
+        crate::cost::stamp("openrouter", "deepseek/deepseek-v4.1-flash", &mut response);
+        assert_eq!(response["usage"]["cost_usd"], 0.0001746);
+        assert_eq!(response["usage"]["cost_source"], "provider");
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_cost_adds_none() {
+        // Every other provider: no `cost` field, so nothing is invented.
+        let mut total = json!({});
+        add_usage(&mut total, &json!({"usage": {"prompt_tokens": 10}}));
+        assert!(total.get("cost").is_none());
+        assert!(total.get("is_byok").is_none());
+    }
 }

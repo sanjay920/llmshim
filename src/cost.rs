@@ -8,6 +8,15 @@
 //! `None`, and so does a model priced for input but not for the cache reads a
 //! response actually used. A `0.0` that means "unknown" is how a spend dashboard
 //! silently under-reports, so unknown is unrepresentable as a number here.
+//!
+//! **A reported bill outranks the catalog.** Some providers return what they
+//! actually charged for the generation — OpenRouter does, as `usage.cost`, when
+//! the request asked for accounting. That number *is* the invoice; the catalog
+//! product is an estimate of it, and deliberately an upper bound where a model
+//! prices some token classes and not others. Letting the estimate overwrite the
+//! invoice would throw away the only exact figure in the response, so
+//! [`stamp`] prefers the reported one and records which it used in
+//! `usage.cost_source`.
 
 use crate::catalog::Cost;
 use serde_json::Value;
@@ -129,24 +138,82 @@ pub fn is_priceable(provider: &str, model: &str) -> bool {
     for_target(provider, model).is_some()
 }
 
+/// `usage.cost_source` when the number came from the provider's own accounting.
+pub const SOURCE_PROVIDER: &str = "provider";
+/// `usage.cost_source` when the number was computed from catalog prices.
+pub const SOURCE_CATALOG: &str = "catalog";
+
+/// The bill the provider itself reported for this generation, if it reported
+/// one. OpenRouter returns it as `usage.cost` (USD) when the request asked for
+/// accounting; the field is absent on every provider that does not.
+///
+/// A reported `0.0` is kept. Unlike a catalog miss it is not missing data — it
+/// is a free generation the provider is telling us about, and the "absent price
+/// is never zero" rule protects against inventing a zero, not against
+/// believing one. A negative or non-finite value is not a bill and is ignored.
+pub fn reported(usage: &Value) -> Option<f64> {
+    usage
+        .get("cost")
+        .and_then(Value::as_f64)
+        .filter(|usd| usd.is_finite() && *usd >= 0.0)
+}
+
+/// USD for one usage object, and which of the two paths produced it.
+///
+/// The reported bill is checked first and unconditionally: it needs no catalog
+/// entry, no token counters, and no price for the model, so it still answers
+/// for the aggregator slugs the catalog has never heard of.
+pub fn resolve(provider: &str, model: &str, usage: &Value) -> (Option<f64>, &'static str) {
+    match reported(usage) {
+        Some(usd) => (Some(usd), SOURCE_PROVIDER),
+        None => (cost_usd(provider, model, usage), SOURCE_CATALOG),
+    }
+}
+
 /// Read a cost already stamped onto a normalized usage object. A stamped
 /// `null` and an unstamped body both mean "not known".
 pub fn stamped(usage: &Value) -> Option<f64> {
     usage.get("cost_usd").and_then(Value::as_f64)
 }
 
-/// Stamp `usage.cost_usd` on a normalized response. The key is always present
-/// so a reader never has to distinguish "absent" from "free"; `null` is the
-/// explicit unknown.
+/// Read the source stamped beside that cost. `None` on a body nothing has
+/// stamped yet.
+pub fn stamped_source(usage: &Value) -> Option<&str> {
+    usage.get("cost_source").and_then(Value::as_str)
+}
+
+/// Cost and source for a usage object, preferring what is already stamped so a
+/// log entry can never disagree with the response it describes. [`stamp`]
+/// writes both keys together, so a source present means the cost beside it is
+/// the authoritative one; a body no transport stamped is priced here instead.
+pub fn attribute(provider: &str, model: &str, usage: &Value) -> (Option<f64>, Option<String>) {
+    match stamped_source(usage) {
+        Some(source) => (stamped(usage), Some(source.to_owned())),
+        None => {
+            let (usd, source) = resolve(provider, model, usage);
+            (usd, Some(source.to_owned()))
+        }
+    }
+}
+
+/// Stamp `usage.cost_usd` and `usage.cost_source` on a normalized response.
+/// Both keys are always present so a reader never has to distinguish "absent"
+/// from "free"; `null` is the explicit unknown.
+///
+/// `cost_source` names the path that answered, not the confidence of the
+/// answer: `"provider"` means the number is the bill the provider reported,
+/// `"catalog"` means it was computed from catalog prices — and a `"catalog"`
+/// source beside a `null` cost says the catalog was asked and had no price.
 pub fn stamp(provider: &str, model: &str, response: &mut Value) {
     if !response["usage"].is_object() {
         return;
     }
-    let cost = cost_usd(provider, model, &response["usage"]);
+    let (cost, source) = resolve(provider, model, &response["usage"]);
     response["usage"]["cost_usd"] = match cost {
         Some(usd) => serde_json::json!(usd),
         None => Value::Null,
     };
+    response["usage"]["cost_source"] = serde_json::json!(source);
 }
 
 /// Stamp a streaming chunk in place of a full response. Chunks without a usage

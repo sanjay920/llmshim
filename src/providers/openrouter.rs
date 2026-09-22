@@ -161,6 +161,10 @@ impl Provider for OpenRouter {
             "seed",
             "stream",
             "stream_options",
+            // OpenRouter's accounting switch, `usage: {include: bool}`. Not a
+            // Chat Completions param, which is why it needs naming here: every
+            // other provider would reject it and none of them is sent it.
+            "usage",
             "tools",
             "tool_choice",
             "parallel_tool_calls",
@@ -225,6 +229,18 @@ impl Provider for OpenRouter {
         // `x-openrouter.transforms`.
         if !body_obj.contains_key("transforms") {
             body_obj.insert("transforms".to_string(), json!([]));
+        }
+
+        // Ask for accounting unless the caller already said something about it.
+        // OpenRouter answers with `usage.cost` — what it actually charged for
+        // this generation — and `crate::cost` stamps that in preference to the
+        // catalog estimate. It is free, it is the only exact cost figure
+        // available for an aggregator slug the catalog does not carry, and the
+        // default has to be on for it to be there when a spend cap asks.
+        // Runs after the `x-openrouter` copy above, so `x-openrouter.usage`
+        // counts as the caller having decided, exactly like `transforms`.
+        if !body_obj.contains_key("usage") {
+            body_obj.insert("usage".to_string(), json!({ "include": true }));
         }
 
         let url = format!("{}/chat/completions", self.base_url);
