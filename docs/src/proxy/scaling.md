@@ -181,11 +181,15 @@ The full context ceiling is used for input rather than treating a tokenizer
 heuristic as a guarantee, so admission can be deliberately conservative even
 for a short prompt.
 Repeated usage snapshots upsert one attempt by UUID; they are never summed as
-separate bills. A terminal response with known usage replaces its reservation
-with the known charge. Failed repair responses are therefore charged even when
-the caller ultimately receives a local `502`. Bounded provider error bodies are
-also inspected for native usage or a provider-reported bill before retry or
-return; the original error body and size limit remain unchanged.
+separate bills. Partial or missing-counter usage may raise liability but cannot
+release it. A successful terminal response replaces its reservation only when
+the wire's required input/output counters are explicitly present, including
+explicit zeros, or when the provider reports an authoritative bill. A terminal
+provider bill also outranks an earlier catalog estimate. Failed repair responses
+are therefore charged even when the caller ultimately receives a local `502`.
+Bounded provider error bodies are inspected for native usage or a
+provider-reported bill before retry or return; the original error body and size
+limit remain unchanged.
 
 Transport uncertainty, cancellation, stream abandonment, worker loss, and a
 failed settlement keep the original reservation in its acquisition window.
@@ -196,6 +200,9 @@ for 24 hours after the acquisition window ends. This makes the cap a
 hard ceiling under the configured catalog pricing policy. Catalog prices are
 still estimates rather than provider invoices: an external price change or fee
 missing from the policy cannot be guaranteed by llmshim.
+If combined known liabilities exceed the fixed-point range, the window becomes
+irreversibly frozen; a later release from another overlapping attempt cannot
+reopen capacity after overflow information has been lost.
 
 Strict admission rejects a request when it cannot form that bound. This includes
 an unknown price or context/output ceiling, variable OpenRouter routing,
@@ -220,8 +227,9 @@ defensible reservation receive the exception. Already-known spend must remain
 below the cap. Such an attempt conservatively holds the remaining window balance
 until final known usage can replace it; uncertainty or abandonment therefore
 exhausts the cap rather than releasing zero. Any later provider-reported or
-catalog-derived charge is still recorded. Priceable requests reserve normally
-even when the flag is set. Each exception increments
+catalog-derived charge is still observed, but only a terminal provider bill can
+resolve the fee uncertainty and release an unpriced reservation. Priceable
+requests reserve normally even when the flag is set. Each exception increments
 `llmshim_gateway_unpriced_under_cap_total{provider,model}`; a non-zero counter
 means the configured policy cannot promise a finite bound for that target.
 
