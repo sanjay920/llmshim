@@ -13,7 +13,7 @@ async fn current_models_completion_and_streaming() {
         "anthropic/claude-opus-5",
         "anthropic/claude-fable-5",
         "anthropic/claude-fable-5-1",
-        "xai/grok-4.6",
+        "xai/grok-4.7",
     ] {
         let input = json!({"model": model, "messages": [{"role": "user", "content": "Reply with only pong."}],
             "max_tokens": 512, "reasoning_effort": "none"});
@@ -151,7 +151,7 @@ async fn current_models_proxy_routes() {
         "anthropic/claude-opus-5",
         "anthropic/claude-fable-5",
         "anthropic/claude-fable-5-1",
-        "xai/grok-4.6",
+        "xai/grok-4.7",
     ] {
         let advertised = catalog["models"]
             .as_array()

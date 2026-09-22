@@ -1,5 +1,6 @@
 use crate::{
-    CatalogError, CatalogSource, Cost, ModelCapabilities, ModelFamily, ModelInfo, Support,
+    CatalogError, CatalogSource, ContextCostTier, Cost, ModelCapabilities, ModelFamily, ModelInfo,
+    Support,
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
@@ -77,6 +78,24 @@ pub(crate) fn model_from_value(
         };
     }
     m.cost = cost(&v["cost"]);
+    m.context_cost_tiers = if let Some(tiers) = v.get("context_cost_tiers") {
+        serde_json::from_value(tiers.clone()).ok()
+    } else {
+        v["cost"]["tiers"].as_array().map(|tiers| {
+            tiers
+                .iter()
+                .filter_map(|tier| {
+                    if tier["tier"]["type"] != "context" {
+                        return None;
+                    }
+                    Some(ContextCostTier {
+                        above_input_tokens: tier["tier"]["size"].as_u64()?,
+                        cost: cost(tier)?,
+                    })
+                })
+                .collect()
+        })
+    };
     m.reasoning_options = v["reasoning_options"]
         .as_array()
         .into_iter()

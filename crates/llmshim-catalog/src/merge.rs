@@ -1,6 +1,6 @@
 use crate::{CatalogSource, Cost, ModelInfo, Support};
 
-fn rank(source: CatalogSource) -> u8 {
+pub(crate) fn rank(source: CatalogSource) -> u8 {
     match source {
         CatalogSource::ModelsDev => 1,
         CatalogSource::Builtin => 2,
@@ -76,6 +76,7 @@ pub(crate) fn merge(target: &mut ModelInfo, incoming: &ModelInfo) {
         }
     }
     if source != CatalogSource::ProviderApi {
+        field!(context_cost_tiers, incoming.context_cost_tiers.is_some());
         if let Some(cost) = incoming.cost {
             let mut merged = target.cost.unwrap_or_default();
             for (key, value, slot) in [

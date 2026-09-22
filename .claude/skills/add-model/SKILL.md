@@ -16,7 +16,7 @@ Model to add: **$ARGUMENTS**
 
 ## One advertised catalog
 
-The curated list lives in `src/models.rs` (`MODELS: &[ModelInfo]`). The CLI
+The curated list lives in `crates/llmshim-catalog/src/builtin.rs` (reexported by `src/models.rs`). The CLI
 imports it directly, and the proxy uses `available_models()`. Advertise only
 the current model in each retained tier; Google entries are stable only.
 Preserve displaced records in private `LEGACY_MODELS` so `spec()` still works
@@ -24,7 +24,7 @@ for explicit historical IDs. Keep legacy transforms and regression tests.
 
 ## Steps
 
-1. **`src/models.rs`** — add a `ModelInfo` entry in the provider's section:
+1. **`crates/llmshim-catalog/src/builtin.rs`** — add a `ModelInfo` entry in the provider's section:
    ```rust
    ModelInfo {
        id: "<provider>/<model-name>",   // e.g. "openai/gpt-5.6"

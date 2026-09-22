@@ -193,7 +193,7 @@ Native `x-chatgpt.reasoning` overrides the unified mapping.
 
 xAI receives the nested native shape `reasoning: {effort}`:
 
-| unified | Grok 4.6 |
+| unified | Grok 4.7 |
 |---|---|
 | `none` | **`low`** |
 | `low` | `low` |
@@ -202,7 +202,18 @@ xAI receives the nested native shape `reasoning: {effort}`:
 | `xhigh` | `xhigh` |
 | `max` | **`xhigh`** |
 
-Grok 4.6 cannot disable reasoning, so `none` clamps to `low`.
+Grok 4.7 cannot disable reasoning, so `none` clamps to `low`.
+
+Grok 4.7 always returns encrypted reasoning on Responses. llmshim preserves
+the opaque payload and its provenance in `message.reasoning`, requests
+`store: false`, and replays compatible payloads unchanged on subsequent turns.
+Persist the full assistant message, including tool wire IDs and reasoning;
+storing only its text loses this context. Decoding does not modify
+`origin.model` or determine routing.
+
+The adapter translates named tool selection to the Responses shape
+`{"type":"function","name":"lookup"}`. Callers may continue to send the
+Chat Completions shape with `function.name`.
 
 ## Mode mapping: `reasoning_mode: "pro"`
 
@@ -212,7 +223,7 @@ Grok 4.6 cannot disable reasoning, so `none` clamps to `low`.
 | OpenAI GPT-6 Astra | One-tier effort bump (`low → medium → high → xhigh`); explicit `max` stays `max` |
 | Anthropic | One-tier effort bump (`low → medium → high → xhigh → max`) |
 | Gemini | One-tier bump within its four-rung enum, capped at `high` |
-| xAI Grok 4.6 | One-tier bump, capped at `xhigh` |
+| xAI Grok 4.7 | One-tier bump, capped at `xhigh` |
 
 Rules that hold across providers:
 
