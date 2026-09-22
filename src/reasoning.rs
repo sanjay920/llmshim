@@ -269,8 +269,6 @@ pub(crate) fn strip_fields(message: &mut Value) {
     }
 }
 
-/// The only replay-policy entry point used by every native adapter. Keeps
-/// matching JSON blocks unchanged; removes unknown/mismatched data and counts it.
 fn filter_reasoning_after_preflight(message: &mut Value, target: &ReplayTarget) {
     let blocks = match message["reasoning"].as_array() {
         Some(a) => a.clone(),
@@ -351,6 +349,9 @@ fn filter_reasoning_after_preflight(message: &mut Value, target: &ReplayTarget) 
     }
 }
 
+/// Apply the shared replay policy to one message. Matching JSON blocks remain
+/// unchanged; unknown or mismatched data is removed and counted. A derived
+/// metadata limit refusal returns before `message` is mutated.
 pub fn filter_reasoning_for_target(
     message: &mut Value,
     target: &ReplayTarget,
