@@ -69,9 +69,27 @@ same error-body buffer limit; oversized bodies are dropped before another attemp
 
 These limits apply through the Rust completion API, CLI, proxy, and gateway.
 They bound decoded body bytes; JSON allocations and process memory have
-additional overhead. SSE processing, including ChatGPT's collected SSE replies,
-and successful raw responses returned by the low-level `ShimClient::send` API
-remain outside these body-reader limits.
+additional overhead. Successful raw responses returned by the low-level
+`ShimClient::send` API remain the caller's responsibility.
+
+Normal provider streams, ChatGPT's collected SSE replies, and native HTTP
+facades use one bounded SSE data decoder. It checks input before growing its
+line and frame buffers:
+
+| Per-stream limit | Maximum |
+|---|---:|
+| Decoded transport bytes | 32 MiB |
+| Line content | 8 MiB |
+| Frame bytes, with CRLF treated as one line ending | 8 MiB |
+| Blank-line-delimited frames, including empty frames | 100,000 |
+| Input chunks, including empty chunks | 1,048,576 |
+
+The decoder handles UTF-8 fragments, an initial byte-order mark, multiline
+`data` fields, comments, and LF/CRLF/CR line endings. Provider transforms consume
+the data fields; unused SSE metadata is discarded. Limits terminate the stream
+with a fixed error and release its input source. EOF does not manufacture a
+completed event from an unterminated frame. These are framing limits, not an
+RSS ceiling or a transport timeout.
 
 For shape details, continue to the [request field map](request-fields.md) and
 [HTTP API](../proxy/http-api.md).
