@@ -78,8 +78,12 @@ impl KeyStore {
                     std::process::exit(1);
                 });
                 let map: HashMap<String, Identity> =
-                    serde_json::from_str(&data).unwrap_or_else(|e| {
-                        eprintln!("gateway: invalid keys file {path}: {e}");
+                    serde_json::from_str(&data).unwrap_or_else(|error| {
+                        eprintln!(
+                            "gateway: invalid keys file {path} at line {}, column {}; credentials were not loaded",
+                            error.line(),
+                            error.column(),
+                        );
                         std::process::exit(1);
                     });
                 eprintln!(
@@ -87,6 +91,12 @@ impl KeyStore {
                     map.len()
                 );
                 KeyStore::Enforced(map)
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                eprintln!(
+                    "gateway: LLMSHIM_GATEWAY_KEYS_FILE is not valid UTF-8; refusing to start"
+                );
+                std::process::exit(1);
             }
             _ => {
                 eprintln!(
