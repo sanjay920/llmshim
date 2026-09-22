@@ -94,8 +94,10 @@ impl Plan {
         let handle = crate::catalog::global()
             .map_err(|_| invalid("model catalog configuration is invalid"))?;
         let snapshot = handle.snapshot();
+        // `lookup_id` normalizes a known OpenRouter variant suffix (`:nitro`,
+        // `:floor`, …) for this capability lookup only.
         let caps = snapshot
-            .resolve(&format!("{provider}/{model}"))
+            .lookup_id(&format!("{provider}/{model}"))
             .map(|m| m.capabilities)
             .unwrap_or_default();
         Self::with_capabilities(wire, request, caps)
