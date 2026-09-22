@@ -992,8 +992,8 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
 #[cfg(feature = "redis-coordination")]
 mod redis_rates {
     use super::*;
+    #[cfg(test)]
     use redis::aio::ConnectionManager;
-    use tokio::sync::OnceCell;
 
     const KEY_TTL_MS: u64 = 3_600_000;
     const RETAIN_LEGACY_SPEND_FLOOR_LUA: &str = r#"
@@ -1353,8 +1353,7 @@ mod redis_rates {
     "#;
 
     pub(super) struct RedisAttemptRates {
-        client: redis::Client,
-        connection: OnceCell<ConnectionManager>,
+        connections: crate::redis_operation::RedisConnectionManagerCache,
         config: RateLimitConfig,
         max_retained_attempts: usize,
         retention_secs: u64,
@@ -1383,9 +1382,9 @@ mod redis_rates {
             retention_secs: u64,
             accounting_index_key: String,
         ) -> redis::RedisResult<Self> {
+            let client = redis::Client::open(url)?;
             Ok(Self {
-                client: redis::Client::open(url)?,
-                connection: OnceCell::new(),
+                connections: crate::redis_operation::RedisConnectionManagerCache::new(client),
                 config,
                 max_retained_attempts,
                 retention_secs,
@@ -1397,11 +1396,9 @@ mod redis_rates {
             })
         }
 
+        #[cfg(test)]
         pub(super) async fn connection(&self) -> redis::RedisResult<ConnectionManager> {
-            self.connection
-                .get_or_try_init(|| ConnectionManager::new(self.client.clone()))
-                .await
-                .cloned()
+            self.connections.connection_for_test().await
         }
 
         fn global_key(provider: &str, dimension: &str) -> String {
@@ -1443,25 +1440,28 @@ mod redis_rates {
             if scope.budget.is_none() {
                 return Ok(());
             }
-            let mut connection = self.connection().await.map_err(|_| ())?;
             let result: i64 = self
-                .settle_budget_script
-                .key(Self::budget_attempt_key(scope, attempt_id))
-                .arg(
-                    observation
-                        .and_then(|value| value.amount_nanos)
-                        .map_or(-1_i64, |value| value as i64),
-                )
-                .arg(i32::from(finalize))
-                .arg(crate::gateway::budget::MAX_EXACT_REDIS_NANOS)
-                .arg(observation.map_or(-1_i32, |value| match value.authority {
-                    crate::gateway::budget::SpendAuthority::Catalog => 0,
-                    crate::gateway::budget::SpendAuthority::Provider => 1,
-                }))
-                .arg(i32::from(
-                    observation.is_some_and(|value| value.terminal_authoritative),
-                ))
-                .invoke_async(&mut connection)
+                .connections
+                .run(|mut connection| async move {
+                    self.settle_budget_script
+                        .key(Self::budget_attempt_key(scope, attempt_id))
+                        .arg(
+                            observation
+                                .and_then(|value| value.amount_nanos)
+                                .map_or(-1_i64, |value| value as i64),
+                        )
+                        .arg(i32::from(finalize))
+                        .arg(crate::gateway::budget::MAX_EXACT_REDIS_NANOS)
+                        .arg(observation.map_or(-1_i32, |value| match value.authority {
+                            crate::gateway::budget::SpendAuthority::Catalog => 0,
+                            crate::gateway::budget::SpendAuthority::Provider => 1,
+                        }))
+                        .arg(i32::from(
+                            observation.is_some_and(|value| value.terminal_authoritative),
+                        ))
+                        .invoke_async(&mut connection)
+                        .await
+                })
                 .await
                 .map_err(|_| ())?;
             (result == 1).then_some(()).ok_or(())
@@ -1489,19 +1489,22 @@ mod redis_rates {
             scope: &TrustedPolicyScope,
         ) -> Result<LegacySpendFloor, ()> {
             let policy = scope.budget.as_ref().ok_or(())?;
-            let mut connection = self.connection().await.map_err(|_| ())?;
             let result: (i64, u64, u64) = self
-                .retain_legacy_spend_floor_script
-                .key(format!("llmshim:spend:{tenant}:"))
-                .key(Self::budget_total_prefix(scope))
-                .key(&self.accounting_index_key)
-                .key(format!("{}:frozen", self.accounting_index_key))
-                .arg(policy.window_secs)
-                .arg(self.retention_secs)
-                .arg(self.max_retained_attempts)
-                .arg(ACCOUNTING_EXPIRY_CLEANUP_BATCH)
-                .arg(crate::gateway::budget::MAX_EXACT_REDIS_NANOS)
-                .invoke_async(&mut connection)
+                .connections
+                .run(|mut connection| async move {
+                    self.retain_legacy_spend_floor_script
+                        .key(format!("llmshim:spend:{tenant}:"))
+                        .key(Self::budget_total_prefix(scope))
+                        .key(&self.accounting_index_key)
+                        .key(format!("{}:frozen", self.accounting_index_key))
+                        .arg(policy.window_secs)
+                        .arg(self.retention_secs)
+                        .arg(self.max_retained_attempts)
+                        .arg(ACCOUNTING_EXPIRY_CLEANUP_BATCH)
+                        .arg(crate::gateway::budget::MAX_EXACT_REDIS_NANOS)
+                        .invoke_async(&mut connection)
+                        .await
+                })
                 .await
                 .map_err(|_| ())?;
             (result.0 == 1)
@@ -1527,10 +1530,6 @@ mod redis_rates {
             if global.rpm == Some(0) || global.tpm == Some(0) {
                 return Err(RateRefusal::Provider(ZERO_LIMIT_RETRY_AFTER));
             }
-            let mut connection = self
-                .connection()
-                .await
-                .map_err(|_| RateRefusal::Unavailable)?;
             let mut invocation = self.combined_script.prepare_invoke();
             invocation
                 .key(Self::global_key(provider, "rpm"))
@@ -1596,8 +1595,9 @@ mod redis_rates {
                 }
                 _ => return Err(RateRefusal::Unavailable),
             }
-            let (admitted, wait_ms, refusal): (i64, i64, i64) = invocation
-                .invoke_async(&mut connection)
+            let (admitted, wait_ms, refusal): (i64, i64, i64) = self
+                .connections
+                .run(|mut connection| async move { invocation.invoke_async(&mut connection).await })
                 .await
                 .map_err(|_| RateRefusal::Unavailable)?;
             if admitted == 1 {
@@ -1624,18 +1624,21 @@ mod redis_rates {
             if limit.rpm.is_none() && limit.tpm.is_none() {
                 return Ok(());
             }
-            let mut connection = self.connection().await.map_err(|_| ())?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|value| value.as_millis() as u64)
                 .unwrap_or_default();
             let _: i64 = self
-                .penalty_script
-                .key(Self::global_key(provider, "rpm"))
-                .key(Self::global_key(provider, "tpm"))
-                .arg(now.saturating_add(duration.as_millis() as u64))
-                .arg(KEY_TTL_MS)
-                .invoke_async(&mut connection)
+                .connections
+                .run(|mut connection| async move {
+                    self.penalty_script
+                        .key(Self::global_key(provider, "rpm"))
+                        .key(Self::global_key(provider, "tpm"))
+                        .arg(now.saturating_add(duration.as_millis() as u64))
+                        .arg(KEY_TTL_MS)
+                        .invoke_async(&mut connection)
+                        .await
+                })
                 .await
                 .map_err(|_| ())?;
             Ok(())
