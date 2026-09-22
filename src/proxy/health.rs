@@ -51,9 +51,7 @@ pub fn build_breaker() -> Arc<ProviderBreaker> {
 mod redis_impl {
     use super::*;
     use crate::breaker::{HealthFuture, SharedHealth};
-    use redis::aio::ConnectionManager;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::OnceCell;
 
     /// Record one failure and decide whether the circuit is now open.
     ///
@@ -96,8 +94,7 @@ mod redis_impl {
     /// unreachable coordinator reports healthy rather than taking every
     /// provider offline across the fleet.
     pub struct RedisHealth {
-        client: redis::Client,
-        conn: OnceCell<ConnectionManager>,
+        connections: crate::redis_operation::RedisConnectionManagerCache,
         cfg: BreakerConfig,
         fail: redis::Script,
         probe: redis::Script,
@@ -105,20 +102,13 @@ mod redis_impl {
 
     impl RedisHealth {
         pub fn new(url: &str, cfg: BreakerConfig) -> redis::RedisResult<Self> {
+            let client = redis::Client::open(url)?;
             Ok(Self {
-                client: redis::Client::open(url)?,
-                conn: OnceCell::new(),
+                connections: crate::redis_operation::RedisConnectionManagerCache::new(client),
                 cfg,
                 fail: redis::Script::new(FAIL_LUA),
                 probe: redis::Script::new(PROBE_LUA),
             })
-        }
-
-        async fn connection(&self) -> redis::RedisResult<ConnectionManager> {
-            self.conn
-                .get_or_try_init(|| ConnectionManager::new(self.client.clone()))
-                .await
-                .cloned()
         }
 
         fn failures_key(target: &str) -> String {
@@ -142,62 +132,70 @@ mod redis_impl {
     impl SharedHealth for RedisHealth {
         fn is_open<'a>(&'a self, target: &'a str) -> HealthFuture<'a, bool> {
             Box::pin(async move {
-                let Ok(mut conn) = self.connection().await else {
-                    return false; // fail open
-                };
-                redis::cmd("EXISTS")
-                    .arg(Self::open_key(target))
-                    .query_async::<i64>(&mut conn)
+                self.connections
+                    .run(|mut connection| async move {
+                        redis::cmd("EXISTS")
+                            .arg(Self::open_key(target))
+                            .query_async::<i64>(&mut connection)
+                            .await
+                    })
                     .await
                     .map(|n| n == 1)
-                    .unwrap_or(false)
+                    .unwrap_or(false) // fail open
             })
         }
 
         fn try_admit_probe<'a>(&'a self, target: &'a str) -> HealthFuture<'a, bool> {
             Box::pin(async move {
-                let Ok(mut conn) = self.connection().await else {
-                    return true; // fail open: no coordinator, no gate
-                };
-                self.probe
-                    .key(Self::open_key(target))
-                    .key(Self::probe_key(target))
-                    .arg(Self::now_ms())
-                    .arg(self.cfg.cooldown.as_millis() as u64)
-                    .invoke_async::<i64>(&mut conn)
+                self.connections
+                    .run(|mut connection| async move {
+                        self.probe
+                            .key(Self::open_key(target))
+                            .key(Self::probe_key(target))
+                            .arg(Self::now_ms())
+                            .arg(self.cfg.cooldown.as_millis() as u64)
+                            .invoke_async::<i64>(&mut connection)
+                            .await
+                    })
                     .await
                     .map(|n| n == 1)
-                    .unwrap_or(true)
+                    .unwrap_or(true) // fail open: no coordinator, no gate
             })
         }
 
         fn observe<'a>(&'a self, target: &'a str, healthy: bool) -> HealthFuture<'a, ()> {
             Box::pin(async move {
-                let Ok(mut conn) = self.connection().await else {
-                    return;
-                };
                 if healthy {
                     // Recovery clears the window and the open marker together,
                     // so one good response ends the fleet-wide skip.
-                    let _: Result<i64, _> = redis::cmd("DEL")
-                        .arg(Self::failures_key(target))
-                        .arg(Self::open_key(target))
-                        .arg(Self::probe_key(target))
-                        .query_async(&mut conn)
+                    let _ = self
+                        .connections
+                        .run(|mut connection| async move {
+                            redis::cmd("DEL")
+                                .arg(Self::failures_key(target))
+                                .arg(Self::open_key(target))
+                                .arg(Self::probe_key(target))
+                                .query_async::<i64>(&mut connection)
+                                .await
+                        })
                         .await;
                     return;
                 }
                 let member = format!("{}:{}", Self::now_ms(), uuid::Uuid::new_v4().simple());
-                let _: Result<i64, _> = self
-                    .fail
-                    .key(Self::failures_key(target))
-                    .key(Self::open_key(target))
-                    .arg(Self::now_ms())
-                    .arg(self.cfg.window.as_millis() as u64)
-                    .arg(self.cfg.trip_threshold as u64)
-                    .arg(self.cfg.cooldown.as_millis() as u64)
-                    .arg(member)
-                    .invoke_async(&mut conn)
+                let _ = self
+                    .connections
+                    .run(|mut connection| async move {
+                        self.fail
+                            .key(Self::failures_key(target))
+                            .key(Self::open_key(target))
+                            .arg(Self::now_ms())
+                            .arg(self.cfg.window.as_millis() as u64)
+                            .arg(self.cfg.trip_threshold as u64)
+                            .arg(self.cfg.cooldown.as_millis() as u64)
+                            .arg(member)
+                            .invoke_async::<i64>(&mut connection)
+                            .await
+                    })
                     .await;
             })
         }
