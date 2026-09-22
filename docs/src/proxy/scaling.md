@@ -303,15 +303,17 @@ calls, quiet streams, response publication, and terminal cleanup. Redis checks
 the token in the same transaction that refreshes, publishes, releases,
 completes, acknowledges, or moves the delivery to the dead-letter queue. A
 worker that has lost its lease can no longer publish or mutate the replacement
-delivery.
+delivery. Lease creation, refresh, and reaping use Redis `TIME`, so host clock
+skew cannot expire another worker's healthy lease.
 
 Distributed worker jobs have a finite six-hour lifetime by default. Redis
 lease operations are bounded to five seconds or one quarter of the configured
 lease, whichever is shorter. Positive millisecond overrides are available as
 `LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS` and
 `LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS`; zero and invalid values retain
-the finite defaults. A worker deadline drops local provider work and completes
-only if the delivery still owns its lease.
+the finite defaults. A worker deadline drops local provider work while retaining
+the heartbeat, then publishes its error, records completion, and removes lease
+state in one owner-fenced Redis transaction.
 
 The queue remains at-least-once across an actual worker crash or coordination
 partition. If a provider accepted a request before ownership became uncertain,
