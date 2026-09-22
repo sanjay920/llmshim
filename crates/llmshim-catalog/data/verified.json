@@ -15,6 +15,17 @@
     "cost": {"input": 2, "cache_read": 0.5, "output": 6},
     "context_cost_tiers": [{"above_input_tokens": 200000, "cost": {"input": 4, "cache_read": 1, "output": 12}}]
   },
+  "openrouter/x-ai/grok-4.7:nitro": {
+    "name": "Grok 4.7 (Nitro)",
+    "family": "grok",
+    "limit": {"context": 500000, "output": 450000},
+    "modalities": {"input": ["text", "image", "file"], "output": ["text"]},
+    "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh"]}],
+    "reasoning": true,
+    "tool_call": true,
+    "structured_output": true,
+    "forced_tool_choice": true
+  },
   "openrouter/x-ai/grok-4.7": {
     "name": "Grok 4.7",
     "family": "grok",

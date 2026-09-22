@@ -2,6 +2,22 @@ use llmshim::{provider::Provider, providers::openai::OpenAi, providers::xai::Xai
 use serde_json::json;
 
 #[test]
+fn openrouter_nitro_replays_reasoning_without_inventing_a_fixed_price() {
+    let p = llmshim::providers::openrouter::OpenRouter::new("test-key".into());
+    let model = "x-ai/grok-4.7:nitro";
+    let details = json!([{"type":"reasoning.encrypted","id":"rs_synthetic","data":"synthetic-ciphertext+/="}]);
+    let result = p.transform_response(model,json!({"choices":[{"message":{"role":"assistant","content":"pong","reasoning_details":details},"finish_reason":"stop"}]})).unwrap();
+    let assistant = &result["choices"][0]["message"];
+    assert_eq!(assistant["reasoning"][0]["origin"]["family"], "grok");
+    assert_eq!(assistant["reasoning"][0]["origin"]["model"], model);
+    let req = json!({"messages":[{"role":"user","content":"ping"},assistant,{"role":"user","content":"continue"}]});
+    let wire = p.transform_request(model, &req).unwrap();
+    assert_eq!(wire.body["model"], model);
+    assert_eq!(wire.body["messages"][1]["reasoning_details"], details);
+    assert_eq!(llmshim::cost::for_target("openrouter", model), None);
+}
+
+#[test]
 fn named_tool_selection_is_flat_for_all_accepted_input_dialects() {
     let p = Xai::new("test-key".into());
     for choice in [

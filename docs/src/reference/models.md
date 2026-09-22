@@ -96,6 +96,8 @@ For OpenRouter, use `openrouter/x-ai/grok-4.7`. You can append `:nitro` and set
 allows priority endpoints, whose rates can be higher. On `/v1/chat`, put
 `x-openrouter` inside `provider_config`. These routing options do not enforce
 ZDR on an llmshim fallback to a different provider.
+The Nitro route has replay metadata but no fixed catalog price; its
+`cost_usd` remains `null` unless local policy supplies rates.
 
 ### ChatGPT subscription
 
