@@ -91,6 +91,43 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
 
+    fn parse_decimal(bytes: &[u8]) -> Option<usize> {
+        std::str::from_utf8(bytes).ok()?.parse().ok()
+    }
+
+    fn line_end(bytes: &[u8], start: usize) -> Option<usize> {
+        bytes[start..]
+            .windows(2)
+            .position(|pair| pair == b"\r\n")
+            .map(|offset| start + offset)
+    }
+
+    fn take_resp_command(buffer: &mut Vec<u8>) -> Option<Vec<Vec<u8>>> {
+        if buffer.first().copied()? != b'*' {
+            return None;
+        }
+        let array_end = line_end(buffer, 1)?;
+        let argument_count = parse_decimal(&buffer[1..array_end])?;
+        let mut cursor = array_end + 2;
+        let mut arguments = Vec::with_capacity(argument_count);
+        for _ in 0..argument_count {
+            if buffer.get(cursor).copied()? != b'$' {
+                return None;
+            }
+            let length_end = line_end(buffer, cursor + 1)?;
+            let argument_length = parse_decimal(&buffer[cursor + 1..length_end])?;
+            let argument_start = length_end + 2;
+            let argument_end = argument_start.checked_add(argument_length)?;
+            if buffer.get(argument_end..argument_end + 2)? != b"\r\n" {
+                return None;
+            }
+            arguments.push(buffer[argument_start..argument_end].to_vec());
+            cursor = argument_end + 2;
+        }
+        buffer.drain(..cursor);
+        Some(arguments)
+    }
+
     struct SyntheticPeer {
         url: String,
         accepts: Arc<AtomicUsize>,
@@ -121,44 +158,39 @@ mod tests {
                         return;
                     };
                     server_accepts.fetch_add(1, Ordering::SeqCst);
-                    server_activity.notify_waiters();
+                    server_activity.notify_one();
                     let connection_closed = server_closed.clone();
                     let connection_pings = server_pings.clone();
                     let connection_activity = server_activity.clone();
                     let connection_stall_ping = server_stall_ping.clone();
                     tokio::spawn(async move {
                         let mut buffer = [0_u8; 8192];
+                        let mut pending = Vec::new();
                         loop {
                             let received = match socket.read(&mut buffer).await {
                                 Ok(0) | Err(_) => {
                                     connection_closed.fetch_add(1, Ordering::SeqCst);
-                                    connection_activity.notify_waiters();
+                                    connection_activity.notify_one();
                                     return;
                                 }
                                 Ok(received) => received,
                             };
-                            let data = &buffer[..received];
-                            let command_count = data
-                                .iter()
-                                .enumerate()
-                                .filter(|(index, byte)| {
-                                    **byte == b'*' && (*index == 0 || data[*index - 1] == b'\n')
-                                })
-                                .count();
-                            let ping_count = String::from_utf8_lossy(data).matches("PING").count();
-                            if ping_count > 0 {
-                                connection_pings.fetch_add(ping_count, Ordering::SeqCst);
-                                connection_activity.notify_waiters();
+                            pending.extend_from_slice(&buffer[..received]);
+                            if pending.len() > 64 * 1024 {
+                                return;
                             }
-                            if ping_count > 0 && connection_stall_ping.load(Ordering::SeqCst) {
-                                continue;
-                            }
-                            let reply: &[u8] = if ping_count > 0 {
-                                b"+PONG\r\n"
-                            } else {
-                                b"+OK\r\n"
-                            };
-                            for _ in 0..command_count {
+                            while let Some(command) = take_resp_command(&mut pending) {
+                                let ping = command
+                                    .first()
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(b"PING"));
+                                if ping {
+                                    connection_pings.fetch_add(1, Ordering::SeqCst);
+                                    connection_activity.notify_one();
+                                }
+                                if ping && connection_stall_ping.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                                let reply: &[u8] = if ping { b"+PONG\r\n" } else { b"+OK\r\n" };
                                 if socket.write_all(reply).await.is_err() {
                                     return;
                                 }
@@ -201,6 +233,25 @@ mod tests {
                 redis::cmd("PING").query_async(&mut connection).await
             })
             .await
+    }
+
+    #[test]
+    fn resp_fixture_parser_handles_fragmented_and_coalesced_commands() {
+        let first = b"*2\r\n$4\r\nECHO\r\n$3\r\none\r\n";
+        let second = b"*1\r\n$4\r\nPING\r\n";
+        let mut pending = first[..9].to_vec();
+        assert!(take_resp_command(&mut pending).is_none());
+        pending.extend_from_slice(&first[9..]);
+        pending.extend_from_slice(second);
+        assert_eq!(
+            take_resp_command(&mut pending),
+            Some(vec![b"ECHO".to_vec(), b"one".to_vec()])
+        );
+        assert_eq!(
+            take_resp_command(&mut pending),
+            Some(vec![b"PING".to_vec()])
+        );
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]
