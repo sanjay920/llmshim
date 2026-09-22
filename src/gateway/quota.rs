@@ -35,21 +35,31 @@ impl Bucket {
         }
     }
 
-    /// Take `want` tokens if available, else report how long until they refill.
-    fn take(&mut self, want: f64, now: Instant) -> Result<(), Duration> {
+    fn refill(&mut self, now: Instant) {
         if self.capacity == 0.0 {
-            return Err(ZERO_QUOTA_RETRY_AFTER);
+            return;
         }
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         self.last = now;
+    }
+
+    /// Report whether `want` tokens are available after [`Self::refill`].
+    fn check(&self, want: f64) -> Result<(), Duration> {
+        if self.capacity == 0.0 {
+            return Err(ZERO_QUOTA_RETRY_AFTER);
+        }
         if self.tokens + 1e-9 >= want {
-            self.tokens -= want;
             Ok(())
         } else {
             let deficit = want - self.tokens;
             Err(Duration::from_secs_f64(deficit / self.refill_per_sec))
         }
+    }
+
+    /// Deduct `want` tokens after every configured bucket has passed `check`.
+    fn commit(&mut self, want: f64) {
+        self.tokens -= want;
     }
 }
 
@@ -87,28 +97,46 @@ impl TenantQuota {
         }
         let now = Instant::now();
         let key = format!("{tenant}:{provider}");
+        let mut rpm_buckets = self.rpm.lock().unwrap();
+        let mut tpm_buckets = self.tpm.lock().unwrap();
         let mut wait: Option<Duration> = None;
 
         if let Some(r) = rpm {
-            let mut buckets = self.rpm.lock().unwrap();
-            let b = buckets
+            let bucket = rpm_buckets
                 .entry(key.clone())
                 .or_insert_with(|| Bucket::new(r, now));
-            if let Err(w) = b.take(1.0, now) {
+            bucket.refill(now);
+            if let Err(w) = bucket.check(1.0) {
                 wait = Some(w);
             }
         }
         if let Some(t) = tpm {
-            let mut buckets = self.tpm.lock().unwrap();
-            let b = buckets.entry(key).or_insert_with(|| Bucket::new(t, now));
-            if let Err(w) = b.take(est_tokens.max(1) as f64, now) {
+            let bucket = tpm_buckets
+                .entry(key.clone())
+                .or_insert_with(|| Bucket::new(t, now));
+            bucket.refill(now);
+            if let Err(w) = bucket.check(est_tokens.max(1) as f64) {
                 wait = Some(wait.map_or(w, |cur| cur.max(w)));
             }
         }
 
         match wait {
             Some(w) => Err(w),
-            None => Ok(()),
+            None => {
+                if rpm.is_some() {
+                    rpm_buckets
+                        .get_mut(&key)
+                        .expect("configured RPM bucket was created")
+                        .commit(1.0);
+                }
+                if tpm.is_some() {
+                    tpm_buckets
+                        .get_mut(&key)
+                        .expect("configured TPM bucket was created")
+                        .commit(est_tokens.max(1) as f64);
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -334,6 +362,23 @@ mod tests {
         assert!(
             q.check("acme", "openai", Some(2), None, 1).is_ok(),
             "refilled after 30s"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_tpm_rejection_does_not_debit_tenant_rpm() {
+        let q = TenantQuota::new();
+
+        let rejection = q.check("acme", "openai", Some(1), Some(10), 11);
+        assert!(rejection.is_err(), "request exceeds the TPM bucket");
+
+        assert!(
+            q.check("acme", "openai", Some(1), Some(10), 1).is_ok(),
+            "a rejected oversized request must leave RPM capacity for valid work"
+        );
+        assert!(
+            q.check("acme", "openai", Some(1), Some(10), 1).is_err(),
+            "the valid request consumed the only RPM permit"
         );
     }
 
