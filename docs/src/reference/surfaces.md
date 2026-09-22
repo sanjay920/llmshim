@@ -59,5 +59,19 @@ running proxy.
 All language clients expose reasoning blocks and the tool-call signature object
 (`data` plus `origin`). Preserve those objects for replay.
 
+## Upstream response limits
+
+The engine limits ordinary JSON completion bodies to 32 MiB and provider error
+bodies to 64 KiB, measured after HTTP decompression. It checks decoded chunks
+before adding them to its body buffer. Oversized final bodies return a fixed
+502 error without including a truncated provider response. Retry bodies use the
+same error-body buffer limit; oversized bodies are dropped before another attempt.
+
+These limits apply through the Rust completion API, CLI, proxy, and gateway.
+They bound decoded body bytes; JSON allocations and process memory have
+additional overhead. SSE processing, including ChatGPT's collected SSE replies,
+and successful raw responses returned by the low-level `ShimClient::send` API
+remain outside these body-reader limits.
+
 For shape details, continue to the [request field map](request-fields.md) and
 [HTTP API](../proxy/http-api.md).

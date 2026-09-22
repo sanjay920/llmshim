@@ -1,5 +1,5 @@
 //! Process-local schema memoization. Never retain whole requests or credentials.
-use super::{Normalization, Options};
+use super::{budget, Normalization, Options};
 use serde_json::Value;
 use std::{
     collections::{hash_map::RandomState, HashMap},
@@ -13,6 +13,7 @@ pub(super) struct Cached {
     pub value: Value,
     pub report: Normalization,
     pub unchanged: bool,
+    pub footprint: budget::Footprint,
 }
 struct Entry {
     input: Value,
@@ -82,6 +83,9 @@ impl Memo {
         let Some(output_bytes) = fingerprint(value, &mut self.hasher.build_hasher()) else {
             return;
         };
+        let Ok(footprint) = budget::measure(value) else {
+            return;
+        };
         // Conservative owned-value estimate plus entry/hash-table bookkeeping.
         let bytes = key
             .input_bytes
@@ -98,6 +102,7 @@ impl Memo {
                 value: value.clone(),
                 report,
                 unchanged,
+                footprint,
             }),
             last_used: 0,
             bytes,
