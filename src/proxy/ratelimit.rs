@@ -20,6 +20,7 @@
 //! The token-bucket math is factored into a small pure [`TokenBucket`] type so
 //! it can be unit-tested deterministically with `tokio::time` paused.
 
+#[cfg(any(feature = "gateway", test))]
 use super::convert::{active_native_namespace, AdmissionTarget, PreparedRequest};
 use super::types::ChatRequest;
 use std::collections::HashMap;
@@ -781,6 +782,7 @@ pub fn estimate_request_tokens(req: &ChatRequest) -> u32 {
         .clamp(1, u32::MAX as u64) as u32
 }
 
+#[cfg(any(feature = "gateway", test))]
 pub(crate) fn estimate_prepared_request_tokens(prepared: &PreparedRequest) -> u32 {
     let mut prompt_characters = 0usize;
     for field in ["messages", "tools", "response_format", "x-shim"] {
@@ -894,6 +896,7 @@ fn omitted_native_output_budget(
         .fold(primary_budget, u64::max)
 }
 
+#[cfg(any(feature = "gateway", test))]
 fn active_native_prompt_characters(prepared: &PreparedRequest) -> usize {
     let Some(active_namespace) = active_native_namespace(&prepared.target) else {
         return 0;
@@ -920,6 +923,7 @@ fn active_native_prompt_characters(prepared: &PreparedRequest) -> usize {
         })
 }
 
+#[cfg(any(feature = "gateway", test))]
 fn portable_output_budget(request: &serde_json::Value) -> Option<u64> {
     request
         .get("max_tokens")
@@ -927,6 +931,7 @@ fn portable_output_budget(request: &serde_json::Value) -> Option<u64> {
         .and_then(serde_json::Value::as_u64)
 }
 
+#[cfg(any(feature = "gateway", test))]
 fn native_u64(request: &serde_json::Value, namespace: &str, path: &[&str]) -> Option<u64> {
     let mut value = request.get(namespace)?;
     for field in path {
@@ -935,6 +940,7 @@ fn native_u64(request: &serde_json::Value, namespace: &str, path: &[&str]) -> Op
     value.as_u64()
 }
 
+#[cfg(any(feature = "gateway", test))]
 fn native_direct_output_budget(
     request: &serde_json::Value,
     target: &AdmissionTarget,
@@ -948,6 +954,7 @@ fn native_direct_output_budget(
         .max()
 }
 
+#[cfg(any(feature = "gateway", test))]
 fn reasoning_output_budget(request: &serde_json::Value, target: &AdmissionTarget) -> Option<u64> {
     let namespace = active_native_namespace(target)?;
     match target.provider_name.as_str() {
@@ -970,6 +977,7 @@ fn reasoning_output_budget(request: &serde_json::Value, target: &AdmissionTarget
     }
 }
 
+#[cfg(any(feature = "gateway", test))]
 fn omitted_output_budget(target: &AdmissionTarget) -> u64 {
     if target.provider_name == "anthropic" {
         return 8_192;
@@ -986,6 +994,7 @@ fn omitted_output_budget(target: &AdmissionTarget) -> u64 {
         })
 }
 
+#[cfg(any(feature = "gateway", test))]
 fn omitted_prepared_output_budget(prepared: &PreparedRequest) -> u64 {
     let primary_budget = omitted_output_budget(&prepared.target);
     if prepared.target.provider_name != "openrouter" {
@@ -1008,6 +1017,7 @@ fn omitted_prepared_output_budget(prepared: &PreparedRequest) -> u64 {
         .fold(primary_budget, u64::max)
 }
 
+#[cfg(any(feature = "gateway", test))]
 fn effective_output_budget(prepared: &PreparedRequest) -> u64 {
     let requested_output_budget = if prepared.target.provider_name == "chatgpt" {
         None
