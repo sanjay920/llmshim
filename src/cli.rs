@@ -9,6 +9,7 @@ pub(crate) struct Options {
 pub(crate) struct ServerOptions {
     pub host: Option<String>,
     pub port: Option<u16>,
+    pub managed: bool,
 }
 
 fn value<'a>(args: &'a [String], at: &mut usize, flag: &str) -> Result<&'a str, String> {
@@ -61,6 +62,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, String> {
                         options.server.port = Some(port(value(tail, &mut at, arg)?)?)
                     }
                     "--host" => options.server.host = Some(value(tail, &mut at, arg)?.into()),
+                    "--managed" if command == "proxy" => options.server.managed = true,
                     _ if arg.starts_with("--port=") => options.server.port = Some(port(&arg[7..])?),
                     _ if arg.starts_with("--host=") => options.server.host = Some(arg[7..].into()),
                     _ => return Err(format!("unknown argument for {command}: {arg}")),
@@ -74,6 +76,11 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, String> {
                 .is_some_and(|host| parse_host(host).is_err())
             {
                 return Err("--host must be an IPv4 or IPv6 address".into());
+            }
+            if options.server.managed
+                && (options.server.host.is_some() || options.server.port.is_some())
+            {
+                return Err("--managed selects its own loopback port and cannot be combined with --host or --port".into());
             }
         }
         "chat" => {
@@ -216,6 +223,26 @@ mod tests {
         assert_eq!(
             error,
             format!("cannot listen on {addr}: port is already in use")
+        );
+    }
+
+    #[test]
+    fn managed_proxy_selects_its_own_address() {
+        let options = parse(&["llmshim".into(), "proxy".into(), "--managed".into()]).unwrap();
+        assert!(options.server.managed);
+        assert_eq!(
+            parse(&[
+                "llmshim".into(),
+                "proxy".into(),
+                "--managed".into(),
+                "--port=3000".into(),
+            ])
+            .unwrap_err(),
+            "--managed selects its own loopback port and cannot be combined with --host or --port"
+        );
+        assert_eq!(
+            parse(&["llmshim".into(), "gateway".into(), "--managed".into()]).unwrap_err(),
+            "unknown argument for gateway: --managed"
         );
     }
 }

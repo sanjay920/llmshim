@@ -14,7 +14,7 @@ from typing import Any, Generator, List, Optional, Union
 
 import httpx
 
-from llmshim._server import ensure_server
+from llmshim import _server
 from llmshim.types import (
     ChatResponse,
     HealthResponse,
@@ -53,10 +53,9 @@ class LlmShimError(Exception):
 
 
 def _get_base_url() -> str:
-    global _base_url
-    if _base_url is None:
-        _base_url = ensure_server()
-    return _base_url
+    if _base_url is not None:
+        return _base_url
+    return _server.ensure_managed_server().base_url
 
 
 def _get_http() -> httpx.Client:
@@ -64,6 +63,17 @@ def _get_http() -> httpx.Client:
     if _http is None:
         _http = httpx.Client(timeout=_timeout)
     return _http
+
+
+def _request_context() -> tuple[str, httpx.Client, dict[str, str]]:
+    if _base_url is not None:
+        return _base_url, _get_http(), {}
+    managed = _server.ensure_managed_server()
+    return (
+        managed.base_url,
+        managed.http,
+        {_server.MANAGED_AUTH_HEADER: managed.auth_token},
+    )
 
 
 def _raise_for_error(resp: httpx.Response) -> None:
@@ -174,9 +184,7 @@ def configure(
     # If server is already running, it won't pick up new keys until restart.
     # Force restart on next call.
     global _base_url
-    from llmshim._server import _stop_server
-
-    _stop_server()
+    _server._stop_server()
     _base_url = None
 
 
@@ -318,7 +326,8 @@ def chat(
         fallback=fallback,
     )
 
-    resp = _get_http().post(f"{_get_base_url()}/v1/chat", json=body)
+    base_url, http, headers = _request_context()
+    resp = http.post(f"{base_url}/v1/chat", json=body, headers=headers)
     _raise_for_error(resp)
     return resp.json()
 
@@ -376,10 +385,12 @@ def stream(
         fallback=fallback,
     )
 
-    with httpx.stream(
+    base_url, http, headers = _request_context()
+    with http.stream(
         "POST",
-        f"{_get_base_url()}/v1/chat/stream",
+        f"{base_url}/v1/chat/stream",
         json=body,
+        headers=headers,
         timeout=_timeout,
     ) as resp:
         if resp.status_code >= 400:
@@ -404,7 +415,8 @@ def models() -> List[ModelEntry]:
     Returns:
         List of ModelEntry dicts with keys: id, provider, name.
     """
-    resp = _get_http().get(f"{_get_base_url()}/v1/models")
+    base_url, http, headers = _request_context()
+    resp = http.get(f"{base_url}/v1/models", headers=headers)
     _raise_for_error(resp)
     return resp.json()["models"]
 
@@ -415,6 +427,7 @@ def health() -> HealthResponse:
     Returns:
         A HealthResponse dict with keys: status, providers.
     """
-    resp = _get_http().get(f"{_get_base_url()}/health")
+    base_url, http, headers = _request_context()
+    resp = http.get(f"{base_url}/health", headers=headers)
     _raise_for_error(resp)
     return resp.json()

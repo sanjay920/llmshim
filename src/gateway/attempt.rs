@@ -47,6 +47,7 @@ impl std::fmt::Debug for TrustedPolicyScope {
 enum RateRefusal {
     Provider(Duration),
     Tenant(Duration),
+    #[cfg(any(feature = "gateway-redis", test))]
     Unavailable,
 }
 
@@ -382,6 +383,7 @@ impl AttemptCoordinator {
                 AttemptPolicyRefusalKind::TenantLimit,
                 Some(wait),
             )),
+            #[cfg(any(feature = "gateway-redis", test))]
             Err(RateRefusal::Unavailable) => Err(AttemptPolicyRefusal::new(
                 AttemptPolicyRefusalKind::CoordinatorUnavailable,
                 None,
