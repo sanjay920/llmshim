@@ -91,6 +91,8 @@ its lock and temporary files. The stock Docker helper does not mount it.
 |---|---|---|
 | `LLMSHIM_HOST` | config value, then `0.0.0.0` | Bind address |
 | `LLMSHIM_PORT` | config value, then `3000` | Bind port |
+| `LLMSHIM_HTTP_MAX_CONNECTIONS` | `1024` | Accepted TCP connections per ordinary proxy or gateway process |
+| `LLMSHIM_HTTP_HEADER_TIMEOUT_MS` | `15000` | First request/protocol-preface deadline and subsequent HTTP/1 header deadline |
 | `LLMSHIM_TRUSTED_ORIGINS` | unset | Comma-separated exact browser origins allowed to call the proxy or gateway |
 
 The environment overrides `[proxy]`. The proxy has no built-in authentication
@@ -98,6 +100,21 @@ or TLS; the bind address is not a security boundary by itself. See
 [Deploy the proxy safely](../proxy/deployment.md). When `LLMSHIM_TRUSTED_ORIGINS`
 is unset, requests with an `Origin` header are rejected before dispatch; SDK
 requests without one are unchanged.
+
+The ordinary `proxy` and `gateway` commands acquire a connection slot before
+accepting a socket and retain it through the response body and connection close.
+Excess sockets wait in the operating system's listen backlog. Invalid, zero, or
+unrepresentable limit values retain the defaults. The first-header deadline also
+covers silent sockets and incomplete HTTP/2 prefaces; it ends when the application
+receives the first request headers, so valid inference and streams can outlast it.
+
+HTTP/1 retains keepalive with a 64 KiB read buffer and at most 100 headers.
+HTTP/2 advertises a 64 KiB header-list limit and at most 128 concurrent streams
+per connection, with 30-second keepalive probes and a 10-second acknowledgement
+timeout. These transport controls are separate from request-body upload limits,
+logical request lifetimes, and provider concurrency. Managed client processes
+retain their separate TLS listener limits. Rust applications serving the exported
+routers through their own listener must configure equivalent transport limits.
 
 ## Retries
 
