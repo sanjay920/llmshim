@@ -92,6 +92,12 @@ impl KeyStore {
                 );
                 KeyStore::Enforced(map)
             }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                eprintln!(
+                    "gateway: LLMSHIM_GATEWAY_KEYS_FILE is not valid UTF-8; refusing to start"
+                );
+                std::process::exit(1);
+            }
             _ => {
                 eprintln!(
                     "  Auth: OPEN (no LLMSHIM_GATEWAY_KEYS_FILE; x-llmshim-priority trusted)"
