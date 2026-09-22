@@ -268,15 +268,26 @@ pub fn capture_response(target: &ReplayTarget, native: &Value, response: &mut Va
 }
 
 pub(crate) fn validate_arguments(arguments: &str, is_upstream: bool) -> Result<()> {
-    serde_json::from_str::<Value>(arguments)
-        .map(|_| ())
-        .map_err(|_| {
-            if is_upstream {
-                upstream("arguments are not complete JSON")
-            } else {
-                invalid("arguments are not complete JSON")
-            }
-        })
+    let limits = if is_upstream {
+        crate::json_bounds::Limits::SSE
+    } else {
+        crate::json_bounds::Limits::INBOUND
+    };
+    match crate::json_bounds::parse_str(arguments, limits) {
+        Ok(_) => Ok(()),
+        Err(crate::json_bounds::ParseError::Complexity) if is_upstream => {
+            Err(upstream("tool arguments exceed JSON complexity limit"))
+        }
+        Err(crate::json_bounds::ParseError::Complexity) => {
+            Err(invalid("tool arguments exceed JSON complexity limit"))
+        }
+        Err(crate::json_bounds::ParseError::Malformed(_)) if is_upstream => {
+            Err(upstream("arguments are not complete JSON"))
+        }
+        Err(crate::json_bounds::ParseError::Malformed(_)) => {
+            Err(invalid("arguments are not complete JSON"))
+        }
+    }
 }
 
 /// Check every call/result pairing. Pending calls at the end are invalid when

@@ -23,6 +23,7 @@ pub(super) enum BodyReadError {
     Http(reqwest::Error),
     TooLarge,
     Timeout,
+    Complexity,
 }
 
 impl BodyReadError {
@@ -37,6 +38,11 @@ impl BodyReadError {
             Self::Timeout => DispatchFailure::LocalTimeout(ShimError::ProviderError {
                 status: 504,
                 body: "upstream response body timed out".into(),
+                retry_after: None,
+            }),
+            Self::Complexity => DispatchFailure::Local(ShimError::ProviderError {
+                status: 502,
+                body: "upstream JSON exceeds complexity limit".into(),
                 retry_after: None,
             }),
         }
@@ -100,6 +106,11 @@ pub(super) async fn read_json(
     total_deadline: tokio::time::Instant,
 ) -> Result<serde_json::Value, BodyReadError> {
     let decoded_body = read(response, maximum_bytes, idle_timeout, total_deadline).await?;
+    match crate::json_bounds::parse_slice(&decoded_body, crate::json_bounds::Limits::UNARY) {
+        Ok(value) => return Ok(value),
+        Err(crate::json_bounds::ParseError::Complexity) => return Err(BodyReadError::Complexity),
+        Err(crate::json_bounds::ParseError::Malformed(_)) => {}
+    }
     // Retain reqwest's public decode-error type after the body is bounded.
     reqwest::Response::from(http::Response::new(decoded_body))
         .json()

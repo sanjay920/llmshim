@@ -330,7 +330,11 @@ impl CatalogHandle {
             ));
         }
         let bytes = bounded_response_body(response, "provider catalog exceeds size limit").await?;
-        let value: Value = serde_json::from_slice(&bytes)?;
+        let value: Value =
+            crate::bounded_json::parse_slice(&bytes, crate::bounded_json::Limits::CATALOG)
+                .map_err(|_| {
+                    CatalogError::Invalid("provider catalog JSON is invalid or too complex")
+                })?;
         let at = Utc::now();
         let mut catalog = (*self.snapshot()).clone();
         let models = catalog.merge_provider_models(provider, &value, at)?;
