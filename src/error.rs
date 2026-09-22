@@ -14,7 +14,7 @@ pub enum ShimError {
     MissingModel,
 
     #[error("HTTP error: {0}")]
-    Http(reqwest::Error),
+    Http(#[source] reqwest::Error),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
@@ -45,10 +45,7 @@ impl std::fmt::Debug for ShimError {
                 .field(provider)
                 .finish(),
             Self::MissingModel => formatter.write_str("MissingModel"),
-            Self::Http(error) => formatter
-                .debug_tuple("Http")
-                .field(&error.to_string())
-                .finish(),
+            Self::Http(_) => formatter.write_str("Http"),
             Self::Json(error) => formatter.debug_tuple("Json").field(error).finish(),
             Self::ProviderError {
                 status,
