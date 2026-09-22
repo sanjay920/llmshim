@@ -152,6 +152,7 @@ fn prepare_resolved_request(
 ) -> crate::error::Result<PreparedRequest> {
     let target = admission_target(provider, resolved_model);
     validate_active_native_overrides(&request, &target)?;
+    crate::reasoning::preflight_request(&request)?;
     if let Some(messages) = request["messages"].as_array() {
         crate::toolcall::validate_history(messages)?;
     }

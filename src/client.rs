@@ -667,6 +667,7 @@ impl ShimClient {
         request: &serde_json::Value,
         policy_context: Option<&DispatchPolicyContext>,
     ) -> DispatchResult<(serde_json::Value, crate::reasoning::ReplayTarget)> {
+        crate::reasoning::preflight_request(request).map_err(DispatchFailure::Local)?;
         let provider_req = provider
             .prepare_request(model, request)
             .await
@@ -1039,6 +1040,7 @@ impl ShimClient {
         request: &serde_json::Value,
         policy_context: Option<&DispatchPolicyContext>,
     ) -> DispatchResult<(StreamDispatch, crate::reasoning::ReplayTarget)> {
+        crate::reasoning::preflight_request(request).map_err(DispatchFailure::Local)?;
         let mut req_value = request.clone();
         req_value["stream"] = serde_json::Value::Bool(true);
 
