@@ -39,6 +39,8 @@ const DEFAULT_QUEUE_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PENALTY_SECS: u64 = 5;
 /// Assumed output size when a request specifies no `max_tokens`, for TPM estimation.
 const DEFAULT_MAX_TOKENS_ESTIMATE: u64 = 1024;
+/// Retry hint for an explicit zero limit, which is a permanent policy denial.
+const ZERO_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 // ===========================================================================
 // RateKey
@@ -127,10 +129,19 @@ impl TokenBucket {
     /// A bucket sized from a per-minute rate (RPM/TPM): capacity == `per_minute`
     /// (burst), refilling at `per_minute / 60` per second. Starts full.
     fn from_per_minute(per_minute: f64, now: Instant) -> Self {
+        let capacity = if per_minute == 0.0 {
+            0.0
+        } else {
+            per_minute.max(1.0)
+        };
         Self {
-            capacity: per_minute.max(1.0),
-            refill_per_sec: (per_minute / 60.0).max(f64::MIN_POSITIVE),
-            tokens: per_minute.max(1.0),
+            capacity,
+            refill_per_sec: if per_minute == 0.0 {
+                0.0
+            } else {
+                (per_minute / 60.0).max(f64::MIN_POSITIVE)
+            },
+            tokens: capacity,
             last: now,
             penalty_until: None,
         }
@@ -158,6 +169,9 @@ impl TokenBucket {
         if self.tokens + 1e-9 >= permits {
             Ok(())
         } else {
+            if self.refill_per_sec <= 0.0 {
+                return Err(ZERO_LIMIT_RETRY_AFTER);
+            }
             let deficit = permits - self.tokens;
             Err(Duration::from_secs_f64(deficit / self.refill_per_sec))
         }
@@ -250,6 +264,10 @@ pub struct ProviderLimit {
 impl ProviderLimit {
     fn is_unlimited(&self) -> bool {
         self.rpm.is_none() && self.tpm.is_none()
+    }
+
+    fn has_zero_limit(&self) -> bool {
+        self.rpm == Some(0) || self.tpm == Some(0)
     }
 }
 
@@ -360,6 +378,9 @@ impl RateLimiter for InMemoryRateLimiter {
         if limit.is_unlimited() {
             return Ok(()); // no-op when unconfigured
         }
+        if limit.has_zero_limit() {
+            return Err(RetryAfter(ZERO_LIMIT_RETRY_AFTER));
+        }
         let now = Instant::now();
         let mut map = self.buckets.lock().await;
         let entry = map
@@ -372,7 +393,7 @@ impl RateLimiter for InMemoryRateLimiter {
 
     async fn penalize(&self, key: &RateKey, retry_after: Duration) {
         let limit = self.config.resolve(&key.provider);
-        if limit.is_unlimited() {
+        if limit.is_unlimited() || limit.has_zero_limit() {
             return;
         }
         let now = Instant::now();
@@ -394,50 +415,124 @@ mod redis_impl {
     use redis::aio::ConnectionManager;
     use tokio::sync::OnceCell;
 
-    /// Atomic token-bucket step in a single round-trip. Stores `tokens`, last
-    /// refill `ts` (ms) and a `penalty` deadline (ms) in one hash. Returns
-    /// `{allowed, wait_ms}`.
-    const BUCKET_LUA: &str = r#"
-        local cap    = tonumber(ARGV[1])
-        local refill = tonumber(ARGV[2])
-        local now    = tonumber(ARGV[3])
-        local want   = tonumber(ARGV[4])
-        local ttl    = tonumber(ARGV[5])
+    /// Atomically checks the configured RPM and TPM buckets in one Redis Lua
+    /// invocation. Each bucket stores `tokens`, last refill `ts` (ms), and a
+    /// `penalty` deadline (ms). Returns `{request_admitted, retry_after_ms}`.
+    const RATE_LIMIT_LUA: &str = r#"
+        local current_timestamp_ms = tonumber(ARGV[1])
+        local key_ttl_ms = tonumber(ARGV[2])
 
-        local h = redis.call('HMGET', KEYS[1], 'tokens', 'ts', 'penalty')
-        local tokens = tonumber(h[1])
-        local ts = tonumber(h[2])
-        local penalty = tonumber(h[3]) or 0
-        if tokens == nil then tokens = cap end
-        if ts == nil then ts = now end
+        local rpm_enabled = tonumber(ARGV[3]) == 1
+        local rpm_capacity = tonumber(ARGV[4])
+        local rpm_refill_per_second = tonumber(ARGV[5])
+        local rpm_required_tokens = tonumber(ARGV[6])
 
-        local elapsed = now - ts
-        if elapsed < 0 then elapsed = 0 end
-        tokens = math.min(cap, tokens + (elapsed / 1000.0) * refill)
-        ts = now
+        local tpm_enabled = tonumber(ARGV[7]) == 1
+        local tpm_capacity = tonumber(ARGV[8])
+        local tpm_refill_per_second = tonumber(ARGV[9])
+        local tpm_required_tokens = tonumber(ARGV[10])
 
-        local allowed = 0
-        local wait = 0
-        if penalty > now then
-            wait = penalty - now
-        elseif tokens >= want then
-            tokens = tokens - want
-            allowed = 1
-        else
-            local deficit = want - tokens
-            wait = math.ceil(deficit / refill * 1000.0)
+        local function load_bucket(bucket_key, capacity, refill_per_second)
+            local stored_bucket_values = redis.call('HMGET', bucket_key, 'tokens', 'ts', 'penalty')
+            local token_balance = tonumber(stored_bucket_values[1])
+            local last_refill_timestamp_ms = tonumber(stored_bucket_values[2])
+            local penalty_deadline_ms = tonumber(stored_bucket_values[3]) or 0
+            if token_balance == nil then token_balance = capacity end
+            if last_refill_timestamp_ms == nil then last_refill_timestamp_ms = current_timestamp_ms end
+
+            local elapsed_ms = current_timestamp_ms - last_refill_timestamp_ms
+            if elapsed_ms < 0 then elapsed_ms = 0 end
+            token_balance = math.min(
+                capacity,
+                token_balance + (elapsed_ms / 1000.0) * refill_per_second
+            )
+            return token_balance, current_timestamp_ms, penalty_deadline_ms
         end
 
-        redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', ts, 'penalty', penalty)
-        redis.call('PEXPIRE', KEYS[1], ttl)
-        return {allowed, wait}
+        local function retry_after_ms(token_balance, penalty_deadline_ms, refill_per_second, required_tokens)
+            if penalty_deadline_ms > current_timestamp_ms then
+                return penalty_deadline_ms - current_timestamp_ms
+            end
+            if token_balance >= required_tokens then
+                return nil
+            end
+            return math.ceil((required_tokens - token_balance) / refill_per_second * 1000.0)
+        end
+
+        local rpm_token_balance, rpm_last_refill_timestamp_ms, rpm_penalty_deadline_ms
+        if rpm_enabled then
+            rpm_token_balance, rpm_last_refill_timestamp_ms, rpm_penalty_deadline_ms = load_bucket(
+                KEYS[1], rpm_capacity, rpm_refill_per_second
+            )
+        end
+
+        local tpm_token_balance, tpm_last_refill_timestamp_ms, tpm_penalty_deadline_ms
+        if tpm_enabled then
+            tpm_token_balance, tpm_last_refill_timestamp_ms, tpm_penalty_deadline_ms = load_bucket(
+                KEYS[2], tpm_capacity, tpm_refill_per_second
+            )
+        end
+
+        local request_admitted = 1
+        local maximum_retry_after_ms = 0
+        if rpm_enabled then
+            local rpm_retry_after_ms = retry_after_ms(
+                rpm_token_balance,
+                rpm_penalty_deadline_ms,
+                rpm_refill_per_second,
+                rpm_required_tokens
+            )
+            if rpm_retry_after_ms ~= nil then
+                request_admitted = 0
+                maximum_retry_after_ms = math.max(maximum_retry_after_ms, rpm_retry_after_ms)
+            end
+        end
+        if tpm_enabled then
+            local tpm_retry_after_ms = retry_after_ms(
+                tpm_token_balance,
+                tpm_penalty_deadline_ms,
+                tpm_refill_per_second,
+                tpm_required_tokens
+            )
+            if tpm_retry_after_ms ~= nil then
+                request_admitted = 0
+                maximum_retry_after_ms = math.max(maximum_retry_after_ms, tpm_retry_after_ms)
+            end
+        end
+
+        if request_admitted == 1 then
+            if rpm_enabled then rpm_token_balance = rpm_token_balance - rpm_required_tokens end
+            if tpm_enabled then tpm_token_balance = tpm_token_balance - tpm_required_tokens end
+        end
+
+        if rpm_enabled then
+            redis.call(
+                'HSET',
+                KEYS[1],
+                'tokens', rpm_token_balance,
+                'ts', rpm_last_refill_timestamp_ms,
+                'penalty', rpm_penalty_deadline_ms
+            )
+            redis.call('PEXPIRE', KEYS[1], key_ttl_ms)
+        end
+        if tpm_enabled then
+            redis.call(
+                'HSET',
+                KEYS[2],
+                'tokens', tpm_token_balance,
+                'ts', tpm_last_refill_timestamp_ms,
+                'penalty', tpm_penalty_deadline_ms
+            )
+            redis.call('PEXPIRE', KEYS[2], key_ttl_ms)
+        end
+        return {request_admitted, maximum_retry_after_ms}
     "#;
 
     const PENALTY_LUA: &str = r#"
-        local until_ms = tonumber(ARGV[1])
-        local ttl = tonumber(ARGV[2])
-        redis.call('HSET', KEYS[1], 'penalty', until_ms, 'tokens', 0)
-        redis.call('PEXPIRE', KEYS[1], ttl)
+        local penalty_deadline_ms = tonumber(ARGV[1])
+        local key_ttl_ms = tonumber(ARGV[2])
+        redis.call('HSET', KEYS[1], 'penalty', penalty_deadline_ms, 'tokens', 0)
+        redis.call('PEXPIRE', KEYS[1], key_ttl_ms)
         return 1
     "#;
 
@@ -453,9 +548,9 @@ mod redis_impl {
     /// [`crate::client`] still protects against provider 429s.
     pub struct RedisRateLimiter {
         client: redis::Client,
-        conn: OnceCell<ConnectionManager>,
+        connection_manager: OnceCell<ConnectionManager>,
         config: RateLimitConfig,
-        bucket_script: redis::Script,
+        rate_limit_script: redis::Script,
         penalty_script: redis::Script,
     }
 
@@ -466,51 +561,65 @@ mod redis_impl {
         pub fn new(url: &str, config: RateLimitConfig) -> redis::RedisResult<Self> {
             Ok(Self {
                 client: redis::Client::open(url)?,
-                conn: OnceCell::new(),
+                connection_manager: OnceCell::new(),
                 config,
-                bucket_script: redis::Script::new(BUCKET_LUA),
+                rate_limit_script: redis::Script::new(RATE_LIMIT_LUA),
                 penalty_script: redis::Script::new(PENALTY_LUA),
             })
         }
 
         async fn connection(&self) -> redis::RedisResult<ConnectionManager> {
-            self.conn
+            self.connection_manager
                 .get_or_try_init(|| ConnectionManager::new(self.client.clone()))
                 .await
                 .cloned()
         }
 
-        fn redis_key(kind: &str, key: &RateKey) -> String {
-            format!("llmshim:rl:{}:{}", key.as_str(), kind)
+        fn redis_key(bucket_dimension: &str, rate_key: &RateKey) -> String {
+            format!("llmshim:rl:{}:{}", rate_key.as_str(), bucket_dimension)
         }
 
-        /// Run the bucket script for one dimension. `Ok(None)` = admitted,
-        /// `Ok(Some(wait))` = denied, `Err` = redis error (caller fails open).
-        async fn step(
+        /// Atomically check and debit the configured RPM and TPM dimensions.
+        /// `Ok(None)` = admitted, `Ok(Some(wait))` = denied, `Err` = Redis
+        /// failure (the caller preserves the documented fail-open behavior).
+        async fn check_and_debit(
             &self,
-            conn: &mut ConnectionManager,
-            kind: &str,
-            key: &RateKey,
-            per_minute: u32,
-            want: f64,
+            connection: &mut ConnectionManager,
+            rate_key: &RateKey,
+            rpm: Option<u32>,
+            tpm: Option<u32>,
+            tpm_permits: u32,
         ) -> redis::RedisResult<Option<Duration>> {
-            let cap = (per_minute as f64).max(1.0);
-            let refill = (per_minute as f64 / 60.0).max(f64::MIN_POSITIVE);
-            let now_ms = now_ms();
-            let (allowed, wait_ms): (i64, i64) = self
-                .bucket_script
-                .key(Self::redis_key(kind, key))
-                .arg(cap)
-                .arg(refill)
-                .arg(now_ms)
-                .arg(want)
+            let rpm_enabled = if rpm.is_some() { 1 } else { 0 };
+            let rpm_per_minute = rpm.unwrap_or(0) as f64;
+            let rpm_capacity = rpm_per_minute.max(1.0);
+            let rpm_refill_per_second = (rpm_per_minute / 60.0).max(f64::MIN_POSITIVE);
+
+            let tpm_enabled = if tpm.is_some() { 1 } else { 0 };
+            let tpm_per_minute = tpm.unwrap_or(0) as f64;
+            let tpm_capacity = tpm_per_minute.max(1.0);
+            let tpm_refill_per_second = (tpm_per_minute / 60.0).max(f64::MIN_POSITIVE);
+            let current_timestamp_ms = current_timestamp_ms();
+            let (request_admitted, retry_after_ms): (i64, i64) = self
+                .rate_limit_script
+                .key(Self::redis_key("rpm", rate_key))
+                .key(Self::redis_key("tpm", rate_key))
+                .arg(current_timestamp_ms)
                 .arg(KEY_TTL_MS)
-                .invoke_async(conn)
+                .arg(rpm_enabled)
+                .arg(rpm_capacity)
+                .arg(rpm_refill_per_second)
+                .arg(1.0)
+                .arg(tpm_enabled)
+                .arg(tpm_capacity)
+                .arg(tpm_refill_per_second)
+                .arg(tpm_permits.max(1) as f64)
+                .invoke_async(connection)
                 .await?;
-            if allowed == 1 {
+            if request_admitted == 1 {
                 Ok(None)
             } else {
-                Ok(Some(Duration::from_millis(wait_ms.max(0) as u64)))
+                Ok(Some(Duration::from_millis(retry_after_ms.max(0) as u64)))
             }
         }
     }
@@ -522,7 +631,10 @@ mod redis_impl {
             if limit.is_unlimited() {
                 return Ok(());
             }
-            let mut conn = match self.connection().await {
+            if limit.has_zero_limit() {
+                return Err(RetryAfter(ZERO_LIMIT_RETRY_AFTER));
+            }
+            let mut connection = match self.connection().await {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("warning: redis rate limiter unavailable ({e}); failing open");
@@ -530,61 +642,45 @@ mod redis_impl {
                 }
             };
 
-            let mut wait: Option<Duration> = None;
-            if let Some(rpm) = limit.rpm {
-                match self.step(&mut conn, "rpm", key, rpm, 1.0).await {
-                    Ok(Some(w)) => wait = Some(wait.map_or(w, |c| c.max(w))),
-                    Ok(None) => {}
-                    Err(e) => {
-                        eprintln!("warning: redis rpm check failed ({e}); failing open");
-                        return Ok(());
-                    }
+            match self
+                .check_and_debit(&mut connection, key, limit.rpm, limit.tpm, permits)
+                .await
+            {
+                Ok(Some(wait)) => Err(RetryAfter(wait)),
+                Ok(None) => Ok(()),
+                Err(error) => {
+                    eprintln!("warning: redis rate-limit check failed ({error}); failing open");
+                    Ok(())
                 }
-            }
-            if let Some(tpm) = limit.tpm {
-                let want = (permits.max(1)) as f64;
-                match self.step(&mut conn, "tpm", key, tpm, want).await {
-                    Ok(Some(w)) => wait = Some(wait.map_or(w, |c| c.max(w))),
-                    Ok(None) => {}
-                    Err(e) => {
-                        eprintln!("warning: redis tpm check failed ({e}); failing open");
-                        return Ok(());
-                    }
-                }
-            }
-
-            match wait {
-                Some(w) => Err(RetryAfter(w)),
-                None => Ok(()),
             }
         }
 
         async fn penalize(&self, key: &RateKey, retry_after: Duration) {
             let limit = self.config.resolve(&key.provider);
-            if limit.is_unlimited() {
+            if limit.is_unlimited() || limit.has_zero_limit() {
                 return;
             }
-            let mut conn = match self.connection().await {
+            let mut connection = match self.connection().await {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("warning: redis penalize skipped, connection failed ({e})");
                     return;
                 }
             };
-            let until = now_ms() + retry_after.as_millis() as u64;
-            for kind in ["rpm", "tpm"] {
+            let penalty_deadline_ms = current_timestamp_ms() + retry_after.as_millis() as u64;
+            for bucket_dimension in ["rpm", "tpm"] {
                 let _: Result<i64, _> = self
                     .penalty_script
-                    .key(Self::redis_key(kind, key))
-                    .arg(until)
+                    .key(Self::redis_key(bucket_dimension, key))
+                    .arg(penalty_deadline_ms)
                     .arg(KEY_TTL_MS)
-                    .invoke_async(&mut conn)
+                    .invoke_async(&mut connection)
                     .await;
             }
         }
     }
 
-    fn now_ms() -> u64 {
+    fn current_timestamp_ms() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -995,6 +1091,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn zero_bucket_rejects_with_finite_wait_without_panicking() {
+        let now = Instant::now();
+        let bucket = TokenBucket::from_per_minute(0.0, now);
+        assert_eq!(
+            bucket.check(1.0, now),
+            Err(ZERO_LIMIT_RETRY_AFTER),
+            "zero refill must be a finite policy rejection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn penalize_backs_off_globally() {
         let now = Instant::now();
         let mut b = TokenBucket::from_per_minute(600.0, now); // plenty of tokens
@@ -1115,6 +1222,70 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn inmemory_zero_rpm_or_tpm_rejects_without_partial_debit() {
+        for limit in [
+            ProviderLimit {
+                rpm: Some(0),
+                tpm: Some(100),
+            },
+            ProviderLimit {
+                rpm: Some(100),
+                tpm: Some(0),
+            },
+        ] {
+            for config in [
+                RateLimitConfig {
+                    global: limit,
+                    per_provider: HashMap::new(),
+                },
+                RateLimitConfig {
+                    global: ProviderLimit {
+                        rpm: Some(100),
+                        tpm: Some(100),
+                    },
+                    per_provider: HashMap::from([(String::from("openai"), limit)]),
+                },
+            ] {
+                let limiter = InMemoryRateLimiter::new(config);
+                let key = RateKey::provider("openai");
+
+                for _ in 0..100 {
+                    let error = limiter.acquire(&key, 1).await.unwrap_err();
+                    assert_eq!(error.0, ZERO_LIMIT_RETRY_AFTER);
+                }
+                assert!(
+                    limiter.buckets.lock().await.is_empty(),
+                    "zero limit must reject before creating or charging buckets"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    async fn redis_zero_limit_rejects_before_connecting_or_debiting() {
+        let loopback_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let loopback_address = loopback_listener.local_addr().unwrap();
+        let redis_rate_limiter = RedisRateLimiter::new(
+            &format!("redis://{loopback_address}"),
+            RateLimitConfig::with_global(Some(100), Some(0)),
+        )
+        .expect("valid Redis URL");
+        let acquisition_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            redis_rate_limiter.acquire(&RateKey::provider("test-provider"), 1),
+        )
+        .await
+        .expect("zero limit must reject without waiting for Redis");
+        assert_eq!(acquisition_result.unwrap_err().0, ZERO_LIMIT_RETRY_AFTER);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), loopback_listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn inmemory_penalize_denies_until_window_clears() {
         let cfg = RateLimitConfig {
             global: ProviderLimit {
@@ -1150,6 +1321,38 @@ mod tests {
         assert!(limiter.acquire(&openai, 1).await.is_ok());
         assert!(limiter.acquire(&openai, 1).await.is_err()); // openai exhausted
         assert!(limiter.acquire(&anthropic, 1).await.is_ok()); // anthropic independent
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires an isolated Redis at LLMSHIM_REDIS_URL"]
+    async fn redis_oversized_tpm_rejection_does_not_debit_rpm() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL")
+            .expect("the ignored integration test requires LLMSHIM_REDIS_URL");
+        let unique_provider = format!(
+            "atomic-rate-debits-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        );
+        let limiter =
+            RedisRateLimiter::new(&redis_url, RateLimitConfig::with_global(Some(1), Some(10)))
+                .expect("valid Redis URL");
+        let key = RateKey::provider(unique_provider);
+
+        assert!(
+            limiter.acquire(&key, 11).await.is_err(),
+            "request exceeding TPM must be rejected"
+        );
+        assert!(
+            limiter.acquire(&key, 1).await.is_ok(),
+            "rejected oversized work must not consume shared RPM capacity"
+        );
+        assert!(
+            limiter.acquire(&key, 1).await.is_err(),
+            "the admitted request consumes the configured RPM capacity"
+        );
     }
 
     // --- Backpressure: concurrency cap + queue timeout ----------------------

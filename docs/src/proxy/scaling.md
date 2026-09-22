@@ -96,9 +96,9 @@ not yet provide attempt-exact quotas during those flows.
 For an authenticated gateway identity, an omitted `rpm` or `tpm` field means
 that dimension is unlimited. An explicit `0` means that dimension admits no
 requests; the gateway rejects before dispatch and does not consume the other
-tenant bucket. This tenant policy is separate from the global provider rate
-limiter, whose configured zero values retain its existing provider-level
-behavior.
+tenant bucket. The same deny-all behavior applies to global and per-provider
+rate-limit values: an explicit zero returns `429` before dispatch, while an
+omitted value remains unlimited.
 
 ## Provider health
 
