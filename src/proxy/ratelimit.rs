@@ -855,13 +855,43 @@ fn estimate_native_attempt_tokens(
     }
     .unwrap_or_default();
     let default_output = omitted_native_output_budget(provider, model, native_body);
+    let output_candidate_count = native_output_candidate_count(wire, native_body);
     prompt_tokens
         .saturating_add(
             explicit_output
                 .unwrap_or(default_output)
-                .max(reasoning_output),
+                .max(reasoning_output)
+                .saturating_mul(output_candidate_count),
         )
         .clamp(1, u32::MAX as u64) as u32
+}
+
+fn native_output_candidate_count(
+    wire: crate::reasoning::WireFormat,
+    native_body: &serde_json::Value,
+) -> u64 {
+    let candidate_controls: &[Option<&serde_json::Value>] = match wire {
+        crate::reasoning::WireFormat::OpenAiChat => &[
+            native_body.get("n"),
+            native_body.get("best_of"),
+            native_body.get("bestOf"),
+        ],
+        crate::reasoning::WireFormat::GoogleGenerateContent => &[
+            native_body.pointer("/generationConfig/candidateCount"),
+            native_body.pointer("/generationConfig/candidate_count"),
+        ],
+        crate::reasoning::WireFormat::AnthropicMessages
+        | crate::reasoning::WireFormat::OpenAiResponses => &[],
+    };
+
+    candidate_controls
+        .iter()
+        .flatten()
+        .map(|value| value.as_u64().filter(|count| *count > 0))
+        .try_fold(1u64, |maximum_candidate_count, count| {
+            count.map(|count| maximum_candidate_count.max(count))
+        })
+        .unwrap_or(u64::MAX)
 }
 
 fn catalog_output_budget(provider: &str, model: &str) -> Option<u64> {
@@ -1887,6 +1917,103 @@ mod tests {
         assert!(openai >= 7_000);
         assert!(anthropic >= 6_000);
         assert!(gemini >= 5_000);
+    }
+
+    #[test]
+    fn native_attempt_estimate_counts_final_wire_output_candidates() {
+        let openai_body = serde_json::json!({
+            "model": "served",
+            "messages": [],
+            "max_tokens": 100,
+            "n": 2,
+            "best_of": 3,
+        });
+        let openai_prompt_tokens = serde_json::to_string(&openai_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "vllm",
+                "served",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &openai_body,
+            ),
+            openai_prompt_tokens.saturating_add(300) as u32,
+        );
+
+        let gemini_body = serde_json::json!({
+            "contents": [],
+            "generationConfig": {"maxOutputTokens": 100, "candidateCount": 2},
+        });
+        let gemini_prompt_tokens = serde_json::to_string(&gemini_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "gemini",
+                "served",
+                crate::reasoning::WireFormat::GoogleGenerateContent,
+                &gemini_body,
+            ),
+            gemini_prompt_tokens.saturating_add(200) as u32,
+        );
+    }
+
+    #[test]
+    fn native_attempt_candidate_controls_fail_closed_without_walking_tool_schemas() {
+        for candidate_control in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("2"),
+            serde_json::json!(true),
+        ] {
+            let body = serde_json::json!({
+                "model": "served",
+                "messages": [],
+                "max_tokens": 1,
+                "n": candidate_control,
+            });
+            assert_eq!(
+                estimate_native_attempt_tokens(
+                    "vllm",
+                    "served",
+                    crate::reasoning::WireFormat::OpenAiChat,
+                    &body,
+                ),
+                u32::MAX,
+            );
+        }
+
+        let overflow_body = serde_json::json!({
+            "model": "served",
+            "messages": [],
+            "max_tokens": 2,
+            "n": u64::MAX,
+        });
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "vllm",
+                "served",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &overflow_body,
+            ),
+            u32::MAX,
+        );
+
+        let tool_schema_body = serde_json::json!({
+            "model": "served",
+            "messages": [],
+            "max_tokens": 2,
+            "tools": [{"function": {"parameters": {"properties": {"n": {"default": 99}}}}}],
+        });
+        let tool_schema_prompt_tokens =
+            serde_json::to_string(&tool_schema_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "vllm",
+                "served",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &tool_schema_body,
+            ),
+            tool_schema_prompt_tokens.saturating_add(2) as u32,
+        );
     }
 
     #[test]
