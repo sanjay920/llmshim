@@ -416,93 +416,122 @@ mod redis_impl {
 
     /// Atomically checks the configured RPM and TPM buckets in one Redis Lua
     /// invocation. Each bucket stores `tokens`, last refill `ts` (ms), and a
-    /// `penalty` deadline (ms). Returns `{allowed, wait_ms}`.
+    /// `penalty` deadline (ms). Returns `{request_admitted, retry_after_ms}`.
     const RATE_LIMIT_LUA: &str = r#"
-        local now = tonumber(ARGV[1])
-        local ttl = tonumber(ARGV[2])
+        local current_timestamp_ms = tonumber(ARGV[1])
+        local key_ttl_ms = tonumber(ARGV[2])
 
         local rpm_enabled = tonumber(ARGV[3]) == 1
-        local rpm_cap = tonumber(ARGV[4])
-        local rpm_refill = tonumber(ARGV[5])
-        local rpm_want = tonumber(ARGV[6])
+        local rpm_capacity = tonumber(ARGV[4])
+        local rpm_refill_per_second = tonumber(ARGV[5])
+        local rpm_required_tokens = tonumber(ARGV[6])
 
         local tpm_enabled = tonumber(ARGV[7]) == 1
-        local tpm_cap = tonumber(ARGV[8])
-        local tpm_refill = tonumber(ARGV[9])
-        local tpm_want = tonumber(ARGV[10])
+        local tpm_capacity = tonumber(ARGV[8])
+        local tpm_refill_per_second = tonumber(ARGV[9])
+        local tpm_required_tokens = tonumber(ARGV[10])
 
-        local function load_bucket(key, cap, refill)
-            local h = redis.call('HMGET', key, 'tokens', 'ts', 'penalty')
-            local tokens = tonumber(h[1])
-            local ts = tonumber(h[2])
-            local penalty = tonumber(h[3]) or 0
-            if tokens == nil then tokens = cap end
-            if ts == nil then ts = now end
+        local function load_bucket(bucket_key, capacity, refill_per_second)
+            local stored_bucket_values = redis.call('HMGET', bucket_key, 'tokens', 'ts', 'penalty')
+            local token_balance = tonumber(stored_bucket_values[1])
+            local last_refill_timestamp_ms = tonumber(stored_bucket_values[2])
+            local penalty_deadline_ms = tonumber(stored_bucket_values[3]) or 0
+            if token_balance == nil then token_balance = capacity end
+            if last_refill_timestamp_ms == nil then last_refill_timestamp_ms = current_timestamp_ms end
 
-            local elapsed = now - ts
-            if elapsed < 0 then elapsed = 0 end
-            tokens = math.min(cap, tokens + (elapsed / 1000.0) * refill)
-            return tokens, now, penalty
+            local elapsed_ms = current_timestamp_ms - last_refill_timestamp_ms
+            if elapsed_ms < 0 then elapsed_ms = 0 end
+            token_balance = math.min(
+                capacity,
+                token_balance + (elapsed_ms / 1000.0) * refill_per_second
+            )
+            return token_balance, current_timestamp_ms, penalty_deadline_ms
         end
 
-        local function wait_for(tokens, penalty, refill, want)
-            if penalty > now then
-                return penalty - now
+        local function retry_after_ms(token_balance, penalty_deadline_ms, refill_per_second, required_tokens)
+            if penalty_deadline_ms > current_timestamp_ms then
+                return penalty_deadline_ms - current_timestamp_ms
             end
-            if tokens >= want then
+            if token_balance >= required_tokens then
                 return nil
             end
-            return math.ceil((want - tokens) / refill * 1000.0)
+            return math.ceil((required_tokens - token_balance) / refill_per_second * 1000.0)
         end
 
-        local rpm_tokens, rpm_ts, rpm_penalty
+        local rpm_token_balance, rpm_last_refill_timestamp_ms, rpm_penalty_deadline_ms
         if rpm_enabled then
-            rpm_tokens, rpm_ts, rpm_penalty = load_bucket(KEYS[1], rpm_cap, rpm_refill)
+            rpm_token_balance, rpm_last_refill_timestamp_ms, rpm_penalty_deadline_ms = load_bucket(
+                KEYS[1], rpm_capacity, rpm_refill_per_second
+            )
         end
 
-        local tpm_tokens, tpm_ts, tpm_penalty
+        local tpm_token_balance, tpm_last_refill_timestamp_ms, tpm_penalty_deadline_ms
         if tpm_enabled then
-            tpm_tokens, tpm_ts, tpm_penalty = load_bucket(KEYS[2], tpm_cap, tpm_refill)
+            tpm_token_balance, tpm_last_refill_timestamp_ms, tpm_penalty_deadline_ms = load_bucket(
+                KEYS[2], tpm_capacity, tpm_refill_per_second
+            )
         end
 
-        local allowed = 1
-        local wait = 0
+        local request_admitted = 1
+        local maximum_retry_after_ms = 0
         if rpm_enabled then
-            local rpm_wait = wait_for(rpm_tokens, rpm_penalty, rpm_refill, rpm_want)
-            if rpm_wait ~= nil then
-                allowed = 0
-                wait = math.max(wait, rpm_wait)
+            local rpm_retry_after_ms = retry_after_ms(
+                rpm_token_balance,
+                rpm_penalty_deadline_ms,
+                rpm_refill_per_second,
+                rpm_required_tokens
+            )
+            if rpm_retry_after_ms ~= nil then
+                request_admitted = 0
+                maximum_retry_after_ms = math.max(maximum_retry_after_ms, rpm_retry_after_ms)
             end
         end
         if tpm_enabled then
-            local tpm_wait = wait_for(tpm_tokens, tpm_penalty, tpm_refill, tpm_want)
-            if tpm_wait ~= nil then
-                allowed = 0
-                wait = math.max(wait, tpm_wait)
+            local tpm_retry_after_ms = retry_after_ms(
+                tpm_token_balance,
+                tpm_penalty_deadline_ms,
+                tpm_refill_per_second,
+                tpm_required_tokens
+            )
+            if tpm_retry_after_ms ~= nil then
+                request_admitted = 0
+                maximum_retry_after_ms = math.max(maximum_retry_after_ms, tpm_retry_after_ms)
             end
         end
 
-        if allowed == 1 then
-            if rpm_enabled then rpm_tokens = rpm_tokens - rpm_want end
-            if tpm_enabled then tpm_tokens = tpm_tokens - tpm_want end
+        if request_admitted == 1 then
+            if rpm_enabled then rpm_token_balance = rpm_token_balance - rpm_required_tokens end
+            if tpm_enabled then tpm_token_balance = tpm_token_balance - tpm_required_tokens end
         end
 
         if rpm_enabled then
-            redis.call('HSET', KEYS[1], 'tokens', rpm_tokens, 'ts', rpm_ts, 'penalty', rpm_penalty)
-            redis.call('PEXPIRE', KEYS[1], ttl)
+            redis.call(
+                'HSET',
+                KEYS[1],
+                'tokens', rpm_token_balance,
+                'ts', rpm_last_refill_timestamp_ms,
+                'penalty', rpm_penalty_deadline_ms
+            )
+            redis.call('PEXPIRE', KEYS[1], key_ttl_ms)
         end
         if tpm_enabled then
-            redis.call('HSET', KEYS[2], 'tokens', tpm_tokens, 'ts', tpm_ts, 'penalty', tpm_penalty)
-            redis.call('PEXPIRE', KEYS[2], ttl)
+            redis.call(
+                'HSET',
+                KEYS[2],
+                'tokens', tpm_token_balance,
+                'ts', tpm_last_refill_timestamp_ms,
+                'penalty', tpm_penalty_deadline_ms
+            )
+            redis.call('PEXPIRE', KEYS[2], key_ttl_ms)
         end
-        return {allowed, wait}
+        return {request_admitted, maximum_retry_after_ms}
     "#;
 
     const PENALTY_LUA: &str = r#"
-        local until_ms = tonumber(ARGV[1])
-        local ttl = tonumber(ARGV[2])
-        redis.call('HSET', KEYS[1], 'penalty', until_ms, 'tokens', 0)
-        redis.call('PEXPIRE', KEYS[1], ttl)
+        local penalty_deadline_ms = tonumber(ARGV[1])
+        local key_ttl_ms = tonumber(ARGV[2])
+        redis.call('HSET', KEYS[1], 'penalty', penalty_deadline_ms, 'tokens', 0)
+        redis.call('PEXPIRE', KEYS[1], key_ttl_ms)
         return 1
     "#;
 
@@ -518,7 +547,7 @@ mod redis_impl {
     /// [`crate::client`] still protects against provider 429s.
     pub struct RedisRateLimiter {
         client: redis::Client,
-        conn: OnceCell<ConnectionManager>,
+        connection_manager: OnceCell<ConnectionManager>,
         config: RateLimitConfig,
         rate_limit_script: redis::Script,
         penalty_script: redis::Script,
@@ -531,7 +560,7 @@ mod redis_impl {
         pub fn new(url: &str, config: RateLimitConfig) -> redis::RedisResult<Self> {
             Ok(Self {
                 client: redis::Client::open(url)?,
-                conn: OnceCell::new(),
+                connection_manager: OnceCell::new(),
                 config,
                 rate_limit_script: redis::Script::new(RATE_LIMIT_LUA),
                 penalty_script: redis::Script::new(PENALTY_LUA),
@@ -539,14 +568,14 @@ mod redis_impl {
         }
 
         async fn connection(&self) -> redis::RedisResult<ConnectionManager> {
-            self.conn
+            self.connection_manager
                 .get_or_try_init(|| ConnectionManager::new(self.client.clone()))
                 .await
                 .cloned()
         }
 
-        fn redis_key(kind: &str, key: &RateKey) -> String {
-            format!("llmshim:rl:{}:{}", key.as_str(), kind)
+        fn redis_key(bucket_dimension: &str, rate_key: &RateKey) -> String {
+            format!("llmshim:rl:{}:{}", rate_key.as_str(), bucket_dimension)
         }
 
         /// Atomically check and debit the configured RPM and TPM dimensions.
@@ -554,8 +583,8 @@ mod redis_impl {
         /// failure (the caller preserves the documented fail-open behavior).
         async fn check_and_debit(
             &self,
-            conn: &mut ConnectionManager,
-            key: &RateKey,
+            connection: &mut ConnectionManager,
+            rate_key: &RateKey,
             rpm: Option<u32>,
             tpm: Option<u32>,
             tpm_permits: u32,
@@ -563,33 +592,33 @@ mod redis_impl {
             let rpm_enabled = if rpm.is_some() { 1 } else { 0 };
             let rpm_per_minute = rpm.unwrap_or(0) as f64;
             let rpm_capacity = rpm_per_minute.max(1.0);
-            let rpm_refill = (rpm_per_minute / 60.0).max(f64::MIN_POSITIVE);
+            let rpm_refill_per_second = (rpm_per_minute / 60.0).max(f64::MIN_POSITIVE);
 
             let tpm_enabled = if tpm.is_some() { 1 } else { 0 };
             let tpm_per_minute = tpm.unwrap_or(0) as f64;
             let tpm_capacity = tpm_per_minute.max(1.0);
-            let tpm_refill = (tpm_per_minute / 60.0).max(f64::MIN_POSITIVE);
-            let now_ms = now_ms();
-            let (allowed, wait_ms): (i64, i64) = self
+            let tpm_refill_per_second = (tpm_per_minute / 60.0).max(f64::MIN_POSITIVE);
+            let current_timestamp_ms = current_timestamp_ms();
+            let (request_admitted, retry_after_ms): (i64, i64) = self
                 .rate_limit_script
-                .key(Self::redis_key("rpm", key))
-                .key(Self::redis_key("tpm", key))
-                .arg(now_ms)
+                .key(Self::redis_key("rpm", rate_key))
+                .key(Self::redis_key("tpm", rate_key))
+                .arg(current_timestamp_ms)
                 .arg(KEY_TTL_MS)
                 .arg(rpm_enabled)
                 .arg(rpm_capacity)
-                .arg(rpm_refill)
+                .arg(rpm_refill_per_second)
                 .arg(1.0)
                 .arg(tpm_enabled)
                 .arg(tpm_capacity)
-                .arg(tpm_refill)
+                .arg(tpm_refill_per_second)
                 .arg(tpm_permits.max(1) as f64)
-                .invoke_async(conn)
+                .invoke_async(connection)
                 .await?;
-            if allowed == 1 {
+            if request_admitted == 1 {
                 Ok(None)
             } else {
-                Ok(Some(Duration::from_millis(wait_ms.max(0) as u64)))
+                Ok(Some(Duration::from_millis(retry_after_ms.max(0) as u64)))
             }
         }
     }
@@ -604,7 +633,7 @@ mod redis_impl {
             if limit.has_zero_limit() {
                 return Err(RetryAfter(ZERO_LIMIT_RETRY_AFTER));
             }
-            let mut conn = match self.connection().await {
+            let mut connection = match self.connection().await {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("warning: redis rate limiter unavailable ({e}); failing open");
@@ -613,7 +642,7 @@ mod redis_impl {
             };
 
             match self
-                .check_and_debit(&mut conn, key, limit.rpm, limit.tpm, permits)
+                .check_and_debit(&mut connection, key, limit.rpm, limit.tpm, permits)
                 .await
             {
                 Ok(Some(wait)) => Err(RetryAfter(wait)),
@@ -630,27 +659,27 @@ mod redis_impl {
             if limit.is_unlimited() || limit.has_zero_limit() {
                 return;
             }
-            let mut conn = match self.connection().await {
+            let mut connection = match self.connection().await {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("warning: redis penalize skipped, connection failed ({e})");
                     return;
                 }
             };
-            let until = now_ms() + retry_after.as_millis() as u64;
-            for kind in ["rpm", "tpm"] {
+            let penalty_deadline_ms = current_timestamp_ms() + retry_after.as_millis() as u64;
+            for bucket_dimension in ["rpm", "tpm"] {
                 let _: Result<i64, _> = self
                     .penalty_script
-                    .key(Self::redis_key(kind, key))
-                    .arg(until)
+                    .key(Self::redis_key(bucket_dimension, key))
+                    .arg(penalty_deadline_ms)
                     .arg(KEY_TTL_MS)
-                    .invoke_async(&mut conn)
+                    .invoke_async(&mut connection)
                     .await;
             }
         }
     }
 
-    fn now_ms() -> u64 {
+    fn current_timestamp_ms() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
