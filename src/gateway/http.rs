@@ -56,10 +56,15 @@ impl RealDispatch {
     fn map_err(err: ShimError) -> DispatchError {
         match err {
             ShimError::ProviderError {
-                status: 429, body, ..
+                status: 429,
+                retry_after,
+                ..
             } => DispatchError {
-                message: body,
-                retry_after: Some(penalty_duration()),
+                message: format!(
+                    "llmshim-rate-limit:{}",
+                    retry_after.unwrap_or_else(penalty_duration).as_millis()
+                ),
+                retry_after: Some(retry_after.unwrap_or_else(penalty_duration)),
             },
             other => DispatchError::new(other.to_string()),
         }
@@ -74,6 +79,22 @@ impl Dispatch for RealDispatch {
             .map_err(Self::map_err)
     }
 
+    async fn dispatch_with_policy(
+        &self,
+        _provider: &str,
+        payload: Value,
+        policy_context: crate::policy::DispatchPolicyContext,
+    ) -> Result<Value, DispatchError> {
+        crate::completion_with_logger_and_policy(
+            self.router.as_ref(),
+            &payload,
+            self.logger.as_ref(),
+            &policy_context,
+        )
+        .await
+        .map_err(Self::map_err)
+    }
+
     async fn dispatch_stream(
         &self,
         _provider: &str,
@@ -83,6 +104,19 @@ impl Dispatch for RealDispatch {
             .await
             .map_err(Self::map_err)?;
         // Map raw ShimError chunks → GatewayError so the channel type is stable.
+        let mapped = upstream.map(|item| item.map_err(|e| GatewayError::Upstream(e.to_string())));
+        Ok(Box::pin(mapped))
+    }
+
+    async fn dispatch_stream_with_policy(
+        &self,
+        _provider: &str,
+        payload: Value,
+        policy_context: crate::policy::DispatchPolicyContext,
+    ) -> Result<ChunkStream, DispatchError> {
+        let upstream = crate::stream_with_policy(self.router.as_ref(), &payload, &policy_context)
+            .await
+            .map_err(Self::map_err)?;
         let mapped = upstream.map(|item| item.map_err(|e| GatewayError::Upstream(e.to_string())));
         Ok(Box::pin(mapped))
     }
@@ -101,7 +135,7 @@ pub struct GatewayState {
     router: Arc<Router>,
     backend: Backend,
     keystore: crate::gateway::auth::KeyStore,
-    quota: crate::gateway::quota::TenantQuota,
+    attempt_coordinator: Arc<crate::gateway::attempt::AttemptCoordinator>,
     /// Per-identity USD cap, checked before dispatch and charged after.
     spend: crate::gateway::quota::SpendCap,
     idempotency: crate::gateway::idempotency::IdempotencyCache,
@@ -124,11 +158,16 @@ impl GatewayState {
             logger,
         });
         let scheduler = Scheduler::new(config.clone(), build_limiter(), dispatch);
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local(
+            crate::proxy::ratelimit::RateLimitConfig::from_env(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        );
         Arc::new(Self {
             router,
             backend: Backend::Local(scheduler),
             keystore: crate::gateway::auth::KeyStore::from_env(),
-            quota: crate::gateway::quota::TenantQuota::new(),
+            attempt_coordinator,
             spend: crate::gateway::quota::SpendCap::in_memory(),
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(
                 std::time::Duration::from_secs(idem_ttl_secs()),
@@ -154,11 +193,19 @@ impl GatewayState {
             router: router.clone(),
             logger,
         });
-        let gateway = crate::gateway::distributed::DistributedGateway::connect(
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::redis(
+            redis_url,
+            crate::proxy::ratelimit::RateLimitConfig::from_env(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        )
+        .map_err(|error| error.to_string())?;
+        let gateway = crate::gateway::distributed::DistributedGateway::connect_with_coordinator(
             redis_url,
             dispatch,
             build_limiter(),
             config.clone(),
+            attempt_coordinator.clone(),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -176,7 +223,7 @@ impl GatewayState {
             router,
             backend: Backend::Distributed(gateway),
             keystore: crate::gateway::auth::KeyStore::from_env(),
-            quota: crate::gateway::quota::TenantQuota::new(),
+            attempt_coordinator,
             spend,
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(
                 std::time::Duration::from_secs(idem_ttl_secs()),
@@ -186,22 +233,37 @@ impl GatewayState {
         }))
     }
 
-    async fn submit(&self, req: GatewayRequest) -> Result<Value, GatewayError> {
+    async fn submit(
+        &self,
+        req: GatewayRequest,
+        policy_scope: crate::gateway::attempt::TrustedPolicyScope,
+    ) -> Result<Value, GatewayError> {
         match &self.backend {
-            Backend::Local(scheduler) => scheduler.submit(req).await,
+            Backend::Local(scheduler) => {
+                scheduler
+                    .submit_with_policy(req, self.attempt_coordinator.context(policy_scope))
+                    .await
+            }
             #[cfg(feature = "redis-coordination")]
-            Backend::Distributed(gateway) => gateway.submit(req).await,
+            Backend::Distributed(gateway) => gateway.submit_with_policy(req, policy_scope).await,
         }
     }
 
     async fn submit_stream(
         &self,
         req: GatewayRequest,
+        policy_scope: crate::gateway::attempt::TrustedPolicyScope,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
         match &self.backend {
-            Backend::Local(scheduler) => scheduler.submit_stream(req).await,
+            Backend::Local(scheduler) => {
+                scheduler
+                    .submit_stream_with_policy(req, self.attempt_coordinator.context(policy_scope))
+                    .await
+            }
             #[cfg(feature = "redis-coordination")]
-            Backend::Distributed(gateway) => gateway.submit_stream(req).await,
+            Backend::Distributed(gateway) => {
+                gateway.submit_stream_with_policy(req, policy_scope).await
+            }
         }
     }
 
@@ -300,30 +362,6 @@ impl GatewayState {
             "providers": providers,
             "lanes": lanes,
         })
-    }
-
-    /// Enforce the caller's per-tenant quota (no-op in open/dev mode). Over
-    /// quota → 429 + `Retry-After`.
-    fn enforce_quota(
-        &self,
-        identity: &crate::gateway::auth::Identity,
-        provider: &str,
-        permits: u32,
-    ) -> Result<(), ApiError> {
-        if let Err(retry) = self.quota.check(
-            &identity.tenant,
-            provider,
-            identity.rpm,
-            identity.tpm,
-            permits,
-        ) {
-            crate::gateway::metrics::incr(
-                crate::gateway::metrics::REJECTED,
-                &[("provider", provider), ("reason", "tenant_quota")],
-            );
-            return Err(ApiError::RateLimited(retry));
-        }
-        Ok(())
     }
 }
 
@@ -460,6 +498,18 @@ fn gateway_err_to_api(state: &GatewayState, err: GatewayError) -> ApiError {
             body: "gateway shutting down".to_string(),
             retry_after: None,
         }),
+        GatewayError::Upstream(message) if message.starts_with("llmshim-rate-limit:") => message
+            .strip_prefix("llmshim-rate-limit:")
+            .and_then(|milliseconds| milliseconds.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .map(ApiError::RateLimited)
+            .unwrap_or_else(|| {
+                ApiError::from(ShimError::ProviderError {
+                    status: 502,
+                    body: "invalid internal rate-limit response".into(),
+                    retry_after: None,
+                })
+            }),
         GatewayError::Upstream(message) => ApiError::from(ShimError::ProviderError {
             status: 502,
             body: message,
@@ -487,10 +537,10 @@ async fn chat(
     let (provider_name, budget_model, gw, identified_caller) =
         build_request(&state, &headers, &req)?;
     let identity = &identified_caller.identity;
-    state.enforce_quota(identity, &provider_name, gw.permits)?;
     state
         .enforce_budget(identity, &provider_name, &budget_model)
         .await?;
+    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(identity);
 
     let idempotency_context = idem_key.as_ref().map(|client_key| {
         crate::gateway::idempotency::IdempotencyContext::new(
@@ -520,7 +570,7 @@ async fn chat(
     }
 
     let timer = RequestTimer::start();
-    match state.submit(gw).await {
+    match state.submit(gw, policy_scope).await {
         Ok(resp) => {
             if let Some(context) = &idempotency_context {
                 state.idem_store(context, &resp).await;
@@ -556,19 +606,17 @@ async fn chat_stream_inner(
             Err(e) => return e.into_response(),
         };
     let identity = identified_caller.identity;
-    if let Err(e) = state.enforce_quota(&identity, &provider_name, gw.permits) {
-        return e.into_response();
-    }
     if let Err(e) = state
         .enforce_budget(&identity, &provider_name, &budget_model)
         .await
     {
         return e.into_response();
     }
+    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
 
     // Admission (queue + rate) happens up front so a rejection is a proper
     // 429/503 before the SSE response begins, not an SSE error event.
-    let mut rx = match state.submit_stream(gw).await {
+    let mut rx = match state.submit_stream(gw, policy_scope).await {
         Ok(rx) => rx,
         Err(err) => return gateway_err_to_api(&state, err).into_response(),
     };
@@ -822,11 +870,16 @@ mod native_tests {
             ("test-key".into(), identity.clone()),
             ("second-key".into(), identity),
         ]);
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local(
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        );
         Arc::new(GatewayState {
             router,
             backend: Backend::Local(scheduler),
             keystore: crate::gateway::auth::KeyStore::enforced(keys),
-            quota: crate::gateway::quota::TenantQuota::new(),
+            attempt_coordinator,
             spend: crate::gateway::quota::SpendCap::in_memory(),
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
                 30,
@@ -889,6 +942,7 @@ mod native_tests {
         router: Arc<Router>,
         gateway: Arc<crate::gateway::distributed::DistributedGateway>,
         config: &GatewayConfig,
+        attempt_coordinator: Arc<crate::gateway::attempt::AttemptCoordinator>,
         tenant: &str,
     ) -> Arc<GatewayState> {
         let identity = crate::gateway::auth::Identity {
@@ -906,7 +960,7 @@ mod native_tests {
             keystore: crate::gateway::auth::KeyStore::enforced(std::collections::HashMap::from([
                 ("reassigned-key".into(), identity),
             ])),
-            quota: crate::gateway::quota::TenantQuota::new(),
+            attempt_coordinator,
             spend: crate::gateway::quota::SpendCap::with_store(gateway),
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
                 30,
@@ -937,13 +991,21 @@ mod native_tests {
         let limiter = Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
             crate::proxy::ratelimit::RateLimitConfig::default(),
         ));
-        let gateway = crate::gateway::distributed::DistributedGateway::connect(
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::redis(
+            &redis_url,
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        )
+        .unwrap();
+        let gateway = crate::gateway::distributed::DistributedGateway::connect_with_coordinator(
             &redis_url,
             Arc::new(CountingDispatch {
                 calls: call_count.clone(),
             }),
             limiter,
             config.clone(),
+            attempt_coordinator.clone(),
         )
         .await
         .unwrap();
@@ -953,10 +1015,15 @@ mod native_tests {
             router.clone(),
             gateway.clone(),
             &config,
+            attempt_coordinator.clone(),
             "tenant-a",
         ));
         let tenant_b_application = app(distributed_state_for_tenant(
-            router, gateway, &config, "tenant-b",
+            router,
+            gateway,
+            &config,
+            attempt_coordinator,
+            "tenant-b",
         ));
         let model = format!("{provider_name}/test");
         let idempotency_key = format!("reassignment-{}", uuid::Uuid::new_v4());
@@ -1132,6 +1199,99 @@ mod native_tests {
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "60");
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn tenant_rpm_one_allows_exactly_one_real_send() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_status(500)
+            .with_body("retryable")
+            .expect(1)
+            .create_async()
+            .await;
+        let state = configured_state_with_limits(&server.url(), Some(1), None);
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::from(
+                        json!({
+                            "model": "local/test",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn forged_policy_fields_do_not_change_the_authenticated_tenant_scope() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "response",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {}
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let state = configured_state_with_limits(&server.url(), Some(1), None);
+        for (index, forged_tenant) in ["forged-a", "forged-b"].into_iter().enumerate() {
+            let response = app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-key")
+                        .body(Body::from(
+                            json!({
+                                "model": "local/test",
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "provider_config": {
+                                    "tenant": forged_tenant,
+                                    "identity": forged_tenant,
+                                    "policy_id": forged_tenant,
+                                    "rpm": 1000000,
+                                    "tpm": 1000000,
+                                    "priority": 255
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if index == 0 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+        }
         upstream.assert_async().await;
     }
 

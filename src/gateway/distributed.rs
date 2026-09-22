@@ -139,6 +139,8 @@ struct JobDescriptor {
     tier: u8,
     permits: u32,
     payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_scope: Option<crate::gateway::attempt::TrustedPolicyScope>,
     #[serde(default)]
     stream: bool,
     /// Enqueue time (epoch ms) — drives the deadline score and the queue-wait
@@ -178,6 +180,7 @@ pub struct DistributedGateway {
     conn: ConnectionManager,
     dispatch: Arc<dyn Dispatch>,
     limiter: Arc<dyn RateLimiter>,
+    attempt_coordinator: Option<Arc<crate::gateway::attempt::AttemptCoordinator>>,
     config: GatewayConfig,
     nonce: u128,
     counter: AtomicU64,
@@ -196,6 +199,33 @@ impl DistributedGateway {
         limiter: Arc<dyn RateLimiter>,
         config: GatewayConfig,
     ) -> redis::RedisResult<Arc<Self>> {
+        Self::connect_inner(redis_url, dispatch, limiter, config, None).await
+    }
+
+    pub(crate) async fn connect_with_coordinator(
+        redis_url: &str,
+        dispatch: Arc<dyn Dispatch>,
+        limiter: Arc<dyn RateLimiter>,
+        config: GatewayConfig,
+        attempt_coordinator: Arc<crate::gateway::attempt::AttemptCoordinator>,
+    ) -> redis::RedisResult<Arc<Self>> {
+        Self::connect_inner(
+            redis_url,
+            dispatch,
+            limiter,
+            config,
+            Some(attempt_coordinator),
+        )
+        .await
+    }
+
+    async fn connect_inner(
+        redis_url: &str,
+        dispatch: Arc<dyn Dispatch>,
+        limiter: Arc<dyn RateLimiter>,
+        config: GatewayConfig,
+        attempt_coordinator: Option<Arc<crate::gateway::attempt::AttemptCoordinator>>,
+    ) -> redis::RedisResult<Arc<Self>> {
         let client = redis::Client::open(redis_url)?;
         let conn = ConnectionManager::new(client.clone()).await?;
         let nonce = SystemTime::now()
@@ -207,6 +237,7 @@ impl DistributedGateway {
             conn,
             dispatch,
             limiter,
+            attempt_coordinator,
             config,
             nonce,
             counter: AtomicU64::new(0),
@@ -329,7 +360,20 @@ impl DistributedGateway {
 
     /// Origin side (unary): enqueue by priority and await the result over the bus.
     pub async fn submit(&self, req: GatewayRequest) -> Result<Value, GatewayError> {
-        let desc = self.descriptor(&req, false);
+        let desc = self.descriptor(&req, false, None);
+        self.submit_descriptor(desc).await
+    }
+
+    pub(crate) async fn submit_with_policy(
+        &self,
+        req: GatewayRequest,
+        policy_scope: crate::gateway::attempt::TrustedPolicyScope,
+    ) -> Result<Value, GatewayError> {
+        let desc = self.descriptor(&req, false, Some(policy_scope));
+        self.submit_descriptor(desc).await
+    }
+
+    async fn submit_descriptor(&self, desc: JobDescriptor) -> Result<Value, GatewayError> {
         let channel = response_channel(&desc.id);
 
         // Subscribe BEFORE enqueue so we can't miss the (fire-and-forget) publish.
@@ -372,7 +416,25 @@ impl DistributedGateway {
         &self,
         req: GatewayRequest,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
-        let desc = self.descriptor(&req, true);
+        let desc = self.descriptor(&req, true, None);
+        self.submit_stream_descriptor(req.provider, desc).await
+    }
+
+    pub(crate) async fn submit_stream_with_policy(
+        &self,
+        req: GatewayRequest,
+        policy_scope: crate::gateway::attempt::TrustedPolicyScope,
+    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
+        let provider = req.provider.clone();
+        let desc = self.descriptor(&req, true, Some(policy_scope));
+        self.submit_stream_descriptor(provider, desc).await
+    }
+
+    async fn submit_stream_descriptor(
+        &self,
+        provider: String,
+        desc: JobDescriptor,
+    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
         let channel = response_channel(&desc.id);
 
         let mut pubsub = self
@@ -389,7 +451,7 @@ impl DistributedGateway {
 
         let (chunk_tx, chunk_rx) = mpsc::channel(16);
         let request_timeout = self.config.request_timeout;
-        let key = queue_key(&req.provider);
+        let key = queue_key(&provider);
         let member = serde_json::to_string(&desc).map_err(|e| redis_err(&e))?;
         let conn = self.conn.clone();
 
@@ -437,13 +499,19 @@ impl DistributedGateway {
         Ok(chunk_rx)
     }
 
-    fn descriptor(&self, req: &GatewayRequest, stream: bool) -> JobDescriptor {
+    fn descriptor(
+        &self,
+        req: &GatewayRequest,
+        stream: bool,
+        policy_scope: Option<crate::gateway::attempt::TrustedPolicyScope>,
+    ) -> JobDescriptor {
         JobDescriptor {
             id: self.next_id(),
             provider: req.provider.clone(),
             tier: req.tier,
             permits: req.permits.max(1),
             payload: req.payload.clone(),
+            policy_scope,
             stream,
             enqueue_ms: now_ms(),
         }
@@ -571,11 +639,21 @@ impl DistributedGateway {
                 continue;
             }
 
-            match self.limiter.acquire(&rate_key, desc.permits).await {
+            let policy_gated = desc.policy_scope.is_some();
+            let rate_admission = if policy_gated {
+                Ok(())
+            } else {
+                self.limiter.acquire(&rate_key, desc.permits).await
+            };
+            match rate_admission {
                 Ok(()) => {
-                    let permit = match sem.clone().acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => break,
+                    let permit = if policy_gated {
+                        None
+                    } else {
+                        match sem.clone().acquire_owned().await {
+                            Ok(permit) => Some(permit),
+                            Err(_) => break,
+                        }
                     };
                     let me = self.clone();
                     tokio::spawn(async move {
@@ -615,8 +693,30 @@ impl DistributedGateway {
         );
         let started_at = now_ms();
 
+        let policy_context = match (&desc.policy_scope, &self.attempt_coordinator) {
+            (Some(scope), Some(coordinator)) => Some(coordinator.context(scope.clone())),
+            (Some(_), None) => {
+                self.publish(
+                    &channel,
+                    &BusMessage::Error("trusted attempt coordinator unavailable".into()),
+                )
+                .await;
+                self.ack_lease(&provider, &member).await;
+                return;
+            }
+            (None, _) => None,
+        };
+
         if desc.stream {
-            match self.dispatch.dispatch_stream(&provider, desc.payload).await {
+            let opened = match policy_context {
+                Some(context) => {
+                    self.dispatch
+                        .dispatch_stream_with_policy(&provider, desc.payload, context)
+                        .await
+                }
+                None => self.dispatch.dispatch_stream(&provider, desc.payload).await,
+            };
+            match opened {
                 Ok(mut upstream) => {
                     metrics::incr(metrics::DISPATCHED, plabels);
                     use futures::StreamExt;
@@ -656,7 +756,15 @@ impl DistributedGateway {
                 }
             }
         } else {
-            let msg = match self.dispatch.dispatch(&provider, desc.payload).await {
+            let dispatched = match policy_context {
+                Some(context) => {
+                    self.dispatch
+                        .dispatch_with_policy(&provider, desc.payload, context)
+                        .await
+                }
+                None => self.dispatch.dispatch(&provider, desc.payload).await,
+            };
+            let msg = match dispatched {
                 Ok(value) => {
                     metrics::incr(metrics::DISPATCHED, plabels);
                     metrics::observe_ms(
@@ -836,12 +944,24 @@ mod tests {
 
     #[test]
     fn descriptor_and_bus_messages_round_trip() {
+        let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(
+            &crate::gateway::auth::Identity {
+                tenant: "server-owned".into(),
+                tier: 3,
+                rpm: Some(1),
+                tpm: Some(42),
+                budget_usd: None,
+                budget_window_secs: None,
+                budget_allow_unpriced: false,
+            },
+        );
         let desc = JobDescriptor {
             id: "abc-1".into(),
             provider: "openai".into(),
             tier: 3,
             permits: 42,
             payload: serde_json::json!({"model": "gpt-5.5"}),
+            policy_scope: Some(policy_scope),
             stream: true,
             enqueue_ms: 1_700_000_000_000,
         };
@@ -849,6 +969,9 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&desc).unwrap()).unwrap();
         assert_eq!(back.id, "abc-1");
         assert!(back.stream);
+        assert!(back.policy_scope.is_some());
+        let serialized = serde_json::to_string(&desc).unwrap();
+        assert!(!serialized.contains("server-owned"));
 
         for msg in [
             BusMessage::Unary(serde_json::json!({"a": 1})),
