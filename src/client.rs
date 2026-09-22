@@ -1383,6 +1383,10 @@ mod tests {
             parse_go_duration("9999999999999999999h"),
             Some(Duration::MAX)
         );
+        assert_eq!(
+            parse_go_duration("9999999999999999999s9999999999999999999s"),
+            Some(Duration::MAX)
+        );
 
         let headers = headers(&[("x-ratelimit-reset-tokens", "99999999999999999999s")]);
         let wait = retry_after_wait(&headers, Duration::from_secs(60)).unwrap();
@@ -1395,6 +1399,7 @@ mod tests {
         for invalid_duration in ["NaNs", "infinitys", "-1s"] {
             assert_eq!(parse_go_duration(invalid_duration), None);
         }
+        assert_eq!(parse_go_duration(&format!("{}s", "9".repeat(400))), None);
     }
 
     // --- Backoff / jitter ---------------------------------------------------
@@ -1519,6 +1524,53 @@ mod tests {
                     matches!(result, Err(ShimError::ProviderError { status: actual, .. }) if actual == status as u16)
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn extreme_provider_reset_headers_retry_without_panicking() {
+        for reset_header in [
+            "99999999999999999999s".to_owned(),
+            "9999999999999999999s9999999999999999999s".to_owned(),
+            format!("{}s", "9".repeat(400)),
+        ] {
+            let mut upstream_server = mockito::Server::new_async().await;
+            let rate_limited_response = upstream_server
+                .mock("POST", "/v1/chat")
+                .with_status(429)
+                .with_header("x-ratelimit-reset-tokens", &reset_header)
+                .with_body("rate limited")
+                .expect(1)
+                .create_async()
+                .await;
+            let successful_response = upstream_server
+                .mock("POST", "/v1/chat")
+                .with_status(200)
+                .with_body("ok")
+                .expect(1)
+                .create_async()
+                .await;
+            let client = ShimClient {
+                retry: RetryConfig {
+                    max_retries: 1,
+                    base: Duration::ZERO,
+                    cap: Duration::from_millis(10),
+                },
+                ..ShimClient::new()
+            };
+            let request = ProviderRequest {
+                url: format!("{}/v1/chat", upstream_server.url()),
+                headers: vec![],
+                body: serde_json::json!({"messages": []}),
+            };
+            let response = tokio::time::timeout(Duration::from_secs(5), client.send(&request))
+                .await
+                .expect("reset hint must remain bounded by the retry cap")
+                .expect("bounded retry must succeed");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.text().await.unwrap(), "ok");
+            rate_limited_response.assert_async().await;
+            successful_response.assert_async().await;
         }
     }
 
