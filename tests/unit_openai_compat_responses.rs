@@ -247,7 +247,7 @@ fn a_recorded_stream_folds_to_one_block_keyed_by_the_item_id_with_this_origin() 
         };
         let chunk: Value = serde_json::from_str(&chunk).unwrap();
         let delta = &chunk["choices"][0]["delta"];
-        acc.push(delta);
+        acc.push(delta).unwrap();
         content.push_str(delta["content"].as_str().unwrap_or(""));
         calls.extend(
             delta["tool_calls"]
@@ -259,7 +259,7 @@ fn a_recorded_stream_folds_to_one_block_keyed_by_the_item_id_with_this_origin() 
     }
     if let Some(chunk) = normalizer.finish().unwrap() {
         let chunk: Value = serde_json::from_str(&chunk).unwrap();
-        acc.push(&chunk["choices"][0]["delta"]);
+        acc.push(&chunk["choices"][0]["delta"]).unwrap();
         calls.extend(
             chunk["choices"][0]["delta"]["tool_calls"]
                 .as_array()
