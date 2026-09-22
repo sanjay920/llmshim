@@ -19,6 +19,8 @@
 export * from "./types.js";
 export { ensureServer, platformPackageName } from "./server.js";
 
+import { request as httpRequest } from "node:http";
+import { Readable } from "node:stream";
 import type {
   ChatRequest,
   ChatResponse,
@@ -68,9 +70,8 @@ export class LlmshimError extends Error {
 export class Client {
   /** Set only when an explicit `baseUrl` was passed at construction. */
   private readonly explicitBaseUrl: string | undefined;
-  /** Memoized auto-start resolution, shared across calls on this instance. */
-  private autoBaseUrl: Promise<string> | undefined;
   private readonly fetchImpl: FetchLike;
+  private readonly usesDefaultFetch: boolean;
   private readonly headers: Record<string, string>;
 
   constructor(options: ClientOptions = {}) {
@@ -83,19 +84,18 @@ export class Client {
     }
     // Bind to preserve `this` for the global fetch.
     this.fetchImpl = f === globalThis.fetch ? f.bind(globalThis) : f;
+    this.usesDefaultFetch = options.fetch === undefined;
     this.headers = { ...options.headers };
   }
 
   /**
    * Resolve the base URL to use for the next request: the explicit `baseUrl`
    * if one was given at construction, otherwise the bundled proxy's URL
-   * (starting it on first call). Memoized so the bundled proxy is only
-   * started once per `Client` instance.
+   * (starting or refreshing it when needed).
    */
   private resolveBaseUrl(): Promise<string> {
     if (this.explicitBaseUrl) return Promise.resolve(this.explicitBaseUrl);
-    if (!this.autoBaseUrl) this.autoBaseUrl = ensureServer();
-    return this.autoBaseUrl;
+    return ensureServer();
   }
 
   /**
@@ -143,7 +143,7 @@ export class Client {
 
   private async post(path: string, body: unknown): Promise<Response> {
     const baseUrl = await this.resolveBaseUrl();
-    return this.fetchImpl(baseUrl + path, {
+    return this.send(baseUrl + path, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -156,16 +156,58 @@ export class Client {
 
   private async get(path: string): Promise<Response> {
     const baseUrl = await this.resolveBaseUrl();
-    return this.fetchImpl(baseUrl + path, {
+    return this.send(baseUrl + path, {
       method: "GET",
       headers: { accept: "application/json", ...this.headers },
     });
+  }
+
+  private send(url: string, init: RequestInit): Promise<Response> {
+    if (!this.explicitBaseUrl && this.usesDefaultFetch) {
+      return localLoopbackFetch(url, init);
+    }
+    return this.fetchImpl(url, init);
   }
 }
 
 /** Convenience factory mirroring `new Client(options)`. */
 export function createClient(options?: ClientOptions): Client {
   return new Client(options);
+}
+
+function localLoopbackFetch(url: string, init: RequestInit): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, {
+      method: init.method,
+      headers: init.headers as Record<string, string>,
+      agent: false,
+    });
+    request.once("error", reject);
+    request.once("response", (response) => {
+      const headers = new Headers();
+      for (const [name, value] of Object.entries(response.headers)) {
+        if (Array.isArray(value)) {
+          for (const item of value) headers.append(name, item);
+        } else if (value !== undefined) {
+          headers.append(name, String(value));
+        }
+      }
+      resolve(
+        new Response(Readable.toWeb(response) as ReadableStream<Uint8Array>, {
+          status: response.statusCode ?? 500,
+          statusText: response.statusMessage,
+          headers,
+        }),
+      );
+    });
+    if (typeof init.body === "string" || init.body instanceof Uint8Array) {
+      request.end(init.body);
+    } else if (init.body === undefined || init.body === null) {
+      request.end();
+    } else {
+      request.destroy(new Error("managed requests require a string or byte body"));
+    }
+  });
 }
 
 /** Throw a {@link LlmshimError} for non-2xx responses, parsing ErrorResponse when present. */
