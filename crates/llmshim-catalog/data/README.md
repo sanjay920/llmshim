@@ -19,6 +19,8 @@ continues to win conflicts for the fields it asserts.
 - OpenRouter's Grok 4.7 identity, capabilities, limits and standard endpoint
   prices: https://openrouter.ai/api/v1/models/x-ai/grok-4.7/endpoints . Priority
   endpoint rates are different; the catalog entries describe standard rates.
+  The `:nitro` entry supplies replay metadata without a fixed price because
+  standard and priority endpoints can compete for that route.
 
 No public `grok-4.7-fast` API route is asserted. Its launch availability is
 limited to Cursor and Grok Build.
