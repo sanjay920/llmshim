@@ -16,6 +16,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod body;
+
 /// Retry bounds, resolved once from the environment (with defaults) at
 /// construction time. Internal/additive to `ShimClient` — not part of the
 /// public API surface.
@@ -88,6 +90,7 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
 pub struct ShimClient {
     http: Client,
     retry: RetryConfig,
+    response_body_limits: body::ResponseBodyLimits,
     /// Provider health, fed by every dispatch this client makes. `None` means
     /// this client reports to nobody — see [`ShimClient::with_breaker`].
     breaker: Option<Arc<ProviderBreaker>>,
@@ -113,6 +116,7 @@ impl ShimClient {
                 .build()
                 .expect("failed to build HTTP client"),
             retry: RetryConfig::from_env(),
+            response_body_limits: body::ResponseBodyLimits::default(),
             breaker: None,
         }
     }
@@ -255,8 +259,7 @@ impl ShimClient {
                             retry_after_wait(resp.headers(), self.retry.cap).unwrap_or_else(|| {
                                 backoff_with_jitter(attempt, self.retry.base, self.retry.cap)
                             });
-                        // Consume body before retrying (can't reuse response)
-                        let _ = resp.text().await;
+                        let _ = body::read(resp, self.response_body_limits.error_bytes).await;
                         if let Some(tracker) = attempt_tracker.as_mut() {
                             let accounting = tracker.accounting(false);
                             tracker
@@ -274,7 +277,7 @@ impl ShimClient {
                     // server's own wait, and a caller with its own backoff
                     // above this client gets to honour it too.
                     let retry_after = parse_retry_after(resp.headers());
-                    let body = resp.text().await.unwrap_or_default();
+                    let error_body = body::read(resp, self.response_body_limits.error_bytes).await;
                     if let Some(tracker) = attempt_tracker.as_mut() {
                         let accounting = tracker.accounting(false);
                         tracker
@@ -285,6 +288,15 @@ impl ShimClient {
                             .await
                             .map_err(DispatchFailure::PolicyObservation)?;
                     }
+                    let body = match error_body {
+                        Ok(error_body_bytes) => {
+                            String::from_utf8_lossy(&error_body_bytes).into_owned()
+                        }
+                        Err(body::BodyReadError::TooLarge) => {
+                            return Err(body::BodyReadError::TooLarge.into_dispatch_failure());
+                        }
+                        Err(body::BodyReadError::Http(_)) => String::new(),
+                    };
                     return Err(DispatchFailure::Upstream(ShimError::ProviderError {
                         status: status_code,
                         body,
@@ -447,11 +459,11 @@ impl ShimClient {
             finish_completed_response(&mut tracker).await?;
             return Ok((result, target));
         }
-        let body: serde_json::Value = match response.json().await {
+        let body = match body::read_json(response, self.response_body_limits.success_bytes).await {
             Ok(body) => body,
             Err(error) => {
                 finish_invalid_response(&mut tracker).await?;
-                return Err(DispatchFailure::Upstream(error.into()));
+                return Err(error.into_dispatch_failure());
             }
         };
         observe_native_response_usage(&target, &body, &mut tracker).await?;
