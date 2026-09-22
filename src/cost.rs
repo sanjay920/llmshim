@@ -9,15 +9,13 @@
 //! response actually used. A `0.0` that means "unknown" is how a spend dashboard
 //! silently under-reports, so unknown is unrepresentable as a number here.
 //!
-//! **A reported bill outranks the catalog.** Some providers return what they
-//! actually charged for the generation — OpenRouter does, as `usage.cost`, on
-//! every call, with no parameter needed to ask for it (measured 2026-09-22;
-//! see `providers/openrouter.rs`). That number *is* the invoice; the catalog
-//! product is an estimate of it, and deliberately an upper bound where a model
-//! prices some token classes and not others. Letting the estimate overwrite the
-//! invoice would throw away the only exact figure in the response, so
-//! [`stamp`] prefers the reported one and records which it used in
-//! `usage.cost_source`.
+//! **Provider accounting and catalog estimates carry different authority.**
+//! Some providers return `usage.cost` (see `providers/openrouter.rs`). A valid
+//! terminal provider bill is the provider's final reported amount and wins over
+//! the catalog estimate. A partial stream bill is only a known lower bound, so
+//! the catalog estimate may remain higher but cannot undercut that floor.
+//! [`stamp`] records the distinction in `usage.cost_source`; none of these
+//! values independently guarantees what an external invoice will contain.
 
 use crate::catalog::Cost;
 use serde_json::Value;
@@ -163,7 +161,7 @@ pub fn reported(usage: &Value) -> Option<f64> {
         .filter(|usd| usd.is_finite() && *usd >= 0.0)
 }
 
-/// USD for one usage object, and which of the two paths produced it.
+/// USD for one usage object and the accounting source or bound it represents.
 ///
 /// The reported bill is checked first and unconditionally: it needs no catalog
 /// entry, no token counters, and no price for the model, so it still answers
@@ -189,8 +187,8 @@ pub fn stamped_source(usage: &Value) -> Option<&str> {
 
 /// Cost and source for a usage object, preferring what is already stamped so a
 /// log entry can never disagree with the response it describes. [`stamp`]
-/// writes both keys together, so a source present means the cost beside it is
-/// the authoritative one; a body no transport stamped is priced here instead.
+/// writes both keys together, so a source present describes the cost beside it;
+/// a body no transport stamped is priced here instead.
 pub fn attribute(provider: &str, model: &str, usage: &Value) -> (Option<f64>, Option<String>) {
     match stamped_source(usage) {
         Some(source) => (stamped(usage), Some(source.to_owned())),
@@ -205,10 +203,11 @@ pub fn attribute(provider: &str, model: &str, usage: &Value) -> (Option<f64>, Op
 /// Both keys are always present so a reader never has to distinguish "absent"
 /// from "free"; `null` is the explicit unknown.
 ///
-/// `cost_source` names the path that answered, not the confidence of the
-/// answer: `"provider"` means the number is the bill the provider reported,
-/// `"catalog"` means it was computed from catalog prices — and a `"catalog"`
-/// source beside a `null` cost says the catalog was asked and had no price.
+/// `cost_source` also carries its accounting meaning: `"provider"` is an exact
+/// terminal provider bill, `"provider_floor"` is the highest partial provider
+/// bill observed and therefore only a lower bound, and `"catalog"` is the
+/// configured estimate. A `"catalog"` source beside `null` says the catalog was
+/// asked and had no price.
 pub fn stamp(provider: &str, model: &str, response: &mut Value) {
     if !response["usage"].is_object() {
         return;

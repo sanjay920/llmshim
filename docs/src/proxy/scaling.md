@@ -215,6 +215,17 @@ If combined known liabilities exceed the fixed-point range, the window becomes
 irreversibly frozen; a later release from another overlapping attempt cannot
 reopen capacity after overflow information has been lost.
 
+The gateway retains at most 100,000 attempt tombstones by default, configured by
+`LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS`. This is an operational
+accounting-state limit, shared by the Redis fleet and per process in local mode.
+When it is full, a new budgeted attempt fails closed with `503` before any RPM,
+TPM, or spend debit; live reservations and the 24-hour settlement interval are
+never evicted to make room. Expired entries are reclaimed incrementally, so a
+large simultaneous expiry does not block the coordinator. Size this limit for
+the number of provider attempts that can begin during one budget window plus
+the 24-hour late-settlement interval. A high-throughput deployment can reach
+this state limit before it reaches its dollar cap.
+
 Strict admission rejects a request when it cannot form that bound. This includes
 an unknown price or context/output ceiling, variable OpenRouter routing,
 multi-candidate output, priority/fast service controls, provider-hosted tools,
@@ -276,7 +287,10 @@ waiting jobs per provider; a full queue refuses new work with `503` and
 
 Drain distributed gateway queues before a rolling upgrade that changes the
 trusted policy envelope. Workers reject older unversioned descriptors rather
-than dispatching them without their originating tenant budget.
+than dispatching them without their originating tenant budget. Deploy the
+bounded accounting index only after draining older workers; pre-index
+tombstones remain conservatively charged until their existing 24-hour expiry,
+but cannot participate in the new shared retained-count admission check.
 
 Do not infer capacity from llmshim's implementation details alone. The
 [README benchmarks](https://github.com/sanjay920/llmshim#benchmarks) are the

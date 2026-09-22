@@ -319,6 +319,7 @@ impl NativeStreamUsage {
             }
             WireFormat::OpenAiChat => {
                 let choices = native_event.get("choices").and_then(Value::as_array);
+                let mut invalidated_by_activity = false;
                 if let Some(choices) = choices {
                     for (position, choice) in choices.iter().enumerate() {
                         let index = choice["index"].as_u64().unwrap_or(position as u64);
@@ -330,6 +331,7 @@ impl NativeStreamUsage {
                             .is_some_and(|delta| !delta.is_empty());
                         if newly_seen || !finished || has_output {
                             self.terminal_candidate = None;
+                            invalidated_by_activity = true;
                         }
                         if finished {
                             self.finished_chat_choices.insert(index);
@@ -344,12 +346,24 @@ impl NativeStreamUsage {
                 if let Some(observation) = observation.as_ref() {
                     let all_known_finished = !self.known_chat_choices.is_empty()
                         && self.finished_chat_choices == self.known_chat_choices;
-                    self.terminal_candidate = all_known_finished.then(|| observation.clone());
+                    if all_known_finished {
+                        let incoming_provider = crate::cost::reported(&observation.usage).is_some();
+                        let retained_provider =
+                            self.terminal_candidate.as_ref().is_some_and(|candidate| {
+                                crate::cost::reported(&candidate.usage).is_some()
+                            });
+                        if incoming_provider || invalidated_by_activity || !retained_provider {
+                            self.terminal_candidate = Some(observation.clone());
+                        }
+                    } else {
+                        self.terminal_candidate = None;
+                    }
                 }
                 observation
             }
             WireFormat::GoogleGenerateContent => {
                 let candidates = native_event.get("candidates").and_then(Value::as_array);
+                let mut invalidated_by_activity = false;
                 if let Some(candidates) = candidates {
                     for (position, candidate) in candidates.iter().enumerate() {
                         let index = candidate["index"].as_u64().unwrap_or(position as u64);
@@ -361,6 +375,7 @@ impl NativeStreamUsage {
                             .is_some_and(|parts| !parts.is_empty());
                         if newly_seen || !finished || has_output {
                             self.terminal_candidate = None;
+                            invalidated_by_activity = true;
                         }
                         if finished {
                             self.finished_gemini_candidates.insert(index);
@@ -375,7 +390,18 @@ impl NativeStreamUsage {
                 if let Some(observation) = observation.as_ref() {
                     let all_known_finished = !self.known_gemini_candidates.is_empty()
                         && self.finished_gemini_candidates == self.known_gemini_candidates;
-                    self.terminal_candidate = all_known_finished.then(|| observation.clone());
+                    if all_known_finished {
+                        let incoming_provider = crate::cost::reported(&observation.usage).is_some();
+                        let retained_provider =
+                            self.terminal_candidate.as_ref().is_some_and(|candidate| {
+                                crate::cost::reported(&candidate.usage).is_some()
+                            });
+                        if incoming_provider || invalidated_by_activity || !retained_provider {
+                            self.terminal_candidate = Some(observation.clone());
+                        }
+                    } else {
+                        self.terminal_candidate = None;
+                    }
                 }
                 observation
             }
@@ -420,6 +446,7 @@ impl StreamUsage {
             );
         }
         let terminal = chunk.clone();
+        let mut invalidated_by_activity = false;
         if let Some(choices) = chunk.get_mut("choices").and_then(Value::as_array_mut) {
             for (i, choice) in choices.iter_mut().enumerate() {
                 let index = choice["index"].as_u64().unwrap_or(i as u64);
@@ -431,6 +458,7 @@ impl StreamUsage {
                     .is_some_and(|delta| !delta.is_empty());
                 if newly_seen || !finished || has_output {
                     self.terminal_chat_provider_cost = None;
+                    invalidated_by_activity = true;
                 }
                 if finished {
                     self.finished_chat_choices.insert(index);
@@ -448,11 +476,16 @@ impl StreamUsage {
         if let Some(usage) = usage {
             let all_known_finished = !self.known_chat_choices.is_empty()
                 && self.finished_chat_choices == self.known_chat_choices;
-            self.terminal_chat_provider_cost = if all_known_finished {
-                provider_cost
+            if all_known_finished {
+                if provider_cost.is_some()
+                    || invalidated_by_activity
+                    || self.terminal_chat_provider_cost.is_none()
+                {
+                    self.terminal_chat_provider_cost = provider_cost;
+                }
             } else {
-                None
-            };
+                self.terminal_chat_provider_cost = None;
+            }
             self.chat_usage = Some(usage);
         }
         if !self.chat_choices.is_empty() {

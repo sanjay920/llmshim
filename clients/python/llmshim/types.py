@@ -183,10 +183,10 @@ class ChatRequest(_ChatRequestBase, _CacheRequest, total=False):
 # --- response ---------------------------------------------------------------
 
 
-#: Where a ``cost_usd`` figure came from. ``"provider"`` is the bill the
-#: provider reported for the generation; ``"catalog"`` is computed from catalog
-#: prices and is an upper bound.
-CostSource = Literal["provider", "catalog"]
+#: Where a ``cost_usd`` figure came from. ``"provider"`` is an exact terminal
+#: bill, ``"provider_floor"`` is a partial provider lower bound, and
+#: ``"catalog"`` is an estimate.
+CostSource = Literal["provider", "provider_floor", "catalog"]
 
 
 class Usage(TypedDict, total=False):
@@ -196,12 +196,11 @@ class Usage(TypedDict, total=False):
     total_tokens: int
     cache_read_tokens: int
     cache_write_tokens: int
-    #: USD charged for this response. ``None`` means the server could not price
-    #: the model — it never means free.
+    #: USD accounting for this response. A provider floor is a lower bound;
+    #: ``None`` means unknown and never means free.
     cost_usd: Optional[float]
-    #: Where ``cost_usd`` came from: ``"provider"`` when the provider reported
-    #: what it charged for this generation (OpenRouter does), ``"catalog"``
-    #: when it was computed from catalog prices, which is an upper bound.
+    #: Exact terminal provider bill, partial provider lower bound, or catalog
+    #: estimate; see :data:`CostSource`.
     cost_source: CostSource
 
 
@@ -300,8 +299,7 @@ class UsageEvent(TypedDict, total=False):
     cache_write_tokens: int
     #: ``None`` when the server could not price the model, never ``0.0``.
     cost_usd: Optional[float]
-    #: Whether ``cost_usd`` is the provider's reported bill or a catalog
-    #: estimate.
+    #: Exact provider bill, partial provider lower bound, or catalog estimate.
     cost_source: CostSource
 
 

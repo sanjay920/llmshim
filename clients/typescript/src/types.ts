@@ -150,11 +150,11 @@ export interface ChatRequest {
 }
 
 /**
- * Where a `cost_usd` figure came from. `"provider"` is the bill the provider
- * reported for the generation; `"catalog"` is computed from catalog prices and
- * is an upper bound.
+ * Where a `cost_usd` figure came from. `"provider"` is an exact terminal bill,
+ * `"provider_floor"` is a partial provider lower bound, and `"catalog"` is an
+ * estimate.
  */
-export type CostSource = 'provider' | 'catalog';
+export type CostSource = 'provider' | 'provider_floor' | 'catalog';
 
 /** Token usage reported by the provider. */
 export interface Usage {
@@ -167,15 +167,14 @@ export interface Usage {
   cache_read_tokens?: number;
   cache_write_tokens?: number;
   /**
-   * USD charged for this response. `null` means the server could not price the
-   * model — it never means free. Absent on servers older than 0.4.
+   * USD accounting for this response. A provider floor is a lower bound.
+   * `null` means the server could not price the model and never means free.
    */
   cost_usd?: number | null;
   /**
-   * Where `cost_usd` came from: `"provider"` when the provider reported what
-   * it charged for this generation (OpenRouter does), `"catalog"` when it was
-   * computed from catalog prices, which is an upper-bound estimate. Absent on
-   * older servers.
+   * `"provider"` for an exact terminal bill, `"provider_floor"` for the highest
+   * partial provider bill observed (a lower bound), or `"catalog"` for an
+   * estimate. Absent on older servers.
    */
   cost_source?: CostSource;
 }
@@ -247,7 +246,7 @@ export interface UsageEvent {
   cache_write_tokens?: number;
   /** `null` when the server could not price the model, never `0`. */
   cost_usd?: number | null;
-  /** Whether `cost_usd` is the provider's reported bill or a catalog estimate. */
+  /** Exact provider bill, partial provider lower bound, or catalog estimate. */
   cost_source?: CostSource;
 }
 

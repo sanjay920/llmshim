@@ -1433,6 +1433,107 @@ async fn partial_provider_cost_precedes_lower_terminal_catalog_candidate() {
 }
 
 #[tokio::test]
+async fn terminal_provider_candidate_survives_catalog_trailer_until_later_activity() {
+    let corrected_chat = record_chat_stream(vec![
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
+        json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}}),
+    ])
+    .await;
+    assert!(corrected_chat.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: true,
+            ..
+        } if usage["cost_source"] == "provider" && usage["cost_usd"] == 0.25
+    )));
+
+    let invalidated_chat = record_chat_stream(vec![
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
+        json!({"choices":[{"index":1,"delta":{"content":"later"},"finish_reason":null}]}),
+        json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}}),
+    ])
+    .await;
+    assert!(invalidated_chat.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: true,
+            ..
+        } if usage["cost_source"] == "catalog"
+    )));
+
+    let corrected_gemini = record_gemini_stream(vec![
+        json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"cost":0.25}}),
+        json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+    ])
+    .await;
+    assert!(corrected_gemini.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: true,
+            ..
+        } if usage["cost_source"] == "provider" && usage["cost_usd"] == 0.25
+    )));
+
+    let invalidated_gemini = record_gemini_stream(vec![
+        json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"cost":0.25}}),
+        json!({"candidates":[{"index":1,"content":{"parts":[{"text":"later"}]}}]}),
+        json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+        json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+    ])
+    .await;
+    assert!(invalidated_gemini.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: true,
+            ..
+        } if usage["cost_source"] == "catalog"
+    )));
+}
+
+#[tokio::test]
+async fn public_terminal_usage_keeps_explicit_terminal_provider_correction() {
+    let mut server = mockito::Server::new_async().await;
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
+        json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}})
+    );
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let chunks: Vec<_> = ShimClient::new()
+        .stream(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+        )
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    upstream.assert_async().await;
+    assert!(chunks
+        .iter()
+        .filter_map(|chunk| serde_json::from_str::<Value>(chunk).ok())
+        .any(|chunk| {
+            chunk["usage"]["cost_source"] == "provider" && chunk["usage"]["cost_usd"] == 0.25
+        }));
+}
+
+#[tokio::test]
 async fn public_terminal_usage_preserves_partial_provider_floor_separately() {
     let mut server = mockito::Server::new_async().await;
     let body = format!(

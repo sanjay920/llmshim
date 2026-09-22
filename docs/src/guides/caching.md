@@ -59,18 +59,21 @@ Anthropic's `input_tokens` excludes the cache read, while the OpenAI Responses,
 Chat Completions and Gemini prompt totals include it. llmshim resolves the
 disagreement at the transport boundary so one counter means one thing.
 
-`cost_usd` carries one of two numbers, and `cost_source` says which:
+`cost_source` distinguishes three accounting meanings:
 
 - `cost_source: "provider"` — the provider reported what it charged for this
   generation and `cost_usd` is that figure, not an estimate. OpenRouter does
   this (as `usage.cost`), unconditionally and on streams too. It needs no
   catalog entry, so it answers for aggregator slugs the catalog has never
   heard of.
+- `cost_source: "provider_floor"` — a partial provider bill is the highest
+  known lower bound, but no exact terminal provider bill survived. `cost_usd`
+  is not a final invoice in this case.
 - `cost_source: "catalog"` — computed here from catalog prices, as below.
 
-A reported bill always wins. The catalog product is an estimate *of* that bill,
-and deliberately an upper bound, so letting it overwrite the bill would discard
-the only exact figure in the response.
+A terminal provider bill always wins. A partial provider bill remains a floor
+that a later catalog estimate cannot undercut, without being mislabeled as an
+exact final invoice.
 
 The catalog estimate charges standard token classes: uncached input, output,
 cache reads and cache writes each at their own catalog rate, so a cached prompt

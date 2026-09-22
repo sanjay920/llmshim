@@ -52,7 +52,7 @@ test("chat() posts to /v1/chat and parses ChatResponse", async () => {
       provider: "anthropic",
       message: { role: "assistant", content: "Hello there!" },
       reasoning: null,
-      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15, cost_usd: 1, cost_source: "provider_floor" },
       latency_ms: 420,
     });
   };
@@ -71,6 +71,8 @@ test("chat() posts to /v1/chat and parses ChatResponse", async () => {
   assert.equal(res.provider, "anthropic");
   assert.equal(res.message.content, "Hello there!");
   assert.equal(res.usage.total_tokens, 15);
+  assert.equal(res.usage.cost_usd, 1);
+  assert.equal(res.usage.cost_source, "provider_floor");
 });
 
 test("stream() yields typed events from a multi-event SSE stream", async () => {

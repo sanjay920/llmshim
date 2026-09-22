@@ -2290,6 +2290,24 @@ mod native_tests {
             StatusCode::TOO_MANY_REQUESTS,
         )
         .await;
+        assert_chat_stream_budget_finality(
+            vec![
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
+                json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}}),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+        assert_chat_stream_budget_finality(
+            vec![
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
+                json!({"choices":[{"index":1,"delta":{"content":"later"},"finish_reason":null}]}),
+                json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}}),
+            ],
+            StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
 
         let gemini_unsafe = vec![
             vec![
@@ -2321,6 +2339,24 @@ mod native_tests {
                 json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
             ],
             StatusCode::OK,
+        )
+        .await;
+        assert_gemini_stream_budget_finality(
+            vec![
+                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"cost":0.25}}),
+                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+        assert_gemini_stream_budget_finality(
+            vec![
+                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"cost":0.25}}),
+                json!({"candidates":[{"index":1,"content":{"parts":[{"text":"later"}]}}]}),
+                json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+            ],
+            StatusCode::TOO_MANY_REQUESTS,
         )
         .await;
     }
