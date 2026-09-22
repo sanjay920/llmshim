@@ -544,20 +544,36 @@ fn parse_go_duration(s: &str) -> Option<Duration> {
             i += 1;
         }
         let unit = &s[unit_start..i];
-        let secs = match unit {
-            "h" => value * 3600.0,
-            "m" => value * 60.0,
-            "s" => value,
-            "ms" => value / 1_000.0,
-            "us" | "µs" | "μs" => value / 1_000_000.0,
-            "ns" => value / 1_000_000_000.0,
-            _ => return None,
-        };
-        total += Duration::from_secs_f64(secs);
+        let parsed_duration_component = parse_go_duration_component(value, unit)?;
+        total = total.saturating_add(parsed_duration_component);
         saw_unit = true;
     }
 
     saw_unit.then_some(total)
+}
+
+fn parse_go_duration_component(value: f64, unit: &str) -> Option<Duration> {
+    if !value.is_finite() || value.is_sign_negative() {
+        return None;
+    }
+
+    let seconds_per_unit = match unit {
+        "h" => 3600.0,
+        "m" => 60.0,
+        "s" => 1.0,
+        "ms" => 1.0 / 1_000.0,
+        "us" | "µs" | "μs" => 1.0 / 1_000_000.0,
+        "ns" => 1.0 / 1_000_000_000.0,
+        _ => return None,
+    };
+
+    let maximum_duration_seconds = Duration::MAX.as_secs_f64();
+    if value > maximum_duration_seconds / seconds_per_unit {
+        return Some(Duration::MAX);
+    }
+
+    let seconds = value * seconds_per_unit;
+    Some(Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX))
 }
 
 /// Positive duration from `now` until `when`; `None`/zero if `when` is in the past.
@@ -860,6 +876,30 @@ mod tests {
         assert_eq!(parse_go_duration("abc"), None);
         assert_eq!(parse_go_duration("10"), None); // no unit
         assert_eq!(parse_go_duration("5x"), None); // unknown unit
+    }
+
+    #[test]
+    fn go_duration_oversized_finite_values_saturate_before_capping() {
+        assert_eq!(
+            parse_go_duration("99999999999999999999s"),
+            Some(Duration::MAX)
+        );
+        assert_eq!(
+            parse_go_duration("9999999999999999999h"),
+            Some(Duration::MAX)
+        );
+
+        let headers = headers(&[("x-ratelimit-reset-tokens", "99999999999999999999s")]);
+        let wait = retry_after_wait(&headers, Duration::from_secs(60)).unwrap();
+        assert!(wait >= Duration::from_secs(60));
+        assert!(wait < Duration::from_secs(60) + Duration::from_millis(251));
+    }
+
+    #[test]
+    fn go_duration_nonfinite_and_negative_values_are_ignored() {
+        for invalid_duration in ["NaNs", "infinitys", "-1s"] {
+            assert_eq!(parse_go_duration(invalid_duration), None);
+        }
     }
 
     // --- Backoff / jitter ---------------------------------------------------
