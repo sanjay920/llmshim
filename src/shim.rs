@@ -904,7 +904,7 @@ pub async fn collect(
                 if let Some(text) = delta["content"].as_str() {
                     crate::streaming::append_string_fragment(&mut choice.message["content"], text);
                 }
-                choice.reasoning.push(delta);
+                choice.reasoning.push(delta)?;
                 if let Some(calls) = delta["tool_calls"].as_array() {
                     if !choice.message["tool_calls"].is_array() {
                         choice.message["tool_calls"] = json!([]);

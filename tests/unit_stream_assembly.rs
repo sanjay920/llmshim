@@ -5,15 +5,18 @@ use serde_json::{json, Value};
 fn fragmented_reasoning_preserves_fields_snapshots_and_origin() {
     let original_origin = json!({"provider": "test", "model": "original"});
     let mut accumulator = ReasoningAccumulator::default();
-    accumulator.push(&json!({"reasoning": [{
-        "index": 0,
-        "origin": original_origin,
-        "text": null,
-        "signature": 0,
-        "payload": {"thinking": false, "summary": null, "other": 0}
-    }]}));
+    accumulator
+        .push(&json!({"reasoning": [{
+            "index": 0,
+            "origin": original_origin,
+            "text": null,
+            "signature": 0,
+            "payload": {"thinking": false, "summary": null, "other": 0}
+        }]}))
+        .unwrap();
     for sequence in 0..64 {
-        accumulator.push(&json!({"reasoning": [{
+        accumulator
+            .push(&json!({"reasoning": [{
             "index": 0,
             "origin": {"provider": "test", "model": "untrusted-change"},
             "text": "λ",
@@ -27,7 +30,8 @@ fn fragmented_reasoning_preserves_fields_snapshots_and_origin() {
                 "summary": "μ",
                 "other": sequence
             }
-        }, {"index": 1, "text": "β"}]}));
+        }, {"index": 1, "text": "β"}]}))
+            .unwrap();
     }
     let assembled = accumulator.blocks();
     assert_eq!(assembled.len(), 2);
@@ -47,13 +51,15 @@ fn fragmented_reasoning_preserves_fields_snapshots_and_origin() {
     assert_eq!(assembled[0]["origin"], original_origin);
     assert_eq!(assembled[1]["text"], "β".repeat(64));
 
-    accumulator.push(&json!({"reasoning": [{
-        "index": 0,
-        "replace": true,
-        "origin": {"provider": "test", "model": "untrusted-change"},
-        "text": "complete",
-        "signature": "final"
-    }]}));
+    accumulator
+        .push(&json!({"reasoning": [{
+            "index": 0,
+            "replace": true,
+            "origin": {"provider": "test", "model": "untrusted-change"},
+            "text": "complete",
+            "signature": "final"
+        }]}))
+        .unwrap();
     let completed = accumulator.blocks();
     assert_eq!(completed[0]["text"], "complete");
     assert_eq!(completed[0]["signature"], "final");

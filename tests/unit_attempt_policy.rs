@@ -455,6 +455,146 @@ async fn record_gemini_stream(events: Vec<Value>) -> Vec<RecordedEvent> {
     policy.events()
 }
 
+#[tokio::test]
+async fn retained_state_failure_observes_current_usage_before_stream_failure() {
+    let mut server = mockito::Server::new_async().await;
+    let body = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"cost":0.25}
+        })
+    );
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+    let limits =
+        llmshim::streaming::StreamRetentionLimits::new(16 * 1024, 64, 16 * 1024, 1).unwrap();
+    let chunks: Vec<_> = ShimClient::new()
+        .with_stream_retention_limits(limits)
+        .unwrap()
+        .stream_with_policy(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await;
+
+    upstream.assert_async().await;
+    assert_eq!(
+        chunks.last().unwrap().as_ref().unwrap_err().to_string(),
+        "stream error: upstream stream retained state exceeds limit"
+    );
+    let events = policy.events();
+    let usage_position = events
+        .iter()
+        .position(
+            |event| matches!(event, RecordedEvent::Usage { usage, .. } if usage["cost"] == 0.25),
+        )
+        .expect("provider usage must be observed");
+    let failure_position = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RecordedEvent::Finished {
+                    outcome: AttemptOutcome::StreamFailure { .. },
+                    ..
+                }
+            )
+        })
+        .expect("retention failure must finish the attempt as a stream failure");
+    assert!(usage_position < failure_position);
+    assert!(!events
+        .iter()
+        .any(|event| { matches!(event, RecordedEvent::Usage { terminal: true, .. }) }));
+}
+
+#[tokio::test]
+async fn anthropic_retention_failure_observes_merged_current_provider_bill() {
+    let mut server = mockito::Server::new_async().await;
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"type":"message_start","message":{"usage":{"input_tokens":1,"cost":0.25}}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2,"cost":0.75}})
+    );
+    let upstream = server
+        .mock("POST", "/messages")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = Anthropic::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+    let limits =
+        llmshim::streaming::StreamRetentionLimits::new(16 * 1024, 64, 16 * 1024, 4).unwrap();
+    let chunks: Vec<_> = ShimClient::new()
+        .with_stream_retention_limits(limits)
+        .unwrap()
+        .stream_with_policy(
+            &provider,
+            "claude-sonnet-5",
+            &request("anthropic/claude-sonnet-5"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await;
+
+    upstream.assert_async().await;
+    assert_eq!(
+        chunks.last().unwrap().as_ref().unwrap_err().to_string(),
+        "stream error: upstream stream retained state exceeds limit"
+    );
+    let events = policy.events();
+    let usage: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            RecordedEvent::Usage {
+                usage, terminal, ..
+            } => Some((usage, terminal)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage.len(), 2);
+    assert_eq!(usage[0].0["cost"], 0.25);
+    assert_eq!(usage[1].0["cost"], 0.75);
+    assert_eq!(usage[1].0["cost_usd"], 0.75);
+    assert_eq!(usage[1].0["cost_source"], "provider");
+    assert_eq!(usage[1].0["prompt_tokens"], 1);
+    assert_eq!(usage[1].0["completion_tokens"], 2);
+    assert!(!*usage[1].1);
+    let failure_position = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RecordedEvent::Finished {
+                    outcome: AttemptOutcome::StreamFailure { .. },
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let second_usage_position = events
+        .iter()
+        .rposition(|event| matches!(event, RecordedEvent::Usage { .. }))
+        .unwrap();
+    assert!(second_usage_position < failure_position);
+}
+
 fn terminal_usage_count(events: &[RecordedEvent]) -> usize {
     events
         .iter()

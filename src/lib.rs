@@ -20,6 +20,7 @@ pub mod providers;
 pub mod reasoning;
 pub mod router;
 mod sse;
+mod stream_retention;
 pub mod streaming;
 pub mod toolcall;
 pub mod usage;
