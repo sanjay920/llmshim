@@ -268,7 +268,8 @@ impl NativeStreamUsage {
                     _ if native_event["usage"].is_object() => "/usage",
                     _ => return None,
                 };
-                let incoming = native_event.pointer(usage_path)?.as_object()?;
+                let incoming_usage = native_event.pointer(usage_path)?;
+                let incoming = incoming_usage.as_object()?;
                 for (key, value) in incoming {
                     self.anthropic_usage[key] = value.clone();
                 }
@@ -276,7 +277,13 @@ impl NativeStreamUsage {
                     && native_event
                         .pointer("/delta/stop_reason")
                         .is_some_and(Value::is_string);
-                usage_observation(self.target.wire, &self.anthropic_usage, terminal)
+                let mut observation =
+                    usage_observation(self.target.wire, &self.anthropic_usage, terminal)?;
+                if terminal && !has_counter(incoming_usage, "/output_tokens") {
+                    observation.counters_complete = false;
+                    observation.explicit_zero = false;
+                }
+                Some(observation)
             }
             WireFormat::OpenAiResponses => {
                 let terminal = native_event["type"] == "response.completed";

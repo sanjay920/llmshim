@@ -169,6 +169,7 @@ struct BudgetWindowKey {
 
 struct AttemptLiability {
     window_key: BudgetWindowKey,
+    pricing_bounded: bool,
     liability_nanos: u64,
     observed_nanos: Option<u64>,
     terminal_catalog_nanos: Option<u64>,
@@ -317,6 +318,7 @@ impl LocalAttemptRates {
                 attempt_id,
                 AttemptLiability {
                     window_key,
+                    pricing_bounded: quote.bounded,
                     liability_nanos: quote.amount_nanos,
                     observed_nanos: None,
                     terminal_catalog_nanos: None,
@@ -431,7 +433,7 @@ impl AttemptRates for LocalAttemptRates {
         &self,
         scope: &TrustedPolicyScope,
         attempt_id: uuid::Uuid,
-        observation: crate::gateway::budget::SpendObservation,
+        mut observation: crate::gateway::budget::SpendObservation,
     ) -> Result<(), ()> {
         if scope.budget.is_none() {
             return Ok(());
@@ -441,6 +443,11 @@ impl AttemptRates for LocalAttemptRates {
             let attempt = state.budget_attempts.get_mut(&attempt_id).ok_or(())?;
             if attempt.finalized {
                 return Ok(());
+            }
+            if !attempt.pricing_bounded
+                && observation.authority == crate::gateway::budget::SpendAuthority::Catalog
+            {
+                observation.terminal_authoritative = false;
             }
             if observation.terminal_authoritative {
                 if let Some(amount_nanos) = observation.amount_nanos {
@@ -966,6 +973,7 @@ mod redis_rates {
                 redis.call('SET', budget_total_key, budget_next, 'PX', budget_ttl)
                 redis.call('HSET', KEYS[6],
                     'liability', reservation,
+                    'bounded', ARGV[20],
                     'observed', -1,
                     'finalized', 0,
                     'total_key', budget_total_key,
@@ -1002,21 +1010,25 @@ mod redis_rates {
     const SETTLE_BUDGET_LUA: &str = r#"
         if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
         local values = redis.call('HMGET', KEYS[1],
-            'liability', 'observed', 'finalized', 'total_key', 'freeze_key',
-            'terminal_catalog', 'terminal_provider')
+            'liability', 'bounded', 'observed', 'finalized', 'total_key',
+            'freeze_key', 'terminal_catalog', 'terminal_provider')
         local liability = tonumber(values[1]) or 0
-        local observed = tonumber(values[2]) or -1
-        local finalized = tonumber(values[3]) or 0
-        local total_key = values[4]
-        local freeze_key = values[5]
-        local terminal_catalog = tonumber(values[6]) or -1
-        local terminal_provider = tonumber(values[7]) or -1
+        local bounded = tonumber(values[2]) or 0
+        local observed = tonumber(values[3]) or -1
+        local finalized = tonumber(values[4]) or 0
+        local total_key = values[5]
+        local freeze_key = values[6]
+        local terminal_catalog = tonumber(values[7]) or -1
+        local terminal_provider = tonumber(values[8]) or -1
         if finalized == 1 then return 1 end
         local incoming = tonumber(ARGV[1])
         local should_finalize = tonumber(ARGV[2]) == 1
         local max_exact = tonumber(ARGV[3])
         local authority = tonumber(ARGV[4])
         local terminal_authoritative = tonumber(ARGV[5]) == 1
+        if bounded == 0 and authority ~= 1 then
+            terminal_authoritative = false
+        end
         if terminal_authoritative and incoming >= 0 then
             if authority == 1 then
                 terminal_provider = incoming
@@ -1365,6 +1377,14 @@ mod tests {
         }
     }
 
+    fn inferred_terminal_zero() -> crate::gateway::budget::SpendObservation {
+        crate::gateway::budget::SpendObservation {
+            amount_nanos: Some(0),
+            authority: crate::gateway::budget::SpendAuthority::Catalog,
+            terminal_authoritative: true,
+        }
+    }
+
     fn partial_catalog(amount_nanos: u64) -> crate::gateway::budget::SpendObservation {
         spend_observation(
             Some(amount_nanos),
@@ -1604,7 +1624,7 @@ mod tests {
                 .await
                 .unwrap();
             rates
-                .observe_usage(&tenant, attempt_id, terminal_catalog(observed))
+                .observe_usage(&tenant, attempt_id, terminal_provider(observed))
                 .await
                 .unwrap();
             rates
@@ -1844,6 +1864,89 @@ mod tests {
             let state = rates.state.lock().await;
             assert_eq!(total_for(&state, &tenant, 43), 15);
         }
+
+        let zero_attempt = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                zero_attempt,
+                Some(quote(80)),
+                Some(2640),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, zero_attempt, inferred_terminal_zero())
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                zero_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(total_for(&state, &tenant, 44), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn unpriced_explicit_zero_counters_do_not_release_fee_uncertainty() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let mut tenant = budget_scope("unpriced-zero", 100);
+        tenant.budget.as_mut().unwrap().allow_unpriced = true;
+        let attempt_id = uuid::Uuid::new_v4();
+        let mut unbounded_quote = quote(0);
+        unbounded_quote.bounded = false;
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                attempt_id,
+                Some(unbounded_quote),
+                Some(2700),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, attempt_id, inferred_terminal_zero())
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                attempt_id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(total_for(&state, &tenant, 45), 100);
+        }
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(1)),
+                    Some(2700),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
     }
 
     #[tokio::test]
@@ -2296,5 +2399,48 @@ mod tests {
                 .await,
             Err(RateRefusal::Budget(_))
         ));
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_terminal_provider_bill_replaces_higher_catalog_observation() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-authority-{}", uuid::Uuid::new_v4().simple());
+        let tenant = budget_scope(&format!("redis-{}", uuid::Uuid::new_v4()), 100);
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let attempt_id = uuid::Uuid::new_v4();
+        rates
+            .acquire(&provider, &tenant, 1, attempt_id, Some(quote(20)))
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, attempt_id, partial_catalog(80))
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, attempt_id, terminal_provider(15))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                attempt_id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut connection = rates.connection().await.unwrap();
+        let attempt_key = RedisAttemptRates::budget_attempt_key(&tenant, attempt_id);
+        let total_key: String = connection.hget(attempt_key, "total_key").await.unwrap();
+        let retained: u64 = connection.get(total_key).await.unwrap();
+        assert_eq!(retained, 15);
     }
 }

@@ -109,8 +109,10 @@ pub(crate) fn spend_observation(
         } else {
             SpendAuthority::Catalog
         };
-    let amount_nanos = observed_cost_nanos(observation.usage())
-        .or_else(|| (observation.counters_complete() && observation.explicit_zero()).then_some(0));
+    let stamped_amount = observed_cost_nanos(observation.usage());
+    let inferred_zero =
+        stamped_amount.is_none() && observation.counters_complete() && observation.explicit_zero();
+    let amount_nanos = stamped_amount.or_else(|| inferred_zero.then_some(0));
     let terminal_authoritative = observation.terminal()
         && amount_nanos.is_some()
         && (authority == SpendAuthority::Provider || observation.counters_complete());

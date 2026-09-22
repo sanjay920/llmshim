@@ -1929,6 +1929,211 @@ mod native_tests {
     }
 
     #[tokio::test]
+    async fn explicit_zero_releases_only_a_verified_bounded_quote() {
+        let response_body = json!({
+            "id": "response",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+        })
+        .to_string();
+        let request_for = |model: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let mut bounded_server = mockito::Server::new_async().await;
+        let bounded_upstream = bounded_server
+            .mock("POST", "/chat/completions")
+            .with_body(&response_body)
+            .expect(2)
+            .create_async()
+            .await;
+        let bounded_router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(bounded_server.url()),
+            ),
+        );
+        let bounded_application = app(configured_state_with_router_and_identity(
+            bounded_router,
+            budgeted_identity(10.0, false),
+        ));
+        for _ in 0..2 {
+            let response = bounded_application
+                .clone()
+                .oneshot(request_for("openrouter/x-ai/grok-4.7"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        bounded_upstream.assert_async().await;
+
+        let mut unpriced_server = mockito::Server::new_async().await;
+        let unpriced_upstream = unpriced_server
+            .mock("POST", "/chat/completions")
+            .with_body(response_body)
+            .expect(1)
+            .create_async()
+            .await;
+        let unpriced_router = Router::new().register(
+            "local",
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                "local",
+                unpriced_server.url(),
+                None,
+            )),
+        );
+        let unpriced_application = app(configured_state_with_router_and_identity(
+            unpriced_router,
+            budgeted_identity(1.0, true),
+        ));
+        let first = unpriced_application
+            .clone()
+            .oneshot(request_for("local/test"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = unpriced_application
+            .oneshot(request_for("local/test"))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        unpriced_upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_unary_and_partial_stream_usage_retain_the_full_quote() {
+        let request_for = |stream: bool| {
+            Request::builder()
+                .method("POST")
+                .uri(if stream {
+                    "/v1/chat/stream"
+                } else {
+                    "/v1/chat"
+                })
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "openrouter/x-ai/grok-4.7",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": stream
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let mut unary_server = mockito::Server::new_async().await;
+        let unary_upstream = unary_server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "response",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 7}
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let unary_router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(unary_server.url()),
+            ),
+        );
+        let unary_application = app(configured_state_with_router_and_identity(
+            unary_router,
+            budgeted_identity(10.0, false),
+        ));
+        assert_eq!(
+            unary_application
+                .clone()
+                .oneshot(request_for(false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            unary_application
+                .oneshot(request_for(false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        unary_upstream.assert_async().await;
+
+        let mut stream_server = mockito::Server::new_async().await;
+        let partial_stream = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id":"r","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}),
+            json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":7}}),
+            json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+        );
+        let stream_upstream = stream_server
+            .mock("POST", "/chat/completions")
+            .with_header("content-type", "text/event-stream")
+            .with_body(partial_stream)
+            .expect(1)
+            .create_async()
+            .await;
+        let stream_router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(stream_server.url()),
+            ),
+        );
+        let stream_application = app(configured_state_with_router_and_identity(
+            stream_router,
+            budgeted_identity(10.0, false),
+        ));
+        let stream_response = stream_application
+            .clone()
+            .oneshot(request_for(true))
+            .await
+            .unwrap();
+        assert_eq!(stream_response.status(), StatusCode::OK);
+        let _ = to_bytes(stream_response.into_body(), 100_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            stream_application
+                .oneshot(request_for(false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        stream_upstream.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn caller_supplied_budget_policy_fields_cannot_unfreeze_a_key() {
         let mut server = mockito::Server::new_async().await;
         let upstream = server
