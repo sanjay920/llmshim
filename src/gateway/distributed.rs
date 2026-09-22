@@ -2078,6 +2078,10 @@ mod tests {
                 .unwrap(),
             1
         );
+        let _: usize = connection
+            .zadd(&scoped_processing, &prepared.member, 0_u64)
+            .await
+            .unwrap();
         assert_eq!(
             gateway
                 .reap_once_protocol(QueueProtocol::ScopedV1, &provider)
