@@ -205,6 +205,12 @@ Connection pools and concurrency limits remain per process. If the Redis client
 cannot be initialized—or the binary lacks the feature—the compact proxy warns
 and falls back to in-memory buckets.
 
+With `gateway-redis`, admitting a new job checks the provider's waiting-queue
+depth and inserts the job in one Lua transaction. Concurrent origins cannot
+claim the same remaining slot. `LLMSHIM_GATEWAY_QUEUE_DEPTH` defaults to 10,000
+waiting jobs per provider; a full queue refuses new work with `503` and
+`Retry-After`.
+
 Do not infer capacity from llmshim's implementation details alone. The
 [README benchmarks](https://github.com/sanjay920/llmshim#benchmarks) are the
 maintained performance snapshot; load-test your model mix, payload sizes,
