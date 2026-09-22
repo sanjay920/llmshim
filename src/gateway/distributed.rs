@@ -455,12 +455,18 @@ impl DistributedGateway {
         let descriptor = &prepared_submission.descriptor;
         let provider_queue_key =
             protocol_queue_key(prepared_submission.protocol, &descriptor.provider);
+        let other_protocol = match prepared_submission.protocol {
+            QueueProtocol::LegacyUnscoped => QueueProtocol::ScopedV1,
+            QueueProtocol::ScopedV1 => QueueProtocol::LegacyUnscoped,
+        };
+        let other_provider_queue_key = protocol_queue_key(other_protocol, &descriptor.provider);
         let mut connection = self.conn.clone();
         let priority_score =
             deadline_score(descriptor.tier, descriptor.enqueue_ms, self.aging_step_ms());
         let admitted = admission::enqueue(
             &mut connection,
             &provider_queue_key,
+            &other_provider_queue_key,
             self.config.max_queue_depth,
             priority_score,
             &prepared_submission.member,
@@ -1350,6 +1356,98 @@ mod tests {
             }
         }
         assert_eq!(queued_members[1], existing_submission.member);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_queue_depth_limit_is_shared_across_scoped_and_legacy_protocols() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("queue-protocol-cap-{}", uuid::Uuid::new_v4());
+        let config = GatewayConfig {
+            max_queue_depth: 2,
+            ..GatewayConfig::default()
+        };
+        let first = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            config.clone(),
+        )
+        .await
+        .unwrap();
+        let second =
+            DistributedGateway::connect(&redis_url, Arc::new(EchoDispatch), unlimited(), config)
+                .await
+                .unwrap();
+        let existing = first
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"id":"existing"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        first.enqueue(&existing).await.unwrap();
+        let scoped = first
+            .prepare_with_policy(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 1,
+                    permits: 1,
+                    payload: serde_json::json!({"id":"scoped"}),
+                },
+                false,
+                crate::gateway::attempt::TrustedPolicyScope::from_identity(
+                    &crate::gateway::auth::Identity {
+                        tenant: "queue-protocol-cap".into(),
+                        tier: 0,
+                        rpm: None,
+                        tpm: None,
+                        budget_usd: None,
+                        budget_window_secs: None,
+                        budget_allow_unpriced: false,
+                    },
+                ),
+            )
+            .unwrap();
+        let competing_legacy = second
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 2,
+                    permits: 1,
+                    payload: serde_json::json!({"id":"legacy"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let (scoped_result, legacy_result) =
+            tokio::join!(first.enqueue(&scoped), second.enqueue(&competing_legacy));
+        assert_eq!(
+            usize::from(scoped_result.is_ok()) + usize::from(legacy_result.is_ok()),
+            1
+        );
+        let mut connection = first.conn.clone();
+        let legacy_depth: u64 = connection
+            .zcard(protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider))
+            .await
+            .unwrap();
+        let scoped_depth: u64 = connection
+            .zcard(protocol_queue_key(QueueProtocol::ScopedV1, &provider))
+            .await
+            .unwrap();
+        assert_eq!(legacy_depth + scoped_depth, 2);
+        for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
+            let _: i64 = connection
+                .del(protocol_queue_key(protocol, &provider))
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
