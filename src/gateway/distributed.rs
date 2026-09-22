@@ -76,6 +76,15 @@ enum QueueProtocol {
 
 fn protocol_key(protocol: QueueProtocol, kind: &str, identifier: &str) -> String {
     match protocol {
+        QueueProtocol::LegacyUnscoped => {
+            format!("llmshim:gw:fenced:v1:{kind}:{identifier}")
+        }
+        QueueProtocol::ScopedV1 => format!("llmshim:gw:scoped:v2:{kind}:{identifier}"),
+    }
+}
+
+fn released_protocol_key(protocol: QueueProtocol, kind: &str, identifier: &str) -> String {
+    match protocol {
         QueueProtocol::LegacyUnscoped => format!("llmshim:gw:{kind}:{identifier}"),
         QueueProtocol::ScopedV1 => format!("llmshim:gw:scoped:v1:{kind}:{identifier}"),
     }
@@ -90,8 +99,21 @@ fn protocol_processing_key(protocol: QueueProtocol, provider: &str) -> String {
 fn protocol_leased_key(protocol: QueueProtocol, provider: &str) -> String {
     protocol_key(protocol, "leased", provider)
 }
+fn protocol_owners_key(protocol: QueueProtocol, provider: &str) -> String {
+    protocol_key(protocol, "owners", provider)
+}
 fn protocol_response_channel(protocol: QueueProtocol, id: &str) -> String {
     protocol_key(protocol, "resp", id)
+}
+fn released_queue_key(protocol: QueueProtocol, provider: &str) -> String {
+    released_protocol_key(protocol, "q", provider)
+}
+#[cfg(test)]
+fn released_processing_key(protocol: QueueProtocol, provider: &str) -> String {
+    released_protocol_key(protocol, "proc", provider)
+}
+fn released_dlq_key(protocol: QueueProtocol, provider: &str) -> String {
+    released_protocol_key(protocol, "dlq", provider)
 }
 
 #[cfg(test)]
@@ -118,7 +140,7 @@ fn generic_idempotency_key(client_key: &str) -> String {
 
 // Atomic lease: pop the earliest-deadline job, move it to `processing` with a
 // visibility deadline, and record its score for redelivery. KEYS: queue,
-// processing, leased. ARGV: visibility_deadline_ms.
+// processing, leased, owners. ARGV: visibility_deadline_ms, owner_token.
 const LEASE_LUA: &str = r#"
     local top = redis.call('ZPOPMIN', KEYS[1], 1)
     if #top == 0 then return false end
@@ -126,27 +148,33 @@ const LEASE_LUA: &str = r#"
     local s = top[2]
     redis.call('ZADD', KEYS[2], ARGV[1], m)
     redis.call('HSET', KEYS[3], m, s)
+    redis.call('HSET', KEYS[4], m, ARGV[2])
     return {m, s}
 "#;
 
-// Ack a completed job. KEYS: processing, leased. ARGV: member.
+// Ack only the caller's delivery. KEYS: processing, leased, owners.
+// ARGV: member, owner_token.
 const ACK_LUA: &str = r#"
+    if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 0 end
     redis.call('ZREM', KEYS[1], ARGV[1])
     redis.call('HDEL', KEYS[2], ARGV[1])
-    return 1
-"#;
-
-// Release a lease back to the queue (e.g. rate-limited), keeping its score.
-// KEYS: queue, processing, leased. ARGV: member, score.
-const RELEASE_LUA: &str = r#"
-    redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
-    redis.call('ZREM', KEYS[2], ARGV[1])
     redis.call('HDEL', KEYS[3], ARGV[1])
     return 1
 "#;
 
+// Release a lease back to the queue (e.g. rate-limited), keeping its score.
+// KEYS: queue, processing, leased, owners. ARGV: member, score, owner_token.
+const RELEASE_LUA: &str = r#"
+    if redis.call('HGET', KEYS[4], ARGV[1]) ~= ARGV[3] then return 0 end
+    redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+    redis.call('ZREM', KEYS[2], ARGV[1])
+    redis.call('HDEL', KEYS[3], ARGV[1])
+    redis.call('HDEL', KEYS[4], ARGV[1])
+    return 1
+"#;
+
 // Reap expired leases back to the queue with their original score. KEYS:
-// processing, queue, leased. ARGV: now_ms, limit.
+// processing, queue, leased, owners. ARGV: now_ms, limit.
 const REAP_LUA: &str = r#"
     local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
     local n = 0
@@ -155,9 +183,59 @@ const REAP_LUA: &str = r#"
         if s then redis.call('ZADD', KEYS[2], s, m) end
         redis.call('ZREM', KEYS[1], m)
         redis.call('HDEL', KEYS[3], m)
+        redis.call('HDEL', KEYS[4], m)
         n = n + 1
     end
     return n
+"#;
+
+// Extend only the caller's current delivery. KEYS: processing, owners.
+// ARGV: member, owner_token, visibility_deadline_ms.
+const REFRESH_LUA: &str = r#"
+    if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return 0 end
+    if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
+    redis.call('ZADD', KEYS[1], 'XX', ARGV[3], ARGV[1])
+    return 1
+"#;
+
+// Publish only while the caller owns the current delivery. KEYS: processing,
+// owners. ARGV: member, owner_token, channel, payload. A zero subscriber count
+// is still a successful fenced publish.
+const PUBLISH_LUA: &str = r#"
+    if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return -1 end
+    if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return -1 end
+    return redis.call('PUBLISH', ARGV[3], ARGV[4])
+"#;
+
+// Complete only the caller's delivery and install the done marker atomically.
+// KEYS: processing, leased, owners, done. ARGV: member, owner_token, ttl_secs.
+const COMPLETE_LUA: &str = r#"
+    if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 0 end
+    if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
+    redis.call('SET', KEYS[4], 1, 'EX', ARGV[3])
+    redis.call('ZREM', KEYS[1], ARGV[1])
+    redis.call('HDEL', KEYS[2], ARGV[1])
+    redis.call('HDEL', KEYS[3], ARGV[1])
+    return 1
+"#;
+
+// Move only the caller's delivery to the DLQ. Retention policy remains a
+// separate concern. KEYS: processing, leased, owners, dlq.
+// ARGV: member, owner_token.
+const DEAD_LETTER_LUA: &str = r#"
+    if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 0 end
+    if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
+    redis.call('LPUSH', KEYS[4], ARGV[1])
+    redis.call('ZREM', KEYS[1], ARGV[1])
+    redis.call('HDEL', KEYS[2], ARGV[1])
+    redis.call('HDEL', KEYS[3], ARGV[1])
+    return 1
+"#;
+
+const BUMP_ATTEMPTS_LUA: &str = r#"
+    local delivery_attempts = redis.call('INCR', KEYS[1])
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+    return delivery_attempts
 "#;
 
 /// A queued unit of work, serialized into the Redis sorted set.
@@ -191,6 +269,15 @@ pub(crate) struct PreparedSubmission {
 pub(crate) struct AcceptedSubmission {
     prepared: PreparedSubmission,
     pubsub: redis::aio::PubSub,
+}
+
+#[derive(Clone)]
+struct LeaseOwnership {
+    protocol: QueueProtocol,
+    provider: String,
+    member: String,
+    original_score: String,
+    owner_token: String,
 }
 
 impl PreparedSubmission {
@@ -261,6 +348,13 @@ pub struct DistributedGateway {
     ack: redis::Script,
     release: redis::Script,
     reap: redis::Script,
+    refresh: redis::Script,
+    fenced_publish: redis::Script,
+    complete: redis::Script,
+    dead_letter_transition: redis::Script,
+    bump_attempts_script: redis::Script,
+    redis_operation_timeout: Duration,
+    worker_job_timeout: Duration,
 }
 
 impl DistributedGateway {
@@ -302,6 +396,16 @@ impl DistributedGateway {
         let client = redis::Client::open(redis_url)?;
         let conn = ConnectionManager::new(client.clone()).await?;
         let nonce = uuid::Uuid::new_v4().as_u128();
+        let configured_redis_operation_timeout = positive_duration_from_env(
+            "LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS",
+            Duration::from_secs(5),
+        );
+        let redis_operation_timeout = configured_redis_operation_timeout
+            .min((config.lease_timeout / 4).max(Duration::from_millis(1)));
+        let worker_job_timeout = positive_duration_from_env(
+            "LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS",
+            Duration::from_secs(6 * 60 * 60),
+        );
         Ok(Arc::new(Self {
             client,
             conn,
@@ -315,6 +419,13 @@ impl DistributedGateway {
             ack: redis::Script::new(ACK_LUA),
             release: redis::Script::new(RELEASE_LUA),
             reap: redis::Script::new(REAP_LUA),
+            refresh: redis::Script::new(REFRESH_LUA),
+            fenced_publish: redis::Script::new(PUBLISH_LUA),
+            complete: redis::Script::new(COMPLETE_LUA),
+            dead_letter_transition: redis::Script::new(DEAD_LETTER_LUA),
+            bump_attempts_script: redis::Script::new(BUMP_ATTEMPTS_LUA),
+            redis_operation_timeout,
+            worker_job_timeout,
         }))
     }
 
@@ -408,7 +519,21 @@ impl DistributedGateway {
                 .zcard(protocol_queue_key(QueueProtocol::ScopedV1, p))
                 .await
                 .unwrap_or(0);
-            out.push((p.clone(), legacy.saturating_add(scoped) as usize));
+            let released_unscoped: u64 = conn
+                .zcard(released_queue_key(QueueProtocol::LegacyUnscoped, p))
+                .await
+                .unwrap_or(0);
+            let released_scoped: u64 = conn
+                .zcard(released_queue_key(QueueProtocol::ScopedV1, p))
+                .await
+                .unwrap_or(0);
+            out.push((
+                p.clone(),
+                legacy
+                    .saturating_add(scoped)
+                    .saturating_add(released_unscoped)
+                    .saturating_add(released_scoped) as usize,
+            ));
         }
         out
     }
@@ -438,8 +563,12 @@ impl DistributedGateway {
             deadline_score(descriptor.tier, descriptor.enqueue_ms, self.aging_step_ms());
         let admitted = admission::enqueue(
             &mut connection,
-            &provider_queue_key,
-            &other_provider_queue_key,
+            [
+                &provider_queue_key,
+                &other_provider_queue_key,
+                &released_queue_key(QueueProtocol::LegacyUnscoped, &descriptor.provider),
+                &released_queue_key(QueueProtocol::ScopedV1, &descriptor.provider),
+            ],
             self.config.max_queue_depth,
             priority_score,
             &prepared_submission.member,
@@ -623,34 +752,28 @@ impl DistributedGateway {
         (self.config.lease_timeout.as_secs() * 3).max(60)
     }
 
-    async fn is_done(&self, protocol: QueueProtocol, id: &str) -> bool {
+    async fn is_done(&self, protocol: QueueProtocol, id: &str) -> Option<bool> {
         let mut conn = self.conn.clone();
-        conn.exists(protocol_done_key(protocol, id))
-            .await
-            .unwrap_or(false)
-    }
-
-    async fn mark_done(&self, protocol: QueueProtocol, id: &str) {
-        let mut conn = self.conn.clone();
-        let _: Result<(), _> = conn
-            .set_ex(protocol_done_key(protocol, id), 1, self.marker_ttl_secs())
-            .await;
+        tokio::time::timeout(
+            self.redis_operation_timeout,
+            conn.exists(protocol_done_key(protocol, id)),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
     }
 
     /// Increment and return this job's delivery-attempt count.
-    async fn bump_attempts(&self, protocol: QueueProtocol, id: &str) -> u32 {
+    async fn bump_attempts(&self, protocol: QueueProtocol, id: &str) -> Option<u32> {
         let mut conn = self.conn.clone();
         let key = protocol_attempts_key(protocol, id);
-        let n: u64 = conn.incr(&key, 1).await.unwrap_or(1);
-        let _: Result<bool, _> = conn.expire(&key, self.marker_ttl_secs() as i64).await;
-        n as u32
-    }
-
-    async fn dead_letter(&self, protocol: QueueProtocol, provider: &str, member: &str) {
-        let mut conn = self.conn.clone();
-        let _: Result<i64, _> = conn
-            .lpush(protocol_dlq_key(protocol, provider), member)
-            .await;
+        let mut invocation = self.bump_attempts_script.key(key);
+        invocation.arg(self.marker_ttl_secs());
+        let operation = invocation.invoke_async::<u32>(&mut conn);
+        tokio::time::timeout(self.redis_operation_timeout, operation)
+            .await
+            .ok()
+            .and_then(Result::ok)
     }
 
     /// Number of dead-lettered jobs for a provider (introspection).
@@ -664,7 +787,18 @@ impl DistributedGateway {
             .llen(protocol_dlq_key(QueueProtocol::ScopedV1, provider))
             .await
             .unwrap_or(0);
-        legacy.saturating_add(scoped) as usize
+        let released_unscoped: u64 = conn
+            .llen(released_dlq_key(QueueProtocol::LegacyUnscoped, provider))
+            .await
+            .unwrap_or(0);
+        let released_scoped: u64 = conn
+            .llen(released_dlq_key(QueueProtocol::ScopedV1, provider))
+            .await
+            .unwrap_or(0);
+        legacy
+            .saturating_add(scoped)
+            .saturating_add(released_unscoped)
+            .saturating_add(released_scoped) as usize
     }
 
     async fn remove_from_queue(&self, prepared: &PreparedSubmission) {
@@ -716,107 +850,188 @@ impl DistributedGateway {
                 Ok(permit) => permit,
                 Err(_) => break,
             };
-            let deadline = now_ms() + self.config.lease_timeout.as_millis() as u64;
-            let leased: Option<(String, String)> = match self
-                .lease
-                .key(&qkey)
+            let owner_token = uuid::Uuid::new_v4().simple().to_string();
+            let deadline = now_ms().saturating_add(self.config.lease_timeout.as_millis() as u64);
+            let mut lease_invocation = self.lease.key(&qkey);
+            lease_invocation
                 .key(&pkey)
                 .key(&lkey)
+                .key(protocol_owners_key(protocol, &provider))
                 .arg(deadline)
-                .invoke_async(&mut conn)
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    drop(preparation_permit);
-                    eprintln!("gateway worker[{provider}]: lease error: {e}");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
+                .arg(&owner_token);
+            let lease_operation = lease_invocation.invoke_async(&mut conn);
+            let leased: Option<(String, String)> =
+                match tokio::time::timeout(self.redis_operation_timeout, lease_operation).await {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => {
+                        drop(preparation_permit);
+                        eprintln!("gateway worker[{provider}]: lease error: {error}");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    Err(_) => {
+                        drop(preparation_permit);
+                        eprintln!("gateway worker[{provider}]: lease operation timed out");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
             let Some((member, score)) = leased else {
                 drop(preparation_permit);
                 tokio::time::sleep(IDLE_POLL).await; // queue empty
                 continue;
             };
-            let desc: JobDescriptor = match serde_json::from_str(&member) {
-                Ok(d) => d,
-                Err(_) => {
-                    self.ack_lease(protocol, &provider, &member).await;
-                    continue;
-                }
+            let ownership = LeaseOwnership {
+                protocol,
+                provider: provider.clone(),
+                member,
+                original_score: score,
+                owner_token,
             };
+            let me = self.clone();
+            let rate_key = rate_key.clone();
+            tokio::spawn(async move {
+                let _preparation_permit = preparation_permit;
+                me.execute_leased_job(ownership, rate_key).await;
+            });
+        }
+    }
 
-            if !descriptor_matches_protocol(protocol, &desc) {
-                self.publish(
-                    &protocol_response_channel(protocol, &desc.id),
-                    &BusMessage::Error("llmshim-coordinator-unavailable".into()),
-                )
-                .await;
-                self.mark_done(protocol, &desc.id).await;
-                self.ack_lease(protocol, &provider, &member).await;
-                continue;
-            }
+    async fn execute_leased_job(&self, ownership: LeaseOwnership, rate_key: RateKey) {
+        enum LeasedJobOutcome {
+            Finished,
+            OwnershipLost,
+            DeadlineExceeded,
+        }
 
-            // Idempotency: a job that already completed (then got redelivered by
-            // the reaper) is skipped.
-            if self.is_done(protocol, &desc.id).await {
-                self.ack_lease(protocol, &provider, &member).await;
-                continue;
-            }
-            // Poison-job guard: dead-letter after too many delivery attempts.
-            let attempts = self.bump_attempts(protocol, &desc.id).await;
-            if attempts > self.config.max_attempts {
+        let mut job = Box::pin(self.process_leased_job(&ownership, rate_key));
+        let mut heartbeat = Box::pin(self.heartbeat_lease(&ownership));
+        let mut deadline = Box::pin(tokio::time::sleep(self.worker_job_timeout));
+        let outcome = tokio::select! {
+            biased;
+            _ = &mut job => LeasedJobOutcome::Finished,
+            _ = &mut heartbeat => LeasedJobOutcome::OwnershipLost,
+            _ = &mut deadline => LeasedJobOutcome::DeadlineExceeded,
+        };
+
+        drop(job);
+        drop(heartbeat);
+        drop(deadline);
+
+        match outcome {
+            LeasedJobOutcome::Finished => {}
+            LeasedJobOutcome::OwnershipLost => {
                 eprintln!(
-                    "gateway worker[{provider}]: dead-lettering job {} after {attempts} attempts",
-                    desc.id
+                    "gateway worker[{}]: lease ownership lost; abandoning local work",
+                    ownership.provider
                 );
-                self.dead_letter(protocol, &provider, &member).await;
-                self.ack_lease(protocol, &provider, &member).await;
-                crate::gateway::metrics::incr(
-                    crate::gateway::metrics::REJECTED,
-                    &[("provider", &provider), ("reason", "dead_letter")],
-                );
-                continue;
             }
-
-            let policy_gated = desc.policy_scope.is_some();
-            let rate_admission = if policy_gated {
-                Ok(())
-            } else {
-                self.limiter.acquire(&rate_key, desc.permits).await
-            };
-            match rate_admission {
-                Ok(()) => {
-                    let me = self.clone();
-                    tokio::spawn(async move {
-                        let _preparation_permit = preparation_permit;
-                        me.run_and_publish(protocol, desc, member).await;
-                    });
-                }
-                Err(RetryAfter(wait)) => {
-                    drop(preparation_permit);
-                    // Release the lease back to the queue (priority preserved).
-                    let _: Result<i64, _> = self
-                        .release
-                        .key(&qkey)
-                        .key(&pkey)
-                        .key(&lkey)
-                        .arg(&member)
-                        .arg(&score)
-                        .invoke_async(&mut conn)
-                        .await;
-                    tokio::time::sleep(wait.min(Duration::from_millis(500))).await;
+            LeasedJobOutcome::DeadlineExceeded => {
+                let descriptor: Option<JobDescriptor> =
+                    serde_json::from_str(&ownership.member).ok();
+                if let Some(descriptor) = descriptor {
+                    let channel = protocol_response_channel(ownership.protocol, &descriptor.id);
+                    if self
+                        .publish_owned(
+                            &ownership,
+                            &channel,
+                            &BusMessage::Error("distributed worker deadline exceeded".into()),
+                        )
+                        .await
+                    {
+                        let _ = self.complete_owned(&ownership, &descriptor.id).await;
+                    }
+                } else {
+                    let _ = self.ack_owned(&ownership).await;
                 }
             }
         }
     }
 
-    /// Dispatch a leased job, publish result(s) to its channel, then mark it done
-    /// (idempotency) and ack the lease.
-    async fn run_and_publish(&self, protocol: QueueProtocol, desc: JobDescriptor, member: String) {
+    async fn heartbeat_lease(&self, ownership: &LeaseOwnership) {
+        let heartbeat_interval = (self.config.lease_timeout / 3).max(Duration::from_millis(1));
+        loop {
+            tokio::time::sleep(heartbeat_interval).await;
+            if !self.refresh_owned(ownership).await {
+                return;
+            }
+        }
+    }
+
+    async fn process_leased_job(&self, ownership: &LeaseOwnership, rate_key: RateKey) {
+        let descriptor: JobDescriptor = match serde_json::from_str(&ownership.member) {
+            Ok(descriptor) => descriptor,
+            Err(_) => {
+                let _ = self.ack_owned(ownership).await;
+                return;
+            }
+        };
+
+        if !descriptor_matches_protocol(ownership.protocol, &descriptor) {
+            let channel = protocol_response_channel(ownership.protocol, &descriptor.id);
+            if self
+                .publish_owned(
+                    ownership,
+                    &channel,
+                    &BusMessage::Error("llmshim-coordinator-unavailable".into()),
+                )
+                .await
+            {
+                let _ = self.complete_owned(ownership, &descriptor.id).await;
+            }
+            return;
+        }
+
+        match self.is_done(ownership.protocol, &descriptor.id).await {
+            Some(true) => {
+                let _ = self.ack_owned(ownership).await;
+                return;
+            }
+            Some(false) => {}
+            None => return,
+        }
+
+        let Some(delivery_attempts) = self.bump_attempts(ownership.protocol, &descriptor.id).await
+        else {
+            return;
+        };
+        if delivery_attempts > self.config.max_attempts {
+            eprintln!(
+                "gateway worker[{}]: dead-lettering job {} after {delivery_attempts} attempts",
+                ownership.provider, descriptor.id
+            );
+            if self.dead_letter_owned(ownership).await {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::REJECTED,
+                    &[
+                        ("provider", ownership.provider.as_str()),
+                        ("reason", "dead_letter"),
+                    ],
+                );
+            }
+            return;
+        }
+
+        let policy_gated = descriptor.policy_scope.is_some();
+        let rate_admission = if policy_gated {
+            Ok(())
+        } else {
+            self.limiter.acquire(&rate_key, descriptor.permits).await
+        };
+        if let Err(RetryAfter(wait)) = rate_admission {
+            tokio::time::sleep(wait.min(Duration::from_millis(500))).await;
+            let _ = self.release_owned(ownership).await;
+            return;
+        }
+
+        self.run_and_publish(ownership, descriptor).await;
+    }
+
+    /// Dispatch a leased job and terminate it only while this delivery still owns
+    /// the lease.
+    async fn run_and_publish(&self, ownership: &LeaseOwnership, desc: JobDescriptor) {
         use crate::gateway::metrics;
-        let channel = protocol_response_channel(protocol, &desc.id);
+        let channel = protocol_response_channel(ownership.protocol, &desc.id);
         let provider = desc.provider.clone();
         let plabels: &[(&str, &str)] = &[("provider", &provider)];
         let _inflight = metrics::inflight(&provider);
@@ -830,12 +1045,16 @@ impl DistributedGateway {
         let policy_context = match (&desc.policy_scope, &self.attempt_coordinator) {
             (Some(scope), Some(coordinator)) => Some(coordinator.context(scope.clone())),
             (Some(_), None) => {
-                self.publish(
-                    &channel,
-                    &BusMessage::Error("llmshim-coordinator-unavailable".into()),
-                )
-                .await;
-                self.ack_lease(protocol, &provider, &member).await;
+                if self
+                    .publish_owned(
+                        ownership,
+                        &channel,
+                        &BusMessage::Error("llmshim-coordinator-unavailable".into()),
+                    )
+                    .await
+                {
+                    let _ = self.complete_owned(ownership, &desc.id).await;
+                }
                 return;
             }
             (None, _) => None,
@@ -855,25 +1074,24 @@ impl DistributedGateway {
                 Ok(mut upstream) => {
                     metrics::incr(metrics::DISPATCHED, plabels);
                     use futures::StreamExt;
-                    let refresh_every = (self.config.lease_timeout / 3).max(Duration::from_secs(1));
-                    let mut next_refresh = now_ms() + refresh_every.as_millis() as u64;
                     while let Some(item) = upstream.next().await {
                         let (msg, stop) = match item {
                             Ok(chunk) => (BusMessage::Chunk(chunk), false),
                             Err(e) => (BusMessage::Error(e.to_string()), true),
                         };
-                        self.publish(&channel, &msg).await;
+                        if !self.publish_owned(ownership, &channel, &msg).await {
+                            return;
+                        }
                         if stop {
                             break;
                         }
-                        // Keep the lease alive so the reaper doesn't redeliver a
-                        // long-running stream mid-flight.
-                        if now_ms() >= next_refresh {
-                            self.refresh_lease(protocol, &provider, &member).await;
-                            next_refresh = now_ms() + refresh_every.as_millis() as u64;
-                        }
                     }
-                    self.publish(&channel, &BusMessage::End).await;
+                    if !self
+                        .publish_owned(ownership, &channel, &BusMessage::End)
+                        .await
+                    {
+                        return;
+                    }
                     metrics::observe_ms(
                         metrics::UPSTREAM_LATENCY,
                         plabels,
@@ -888,8 +1106,12 @@ impl DistributedGateway {
                     if !policy_gated {
                         self.penalize_if_429(&provider, &err).await;
                     }
-                    self.publish(&channel, &BusMessage::Error(err.message))
-                        .await;
+                    if !self
+                        .publish_owned(ownership, &channel, &BusMessage::Error(err.message))
+                        .await
+                    {
+                        return;
+                    }
                 }
             }
         } else {
@@ -922,44 +1144,137 @@ impl DistributedGateway {
                     BusMessage::Error(err.message)
                 }
             };
-            self.publish(&channel, &msg).await;
+            if !self.publish_owned(ownership, &channel, &msg).await {
+                return;
+            }
         }
 
-        // Idempotency marker so a late redelivery of this (now-complete) job is
-        // skipped, then release the lease.
-        self.mark_done(protocol, &desc.id).await;
-        self.ack_lease(protocol, &provider, &member).await;
+        let _ = self.complete_owned(ownership, &desc.id).await;
     }
 
-    async fn publish(&self, channel: &str, msg: &BusMessage) {
-        if let Ok(payload) = serde_json::to_string(msg) {
-            let mut conn = self.conn.clone();
-            let _: Result<i64, _> = conn.publish(channel, payload).await;
-        }
+    async fn publish_owned(
+        &self,
+        ownership: &LeaseOwnership,
+        channel: &str,
+        message: &BusMessage,
+    ) -> bool {
+        let Ok(payload) = serde_json::to_string(message) else {
+            return false;
+        };
+        let mut connection = self.conn.clone();
+        let mut invocation = self.fenced_publish.key(protocol_processing_key(
+            ownership.protocol,
+            &ownership.provider,
+        ));
+        invocation
+            .key(protocol_owners_key(ownership.protocol, &ownership.provider))
+            .arg(&ownership.member)
+            .arg(&ownership.owner_token)
+            .arg(channel)
+            .arg(payload);
+        let operation = invocation.invoke_async::<i64>(&mut connection);
+        matches!(
+            tokio::time::timeout(self.redis_operation_timeout, operation).await,
+            Ok(Ok(subscriber_count)) if subscriber_count >= 0
+        )
     }
 
-    async fn ack_lease(&self, protocol: QueueProtocol, provider: &str, member: &str) {
-        let mut conn = self.conn.clone();
-        let _: Result<i64, _> = self
-            .ack
-            .key(protocol_processing_key(protocol, provider))
-            .key(protocol_leased_key(protocol, provider))
-            .arg(member)
-            .invoke_async(&mut conn)
-            .await;
+    async fn ack_owned(&self, ownership: &LeaseOwnership) -> bool {
+        let mut connection = self.conn.clone();
+        let mut invocation = self.ack.key(protocol_processing_key(
+            ownership.protocol,
+            &ownership.provider,
+        ));
+        invocation
+            .key(protocol_leased_key(ownership.protocol, &ownership.provider))
+            .key(protocol_owners_key(ownership.protocol, &ownership.provider))
+            .arg(&ownership.member)
+            .arg(&ownership.owner_token);
+        let operation = invocation.invoke_async::<i64>(&mut connection);
+        matches!(
+            tokio::time::timeout(self.redis_operation_timeout, operation).await,
+            Ok(Ok(1))
+        )
     }
 
-    async fn refresh_lease(&self, protocol: QueueProtocol, provider: &str, member: &str) {
-        let deadline = now_ms() + self.config.lease_timeout.as_millis() as u64;
-        let mut conn = self.conn.clone();
-        // XX: only refresh if still leased (not acked/reaped).
-        let _: Result<i64, _> = redis::cmd("ZADD")
-            .arg(protocol_processing_key(protocol, provider))
-            .arg("XX")
-            .arg(deadline)
-            .arg(member)
-            .query_async(&mut conn)
-            .await;
+    async fn refresh_owned(&self, ownership: &LeaseOwnership) -> bool {
+        let deadline = now_ms().saturating_add(self.config.lease_timeout.as_millis() as u64);
+        let mut connection = self.conn.clone();
+        let mut invocation = self.refresh.key(protocol_processing_key(
+            ownership.protocol,
+            &ownership.provider,
+        ));
+        invocation
+            .key(protocol_owners_key(ownership.protocol, &ownership.provider))
+            .arg(&ownership.member)
+            .arg(&ownership.owner_token)
+            .arg(deadline);
+        let operation = invocation.invoke_async::<i64>(&mut connection);
+        matches!(
+            tokio::time::timeout(self.redis_operation_timeout, operation).await,
+            Ok(Ok(1))
+        )
+    }
+
+    async fn release_owned(&self, ownership: &LeaseOwnership) -> bool {
+        let mut connection = self.conn.clone();
+        let mut invocation = self
+            .release
+            .key(protocol_queue_key(ownership.protocol, &ownership.provider));
+        invocation
+            .key(protocol_processing_key(
+                ownership.protocol,
+                &ownership.provider,
+            ))
+            .key(protocol_leased_key(ownership.protocol, &ownership.provider))
+            .key(protocol_owners_key(ownership.protocol, &ownership.provider))
+            .arg(&ownership.member)
+            .arg(&ownership.original_score)
+            .arg(&ownership.owner_token);
+        let operation = invocation.invoke_async::<i64>(&mut connection);
+        matches!(
+            tokio::time::timeout(self.redis_operation_timeout, operation).await,
+            Ok(Ok(1))
+        )
+    }
+
+    async fn complete_owned(&self, ownership: &LeaseOwnership, id: &str) -> bool {
+        let mut connection = self.conn.clone();
+        let mut invocation = self.complete.key(protocol_processing_key(
+            ownership.protocol,
+            &ownership.provider,
+        ));
+        invocation
+            .key(protocol_leased_key(ownership.protocol, &ownership.provider))
+            .key(protocol_owners_key(ownership.protocol, &ownership.provider))
+            .key(protocol_done_key(ownership.protocol, id))
+            .arg(&ownership.member)
+            .arg(&ownership.owner_token)
+            .arg(self.marker_ttl_secs());
+        let operation = invocation.invoke_async::<i64>(&mut connection);
+        matches!(
+            tokio::time::timeout(self.redis_operation_timeout, operation).await,
+            Ok(Ok(1))
+        )
+    }
+
+    async fn dead_letter_owned(&self, ownership: &LeaseOwnership) -> bool {
+        let mut connection = self.conn.clone();
+        let mut invocation = self.dead_letter_transition.key(protocol_processing_key(
+            ownership.protocol,
+            &ownership.provider,
+        ));
+        invocation
+            .key(protocol_leased_key(ownership.protocol, &ownership.provider))
+            .key(protocol_owners_key(ownership.protocol, &ownership.provider))
+            .key(protocol_dlq_key(ownership.protocol, &ownership.provider))
+            .arg(&ownership.member)
+            .arg(&ownership.owner_token);
+        let operation = invocation.invoke_async::<i64>(&mut connection);
+        matches!(
+            tokio::time::timeout(self.redis_operation_timeout, operation).await,
+            Ok(Ok(1))
+        )
     }
 
     async fn penalize_if_429(&self, provider: &str, err: &super::DispatchError) {
@@ -973,7 +1288,7 @@ impl DistributedGateway {
     /// Run the reaper loop: periodically requeue leases whose visibility deadline
     /// has passed (a crashed or stuck worker).
     async fn reaper(self: Arc<Self>, providers: Vec<String>) {
-        let interval = (self.config.lease_timeout / 3).max(Duration::from_secs(1));
+        let interval = (self.config.lease_timeout / 3).max(Duration::from_millis(1));
         loop {
             tokio::time::sleep(interval).await;
             for provider in &providers {
@@ -1004,16 +1319,29 @@ impl DistributedGateway {
 
     async fn reap_once_protocol(&self, protocol: QueueProtocol, provider: &str) -> i64 {
         let mut conn = self.conn.clone();
-        self.reap
-            .key(protocol_processing_key(protocol, provider))
+        let mut invocation = self.reap.key(protocol_processing_key(protocol, provider));
+        invocation
             .key(protocol_queue_key(protocol, provider))
             .key(protocol_leased_key(protocol, provider))
+            .key(protocol_owners_key(protocol, provider))
             .arg(now_ms())
-            .arg(256)
-            .invoke_async(&mut conn)
+            .arg(256);
+        let operation = invocation.invoke_async(&mut conn);
+        tokio::time::timeout(self.redis_operation_timeout, operation)
             .await
+            .ok()
+            .and_then(Result::ok)
             .unwrap_or(0)
     }
+}
+
+fn positive_duration_from_env(name: &str, fallback: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|milliseconds| *milliseconds > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(fallback)
 }
 
 /// Wrap any error as a gateway upstream error (redis failures fail the request,
@@ -1236,6 +1564,72 @@ mod tests {
         }
     }
 
+    struct QuietStreamDispatch {
+        dispatch_starts: Arc<std::sync::atomic::AtomicUsize>,
+        dispatch_started: Arc<tokio::sync::Notify>,
+        release_streams: Arc<Semaphore>,
+    }
+
+    struct PendingDispatch {
+        dispatch_starts: Arc<std::sync::atomic::AtomicUsize>,
+        dispatch_started: Arc<tokio::sync::Notify>,
+        dispatch_drops: Arc<std::sync::atomic::AtomicUsize>,
+        dispatch_dropped: Arc<tokio::sync::Notify>,
+    }
+
+    struct DispatchDropGuard {
+        dispatch_drops: Arc<std::sync::atomic::AtomicUsize>,
+        dispatch_dropped: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for DispatchDropGuard {
+        fn drop(&mut self) {
+            self.dispatch_drops
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.dispatch_dropped.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Dispatch for PendingDispatch {
+        async fn dispatch(&self, _provider: &str, _payload: Value) -> Result<Value, DispatchError> {
+            self.dispatch_starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.dispatch_started.notify_one();
+            let _drop_guard = DispatchDropGuard {
+                dispatch_drops: self.dispatch_drops.clone(),
+                dispatch_dropped: self.dispatch_dropped.clone(),
+            };
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Dispatch for QuietStreamDispatch {
+        async fn dispatch(&self, _provider: &str, _payload: Value) -> Result<Value, DispatchError> {
+            unreachable!("quiet stream fixture only dispatches streams")
+        }
+
+        async fn dispatch_stream(
+            &self,
+            _provider: &str,
+            _payload: Value,
+        ) -> Result<super::super::ChunkStream, DispatchError> {
+            self.dispatch_starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.dispatch_started.notify_one();
+            let release_streams = self.release_streams.clone();
+            Ok(Box::pin(futures::stream::once(async move {
+                release_streams
+                    .acquire()
+                    .await
+                    .expect("test release semaphore remains open")
+                    .forget();
+                Ok("terminal".into())
+            })))
+        }
+    }
+
     fn unlimited() -> Arc<dyn RateLimiter> {
         Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default()))
     }
@@ -1249,6 +1643,7 @@ mod tests {
             queue_key(provider_seed),
             processing_key(provider_seed),
             leased_key(provider_seed),
+            protocol_owners_key(QueueProtocol::LegacyUnscoped, provider_seed),
         ] {
             let _: Result<i64, _> = conn.del(k).await;
         }
@@ -1364,7 +1759,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        first.enqueue(&existing).await.unwrap();
+        let mut connection = first.conn.clone();
+        let released_queue = released_queue_key(QueueProtocol::LegacyUnscoped, &provider);
+        let _: () = connection
+            .zadd(&released_queue, &existing.member, 0_u64)
+            .await
+            .unwrap();
         let scoped = first
             .prepare_with_policy(
                 GatewayRequest {
@@ -1405,7 +1805,6 @@ mod tests {
             usize::from(scoped_result.is_ok()) + usize::from(legacy_result.is_ok()),
             1
         );
-        let mut connection = first.conn.clone();
         let legacy_depth: u64 = connection
             .zcard(protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider))
             .await
@@ -1414,13 +1813,16 @@ mod tests {
             .zcard(protocol_queue_key(QueueProtocol::ScopedV1, &provider))
             .await
             .unwrap();
-        assert_eq!(legacy_depth + scoped_depth, 2);
+        let released_depth: u64 = connection.zcard(&released_queue).await.unwrap();
+        assert_eq!(legacy_depth + scoped_depth, 1);
+        assert_eq!(released_depth, 1);
         for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
             let _: i64 = connection
                 .del(protocol_queue_key(protocol, &provider))
                 .await
                 .unwrap();
         }
+        let _: i64 = connection.del(released_queue).await.unwrap();
     }
 
     #[tokio::test]
@@ -1537,15 +1939,22 @@ mod tests {
         assert!(released.policy_scope.is_some());
 
         let mut connection = gateway.conn.clone();
-        let legacy_queue = protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider);
+        let legacy_queue = released_queue_key(QueueProtocol::LegacyUnscoped, &provider);
+        let legacy_processing = released_processing_key(QueueProtocol::LegacyUnscoped, &provider);
+        let legacy_leased =
+            released_protocol_key(QueueProtocol::LegacyUnscoped, "leased", &provider);
         let scoped_queue = protocol_queue_key(QueueProtocol::ScopedV1, &provider);
         let scoped_processing = protocol_processing_key(QueueProtocol::ScopedV1, &provider);
         let scoped_leased = protocol_leased_key(QueueProtocol::ScopedV1, &provider);
+        let scoped_owners = protocol_owners_key(QueueProtocol::ScopedV1, &provider);
         for key in [
             legacy_queue.clone(),
+            legacy_processing.clone(),
+            legacy_leased.clone(),
             scoped_queue.clone(),
             scoped_processing.clone(),
             scoped_leased.clone(),
+            scoped_owners.clone(),
         ] {
             let _: i64 = connection.del(key).await.unwrap();
         }
@@ -1553,17 +1962,19 @@ mod tests {
         assert_eq!(connection.zcard::<_, u64>(&legacy_queue).await.unwrap(), 0);
         assert_eq!(connection.zcard::<_, u64>(&scoped_queue).await.unwrap(), 1);
 
-        let released_worker_lease: Option<(String, String)> = gateway
-            .lease
+        let released_lease = redis::Script::new(
+            r#"
+            local top = redis.call('ZPOPMIN', KEYS[1], 1)
+            if #top == 0 then return false end
+            redis.call('ZADD', KEYS[2], ARGV[1], top[1])
+            redis.call('HSET', KEYS[3], top[1], top[2])
+            return {top[1], top[2]}
+            "#,
+        );
+        let released_worker_lease: Option<(String, String)> = released_lease
             .key(&legacy_queue)
-            .key(protocol_processing_key(
-                QueueProtocol::LegacyUnscoped,
-                &provider,
-            ))
-            .key(protocol_leased_key(
-                QueueProtocol::LegacyUnscoped,
-                &provider,
-            ))
+            .key(&legacy_processing)
+            .key(&legacy_leased)
             .arg(1_u64)
             .invoke_async(&mut connection)
             .await
@@ -1575,7 +1986,9 @@ mod tests {
             .key(&scoped_queue)
             .key(&scoped_processing)
             .key(&scoped_leased)
+            .key(&scoped_owners)
             .arg(1_u64)
+            .arg("scoped-owner")
             .invoke_async(&mut connection)
             .await
             .unwrap();
@@ -1617,7 +2030,7 @@ mod tests {
             .unwrap();
         let newly_leased: Option<(String, String)> = gateway
             .lease
-            .key(&legacy_queue)
+            .key(protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider))
             .key(protocol_processing_key(
                 QueueProtocol::LegacyUnscoped,
                 &provider,
@@ -1626,21 +2039,49 @@ mod tests {
                 QueueProtocol::LegacyUnscoped,
                 &provider,
             ))
+            .key(protocol_owners_key(
+                QueueProtocol::LegacyUnscoped,
+                &provider,
+            ))
             .arg(now_ms() + 1_000)
+            .arg("legacy-owner")
             .invoke_async(&mut connection)
             .await
             .unwrap();
-        let (member, _) = newly_leased.unwrap();
-        let parsed: JobDescriptor = serde_json::from_str(&member).unwrap();
-        assert!(!descriptor_matches_protocol(
-            QueueProtocol::LegacyUnscoped,
-            &parsed
-        ));
-        gateway
-            .ack_lease(QueueProtocol::LegacyUnscoped, &provider, &member)
-            .await;
+        assert!(newly_leased.is_none());
+        assert_eq!(connection.zcard::<_, u64>(&legacy_queue).await.unwrap(), 1);
+        let released_processing_delivery: Option<(String, String)> = released_lease
+            .key(&legacy_queue)
+            .key(&legacy_processing)
+            .key(&legacy_leased)
+            .arg(1_u64)
+            .invoke_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(released_processing_delivery.is_some());
+        assert_eq!(
+            gateway
+                .reap_once_protocol(QueueProtocol::LegacyUnscoped, &provider)
+                .await,
+            0
+        );
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(&legacy_processing)
+                .await
+                .unwrap(),
+            1
+        );
 
-        for key in [legacy_queue, scoped_queue, scoped_processing, scoped_leased] {
+        for key in [
+            legacy_queue,
+            legacy_processing,
+            legacy_leased,
+            scoped_queue,
+            scoped_processing,
+            scoped_leased,
+            scoped_owners,
+        ] {
             let _: i64 = connection.del(key).await.unwrap();
         }
     }
@@ -1689,6 +2130,415 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_heartbeat_prevents_healthy_unary_redelivery() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("lease-unary-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let release_dispatches = Arc::new(Semaphore::new(0));
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(LatchBlockedDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: dispatch_started.clone(),
+                release_dispatches: release_dispatches.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(300),
+                request_timeout: Duration::from_secs(3),
+                max_concurrency_per_provider: 2,
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let worker_handles = gateway.spawn_workers(vec![provider.clone()]);
+        let first_dispatch_started = dispatch_started.notified();
+        let submission_gateway = gateway.clone();
+        let submission_provider = provider.clone();
+        let submission = tokio::spawn(async move {
+            submission_gateway
+                .submit(GatewayRequest {
+                    provider: submission_provider,
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"quiet unary"}),
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), first_dispatch_started)
+            .await
+            .expect("unary dispatch should start");
+
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(320)).await;
+            assert_eq!(
+                gateway
+                    .reap_once_protocol(QueueProtocol::LegacyUnscoped, &provider)
+                    .await,
+                0,
+                "a healthy unary delivery must refresh independently"
+            );
+        }
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release_dispatches.add_permits(1);
+        let response = tokio::time::timeout(Duration::from_secs(1), submission)
+            .await
+            .expect("unary submission should finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["request"], "quiet unary");
+        for worker_handle in worker_handles {
+            worker_handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_heartbeat_prevents_quiet_stream_redelivery() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("lease-stream-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let release_streams = Arc::new(Semaphore::new(0));
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(QuietStreamDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: dispatch_started.clone(),
+                release_streams: release_streams.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(300),
+                request_timeout: Duration::from_secs(3),
+                max_concurrency_per_provider: 2,
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let worker_handles = gateway.spawn_workers(vec![provider.clone()]);
+        let first_dispatch_started = dispatch_started.notified();
+        let mut receiver = gateway
+            .submit_stream(GatewayRequest {
+                provider: provider.clone(),
+                tier: 0,
+                permits: 1,
+                payload: serde_json::json!({"request":"quiet stream"}),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), first_dispatch_started)
+            .await
+            .expect("stream dispatch should start");
+
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(320)).await;
+            assert_eq!(
+                gateway
+                    .reap_once_protocol(QueueProtocol::LegacyUnscoped, &provider)
+                    .await,
+                0,
+                "a healthy quiet stream must refresh independently"
+            );
+        }
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release_streams.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("stream should emit")
+                .expect("stream should remain open")
+                .expect("stream item should succeed"),
+            "terminal"
+        );
+        for worker_handle in worker_handles {
+            worker_handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_worker_deadline_drops_dispatch_and_completes_only_owned_delivery() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("lease-deadline-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let dispatch_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_dropped = Arc::new(tokio::sync::Notify::new());
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(PendingDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: dispatch_started.clone(),
+                dispatch_drops: dispatch_drops.clone(),
+                dispatch_dropped: dispatch_dropped.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(600),
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut gateway).unwrap().worker_job_timeout = Duration::from_millis(180);
+        let preparation_capacity = Arc::new(Semaphore::new(1));
+        let worker = tokio::spawn(gateway.clone().worker(
+            provider.clone(),
+            QueueProtocol::LegacyUnscoped,
+            preparation_capacity,
+        ));
+        let first_dispatch_started = dispatch_started.notified();
+        let dropped = dispatch_dropped.notified();
+        let submission_gateway = gateway.clone();
+        let submission_provider = provider.clone();
+        let submission = tokio::spawn(async move {
+            submission_gateway
+                .submit(GatewayRequest {
+                    provider: submission_provider,
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"deadline"}),
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), first_dispatch_started)
+            .await
+            .expect("dispatch should start");
+        tokio::time::timeout(Duration::from_secs(1), dropped)
+            .await
+            .expect("worker deadline should drop dispatch");
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(dispatch_drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), submission)
+                .await
+                .expect("origin should receive deadline")
+                .unwrap(),
+            Err(GatewayError::Upstream(message)) if message == "distributed worker deadline exceeded"
+        ));
+        let mut connection = gateway.conn.clone();
+        let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if connection.zcard::<_, u64>(&processing).await.unwrap() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned deadline completion should clear processing");
+        worker.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_heartbeat_ownership_loss_drops_work_without_stale_cleanup() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("lease-loss-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let dispatch_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_dropped = Arc::new(tokio::sync::Notify::new());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(PendingDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: dispatch_started.clone(),
+                dispatch_drops: dispatch_drops.clone(),
+                dispatch_dropped: dispatch_dropped.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(300),
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let preparation_capacity = Arc::new(Semaphore::new(1));
+        let worker = tokio::spawn(gateway.clone().worker(
+            provider.clone(),
+            QueueProtocol::LegacyUnscoped,
+            preparation_capacity,
+        ));
+        let first_dispatch_started = dispatch_started.notified();
+        let dropped = dispatch_dropped.notified();
+        let submission_gateway = gateway.clone();
+        let submission_provider = provider.clone();
+        let submission = tokio::spawn(async move {
+            submission_gateway
+                .submit(GatewayRequest {
+                    provider: submission_provider,
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"ownership loss"}),
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), first_dispatch_started)
+            .await
+            .expect("dispatch should start");
+
+        let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
+        let owners = protocol_owners_key(QueueProtocol::LegacyUnscoped, &provider);
+        let mut connection = gateway.conn.clone();
+        let members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
+        assert_eq!(members.len(), 1);
+        let member = &members[0];
+        let descriptor: JobDescriptor = serde_json::from_str(member).unwrap();
+        let _: () = connection
+            .hset(&owners, member, "replacement-owner")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), dropped)
+            .await
+            .expect("failed heartbeat should drop dispatch");
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(dispatch_drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(connection
+            .zscore::<_, _, Option<f64>>(&processing, member)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            connection
+                .hget::<_, _, String>(&owners, member)
+                .await
+                .unwrap(),
+            "replacement-owner"
+        );
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider,))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(!connection
+            .exists::<_, bool>(protocol_done_key(
+                QueueProtocol::LegacyUnscoped,
+                &descriptor.id,
+            ))
+            .await
+            .unwrap());
+        submission.abort();
+        worker.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_worker_task_cancellation_drops_dispatch_and_leaves_owned_lease() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("lease-cancel-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let dispatch_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_dropped = Arc::new(tokio::sync::Notify::new());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(PendingDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: dispatch_started.clone(),
+                dispatch_drops: dispatch_drops.clone(),
+                dispatch_dropped: dispatch_dropped.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let prepared = gateway
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"cancel worker"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let job_id = prepared.descriptor.id.clone();
+        gateway.enqueue(&prepared).await.unwrap();
+        let protocol = QueueProtocol::LegacyUnscoped;
+        let queue = protocol_queue_key(protocol, &provider);
+        let processing = protocol_processing_key(protocol, &provider);
+        let leased = protocol_leased_key(protocol, &provider);
+        let owners = protocol_owners_key(protocol, &provider);
+        let owner_token = "cancel-owner";
+        let mut connection = gateway.conn.clone();
+        let leased_delivery: Option<(String, String)> = gateway
+            .lease
+            .key(&queue)
+            .key(&processing)
+            .key(&leased)
+            .key(&owners)
+            .arg(now_ms().saturating_add(2_000))
+            .arg(owner_token)
+            .invoke_async(&mut connection)
+            .await
+            .unwrap();
+        let (member, original_score) = leased_delivery.expect("job should lease");
+        let ownership = LeaseOwnership {
+            protocol,
+            provider: provider.clone(),
+            member: member.clone(),
+            original_score,
+            owner_token: owner_token.into(),
+        };
+        let first_dispatch_started = dispatch_started.notified();
+        let dropped = dispatch_dropped.notified();
+        let task_gateway = gateway.clone();
+        let task = tokio::spawn(async move {
+            task_gateway
+                .execute_leased_job(ownership, RateKey::provider(provider))
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), first_dispatch_started)
+            .await
+            .expect("dispatch should start");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), dropped)
+            .await
+            .expect("task cancellation should drop dispatch and heartbeat");
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(dispatch_drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(connection
+            .zscore::<_, _, Option<f64>>(&processing, &member)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            connection
+                .hget::<_, _, String>(&owners, &member)
+                .await
+                .unwrap(),
+            owner_token
+        );
+        assert!(!connection
+            .exists::<_, bool>(protocol_done_key(protocol, &job_id))
+            .await
+            .unwrap());
+        assert_eq!(connection.zcard::<_, u64>(&queue).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn redis_worker_leases_only_available_preparation_capacity() {
         let Some(redis_url) = std::env::var("LLMSHIM_REDIS_URL").ok() else {
             return;
@@ -1703,6 +2553,7 @@ mod tests {
             queue_key(&provider),
             processing_key(&provider),
             leased_key(&provider),
+            protocol_owners_key(QueueProtocol::LegacyUnscoped, &provider),
         ] {
             let _: i64 = connection.del(key).await.unwrap();
         }
@@ -1800,6 +2651,7 @@ mod tests {
             queue_key(&provider),
             processing_key(&provider),
             leased_key(&provider),
+            protocol_owners_key(QueueProtocol::LegacyUnscoped, &provider),
         ] {
             let _: i64 = connection.del(key).await.unwrap();
         }
@@ -1908,6 +2760,7 @@ mod tests {
                 protocol_queue_key(protocol, &provider),
                 protocol_processing_key(protocol, &provider),
                 protocol_leased_key(protocol, &provider),
+                protocol_owners_key(protocol, &provider),
             ] {
                 let _: i64 = connection.del(key).await.unwrap();
             }
@@ -1948,6 +2801,132 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_stale_owner_cannot_mutate_or_publish_for_replacement_delivery() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("lease-fence-{}", uuid::Uuid::new_v4().simple());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(400),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let prepared = gateway
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"fenced"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let job_id = prepared.descriptor.id.clone();
+        gateway.enqueue(&prepared).await.unwrap();
+
+        let protocol = QueueProtocol::LegacyUnscoped;
+        let queue = protocol_queue_key(protocol, &provider);
+        let processing = protocol_processing_key(protocol, &provider);
+        let leased = protocol_leased_key(protocol, &provider);
+        let owners = protocol_owners_key(protocol, &provider);
+        let mut connection = gateway.conn.clone();
+        let first_token = "first-owner";
+        let first_lease: Option<(String, String)> = gateway
+            .lease
+            .key(&queue)
+            .key(&processing)
+            .key(&leased)
+            .key(&owners)
+            .arg(now_ms().saturating_add(400))
+            .arg(first_token)
+            .invoke_async(&mut connection)
+            .await
+            .unwrap();
+        let (member, original_score) = first_lease.expect("first delivery should lease");
+        let stale_ownership = LeaseOwnership {
+            protocol,
+            provider: provider.clone(),
+            member: member.clone(),
+            original_score: original_score.clone(),
+            owner_token: first_token.into(),
+        };
+
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(gateway.reap_once_protocol(protocol, &provider).await, 1);
+        let replacement_token = "replacement-owner";
+        let replacement_lease: Option<(String, String)> = gateway
+            .lease
+            .key(&queue)
+            .key(&processing)
+            .key(&leased)
+            .key(&owners)
+            .arg(now_ms().saturating_add(1_000))
+            .arg(replacement_token)
+            .invoke_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(replacement_lease.is_some());
+
+        let response_channel = protocol_response_channel(protocol, &job_id);
+        assert!(!gateway.refresh_owned(&stale_ownership).await);
+        assert!(
+            !gateway
+                .publish_owned(
+                    &stale_ownership,
+                    &response_channel,
+                    &BusMessage::Unary(serde_json::json!({"stale":true})),
+                )
+                .await
+        );
+        assert!(!gateway.complete_owned(&stale_ownership, &job_id).await);
+        assert!(!gateway.dead_letter_owned(&stale_ownership).await);
+        assert!(!gateway.release_owned(&stale_ownership).await);
+        assert!(!gateway.ack_owned(&stale_ownership).await);
+
+        assert!(connection
+            .zscore::<_, _, Option<f64>>(&processing, &member)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            connection
+                .hget::<_, _, String>(&owners, &member)
+                .await
+                .unwrap(),
+            replacement_token
+        );
+        assert!(!connection
+            .exists::<_, bool>(protocol_done_key(protocol, &job_id))
+            .await
+            .unwrap());
+        assert_eq!(
+            connection
+                .llen::<_, u64>(protocol_dlq_key(protocol, &provider))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(connection.zcard::<_, u64>(&queue).await.unwrap(), 0);
+
+        let replacement_ownership = LeaseOwnership {
+            protocol,
+            provider: provider.clone(),
+            member,
+            original_score,
+            owner_token: replacement_token.into(),
+        };
+        assert!(gateway.refresh_owned(&replacement_ownership).await);
+        assert!(gateway.ack_owned(&replacement_ownership).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn redis_dedup_and_dead_letter_markers() {
         let provider = "itest-dedup";
         let Some(gw) = test_gateway(provider).await else {
@@ -1958,31 +2937,105 @@ mod tests {
             protocol_done_key(QueueProtocol::LegacyUnscoped, "job-x"),
             protocol_attempts_key(QueueProtocol::LegacyUnscoped, "job-y"),
             protocol_dlq_key(QueueProtocol::LegacyUnscoped, provider),
+            released_dlq_key(QueueProtocol::LegacyUnscoped, provider),
+            released_dlq_key(QueueProtocol::ScopedV1, provider),
+            protocol_processing_key(QueueProtocol::LegacyUnscoped, provider),
+            protocol_leased_key(QueueProtocol::LegacyUnscoped, provider),
+            protocol_owners_key(QueueProtocol::LegacyUnscoped, provider),
         ] {
             let _: Result<i64, _> = conn.del(k).await;
         }
 
         // Idempotency marker.
-        assert!(!gw.is_done(QueueProtocol::LegacyUnscoped, "job-x").await);
-        gw.mark_done(QueueProtocol::LegacyUnscoped, "job-x").await;
-        assert!(gw.is_done(QueueProtocol::LegacyUnscoped, "job-x").await);
+        assert_eq!(
+            gw.is_done(QueueProtocol::LegacyUnscoped, "job-x").await,
+            Some(false)
+        );
+        let completed_member = "completed-member";
+        let completed_ownership = LeaseOwnership {
+            protocol: QueueProtocol::LegacyUnscoped,
+            provider: provider.into(),
+            member: completed_member.into(),
+            original_score: "0".into(),
+            owner_token: "completed-owner".into(),
+        };
+        let _: () = conn
+            .zadd(
+                protocol_processing_key(QueueProtocol::LegacyUnscoped, provider),
+                completed_member,
+                now_ms().saturating_add(1_000),
+            )
+            .await
+            .unwrap();
+        let _: () = conn
+            .hset(
+                protocol_leased_key(QueueProtocol::LegacyUnscoped, provider),
+                completed_member,
+                0,
+            )
+            .await
+            .unwrap();
+        let _: () = conn
+            .hset(
+                protocol_owners_key(QueueProtocol::LegacyUnscoped, provider),
+                completed_member,
+                "completed-owner",
+            )
+            .await
+            .unwrap();
+        assert!(gw.complete_owned(&completed_ownership, "job-x").await);
+        assert_eq!(
+            gw.is_done(QueueProtocol::LegacyUnscoped, "job-x").await,
+            Some(true)
+        );
 
         // Attempt counter increments per delivery.
         assert_eq!(
             gw.bump_attempts(QueueProtocol::LegacyUnscoped, "job-y")
                 .await,
-            1
+            Some(1)
         );
         assert_eq!(
             gw.bump_attempts(QueueProtocol::LegacyUnscoped, "job-y")
                 .await,
-            2
+            Some(2)
         );
 
         // Dead-letter queue.
         assert_eq!(gw.dead_letter_len(provider).await, 0);
-        gw.dead_letter(QueueProtocol::LegacyUnscoped, provider, "poison-member")
-            .await;
+        let poison_member = "poison-member";
+        let poison_ownership = LeaseOwnership {
+            protocol: QueueProtocol::LegacyUnscoped,
+            provider: provider.into(),
+            member: poison_member.into(),
+            original_score: "0".into(),
+            owner_token: "poison-owner".into(),
+        };
+        let _: () = conn
+            .zadd(
+                protocol_processing_key(QueueProtocol::LegacyUnscoped, provider),
+                poison_member,
+                now_ms().saturating_add(1_000),
+            )
+            .await
+            .unwrap();
+        let _: () = conn
+            .hset(
+                protocol_leased_key(QueueProtocol::LegacyUnscoped, provider),
+                poison_member,
+                0,
+            )
+            .await
+            .unwrap();
+        let _: () = conn
+            .hset(
+                protocol_owners_key(QueueProtocol::LegacyUnscoped, provider),
+                poison_member,
+                "poison-owner",
+            )
+            .await
+            .unwrap();
+        assert!(gw.dead_letter_owned(&poison_ownership).await);
         assert_eq!(gw.dead_letter_len(provider).await, 1);
     }
 
