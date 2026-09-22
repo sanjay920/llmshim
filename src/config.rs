@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 /// The full config file structure.
@@ -121,9 +122,27 @@ pub fn load() -> Config {
 pub fn save(config: &Config) -> std::io::Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)?;
-    let path = config_path();
+    restrict_config_directory_permissions(&dir)?;
     let contents = toml::to_string_pretty(config).map_err(std::io::Error::other)?;
-    std::fs::write(&path, contents)
+    let mut temporary_config_file = tempfile::NamedTempFile::new_in(&dir)?;
+    temporary_config_file.write_all(contents.as_bytes())?;
+    temporary_config_file.as_file().sync_all()?;
+    temporary_config_file
+        .persist(config_path())
+        .map(|_| ())
+        .map_err(|persist_error| persist_error.error)
+}
+
+#[cfg(unix)]
+fn restrict_config_directory_permissions(directory_path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(directory_path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn restrict_config_directory_permissions(_: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Apply config keys as environment variables (only if not already set).
