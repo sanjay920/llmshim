@@ -2168,7 +2168,6 @@ impl DistributedGateway {
             .key(lifecycle::meta_key(id))
             .key(lifecycle::terminal_reservations())
             .key(lifecycle::reservation_states())
-            .key(lifecycle::origin_expiry())
             .arg(&ownership.member)
             .arg(&ownership.original_score)
             .arg(&ownership.owner_token)
