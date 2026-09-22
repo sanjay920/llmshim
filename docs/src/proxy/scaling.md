@@ -191,6 +191,11 @@ Bounded provider error bodies are inspected for native usage or a
 provider-reported bill before retry or return; the original error body and size
 limit remain unchanged.
 
+Streaming snapshots remain partial until the protocol normalizer validates a
+clean end. A private candidate must still cover every choice or candidate after
+all later output and newly seen indexes; early usage-only frames and mixed
+finished/unfinished results cannot authorize release.
+
 Transport uncertainty, cancellation, stream abandonment, worker loss, and a
 failed settlement keep the original reservation in its acquisition window.
 The window is selected only after concurrency admission; Redis selects it from
