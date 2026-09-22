@@ -3,7 +3,7 @@ mod auth;
 mod streaming;
 
 pub use auth::{ChatGptAuth, DeviceCode, LoginStatus};
-pub(crate) use streaming::collect_response;
+pub(crate) use streaming::collect_response_with_terminal;
 pub(crate) use streaming::transform_chunk as parse_stream_chunk;
 
 use crate::{
@@ -199,6 +199,15 @@ impl ChatGpt {
 impl Provider for ChatGpt {
     fn name(&self) -> &str {
         "chatgpt"
+    }
+
+    fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
+        crate::provider::RequestAdmissionPolicy::namespaced(
+            "x-chatgpt",
+            &["input"],
+            &["instructions", "text", "tools", "tool_choice", "reasoning"],
+            &[],
+        )
     }
 
     fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {

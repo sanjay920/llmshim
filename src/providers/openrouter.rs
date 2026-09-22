@@ -120,6 +120,15 @@ impl Provider for OpenRouter {
         "openrouter"
     }
 
+    fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
+        crate::provider::RequestAdmissionPolicy::namespaced(
+            "x-openrouter",
+            &["model", "messages"],
+            &["tools", "tool_choice", "response_format", "reasoning"],
+            &["max_tokens", "max_completion_tokens"],
+        )
+    }
+
     fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
         crate::reasoning::ReplayTarget::new(
             self.name(),
