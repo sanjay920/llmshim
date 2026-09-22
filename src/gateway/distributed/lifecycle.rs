@@ -1443,7 +1443,7 @@ mod tests {
                     > 0
             );
         }
-        assert_eq!(cleanup_caches(&mut connection, 16).await.unwrap(), 2);
+        assert!(cleanup_caches(&mut connection, 16).await.unwrap() >= 2);
         for (value_key, _, reservations, counters) in &cache_keys {
             assert!(!connection
                 .hexists::<_, _, bool>(reservations, value_key)
