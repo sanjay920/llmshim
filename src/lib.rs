@@ -12,6 +12,7 @@ mod default_secret_file;
 pub mod env;
 pub mod error;
 pub mod fallback;
+mod json_bounds;
 pub mod log;
 pub mod models;
 pub mod policy;

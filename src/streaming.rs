@@ -93,7 +93,16 @@ impl StreamNormalizer {
         if data.trim().is_empty() {
             return Ok(None);
         }
-        let mut native: Value = serde_json::from_str(data)?;
+        let mut native: Value =
+            match crate::json_bounds::parse_str(data, crate::json_bounds::Limits::SSE) {
+                Ok(value) => value,
+                Err(crate::json_bounds::ParseError::Malformed(error)) => return Err(error.into()),
+                Err(crate::json_bounds::ParseError::Complexity) => {
+                    return Err(ShimError::Stream(
+                        "upstream JSON exceeds complexity limit".into(),
+                    ))
+                }
+            };
         if matches!(native["type"].as_str(), Some("error" | "response.failed"))
             || native.get("error").is_some_and(|v| !v.is_null())
         {

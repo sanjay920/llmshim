@@ -59,6 +59,55 @@ pub(crate) async fn install_default_receipt_store(
     next.run(request).await
 }
 
+pub(crate) async fn bound_inference_request_json(request: Request, next: Next) -> Response {
+    if request.method() != axum::http::Method::POST
+        || !matches!(
+            request.uri().path(),
+            "/v1/chat" | "/v1/chat/stream" | "/v1/chat/completions" | "/v1/messages"
+        )
+    {
+        return next.run(request).await;
+    }
+    let path = request.uri().path().to_owned();
+    let (parts, body) = request.into_parts();
+    let bytes = match to_bytes(body, 2 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return inbound_json_failure(
+                &path,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request exceeds size limit",
+            )
+        }
+    };
+    match crate::json_bounds::parse_slice(&bytes, crate::json_bounds::Limits::INBOUND) {
+        Ok(_) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        Err(crate::json_bounds::ParseError::Malformed(_)) => {
+            inbound_json_failure(&path, StatusCode::BAD_REQUEST, "invalid JSON request")
+        }
+        Err(crate::json_bounds::ParseError::Complexity) => inbound_json_failure(
+            &path,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request JSON exceeds complexity limit",
+        ),
+    }
+}
+
+fn inbound_json_failure(path: &str, status: StatusCode, message: &str) -> Response {
+    match path {
+        "/v1/chat/completions" => fail(Wire::Chat, status, message),
+        "/v1/messages" => fail(Wire::Messages, status, message),
+        _ => (
+            status,
+            Json(json!({"error":{"code": if status == StatusCode::PAYLOAD_TOO_LARGE {"request_too_large"} else {"invalid_request"},"message":message}})),
+        )
+            .into_response(),
+    }
+}
+
 fn fallback_receipt_store() -> DefaultReceiptStore {
     static STORE: OnceLock<DefaultReceiptStore> = OnceLock::new();
     STORE.get_or_init(DefaultReceiptStore::from_env).clone()
@@ -651,16 +700,26 @@ pub async fn translate(request: Request, next: Next) -> Response {
             )
         }
     };
-    let native: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(_) => return fail(wire, StatusCode::BAD_REQUEST, "invalid JSON request"),
-    };
-    let request_native = native.clone();
+    let native: Value =
+        match crate::json_bounds::parse_slice(&bytes, crate::json_bounds::Limits::INBOUND) {
+            Ok(value) => value,
+            Err(crate::json_bounds::ParseError::Malformed(_)) => {
+                return fail(wire, StatusCode::BAD_REQUEST, "invalid JSON request")
+            }
+            Err(crate::json_bounds::ParseError::Complexity) => {
+                return fail(
+                    wire,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request JSON exceeds complexity limit",
+                )
+            }
+        };
+    let response_model = native["model"].clone();
     let request_receipts = receipts.clone();
     let request_scope = scope.clone();
     let chat = match receipt_executor
         .run(ReceiptWorkKind::Ingress, move || {
-            request_to_chat(&request_native, wire, &request_receipts, &request_scope)
+            request_to_chat(&native, wire, &request_receipts, &request_scope)
         })
         .await
     {
@@ -684,7 +743,7 @@ pub async fn translate(request: Request, next: Next) -> Response {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream"))
     {
-        let model = native["model"].clone();
+        let model = response_model;
         let events = async_stream::stream! {
             let mut stream = Box::pin(crate::sse::data(body.into_data_stream()));
             let mut response=json!({"id":format!("msg_{}",uuid::Uuid::new_v4().simple()),"model":model,"message":{"role":"assistant","content":""},"usage":{},"finish_reason":"stop"});
@@ -951,6 +1010,7 @@ mod async_receipt_tests {
                 post(|| async { Json(canonical_response()) }),
             )
             .layer(axum::middleware::from_fn(translate))
+            .layer(axum::middleware::from_fn(bound_inference_request_json))
             .layer(axum::middleware::from_fn_with_state(
                 default_store,
                 install_default_receipt_store,
@@ -967,6 +1027,39 @@ mod async_receipt_tests {
                     .to_string(),
             ))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_request_complexity_is_rejected_before_handler_with_wire_shape() {
+        let receipts = Arc::new(Receipts::new(tempfile::tempdir().unwrap().keep()));
+        let application = native_app(DefaultReceiptStore::new(receipts));
+        let wide = (0..32_768).map(|_| 0).collect::<Vec<_>>();
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model":"local/test",
+                            "messages":[],
+                            "ignored":wide
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("complexity"));
     }
 
     fn gated_native_app(

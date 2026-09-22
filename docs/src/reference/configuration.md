@@ -196,6 +196,21 @@ event ended at a valid boundary; expiry in a partial event ends the body with a
 transport error. A unary response whose headers are already committed also
 ends with a transport error.
 
+## Parsed JSON limits
+
+Network JSON keeps its existing decoded-byte limits and also has mandatory
+finite parse budgets. Unary provider responses allow 65,536 values and about
+40 MiB of estimated owned JSON; each SSE event allows 16,384 values and 16 MiB;
+inbound HTTP requests allow 32,768 values and 8 MiB. All profiles retain a
+maximum depth of 128. Complexity failures return a content-free upstream 502 or
+stream error, and inbound requests receive route-correct 413 framing.
+
+The owned-byte figure is an application estimate for `Value` nodes, strings,
+keys, and array elements. The transport input, decoder scratch space, allocator
+metadata, and later derived output can coexist with that estimate, so it is not
+a process RSS promise. Limits reject the whole value and never truncate JSON
+into a successful response.
+
 ## JSONL request logging
 
 Set `LLMSHIM_LOG` to append one JSON object per completed request to a file:
