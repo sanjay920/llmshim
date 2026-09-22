@@ -70,15 +70,24 @@ fn open_private_directory_at(
 
 #[cfg(unix)]
 fn open_regular_file_at(parent_directory_handle: &File, file_name: &str) -> io::Result<File> {
-    let file_handle = open_at_no_follow(parent_directory_handle, file_name, libc::O_RDONLY)?;
+    let file_handle = open_at_no_follow(
+        parent_directory_handle,
+        file_name,
+        libc::O_RDONLY | libc::O_NONBLOCK,
+    )?;
     let metadata = file_handle.metadata()?;
-    if !metadata.file_type().is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "unsafe default secret file",
         ));
     }
-    file_handle.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    if metadata.mode() & 0o777 != 0o600 {
+        file_handle.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(file_handle)
 }
 
@@ -91,7 +100,10 @@ fn validate_and_restrict_directory(directory_handle: &File) -> io::Result<()> {
             "unsafe default secret directory",
         ));
     }
-    directory_handle.set_permissions(std::fs::Permissions::from_mode(0o700))
+    if metadata.mode() & 0o777 != 0o700 {
+        directory_handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

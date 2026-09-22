@@ -133,7 +133,7 @@ pub struct DeviceCode {
 #[derive(Clone)]
 pub struct ChatGptAuth {
     path: PathBuf,
-    protect_default_path: bool,
+    protected_default_root: Option<PathBuf>,
     base_url: String,
     http: Client,
 }
@@ -149,20 +149,21 @@ impl ChatGptAuth {
         let token_directory_override = std::env::var_os("CHATGPT_TOKEN_DIR");
         let auth_file_override = std::env::var_os("CHATGPT_AUTH_FILE");
         let use_default_path = token_directory_override.is_none() && auth_file_override.is_none();
+        let protected_default_root = use_default_path.then(crate::config::config_dir);
         let dir = token_directory_override
             .as_ref()
             .map(PathBuf::from)
-            .unwrap_or_else(|| crate::config::config_dir().join("chatgpt"));
+            .unwrap_or_else(|| protected_default_root.as_ref().unwrap().join("chatgpt"));
         let file = auth_file_override.unwrap_or_else(|| "auth.json".into());
         let mut auth = Self::new(dir.join(file));
-        auth.protect_default_path = use_default_path;
+        auth.protected_default_root = protected_default_root;
         auth
     }
 
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            protect_default_path: false,
+            protected_default_root: None,
             base_url: AUTH_BASE.into(),
             http: Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -188,9 +189,9 @@ impl ChatGptAuth {
 
     fn read(&self) -> Result<Option<Tokens>> {
         let mut data = Vec::new();
-        if self.protect_default_path {
+        if let Some(protected_default_root) = &self.protected_default_root {
             let mut file_handle = crate::default_secret_file::open_default_secret_file(
-                &crate::config::config_dir(),
+                protected_default_root,
                 &["chatgpt"],
                 "auth.json",
             )
@@ -439,6 +440,21 @@ async fn oauth_json(response: reqwest::Response, message: &str) -> Result<Value>
 mod tests {
     use super::*;
 
+    struct EnvironmentVariableRestore {
+        name: &'static str,
+        previous_value: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvironmentVariableRestore {
+        fn drop(&mut self) {
+            if let Some(previous_value) = &self.previous_value {
+                std::env::set_var(self.name, previous_value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn pending_device_authorization_waits_and_times_out() {
         let mut server = mockito::Server::new_async().await;
@@ -489,5 +505,50 @@ mod tests {
             let err = Tokens::from_response(value, None).err().unwrap();
             assert!(!err.to_string().contains("private"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_default_auth_read_keeps_its_construction_home() {
+        let previous_home = EnvironmentVariableRestore {
+            name: "HOME",
+            previous_value: std::env::var_os("HOME"),
+        };
+        let previous_token_directory = EnvironmentVariableRestore {
+            name: "CHATGPT_TOKEN_DIR",
+            previous_value: std::env::var_os("CHATGPT_TOKEN_DIR"),
+        };
+        let previous_auth_file = EnvironmentVariableRestore {
+            name: "CHATGPT_AUTH_FILE",
+            previous_value: std::env::var_os("CHATGPT_AUTH_FILE"),
+        };
+        let construction_home_directory = tempfile::tempdir().unwrap();
+        let changed_home_directory = tempfile::tempdir().unwrap();
+        let construction_auth_directory =
+            construction_home_directory.path().join(".llmshim/chatgpt");
+        std::fs::create_dir_all(&construction_auth_directory).unwrap();
+        std::fs::write(
+            construction_auth_directory.join("auth.json"),
+            format!(
+                r#"{{"access_token":"synthetic","expires_at":{}}}"#,
+                now().saturating_add(3600)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("HOME", construction_home_directory.path());
+        std::env::remove_var("CHATGPT_TOKEN_DIR");
+        std::env::remove_var("CHATGPT_AUTH_FILE");
+        let auth = ChatGptAuth::from_env();
+
+        std::env::set_var("HOME", changed_home_directory.path());
+        assert_eq!(auth.status().unwrap(), LoginStatus::Ready);
+        assert_eq!(
+            auth.auth_path(),
+            construction_auth_directory.join("auth.json")
+        );
+
+        drop(previous_auth_file);
+        drop(previous_token_directory);
+        drop(previous_home);
     }
 }
