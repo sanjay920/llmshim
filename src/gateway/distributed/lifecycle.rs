@@ -19,7 +19,7 @@ const CLEANUP_GRACE_MS: u64 = 60 * 60 * 1000;
 const MIN_TERMINAL_BYTES: u64 = 4 * 1024;
 
 fn lifecycle_prefix() -> &'static str {
-    "llmshim:gw:lifecycle:v1"
+    "llmshim:gw:lifecycle:v2"
 }
 
 pub(super) fn job_prefix() -> String {
@@ -48,6 +48,10 @@ pub(super) fn reservation_states() -> String {
 
 pub(super) fn expiry() -> String {
     expiry_key()
+}
+
+pub(super) fn origin_expiry() -> String {
+    origin_expiry_key()
 }
 
 pub(super) fn queue_key(protocol: QueueProtocol, provider: &str) -> String {
@@ -142,6 +146,10 @@ fn expiry_key() -> String {
     format!("{}:expiry", lifecycle_prefix())
 }
 
+fn origin_expiry_key() -> String {
+    format!("{}:origin-expiry", lifecycle_prefix())
+}
+
 const RESERVE_LUA: &str = r#"
     if redis.call('EXISTS', KEYS[5]) == 1 then
         local nonce = redis.call('HGET', KEYS[5], 'nonce')
@@ -150,7 +158,7 @@ const RESERVE_LUA: &str = r#"
         end
         return {-3, false}
     end
-    for index = 8, 15 do
+    for index = 8, 19 do
         if redis.call('ZCARD', KEYS[index]) > 0 then return {-4, false} end
     end
     local jobs = tonumber(redis.call('HGET', KEYS[2], 'jobs') or '0')
@@ -170,14 +178,19 @@ const RESERVE_LUA: &str = r#"
         'priority_score', ARGV[10], 'base_charge', charge, 'cancel_requested', '0')
     redis.call('SET', KEYS[6], ARGV[3])
     redis.call('HSET', KEYS[3], member, charge)
-    redis.call('HSET', KEYS[16], member, 0)
-    redis.call('HSET', KEYS[17], member, 0)
-    redis.call('HSET', KEYS[18], member, 'pending_origin')
-    redis.call('HSET', KEYS[19], member, ARGV[7])
-    redis.call('HSET', KEYS[20], member, ARGV[8])
+    local origin_max = now_ms + tonumber(ARGV[14])
+    local origin_expiry = math.min(now_ms + tonumber(ARGV[13]), origin_max)
+    redis.call('HSET', KEYS[5], 'origin_token', ARGV[15],
+        'origin_expires_at_ms', origin_expiry, 'origin_max_expires_at_ms', origin_max)
+    redis.call('HSET', KEYS[20], member, 0)
+    redis.call('HSET', KEYS[21], member, 0)
+    redis.call('HSET', KEYS[22], member, 'pending_origin')
+    redis.call('HSET', KEYS[23], member, ARGV[7])
+    redis.call('HSET', KEYS[24], member, ARGV[8])
     redis.call('HINCRBY', KEYS[2], 'jobs', 1)
     redis.call('HINCRBY', KEYS[2], 'base_bytes', charge)
     redis.call('ZADD', KEYS[4], now_ms + tonumber(ARGV[11]), member)
+    redis.call('ZADD', KEYS[25], origin_expiry, member)
     redis.call('PEXPIRE', KEYS[5], tonumber(ARGV[11]) + tonumber(ARGV[12]))
     redis.call('PEXPIRE', KEYS[6], tonumber(ARGV[11]) + tonumber(ARGV[12]))
     return {2, generation}
@@ -187,14 +200,14 @@ const ACTIVATE_LUA: &str = r#"
     if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1]
         or redis.call('HGET', KEYS[1], 'state') ~= 'pending_origin' then return 0 end
     local waiting = 0
-    for index = 3, 8 do waiting = waiting + redis.call('ZCARD', KEYS[index]) end
+    for index = 3, 10 do waiting = waiting + redis.call('ZCARD', KEYS[index]) end
     if waiting >= tonumber(ARGV[6]) then return -1 end
     local redis_time = redis.call('TIME')
     local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
     redis.call('HSET', KEYS[1], 'state', 'waiting')
-    redis.call('HSET', KEYS[10], ARGV[2], 'waiting')
+    redis.call('HSET', KEYS[12], ARGV[2], 'waiting')
     redis.call('ZADD', KEYS[3], ARGV[3], ARGV[2])
-    redis.call('ZADD', KEYS[9], now_ms + tonumber(ARGV[4]), ARGV[2])
+    redis.call('ZADD', KEYS[11], now_ms + tonumber(ARGV[4]), ARGV[2])
     redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[4]) + tonumber(ARGV[5]))
     redis.call('PEXPIRE', KEYS[2], tonumber(ARGV[4]) + tonumber(ARGV[5]))
     return 1
@@ -202,9 +215,11 @@ const ACTIVATE_LUA: &str = r#"
 
 const CANCEL_LUA: &str = r#"
     if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1] then return 0 end
+    if redis.call('HGET', KEYS[1], 'origin_token') ~= ARGV[7] then return 0 end
     local state = redis.call('HGET', KEYS[1], 'state')
     if state == 'processing' then
         redis.call('HSET', KEYS[1], 'cancel_requested', '1')
+        redis.call('ZREM', KEYS[7], ARGV[2])
         redis.call('PUBLISH', ARGV[4], ARGV[5])
         return 2
     end
@@ -213,6 +228,7 @@ const CANCEL_LUA: &str = r#"
         redis.call('SET', KEYS[2], ARGV[5])
         redis.call('HSET', KEYS[1], 'state', 'terminal', 'terminal_charge', '0')
         redis.call('HSET', KEYS[5], ARGV[2], 'terminal')
+        redis.call('ZREM', KEYS[7], ARGV[2])
         local redis_time = redis.call('TIME')
         local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
         redis.call('ZADD', KEYS[4], now_ms + tonumber(ARGV[3]), ARGV[2])
@@ -224,6 +240,62 @@ const CANCEL_LUA: &str = r#"
         return 1
     end
     return 3
+"#;
+
+const ORIGIN_HEARTBEAT_LUA: &str = r#"
+    if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1]
+        or redis.call('HGET', KEYS[1], 'origin_token') ~= ARGV[3] then return 0 end
+    local state = redis.call('HGET', KEYS[1], 'state')
+    if state ~= 'pending_origin' and state ~= 'waiting' and state ~= 'processing' then return 0 end
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    local current_expiry = tonumber(redis.call('HGET', KEYS[1], 'origin_expires_at_ms') or '0')
+    local maximum_expiry = tonumber(redis.call('HGET', KEYS[1], 'origin_max_expires_at_ms') or '0')
+    if current_expiry <= now_ms or maximum_expiry <= now_ms then
+        redis.call('HSET', KEYS[1], 'cancel_requested', '1')
+        redis.call('ZREM', KEYS[2], ARGV[2])
+        return -1
+    end
+    local next_expiry = math.min(now_ms + tonumber(ARGV[4]), maximum_expiry)
+    redis.call('HSET', KEYS[1], 'origin_expires_at_ms', next_expiry)
+    redis.call('ZADD', KEYS[2], next_expiry, ARGV[2])
+    return 1
+"#;
+
+const EXPIRE_ORIGINS_LUA: &str = r#"
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now_ms, 'LIMIT', 0, ARGV[1])
+    local transitioned = 0
+    for _, member in ipairs(expired) do
+        local id, generation = string.match(member, '^(.*):([^:]*)$')
+        local meta = id and (ARGV[2] .. ':job:' .. id .. ':meta') or nil
+        if meta and redis.call('HGET', meta, 'generation') == generation then
+            local state = redis.call('HGET', meta, 'state')
+            local scope = redis.call('HGET', KEYS[3], member)
+            local provider = redis.call('HGET', KEYS[4], member)
+            if state == 'processing' then
+                redis.call('HSET', meta, 'cancel_requested', '1')
+                if scope then redis.call('PUBLISH', ARGV[2] .. ':resp:' .. scope .. ':' .. id, ARGV[5]) end
+                transitioned = transitioned + 1
+            elseif (state == 'pending_origin' or state == 'waiting') and scope and provider then
+                redis.call('ZREM', ARGV[2] .. ':q:' .. scope .. ':' .. provider, member)
+                redis.call('SET', ARGV[2] .. ':job:' .. id .. ':terminal', ARGV[5])
+                redis.call('HSET', meta, 'state', 'terminal', 'terminal_charge', '0',
+                    'cancel_requested', '1')
+                redis.call('HSET', KEYS[2], member, 'terminal')
+                redis.call('ZADD', KEYS[5], now_ms + tonumber(ARGV[3]), member)
+                local hard_ttl = tonumber(ARGV[3]) + tonumber(ARGV[4])
+                redis.call('PEXPIRE', meta, hard_ttl)
+                redis.call('PEXPIRE', ARGV[2] .. ':job:' .. id .. ':payload', hard_ttl)
+                redis.call('PEXPIRE', ARGV[2] .. ':job:' .. id .. ':terminal', hard_ttl)
+                redis.call('PUBLISH', ARGV[2] .. ':resp:' .. scope .. ':' .. id, ARGV[5])
+                transitioned = transitioned + 1
+            end
+        end
+        redis.call('ZREM', KEYS[1], member)
+    end
+    return transitioned
 "#;
 
 const CLEANUP_LUA: &str = r#"
@@ -267,6 +339,7 @@ const CLEANUP_LUA: &str = r#"
                 redis.call('DEL', meta, ARGV[2] .. ':job:' .. id .. ':payload',
                     ARGV[2] .. ':job:' .. id .. ':terminal')
                 redis.call('ZREM', KEYS[1], member)
+                redis.call('ZREM', KEYS[9], member)
                 cleaned = cleaned + 1
             end
         end
@@ -369,6 +442,10 @@ const READ_TERMINAL_LUA: &str = r#"
 static RESERVE: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(RESERVE_LUA));
 static ACTIVATE: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(ACTIVATE_LUA));
 static CANCEL: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(CANCEL_LUA));
+static ORIGIN_HEARTBEAT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(ORIGIN_HEARTBEAT_LUA));
+static EXPIRE_ORIGINS: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(EXPIRE_ORIGINS_LUA));
 static CLEANUP: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(CLEANUP_LUA));
 static CACHE_PUT: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(CACHE_PUT_LUA));
 static CACHE_GET: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(CACHE_GET_LUA));
@@ -459,7 +536,10 @@ pub(super) async fn reserve(
     stream: bool,
     priority_score: f64,
     limits: Limits,
-    old_keys: [&str; 8],
+    old_keys: [&str; 12],
+    origin_lease: Duration,
+    origin_total_lifetime: Duration,
+    origin_token: &str,
 ) -> Result<ReservedJob, ReserveFailure> {
     let _ = cleanup_expired(connection, 16).await;
     let meta = meta_key(id);
@@ -480,7 +560,8 @@ pub(super) async fn reserve(
         .key(dlq_reservations_key())
         .key(reservation_states_key())
         .key(reservation_scopes_key())
-        .key(reservation_providers_key());
+        .key(reservation_providers_key())
+        .key(origin_expiry_key());
     invocation
         .arg(id)
         .arg(nonce)
@@ -493,7 +574,10 @@ pub(super) async fn reserve(
         .arg(u8::from(stream))
         .arg(priority_score)
         .arg(ACTIVATION_TTL_MS)
-        .arg(CLEANUP_GRACE_MS);
+        .arg(CLEANUP_GRACE_MS)
+        .arg(duration_millis(origin_lease))
+        .arg(duration_millis(origin_total_lifetime).max(1))
+        .arg(origin_token);
     let result: (i64, Option<String>) = invocation
         .invoke_async(connection)
         .await
@@ -520,7 +604,7 @@ pub(super) async fn activate(
     priority_score: f64,
     waiting_ttl: Duration,
     maximum_waiting: usize,
-    capacity_queue_keys: [&str; 5],
+    capacity_queue_keys: [&str; 7],
 ) -> redis::RedisResult<bool> {
     let mut invocation = ACTIVATE.key(meta_key(id));
     invocation
@@ -531,6 +615,8 @@ pub(super) async fn activate(
         .key(capacity_queue_keys[2])
         .key(capacity_queue_keys[3])
         .key(capacity_queue_keys[4])
+        .key(capacity_queue_keys[5])
+        .key(capacity_queue_keys[6])
         .key(expiry_key())
         .key(reservation_states_key());
     invocation
@@ -566,6 +652,7 @@ pub(super) async fn cancel(
     generation: &str,
     member: &str,
     terminal_ttl: Duration,
+    origin_token: &str,
 ) -> redis::RedisResult<i64> {
     let envelope = serde_json::to_vec(&BusMessage::Error("distributed origin canceled".into()))
         .expect("fixed cancellation envelope serializes");
@@ -576,12 +663,14 @@ pub(super) async fn cancel(
         .key(expiry_key())
         .key(reservation_states_key())
         .key(payload_key(id))
+        .key(origin_expiry_key())
         .arg(generation)
         .arg(member)
         .arg(duration_millis(terminal_ttl))
         .arg(response_channel(protocol, id))
         .arg(envelope)
         .arg(CLEANUP_GRACE_MS)
+        .arg(origin_token)
         .invoke_async(connection)
         .await
 }
@@ -599,8 +688,50 @@ pub(super) async fn cleanup_expired(
         .key(reservation_states_key())
         .key(reservation_scopes_key())
         .key(reservation_providers_key())
+        .key(origin_expiry_key())
         .arg(maximum_records)
         .arg(lifecycle_prefix())
+        .invoke_async(connection)
+        .await
+}
+
+pub(super) async fn heartbeat_origin(
+    connection: &mut ConnectionManager,
+    id: &str,
+    generation: &str,
+    member: &str,
+    origin_token: &str,
+    origin_lease: Duration,
+) -> redis::RedisResult<i64> {
+    ORIGIN_HEARTBEAT
+        .key(meta_key(id))
+        .key(origin_expiry_key())
+        .arg(generation)
+        .arg(member)
+        .arg(origin_token)
+        .arg(duration_millis(origin_lease))
+        .invoke_async(connection)
+        .await
+}
+
+pub(super) async fn expire_origins(
+    connection: &mut ConnectionManager,
+    maximum_records: usize,
+    terminal_ttl: Duration,
+) -> redis::RedisResult<usize> {
+    let envelope = serde_json::to_vec(&BusMessage::Error("distributed origin canceled".into()))
+        .expect("fixed cancellation envelope serializes");
+    EXPIRE_ORIGINS
+        .key(origin_expiry_key())
+        .key(reservation_states_key())
+        .key(reservation_scopes_key())
+        .key(reservation_providers_key())
+        .key(expiry_key())
+        .arg(maximum_records)
+        .arg(lifecycle_prefix())
+        .arg(duration_millis(terminal_ttl))
+        .arg(CLEANUP_GRACE_MS)
+        .arg(envelope)
         .invoke_async(connection)
         .await
 }
@@ -811,6 +942,10 @@ mod tests {
             format!("old:3:p:{old_provider}"),
             format!("old:4:q:{old_provider}"),
             format!("old:4:p:{old_provider}"),
+            format!("old:5:q:{old_provider}"),
+            format!("old:5:p:{old_provider}"),
+            format!("old:6:q:{old_provider}"),
+            format!("old:6:p:{old_provider}"),
         ];
         let capacity_keys = [
             old_keys[0].as_str(),
@@ -818,6 +953,8 @@ mod tests {
             old_keys[2].as_str(),
             old_keys[3].as_str(),
             old_keys[4].as_str(),
+            old_keys[5].as_str(),
+            old_keys[6].as_str(),
         ];
         for key in [
             generation_key(),
@@ -853,6 +990,9 @@ mod tests {
             1.0,
             limits,
             old_keys.each_ref().map(|key| key.as_str()),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            "origin-token",
         )
         .await
         .unwrap();
@@ -868,6 +1008,9 @@ mod tests {
             1.0,
             limits,
             old_keys.each_ref().map(|key| key.as_str()),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            "origin-token",
         )
         .await
         .unwrap();
@@ -884,6 +1027,9 @@ mod tests {
                 2.0,
                 limits,
                 old_keys.each_ref().map(|key| key.as_str()),
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+                "other-origin-token",
             )
             .await,
             Err(ReserveFailure::Capacity)
@@ -897,6 +1043,7 @@ mod tests {
                 &first.generation,
                 &first.member,
                 Duration::from_secs(60),
+                "origin-token",
             )
             .await
             .unwrap(),
@@ -932,6 +1079,9 @@ mod tests {
             1.0,
             limits,
             old_keys.each_ref().map(|key| key.as_str()),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            "replacement-origin-token",
         )
         .await
         .unwrap();
@@ -1137,6 +1287,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let _: () = connection
+                .zadd(origin_expiry_key(), &member, 9_000_000_000_000_000_i64)
+                .await
+                .unwrap();
             members.push(member);
         }
         let _: i64 = connection
@@ -1203,6 +1357,11 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some());
+            assert!(connection
+                .zscore::<_, _, Option<f64>>(origin_expiry_key(), &member)
+                .await
+                .unwrap()
+                .is_none());
             assert!(!connection
                 .zscore::<_, _, Option<f64>>(
                     dlq_key(QueueProtocol::LegacyUnscoped, &provider),
