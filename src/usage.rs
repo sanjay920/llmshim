@@ -397,6 +397,10 @@ pub(crate) struct StreamUsage {
     chat_usage: Option<Value>,
     chat_terminal: Option<Value>,
     chat_choices: std::collections::BTreeMap<u64, Value>,
+    known_chat_choices: std::collections::BTreeSet<u64>,
+    finished_chat_choices: std::collections::BTreeSet<u64>,
+    chat_provider_cost_floor: Option<f64>,
+    terminal_chat_provider_cost: Option<f64>,
 }
 
 impl StreamUsage {
@@ -404,21 +408,52 @@ impl StreamUsage {
     /// terminal marker so proxy clients do not stop before receiving accounting.
     pub(crate) fn defer_chat_terminal(&mut self, data: String) -> crate::error::Result<String> {
         let mut chunk: Value = serde_json::from_str(&data)?;
-        if let Some(usage) = chunk.get("usage").filter(|v| v.is_object()) {
-            self.chat_usage = Some(usage.clone());
+        let usage = chunk
+            .get("usage")
+            .filter(|value| value.is_object())
+            .cloned();
+        let provider_cost = usage.as_ref().and_then(crate::cost::reported);
+        if let Some(provider_cost) = provider_cost {
+            self.chat_provider_cost_floor = Some(
+                self.chat_provider_cost_floor
+                    .map_or(provider_cost, |current| current.max(provider_cost)),
+            );
         }
         let terminal = chunk.clone();
         if let Some(choices) = chunk.get_mut("choices").and_then(Value::as_array_mut) {
             for (i, choice) in choices.iter_mut().enumerate() {
-                if !choice["finish_reason"].is_string() {
-                    continue;
+                let index = choice["index"].as_u64().unwrap_or(i as u64);
+                let newly_seen = self.known_chat_choices.insert(index);
+                let finished = choice["finish_reason"].is_string();
+                let has_output = choice
+                    .get("delta")
+                    .and_then(Value::as_object)
+                    .is_some_and(|delta| !delta.is_empty());
+                if newly_seen || !finished || has_output {
+                    self.terminal_chat_provider_cost = None;
                 }
-                let mut done = choice.clone();
-                done["delta"] = json!({});
-                self.chat_choices
-                    .insert(choice["index"].as_u64().unwrap_or(i as u64), done);
-                choice["finish_reason"] = Value::Null;
+                if finished {
+                    self.finished_chat_choices.insert(index);
+                } else {
+                    self.finished_chat_choices.remove(&index);
+                }
+                if finished {
+                    let mut done = choice.clone();
+                    done["delta"] = json!({});
+                    self.chat_choices.insert(index, done);
+                    choice["finish_reason"] = Value::Null;
+                }
             }
+        }
+        if let Some(usage) = usage {
+            let all_known_finished = !self.known_chat_choices.is_empty()
+                && self.finished_chat_choices == self.known_chat_choices;
+            self.terminal_chat_provider_cost = if all_known_finished {
+                provider_cost
+            } else {
+                None
+            };
+            self.chat_usage = Some(usage);
         }
         if !self.chat_choices.is_empty() {
             let pending = self.chat_terminal.get_or_insert(terminal);
@@ -429,7 +464,17 @@ impl StreamUsage {
 
     pub(crate) fn take_terminal(&mut self) -> Option<String> {
         let mut terminal = self.chat_terminal.take()?;
-        if let Some(usage) = self.chat_usage.take() {
+        if let Some(mut usage) = self.chat_usage.take() {
+            if let Some(provider_cost) = self.terminal_chat_provider_cost.take() {
+                usage["cost"] = json!(provider_cost);
+            } else if let Some(provider_floor) = self.chat_provider_cost_floor.take() {
+                if let Some(object) = usage.as_object_mut() {
+                    object.remove("cost");
+                    object.remove("cost_usd");
+                    object.remove("cost_source");
+                }
+                usage["provider_cost_floor_usd"] = json!(provider_floor);
+            }
             terminal["usage"] = usage;
         }
         Some(terminal.to_string())

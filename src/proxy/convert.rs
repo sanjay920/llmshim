@@ -709,6 +709,13 @@ fn cache_accounting_survives_proxy_projection() {
     let empty = serde_json::to_value(extract_usage(&json!({}))).unwrap();
     assert_eq!(empty["cache_read_tokens"], 0);
     assert_eq!(empty["cache_write_tokens"], 0);
+    let provider_floor = serde_json::to_value(extract_usage(&json!({
+        "cost_usd": 1.0,
+        "cost_source": "provider_floor"
+    })))
+    .unwrap();
+    assert_eq!(provider_floor["cost_usd"], 1.0);
+    assert_eq!(provider_floor["cost_source"], "provider_floor");
     let events =
         chunk_to_events(&json!({"choices":[],"usage":{"cache_read_tokens":9}}).to_string());
     assert!(matches!(

@@ -191,6 +191,12 @@ Bounded provider error bodies are inspected for native usage or a
 provider-reported bill before retry or return; the original error body and size
 limit remain unchanged.
 
+Any provider-reported partial charge also establishes a floor: a later terminal
+catalog estimate cannot settle below it. A genuine terminal provider bill may
+apply the provider-final correction rule. Public Chat stream aggregation exposes
+a nonterminal bill as `usage.provider_cost_floor_usd` instead of presenting it
+as an exact final `cost_usd`.
+
 Streaming snapshots remain partial until the protocol normalizer validates a
 clean end. A private candidate must still cover every choice or candidate after
 all later output and newly seen indexes; early usage-only frames and mixed

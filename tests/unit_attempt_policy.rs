@@ -1398,6 +1398,88 @@ async fn chat_terminal_authority_survives_only_without_later_choice_activity() {
 }
 
 #[tokio::test]
+async fn partial_provider_cost_precedes_lower_terminal_catalog_candidate() {
+    let events = record_chat_stream(vec![
+        json!({
+            "id":"r",
+            "choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}],
+            "usage":{"cost":1.0}
+        }),
+        json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        json!({
+            "id":"r",
+            "choices":[],
+            "usage":{"prompt_tokens":7,"completion_tokens":3}
+        }),
+    ])
+    .await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: false,
+            ..
+        } if usage["cost_source"] == "provider" && usage["cost_usd"] == 1.0
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: true,
+            ..
+        } if usage["cost_source"] == "catalog"
+            && usage["cost_usd"].as_f64().is_some_and(|cost| cost < 1.0)
+    )));
+}
+
+#[tokio::test]
+async fn public_terminal_usage_preserves_partial_provider_floor_separately() {
+    let mut server = mockito::Server::new_async().await;
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}],"usage":{"cost":1.0}}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}})
+    );
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let chunks: Vec<_> = ShimClient::new()
+        .stream(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+        )
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    upstream.assert_async().await;
+    let terminal_usage = chunks
+        .iter()
+        .filter_map(|chunk| serde_json::from_str::<Value>(chunk).ok())
+        .find_map(|chunk| {
+            chunk
+                .get("usage")
+                .filter(|usage| usage["provider_cost_floor_usd"].is_number())
+                .cloned()
+        })
+        .unwrap();
+    assert_eq!(terminal_usage["provider_cost_floor_usd"], 1.0);
+    assert_eq!(terminal_usage["cost_source"], "provider_floor");
+    assert_eq!(terminal_usage["cost_usd"], 1.0);
+    assert!(terminal_usage.get("cost").is_none());
+}
+
+#[tokio::test]
 async fn gemini_terminal_authority_survives_only_without_later_candidate_activity() {
     let unsafe_sequences = vec![
         vec![

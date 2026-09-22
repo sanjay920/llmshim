@@ -142,6 +142,8 @@ pub fn is_priceable(provider: &str, model: &str) -> bool {
 
 /// `usage.cost_source` when the number came from the provider's own accounting.
 pub const SOURCE_PROVIDER: &str = "provider";
+/// `usage.cost_source` when a partial provider bill is the highest known floor.
+pub const SOURCE_PROVIDER_FLOOR: &str = "provider_floor";
 /// `usage.cost_source` when the number was computed from catalog prices.
 pub const SOURCE_CATALOG: &str = "catalog";
 
@@ -211,7 +213,17 @@ pub fn stamp(provider: &str, model: &str, response: &mut Value) {
     if !response["usage"].is_object() {
         return;
     }
-    let (cost, source) = resolve(provider, model, &response["usage"]);
+    let (mut cost, mut source) = resolve(provider, model, &response["usage"]);
+    let provider_floor = response["usage"]
+        .get("provider_cost_floor_usd")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    if source != SOURCE_PROVIDER
+        && provider_floor.is_some_and(|floor| cost.is_none_or(|resolved| resolved < floor))
+    {
+        cost = provider_floor;
+        source = SOURCE_PROVIDER_FLOOR;
+    }
     response["usage"]["cost_usd"] = match cost {
         Some(usd) => serde_json::json!(usd),
         None => Value::Null,
@@ -396,6 +408,26 @@ mod tests {
             "an unpriceable model must stamp null, never 0"
         );
         assert!(response["usage"].get("cost_usd").is_some());
+    }
+
+    #[test]
+    fn partial_provider_floor_is_distinct_from_a_terminal_provider_bill() {
+        let mut floor = json!({"usage": {
+            "prompt_tokens": 7,
+            "completion_tokens": 3,
+            "provider_cost_floor_usd": 1.0
+        }});
+        stamp("openrouter", "x-ai/grok-4.7", &mut floor);
+        assert_eq!(floor["usage"]["cost_usd"], 1.0);
+        assert_eq!(floor["usage"]["cost_source"], SOURCE_PROVIDER_FLOOR);
+
+        let mut corrected = json!({"usage": {
+            "cost": 0.25,
+            "provider_cost_floor_usd": 1.0
+        }});
+        stamp("openrouter", "x-ai/grok-4.7", &mut corrected);
+        assert_eq!(corrected["usage"]["cost_usd"], 0.25);
+        assert_eq!(corrected["usage"]["cost_source"], SOURCE_PROVIDER);
     }
 
     #[test]
