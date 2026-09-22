@@ -119,6 +119,16 @@ pub(crate) fn models_dev(
     let providers = root
         .as_object()
         .ok_or(CatalogError::Invalid("catalog must be an object"))?;
+    let mut import_budget = crate::import_budget::ImportBudget::default();
+    for (provider, provider_value) in providers {
+        if let Some(entries) = provider_value["models"].as_object() {
+            for (model_name, model_value) in entries {
+                if model_value.is_object() && !model_name.is_empty() {
+                    import_budget.admit(provider, model_name)?;
+                }
+            }
+        }
+    }
     let mut models = Vec::new();
     for (provider, p) in providers {
         let Some(entries) = p["models"].as_object() else {
