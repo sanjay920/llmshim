@@ -555,7 +555,7 @@ pub(crate) struct LifecycleReference {
 /// (`submit` / `submit_stream`) and the worker + reaper side.
 pub struct DistributedGateway {
     client: redis::Client,
-    conn: ConnectionManager,
+    connections: Arc<crate::redis_operation::RedisConnectionManagerCache>,
     dispatch: Arc<dyn Dispatch>,
     limiter: Arc<dyn RateLimiter>,
     attempt_coordinator: Option<Arc<crate::gateway::attempt::AttemptCoordinator>>,
@@ -617,14 +617,6 @@ impl DistributedGateway {
         attempt_coordinator: Option<Arc<crate::gateway::attempt::AttemptCoordinator>>,
     ) -> redis::RedisResult<Arc<Self>> {
         let client = redis::Client::open(redis_url)?;
-        let conn = tokio::time::timeout(
-            Duration::from_secs(5),
-            ConnectionManager::new(client.clone()),
-        )
-        .await
-        .map_err(|_| {
-            redis::RedisError::from((redis::ErrorKind::Io, "Redis connection timed out"))
-        })??;
         let nonce = uuid::Uuid::new_v4().as_u128();
         let configured_redis_operation_timeout = positive_duration_from_env(
             "LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS",
@@ -636,9 +628,22 @@ impl DistributedGateway {
             "LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS",
             Duration::from_secs(6 * 60 * 60),
         );
+        let connections = Arc::new(crate::redis_operation::RedisConnectionManagerCache::new(
+            client.clone(),
+        ));
+        run_redis_operation(
+            &connections,
+            redis_operation_timeout,
+            |mut connection| async move {
+                redis::cmd("PING")
+                    .query_async::<String>(&mut connection)
+                    .await
+            },
+        )
+        .await?;
         Ok(Arc::new(Self {
             client,
-            conn,
+            connections,
             dispatch,
             limiter,
             attempt_coordinator,
@@ -664,17 +669,23 @@ impl DistributedGateway {
         }))
     }
 
+    async fn redis_operation<T, F, Fut>(&self, operation: F) -> redis::RedisResult<T>
+    where
+        F: FnOnce(ConnectionManager) -> Fut,
+        Fut: std::future::Future<Output = redis::RedisResult<T>>,
+    {
+        run_redis_operation(&self.connections, self.redis_operation_timeout, operation).await
+    }
+
     /// Generic Redis cache lookup retained for API compatibility.
     #[deprecated(note = "gateway HTTP replay uses credential-scoped idempotency")]
     pub async fn idem_get(&self, key: &str) -> Option<Value> {
-        let mut connection = self.conn.clone();
-        tokio::time::timeout(
-            self.redis_operation_timeout,
-            lifecycle::generic_cache_get(&mut connection, &generic_idempotency_key(key)),
-        )
+        let storage_key = generic_idempotency_key(key);
+        self.redis_operation(|mut connection| async move {
+            lifecycle::generic_cache_get(&mut connection, &storage_key).await
+        })
         .await
         .ok()
-        .and_then(Result::ok)
         .flatten()
         .and_then(|value| serde_json::from_slice(&value).ok())
     }
@@ -683,17 +694,18 @@ impl DistributedGateway {
     #[deprecated(note = "gateway HTTP replay uses credential-scoped idempotency")]
     pub async fn idem_put(&self, key: &str, value: &Value, ttl_secs: u64) {
         if let Ok(serialized_value) = serde_json::to_string(value) {
-            let mut connection = self.conn.clone();
-            let _ = tokio::time::timeout(
-                self.redis_operation_timeout,
-                lifecycle::generic_cache_put(
-                    &mut connection,
-                    &generic_idempotency_key(key),
-                    serialized_value.as_bytes(),
-                    ttl_secs,
-                ),
-            )
-            .await;
+            let storage_key = generic_idempotency_key(key);
+            let _ = self
+                .redis_operation(|mut connection| async move {
+                    lifecycle::generic_cache_put(
+                        &mut connection,
+                        &storage_key,
+                        serialized_value.as_bytes(),
+                        ttl_secs,
+                    )
+                    .await
+                })
+                .await;
         }
     }
 
@@ -702,15 +714,15 @@ impl DistributedGateway {
         &self,
         context: &crate::gateway::idempotency::IdempotencyContext,
     ) -> crate::gateway::idempotency::IdempotencyLookup {
-        let mut connection = self.conn.clone();
-        let Some(serialized_pointer) = tokio::time::timeout(
-            self.redis_operation_timeout,
-            lifecycle::scoped_pointer_get(&mut connection, &scoped_idempotency_key(context)),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten() else {
+        let storage_key = scoped_idempotency_key(context);
+        let Some(serialized_pointer) = self
+            .redis_operation(|mut connection| async move {
+                lifecycle::scoped_pointer_get(&mut connection, &storage_key).await
+            })
+            .await
+            .ok()
+            .flatten()
+        else {
             return crate::gateway::idempotency::IdempotencyLookup::Miss;
         };
         let Ok(pointer) = serde_json::from_slice::<ScopedIdempotencyPointer>(&serialized_pointer)
@@ -720,13 +732,16 @@ impl DistributedGateway {
         if pointer.request_fingerprint != context.request_fingerprint() {
             return crate::gateway::idempotency::IdempotencyLookup::Conflict;
         }
-        match tokio::time::timeout(
-            self.redis_operation_timeout,
-            lifecycle::read_terminal(&mut connection, &pointer.job_id, &pointer.generation),
-        )
-        .await
+        let pointer_job_id = pointer.job_id;
+        let pointer_generation = pointer.generation;
+        match self
+            .redis_operation(|mut connection| async move {
+                lifecycle::read_terminal(&mut connection, &pointer_job_id, &pointer_generation)
+                    .await
+            })
+            .await
         {
-            Ok(Ok(Some(BusMessage::Unary(value)))) => {
+            Ok(Some(BusMessage::Unary(value))) => {
                 crate::gateway::idempotency::IdempotencyLookup::Replay(value)
             }
             _ => crate::gateway::idempotency::IdempotencyLookup::Miss,
@@ -747,56 +762,58 @@ impl DistributedGateway {
             request_fingerprint: context.request_fingerprint().into(),
         };
         if let Ok(serialized_pointer) = serde_json::to_vec(&pointer) {
-            let mut connection = self.conn.clone();
+            let job_id = lifecycle_reference.job_id.clone();
+            let generation = lifecycle_reference.generation.clone();
             if !matches!(
-                tokio::time::timeout(
-                    self.redis_operation_timeout,
+                self.redis_operation(|mut connection| async move {
                     lifecycle::extend_terminal_retention(
                         &mut connection,
-                        &lifecycle_reference.job_id,
-                        &lifecycle_reference.generation,
+                        &job_id,
+                        &generation,
                         effective_ttl_secs,
-                    ),
-                )
+                    )
+                    .await
+                })
                 .await,
-                Ok(Ok(true))
+                Ok(true)
             ) {
                 return;
             }
-            let _ = tokio::time::timeout(
-                self.redis_operation_timeout,
-                lifecycle::scoped_pointer_put(
-                    &mut connection,
-                    &scoped_idempotency_key(context),
-                    &serialized_pointer,
-                    effective_ttl_secs,
-                ),
-            )
-            .await;
+            let storage_key = scoped_idempotency_key(context);
+            let _ = self
+                .redis_operation(|mut connection| async move {
+                    lifecycle::scoped_pointer_put(
+                        &mut connection,
+                        &storage_key,
+                        &serialized_pointer,
+                        effective_ttl_secs,
+                    )
+                    .await
+                })
+                .await;
         }
     }
 
     /// Liveness check: `PING` Redis (readiness gate for the fleet).
     pub async fn ping(&self) -> bool {
-        let mut conn = self.conn.clone();
         matches!(
-            tokio::time::timeout(
-                self.redis_operation_timeout,
-                redis::cmd("PING").query_async::<String>(&mut conn),
-            )
+            self.redis_operation(|mut connection| async move {
+                redis::cmd("PING")
+                    .query_async::<String>(&mut connection)
+                    .await
+            })
             .await,
-            Ok(Ok(response)) if response == "PONG"
+            Ok(response) if response == "PONG"
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn connection_for_test(&self) -> ConnectionManager {
-        self.conn.clone()
+    pub(crate) async fn connection_for_test(&self) -> redis::RedisResult<ConnectionManager> {
+        ConnectionManager::new(self.client.clone()).await
     }
 
     /// Waiting-queue depth per provider (for metrics / introspection).
     pub async fn queue_depths(&self, providers: &[String]) -> Vec<(String, usize)> {
-        let mut conn = self.conn.clone();
         let mut out = Vec::with_capacity(providers.len());
         for p in providers {
             let mut pipeline = redis::pipe();
@@ -814,14 +831,13 @@ impl DistributedGateway {
                 u64,
                 u64,
                 u64,
-            ) = tokio::time::timeout(
-                self.redis_operation_timeout,
-                pipeline.query_async(&mut conn),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+            ) = self
+                .redis_operation(|mut connection| async move {
+                    pipeline.query_async(&mut connection).await
+                })
+                .await
+                .ok()
+                .unwrap_or_default();
             out.push((
                 p.clone(),
                 legacy
@@ -851,96 +867,105 @@ impl DistributedGateway {
         prepared_submission: &mut PreparedSubmission,
     ) -> Result<(), GatewayError> {
         let descriptor = &prepared_submission.descriptor;
-        let mut connection = self.conn.clone();
+        let protocol = prepared_submission.protocol;
+        let id = descriptor.id.clone();
+        let provider = descriptor.provider.clone();
+        let reservation_nonce = prepared_submission.reservation_nonce.clone();
+        let serialized_payload = prepared_submission.serialized_payload.clone();
+        let stream = descriptor.stream;
         let priority_score =
             deadline_score(descriptor.tier, descriptor.enqueue_ms, self.aging_step_ms());
         let old_keys = [
-            released_queue_key(QueueProtocol::LegacyUnscoped, &descriptor.provider),
-            released_processing_key(QueueProtocol::LegacyUnscoped, &descriptor.provider),
-            released_queue_key(QueueProtocol::ScopedV1, &descriptor.provider),
-            released_processing_key(QueueProtocol::ScopedV1, &descriptor.provider),
-            l1_protocol_key(QueueProtocol::LegacyUnscoped, "q", &descriptor.provider),
-            l1_protocol_key(QueueProtocol::LegacyUnscoped, "proc", &descriptor.provider),
-            l1_protocol_key(QueueProtocol::ScopedV1, "q", &descriptor.provider),
-            l1_protocol_key(QueueProtocol::ScopedV1, "proc", &descriptor.provider),
+            released_queue_key(QueueProtocol::LegacyUnscoped, &provider),
+            released_processing_key(QueueProtocol::LegacyUnscoped, &provider),
+            released_queue_key(QueueProtocol::ScopedV1, &provider),
+            released_processing_key(QueueProtocol::ScopedV1, &provider),
+            l1_protocol_key(QueueProtocol::LegacyUnscoped, "q", &provider),
+            l1_protocol_key(QueueProtocol::LegacyUnscoped, "proc", &provider),
+            l1_protocol_key(QueueProtocol::ScopedV1, "q", &provider),
+            l1_protocol_key(QueueProtocol::ScopedV1, "proc", &provider),
         ];
-        let reserved = tokio::time::timeout(
-            self.redis_operation_timeout,
-            lifecycle::reserve(
-                &mut connection,
-                prepared_submission.protocol,
-                &descriptor.id,
-                &prepared_submission.reservation_nonce,
-                &prepared_submission.serialized_payload,
-                &descriptor.provider,
-                descriptor.stream,
-                priority_score,
-                self.lifecycle_limits,
-                old_keys.each_ref().map(|key| key.as_str()),
-            ),
-        )
-        .await
-        .map_err(|_| GatewayError::Upstream("distributed gateway lifecycle timed out".into()))?
-        .map_err(|failure| match failure {
-            lifecycle::ReserveFailure::Capacity => {
-                GatewayError::Overloaded(self.config.overloaded_retry_after)
-            }
-            lifecycle::ReserveFailure::Migration => GatewayError::Upstream(
-                "distributed gateway lifecycle migration is still draining".into(),
-            ),
-            lifecycle::ReserveFailure::Collision => {
-                GatewayError::Upstream("distributed gateway job identity conflict".into())
-            }
-            lifecycle::ReserveFailure::Redis => {
-                GatewayError::Upstream("distributed gateway lifecycle unavailable".into())
-            }
-        })?;
+        let limits = self.lifecycle_limits;
+        let reserved = self
+            .redis_operation(|mut connection| async move {
+                match lifecycle::reserve(
+                    &mut connection,
+                    protocol,
+                    &id,
+                    &reservation_nonce,
+                    &serialized_payload,
+                    &provider,
+                    stream,
+                    priority_score,
+                    limits,
+                    old_keys.each_ref().map(|key| key.as_str()),
+                )
+                .await
+                {
+                    Err(lifecycle::ReserveFailure::Redis) => Err(redis::RedisError::from((
+                        redis::ErrorKind::Io,
+                        "distributed lifecycle reserve failed",
+                    ))),
+                    result => Ok(result),
+                }
+            })
+            .await
+            .map_err(|error| redis_err(&error))?
+            .map_err(|failure| match failure {
+                lifecycle::ReserveFailure::Capacity => {
+                    GatewayError::Overloaded(self.config.overloaded_retry_after)
+                }
+                lifecycle::ReserveFailure::Migration => GatewayError::Upstream(
+                    "distributed gateway lifecycle migration is still draining".into(),
+                ),
+                lifecycle::ReserveFailure::Collision => {
+                    GatewayError::Upstream("distributed gateway job identity conflict".into())
+                }
+                lifecycle::ReserveFailure::Redis => {
+                    GatewayError::Upstream("distributed gateway lifecycle unavailable".into())
+                }
+            })?;
         prepared_submission.member = reserved.member.clone();
-        let activation = tokio::time::timeout(
-            self.redis_operation_timeout,
-            lifecycle::activate(
-                &mut connection,
-                prepared_submission.protocol,
-                &descriptor.provider,
-                &descriptor.id,
-                &reserved,
-                priority_score,
-                self.config.request_timeout,
-                self.config.max_queue_depth,
-                [
-                    &protocol_queue_key(
-                        match prepared_submission.protocol {
-                            QueueProtocol::LegacyUnscoped => QueueProtocol::ScopedV1,
-                            QueueProtocol::ScopedV1 => QueueProtocol::LegacyUnscoped,
-                        },
-                        &descriptor.provider,
-                    ),
-                    &released_queue_key(QueueProtocol::LegacyUnscoped, &descriptor.provider),
-                    &released_queue_key(QueueProtocol::ScopedV1, &descriptor.provider),
-                    &l1_protocol_key(QueueProtocol::LegacyUnscoped, "q", &descriptor.provider),
-                    &l1_protocol_key(QueueProtocol::ScopedV1, "q", &descriptor.provider),
-                ],
-            ),
-        )
-        .await;
+        let provider = descriptor.provider.clone();
+        let id = descriptor.id.clone();
+        let request_timeout = self.config.request_timeout;
+        let max_queue_depth = self.config.max_queue_depth;
+        let activation = self
+            .redis_operation(|mut connection| async move {
+                let other_protocol = match protocol {
+                    QueueProtocol::LegacyUnscoped => QueueProtocol::ScopedV1,
+                    QueueProtocol::ScopedV1 => QueueProtocol::LegacyUnscoped,
+                };
+                let capacity_keys = [
+                    protocol_queue_key(other_protocol, &provider),
+                    released_queue_key(QueueProtocol::LegacyUnscoped, &provider),
+                    released_queue_key(QueueProtocol::ScopedV1, &provider),
+                    l1_protocol_key(QueueProtocol::LegacyUnscoped, "q", &provider),
+                    l1_protocol_key(QueueProtocol::ScopedV1, "q", &provider),
+                ];
+                lifecycle::activate(
+                    &mut connection,
+                    protocol,
+                    &provider,
+                    &id,
+                    &reserved,
+                    priority_score,
+                    request_timeout,
+                    max_queue_depth,
+                    capacity_keys.each_ref().map(|key| key.as_str()),
+                )
+                .await
+            })
+            .await;
         match activation {
-            Ok(Ok(true)) => Ok(()),
-            Ok(Ok(false)) => {
+            Ok(true) => Ok(()),
+            Ok(false) => {
                 self.cancel_prepared(prepared_submission).await;
                 Err(GatewayError::Overloaded(self.config.overloaded_retry_after))
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 self.cancel_prepared(prepared_submission).await;
                 Err(redis_err(&error))
-            }
-            Err(_) => {
-                // The activation may have reached Redis even though its reply did not.
-                // A generation-fenced cancellation is safe before or after that delayed
-                // activation and prevents the originless job from being resurrected.
-                self.cancel_prepared(prepared_submission).await;
-                Err(GatewayError::Upstream(
-                    "distributed gateway activation timed out".into(),
-                ))
             }
         }
     }
@@ -1040,16 +1065,13 @@ impl DistributedGateway {
             }
             Ok(None) => Err(GatewayError::Shutdown),
             Err(_) => {
-                let mut connection = self.conn.clone();
-                if let Ok(Ok(Some(terminal))) = tokio::time::timeout(
-                    self.redis_operation_timeout,
-                    lifecycle::read_terminal(
-                        &mut connection,
-                        &accepted.prepared.descriptor.id,
-                        &lifecycle_reference.generation,
-                    ),
-                )
-                .await
+                let job_id = accepted.prepared.descriptor.id.clone();
+                let generation = lifecycle_reference.generation.clone();
+                if let Ok(Some(terminal)) = self
+                    .redis_operation(|mut connection| async move {
+                        lifecycle::read_terminal(&mut connection, &job_id, &generation).await
+                    })
+                    .await
                 {
                     return match terminal {
                         BusMessage::Unary(value) => Ok((value, lifecycle_reference)),
@@ -1097,7 +1119,7 @@ impl DistributedGateway {
             .rsplit_once(':')
             .map(|(_, generation)| generation.to_string())
             .unwrap_or_default();
-        let conn = self.conn.clone();
+        let connections = self.connections.clone();
         let redis_operation_timeout = self.redis_operation_timeout;
 
         tokio::spawn(async move {
@@ -1113,19 +1135,26 @@ impl DistributedGateway {
                         match serde_json::from_str::<BusMessage>(&payload) {
                             Ok(BusMessage::Chunk(s)) => {
                                 if chunk_tx.send(Ok(s)).await.is_err() {
-                                    let mut cancellation_connection = conn.clone();
                                     if let Some((_, generation)) = member.rsplit_once(':') {
-                                        let _ = tokio::time::timeout(
+                                        let generation = generation.to_string();
+                                        let member = member.clone();
+                                        let request_provider = request_provider.clone();
+                                        let request_id = request_id.clone();
+                                        let _ = run_redis_operation(
+                                            &connections,
                                             redis_operation_timeout,
-                                            lifecycle::cancel(
-                                                &mut cancellation_connection,
-                                                request_protocol,
-                                                &request_provider,
-                                                &request_id,
-                                                generation,
-                                                &member,
-                                                Duration::from_secs(10 * 60),
-                                            ),
+                                            |mut connection| async move {
+                                                lifecycle::cancel(
+                                                    &mut connection,
+                                                    request_protocol,
+                                                    &request_provider,
+                                                    &request_id,
+                                                    &generation,
+                                                    &member,
+                                                    Duration::from_secs(10 * 60),
+                                                )
+                                                .await
+                                            },
                                         )
                                         .await;
                                     }
@@ -1142,14 +1171,19 @@ impl DistributedGateway {
                     }
                     Ok(None) => break,
                     Err(_) => {
-                        let mut terminal_connection = conn.clone();
-                        if let Ok(Ok(Some(terminal))) = tokio::time::timeout(
-                            request_timeout.min(Duration::from_secs(5)),
-                            lifecycle::read_terminal(
-                                &mut terminal_connection,
-                                &request_id,
-                                &request_generation,
-                            ),
+                        let terminal_id = request_id.clone();
+                        let terminal_generation = request_generation.clone();
+                        if let Ok(Some(terminal)) = run_redis_operation(
+                            &connections,
+                            redis_operation_timeout,
+                            |mut connection| async move {
+                                lifecycle::read_terminal(
+                                    &mut connection,
+                                    &terminal_id,
+                                    &terminal_generation,
+                                )
+                                .await
+                            },
                         )
                         .await
                         {
@@ -1162,19 +1196,26 @@ impl DistributedGateway {
                                 _ => {}
                             }
                         }
-                        let mut c = conn.clone();
                         if let Some((_, generation)) = member.rsplit_once(':') {
-                            let _ = tokio::time::timeout(
+                            let generation = generation.to_string();
+                            let cancel_member = member.clone();
+                            let cancel_provider = request_provider.clone();
+                            let cancel_id = request_id.clone();
+                            let _ = run_redis_operation(
+                                &connections,
                                 redis_operation_timeout,
-                                lifecycle::cancel(
-                                    &mut c,
-                                    request_protocol,
-                                    &request_provider,
-                                    &request_id,
-                                    generation,
-                                    &member,
-                                    Duration::from_secs(10 * 60),
-                                ),
+                                |mut connection| async move {
+                                    lifecycle::cancel(
+                                        &mut connection,
+                                        request_protocol,
+                                        &cancel_provider,
+                                        &cancel_id,
+                                        &generation,
+                                        &cancel_member,
+                                        Duration::from_secs(10 * 60),
+                                    )
+                                    .await
+                                },
                             )
                             .await;
                         }
@@ -1216,46 +1257,38 @@ impl DistributedGateway {
     }
 
     async fn is_done(&self, protocol: QueueProtocol, id: &str) -> Option<bool> {
-        let mut conn = self.conn.clone();
-        tokio::time::timeout(
-            self.redis_operation_timeout,
-            conn.exists(protocol_done_key(protocol, id)),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
+        let key = protocol_done_key(protocol, id);
+        self.redis_operation(|mut connection| async move { connection.exists(key).await })
+            .await
+            .ok()
     }
 
     /// Increment and return this job's delivery-attempt count.
     async fn bump_attempts(&self, protocol: QueueProtocol, id: &str) -> Option<u32> {
-        let mut conn = self.conn.clone();
         let key = protocol_attempts_key(protocol, id);
         let mut invocation = self.bump_attempts_script.key(key);
         invocation.arg(self.marker_ttl_secs());
-        let operation = invocation.invoke_async::<u32>(&mut conn);
-        tokio::time::timeout(self.redis_operation_timeout, operation)
-            .await
-            .ok()
-            .and_then(Result::ok)
+        self.redis_operation(|mut connection| async move {
+            invocation.invoke_async::<u32>(&mut connection).await
+        })
+        .await
+        .ok()
     }
 
     /// Number of dead-lettered jobs for a provider (introspection).
     pub async fn dead_letter_len(&self, provider: &str) -> usize {
-        let mut conn = self.conn.clone();
         let mut pipeline = redis::pipe();
         pipeline
             .zcard(protocol_dlq_key(QueueProtocol::LegacyUnscoped, provider))
             .zcard(protocol_dlq_key(QueueProtocol::ScopedV1, provider))
             .llen(released_dlq_key(QueueProtocol::LegacyUnscoped, provider))
             .llen(released_dlq_key(QueueProtocol::ScopedV1, provider));
-        let (legacy, scoped, released_unscoped, released_scoped): (u64, u64, u64, u64) =
-            tokio::time::timeout(
-                self.redis_operation_timeout,
-                pipeline.query_async(&mut conn),
+        let (legacy, scoped, released_unscoped, released_scoped): (u64, u64, u64, u64) = self
+            .redis_operation(
+                |mut connection| async move { pipeline.query_async(&mut connection).await },
             )
             .await
             .ok()
-            .and_then(Result::ok)
             .unwrap_or_default();
         legacy
             .saturating_add(scoped)
@@ -1267,20 +1300,25 @@ impl DistributedGateway {
         let Some((_, generation)) = prepared.member.rsplit_once(':') else {
             return;
         };
-        let mut connection = self.conn.clone();
-        let _ = tokio::time::timeout(
-            self.redis_operation_timeout,
-            lifecycle::cancel(
-                &mut connection,
-                prepared.protocol,
-                &prepared.descriptor.provider,
-                &prepared.descriptor.id,
-                generation,
-                &prepared.member,
-                Duration::from_secs(10 * 60),
-            ),
-        )
-        .await;
+        let protocol = prepared.protocol;
+        let provider = prepared.descriptor.provider.clone();
+        let id = prepared.descriptor.id.clone();
+        let generation = generation.to_string();
+        let member = prepared.member.clone();
+        let _ = self
+            .redis_operation(|mut connection| async move {
+                lifecycle::cancel(
+                    &mut connection,
+                    protocol,
+                    &provider,
+                    &id,
+                    &generation,
+                    &member,
+                    Duration::from_secs(10 * 60),
+                )
+                .await
+            })
+            .await;
     }
 
     /// Spawn one worker loop per provider plus a reaper for redelivery.
@@ -1315,7 +1353,6 @@ impl DistributedGateway {
         let pkey = protocol_processing_key(protocol, &provider);
         let lkey = protocol_leased_key(protocol, &provider);
         let rate_key = RateKey::provider(provider.clone());
-        let mut conn = self.conn.clone();
 
         loop {
             let preparation_permit = match preparation_capacity.clone().acquire_owned().await {
@@ -1344,23 +1381,20 @@ impl DistributedGateway {
                         .saturating_add(Duration::from_secs(60 * 60)),
                 ))
                 .arg(duration_millis_u64(self.worker_job_timeout));
-            let lease_operation = lease_invocation.invoke_async(&mut conn);
-            let leased: Option<(String, String, String)> =
-                match tokio::time::timeout(self.redis_operation_timeout, lease_operation).await {
-                    Ok(Ok(value)) => value,
-                    Ok(Err(error)) => {
-                        drop(preparation_permit);
-                        eprintln!("gateway worker[{provider}]: lease error: {error}");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    Err(_) => {
-                        drop(preparation_permit);
-                        eprintln!("gateway worker[{provider}]: lease operation timed out");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                };
+            let leased: Option<(String, String, String)> = match self
+                .redis_operation(|mut connection| async move {
+                    lease_invocation.invoke_async(&mut connection).await
+                })
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(preparation_permit);
+                    eprintln!("gateway worker[{provider}]: lease error: {error}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
             let Some((member, score, serialized_payload)) = leased else {
                 drop(preparation_permit);
                 tokio::time::sleep(IDLE_POLL).await; // queue empty
@@ -1701,7 +1735,6 @@ impl DistributedGateway {
             return false;
         };
         let channel = protocol_response_channel(ownership.protocol, id);
-        let mut connection = self.conn.clone();
         let mut invocation = self.terminal_publish_complete.key(protocol_processing_key(
             ownership.protocol,
             &ownership.provider,
@@ -1728,10 +1761,12 @@ impl DistributedGateway {
                 serde_json::to_vec(&BusMessage::Error("distributed origin canceled".into()))
                     .expect("fixed cancellation envelope serializes"),
             );
-        let operation = invocation.invoke_async::<i64>(&mut connection);
         matches!(
-            tokio::time::timeout(self.redis_operation_timeout, operation).await,
-            Ok(Ok(1))
+            self.redis_operation(|mut connection| async move {
+                invocation.invoke_async::<i64>(&mut connection).await
+            })
+            .await,
+            Ok(1)
         )
     }
 
@@ -1747,7 +1782,6 @@ impl DistributedGateway {
         let Ok(payload) = serde_json::to_string(message) else {
             return false;
         };
-        let mut connection = self.conn.clone();
         let mut invocation = self.fenced_publish.key(protocol_processing_key(
             ownership.protocol,
             &ownership.provider,
@@ -1760,15 +1794,16 @@ impl DistributedGateway {
             .arg(channel)
             .arg(payload)
             .arg(generation);
-        let operation = invocation.invoke_async::<i64>(&mut connection);
         matches!(
-            tokio::time::timeout(self.redis_operation_timeout, operation).await,
-            Ok(Ok(subscriber_count)) if subscriber_count >= 0
+            self.redis_operation(|mut connection| async move {
+                invocation.invoke_async::<i64>(&mut connection).await
+            })
+            .await,
+            Ok(subscriber_count) if subscriber_count >= 0
         )
     }
 
     async fn ack_owned(&self, ownership: &LeaseOwnership) -> bool {
-        let mut connection = self.conn.clone();
         let mut invocation = self.ack.key(protocol_processing_key(
             ownership.protocol,
             &ownership.provider,
@@ -1778,10 +1813,12 @@ impl DistributedGateway {
             .key(protocol_owners_key(ownership.protocol, &ownership.provider))
             .arg(&ownership.member)
             .arg(&ownership.owner_token);
-        let operation = invocation.invoke_async::<i64>(&mut connection);
         matches!(
-            tokio::time::timeout(self.redis_operation_timeout, operation).await,
-            Ok(Ok(1))
+            self.redis_operation(|mut connection| async move {
+                invocation.invoke_async::<i64>(&mut connection).await
+            })
+            .await,
+            Ok(1)
         )
     }
 
@@ -1790,7 +1827,6 @@ impl DistributedGateway {
             return 0;
         };
         let lease_duration_ms = duration_millis_u64(self.config.lease_timeout);
-        let mut connection = self.conn.clone();
         let mut invocation = self.refresh.key(protocol_processing_key(
             ownership.protocol,
             &ownership.provider,
@@ -1802,18 +1838,17 @@ impl DistributedGateway {
             .arg(&ownership.owner_token)
             .arg(lease_duration_ms)
             .arg(generation);
-        let operation = invocation.invoke_async::<i64>(&mut connection);
-        match tokio::time::timeout(self.redis_operation_timeout, operation).await {
-            Ok(Ok(status)) => status,
-            _ => 0,
-        }
+        self.redis_operation(|mut connection| async move {
+            invocation.invoke_async::<i64>(&mut connection).await
+        })
+        .await
+        .unwrap_or_default()
     }
 
     async fn release_owned(&self, ownership: &LeaseOwnership) -> bool {
         let Some((id, generation)) = ownership.id_and_generation() else {
             return false;
         };
-        let mut connection = self.conn.clone();
         let mut invocation = self
             .release
             .key(protocol_queue_key(ownership.protocol, &ownership.provider));
@@ -1832,16 +1867,17 @@ impl DistributedGateway {
             .arg(&ownership.original_score)
             .arg(&ownership.owner_token)
             .arg(generation);
-        let operation = invocation.invoke_async::<i64>(&mut connection);
         matches!(
-            tokio::time::timeout(self.redis_operation_timeout, operation).await,
-            Ok(Ok(1))
+            self.redis_operation(|mut connection| async move {
+                invocation.invoke_async::<i64>(&mut connection).await
+            })
+            .await,
+            Ok(1)
         )
     }
 
     #[cfg(test)]
     async fn complete_owned(&self, ownership: &LeaseOwnership, id: &str) -> bool {
-        let mut connection = self.conn.clone();
         let mut invocation = self.complete.key(protocol_processing_key(
             ownership.protocol,
             &ownership.provider,
@@ -1853,10 +1889,12 @@ impl DistributedGateway {
             .arg(&ownership.member)
             .arg(&ownership.owner_token)
             .arg(self.marker_ttl_secs());
-        let operation = invocation.invoke_async::<i64>(&mut connection);
         matches!(
-            tokio::time::timeout(self.redis_operation_timeout, operation).await,
-            Ok(Ok(1))
+            self.redis_operation(|mut connection| async move {
+                invocation.invoke_async::<i64>(&mut connection).await
+            })
+            .await,
+            Ok(1)
         )
     }
 
@@ -1864,7 +1902,6 @@ impl DistributedGateway {
         let Some((id, generation)) = ownership.id_and_generation() else {
             return false;
         };
-        let mut connection = self.conn.clone();
         let mut invocation = self.dead_letter_transition.key(protocol_processing_key(
             ownership.protocol,
             &ownership.provider,
@@ -1901,10 +1938,12 @@ impl DistributedGateway {
                     .expect("fixed cancellation envelope serializes"),
             )
             .arg(60 * 60 * 1000_u64);
-        let operation = invocation.invoke_async::<i64>(&mut connection);
         matches!(
-            tokio::time::timeout(self.redis_operation_timeout, operation).await,
-            Ok(Ok(1))
+            self.redis_operation(|mut connection| async move {
+                invocation.invoke_async::<i64>(&mut connection).await
+            })
+            .await,
+            Ok(1)
         )
     }
 
@@ -1922,17 +1961,16 @@ impl DistributedGateway {
         let interval = (self.config.lease_timeout / 3).max(Duration::from_millis(1));
         loop {
             tokio::time::sleep(interval).await;
-            let mut cleanup_connection = self.conn.clone();
-            let _ = tokio::time::timeout(
-                self.redis_operation_timeout,
-                lifecycle::cleanup_expired(&mut cleanup_connection, 128),
-            )
-            .await;
-            let _ = tokio::time::timeout(
-                self.redis_operation_timeout,
-                lifecycle::cleanup_caches(&mut cleanup_connection, 128),
-            )
-            .await;
+            let _ = self
+                .redis_operation(|mut connection| async move {
+                    lifecycle::cleanup_expired(&mut connection, 128).await
+                })
+                .await;
+            let _ = self
+                .redis_operation(|mut connection| async move {
+                    lifecycle::cleanup_caches(&mut connection, 128).await
+                })
+                .await;
             for provider in &providers {
                 for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
                     let reaped = self.reap_once_protocol(protocol, provider).await;
@@ -1960,7 +1998,6 @@ impl DistributedGateway {
     }
 
     async fn reap_once_protocol(&self, protocol: QueueProtocol, provider: &str) -> i64 {
-        let mut conn = self.conn.clone();
         let mut invocation = self.reap.key(protocol_processing_key(protocol, provider));
         invocation
             .key(protocol_queue_key(protocol, provider))
@@ -1978,15 +2015,15 @@ impl DistributedGateway {
                     .expect("fixed cancellation envelope serializes"),
             )
             .arg(60 * 60 * 1000_u64);
-        let operation = invocation.invoke_async(&mut conn);
-        match tokio::time::timeout(self.redis_operation_timeout, operation).await {
-            Ok(Ok(reaped)) => reaped,
-            Ok(Err(error)) => {
+        match self
+            .redis_operation(|mut connection| async move {
+                invocation.invoke_async(&mut connection).await
+            })
+            .await
+        {
+            Ok(reaped) => reaped,
+            Err(error) => {
                 eprintln!("gateway reaper[{provider}]: Redis transition failed: {error}");
-                0
-            }
-            Err(_) => {
-                eprintln!("gateway reaper[{provider}]: Redis transition timed out");
                 0
             }
         }
@@ -2006,6 +2043,20 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
+async fn run_redis_operation<T, F, Fut>(
+    connections: &crate::redis_operation::RedisConnectionManagerCache,
+    timeout: Duration,
+    operation: F,
+) -> redis::RedisResult<T>
+where
+    F: FnOnce(ConnectionManager) -> Fut,
+    Fut: std::future::Future<Output = redis::RedisResult<T>>,
+{
+    tokio::time::timeout(timeout, connections.run(operation))
+        .await
+        .map_err(|_| redis::RedisError::from((redis::ErrorKind::Io, "Redis operation timed out")))?
+}
+
 /// Wrap any error as a gateway upstream error (redis failures fail the request,
 /// not the process).
 fn redis_err(e: &dyn std::fmt::Display) -> GatewayError {
@@ -2019,28 +2070,26 @@ fn redis_err(e: &dyn std::fmt::Display) -> GatewayError {
 #[async_trait::async_trait]
 impl crate::gateway::quota::SpendStore for DistributedGateway {
     async fn spent(&self, tenant: &str, window: Duration) -> f64 {
-        let mut conn = self.conn.clone();
-        let raw: Option<String> = tokio::time::timeout(
-            self.redis_operation_timeout,
-            conn.get(spend_key(tenant, window)),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok);
+        let key = spend_key(tenant, window);
+        let raw: Option<String> = self
+            .redis_operation(|mut connection| async move { connection.get(key).await })
+            .await
+            .ok()
+            .flatten();
         raw.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0)
     }
 
     async fn record(&self, tenant: &str, window: Duration, usd: f64) {
         let key = spend_key(tenant, window);
-        let mut conn = self.conn.clone();
         // Two windows of slack so a late charge still lands on its own window.
         let ttl = window.as_millis().saturating_mul(2).min(u64::MAX as u128) as u64;
-        let operation = async {
-            let _: f64 = conn.incr(&key, usd).await?;
-            let _: bool = conn.pexpire(&key, ttl as i64).await?;
-            redis::RedisResult::Ok(())
-        };
-        let _ = tokio::time::timeout(self.redis_operation_timeout, operation).await;
+        let _ = self
+            .redis_operation(|mut connection| async move {
+                let _: f64 = connection.incr(&key, usd).await?;
+                let _: bool = connection.pexpire(&key, ttl as i64).await?;
+                redis::RedisResult::Ok(())
+            })
+            .await;
     }
 }
 
@@ -2359,7 +2408,7 @@ mod tests {
         let id = prepared.descriptor.id.clone();
         gateway.enqueue_prepared(&mut prepared).await.unwrap();
         let protocol = QueueProtocol::LegacyUnscoped;
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let leased: Option<(String, String, String)> = gateway
             .lease
             .key(protocol_queue_key(protocol, provider))
@@ -2393,6 +2442,71 @@ mod tests {
             },
             id,
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_timed_out_operation_retires_only_its_cached_connection_generation() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            GatewayConfig::default(),
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut gateway).unwrap().redis_operation_timeout = Duration::from_millis(20);
+        let connection_name = format!("llmshim-retire-{}", uuid::Uuid::new_v4().simple());
+        let set_name = connection_name.clone();
+        gateway
+            .redis_operation(|mut connection| async move {
+                redis::cmd("CLIENT")
+                    .arg("SETNAME")
+                    .arg(set_name)
+                    .query_async::<String>(&mut connection)
+                    .await
+            })
+            .await
+            .unwrap();
+
+        let observer_client = redis::Client::open(redis_url).unwrap();
+        let mut observer = ConnectionManager::new(observer_client).await.unwrap();
+        let clients: String = redis::cmd("CLIENT")
+            .arg("LIST")
+            .query_async(&mut observer)
+            .await
+            .unwrap();
+        assert!(clients.contains(&connection_name));
+
+        let blocking_key = format!("retire-block-{}", uuid::Uuid::new_v4().simple());
+        assert!(gateway
+            .redis_operation(|mut connection| async move {
+                redis::cmd("BRPOP")
+                    .arg(blocking_key)
+                    .arg(1_u64)
+                    .query_async::<Option<(String, String)>>(&mut connection)
+                    .await
+            })
+            .await
+            .is_err());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let clients: String = redis::cmd("CLIENT")
+                    .arg("LIST")
+                    .query_async(&mut observer)
+                    .await
+                    .unwrap();
+                if !clients.contains(&connection_name) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retired cached generation should close its socket");
+        assert!(gateway.ping().await);
     }
 
     #[tokio::test]
@@ -2445,7 +2559,7 @@ mod tests {
                 .map(|(gateway, prepared)| gateway.enqueue(prepared)),
         )
         .await;
-        let mut connection = gateways[0].conn.clone();
+        let mut connection = gateways[0].connection_for_test().await.unwrap();
         let queued_members: Vec<String> = connection
             .zrange(queue_key(&provider_name), 0, -1)
             .await
@@ -2500,7 +2614,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        let mut connection = first.conn.clone();
+        let mut connection = first.connection_for_test().await.unwrap();
         let released_queue = released_queue_key(QueueProtocol::LegacyUnscoped, &provider);
         let _: () = connection
             .zadd(&released_queue, &existing.member, 0_u64)
@@ -2599,7 +2713,7 @@ mod tests {
             Err(GatewayError::Overloaded(delay)) if delay == Duration::from_secs(7)
         ));
         let provider_queue_key = queue_key(&provider_name);
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let queue_exists: bool = connection.exists(&provider_queue_key).await.unwrap();
         assert!(!queue_exists);
 
@@ -2691,7 +2805,7 @@ mod tests {
             serde_json::from_str(&prepared.serialized_payload).unwrap();
         assert!(released.policy_scope.is_some());
 
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let legacy_queue = released_queue_key(QueueProtocol::LegacyUnscoped, &provider);
         let legacy_processing = released_processing_key(QueueProtocol::LegacyUnscoped, &provider);
         let legacy_leased =
@@ -3051,7 +3165,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), first_dispatch_started)
             .await
             .expect("dispatch should start");
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
         let members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
         assert_eq!(members.len(), 1);
@@ -3119,7 +3233,7 @@ mod tests {
             let provider = format!("{provider_seed}-{suffix}");
             let (ownership, id) = lease_test_job(&gateway, &provider, false, suffix).await;
             let (_, generation) = ownership.id_and_generation().unwrap();
-            let mut connection = gateway.conn.clone();
+            let mut connection = gateway.connection_for_test().await.unwrap();
             assert_eq!(
                 lifecycle::cancel(
                     &mut connection,
@@ -3151,7 +3265,7 @@ mod tests {
         let (stream_ownership, stream_id) =
             lease_test_job(&gateway, &stream_provider, true, "stream-owner").await;
         let (_, stream_generation) = stream_ownership.id_and_generation().unwrap();
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         assert_eq!(
             lifecycle::cancel(
                 &mut connection,
@@ -3455,7 +3569,7 @@ mod tests {
             .await
             .expect("dispatch should start");
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
         let processing_members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
         assert_eq!(processing_members.len(), 1);
@@ -3551,7 +3665,7 @@ mod tests {
 
         let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
         let owners = protocol_owners_key(QueueProtocol::LegacyUnscoped, &provider);
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
         assert_eq!(members.len(), 1);
         let member = &members[0];
@@ -3638,7 +3752,7 @@ mod tests {
         let leased = protocol_leased_key(protocol, &provider);
         let owners = protocol_owners_key(protocol, &provider);
         let owner_token = "cancel-owner";
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let leased_delivery: Option<(String, String, String)> = gateway
             .lease
             .key(&queue)
@@ -3905,7 +4019,7 @@ mod tests {
             preparation_capacity,
         ));
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
             connection
@@ -3944,7 +4058,7 @@ mod tests {
         let Some(gw) = test_gateway(&provider).await else {
             return;
         };
-        let mut conn = gw.conn.clone();
+        let mut conn = gw.connection_for_test().await.unwrap();
         let (ownership, _) = lease_test_job(&gw, &provider, false, "crashed-owner").await;
         let member = ownership.member;
         let orig_score: f64 = ownership.original_score.parse().unwrap();
@@ -4000,7 +4114,7 @@ mod tests {
         let leased = protocol_leased_key(protocol, &provider);
         let owners = protocol_owners_key(protocol, &provider);
         let owner_token = "coordinator-time-owner";
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let server_before_lease = redis_server_time_ms(&mut connection).await;
         let leased_delivery: Option<(String, String, String)> = gateway
             .lease
@@ -4098,7 +4212,7 @@ mod tests {
         let processing = protocol_processing_key(protocol, &provider);
         let leased = protocol_leased_key(protocol, &provider);
         let owners = protocol_owners_key(protocol, &provider);
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let first_token = "first-owner";
         let first_lease: Option<(String, String, String)> = gateway
             .lease
@@ -4218,7 +4332,7 @@ mod tests {
         let Some(gw) = test_gateway(provider).await else {
             return;
         };
-        let mut conn = gw.conn.clone();
+        let mut conn = gw.connection_for_test().await.unwrap();
         for k in [
             protocol_done_key(QueueProtocol::LegacyUnscoped, "job-x"),
             protocol_attempts_key(QueueProtocol::LegacyUnscoped, "job-y"),
@@ -4381,7 +4495,7 @@ mod tests {
             "client-key",
             &serde_json::json!({"prompt": "one"}),
         );
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let scoped_storage_key = scoped_idempotency_key(&original_context);
         let unsafe_legacy_key = "llmshim:gw:idem:client-key";
         let _: Result<i64, _> = connection.del(&scoped_storage_key).await;
@@ -4487,7 +4601,7 @@ mod tests {
             return;
         };
         let client_key = format!("generic-{}", uuid::Uuid::new_v4());
-        let mut connection = gateway.conn.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let generic_key = generic_idempotency_key(&client_key);
         let unsafe_legacy_key = format!("llmshim:gw:idem:{client_key}");
         let _: Result<i64, _> = connection.del(&generic_key).await;
@@ -4514,7 +4628,7 @@ mod tests {
         let Some(gw) = test_gateway(provider).await else {
             return;
         };
-        let mut conn = gw.conn.clone();
+        let mut conn = gw.connection_for_test().await.unwrap();
         let key = queue_key(provider);
         // tier 1 (older, newer), tier 3.
         for (member, tier, ms) in [("a", 1u8, 1000u64), ("b", 1, 2000), ("c", 3, 3000)] {

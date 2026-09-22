@@ -1593,7 +1593,7 @@ mod native_tests {
             budget_window_secs: Some(window_secs),
             budget_allow_unpriced: false,
         };
-        let mut connection = gateway.connection_for_test();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let redis_time: (u64, u64) = redis::cmd("TIME")
             .query_async(&mut connection)
             .await
@@ -1709,7 +1709,7 @@ mod native_tests {
             overloaded_retry_after: config.overloaded_retry_after,
         });
         let application = app(state);
-        let mut connection = gateway.connection_for_test();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let redis_time: (u64, u64) = redis::cmd("TIME")
             .query_async(&mut connection)
             .await
