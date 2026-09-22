@@ -44,7 +44,6 @@ impl Bucket {
         self.last = now;
     }
 
-    /// Report whether `want` tokens are available after [`Self::refill`].
     fn check(&self, want: f64) -> Result<(), Duration> {
         if self.capacity == 0.0 {
             return Err(ZERO_QUOTA_RETRY_AFTER);
@@ -57,7 +56,6 @@ impl Bucket {
         }
     }
 
-    /// Deduct `want` tokens after every configured bucket has passed `check`.
     fn commit(&mut self, want: f64) {
         self.tokens -= want;
     }
@@ -367,17 +365,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn oversized_tpm_rejection_does_not_debit_tenant_rpm() {
-        let q = TenantQuota::new();
+        let tenant_quota = TenantQuota::new();
 
-        let rejection = q.check("acme", "openai", Some(1), Some(10), 11);
+        let rejection = tenant_quota.check("acme", "openai", Some(1), Some(10), 11);
         assert!(rejection.is_err(), "request exceeds the TPM bucket");
 
         assert!(
-            q.check("acme", "openai", Some(1), Some(10), 1).is_ok(),
+            tenant_quota
+                .check("acme", "openai", Some(1), Some(10), 1)
+                .is_ok(),
             "a rejected oversized request must leave RPM capacity for valid work"
         );
         assert!(
-            q.check("acme", "openai", Some(1), Some(10), 1).is_err(),
+            tenant_quota
+                .check("acme", "openai", Some(1), Some(10), 1)
+                .is_err(),
             "the valid request consumed the only RPM permit"
         );
     }
