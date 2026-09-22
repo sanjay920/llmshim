@@ -72,6 +72,13 @@ LiteLLM and Codex. Refreshes are serialized across processes sharing that file
 and saved atomically; new token files have Unix mode `0600`. An expired or
 unreadable session returns an error, never a background interactive login.
 
+On Unix, reads of the default cache also repair owned directory modes to
+`0700` and the file mode to `0600`. Symlinks, additional hard links, nonregular
+files, and paths owned by another user are refused before token parsing.
+Already-private handles do not require a chmod. Explicit `CHATGPT_TOKEN_DIR`
+or `CHATGPT_AUTH_FILE` overrides remain operator-managed and are read without
+this default-path permission repair; secure those locations separately.
+
 The router registers ChatGPT when the selected cache file exists. Create a new
 router or restart the proxy after the first login. Once registered, requests
 read the cache each time, so refreshed or replaced tokens need no restart.
