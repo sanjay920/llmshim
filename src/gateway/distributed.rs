@@ -717,7 +717,8 @@ impl DistributedGateway {
         let lifecycle_limits = lifecycle::Limits::from_env();
         let cancellation_capacity = usize::try_from(lifecycle_limits.max_jobs)
             .unwrap_or(usize::MAX)
-            .max(1);
+            .min(config.max_queue_depth.max(1))
+            .clamp(1, 10_000);
         let (origin_cancel_sender, origin_cancel_receiver) = mpsc::channel(cancellation_capacity);
         let connections = Arc::new(crate::redis_operation::RedisConnectionManagerCache::new(
             client.clone(),
@@ -1141,7 +1142,13 @@ impl DistributedGateway {
         logical_deadline: Option<tokio::time::Instant>,
     ) -> Result<AcceptedSubmission, GatewayError> {
         let now = tokio::time::Instant::now();
-        let configured_deadline = now.checked_add(self.config.request_timeout).unwrap_or(now);
+        let worker_deadline = now
+            .checked_add(self.worker_job_timeout)
+            .unwrap_or(now + Duration::from_secs(6 * 60 * 60));
+        let configured_deadline = now
+            .checked_add(self.config.request_timeout)
+            .unwrap_or(worker_deadline)
+            .min(worker_deadline);
         let origin_deadline = logical_deadline
             .map(|deadline| deadline.min(configured_deadline))
             .unwrap_or(configured_deadline);
@@ -1911,6 +1918,16 @@ impl DistributedGateway {
                                     .publish_owned(ownership, &channel, &BusMessage::Chunk(chunk))
                                     .await
                                 {
+                                    let _ = self
+                                        .terminal_owned(
+                                            ownership,
+                                            &desc.id,
+                                            true,
+                                            &BusMessage::Error(
+                                                "distributed response publication failed".into(),
+                                            ),
+                                        )
+                                        .await;
                                     return;
                                 }
                             }
@@ -3948,6 +3965,82 @@ mod tests {
                 .unwrap(),
             Some(BusMessage::Error(message)) if message == "distributed origin canceled"
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_origin_crash_expiry_drops_processing_dispatch() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-processing-crash-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let dispatch_dropped = Arc::new(tokio::sync::Notify::new());
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(PendingDispatch {
+                dispatch_starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dispatch_started: dispatch_started.clone(),
+                dispatch_drops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dispatch_dropped: dispatch_dropped.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(90),
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut gateway).unwrap().origin_lease_timeout = Duration::from_millis(40);
+        let mut prepared = gateway
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"processing-crash"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let id = prepared.descriptor.id.clone();
+        gateway
+            .enqueue_prepared(
+                &mut prepared,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        let generation = prepared.member.rsplit_once(':').unwrap().1.to_string();
+        let workers = gateway.spawn_workers(vec![provider]);
+        let started = dispatch_started.notified();
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .expect("processing dispatch should start");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            gateway
+                .redis_operation(|mut connection| async move {
+                    lifecycle::expire_origins(&mut connection, 16, Duration::from_secs(60)).await
+                })
+                .await
+                .unwrap(),
+            1
+        );
+        tokio::time::timeout(Duration::from_secs(1), dispatch_dropped.notified())
+            .await
+            .expect("origin expiry should drop active provider work");
+        let mut connection = gateway.connection_for_test().await.unwrap();
+        assert!(matches!(
+            lifecycle::read_terminal(&mut connection, &id, &generation)
+                .await
+                .unwrap(),
+            Some(BusMessage::Error(message)) if message == "distributed origin canceled"
+        ));
+        for worker in workers {
+            worker.abort();
+        }
     }
 
     #[tokio::test]

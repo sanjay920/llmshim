@@ -253,7 +253,6 @@ const ORIGIN_HEARTBEAT_LUA: &str = r#"
     local maximum_expiry = tonumber(redis.call('HGET', KEYS[1], 'origin_max_expires_at_ms') or '0')
     if current_expiry <= now_ms or maximum_expiry <= now_ms then
         redis.call('HSET', KEYS[1], 'cancel_requested', '1')
-        redis.call('ZREM', KEYS[2], ARGV[2])
         return -1
     end
     local next_expiry = math.min(now_ms + tonumber(ARGV[4]), maximum_expiry)
@@ -644,6 +643,7 @@ pub(super) async fn read_terminal(
     Ok(serialized.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn cancel(
     connection: &mut ConnectionManager,
     protocol: QueueProtocol,
