@@ -9,15 +9,16 @@ use llmshim::{
 };
 use mockito::Matcher;
 use serde_json::json;
+use std::error::Error as StdError;
 use tower::ServiceExt;
 
-const SYNTHETIC_GEMINI_KEY: &str = "a02-synthetic-gemini-key";
-const GEMINI_MODEL: &str = "gemini-a02-model";
+const SYNTHETIC_GEMINI_KEY: &str = "test-gemini-key";
+const GEMINI_MODEL: &str = "gemini-test-model";
 
 fn request() -> serde_json::Value {
     json!({
         "model": format!("gemini/{GEMINI_MODEL}"),
-        "messages": [{"role": "user", "content": "audit"}],
+        "messages": [{"role": "user", "content": "test"}],
     })
 }
 
@@ -46,6 +47,16 @@ fn assert_error_has_no_sensitive_url(
             "{error_kind} error retained the full request URL"
         );
     }
+    let source = StdError::source(error).expect("HTTP errors retain their source");
+    let rendered_source = source.to_string();
+    assert!(
+        !rendered_source.contains(SYNTHETIC_GEMINI_KEY),
+        "{error_kind} error source retained the synthetic query credential"
+    );
+    assert!(
+        !rendered_source.contains(expected_sensitive_url),
+        "{error_kind} error source retained the full request URL"
+    );
 }
 
 #[tokio::test]
@@ -69,7 +80,7 @@ async fn gemini_transport_and_malformed_json_errors_redact_query_credentials() {
 
     let mut upstream_server = mockito::Server::new_async().await;
     let malformed_response = upstream_server
-        .mock("POST", "/models/gemini-a02-model:generateContent")
+        .mock("POST", "/models/gemini-test-model:generateContent")
         .match_query(Matcher::UrlEncoded(
             "key".into(),
             SYNTHETIC_GEMINI_KEY.into(),
