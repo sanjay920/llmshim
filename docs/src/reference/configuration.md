@@ -128,10 +128,10 @@ unrepresentable values retain the finite default. Rust callers can instead pass
 checked `AttemptDeadlines` through `ShimClient::with_attempt_deadlines`.
 
 These clocks bound a physical provider send, its response body, normalization,
-accounting, and attempt-policy callbacks. They do not bound the lifetime of an
-HTTP response body after a proxy or gateway frontend has taken ownership of it.
-The distributed gateway's existing 120-second request timeout is unchanged and
-may be the narrower boundary.
+accounting, and attempt-policy callbacks. The proxy's separate logical clocks
+below cover the complete HTTP operation. Gateway response and job lifetimes are
+separate. The distributed gateway's existing 120-second request timeout is
+unchanged and may be the narrower boundary.
 
 ## Proxy admission and rate limits
 
@@ -139,6 +139,8 @@ may be the narrower boundary.
 |---|---:|---|
 | `LLMSHIM_MAX_CONCURRENCY` | `256` | In-flight upstream requests per proxy instance |
 | `LLMSHIM_QUEUE_TIMEOUT_MS` | `5000` | Wait for a concurrency slot before `503` |
+| `LLMSHIM_PROXY_UNARY_TIMEOUT_MS` | `7200000` | Absolute unary request and final-body lifetime after preparation admission |
+| `LLMSHIM_PROXY_STREAM_TIMEOUT_MS` | `21600000` | Absolute streaming request and final-body lifetime after preparation admission |
 | `LLMSHIM_RATE_LIMIT_RPM` | unset | Per-provider default requests per minute |
 | `LLMSHIM_RATE_LIMIT_TPM` | unset | Per-provider default estimated tokens per minute |
 | `LLMSHIM_<PROVIDER>_RPM` | unset | Provider RPM override |
@@ -150,6 +152,32 @@ may be the narrower boundary.
 override their global dimension; an omitted dimension inherits its global
 value. Redis coordination requires a binary built with `redis-coordination`.
 See [Scaling and rate limits](../proxy/scaling.md).
+
+The proxy logical clock includes request decoding, provider preparation,
+retries, repair and fallback, native response conversion, and final response
+body production. `/v1/chat/stream` selects the stream clock immediately. Routes
+whose mode comes from JSON begin on the unary clock while the body is read and
+extend to the stream deadline, anchored to the original admission time, only
+after canonical `stream:true` has been parsed. Zero, invalid, and
+unrepresentable values retain the finite defaults.
+
+Inbound upload parsing consumes this total clock. It is not a separate upload
+header, body-idle, or per-chunk timeout; deployments still need their HTTP
+front end to enforce those narrower upload controls.
+
+Each built-in provider attempt checks this logical clock after provider request
+preparation, before and after attempt-policy admission, and again immediately
+before initiating the HTTP request. If successful admission finishes after the
+deadline, the attempt is abandoned through the existing conservative policy
+accounting path. The check prevents a send once built-in code observes expiry;
+it cannot preempt synchronous code or retract a kernel operation that was
+already authorized while the clock was live.
+
+Expiry before response headers returns `504` in the selected route's JSON
+shape. After SSE headers, expiry emits the route's error event when the prior
+event ended at a valid boundary; expiry in a partial event ends the body with a
+transport error. A unary response whose headers are already committed also
+ends with a transport error.
 
 ## JSONL request logging
 

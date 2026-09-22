@@ -79,6 +79,7 @@ Before streaming begins, proxy errors use an HTTP status and a stable envelope:
 | Exhausted fallback chain | `502` | `all_failed` |
 | Proactive rate-limit rejection | `429` | `rate_limited` |
 | Concurrency queue timeout | `503` | `overloaded` |
+| Proxy logical lifetime exceeded before headers | `504` | `request_timeout` |
 
 The proxy-generated `429 rate_limited` and `503 overloaded` responses include
 `Retry-After` in whole seconds. An upstream provider's `429` or `503` status is
@@ -101,6 +102,10 @@ data: {"type":"error","message":"API key is invalid."}
 
 Do not expect an HTTP status change after headers have been sent. Consumers
 must handle both the initial HTTP response and `error` events in the stream.
+When the proxy logical lifetime expires after SSE headers, it emits the native
+or compact timeout event only at a complete SSE boundary. If an event is
+partially framed, the body ends with a transport error so the timeout cannot be
+misread as part of the unfinished `data:` field.
 
 JSON and SSE messages on the proxy, gateway, and native endpoints share one
 normalizer. Recognized upstream error envelopes are unwrapped, and internal
