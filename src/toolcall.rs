@@ -155,6 +155,9 @@ fn binding_footprint(
     id: Option<&str>,
     item: Option<&str>,
 ) -> Option<DerivedFootprint> {
+    let container_bytes = 7_usize
+        .checked_mul(64_usize.checked_add(size_of::<Value>())?)?
+        .checked_add("providerwirescopepart_ididitem_idsignature_field".len())?;
     let string_bytes = target
         .provider
         .len()
@@ -162,8 +165,8 @@ fn binding_footprint(
         .checked_add(part.to_string().len())?
         .checked_add(id.map(str::len).unwrap_or(0))?
         .checked_add(item.map(str::len).unwrap_or(0))?
-        .checked_add(40)?;
-    DerivedFootprint::record(size_of::<WireToolId>())?
+        .checked_add(72)?;
+    DerivedFootprint::record(size_of::<WireToolId>().checked_add(container_bytes)?)?
         .checked_add(DerivedFootprint::strings(string_bytes))?
         .checked_multiply(2)
 }
@@ -293,6 +296,11 @@ pub(crate) fn capture_response_with_budget(
                 .pointer("/extra_content/google/thought_signature")
                 .and_then(Value::as_str)
             {
+                let signature_field = "extra_content.google.thought_signature";
+                let signature_field_footprint = DerivedFootprint::record(signature_field.len())
+                    .and_then(|footprint| footprint.checked_multiply(2))
+                    .ok_or_else(|| budget.error())?;
+                budget.reserve(signature_field_footprint)?;
                 let signature_footprint =
                     DerivedFootprint::record(size_of::<crate::reasoning::ThoughtSignature>())
                         .ok_or_else(|| budget.error())?
@@ -304,7 +312,7 @@ pub(crate) fn capture_response_with_budget(
                         .and_then(|value| value.checked_multiply(2))
                         .ok_or_else(|| budget.error())?;
                 budget.reserve(signature_footprint)?;
-                binding.signature_field = Some("extra_content.google.thought_signature".into());
+                binding.signature_field = Some(signature_field.into());
                 call["thought_signature"] = json!(crate::reasoning::ThoughtSignature {
                     data: sig.to_owned(),
                     origin: target.origin()
