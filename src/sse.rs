@@ -1,3 +1,5 @@
+//! Bounded SSE data fields; LLM transports do not retain SSE event IDs or retry metadata.
+
 use crate::error::{Result, ShimError};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -165,6 +167,7 @@ impl Stream for DataStream {
 
             let follows_carriage_return = self.after_carriage_return;
             self.after_carriage_return = false;
+            // Count both transport bytes, but only one logical CRLF line ending.
             if follows_carriage_return && byte == b'\n' {
                 continue;
             }
