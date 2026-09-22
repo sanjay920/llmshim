@@ -834,6 +834,12 @@ fn estimate_native_attempt_tokens(
     wire: crate::reasoning::WireFormat,
     native_body: &serde_json::Value,
 ) -> u32 {
+    if native_output_limit_values(wire, native_body)
+        .into_iter()
+        .any(|value| !value.is_null() && value.as_u64().is_none())
+    {
+        return u32::MAX;
+    }
     let prompt_tokens = serde_json::to_string(native_body)
         .map(|serialized| serialized.len() as u64 / 4)
         .unwrap_or(u64::MAX);
@@ -884,6 +890,27 @@ fn estimate_native_attempt_tokens(
                 .saturating_mul(output_candidate_count),
         )
         .clamp(1, u32::MAX as u64) as u32
+}
+
+fn native_output_limit_values(
+    wire: crate::reasoning::WireFormat,
+    native_body: &serde_json::Value,
+) -> Vec<&serde_json::Value> {
+    match wire {
+        crate::reasoning::WireFormat::AnthropicMessages => {
+            native_body.get("max_tokens").into_iter().collect()
+        }
+        crate::reasoning::WireFormat::OpenAiResponses => {
+            native_body.get("max_output_tokens").into_iter().collect()
+        }
+        crate::reasoning::WireFormat::OpenAiChat => ["max_completion_tokens", "max_tokens"]
+            .into_iter()
+            .filter_map(|field| native_body.get(field))
+            .collect(),
+        crate::reasoning::WireFormat::GoogleGenerateContent => {
+            native_values_at_paths(native_body, GEMINI_OUTPUT_TOKEN_PATHS)
+        }
+    }
 }
 
 fn native_output_candidate_count(
@@ -2103,6 +2130,82 @@ mod tests {
                 &serde_json::json!({"max_tokens": null, "max_completion_tokens": 5000})
             ),
             Some(5000),
+        );
+    }
+
+    #[test]
+    fn native_output_limit_shapes_fail_closed_at_every_recognized_path() {
+        use crate::reasoning::WireFormat;
+
+        let native_output_paths: &[(WireFormat, &[&str])] = &[
+            (WireFormat::AnthropicMessages, &["max_tokens"]),
+            (WireFormat::OpenAiResponses, &["max_output_tokens"]),
+            (WireFormat::OpenAiChat, &["max_tokens"]),
+            (WireFormat::OpenAiChat, &["max_completion_tokens"]),
+            (
+                WireFormat::GoogleGenerateContent,
+                &["generationConfig", "maxOutputTokens"],
+            ),
+            (
+                WireFormat::GoogleGenerateContent,
+                &["generationConfig", "max_output_tokens"],
+            ),
+            (
+                WireFormat::GoogleGenerateContent,
+                &["generation_config", "maxOutputTokens"],
+            ),
+            (
+                WireFormat::GoogleGenerateContent,
+                &["generation_config", "max_output_tokens"],
+            ),
+        ];
+        for (wire, output_path) in native_output_paths {
+            for output_control in [
+                serde_json::json!("5000"),
+                serde_json::json!(5000.0),
+                serde_json::json!(0.5),
+                serde_json::json!(-1),
+                serde_json::json!(true),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let mut native_body = output_control;
+                for path_component in output_path.iter().rev() {
+                    native_body = serde_json::json!({(*path_component): native_body});
+                }
+                assert_eq!(
+                    estimate_native_attempt_tokens("local", "test", *wire, &native_body),
+                    u32::MAX,
+                    "{native_body}",
+                );
+            }
+        }
+
+        let schema_with_literal_control_names = serde_json::json!({
+            "max_tokens": 1,
+            "max_completion_tokens": null,
+            "tools": [{"function": {"parameters": {"properties": {
+                "max_tokens": {"default": "5000"},
+                "max_completion_tokens": {"default": -1},
+            }}}}],
+        });
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "local",
+                "test",
+                WireFormat::OpenAiChat,
+                &schema_with_literal_control_names,
+            ),
+            schema_with_literal_control_names.to_string().len() as u32 / 4 + 1,
+        );
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "local",
+                "test",
+                WireFormat::OpenAiChat,
+                &serde_json::json!({"max_tokens": "5000", "max_completion_tokens": 1}),
+            ),
+            u32::MAX,
         );
     }
 

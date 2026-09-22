@@ -697,6 +697,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_integer_output_controls_cannot_bypass_tpm_admission() {
+        let mut upstream_server = mockito::Server::new_async().await;
+        let upstream_response = upstream_server
+            .mock("POST", "/chat/completions")
+            .with_body(compatible_response(serde_json::json!("ok")))
+            .expect(1)
+            .create_async()
+            .await;
+        let application_state = Arc::new(AppState {
+            router: Router::new().register(
+                "local",
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    "local",
+                    upstream_server.url(),
+                    None,
+                )),
+            ),
+            logger: None,
+            limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::with_global(
+                Some(1),
+                Some(3000),
+            ))),
+            backpressure: Backpressure::new(8, Duration::from_secs(1)),
+        });
+
+        for output_allowance in [serde_json::json!("5000"), serde_json::json!(5000.0)] {
+            for output_field in ["max_tokens", "max_completion_tokens"] {
+                for request_path in ["/v1/chat", "/v1/chat/stream", "/v1/chat/completions"] {
+                    let mut request_payload = serde_json::json!({
+                        "model": "local/test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    });
+                    if request_path == "/v1/chat/completions" {
+                        request_payload[output_field] = output_allowance.clone();
+                    } else {
+                        request_payload["provider_config"] = serde_json::json!({
+                            (output_field): output_allowance,
+                        });
+                    }
+                    let response = post_json(
+                        app_with_state(application_state.clone()),
+                        request_path,
+                        request_payload,
+                    )
+                    .await;
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "{request_path}: {output_field}"
+                    );
+                }
+            }
+        }
+
+        let admitted_response = post_json(
+            app_with_state(application_state),
+            "/v1/chat",
+            serde_json::json!({
+                "model": "local/test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "config": {"max_tokens": 1},
+            }),
+        )
+        .await;
+        assert_eq!(admitted_response.status(), StatusCode::OK);
+        upstream_response.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn rate_limited_also_applies_on_stream_endpoint() {
         let router = Router::new().register(
             "openai",
