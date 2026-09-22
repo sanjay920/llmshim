@@ -1,5 +1,6 @@
 use crate::error::{Result, ShimError};
 use crate::log::{LogEntry, Logger, RequestTimer};
+use crate::policy::DispatchPolicyContext;
 use crate::router::Router;
 use serde_json::Value;
 use std::time::Duration;
@@ -62,6 +63,26 @@ pub async fn completion_with_fallback(
     config: &FallbackConfig,
     logger: Option<&Logger>,
 ) -> Result<Value> {
+    completion_with_fallback_inner(router, request, config, logger, None).await
+}
+
+pub async fn completion_with_fallback_and_policy(
+    router: &Router,
+    request: &Value,
+    config: &FallbackConfig,
+    logger: Option<&Logger>,
+    policy_context: &DispatchPolicyContext,
+) -> Result<Value> {
+    completion_with_fallback_inner(router, request, config, logger, Some(policy_context)).await
+}
+
+async fn completion_with_fallback_inner(
+    router: &Router,
+    request: &Value,
+    config: &FallbackConfig,
+    logger: Option<&Logger>,
+    policy_context: Option<&DispatchPolicyContext>,
+) -> Result<Value> {
     let models = if config.models.is_empty() {
         // No fallback configured — just use the model from the request
         vec![request
@@ -118,7 +139,14 @@ pub async fn completion_with_fallback(
             let timer = RequestTimer::start();
             // Keep OAuth preparation, SSE-only providers, reasoning provenance,
             // and tool normalization identical to an ordinary completion.
-            let outcome = client.completion(provider, &model, &req).await;
+            let outcome = match policy_context {
+                Some(context) => {
+                    client
+                        .completion_with_policy(provider, &model, &req, context)
+                        .await
+                }
+                None => client.completion(provider, &model, &req).await,
+            };
             match outcome {
                 Ok(result) => {
                     if let Some(logger) = logger {
@@ -132,6 +160,17 @@ pub async fn completion_with_fallback(
                     return Ok(result);
                 }
                 Err(e) => {
+                    if policy_context.is_some() && crate::policy::terminates_fallback(&e) {
+                        if let Some(logger) = logger {
+                            logger.log(&LogEntry::from_error(
+                                provider.name(),
+                                model_str,
+                                &e.to_string(),
+                                timer.elapsed(),
+                            ));
+                        }
+                        return Err(e);
+                    }
                     if is_retryable(&e, &config.retryable_statuses) && attempt < config.max_retries
                     {
                         errors.push(format!("{} (attempt {}): {}", model_str, attempt + 1, e));

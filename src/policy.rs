@@ -1,0 +1,378 @@
+//! Trusted, out-of-band policy hooks for individual provider attempts.
+
+use crate::error::ShimError;
+use serde_json::Value;
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+
+pub type AttemptPolicyFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Clone)]
+pub struct DispatchPolicyContext {
+    policy: Arc<dyn AttemptPolicy>,
+}
+
+impl DispatchPolicyContext {
+    pub fn new(policy: Arc<dyn AttemptPolicy>) -> Self {
+        Self { policy }
+    }
+
+    pub(crate) async fn acquire(
+        &self,
+        kind: AttemptKind,
+        provider_name: &str,
+        resolved_model: &str,
+        endpoint: &str,
+        native_body: &Value,
+    ) -> Result<AttemptTracker, AttemptPolicyRefusal> {
+        let identity = AttemptIdentity {
+            id: uuid::Uuid::new_v4(),
+            kind,
+            provider_name: provider_name.to_owned(),
+            resolved_model: resolved_model.to_owned(),
+            native_model: native_body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            endpoint: sanitized_endpoint(endpoint),
+        };
+        let prepared_attempt = PreparedAttempt {
+            identity: &identity,
+            method: "POST",
+            native_body,
+        };
+        self.policy.acquire(&prepared_attempt).await?;
+        Ok(AttemptTracker {
+            context: self.clone(),
+            identity,
+            usage_observed: false,
+            finished: false,
+        })
+    }
+
+    async fn observe(&self, identity: &AttemptIdentity, event: AttemptEvent<'_>) {
+        self.policy.observe(identity, event).await;
+    }
+}
+
+impl std::fmt::Debug for DispatchPolicyContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DispatchPolicyContext")
+            .finish_non_exhaustive()
+    }
+}
+
+pub trait AttemptPolicy: Send + Sync {
+    fn acquire<'a>(
+        &'a self,
+        attempt: &'a PreparedAttempt<'a>,
+    ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyRefusal>>;
+
+    fn observe<'a>(
+        &'a self,
+        attempt: &'a AttemptIdentity,
+        event: AttemptEvent<'a>,
+    ) -> AttemptPolicyFuture<'a, ()>;
+
+    fn observe_abandoned(&self, attempt: &AttemptIdentity, outcome: AttemptOutcome);
+}
+
+pub struct PreparedAttempt<'a> {
+    identity: &'a AttemptIdentity,
+    method: &'static str,
+    native_body: &'a Value,
+}
+
+impl<'a> PreparedAttempt<'a> {
+    pub fn identity(&self) -> &AttemptIdentity {
+        self.identity
+    }
+
+    pub fn method(&self) -> &'static str {
+        self.method
+    }
+
+    pub fn native_body(&self) -> &'a Value {
+        self.native_body
+    }
+}
+
+impl std::fmt::Debug for PreparedAttempt<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedAttempt")
+            .field("identity", self.identity)
+            .field("method", &self.method)
+            .field("native_body", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttemptIdentity {
+    id: uuid::Uuid,
+    kind: AttemptKind,
+    provider_name: String,
+    resolved_model: String,
+    native_model: Option<String>,
+    endpoint: String,
+}
+
+impl AttemptIdentity {
+    pub fn id(&self) -> uuid::Uuid {
+        self.id
+    }
+
+    pub fn kind(&self) -> AttemptKind {
+        self.kind
+    }
+
+    pub fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
+    pub fn resolved_model(&self) -> &str {
+        &self.resolved_model
+    }
+
+    pub fn native_model(&self) -> Option<&str> {
+        self.native_model.as_deref()
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+impl std::fmt::Debug for AttemptIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttemptIdentity")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("provider_name", &self.provider_name)
+            .field("resolved_model", &self.resolved_model)
+            .field("native_model", &self.native_model)
+            .field("endpoint", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptKind {
+    Completion,
+    Stream,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptAccounting {
+    UsageObserved,
+    NoUsageReported,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    Completed {
+        accounting: AttemptAccounting,
+    },
+    HttpFailure {
+        status: u16,
+        accounting: AttemptAccounting,
+    },
+    TransportFailure {
+        accounting: AttemptAccounting,
+    },
+    InvalidResponse {
+        accounting: AttemptAccounting,
+    },
+    StreamFailure {
+        accounting: AttemptAccounting,
+    },
+    Abandoned {
+        kind: AttemptKind,
+        accounting: AttemptAccounting,
+    },
+}
+
+#[derive(Debug)]
+pub enum AttemptEvent<'a> {
+    ResponseHeaders {
+        status: u16,
+    },
+    /// A cumulative accounting snapshot. Streams may update it more than once;
+    /// consumers must key settlement by [`AttemptIdentity::id`].
+    Usage {
+        usage: &'a Value,
+    },
+    Finished(AttemptOutcome),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptPolicyRefusalKind {
+    ProviderLimit,
+    TenantLimit,
+    Budget,
+    Unpriceable,
+    CoordinatorUnavailable,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttemptPolicyRefusal {
+    kind: AttemptPolicyRefusalKind,
+    retry_after: Option<Duration>,
+}
+
+impl AttemptPolicyRefusal {
+    pub fn new(kind: AttemptPolicyRefusalKind, retry_after: Option<Duration>) -> Self {
+        Self { kind, retry_after }
+    }
+
+    pub fn kind(&self) -> AttemptPolicyRefusalKind {
+        self.kind
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
+    pub(crate) fn into_shim_error(self) -> ShimError {
+        let (status, body) = match self.kind {
+            AttemptPolicyRefusalKind::ProviderLimit => (429, "provider attempt limit exceeded"),
+            AttemptPolicyRefusalKind::TenantLimit => (429, "tenant attempt limit exceeded"),
+            AttemptPolicyRefusalKind::Budget => (429, "attempt budget exhausted"),
+            AttemptPolicyRefusalKind::Unpriceable => {
+                (400, "attempt cannot be admitted under the active policy")
+            }
+            AttemptPolicyRefusalKind::CoordinatorUnavailable => {
+                (503, "attempt policy coordinator unavailable")
+            }
+            AttemptPolicyRefusalKind::Other => (429, "attempt refused by policy"),
+        };
+        ShimError::ProviderError {
+            status,
+            body: body.to_owned(),
+            retry_after: self.retry_after,
+        }
+    }
+}
+
+impl std::fmt::Display for AttemptPolicyRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "attempt refused by policy ({:?})", self.kind)
+    }
+}
+
+impl std::error::Error for AttemptPolicyRefusal {}
+
+pub(crate) fn is_refusal(error: &ShimError) -> bool {
+    let ShimError::ProviderError { body, .. } = error else {
+        return false;
+    };
+    matches!(
+        body.as_str(),
+        "provider attempt limit exceeded"
+            | "tenant attempt limit exceeded"
+            | "attempt budget exhausted"
+            | "attempt cannot be admitted under the active policy"
+            | "attempt policy coordinator unavailable"
+            | "attempt refused by policy"
+    )
+}
+
+pub(crate) fn terminates_fallback(error: &ShimError) -> bool {
+    is_refusal(error)
+        && !matches!(
+            error,
+            ShimError::ProviderError { body, .. } if body == "provider attempt limit exceeded"
+        )
+}
+
+pub(crate) struct AttemptTracker {
+    context: DispatchPolicyContext,
+    identity: AttemptIdentity,
+    usage_observed: bool,
+    finished: bool,
+}
+
+impl AttemptTracker {
+    pub(crate) async fn response_headers(&self, status: u16) {
+        self.context
+            .observe(&self.identity, AttemptEvent::ResponseHeaders { status })
+            .await;
+    }
+
+    pub(crate) async fn usage(&mut self, usage: &Value) {
+        self.context
+            .observe(&self.identity, AttemptEvent::Usage { usage })
+            .await;
+        self.usage_observed = true;
+    }
+
+    pub(crate) fn accounting(&self, completed: bool) -> AttemptAccounting {
+        if self.usage_observed {
+            AttemptAccounting::UsageObserved
+        } else if completed {
+            AttemptAccounting::NoUsageReported
+        } else {
+            AttemptAccounting::Unknown
+        }
+    }
+
+    pub(crate) async fn finish(&mut self, outcome: AttemptOutcome) {
+        if self.finished {
+            return;
+        }
+        self.context
+            .observe(&self.identity, AttemptEvent::Finished(outcome))
+            .await;
+        self.finished = true;
+    }
+}
+
+impl Drop for AttemptTracker {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let accounting = self.accounting(false);
+        self.context.policy.observe_abandoned(
+            &self.identity,
+            AttemptOutcome::Abandoned {
+                kind: self.identity.kind,
+                accounting,
+            },
+        );
+        self.finished = true;
+    }
+}
+
+fn sanitized_endpoint(endpoint: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(endpoint) else {
+        return "<invalid-endpoint>".to_owned();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_metadata_never_keeps_query_credentials() {
+        assert_eq!(
+            sanitized_endpoint("https://example.test/models/m:generate?key=secret&alt=sse"),
+            "https://example.test/models/m:generate"
+        );
+        assert_eq!(
+            sanitized_endpoint("https://user:password@example.test/v1"),
+            "https://example.test/v1"
+        );
+        assert_eq!(sanitized_endpoint("not a url"), "<invalid-endpoint>");
+    }
+}
