@@ -23,7 +23,7 @@ pub fn build_breaker() -> Arc<ProviderBreaker> {
             {
                 match redis_impl::RedisHealth::new(&url, config) {
                     Ok(shared) => {
-                        eprintln!("provider health: redis coordination enabled ({url})");
+                        eprintln!("provider health: redis coordination enabled");
                         return Arc::new(breaker.with_shared(Arc::new(shared)));
                     }
                     Err(e) => {
