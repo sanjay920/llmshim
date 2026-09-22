@@ -48,8 +48,18 @@ fn native_stream(response: reqwest::Response) -> NativeStream {
                     Some(Ok(event)) if event.trim() == "[DONE]" => {
                         Err(stream_error("stream ended before a terminal response"))
                     }
-                    Some(Ok(event)) => serde_json::from_str::<Value>(&event)
-                        .map_err(|_| stream_error("invalid SSE JSON")),
+                    Some(Ok(event)) => {
+                        match crate::json_bounds::parse_str(&event, crate::json_bounds::Limits::SSE)
+                        {
+                            Ok(value) => Ok(value),
+                            Err(crate::json_bounds::ParseError::Malformed(_)) => {
+                                Err(stream_error("invalid SSE JSON"))
+                            }
+                            Err(crate::json_bounds::ParseError::Complexity) => {
+                                Err(stream_error("upstream JSON exceeds complexity limit"))
+                            }
+                        }
+                    }
                     Some(Err(_)) => Err(stream_error("could not read upstream SSE")),
                     None => Err(stream_error("stream ended before a terminal response")),
                 };
@@ -383,7 +393,15 @@ pub(crate) fn transform_chunk(model: &str, chunk: &str) -> Result<Option<String>
     if chunk.trim().is_empty() || chunk.trim() == "[DONE]" {
         return Ok(None);
     }
-    let event: Value = serde_json::from_str(chunk).map_err(|_| stream_error("invalid SSE JSON"))?;
+    let event: Value = match crate::json_bounds::parse_str(chunk, crate::json_bounds::Limits::SSE) {
+        Ok(value) => value,
+        Err(crate::json_bounds::ParseError::Malformed(_)) => {
+            return Err(stream_error("invalid SSE JSON"))
+        }
+        Err(crate::json_bounds::ParseError::Complexity) => {
+            return Err(stream_error("upstream JSON exceeds complexity limit"))
+        }
+    };
     if terminal(&event)? {
         let mut response = event["response"].clone();
         if !response["output"].is_array() {

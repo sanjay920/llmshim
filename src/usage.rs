@@ -544,8 +544,38 @@ impl NativeStreamUsage {
         candidate
     }
 
+    #[cfg(test)]
     pub(crate) fn ingest(&mut self, native_event_text: &str) -> Option<NativeUsageObservation> {
         let native_event: Value = serde_json::from_str(native_event_text).ok()?;
+        self.ingest_value(native_event)
+    }
+
+    pub(crate) fn ingest_bounded(
+        &mut self,
+        native_event_text: &str,
+    ) -> crate::error::Result<Option<NativeUsageObservation>> {
+        if native_event_text.trim().is_empty() || native_event_text.trim() == "[DONE]" {
+            return Ok(None);
+        }
+        let native_event =
+            match crate::json_bounds::parse_str(native_event_text, crate::json_bounds::Limits::SSE)
+            {
+                Ok(value) => value,
+                Err(crate::json_bounds::ParseError::Malformed(_)) => {
+                    return Err(crate::error::ShimError::Stream(
+                        "invalid upstream JSON".into(),
+                    ))
+                }
+                Err(crate::json_bounds::ParseError::Complexity) => {
+                    return Err(crate::error::ShimError::Stream(
+                        "upstream JSON exceeds complexity limit".into(),
+                    ))
+                }
+            };
+        Ok(self.ingest_value(native_event))
+    }
+
+    fn ingest_value(&mut self, native_event: Value) -> Option<NativeUsageObservation> {
         match self.target.wire {
             WireFormat::AnthropicMessages => {
                 let usage_path = match native_event["type"].as_str() {
@@ -899,7 +929,16 @@ impl StreamUsage {
     /// Chat Completions may send usage after the finish-reason chunk. Delay the
     /// terminal marker so proxy clients do not stop before receiving accounting.
     pub(crate) fn defer_chat_terminal(&mut self, data: String) -> crate::error::Result<String> {
-        let mut chunk: Value = serde_json::from_str(&data)?;
+        let mut chunk: Value =
+            match crate::json_bounds::parse_str(&data, crate::json_bounds::Limits::SSE) {
+                Ok(value) => value,
+                Err(crate::json_bounds::ParseError::Malformed(error)) => return Err(error.into()),
+                Err(crate::json_bounds::ParseError::Complexity) => {
+                    return Err(crate::error::ShimError::Stream(
+                        "stream JSON exceeds complexity limit".into(),
+                    ))
+                }
+            };
         let usage = chunk
             .get("usage")
             .filter(|value| value.is_object())
