@@ -18,8 +18,8 @@ pub const DISPATCHED: &str = "llmshim_gateway_dispatched_total";
 /// Requests that did not dispatch (labels: provider, reason).
 pub const REJECTED: &str = "llmshim_gateway_rejected_total";
 
-/// Requests permitted to run without a price while a spend cap is configured.
-/// Non-zero means a budget is not binding for that provider/model.
+/// Requests admitted through the explicit unbounded-spend exception.
+/// Known charges still accrue; non-zero means no finite pre-send bound existed.
 pub const UNPRICED_UNDER_CAP: &str = "llmshim_gateway_unpriced_under_cap_total";
 /// In-flight upstream calls (gauge, label: provider).
 pub const INFLIGHT: &str = "llmshim_gateway_inflight";

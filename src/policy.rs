@@ -10,11 +10,15 @@ pub type AttemptPolicyFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a
 #[derive(Clone)]
 pub struct DispatchPolicyContext {
     policy: Arc<dyn AttemptPolicy>,
+    last_refusal: Arc<std::sync::Mutex<Option<AttemptPolicyRefusal>>>,
 }
 
 impl DispatchPolicyContext {
     pub fn new(policy: Arc<dyn AttemptPolicy>) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            last_refusal: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     pub(crate) async fn acquire(
@@ -40,7 +44,11 @@ impl DispatchPolicyContext {
             method: "POST",
             native_body,
         };
-        self.policy.acquire(&prepared_attempt).await?;
+        *self.last_refusal.lock().unwrap() = None;
+        if let Err(refusal) = self.policy.acquire(&prepared_attempt).await {
+            *self.last_refusal.lock().unwrap() = Some(refusal);
+            return Err(refusal);
+        }
         Ok(AttemptTracker {
             context: self.clone(),
             identity,
@@ -55,6 +63,10 @@ impl DispatchPolicyContext {
         event: AttemptEvent<'_>,
     ) -> Result<(), AttemptPolicyError> {
         self.policy.observe(identity, event).await
+    }
+
+    pub(crate) fn take_last_refusal(&self) -> Option<AttemptPolicyRefusal> {
+        self.last_refusal.lock().unwrap().take()
     }
 }
 
