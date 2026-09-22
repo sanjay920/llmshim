@@ -1034,16 +1034,25 @@ mod tests {
     #[cfg(feature = "redis-coordination")]
     #[tokio::test]
     async fn redis_zero_limit_rejects_before_connecting_or_debiting() {
-        let limiter = RedisRateLimiter::new(
-            "redis://127.0.0.1:65535",
+        let loopback_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let loopback_address = loopback_listener.local_addr().unwrap();
+        let redis_rate_limiter = RedisRateLimiter::new(
+            &format!("redis://{loopback_address}"),
             RateLimitConfig::with_global(Some(100), Some(0)),
         )
         .expect("valid Redis URL");
-        let error = limiter
-            .acquire(&RateKey::provider("openai"), 1)
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, ZERO_LIMIT_RETRY_AFTER);
+        let acquisition_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            redis_rate_limiter.acquire(&RateKey::provider("test-provider"), 1),
+        )
+        .await
+        .expect("zero limit must reject without waiting for Redis");
+        assert_eq!(acquisition_result.unwrap_err().0, ZERO_LIMIT_RETRY_AFTER);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), loopback_listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(start_paused = true)]
