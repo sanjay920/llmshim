@@ -14,6 +14,26 @@ use std::{
 
 const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
 
+fn transport_error() -> CatalogError {
+    // reqwest includes the request URL in its Display implementation. Catalog
+    // endpoints may use query credentials, so keep transport diagnostics URL-free.
+    CatalogError::Invalid("catalog transport failed")
+}
+
+async fn bounded_response_body(
+    mut response: reqwest::Response,
+    size_error: &'static str,
+) -> Result<Vec<u8>, CatalogError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| transport_error())? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_CATALOG_BYTES {
+            return Err(CatalogError::Invalid(size_error));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Clone)]
 pub struct CatalogOptions {
     pub cache_file: Option<PathBuf>,
@@ -211,7 +231,7 @@ impl CatalogHandle {
         if let Some(etag) = meta.and_then(|m| m.etag.as_deref()) {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
         }
-        let mut response = request.send().await?;
+        let response = request.send().await.map_err(|_| transport_error())?;
         let not_modified = response.status() == reqwest::StatusCode::NOT_MODIFIED;
         let etag = response
             .headers()
@@ -233,14 +253,10 @@ impl CatalogHandle {
                 .map(|(data, _)| data)
                 .ok_or(CatalogError::Invalid("304 without a validated cache"))?
         } else {
-            response = response.error_for_status()?;
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await? {
-                if bytes.len().saturating_add(chunk.len()) > MAX_CATALOG_BYTES {
-                    return Err(CatalogError::Invalid("catalog exceeds size limit"));
-                }
-                bytes.extend_from_slice(&chunk);
+            if !response.status().is_success() {
+                return Err(CatalogError::Invalid("catalog server returned an error"));
             }
+            let bytes = bounded_response_body(response, "catalog exceeds size limit").await?;
             String::from_utf8(bytes).map_err(|_| CatalogError::Invalid("catalog is not UTF-8"))?
         };
         let fetched_at = Utc::now();
@@ -295,14 +311,13 @@ impl CatalogHandle {
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }
-        let mut response = request.send().await?.error_for_status()?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            if bytes.len().saturating_add(chunk.len()) > MAX_CATALOG_BYTES {
-                return Err(CatalogError::Invalid("provider catalog exceeds size limit"));
-            }
-            bytes.extend_from_slice(&chunk);
+        let response = request.send().await.map_err(|_| transport_error())?;
+        if !response.status().is_success() {
+            return Err(CatalogError::Invalid(
+                "provider catalog server returned an error",
+            ));
         }
+        let bytes = bounded_response_body(response, "provider catalog exceeds size limit").await?;
         let value: Value = serde_json::from_slice(&bytes)?;
         let at = Utc::now();
         let mut catalog = (*self.snapshot()).clone();

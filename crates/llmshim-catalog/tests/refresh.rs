@@ -130,6 +130,91 @@ async fn failures_serve_stale_indefinitely_without_replacing_the_cache() {
     }
 }
 
+#[tokio::test]
+async fn catalog_transport_errors_do_not_expose_query_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new_async().await;
+    let query_credential = "synthetic-catalog-query-credential";
+    let catalog_url = format!("{}/catalog?key={query_credential}", server.url());
+    let failed_catalog = server
+        .mock("GET", "/catalog")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "key".into(),
+            query_credential.into(),
+        ))
+        .with_status(503)
+        .expect(1)
+        .create_async()
+        .await;
+    let handle = CatalogHandle::load(options(&dir, catalog_url)).unwrap();
+    let RefreshOutcome::Stale { reason } = handle.refresh(true).await else {
+        panic!("catalog request should have remained stale");
+    };
+    assert!(!reason.contains(query_credential));
+    assert!(!reason.contains("/catalog"));
+    failed_catalog.assert_async().await;
+
+    let failed_provider = server
+        .mock("GET", "/models")
+        .match_query(mockito::Matcher::UrlEncoded(
+            "key".into(),
+            query_credential.into(),
+        ))
+        .with_status(503)
+        .expect(1)
+        .create_async()
+        .await;
+    let error = handle
+        .discover_provider(
+            "fixture",
+            &format!("{}/models?key={query_credential}", server.url()),
+            Some("synthetic-bearer-credential"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains(query_credential));
+    assert!(!error.contains("synthetic-bearer-credential"));
+    assert!(!error.contains("/models"));
+    failed_provider.assert_async().await;
+}
+
+#[tokio::test]
+async fn provider_discovery_does_not_follow_redirects_or_forward_bearer_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = mockito::Server::new_async().await;
+    let mut redirected = mockito::Server::new_async().await;
+    let redirected_request = redirected
+        .mock("GET", mockito::Matcher::Any)
+        .expect(0)
+        .create_async()
+        .await;
+    let redirect = source
+        .mock("GET", "/models")
+        .match_header("authorization", "Bearer synthetic-bearer-credential")
+        .with_status(302)
+        .with_header("location", &format!("{}/models", redirected.url()))
+        .expect(1)
+        .create_async()
+        .await;
+    let handle = CatalogHandle::load(options(&dir, source.url())).unwrap();
+    let error = handle
+        .discover_provider(
+            "fixture",
+            &format!("{}/models", source.url()),
+            Some("synthetic-bearer-credential"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "invalid catalog: provider catalog server returned an error"
+    );
+    redirect.assert_async().await;
+    redirected_request.assert_async().await;
+}
+
 #[test]
 fn corrupt_cache_and_partial_metadata_fall_back_to_snapshot() {
     let dir = tempfile::tempdir().unwrap();
