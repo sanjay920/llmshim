@@ -319,6 +319,7 @@ impl GatewayState {
         &self,
         prepared: PreparedGatewaySubmission,
         prequeue_permit: PrequeuePreparationPermit,
+        logical_deadline: Option<tokio::time::Instant>,
     ) -> Result<SubmittedValue, GatewayError> {
         match prepared {
             PreparedGatewaySubmission::Local {
@@ -327,14 +328,20 @@ impl GatewayState {
             } => match &self.backend {
                 Backend::Local(scheduler) => {
                     drop(prequeue_permit);
-                    scheduler
-                        .submit_with_policy(request, self.attempt_coordinator.context(policy_scope))
-                        .await
-                        .map(|value| SubmittedValue {
-                            value,
-                            #[cfg(feature = "redis-coordination")]
-                            lifecycle_reference: None,
-                        })
+                    let policy_context = self.attempt_coordinator.context(policy_scope);
+                    let value = match logical_deadline {
+                        Some(deadline) => {
+                            scheduler
+                                .submit_with_policy_deadline(request, policy_context, deadline)
+                                .await
+                        }
+                        None => scheduler.submit_with_policy(request, policy_context).await,
+                    }?;
+                    Ok(SubmittedValue {
+                        value,
+                        #[cfg(feature = "redis-coordination")]
+                        lifecycle_reference: None,
+                    })
                 }
                 #[cfg(feature = "redis-coordination")]
                 Backend::Distributed(_) => unreachable!("prepared backend changed"),
@@ -343,6 +350,7 @@ impl GatewayState {
             PreparedGatewaySubmission::Distributed(prepared) => match &self.backend {
                 Backend::Distributed(gateway) => {
                     drop(prequeue_permit);
+                    let _ = logical_deadline;
                     gateway.submit_prepared_with_reference(prepared).await.map(
                         |(value, lifecycle_reference)| SubmittedValue {
                             value,
@@ -359,6 +367,7 @@ impl GatewayState {
         &self,
         prepared: PreparedGatewaySubmission,
         prequeue_permit: PrequeuePreparationPermit,
+        logical_deadline: Option<tokio::time::Instant>,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
         match prepared {
             PreparedGatewaySubmission::Local {
@@ -367,12 +376,23 @@ impl GatewayState {
             } => match &self.backend {
                 Backend::Local(scheduler) => {
                     drop(prequeue_permit);
-                    scheduler
-                        .submit_stream_with_policy(
-                            request,
-                            self.attempt_coordinator.context(policy_scope),
-                        )
-                        .await
+                    let policy_context = self.attempt_coordinator.context(policy_scope);
+                    match logical_deadline {
+                        Some(deadline) => {
+                            scheduler
+                                .submit_stream_with_policy_deadline(
+                                    request,
+                                    policy_context,
+                                    deadline,
+                                )
+                                .await
+                        }
+                        None => {
+                            scheduler
+                                .submit_stream_with_policy(request, policy_context)
+                                .await
+                        }
+                    }
                 }
                 #[cfg(feature = "redis-coordination")]
                 Backend::Distributed(_) => unreachable!("prepared backend changed"),
@@ -622,13 +642,23 @@ fn gateway_err_to_api(state: &GatewayState, err: GatewayError) -> ApiError {
 async fn chat(
     State(state): State<Arc<GatewayState>>,
     installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
+    logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
     headers: HeaderMap,
     uri: Uri,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
     let prequeue_permit = prequeue_permit(&state, installed_prequeue_permit).await?;
+    if logical_lifetime
+        .as_ref()
+        .is_some_and(|axum::Extension(lifetime)| lifetime.select_streaming(req.stream).is_err())
+    {
+        return Ok(crate::proxy::lifetime::timeout_response(uri.path()));
+    }
+    let logical_deadline = logical_lifetime
+        .as_ref()
+        .map(|axum::Extension(lifetime)| lifetime.deadline());
     if req.stream {
-        return Ok(chat_stream_inner(state, headers, req, prequeue_permit).await);
+        return Ok(chat_stream_inner(state, headers, req, prequeue_permit, logical_lifetime).await);
     }
 
     let idem_key = headers
@@ -674,7 +704,7 @@ async fn chat(
 
     let timer = RequestTimer::start();
     match state
-        .submit_prepared(prepared_submission, prequeue_permit)
+        .submit_prepared(prepared_submission, prequeue_permit, logical_deadline)
         .await
     {
         Ok(submitted) => {
@@ -699,6 +729,7 @@ async fn chat(
 async fn chat_stream(
     State(state): State<Arc<GatewayState>>,
     installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
+    logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Response {
@@ -706,7 +737,13 @@ async fn chat_stream(
         Ok(permit) => permit,
         Err(error) => return error.into_response(),
     };
-    chat_stream_inner(state, headers, req, prequeue_permit).await
+    if logical_lifetime
+        .as_ref()
+        .is_some_and(|axum::Extension(lifetime)| lifetime.select_streaming(true).is_err())
+    {
+        return crate::proxy::lifetime::timeout_response("/v1/chat/stream");
+    }
+    chat_stream_inner(state, headers, req, prequeue_permit, logical_lifetime).await
 }
 
 async fn chat_stream_inner(
@@ -714,6 +751,7 @@ async fn chat_stream_inner(
     headers: HeaderMap,
     req: ChatRequest,
     prequeue_permit: PrequeuePreparationPermit,
+    logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
 ) -> Response {
     let (_provider_name, _budget_model, gw, identified_caller) =
         match build_request(&state, &headers, &req) {
@@ -732,7 +770,13 @@ async fn chat_stream_inner(
     // Admission (queue + rate) happens up front so a rejection is a proper
     // 429/503 before the SSE response begins, not an SSE error event.
     let mut rx = match state
-        .submit_stream_prepared(prepared_submission, prequeue_permit)
+        .submit_stream_prepared(
+            prepared_submission,
+            prequeue_permit,
+            logical_lifetime
+                .as_ref()
+                .map(|axum::Extension(lifetime)| lifetime.deadline()),
+        )
         .await
     {
         Ok(rx) => rx,
@@ -862,7 +906,23 @@ pub(crate) fn app_with_origin_policy(
     state: Arc<GatewayState>,
     origin_policy: OriginPolicy,
 ) -> axum::Router {
+    app_with_origin_policy_and_deadlines(
+        state,
+        origin_policy,
+        crate::proxy::lifetime::LogicalRequestDeadlines::gateway_from_env(),
+    )
+}
+
+fn app_with_origin_policy_and_deadlines(
+    state: Arc<GatewayState>,
+    origin_policy: OriginPolicy,
+    logical_deadlines: crate::proxy::lifetime::LogicalRequestDeadlines,
+) -> axum::Router {
     let default_receipt_store = crate::proxy::wire::DefaultReceiptStore::from_env();
+    let ingress_state = IngressAdmissionState {
+        gateway: state.clone(),
+        deadlines: logical_deadlines,
+    };
     axum::Router::new()
         .route("/v1/chat", post(chat))
         .route("/v1/chat/completions", post(chat))
@@ -882,7 +942,7 @@ pub(crate) fn app_with_origin_policy(
             crate::proxy::wire::install_default_receipt_store,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
+            ingress_state,
             admit_ingress_preparation,
         ))
         .layer(axum::middleware::from_fn(request_id))
@@ -896,6 +956,12 @@ pub(crate) fn app_with_origin_policy(
 #[derive(Clone)]
 struct PrequeuePreparationPermit {
     _permit: Arc<OwnedSemaphorePermit>,
+}
+
+#[derive(Clone)]
+struct IngressAdmissionState {
+    gateway: Arc<GatewayState>,
+    deadlines: crate::proxy::lifetime::LogicalRequestDeadlines,
 }
 
 async fn prequeue_permit(
@@ -916,21 +982,22 @@ async fn prequeue_permit(
 }
 
 async fn admit_ingress_preparation(
-    State(state): State<Arc<GatewayState>>,
+    State(ingress): State<IngressAdmissionState>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let inference_path = request.uri().path();
+    let state = &ingress.gateway;
+    let inference_path = request.uri().path().to_owned();
     let requires_preparation = request.method() == axum::http::Method::POST
         && matches!(
-            inference_path,
+            inference_path.as_str(),
             "/v1/chat" | "/v1/chat/stream" | "/v1/chat/completions" | "/v1/messages"
         );
     if !requires_preparation {
         return next.run(request).await;
     }
 
-    let native_wire = match inference_path {
+    let native_wire = match inference_path.as_str() {
         "/v1/chat/completions" => Some(crate::proxy::wire::Wire::Chat),
         "/v1/messages" => Some(crate::proxy::wire::Wire::Messages),
         _ => None,
@@ -970,7 +1037,23 @@ async fn admit_ingress_preparation(
         }
     };
     request.extensions_mut().insert(permit);
-    next.run(request).await
+    let lifetime =
+        crate::proxy::lifetime::LogicalRequestLifetime::new(&inference_path, ingress.deadlines);
+    request.extensions_mut().insert(lifetime.clone());
+    let response_future = next.run(request);
+    tokio::pin!(response_future);
+    let response = tokio::select! {
+        biased;
+        _ = lifetime.expired() => {
+            return crate::proxy::lifetime::timeout_response(&inference_path)
+        }
+        response = &mut response_future => response,
+    };
+    if lifetime.is_expired() {
+        drop(response);
+        return crate::proxy::lifetime::timeout_response(&inference_path);
+    }
+    crate::proxy::lifetime::pump_response(response, inference_path, lifetime)
 }
 
 fn insert_retry_after(response: &mut Response, wait: Duration) {
