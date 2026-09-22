@@ -164,7 +164,8 @@ fn generic_idempotency_key(client_key: &str) -> String {
 // Atomic lease: pop the earliest-deadline job, move it to `processing` with a
 // visibility deadline, and record its score for redelivery. KEYS: queue,
 // processing, leased, owners, lifecycle counters. ARGV: lease_duration_ms,
-// owner_token, terminal pool max, unary headroom, stream headroom, job prefix.
+// owner_token, terminal pool max, unary headroom, stream headroom, job prefix,
+// retained processing ttl ms.
 const LEASE_LUA: &str = r#"
     if not ARGV[6] then
         local legacy_top = redis.call('ZPOPMIN', KEYS[1], 1)
@@ -205,6 +206,9 @@ const LEASE_LUA: &str = r#"
     if existing_charge == 0 then redis.call('HINCRBY', KEYS[5], 'terminal_bytes', terminal_charge) end
     redis.call('HSET', meta, 'state', 'processing', 'owner', ARGV[2],
         'terminal_charge', terminal_charge)
+    local retained_ttl = tonumber(ARGV[7]) or 25200000
+    redis.call('PEXPIRE', meta, retained_ttl)
+    redis.call('PEXPIRE', payload_key, retained_ttl)
     return {m, s, payload}
 "#;
 
@@ -750,30 +754,29 @@ impl DistributedGateway {
         let mut conn = self.conn.clone();
         let mut out = Vec::with_capacity(providers.len());
         for p in providers {
-            let legacy: u64 = conn
+            let mut pipeline = redis::pipe();
+            pipeline
                 .zcard(protocol_queue_key(QueueProtocol::LegacyUnscoped, p))
-                .await
-                .unwrap_or(0);
-            let scoped: u64 = conn
                 .zcard(protocol_queue_key(QueueProtocol::ScopedV1, p))
-                .await
-                .unwrap_or(0);
-            let released_unscoped: u64 = conn
                 .zcard(released_queue_key(QueueProtocol::LegacyUnscoped, p))
-                .await
-                .unwrap_or(0);
-            let released_scoped: u64 = conn
                 .zcard(released_queue_key(QueueProtocol::ScopedV1, p))
-                .await
-                .unwrap_or(0);
-            let l1_unscoped: u64 = conn
                 .zcard(l1_protocol_key(QueueProtocol::LegacyUnscoped, "q", p))
-                .await
-                .unwrap_or(0);
-            let l1_scoped: u64 = conn
-                .zcard(l1_protocol_key(QueueProtocol::ScopedV1, "q", p))
-                .await
-                .unwrap_or(0);
+                .zcard(l1_protocol_key(QueueProtocol::ScopedV1, "q", p));
+            let (legacy, scoped, released_unscoped, released_scoped, l1_unscoped, l1_scoped): (
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+            ) = tokio::time::timeout(
+                self.redis_operation_timeout,
+                pipeline.query_async(&mut conn),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
             out.push((
                 p.clone(),
                 legacy
@@ -847,7 +850,8 @@ impl DistributedGateway {
                 GatewayError::Upstream("distributed gateway lifecycle unavailable".into())
             }
         })?;
-        let activated = tokio::time::timeout(
+        prepared_submission.member = reserved.member.clone();
+        let activation = tokio::time::timeout(
             self.redis_operation_timeout,
             lifecycle::activate(
                 &mut connection,
@@ -873,14 +877,27 @@ impl DistributedGateway {
                 ],
             ),
         )
-        .await
-        .map_err(|_| GatewayError::Upstream("distributed gateway activation timed out".into()))?
-        .map_err(|error| redis_err(&error))?;
-        if !activated {
-            return Err(GatewayError::Overloaded(self.config.overloaded_retry_after));
+        .await;
+        match activation {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => {
+                self.cancel_prepared(prepared_submission).await;
+                Err(GatewayError::Overloaded(self.config.overloaded_retry_after))
+            }
+            Ok(Err(error)) => {
+                self.cancel_prepared(prepared_submission).await;
+                Err(redis_err(&error))
+            }
+            Err(_) => {
+                // The activation may have reached Redis even though its reply did not.
+                // A generation-fenced cancellation is safe before or after that delayed
+                // activation and prevents the originless job from being resurrected.
+                self.cancel_prepared(prepared_submission).await;
+                Err(GatewayError::Upstream(
+                    "distributed gateway activation timed out".into(),
+                ))
+            }
         }
-        prepared_submission.member = reserved.member;
-        Ok(())
     }
 
     #[cfg(test)]
@@ -1036,6 +1053,7 @@ impl DistributedGateway {
             .map(|(_, generation)| generation.to_string())
             .unwrap_or_default();
         let conn = self.conn.clone();
+        let redis_operation_timeout = self.redis_operation_timeout;
 
         tokio::spawn(async move {
             use futures::StreamExt;
@@ -1052,14 +1070,17 @@ impl DistributedGateway {
                                 if chunk_tx.send(Ok(s)).await.is_err() {
                                     let mut cancellation_connection = conn.clone();
                                     if let Some((_, generation)) = member.rsplit_once(':') {
-                                        let _ = lifecycle::cancel(
-                                            &mut cancellation_connection,
-                                            request_protocol,
-                                            &request_provider,
-                                            &request_id,
-                                            generation,
-                                            &member,
-                                            Duration::from_secs(10 * 60),
+                                        let _ = tokio::time::timeout(
+                                            redis_operation_timeout,
+                                            lifecycle::cancel(
+                                                &mut cancellation_connection,
+                                                request_protocol,
+                                                &request_provider,
+                                                &request_id,
+                                                generation,
+                                                &member,
+                                                Duration::from_secs(10 * 60),
+                                            ),
                                         )
                                         .await;
                                     }
@@ -1098,14 +1119,17 @@ impl DistributedGateway {
                         }
                         let mut c = conn.clone();
                         if let Some((_, generation)) = member.rsplit_once(':') {
-                            let _ = lifecycle::cancel(
-                                &mut c,
-                                request_protocol,
-                                &request_provider,
-                                &request_id,
-                                generation,
-                                &member,
-                                Duration::from_secs(10 * 60),
+                            let _ = tokio::time::timeout(
+                                redis_operation_timeout,
+                                lifecycle::cancel(
+                                    &mut c,
+                                    request_protocol,
+                                    &request_provider,
+                                    &request_id,
+                                    generation,
+                                    &member,
+                                    Duration::from_secs(10 * 60),
+                                ),
                             )
                             .await;
                         }
@@ -1173,22 +1197,21 @@ impl DistributedGateway {
     /// Number of dead-lettered jobs for a provider (introspection).
     pub async fn dead_letter_len(&self, provider: &str) -> usize {
         let mut conn = self.conn.clone();
-        let legacy: u64 = conn
+        let mut pipeline = redis::pipe();
+        pipeline
             .zcard(protocol_dlq_key(QueueProtocol::LegacyUnscoped, provider))
-            .await
-            .unwrap_or(0);
-        let scoped: u64 = conn
             .zcard(protocol_dlq_key(QueueProtocol::ScopedV1, provider))
-            .await
-            .unwrap_or(0);
-        let released_unscoped: u64 = conn
             .llen(released_dlq_key(QueueProtocol::LegacyUnscoped, provider))
+            .llen(released_dlq_key(QueueProtocol::ScopedV1, provider));
+        let (legacy, scoped, released_unscoped, released_scoped): (u64, u64, u64, u64) =
+            tokio::time::timeout(
+                self.redis_operation_timeout,
+                pipeline.query_async(&mut conn),
+            )
             .await
-            .unwrap_or(0);
-        let released_scoped: u64 = conn
-            .llen(released_dlq_key(QueueProtocol::ScopedV1, provider))
-            .await
-            .unwrap_or(0);
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         legacy
             .saturating_add(scoped)
             .saturating_add(released_unscoped)
@@ -1267,7 +1290,11 @@ impl DistributedGateway {
                 .arg(self.lifecycle_limits.max_terminal_bytes)
                 .arg(self.lifecycle_limits.unary_terminal_bytes)
                 .arg(self.lifecycle_limits.stream_terminal_bytes)
-                .arg(lifecycle::job_prefix());
+                .arg(lifecycle::job_prefix())
+                .arg(duration_millis_u64(
+                    self.worker_job_timeout
+                        .saturating_add(Duration::from_secs(60 * 60)),
+                ));
             let lease_operation = lease_invocation.invoke_async(&mut conn);
             let leased: Option<(String, String, String)> =
                 match tokio::time::timeout(self.redis_operation_timeout, lease_operation).await {
@@ -1826,7 +1853,11 @@ impl DistributedGateway {
         loop {
             tokio::time::sleep(interval).await;
             let mut cleanup_connection = self.conn.clone();
-            let _ = lifecycle::cleanup_expired(&mut cleanup_connection, 128).await;
+            let _ = tokio::time::timeout(
+                self.redis_operation_timeout,
+                lifecycle::cleanup_expired(&mut cleanup_connection, 128),
+            )
+            .await;
             for provider in &providers {
                 for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
                     let reaped = self.reap_once_protocol(protocol, provider).await;
@@ -1905,17 +1936,27 @@ fn redis_err(e: &dyn std::fmt::Display) -> GatewayError {
 impl crate::gateway::quota::SpendStore for DistributedGateway {
     async fn spent(&self, tenant: &str, window: Duration) -> f64 {
         let mut conn = self.conn.clone();
-        let raw: Option<String> = conn.get(spend_key(tenant, window)).await.unwrap_or(None);
+        let raw: Option<String> = tokio::time::timeout(
+            self.redis_operation_timeout,
+            conn.get(spend_key(tenant, window)),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
         raw.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0)
     }
 
     async fn record(&self, tenant: &str, window: Duration, usd: f64) {
         let key = spend_key(tenant, window);
         let mut conn = self.conn.clone();
-        let _: Result<f64, _> = conn.incr(&key, usd).await;
         // Two windows of slack so a late charge still lands on its own window.
         let ttl = window.as_millis().saturating_mul(2).min(u64::MAX as u128) as u64;
-        let _: Result<(), _> = conn.pexpire(&key, ttl as i64).await;
+        let operation = async {
+            let _: f64 = conn.incr(&key, usd).await?;
+            let _: bool = conn.pexpire(&key, ttl as i64).await?;
+            redis::RedisResult::Ok(())
+        };
+        let _ = tokio::time::timeout(self.redis_operation_timeout, operation).await;
     }
 }
 
@@ -2425,8 +2466,21 @@ mod tests {
             .set(&provider_queue_key, "existing value")
             .await
             .unwrap();
+        let storage_error_submission = PreparedSubmission::new(JobDescriptor {
+            id: format!("storage-error-{}", uuid::Uuid::new_v4().simple()),
+            provider: provider_name.clone(),
+            tier: 0,
+            permits: 1,
+            payload: serde_json::json!({"request": "synthetic payload"}),
+            policy_envelope_version: 1,
+            trusted_unscoped: true,
+            policy_scope: None,
+            stream: false,
+            enqueue_ms: 1_700_000_000_001,
+        })
+        .unwrap();
         assert!(matches!(
-            gateway.enqueue(&prepared_submission).await,
+            gateway.enqueue(&storage_error_submission).await,
             Err(GatewayError::Upstream(_))
         ));
         let stored_value: String = connection.get(&provider_queue_key).await.unwrap();
