@@ -163,11 +163,18 @@ buckets. A gateway key's identity may carry `budget_usd` and an optional
 {"sk-example": {"tenant": "acme", "tier": 1, "budget_usd": 100, "budget_window_secs": 86400}}
 ```
 
+`budget_usd` must be finite, non-negative, and no greater than
+`9007199.254740992`. The ledger stores nano-USD integers and keeps every Redis
+value within Lua's exact-integer range; invalid limits fail closed.
+
 Every actual provider send reserves a conservative amount before it consumes
 RPM or TPM. The reservation uses the final provider-native model and body, the
 catalog context ceiling, the request's output/reasoning bound (or the catalog
 output ceiling), and the applicable catalog price tier. The rate debits and USD
 reservation commit together, so a budget refusal consumes neither allowance.
+The full context ceiling is used for input rather than treating a tokenizer
+heuristic as a guarantee, so admission can be deliberately conservative even
+for a short prompt.
 Repeated usage snapshots upsert one attempt by UUID; they are never summed as
 separate bills. A terminal response with known usage replaces its reservation
 with the known charge. Failed repair responses are therefore charged even when
