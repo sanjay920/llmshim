@@ -4,7 +4,6 @@ use crate::policy::{
     AttemptPolicyFuture, AttemptPolicyRefusal, AttemptPolicyRefusalKind, DispatchPolicyContext,
     PreparedAttempt,
 };
-use crate::reasoning::WireFormat;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
@@ -37,7 +36,7 @@ impl AttemptPolicy for ProxyAttemptPolicy {
             })?;
             let key = RateKey::provider(attempt.identity().provider_name());
             self.limiter
-                .acquire(&key, estimate_prepared_attempt_tokens(attempt))
+                .acquire(&key, super::ratelimit::estimate_attempt_tokens(attempt))
                 .await
                 .map_err(|retry| {
                     AttemptPolicyRefusal::new(
@@ -86,58 +85,4 @@ impl AttemptPolicy for ProxyAttemptPolicy {
         self.active_permits.lock().unwrap().remove(&attempt.id());
         Ok(())
     }
-}
-
-fn estimate_prepared_attempt_tokens(attempt: &PreparedAttempt<'_>) -> u32 {
-    let native_body = attempt.native_body();
-    let prompt_tokens = serde_json::to_string(native_body)
-        .map(|serialized| serialized.len() as u64 / 4)
-        .unwrap_or(u64::MAX);
-    let explicit_output = match attempt.identity().wire() {
-        WireFormat::AnthropicMessages => native_body.get("max_tokens").and_then(|v| v.as_u64()),
-        WireFormat::OpenAiResponses => native_body
-            .get("max_output_tokens")
-            .and_then(|v| v.as_u64()),
-        WireFormat::OpenAiChat => native_body
-            .get("max_completion_tokens")
-            .or_else(|| native_body.get("max_tokens"))
-            .and_then(|v| v.as_u64()),
-        WireFormat::GoogleGenerateContent => native_body
-            .pointer("/generationConfig/maxOutputTokens")
-            .and_then(|v| v.as_u64()),
-    };
-    let reasoning_output = match attempt.identity().wire() {
-        WireFormat::AnthropicMessages => native_body
-            .pointer("/thinking/budget_tokens")
-            .and_then(|v| v.as_u64()),
-        WireFormat::GoogleGenerateContent => native_body
-            .pointer("/generationConfig/thinkingConfig/thinkingBudget")
-            .and_then(|v| v.as_u64()),
-        WireFormat::OpenAiResponses | WireFormat::OpenAiChat => native_body
-            .pointer("/reasoning/max_tokens")
-            .and_then(|v| v.as_u64()),
-    }
-    .unwrap_or_default();
-    let default_output = crate::catalog::resolve(&format!(
-        "{}/{}",
-        attempt.identity().provider_name(),
-        attempt.identity().native_model()
-    ))
-    .or_else(|| crate::catalog::resolve(attempt.identity().native_model()))
-    .and_then(|model| model.max_output_tokens)
-    .map(u64::from)
-    .unwrap_or_else(|| match attempt.identity().provider_name() {
-        "anthropic" => 8_192,
-        "gemini" => 65_536,
-        "openai" | "chatgpt" | "xai" => 128_000,
-        "openrouter" => 1_048_576,
-        _ => 1_024,
-    });
-    prompt_tokens
-        .saturating_add(
-            explicit_output
-                .unwrap_or(default_output)
-                .max(reasoning_output),
-        )
-        .clamp(1, u32::MAX as u64) as u32
 }

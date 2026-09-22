@@ -3,8 +3,9 @@
 //! The in-memory [`Scheduler`](super::Scheduler) governs one process. A fleet of
 //! gateway replicas (Cloud Run / ECS) needs a *shared* priority queue so any
 //! instance can serve any request, ordered globally by tier then FIFO (with
-//! aging), while the shared [`RedisRateLimiter`](crate::proxy::ratelimit) keeps
-//! the whole fleet under one provider rate limit.
+//! aging). Built-in HTTP jobs carry a server-created policy scope so the shared
+//! coordinator atomically gates provider and tenant limits at each real send;
+//! unscoped custom jobs retain the standalone Redis limiter behavior.
 //!
 //! As the advisor put it, you can't stretch the in-process `Job`/`RequestQueue`
 //! (it holds a `oneshot`) across processes — so distributed mode is a **separate

@@ -1295,6 +1295,104 @@ mod native_tests {
         upstream.assert_async().await;
     }
 
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn two_http_origins_share_one_redis_tenant_allowance() {
+        let Some(redis_url) = std::env::var("LLMSHIM_REDIS_URL").ok() else {
+            return;
+        };
+        let provider_name = format!("tenant-http-{}", uuid::Uuid::new_v4().simple());
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "response",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {}
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let build_origin = || {
+            let router = Arc::new(Router::new().register(
+                &provider_name,
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    provider_name.clone(),
+                    server.url(),
+                    None,
+                )),
+            ));
+            let config = GatewayConfig::default();
+            let scheduler = Scheduler::new(
+                config.clone(),
+                Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
+                    crate::proxy::ratelimit::RateLimitConfig::default(),
+                )),
+                Arc::new(RealDispatch {
+                    router: router.clone(),
+                    logger: None,
+                }),
+            );
+            let identity = crate::gateway::auth::Identity {
+                tenant: "shared-http-tenant".into(),
+                tier: 1,
+                rpm: Some(1),
+                tpm: None,
+                budget_usd: None,
+                budget_window_secs: None,
+                budget_allow_unpriced: false,
+            };
+            Arc::new(GatewayState {
+                router,
+                backend: Backend::Local(scheduler),
+                keystore: crate::gateway::auth::KeyStore::enforced(
+                    std::collections::HashMap::from([("shared-key".into(), identity)]),
+                ),
+                attempt_coordinator: crate::gateway::attempt::AttemptCoordinator::redis(
+                    &redis_url,
+                    crate::proxy::ratelimit::RateLimitConfig::with_global(Some(100), None),
+                    config.max_concurrency_per_provider,
+                    config.max_wait,
+                )
+                .unwrap(),
+                spend: crate::gateway::quota::SpendCap::in_memory(),
+                idempotency: crate::gateway::idempotency::IdempotencyCache::new(
+                    Duration::from_secs(30),
+                ),
+                idempotency_ttl_secs: 30,
+                overloaded_retry_after: config.overloaded_retry_after,
+            })
+        };
+        let payload = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer shared-key")
+                .body(Body::from(
+                    json!({
+                        "model": format!("{provider_name}/test"),
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let first = app(build_origin()).oneshot(payload()).await.unwrap();
+        let second = app(build_origin()).oneshot(payload()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        upstream.assert_async().await;
+    }
+
     #[tokio::test]
     async fn native_routes_preserve_auth_queue_and_protocol_scoped_idempotency() {
         let mut server = mockito::Server::new_async().await;

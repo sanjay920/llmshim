@@ -12,7 +12,7 @@
 //! ```text
 //!  submit(req) ──enqueue──► [per-provider priority queue] ──dequeue──► dispatcher
 //!      ▲ await oneshot                                                    │
-//!      └──────────────────── result ◄──── Dispatch::dispatch ◄── RateLimiter.acquire
+//!      └──────────────────── result ◄──── Dispatch::dispatch ◄── attempt policy
 //! ```
 //!
 //! * **[`Scheduler`]** owns one lane (queue + dispatcher task) per provider, so a
@@ -24,9 +24,9 @@
 //!   notify; on a rate-limit miss it requeues and sleeps for exactly the
 //!   [`RetryAfter`] the [`RateLimiter`] reports (waking early if new work
 //!   arrives) — no busy-waiting, no `RateLimiter` changes.
-//! * Reuses the proxy's [`RateLimiter`] (token buckets, per-provider RPM/TPM)
-//!   and [`RetryAfter`]; the [`Dispatch`] trait is injected so the scheduler is
-//!   testable without real HTTP.
+//! * Built-in HTTP dispatch attaches a trusted policy context that gates every
+//!   prepared provider send. Unscoped custom [`Dispatch`] implementations retain
+//!   the scheduler's legacy [`RateLimiter`] behavior for compatibility.
 //!
 //! Beyond the basics this also implements: **tier fairness/aging** (a starved
 //! low tier eventually overtakes a high-tier flood — see [`InMemoryQueue`]),
