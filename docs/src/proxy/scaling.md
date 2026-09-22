@@ -279,11 +279,14 @@ Connection pools and concurrency limits remain per process. If the Redis client
 cannot be initialized—or the binary lacks the feature—the compact proxy warns
 and falls back to in-memory buckets.
 
-With `gateway-redis`, admitting a new job checks the provider's waiting-queue
-depth and inserts the job in one Lua transaction. Concurrent origins cannot
-claim the same remaining slot. `LLMSHIM_GATEWAY_QUEUE_DEPTH` defaults to 10,000
-waiting jobs per provider; a full queue refuses new work with `503` and
-`Retry-After`.
+With `gateway-redis`, admitting a new job checks both protocol queues' combined
+provider waiting depth and inserts the job in one Lua transaction. Concurrent
+origins cannot claim the same remaining slot. `LLMSHIM_GATEWAY_QUEUE_DEPTH`
+defaults to 10,000 total waiting jobs per provider; a full queue refuses new
+work with `503` and `Retry-After`. Released origins only count the legacy queue,
+so that combined bound becomes exact after old ingress stops. The two protocol
+queues keep independent priority ordering during the transition; one shared
+worker-capacity bound prevents them from doubling upstream concurrency.
 
 Authenticated jobs use a versioned scoped queue, lease, response, completion,
 dead-letter, and reaper namespace. Released workers only watch the legacy
@@ -297,9 +300,14 @@ During an upgrade from the post-charge spend counter, a new authenticated
 origin reads the active legacy `llmshim:spend` value before it queues work. The
 private descriptor carries only the Redis-time window index and a rounded-up
 nano-USD floor, never the raw tenant or bearer. Atomic admission remembers the
-largest imported floor and adds only a later positive delta, separately from
+largest known imported floor even when its request is refused. Admission tracks
+the separately applied floor and adds only a later positive delta, alongside
 new reservations and settlements. This preserves known active-window spend
 without double charging repeated imports or forgetting intervening new spend.
+Known-floor records share the finite retained-accounting index. If that index
+cannot retain newly learned spend, one fleet freeze marker blocks budgeted work
+until the longest affected window retention expires; stale descriptors cannot
+become admissible merely because the original request was refused.
 Keep each identity's `budget_window_secs` unchanged through this transition so
 the old and new counters name the same tumbling window.
 
