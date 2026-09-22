@@ -570,6 +570,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_openai_candidate_count_exhausts_tpm_before_any_send() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(compatible_response(serde_json::json!("ok")))
+            .expect(1)
+            .create_async()
+            .await;
+        let state = Arc::new(AppState {
+            router: Router::new().register(
+                "local",
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    "local",
+                    server.url(),
+                    None,
+                )),
+            ),
+            logger: None,
+            limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::with_global(
+                None,
+                Some(50),
+            ))),
+            backpressure: Backpressure::new(8, Duration::from_secs(1)),
+        });
+
+        let multiple_candidates = post_json(
+            app_with_state(state.clone()),
+            "/v1/chat",
+            serde_json::json!({
+                "model": "local/test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "config": {"max_tokens": 1},
+                "provider_config": {"n": 64},
+            }),
+        )
+        .await;
+        assert_eq!(multiple_candidates.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let single_candidate = post_json(
+            app_with_state(state),
+            "/v1/chat",
+            serde_json::json!({
+                "model": "local/test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "config": {"max_tokens": 1},
+                "provider_config": {"n": 1},
+            }),
+        )
+        .await;
+        assert_eq!(single_candidate.status(), StatusCode::OK);
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn rate_limited_also_applies_on_stream_endpoint() {
         let router = Router::new().register(
             "openai",
