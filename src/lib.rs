@@ -7,6 +7,7 @@ pub mod shim;
 pub use llmshim_catalog as catalog;
 pub mod config;
 pub mod cost;
+pub mod credentials;
 pub mod env;
 pub mod error;
 pub mod fallback;
