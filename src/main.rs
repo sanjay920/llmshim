@@ -1,6 +1,7 @@
 mod cli;
 #[cfg(feature = "proxy")]
 mod managed_server;
+mod terminal_text;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
@@ -10,6 +11,7 @@ use serde_json::{json, Value};
 use std::io::{self, Write};
 
 use llmshim::models::MODELS;
+use terminal_text::TerminalText;
 
 fn print_models(current: &str) {
     println!("\n  Available models:");
@@ -280,7 +282,7 @@ fn read_line_raw() -> Option<RawInput> {
                             None => {
                                 // No image — paste text from clipboard
                                 if let Some(text) = clipboard_text() {
-                                    print!("{}", text);
+                                    print!("{}", TerminalText(&text));
                                     io::stdout().flush().ok();
                                     current_text.push_str(&text);
                                 }
@@ -328,7 +330,8 @@ fn read_line_raw() -> Option<RawInput> {
                     // Regular character
                     (KeyCode::Char(c), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
                         current_text.push(c);
-                        print!("{}", c);
+                        let mut character_buffer = [0; 4];
+                        print!("{}", TerminalText(c.encode_utf8(&mut character_buffer)));
                         io::stdout().flush().ok();
                     }
 
@@ -336,7 +339,7 @@ fn read_line_raw() -> Option<RawInput> {
                 }
             }
             Ok(Event::Paste(text)) => {
-                print!("{}", text);
+                print!("{}", TerminalText(&text));
                 io::stdout().flush().ok();
                 current_text.push_str(&text);
             }
@@ -614,7 +617,11 @@ async fn cmd_models(args: &[String]) {
             println!("{}", serde_json::to_string_pretty(&models).unwrap());
         } else {
             for model in models {
-                println!("  {} ({})", model.id, model.label);
+                println!(
+                    "  {} ({})",
+                    TerminalText(&model.id),
+                    TerminalText(&model.label)
+                );
             }
         }
         return;
@@ -1290,7 +1297,7 @@ async fn main() {
                         current_model
                     );
                 } else {
-                    println!("  Unknown model: {}\n", query);
+                    println!("  Unknown model: {}\n", TerminalText(query));
                 }
                 continue;
             }
@@ -1316,12 +1323,12 @@ async fn main() {
                         pending_images.push(block);
                         println!(
                             "  \x1b[32mAttached: {} ({} total)\x1b[0m\n",
-                            path,
+                            TerminalText(path),
                             pending_images.len()
                         );
                     }
                     None => {
-                        println!("  Could not read image: {}\n", path);
+                        println!("  Could not read image: {}\n", TerminalText(path));
                     }
                 }
                 continue;
@@ -1374,7 +1381,7 @@ async fn main() {
                                     print!("\x1b[2m\x1b[90m");
                                     in_reasoning = true;
                                 }
-                                print!("{}", reasoning_text);
+                                print!("{}", TerminalText(&reasoning_text));
                                 io::stdout().flush().ok();
                             }
 
@@ -1387,7 +1394,7 @@ async fn main() {
                                     println!("\x1b[0m"); // reset, newline
                                     in_reasoning = false;
                                 }
-                                print!("{}", text);
+                                print!("{}", TerminalText(text));
                                 io::stdout().flush().ok();
                                 full_text.push_str(text);
                             }
@@ -1399,7 +1406,7 @@ async fn main() {
                         }
                         Err(e) => {
                             stream_failed = true;
-                            eprintln!("\n  Stream error: {}", e);
+                            eprintln!("\n  Stream error: {}", TerminalText(&e.to_string()));
                             if let Some(ref logger) = logger {
                                 logger.log(&LogEntry::from_error(
                                     provider_name,
@@ -1471,7 +1478,7 @@ async fn main() {
             }
             Err(e) => {
                 let elapsed = timer.elapsed();
-                eprintln!("  Error: {}\n", e);
+                eprintln!("  Error: {}\n", TerminalText(&e.to_string()));
                 if let Some(ref logger) = logger {
                     logger.log(&LogEntry::from_error(
                         provider_name,
