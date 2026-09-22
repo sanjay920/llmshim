@@ -26,9 +26,9 @@ impl OriginPolicy {
                 }
             },
             Err(env::VarError::NotPresent) => Self::default(),
-            Err(error) => {
+            Err(env::VarError::NotUnicode(_)) => {
                 eprintln!(
-                    "Ignoring {TRUSTED_ORIGINS_ENV}: {error}. Browser-origin requests will be rejected."
+                    "Ignoring {TRUSTED_ORIGINS_ENV}: value is not valid Unicode. Browser-origin requests will be rejected."
                 );
                 Self::default()
             }
@@ -37,13 +37,16 @@ impl OriginPolicy {
 
     pub(crate) fn from_csv(configured_origins: &str) -> Result<Self, String> {
         let mut trusted_origins = Vec::new();
-        for configured_origin in configured_origins.split(',') {
+        for (configured_origin_index, configured_origin) in
+            configured_origins.split(',').enumerate()
+        {
+            let origin_entry_number = configured_origin_index + 1;
             let trimmed_origin = configured_origin.trim();
             if trimmed_origin.is_empty() {
-                return Err("origins must be a comma-separated list without empty entries".into());
+                return Err(format!("origin entry {origin_entry_number} is empty"));
             }
             let parsed_origin = reqwest::Url::parse(trimmed_origin)
-                .map_err(|_| format!("{trimmed_origin:?} is not a valid origin"))?;
+                .map_err(|_| format!("origin entry {origin_entry_number} is not a valid origin"))?;
             if !matches!(parsed_origin.scheme(), "http" | "https")
                 || !parsed_origin.username().is_empty()
                 || parsed_origin.password().is_some()
@@ -52,12 +55,12 @@ impl OriginPolicy {
                 || parsed_origin.fragment().is_some()
             {
                 return Err(format!(
-                    "{trimmed_origin:?} must be an http or https origin without credentials, a path, query, or fragment"
+                    "origin entry {origin_entry_number} must be an http or https origin without credentials, a path, query, or fragment"
                 ));
             }
             let serialized_origin = parsed_origin.origin().ascii_serialization();
             let origin_header = HeaderValue::try_from(serialized_origin.as_str())
-                .map_err(|_| format!("{trimmed_origin:?} is not a valid origin"))?;
+                .map_err(|_| format!("origin entry {origin_entry_number} is not a valid origin"))?;
             if !trusted_origins.contains(&origin_header) {
                 trusted_origins.push(origin_header);
             }
@@ -129,5 +132,17 @@ mod tests {
                 "{configured_origins} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn rejected_configuration_diagnostics_do_not_echo_origin_secrets() {
+        let synthetic_origin_secret = "origin-password-must-not-appear";
+        let configured_origins = format!("https://user:{synthetic_origin_secret}@app.example");
+        let diagnostic = OriginPolicy::from_csv(&configured_origins).expect_err("invalid origin");
+        assert_eq!(
+            diagnostic,
+            "origin entry 1 must be an http or https origin without credentials, a path, query, or fragment"
+        );
+        assert!(!diagnostic.contains(synthetic_origin_secret));
     }
 }
