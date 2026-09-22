@@ -163,44 +163,49 @@ buckets. A gateway key's identity may carry `budget_usd` and an optional
 {"sk-example": {"tenant": "acme", "tier": 1, "budget_usd": 100, "budget_window_secs": 86400}}
 ```
 
-Cost is only knowable after a response, so the cap is checked before dispatch and
-charged after. Everything admitted between the last charge and the next check
-passes, so the overshoot bound is **admitted concurrency × the most expensive
-request**, multiplied again across replicas that have not yet shared their
-ledger. Size a cap with that headroom in mind rather than as a hard ceiling.
+Every actual provider send reserves a conservative amount before it consumes
+RPM or TPM. The reservation uses the final provider-native model and body, the
+catalog context ceiling, the request's output/reasoning bound (or the catalog
+output ceiling), and the applicable catalog price tier. The rate debits and USD
+reservation commit together, so a budget refusal consumes neither allowance.
+Repeated usage snapshots upsert one attempt by UUID; they are never summed as
+separate bills. A terminal response with known usage replaces its reservation
+with the known charge. Failed repair responses are therefore charged even when
+the caller ultimately receives a local `502`.
 
-The current spend ledger charges successful returned usage. A provider response
-that is later discarded by a failed managed repair, and a send whose billing is
-uncertain after a transport failure or worker loss, can still escape settlement.
-Treat this as a soft accounting cap until per-attempt reservation and settlement
-are enabled; RPM/TPM attempt coordination does not close that spend gap.
+Transport uncertainty, cancellation, stream abandonment, worker loss, and a
+failed settlement keep the original reservation in its acquisition window.
+Rollover never moves that liability into a later window. This makes the cap a
+hard ceiling under the configured catalog pricing policy. Catalog prices are
+still estimates rather than provider invoices: an external price change or fee
+missing from the policy cannot be guaranteed by llmshim.
 
-A response the catalog cannot price at all is **not** charged — recording zero
-would let an unpriced model run forever under a budget. A model that prices only
-*some* token classes is charged at its highest published rate for the rest, so a
-partial price bounds the charge from above instead of voiding it: 2,537 of the
-7,461 priced models in the catalog publish no `cache_read` rate, and voiding
-those would have reopened this same hole one layer down. So that a cap cannot silently stop
-binding, a request whose target has **no catalog price is refused before it runs**
-when a budget is set:
+Strict admission rejects a request when it cannot form that bound. This includes
+an unknown price or context/output ceiling, variable OpenRouter routing,
+priority/fast service controls, provider-hosted tools, and cache-creation
+controls whose fee dimension is not bounded. The rejection happens before send:
 
 ```
 400 {"error":{"code":"unpriceable_under_budget","param":"model", …}}
 ```
 
-It is deliberately not a `429`: retrying never clears it. Three ways forward —
-use a priced model, add a local price override in the catalog, or accept the risk
-explicitly per key:
+It is deliberately not a `429`: retrying never clears it. Use a bounded model,
+add a complete local catalog policy, remove the unbounded control, or accept the
+risk explicitly per key:
 
 ```json
 {"sk-example": {"tenant": "acme", "budget_usd": 100, "budget_allow_unpriced": true}}
 ```
 
-`budget_allow_unpriced` defaults to `false`. With it set, those requests run and
-are not charged, and each one logs a warning and increments
-`llmshim_gateway_unpriced_under_cap_total{provider,model}` — a non-zero counter
-means the budget is not binding for that target. An accepted risk should stay
-measurable rather than become an assumption.
+`budget_allow_unpriced` defaults to `false`. With it set, only requests lacking a
+defensible reservation receive the exception. Already-known spend must remain
+below the cap. Such an attempt conservatively holds the remaining window balance
+until final known usage can replace it; uncertainty or abandonment therefore
+exhausts the cap rather than releasing zero. Any later provider-reported or
+catalog-derived charge is still recorded. Priceable requests reserve normally
+even when the flag is set. Each exception increments
+`llmshim_gateway_unpriced_under_cap_total{provider,model}`; a non-zero counter
+means the configured policy cannot promise a finite bound for that target.
 
 ## One replica or a coordinated fleet
 
@@ -231,6 +236,10 @@ depth and inserts the job in one Lua transaction. Concurrent origins cannot
 claim the same remaining slot. `LLMSHIM_GATEWAY_QUEUE_DEPTH` defaults to 10,000
 waiting jobs per provider; a full queue refuses new work with `503` and
 `Retry-After`.
+
+Drain distributed gateway queues before a rolling upgrade that changes the
+trusted policy envelope. Workers reject older unversioned descriptors rather
+than dispatching them without their originating tenant budget.
 
 Do not infer capacity from llmshim's implementation details alone. The
 [README benchmarks](https://github.com/sanjay920/llmshim#benchmarks) are the

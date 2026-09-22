@@ -39,6 +39,7 @@
 
 mod attempt;
 pub mod auth;
+mod budget;
 pub mod http;
 pub mod idempotency;
 pub mod metrics;

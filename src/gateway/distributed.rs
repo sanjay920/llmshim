@@ -142,6 +142,10 @@ struct JobDescriptor {
     tier: u8,
     permits: u32,
     payload: Value,
+    #[serde(default)]
+    policy_envelope_version: u8,
+    #[serde(default)]
+    trusted_unscoped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy_scope: Option<crate::gateway::attempt::TrustedPolicyScope>,
     #[serde(default)]
@@ -167,6 +171,11 @@ impl PreparedSubmission {
         let member = serde_json::to_string(&descriptor).map_err(|error| redis_err(&error))?;
         Ok(Self { descriptor, member })
     }
+}
+
+fn policy_envelope_is_current(descriptor: &JobDescriptor) -> bool {
+    descriptor.policy_envelope_version == 1
+        && (descriptor.policy_scope.is_some() || descriptor.trusted_unscoped)
 }
 
 fn done_key(id: &str) -> String {
@@ -533,6 +542,8 @@ impl DistributedGateway {
             tier: req.tier,
             permits: req.permits.max(1),
             payload: req.payload,
+            policy_envelope_version: 1,
+            trusted_unscoped: policy_scope.is_none(),
             policy_scope,
             stream,
             enqueue_ms: now_ms(),
@@ -645,6 +656,17 @@ impl DistributedGateway {
                     continue;
                 }
             };
+
+            if !policy_envelope_is_current(&desc) {
+                self.publish(
+                    &response_channel(&desc.id),
+                    &BusMessage::Error("llmshim-coordinator-unavailable".into()),
+                )
+                .await;
+                self.mark_done(&desc.id).await;
+                self.ack_lease(&provider, &member).await;
+                continue;
+            }
 
             // Idempotency: a job that already completed (then got redelivered by
             // the reaper) is skipped.
@@ -988,6 +1010,8 @@ mod tests {
             tier: 3,
             permits: 42,
             payload: serde_json::json!({"model": "gpt-5.5"}),
+            policy_envelope_version: 1,
+            trusted_unscoped: false,
             policy_scope: Some(policy_scope),
             stream: true,
             enqueue_ms: 1_700_000_000_000,
@@ -1004,6 +1028,30 @@ mod tests {
         let prepared_descriptor: JobDescriptor = serde_json::from_str(&prepared.member).unwrap();
         assert_eq!(prepared_descriptor.id, "abc-1");
         assert!(prepared_descriptor.stream);
+
+        let legacy: JobDescriptor = serde_json::from_value(serde_json::json!({
+            "id": "old",
+            "provider": "openai",
+            "tier": 1,
+            "permits": 1,
+            "payload": {"model": "gpt-5.5"}
+        }))
+        .unwrap();
+        assert!(!policy_envelope_is_current(&legacy));
+
+        let trusted_unscoped = JobDescriptor {
+            id: "custom".into(),
+            provider: "custom".into(),
+            tier: 0,
+            permits: 1,
+            payload: serde_json::json!({}),
+            policy_envelope_version: 1,
+            trusted_unscoped: true,
+            policy_scope: None,
+            stream: false,
+            enqueue_ms: 0,
+        };
+        assert!(policy_envelope_is_current(&trusted_unscoped));
 
         for msg in [
             BusMessage::Unary(serde_json::json!({"a": 1})),
