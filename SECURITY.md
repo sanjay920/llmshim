@@ -57,6 +57,13 @@ do not expose it directly. Keep provider keys in the server's environment or
 config file, never in client code. See the deployment documentation for the
 concurrency, rate-limit, and backpressure controls.
 
+Browser requests that include an `Origin` header are rejected before dispatch
+unless the operator explicitly allows that exact origin with
+`LLMSHIM_TRUSTED_ORIGINS`. This protects a credential-backed local or private
+proxy from an unrelated website a user visits. It does not authenticate the
+proxy or restrict non-browser clients, so keep the network and authentication
+boundary described above.
+
 ## No warranty
 
 llmshim is provided "AS IS", without warranty of any kind. Operating it is at
