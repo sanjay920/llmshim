@@ -24,9 +24,26 @@ jobs:
           LLMSHIM_CATALOG_OFFLINE: '1'
         run: cargo test --workspace --features proxy --tests
 
+  release-inputs:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Validate release tag and package inputs
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: .github/scripts/verify-release-inputs.sh "$RELEASE_TAG"
+
   # --- Publish to crates.io ---
   crates-io:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +75,7 @@ jobs:
 
   # --- Build standalone macOS binaries + GitHub release ---
   github-release:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: macos-14
     permissions:
       contents: write
@@ -82,17 +99,18 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
         # Idempotent: if the release already exists (re-run), (re-)upload the
         # tarballs to it instead of failing on create.
         run: |
-          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release already exists; uploading assets with --clobber."
-            gh release upload "${{ github.ref_name }}" \
+            gh release upload "$RELEASE_TAG" \
               llmshim-aarch64-apple-darwin.tar.gz \
               llmshim-x86_64-apple-darwin.tar.gz --clobber
           else
-            gh release create ${{ github.ref_name }} \
-              --title "${{ github.ref_name }}" \
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
               --generate-notes \
               llmshim-aarch64-apple-darwin.tar.gz \
               llmshim-x86_64-apple-darwin.tar.gz
@@ -100,7 +118,7 @@ jobs:
 
   # --- Update Homebrew tap ---
   homebrew:
-    needs: github-release
+    needs: [release-inputs, github-release]
     runs-on: macos-14
     steps:
       - name: Update Homebrew formula
@@ -182,7 +200,7 @@ jobs:
   # npmjs.com once (same values as the root package: repo sanjay920/llmshim,
   # workflow release.yml, environment release) — see clients/typescript/README.md.
   npm-macos-binaries:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: macos-14
     environment: release
     permissions:
@@ -242,7 +260,7 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
 
   npm-linux-x64-binary:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -286,7 +304,7 @@ jobs:
 
   # Native arm64 runner (GA, free on public repos) — no cross-compilation needed.
   npm-linux-arm64-binary:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: ubuntu-24.04-arm
     environment: release
     permissions:
@@ -329,7 +347,7 @@ jobs:
         run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
 
   npm-windows-binary:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: windows-latest
     environment: release
     permissions:
@@ -384,6 +402,7 @@ jobs:
   npm:
     needs:
       - test
+      - release-inputs
       - npm-macos-binaries
       - npm-linux-x64-binary
       - npm-linux-arm64-binary
@@ -433,7 +452,7 @@ jobs:
   # Uses a "pending trusted publisher" — configurable on rubygems.org before
   # the gem's first-ever release, no manual bootstrap publish needed.
   rubygems:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -476,7 +495,7 @@ jobs:
   # that tag on every release so `go get .../clients/go@latest` resolves clean
   # semver matching the crate version.
   go-tag:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -507,7 +526,7 @@ jobs:
 
   # --- Build PyPI source distribution ---
   sdist:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -527,7 +546,7 @@ jobs:
 
   # --- macOS wheels (ARM64 + x86_64) ---
   macos:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: macos-14
     strategy:
       matrix:
@@ -550,7 +569,7 @@ jobs:
 
   # --- Linux x86_64 wheel ---
   linux-x86:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -571,7 +590,7 @@ jobs:
 
   # --- Linux aarch64 wheel (use zig for cross-compilation) ---
   linux-arm:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -592,7 +611,7 @@ jobs:
 
   # --- Windows x86_64 wheel ---
   windows:
-    needs: test
+    needs: [test, release-inputs]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -612,7 +631,7 @@ jobs:
 
   # --- Publish to PyPI ---
   pypi:
-    needs: [sdist, macos, linux-x86, linux-arm, windows]
+    needs: [release-inputs, sdist, macos, linux-x86, linux-arm, windows]
     runs-on: ubuntu-latest
     environment: release
     permissions:
