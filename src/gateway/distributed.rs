@@ -422,33 +422,6 @@ impl DistributedGateway {
         self.config.aging_step.as_millis() as u64
     }
 
-    pub(crate) async fn legacy_spend_floor(
-        &self,
-        tenant: &str,
-        window_secs: u64,
-    ) -> Result<(u64, u64), GatewayError> {
-        let mut connection = self.conn.clone();
-        let redis_time: (u64, u64) = redis::cmd("TIME")
-            .query_async(&mut connection)
-            .await
-            .map_err(|_| GatewayError::Upstream("llmshim-coordinator-unavailable".into()))?;
-        let window_index = redis_time.0 / window_secs.max(1);
-        let key = format!("llmshim:spend:{tenant}:{window_index}");
-        let raw: Option<String> = connection
-            .get(key)
-            .await
-            .map_err(|_| GatewayError::Upstream("llmshim-coordinator-unavailable".into()))?;
-        let amount_nanos = match raw {
-            Some(value) => value
-                .parse::<f64>()
-                .ok()
-                .and_then(crate::gateway::budget::legacy_spend_nanos)
-                .ok_or_else(|| GatewayError::Upstream("llmshim-coordinator-unavailable".into()))?,
-            None => 0,
-        };
-        Ok((window_index, amount_nanos))
-    }
-
     /// Enqueue a descriptor onto its provider's priority queue, first shedding
     /// with `Overloaded` if the waiting queue is at capacity.
     async fn enqueue(&self, prepared_submission: &PreparedSubmission) -> Result<(), GatewayError> {
@@ -1670,44 +1643,6 @@ mod tests {
         for key in [legacy_queue, scoped_queue, scoped_processing, scoped_leased] {
             let _: i64 = connection.del(key).await.unwrap();
         }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires LLMSHIM_REDIS_URL"]
-    async fn redis_legacy_spend_snapshot_uses_server_window_and_fails_closed() {
-        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
-        let gateway = DistributedGateway::connect(
-            &redis_url,
-            Arc::new(EchoDispatch),
-            unlimited(),
-            GatewayConfig::default(),
-        )
-        .await
-        .unwrap();
-        let tenant = format!("legacy-spend-{}", uuid::Uuid::new_v4());
-        let window_secs = 3_600;
-        let mut connection = gateway.conn.clone();
-        let redis_time: (u64, u64) = redis::cmd("TIME")
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        let window_index = redis_time.0 / window_secs;
-        let key = format!("llmshim:spend:{tenant}:{window_index}");
-        let _: () = connection.set(&key, "0.00000005").await.unwrap();
-        assert_eq!(
-            gateway
-                .legacy_spend_floor(&tenant, window_secs)
-                .await
-                .unwrap(),
-            (window_index, 50)
-        );
-        let _: () = connection.set(&key, "not-a-number").await.unwrap();
-        assert!(matches!(
-            gateway.legacy_spend_floor(&tenant, window_secs).await,
-            Err(GatewayError::Upstream(message))
-                if message == "llmshim-coordinator-unavailable"
-        ));
-        let _: i64 = connection.del(key).await.unwrap();
     }
 
     #[tokio::test]
