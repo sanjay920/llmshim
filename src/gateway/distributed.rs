@@ -208,22 +208,42 @@ impl DistributedGateway {
         }))
     }
 
-    /// Client-idempotency lookup: cached response for an `Idempotency-Key`.
-    pub async fn idem_get(&self, key: &str) -> Option<Value> {
+    /// Client-idempotency lookup for one credential-, route-, and request-bound key.
+    pub(crate) async fn idem_get(
+        &self,
+        context: &crate::gateway::idempotency::IdempotencyContext,
+    ) -> crate::gateway::idempotency::IdempotencyLookup {
         let mut conn = self.conn.clone();
         let raw: Option<String> = conn
-            .get(format!("llmshim:gw:idem:{key}"))
+            .get(format!("llmshim:gw:idem:v2:{}", context.storage_key()))
             .await
             .unwrap_or(None);
-        raw.and_then(|s| serde_json::from_str(&s).ok())
+        raw.and_then(|serialized| serde_json::from_str(&serialized).ok())
+            .map_or(
+                crate::gateway::idempotency::IdempotencyLookup::Miss,
+                |cached_response: crate::gateway::idempotency::CachedResponse| {
+                    cached_response.lookup(context)
+                },
+            )
     }
 
-    /// Cache a completed response under an `Idempotency-Key`.
-    pub async fn idem_put(&self, key: &str, value: &Value, ttl_secs: u64) {
-        if let Ok(s) = serde_json::to_string(value) {
+    /// Cache a completed response under its request-bound idempotency context.
+    pub(crate) async fn idem_put(
+        &self,
+        context: &crate::gateway::idempotency::IdempotencyContext,
+        value: &Value,
+        ttl_secs: u64,
+    ) {
+        let cached_response =
+            crate::gateway::idempotency::CachedResponse::new(context, value.clone());
+        if let Ok(serialized_response) = serde_json::to_string(&cached_response) {
             let mut conn = self.conn.clone();
             let _: Result<(), _> = conn
-                .set_ex(format!("llmshim:gw:idem:{key}"), s, ttl_secs)
+                .set_ex(
+                    format!("llmshim:gw:idem:v2:{}", context.storage_key()),
+                    serialized_response,
+                    ttl_secs,
+                )
                 .await;
         }
     }
@@ -958,6 +978,66 @@ mod tests {
         assert_eq!(gw.dead_letter_len(provider).await, 0);
         gw.dead_letter(provider, "poison-member").await;
         assert_eq!(gw.dead_letter_len(provider).await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_client_idempotency_binds_owner_and_request() {
+        let provider = "itest-client-idempotency";
+        let Some(gateway) = test_gateway(provider).await else {
+            return;
+        };
+        let original_context = crate::gateway::idempotency::IdempotencyContext::new(
+            "credential-a",
+            "/v1/chat",
+            "client-key",
+            &serde_json::json!({"prompt": "one"}),
+        );
+        let changed_request_context = crate::gateway::idempotency::IdempotencyContext::new(
+            "credential-a",
+            "/v1/chat",
+            "client-key",
+            &serde_json::json!({"prompt": "two"}),
+        );
+        let other_credential_context = crate::gateway::idempotency::IdempotencyContext::new(
+            "credential-b",
+            "/v1/chat",
+            "client-key",
+            &serde_json::json!({"prompt": "one"}),
+        );
+        let mut connection = gateway.conn.clone();
+        let _: Result<i64, _> = connection
+            .del(format!(
+                "llmshim:gw:idem:v2:{}",
+                original_context.storage_key()
+            ))
+            .await;
+
+        assert_eq!(
+            gateway.idem_get(&original_context).await,
+            crate::gateway::idempotency::IdempotencyLookup::Miss
+        );
+        gateway
+            .idem_put(
+                &original_context,
+                &serde_json::json!({"private": "response"}),
+                60,
+            )
+            .await;
+        assert_eq!(
+            gateway.idem_get(&original_context).await,
+            crate::gateway::idempotency::IdempotencyLookup::Replay(
+                serde_json::json!({"private": "response"})
+            )
+        );
+        assert_eq!(
+            gateway.idem_get(&changed_request_context).await,
+            crate::gateway::idempotency::IdempotencyLookup::Conflict
+        );
+        assert_eq!(
+            gateway.idem_get(&other_credential_context).await,
+            crate::gateway::idempotency::IdempotencyLookup::Miss
+        );
     }
 
     #[tokio::test]
