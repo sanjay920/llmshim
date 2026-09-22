@@ -229,10 +229,7 @@ impl DistributedGateway {
     ) -> redis::RedisResult<Arc<Self>> {
         let client = redis::Client::open(redis_url)?;
         let conn = ConnectionManager::new(client.clone()).await?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        let nonce = uuid::Uuid::new_v4().as_u128();
         Ok(Arc::new(Self {
             client,
             conn,
