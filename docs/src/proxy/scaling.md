@@ -53,10 +53,23 @@ second layer: **retry the route, then change the route**. See
 
 ## Backpressure and proactive limits
 
-Every actual provider attempt acquires an instance concurrency slot immediately
-before the send. Waiting longer than the queue timeout returns `503` with
-`Retry-After`. A retry or repair releases the completed attempt's slot and must
-acquire again; fallback acquires against the provider it actually targets.
+Every logical request first acquires an instance preparation slot before route
+resolution, schema work, or provider preparation. Each actual provider attempt
+then acquires a separate concurrency slot immediately before the send. Both
+waits use the queue timeout and return `503` with `Retry-After` when saturated.
+The logical slot remains held for the request or stream lifetime. A retry or
+repair releases the completed attempt's slot and must acquire again; fallback
+acquires against the provider it actually targets without reacquiring the
+logical slot.
+
+The authenticated gateway checks credentials before acquiring its short-lived
+prequeue preparation slot. It releases that slot after native conversion,
+route expansion, token estimation, keyed request fingerprinting, and policy
+checks. Distributed mode retains it through finite-queue admission and then
+releases it before waiting for execution or results; local mode releases before
+its synchronous in-memory enqueue. Queued dispatch and each final provider
+attempt keep their independent capacity and rate-policy gates. Post-queue
+gateway response projection is outside this short-lived prequeue slot.
 
 | Variable | Default | Meaning |
 |---|---:|---|
