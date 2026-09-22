@@ -1022,7 +1022,8 @@ mod redis_rates {
         local legacy_usd = 0
         if legacy_raw ~= false then
             legacy_usd = tonumber(legacy_raw)
-            if legacy_usd == nil or legacy_usd ~= legacy_usd or legacy_usd < 0 then
+            if legacy_usd == nil or legacy_usd ~= legacy_usd or
+                    legacy_usd == math.huge or legacy_usd < 0 then
                 extend_global_freeze()
                 return {-1, window_index, 0}
             end
@@ -3419,7 +3420,15 @@ mod tests {
         let Some(redis_url) = redis_url() else {
             return;
         };
-        for wrong_type in [false, true] {
+        for invalid_legacy_value in [
+            Some("not-a-number"),
+            Some("nan"),
+            Some("-1"),
+            Some("inf"),
+            Some("-inf"),
+            Some("1e309"),
+            None,
+        ] {
             let namespace = uuid::Uuid::new_v4();
             let tenant = format!("origin-invalid-{namespace}");
             let provider = format!("origin-invalid-{namespace}");
@@ -3457,11 +3466,14 @@ mod tests {
                 .await
                 .unwrap();
             stale_scope.set_legacy_spend_floor(stale_floor.window_index, stale_floor.amount_nanos);
-            if wrong_type {
+            if let Some(invalid_legacy_value) = invalid_legacy_value {
+                let _: () = connection
+                    .set(&legacy_key, invalid_legacy_value)
+                    .await
+                    .unwrap();
+            } else {
                 let _: i64 = connection.del(&legacy_key).await.unwrap();
                 let _: usize = connection.rpush(&legacy_key, "wrong-type").await.unwrap();
-            } else {
-                let _: () = connection.set(&legacy_key, "not-a-number").await.unwrap();
             }
 
             assert!(rates
