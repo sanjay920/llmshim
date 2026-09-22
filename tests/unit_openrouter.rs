@@ -41,6 +41,22 @@ fn request_preserves_slug_and_messages() {
 }
 
 #[test]
+fn request_preserves_a_variant_suffix_on_the_wire() {
+    // MOH-240: the catalog lookup normalizes a suffix like `:nitro` off for
+    // metadata (family/window/price/capabilities), but the suffix is a
+    // routing hint OpenRouter reads off the wire model string itself, so the
+    // built request body must carry it exactly as given.
+    let p = provider();
+    let model = "deepseek/deepseek-v4.1-flash:nitro";
+    let req = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let result = p.transform_request(model, &req).unwrap();
+    assert_eq!(result.body["model"], model);
+}
+
+#[test]
 fn request_forwards_tools_unchanged() {
     // OpenRouter is Chat Completions-native, so nested tools need no translation.
     let p = provider();
