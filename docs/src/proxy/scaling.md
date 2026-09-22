@@ -333,8 +333,12 @@ state in one owner-fenced Redis transaction.
 
 Caller-side Redis deadlines also cover distributed connection setup, readiness,
 queue and DLQ statistics, lifecycle reserve/activate/cancel/readback and the
-bounded generic and scoped idempotency caches. A leased request and its metadata
-retain hard expiry headroom for the full worker lifetime plus cleanup grace.
+bounded generic and scoped idempotency caches. Each of those logical operations
+uses the same generation-retiring connection cache: failure or caller timeout
+retires that operation's exact generation before a later operation can reuse it.
+Pub/sub connections remain separately owned for the accepted response lifetime.
+A leased request and its metadata retain hard expiry headroom for the full worker
+lifetime plus cleanup grace.
 
 The queue remains at-least-once across an actual worker crash or coordination
 partition. If a provider accepted a request before ownership became uncertain,
