@@ -107,8 +107,12 @@ pub fn load() -> Config {
         // caller's API keys as well as the section they mistyped, and surface
         // only as "unknown provider" with nothing pointing at the real cause.
         Ok(contents) => toml::from_str(&contents).unwrap_or_else(|error| {
+            let location = error
+                .span()
+                .map(|span| toml_error_location(&contents, span.start))
+                .unwrap_or_else(|| "unknown location".to_string());
             eprintln!(
-                "warning: {} is not valid TOML and was ignored ({error}); \
+                "warning: {} has a TOML configuration error at {location} and was ignored; \
                  API keys and routes from it are not in effect",
                 path.display()
             );
@@ -116,6 +120,23 @@ pub fn load() -> Config {
         }),
         Err(_) => Config::default(),
     }
+}
+
+fn toml_error_location(contents: &str, error_offset: usize) -> String {
+    let mut line_number = 1;
+    let mut column_number = 1;
+    for (character_offset, character) in contents.char_indices() {
+        if character_offset >= error_offset {
+            break;
+        }
+        if character == '\n' {
+            line_number += 1;
+            column_number = 1;
+        } else {
+            column_number += 1;
+        }
+    }
+    format!("line {line_number}, column {column_number}")
 }
 
 /// Save config to ~/.llmshim/config.toml. Creates the directory if needed.
