@@ -1,0 +1,6 @@
+[project]
+name = "llmshim"
+dynamic = ["version"]
+
+[tool.maturin]
+manifest-path = "../../Cargo.toml"
