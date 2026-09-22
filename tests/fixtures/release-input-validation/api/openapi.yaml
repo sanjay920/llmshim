@@ -1,0 +1,4 @@
+openapi: 3.1.0
+info:
+  title: llmshim API
+  version: 1.2.3

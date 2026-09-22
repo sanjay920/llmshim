@@ -1,0 +1,6 @@
+[package]
+name = "llmshim"
+version = "1.2.3"
+
+[dependencies]
+llmshim-catalog = { version = "0.4.5", path = "crates/llmshim-catalog" }
