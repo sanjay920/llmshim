@@ -116,6 +116,10 @@ reports its bill, llmshim uses it for `usage.cost_usd` and sets
 `usage.cost_source` to `"provider"`. Without a reported bill or locally configured
 rates, `cost_usd` remains `null`.
 
+A partial stream bill that is not confirmed as the terminal provider bill uses
+`cost_source: "provider_floor"`; it is a known lower bound rather than an exact
+invoice.
+
 ### ChatGPT subscription
 
 | ID | Display name |

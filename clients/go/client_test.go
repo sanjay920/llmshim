@@ -33,7 +33,7 @@ func TestChat(t *testing.T) {
 			"provider": "anthropic",
 			"message": {"role": "assistant", "content": "Hi there!"},
 			"reasoning": "thinking...",
-			"usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+			"usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15, "cost_usd": 1.0, "cost_source": "provider_floor"},
 			"latency_ms": 420
 		}`)
 	}))
@@ -58,6 +58,9 @@ func TestChat(t *testing.T) {
 	}
 	if resp.Usage.TotalTokens != 15 || resp.LatencyMs != 420 {
 		t.Errorf("usage/latency = %+v %d", resp.Usage, resp.LatencyMs)
+	}
+	if resp.Usage.CostUSD == nil || *resp.Usage.CostUSD != 1.0 || resp.Usage.CostSource != "provider_floor" {
+		t.Errorf("cost accounting = %+v", resp.Usage)
 	}
 }
 

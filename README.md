@@ -97,6 +97,10 @@ chunk. Because OpenRouter is an aggregator, the response's top-level
 `"Fireworks"`, …) and `id` is the OpenRouter generation id; both survive the
 streaming and buffered paths.
 
+If a stream reports a provider cost before its validated terminal accounting,
+the final usage may instead carry `cost_source: "provider_floor"`. That value is
+the highest observed lower bound, not an exact final invoice.
+
 This matters more than a rounding difference. Measured on
 `deepseek/deepseek-v4.1-flash`, the catalog's own rate for the OpenRouter slug
 was **half** what OpenRouter actually billed, so the estimate it replaces was

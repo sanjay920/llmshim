@@ -10,11 +10,15 @@ pub type AttemptPolicyFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a
 #[derive(Clone)]
 pub struct DispatchPolicyContext {
     policy: Arc<dyn AttemptPolicy>,
+    last_refusal: Arc<std::sync::Mutex<Option<AttemptPolicyRefusal>>>,
 }
 
 impl DispatchPolicyContext {
     pub fn new(policy: Arc<dyn AttemptPolicy>) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            last_refusal: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     pub(crate) async fn acquire(
@@ -40,7 +44,11 @@ impl DispatchPolicyContext {
             method: "POST",
             native_body,
         };
-        self.policy.acquire(&prepared_attempt).await?;
+        *self.last_refusal.lock().unwrap() = None;
+        if let Err(refusal) = self.policy.acquire(&prepared_attempt).await {
+            *self.last_refusal.lock().unwrap() = Some(refusal);
+            return Err(refusal);
+        }
         Ok(AttemptTracker {
             context: self.clone(),
             identity,
@@ -55,6 +63,19 @@ impl DispatchPolicyContext {
         event: AttemptEvent<'_>,
     ) -> Result<(), AttemptPolicyError> {
         self.policy.observe(identity, event).await
+    }
+
+    async fn observe_usage(
+        &self,
+        identity: &AttemptIdentity,
+        observation: AttemptUsageObservation<'_>,
+    ) -> Result<(), AttemptPolicyError> {
+        self.policy.observe_usage(identity, observation).await
+    }
+
+    #[cfg(feature = "gateway")]
+    pub(crate) fn take_last_refusal(&self) -> Option<AttemptPolicyRefusal> {
+        self.last_refusal.lock().unwrap().take()
     }
 }
 
@@ -81,6 +102,19 @@ pub trait AttemptPolicy: Send + Sync {
         event: AttemptEvent<'a>,
     ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>>;
 
+    fn observe_usage<'a>(
+        &'a self,
+        attempt: &'a AttemptIdentity,
+        observation: AttemptUsageObservation<'a>,
+    ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>> {
+        self.observe(
+            attempt,
+            AttemptEvent::Usage {
+                usage: observation.usage(),
+            },
+        )
+    }
+
     /// The acquire-time liability remains authoritative when this best-effort
     /// drop notification fails.
     fn observe_abandoned(
@@ -88,6 +122,46 @@ pub trait AttemptPolicy: Send + Sync {
         attempt: &AttemptIdentity,
         outcome: AttemptOutcome,
     ) -> Result<(), AttemptPolicyError>;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AttemptUsageObservation<'a> {
+    usage: &'a Value,
+    terminal: bool,
+    counters_complete: bool,
+    explicit_zero: bool,
+}
+
+impl<'a> AttemptUsageObservation<'a> {
+    pub fn new(
+        usage: &'a Value,
+        terminal: bool,
+        counters_complete: bool,
+        explicit_zero: bool,
+    ) -> Self {
+        Self {
+            usage,
+            terminal,
+            counters_complete,
+            explicit_zero,
+        }
+    }
+
+    pub fn usage(self) -> &'a Value {
+        self.usage
+    }
+
+    pub fn terminal(self) -> bool {
+        self.terminal
+    }
+
+    pub fn counters_complete(self) -> bool {
+        self.counters_complete
+    }
+
+    pub fn explicit_zero(self) -> bool {
+        self.explicit_zero
+    }
 }
 
 pub struct PreparedAttempt<'a> {
@@ -357,9 +431,18 @@ impl AttemptTracker {
             .await
     }
 
-    pub(crate) async fn usage(&mut self, usage: &Value) -> Result<(), AttemptPolicyError> {
+    pub(crate) async fn usage(
+        &mut self,
+        usage: &Value,
+        terminal: bool,
+        counters_complete: bool,
+        explicit_zero: bool,
+    ) -> Result<(), AttemptPolicyError> {
         self.context
-            .observe(&self.identity, AttemptEvent::Usage { usage })
+            .observe_usage(
+                &self.identity,
+                AttemptUsageObservation::new(usage, terminal, counters_complete, explicit_zero),
+            )
             .await?;
         self.usage_observed = true;
         Ok(())

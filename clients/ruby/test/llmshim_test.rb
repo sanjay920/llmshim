@@ -48,7 +48,8 @@ class LlmshimClientTest < Minitest::Test
         ]
       },
       reasoning: "thinking...",
-      usage: { input_tokens: 10, output_tokens: 5, reasoning_tokens: 3, total_tokens: 18 },
+      usage: { input_tokens: 10, output_tokens: 5, reasoning_tokens: 3, total_tokens: 18,
+               cost_usd: 1.0, cost_source: "provider_floor" },
       latency_ms: 1234
     }
 
@@ -69,6 +70,8 @@ class LlmshimClientTest < Minitest::Test
     assert_equal 1234, resp.latency_ms
     assert_equal 18, resp.usage.total_tokens
     assert_equal 3, resp.usage.reasoning_tokens
+    assert_equal 1.0, resp.usage.cost_usd
+    assert_equal "provider_floor", resp.usage.cost_source
 
     tc = resp.message.tool_calls.first
     assert_equal "call_1", tc.id

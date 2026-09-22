@@ -163,44 +163,97 @@ buckets. A gateway key's identity may carry `budget_usd` and an optional
 {"sk-example": {"tenant": "acme", "tier": 1, "budget_usd": 100, "budget_window_secs": 86400}}
 ```
 
-Cost is only knowable after a response, so the cap is checked before dispatch and
-charged after. Everything admitted between the last charge and the next check
-passes, so the overshoot bound is **admitted concurrency × the most expensive
-request**, multiplied again across replicas that have not yet shared their
-ledger. Size a cap with that headroom in mind rather than as a hard ceiling.
+`budget_usd` must be finite, non-negative, and no greater than
+`9007199.254740992`. The ledger stores nano-USD integers and keeps every Redis
+value within Lua's exact-integer range; invalid limits fail closed.
+An explicit zero freezes the identity, including models whose configured token
+rates are zero.
 
-The current spend ledger charges successful returned usage. A provider response
-that is later discarded by a failed managed repair, and a send whose billing is
-uncertain after a transport failure or worker loss, can still escape settlement.
-Treat this as a soft accounting cap until per-attempt reservation and settlement
-are enabled; RPM/TPM attempt coordination does not close that spend gap.
+Every actual provider send reserves a conservative amount before it consumes
+RPM or TPM. The reservation uses the final provider-native model and body,
+trusted per-field catalog facts, the request's output/reasoning bound (or a
+trusted catalog output ceiling), and the applicable trusted price tier. Local
+operator policy is authoritative; verified built-in prices and built-in or
+provider-reported limits are accepted. Community `models.dev` values alone do
+not establish a hard-cap policy. The rate debits and USD reservation commit
+together, so a budget refusal consumes neither allowance.
+The full context ceiling is used for input rather than treating a tokenizer
+heuristic as a guarantee, so admission can be deliberately conservative even
+for a short prompt.
+Repeated usage snapshots upsert one attempt by UUID; they are never summed as
+separate bills. Partial or missing-counter usage may raise liability but cannot
+release it. A successful terminal response replaces its reservation only when
+the wire's required input/output counters are explicitly present, including
+explicit zeros, or when the provider reports an authoritative bill. A terminal
+provider bill also outranks an earlier catalog estimate. Failed repair responses
+are therefore charged even when the caller ultimately receives a local `502`.
+Bounded provider error bodies are inspected for native usage or a
+provider-reported bill before retry or return; the original error body and size
+limit remain unchanged.
 
-A response the catalog cannot price at all is **not** charged — recording zero
-would let an unpriced model run forever under a budget. A model that prices only
-*some* token classes is charged at its highest published rate for the rest, so a
-partial price bounds the charge from above instead of voiding it: 2,537 of the
-7,461 priced models in the catalog publish no `cache_read` rate, and voiding
-those would have reopened this same hole one layer down. So that a cap cannot silently stop
-binding, a request whose target has **no catalog price is refused before it runs**
-when a budget is set:
+Any provider-reported partial charge also establishes a floor: a later terminal
+catalog estimate cannot settle below it. A genuine terminal provider bill may
+apply the provider-final correction rule. Public Chat stream aggregation exposes
+a nonterminal bill as `usage.provider_cost_floor_usd` instead of presenting it
+as an exact final `cost_usd`.
+
+Streaming snapshots remain partial until the protocol normalizer validates a
+clean end. A private candidate must still cover every choice or candidate after
+all later output and newly seen indexes; early usage-only frames and mixed
+finished/unfinished results cannot authorize release.
+
+Transport uncertainty, cancellation, stream abandonment, worker loss, and a
+failed settlement keep the original reservation in its acquisition window.
+The window is selected only after concurrency admission; Redis selects it from
+server time inside the atomic transaction. Rollover never moves that liability
+into a later window, and attempt tombstones remain available for late settlement
+for 24 hours after the acquisition window ends. This makes the cap a
+hard ceiling under the configured catalog pricing policy. Catalog prices are
+still estimates rather than provider invoices: an external price change or fee
+missing from the policy cannot be guaranteed by llmshim.
+If combined known liabilities exceed the fixed-point range, the window becomes
+irreversibly frozen; a later release from another overlapping attempt cannot
+reopen capacity after overflow information has been lost.
+
+The gateway retains at most 100,000 attempt tombstones by default, configured by
+`LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS`. This is an operational
+accounting-state limit, shared by the Redis fleet and per process in local mode.
+When it is full, a new budgeted attempt fails closed with `503` before any RPM,
+TPM, or spend debit; live reservations and the 24-hour settlement interval are
+never evicted to make room. Expired entries are reclaimed incrementally, so a
+large simultaneous expiry does not block the coordinator. Size this limit for
+the number of provider attempts that can begin during one budget window plus
+the 24-hour late-settlement interval. A high-throughput deployment can reach
+this state limit before it reaches its dollar cap.
+
+Strict admission rejects a request when it cannot form that bound. This includes
+an unknown price or context/output ceiling, variable OpenRouter routing,
+multi-candidate output, priority/fast service controls, provider-hosted tools,
+unbounded media, unknown native controls, and cache-creation controls whose fee
+dimension is not bounded. The rejection happens before send:
 
 ```
 400 {"error":{"code":"unpriceable_under_budget","param":"model", …}}
 ```
 
-It is deliberately not a `429`: retrying never clears it. Three ways forward —
-use a priced model, add a local price override in the catalog, or accept the risk
-explicitly per key:
+It is deliberately not a `429`: retrying never clears it. Use a bounded model,
+add a complete local catalog policy, remove the unbounded control, or accept the
+risk explicitly per key:
 
 ```json
 {"sk-example": {"tenant": "acme", "budget_usd": 100, "budget_allow_unpriced": true}}
 ```
 
-`budget_allow_unpriced` defaults to `false`. With it set, those requests run and
-are not charged, and each one logs a warning and increments
-`llmshim_gateway_unpriced_under_cap_total{provider,model}` — a non-zero counter
-means the budget is not binding for that target. An accepted risk should stay
-measurable rather than become an assumption.
+`budget_allow_unpriced` defaults to `false`. With it set, only requests lacking a
+defensible reservation receive the exception. Already-known spend must remain
+below the cap. Such an attempt conservatively holds the remaining window balance
+until final known usage can replace it; uncertainty or abandonment therefore
+exhausts the cap rather than releasing zero. Any later provider-reported or
+catalog-derived charge is still observed, but only a terminal provider bill can
+resolve the fee uncertainty and release an unpriced reservation. Priceable
+requests reserve normally even when the flag is set. Each exception increments
+`llmshim_gateway_unpriced_under_cap_total{provider,model}`; a non-zero counter
+means the configured policy cannot promise a finite bound for that target.
 
 ## One replica or a coordinated fleet
 
@@ -226,11 +279,55 @@ Connection pools and concurrency limits remain per process. If the Redis client
 cannot be initialized—or the binary lacks the feature—the compact proxy warns
 and falls back to in-memory buckets.
 
-With `gateway-redis`, admitting a new job checks the provider's waiting-queue
-depth and inserts the job in one Lua transaction. Concurrent origins cannot
-claim the same remaining slot. `LLMSHIM_GATEWAY_QUEUE_DEPTH` defaults to 10,000
-waiting jobs per provider; a full queue refuses new work with `503` and
-`Retry-After`.
+With `gateway-redis`, admitting a new job checks both protocol queues' combined
+provider waiting depth and inserts the job in one Lua transaction. Concurrent
+origins cannot claim the same remaining slot. `LLMSHIM_GATEWAY_QUEUE_DEPTH`
+defaults to 10,000 total waiting jobs per provider; a full queue refuses new
+work with `503` and `Retry-After`. Released origins only count the legacy queue,
+so that combined bound becomes exact after old ingress stops. The two protocol
+queues keep independent priority ordering during the transition; one shared
+worker-capacity bound prevents them from doubling upstream concurrency.
+
+Authenticated jobs use a versioned scoped queue, lease, response, completion,
+dead-letter, and reaper namespace. Released workers only watch the legacy
+namespace and cannot lease a new scoped job or move its expired lease. New
+workers also serve the legacy namespace for deliberately trusted custom Rust
+jobs, with one per-provider concurrency limit shared across both protocols.
+They reject an older scoped descriptor found in the legacy queue instead of
+running it without its budget policy.
+
+During an upgrade from the post-charge spend counter, each new authenticated
+origin uses one Redis-time Lua transaction to read the active legacy
+`llmshim:spend` value and retain the largest rounded-up nano-USD floor before
+idempotency lookup, queueing, or any worker refusal. A replay, conflict,
+overloaded or cancelled submission, unpriceable request, semaphore timeout, and
+zero-rate policy therefore cannot forget spend that the origin already saw.
+The private descriptor carries only the Redis-time window index and retained
+nano-USD floor, never the raw tenant or bearer. Worker admission tracks the
+separately applied floor and adds only a later positive delta, alongside new
+reservations and settlements. Origin retention creates no attempt, rate debit,
+aggregate charge, or applied delta. This preserves known active-window spend
+without double charging repeated imports or forgetting intervening new spend.
+Known-floor records share the finite retained-accounting index. If that index
+cannot retain newly learned spend, the same origin transaction sets one fleet
+freeze marker through the longest affected retention horizon. It remains in
+force if a slot later frees, so a stale descriptor cannot exploit discarded
+knowledge. A malformed, negative, non-finite, or wrong-type active legacy value
+also sets or extends that marker before the origin fails closed; its amount is
+unknown, so older queued snapshots cannot safely proceed.
+Keep each identity's `budget_window_secs` unchanged through this transition so
+the old and new counters name the same tumbling window.
+
+An origin running released code can still admit and record its own request after
+a new origin takes that point-in-time snapshot. Queue isolation prevents old
+workers from weakening new-origin jobs, but cannot retrofit atomic accounting
+into old ingress. Stop old ingress before claiming one fleet-wide hard cap for
+the rest of the transition window. After old ingress is stopped, queued legacy
+scoped jobs fail closed on new workers; custom unscoped jobs remain compatible.
+If Redis cannot execute or persist the origin transaction at all, it cannot
+durably record a freeze. Worker coordination fails while Redis is unavailable;
+after recovery, require a fresh successful origin retention before treating
+previously queued transition work as safe.
 
 Do not infer capacity from llmshim's implementation details alone. The
 [README benchmarks](https://github.com/sanjay920/llmshim#benchmarks) are the

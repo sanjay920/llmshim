@@ -119,8 +119,8 @@ pub struct Usage {
     pub total_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
-    /// USD charged for this response. `null` means the catalog carries no price
-    /// for the model at all — it never means free.
+    /// USD accounting for this response. A provider floor is a known lower
+    /// bound; `null` means the cost could not be known and never means free.
     ///
     /// Where a model prices some token classes and not others, the unpriced ones
     /// are charged at its highest published rate, so this is an **upper bound**
@@ -128,10 +128,13 @@ pub struct Usage {
     /// over-reporting merely spends a budget slightly early. See `llmshim::cost`.
     ///
     /// Unless `cost_source` says `"provider"`, in which case the number is not
-    /// an estimate at all but what the provider reported charging.
+    /// an estimate at all but what the provider reported charging. A
+    /// `"provider_floor"` source is the highest partial provider bill observed;
+    /// it is a known lower bound rather than an exact final invoice.
     pub cost_usd: Option<f64>,
-    /// `"provider"` when `cost_usd` is the provider's own reported bill for
-    /// this generation, `"catalog"` when it was computed from catalog prices.
+    /// `"provider"` when `cost_usd` is the provider's own reported final bill,
+    /// `"provider_floor"` for the highest partial provider bill observed, and
+    /// `"catalog"` when it was computed from catalog prices.
     /// Absent on a usage object nothing has priced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_source: Option<String>,
