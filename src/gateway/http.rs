@@ -2278,6 +2278,18 @@ mod native_tests {
             StatusCode::OK,
         )
         .await;
+        assert_chat_stream_budget_finality(
+            vec![
+                json!({
+                    "choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}],
+                    "usage":{"cost":1.0}
+                }),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            ],
+            StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
 
         let gemini_unsafe = vec![
             vec![
