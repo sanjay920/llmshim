@@ -8,6 +8,7 @@ pub use llmshim_catalog as catalog;
 pub mod config;
 pub mod cost;
 pub mod credentials;
+mod default_secret_file;
 pub mod env;
 pub mod error;
 pub mod fallback;

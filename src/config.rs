@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// The full config file structure.
@@ -98,27 +98,41 @@ pub fn config_path() -> PathBuf {
 
 /// Load config from ~/.llmshim/config.toml. Returns default if file doesn't exist.
 pub fn load() -> Config {
-    let path = config_path();
-    if !path.exists() {
-        return Config::default();
-    }
-    match std::fs::read_to_string(&path) {
-        // A malformed file must be loud. Falling back silently would drop the
-        // caller's API keys as well as the section they mistyped, and surface
-        // only as "unknown provider" with nothing pointing at the real cause.
-        Ok(contents) => toml::from_str(&contents).unwrap_or_else(|error| {
-            let location = error
-                .span()
-                .map(|span| toml_error_location(&contents, span.start))
-                .unwrap_or_else(|| "unknown location".to_string());
-            eprintln!(
+    let configuration_directory = config_dir();
+    let path = configuration_directory.join("config.toml");
+    match crate::default_secret_file::open_default_secret_file(
+        &configuration_directory,
+        &[],
+        "config.toml",
+    ) {
+        Ok(None) => Config::default(),
+        Ok(Some(mut file_handle)) => {
+            let mut contents = String::new();
+            match file_handle.read_to_string(&mut contents) {
+                // A malformed file must be loud. Falling back silently would drop the
+                // caller's API keys as well as the section they mistyped, and surface
+                // only as "unknown provider" with nothing pointing at the real cause.
+                Ok(_) => toml::from_str(&contents).unwrap_or_else(|error| {
+                    let location = error
+                        .span()
+                        .map(|span| toml_error_location(&contents, span.start))
+                        .unwrap_or_else(|| "unknown location".to_string());
+                    eprintln!(
                 "warning: {} has a TOML configuration error at {location} and was ignored; \
                  API keys and routes from it are not in effect",
                 path.display()
             );
+                    Config::default()
+                }),
+                Err(_) => Config::default(),
+            }
+        }
+        Err(_) => {
+            eprintln!(
+                "warning: default configuration file could not be safely loaded and was ignored"
+            );
             Config::default()
-        }),
-        Err(_) => Config::default(),
+        }
     }
 }
 

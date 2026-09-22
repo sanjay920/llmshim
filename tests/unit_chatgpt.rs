@@ -676,6 +676,176 @@ fn cli_discovers_saved_login_and_lists_subscription_models() {
     }
 }
 
+#[cfg(unix)]
+fn bounded_child_output(mut child: std::process::Child) -> std::process::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("ChatGPT cache reader blocked on a synthetic FIFO");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn create_fifo(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn default_auth_status_repairs_legacy_modes_without_touching_override_paths() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary_home_directory = tempfile::tempdir().unwrap();
+    let config_directory_path = temporary_home_directory.path().join(".llmshim");
+    let auth_directory_path = config_directory_path.join("chatgpt");
+    let auth_file_path = auth_directory_path.join("auth.json");
+    std::fs::create_dir_all(&auth_directory_path).unwrap();
+    std::fs::write(&auth_file_path, token_record(false).to_string()).unwrap();
+    for path in [&config_directory_path, &auth_directory_path] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::set_permissions(&auth_file_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let command_output = std::process::Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args(["login", "chatgpt", "--status"])
+        .env("HOME", temporary_home_directory.path())
+        .env_remove("CHATGPT_TOKEN_DIR")
+        .env_remove("CHATGPT_AUTH_FILE")
+        .output()
+        .unwrap();
+
+    assert!(command_output.status.success());
+    assert!(String::from_utf8_lossy(&command_output.stdout).contains("ChatGPT login is ready"));
+    for path in [&config_directory_path, &auth_directory_path] {
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(auth_file_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let override_directory = tempfile::tempdir().unwrap();
+    let override_file = override_directory.path().join("auth.json");
+    std::fs::write(&override_file, token_record(false).to_string()).unwrap();
+    std::fs::set_permissions(&override_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        ChatGptAuth::new(override_file.clone()).status().unwrap(),
+        LoginStatus::Ready
+    );
+    assert_eq!(
+        std::fs::metadata(override_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn default_auth_status_rejects_a_symlinked_cache() {
+    let temporary_home_directory = tempfile::tempdir().unwrap();
+    let auth_directory_path = temporary_home_directory.path().join(".llmshim/chatgpt");
+    let target_path = temporary_home_directory.path().join("auth-target.json");
+    std::fs::create_dir_all(&auth_directory_path).unwrap();
+    let target_contents = token_record(false).to_string();
+    std::fs::write(&target_path, &target_contents).unwrap();
+    std::os::unix::fs::symlink(&target_path, auth_directory_path.join("auth.json")).unwrap();
+
+    let command_output = std::process::Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args(["login", "chatgpt", "--status"])
+        .env("HOME", temporary_home_directory.path())
+        .env_remove("CHATGPT_TOKEN_DIR")
+        .env_remove("CHATGPT_AUTH_FILE")
+        .output()
+        .unwrap();
+
+    assert!(!command_output.status.success());
+    assert!(String::from_utf8_lossy(&command_output.stderr)
+        .contains("ChatGPT: cannot read or update the OAuth cache"));
+    assert_eq!(
+        std::fs::read_to_string(target_path).unwrap(),
+        target_contents
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn default_auth_status_rejects_a_fifo_cache_without_blocking() {
+    let temporary_home_directory = tempfile::tempdir().unwrap();
+    let auth_directory_path = temporary_home_directory.path().join(".llmshim/chatgpt");
+    std::fs::create_dir_all(&auth_directory_path).unwrap();
+    create_fifo(&auth_directory_path.join("auth.json"));
+
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args(["login", "chatgpt", "--status"])
+        .env("HOME", temporary_home_directory.path())
+        .env_remove("CHATGPT_TOKEN_DIR")
+        .env_remove("CHATGPT_AUTH_FILE")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let command_output = bounded_child_output(child);
+
+    assert!(!command_output.status.success());
+    assert!(String::from_utf8_lossy(&command_output.stderr)
+        .contains("ChatGPT: cannot read or update the OAuth cache"));
+}
+
+#[cfg(unix)]
+#[test]
+fn default_auth_status_rejects_a_hard_link_without_changing_its_target() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary_home_directory = tempfile::tempdir().unwrap();
+    let auth_directory_path = temporary_home_directory.path().join(".llmshim/chatgpt");
+    let target_path = temporary_home_directory.path().join("auth-target.json");
+    let target_contents = token_record(false).to_string();
+    std::fs::create_dir_all(&auth_directory_path).unwrap();
+    std::fs::write(&target_path, &target_contents).unwrap();
+    std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::hard_link(&target_path, auth_directory_path.join("auth.json")).unwrap();
+
+    let command_output = std::process::Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args(["login", "chatgpt", "--status"])
+        .env("HOME", temporary_home_directory.path())
+        .env_remove("CHATGPT_TOKEN_DIR")
+        .env_remove("CHATGPT_AUTH_FILE")
+        .output()
+        .unwrap();
+
+    assert!(!command_output.status.success());
+    assert!(String::from_utf8_lossy(&command_output.stderr)
+        .contains("ChatGPT: cannot read or update the OAuth cache"));
+    assert_eq!(
+        std::fs::read_to_string(&target_path).unwrap(),
+        target_contents
+    );
+    assert_eq!(
+        std::fs::metadata(target_path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}
+
 #[tokio::test]
 async fn sse_handles_multiline_events_and_split_utf8_bytes() {
     let mut server = Server::new_async().await;
