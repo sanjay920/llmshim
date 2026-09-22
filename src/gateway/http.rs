@@ -267,6 +267,29 @@ impl GatewayState {
         }))
     }
 
+    async fn trusted_policy_scope(
+        &self,
+        identity: &crate::gateway::auth::Identity,
+    ) -> Result<crate::gateway::attempt::TrustedPolicyScope, GatewayError> {
+        let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(identity);
+        #[cfg(feature = "redis-coordination")]
+        let mut policy_scope = policy_scope;
+        #[cfg(feature = "redis-coordination")]
+        if identity.budget_usd.is_some() {
+            if let Backend::Distributed(gateway) = &self.backend {
+                let window_secs = identity
+                    .budget_window_secs
+                    .unwrap_or(crate::gateway::quota::DEFAULT_BUDGET_WINDOW_SECS)
+                    .max(1);
+                let (window_index, amount_nanos) = gateway
+                    .legacy_spend_floor(&identity.tenant, window_secs)
+                    .await?;
+                policy_scope.set_legacy_spend_floor(window_index, amount_nanos);
+            }
+        }
+        Ok(policy_scope)
+    }
+
     fn prepare_submission(
         &self,
         req: GatewayRequest,
@@ -605,7 +628,10 @@ async fn chat(
             &gw.payload,
         )
     });
-    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(identity);
+    let policy_scope = state
+        .trusted_policy_scope(identity)
+        .await
+        .map_err(|error| gateway_err_to_api(&state, error))?;
     let prepared_submission = state
         .prepare_submission(gw, policy_scope, false)
         .map_err(|error| gateway_err_to_api(&state, error))?;
@@ -669,7 +695,10 @@ async fn chat_stream_inner(
             Err(e) => return e.into_response(),
         };
     let identity = identified_caller.identity;
-    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
+    let policy_scope = match state.trusted_policy_scope(&identity).await {
+        Ok(scope) => scope,
+        Err(error) => return gateway_err_to_api(&state, error).into_response(),
+    };
     let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {
         Ok(prepared) => prepared,
         Err(error) => return gateway_err_to_api(&state, error).into_response(),
@@ -1414,6 +1443,77 @@ mod native_tests {
             .unwrap();
         assert_eq!(tenant_b_replay.headers()["idempotency-replayed"], "true");
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn authenticated_scope_imports_legacy_spend_without_serializing_the_tenant() {
+        use redis::AsyncCommands;
+
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let tenant = format!("legacy-http-{}", uuid::Uuid::new_v4());
+        let window_secs = 3_600;
+        let config = GatewayConfig::default();
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::redis(
+            &redis_url,
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        )
+        .unwrap();
+        let gateway = crate::gateway::distributed::DistributedGateway::connect_with_coordinator(
+            &redis_url,
+            Arc::new(CountingDispatch {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
+                crate::proxy::ratelimit::RateLimitConfig::default(),
+            )),
+            config.clone(),
+            attempt_coordinator.clone(),
+        )
+        .await
+        .unwrap();
+        let identity = crate::gateway::auth::Identity {
+            tenant: tenant.clone(),
+            tier: 1,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(1.0),
+            budget_window_secs: Some(window_secs),
+            budget_allow_unpriced: false,
+        };
+        let mut connection = gateway.connection_for_test();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_index = redis_time.0 / window_secs;
+        let legacy_key = format!("llmshim:spend:{tenant}:{window_index}");
+        let _: () = connection.set(&legacy_key, "0.00000005").await.unwrap();
+        let state = GatewayState {
+            router: Arc::new(Router::new()),
+            backend: Backend::Distributed(gateway),
+            keystore: crate::gateway::auth::KeyStore::Open,
+            attempt_coordinator,
+            idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
+                30,
+            )),
+            idempotency_ttl_secs: 30,
+            prequeue_backpressure: Backpressure::new(
+                config.max_concurrency_per_provider,
+                config.max_wait,
+            ),
+            overloaded_retry_after: config.overloaded_retry_after,
+        };
+        let serialized =
+            serde_json::to_string(&state.trusted_policy_scope(&identity).await.unwrap()).unwrap();
+        assert!(!serialized.contains(&tenant));
+        let value: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["legacy_spend_floor"]["window_index"], window_index);
+        assert_eq!(value["legacy_spend_floor"]["amount_nanos"], 50);
+        let _: i64 = connection.del(legacy_key).await.unwrap();
     }
 
     #[tokio::test]

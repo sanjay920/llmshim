@@ -87,6 +87,17 @@ pub(crate) fn observed_cost_nanos(usage: &Value) -> Option<u64> {
     Some(scaled.ceil() as u64)
 }
 
+#[cfg(feature = "redis-coordination")]
+pub(crate) fn legacy_spend_nanos(cost_usd: f64) -> Option<u64> {
+    if !cost_usd.is_finite() || cost_usd < 0.0 {
+        return None;
+    }
+    if cost_usd >= MAX_EXACT_REDIS_NANOS as f64 / NANOS_PER_USD {
+        return Some(MAX_EXACT_REDIS_NANOS);
+    }
+    Some((cost_usd * NANOS_PER_USD).ceil() as u64)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpendAuthority {
     Catalog,
@@ -681,5 +692,15 @@ output = 3
             observed_cost_nanos(&serde_json::json!({"cost_usd": f64::MAX})),
             Some(MAX_EXACT_REDIS_NANOS)
         );
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[test]
+    fn legacy_spend_conversion_rounds_up_saturates_and_rejects_invalid_values() {
+        assert_eq!(legacy_spend_nanos(0.000_000_001), Some(1));
+        assert_eq!(legacy_spend_nanos(0.000_000_001_1), Some(2));
+        assert_eq!(legacy_spend_nanos(f64::MAX), Some(MAX_EXACT_REDIS_NANOS));
+        assert_eq!(legacy_spend_nanos(-1.0), None);
+        assert_eq!(legacy_spend_nanos(f64::NAN), None);
     }
 }
