@@ -38,6 +38,8 @@ const DEFAULT_QUEUE_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PENALTY_SECS: u64 = 5;
 /// Assumed output size when a request specifies no `max_tokens`, for TPM estimation.
 const DEFAULT_MAX_TOKENS_ESTIMATE: u64 = 1024;
+/// Retry hint for an explicit zero limit, which is a permanent policy denial.
+const ZERO_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 // ===========================================================================
 // RateKey
@@ -126,10 +128,19 @@ impl TokenBucket {
     /// A bucket sized from a per-minute rate (RPM/TPM): capacity == `per_minute`
     /// (burst), refilling at `per_minute / 60` per second. Starts full.
     fn from_per_minute(per_minute: f64, now: Instant) -> Self {
+        let capacity = if per_minute == 0.0 {
+            0.0
+        } else {
+            per_minute.max(1.0)
+        };
         Self {
-            capacity: per_minute.max(1.0),
-            refill_per_sec: (per_minute / 60.0).max(f64::MIN_POSITIVE),
-            tokens: per_minute.max(1.0),
+            capacity,
+            refill_per_sec: if per_minute == 0.0 {
+                0.0
+            } else {
+                (per_minute / 60.0).max(f64::MIN_POSITIVE)
+            },
+            tokens: capacity,
             last: now,
             penalty_until: None,
         }
@@ -157,6 +168,9 @@ impl TokenBucket {
         if self.tokens + 1e-9 >= permits {
             Ok(())
         } else {
+            if self.refill_per_sec <= 0.0 {
+                return Err(ZERO_LIMIT_RETRY_AFTER);
+            }
             let deficit = permits - self.tokens;
             Err(Duration::from_secs_f64(deficit / self.refill_per_sec))
         }
@@ -249,6 +263,10 @@ pub struct ProviderLimit {
 impl ProviderLimit {
     fn is_unlimited(&self) -> bool {
         self.rpm.is_none() && self.tpm.is_none()
+    }
+
+    fn has_zero_limit(&self) -> bool {
+        self.rpm == Some(0) || self.tpm == Some(0)
     }
 }
 
@@ -359,6 +377,9 @@ impl RateLimiter for InMemoryRateLimiter {
         if limit.is_unlimited() {
             return Ok(()); // no-op when unconfigured
         }
+        if limit.has_zero_limit() {
+            return Err(RetryAfter(ZERO_LIMIT_RETRY_AFTER));
+        }
         let now = Instant::now();
         let mut map = self.buckets.lock().await;
         let entry = map
@@ -371,7 +392,7 @@ impl RateLimiter for InMemoryRateLimiter {
 
     async fn penalize(&self, key: &RateKey, retry_after: Duration) {
         let limit = self.config.resolve(&key.provider);
-        if limit.is_unlimited() {
+        if limit.is_unlimited() || limit.has_zero_limit() {
             return;
         }
         let now = Instant::now();
@@ -493,6 +514,9 @@ mod redis_impl {
             per_minute: u32,
             want: f64,
         ) -> redis::RedisResult<Option<Duration>> {
+            if per_minute == 0 {
+                return Ok(Some(ZERO_LIMIT_RETRY_AFTER));
+            }
             let cap = (per_minute as f64).max(1.0);
             let refill = (per_minute as f64 / 60.0).max(f64::MIN_POSITIVE);
             let now_ms = now_ms();
@@ -520,6 +544,9 @@ mod redis_impl {
             let limit = self.config.resolve(&key.provider);
             if limit.is_unlimited() {
                 return Ok(());
+            }
+            if limit.has_zero_limit() {
+                return Err(RetryAfter(ZERO_LIMIT_RETRY_AFTER));
             }
             let mut conn = match self.connection().await {
                 Ok(c) => c,
@@ -560,7 +587,7 @@ mod redis_impl {
 
         async fn penalize(&self, key: &RateKey, retry_after: Duration) {
             let limit = self.config.resolve(&key.provider);
-            if limit.is_unlimited() {
+            if limit.is_unlimited() || limit.has_zero_limit() {
                 return;
             }
             let mut conn = match self.connection().await {
@@ -834,6 +861,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn zero_bucket_rejects_with_finite_wait_without_panicking() {
+        let now = Instant::now();
+        let bucket = TokenBucket::from_per_minute(0.0, now);
+        assert_eq!(
+            bucket.check(1.0, now),
+            Err(ZERO_LIMIT_RETRY_AFTER),
+            "zero refill must be a finite policy rejection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn penalize_backs_off_globally() {
         let now = Instant::now();
         let mut b = TokenBucket::from_per_minute(600.0, now); // plenty of tokens
@@ -951,6 +989,61 @@ mod tests {
         // After a virtual minute, the bucket has refilled.
         tokio::time::advance(secs(60.0)).await;
         assert!(limiter.acquire(&key, 1).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inmemory_zero_rpm_or_tpm_rejects_without_partial_debit() {
+        for limit in [
+            ProviderLimit {
+                rpm: Some(0),
+                tpm: Some(100),
+            },
+            ProviderLimit {
+                rpm: Some(100),
+                tpm: Some(0),
+            },
+        ] {
+            for config in [
+                RateLimitConfig {
+                    global: limit,
+                    per_provider: HashMap::new(),
+                },
+                RateLimitConfig {
+                    global: ProviderLimit {
+                        rpm: Some(100),
+                        tpm: Some(100),
+                    },
+                    per_provider: HashMap::from([(String::from("openai"), limit)]),
+                },
+            ] {
+                let limiter = InMemoryRateLimiter::new(config);
+                let key = RateKey::provider("openai");
+
+                for _ in 0..100 {
+                    let error = limiter.acquire(&key, 1).await.unwrap_err();
+                    assert_eq!(error.0, ZERO_LIMIT_RETRY_AFTER);
+                }
+                assert!(
+                    limiter.buckets.lock().await.is_empty(),
+                    "zero limit must reject before creating or charging buckets"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    async fn redis_zero_limit_rejects_before_connecting_or_debiting() {
+        let limiter = RedisRateLimiter::new(
+            "redis://127.0.0.1:65535",
+            RateLimitConfig::with_global(Some(100), Some(0)),
+        )
+        .expect("valid Redis URL");
+        let error = limiter
+            .acquire(&RateKey::provider("openai"), 1)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, ZERO_LIMIT_RETRY_AFTER);
     }
 
     #[tokio::test(start_paused = true)]
