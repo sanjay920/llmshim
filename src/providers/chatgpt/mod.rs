@@ -79,6 +79,8 @@ impl ChatGpt {
 
     fn request(&self, model: &str, request: &Value, tokens: Tokens) -> Result<ProviderRequest> {
         // Isolate ChatGPT's native namespace from API-key OpenAI extensions.
+        let mut schema_budget = crate::schema::RequestBudget::new();
+        schema_budget.reserve_request_schemas(request)?;
         let mut input = request.clone();
         crate::reasoning::sanitize_extensions(&mut input);
         let obj = input
@@ -106,7 +108,12 @@ impl ChatGpt {
             crate::reasoning::WireFormat::OpenAiResponses,
         )
         .bind_account(&self.base_url, tokens.account_id.as_deref());
-        let mut req = translator().transform_request_for_target(model, &input, &target)?;
+        let mut req = translator().transform_request_for_target_with_budget(
+            model,
+            &input,
+            &target,
+            &mut schema_budget,
+        )?;
         let body = req.body.as_object_mut().unwrap();
         if let Some(ext) = request.get("x-chatgpt").and_then(Value::as_object) {
             body.extend(ext.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -156,12 +163,14 @@ impl ChatGpt {
         crate::schema::normalize_native_tools(
             crate::schema::Target::OpenAiResponses,
             &mut req.body,
-        );
+            &mut schema_budget,
+        )?;
         crate::shim::native_format(
             request,
             crate::reasoning::WireFormat::OpenAiResponses,
             &mut req.body,
-        );
+            &mut schema_budget,
+        )?;
         crate::cache::finish_request(
             request,
             &mut req.body,

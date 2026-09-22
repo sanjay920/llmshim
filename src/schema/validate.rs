@@ -1,6 +1,7 @@
 //! Instance validation never retrieves a network or filesystem resource.
 use crate::error::{Result, ShimError};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 struct NoExternal;
 impl jsonschema::Retrieve for NoExternal {
@@ -62,6 +63,72 @@ pub fn errors(validator: &jsonschema::Validator, value: &Value) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Default)]
+pub(crate) enum OptionalOmissions {
+    Object(BTreeMap<String, OptionalProperty>),
+    Array(Box<OptionalOmissions>),
+    #[default]
+    None,
+}
+
+#[derive(Debug)]
+pub(crate) struct OptionalProperty {
+    omit_null: bool,
+    nested: OptionalOmissions,
+}
+
+impl OptionalOmissions {
+    pub(crate) fn compile(schema: &Value, budget: &mut super::RequestBudget) -> Result<Self> {
+        if let Some(properties) = schema["properties"].as_object() {
+            let mut planned_properties = BTreeMap::new();
+            for (name, property_schema) in properties {
+                let required = schema["required"]
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|required_name| required_name == name));
+                let omit_null = if required {
+                    false
+                } else {
+                    budget.reserve_validator(property_schema)?;
+                    compile(property_schema)
+                        .is_ok_and(|validator| !validator.is_valid(&Value::Null))
+                };
+                planned_properties.insert(
+                    name.clone(),
+                    OptionalProperty {
+                        omit_null,
+                        nested: Self::compile(property_schema, budget)?,
+                    },
+                );
+            }
+            Ok(Self::Object(planned_properties))
+        } else if let Some(item_schema) = schema.get("items").filter(|value| value.is_object()) {
+            Ok(Self::Array(Box::new(Self::compile(item_schema, budget)?)))
+        } else {
+            Ok(Self::None)
+        }
+    }
+
+    pub(crate) fn restore(&self, value: &mut Value) {
+        match (self, value) {
+            (Self::Object(properties), Value::Object(object)) => {
+                for (name, property) in properties {
+                    if property.omit_null && object.get(name) == Some(&Value::Null) {
+                        object.remove(name);
+                    } else if let Some(value) = object.get_mut(name) {
+                        property.nested.restore(value);
+                    }
+                }
+            }
+            (Self::Array(item_plan), Value::Array(items)) => {
+                for item in items {
+                    item_plan.restore(item);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Strict transports represent absent optional values as null. Restore omission
 /// only where the original property schema forbids null; explicit nulls survive.
 pub fn restore_optional_omissions(schema: &Value, value: &mut Value) {
@@ -71,7 +138,7 @@ pub fn restore_optional_omissions(schema: &Value, value: &mut Value) {
         for (name, property) in properties {
             let required = schema["required"]
                 .as_array()
-                .is_some_and(|a| a.iter().any(|n| n == name));
+                .is_some_and(|names| names.iter().any(|required_name| required_name == name));
             let omit = !required
                 && object.get(name) == Some(&Value::Null)
                 && compile(property).is_ok_and(|validator| !validator.is_valid(&Value::Null));
@@ -82,9 +149,9 @@ pub fn restore_optional_omissions(schema: &Value, value: &mut Value) {
             }
         }
     } else if let Some(items) = value.as_array_mut() {
-        if let Some(schema) = schema.get("items").filter(|s| s.is_object()) {
+        if let Some(item_schema) = schema.get("items").filter(|value| value.is_object()) {
             for value in items {
-                restore_optional_omissions(schema, value);
+                restore_optional_omissions(item_schema, value);
             }
         }
     }

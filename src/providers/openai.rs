@@ -554,7 +554,18 @@ impl OpenAi {
         request: &Value,
         target: &crate::reasoning::ReplayTarget,
     ) -> Result<ProviderRequest> {
-        let request = crate::schema::prepare_request(request);
+        let mut schema_budget = crate::schema::RequestBudget::new();
+        self.transform_request_for_target_with_budget(model, request, target, &mut schema_budget)
+    }
+
+    pub(crate) fn transform_request_for_target_with_budget(
+        &self,
+        model: &str,
+        request: &Value,
+        target: &crate::reasoning::ReplayTarget,
+        schema_budget: &mut crate::schema::RequestBudget,
+    ) -> Result<ProviderRequest> {
+        let request = crate::schema::prepare_request(request, schema_budget)?;
         let request = crate::cache::prepare_request(&request, target.wire)?;
         let request = crate::reasoning::prepare_request(&request, target);
         let request = crate::toolcall::prepare_request(&request, target)?;
@@ -698,12 +709,17 @@ impl OpenAi {
 
         crate::reasoning::enforce_stateless(&mut body)?;
         crate::toolcall::validate_native(&body, target)?;
-        crate::schema::normalize_native_tools(crate::schema::Target::OpenAiResponses, &mut body);
+        crate::schema::normalize_native_tools(
+            crate::schema::Target::OpenAiResponses,
+            &mut body,
+            schema_budget,
+        )?;
         crate::shim::native_format(
             &request,
             crate::reasoning::WireFormat::OpenAiResponses,
             &mut body,
-        );
+            schema_budget,
+        )?;
         crate::cache::finish_request(
             &request,
             &mut body,
