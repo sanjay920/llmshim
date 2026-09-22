@@ -293,3 +293,47 @@ async fn derived_refusal_does_not_dispatch_a_structured_output_repair() {
     );
     upstream.assert_async().await;
 }
+
+#[tokio::test]
+async fn public_completion_rejects_a_native_signature_object_with_malformed_origin() {
+    let mut server = mockito::Server::new_async().await;
+    let body = json!({
+        "id":"malformed-signature",
+        "choices":[{
+            "index":0,
+            "message":{
+                "role":"assistant",
+                "content":null,
+                "tool_calls":[{
+                    "id":"native-call",
+                    "type":"function",
+                    "function":{"name":"read","arguments":"{}"},
+                    "thought_signature":{"data":"opaque","origin":[]}
+                }]
+            },
+            "finish_reason":"tool_calls"
+        }],
+        "usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+    });
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_body(body.to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let request = json!({
+        "model":"vllm/model",
+        "messages":[{"role":"user","content":"test"}]
+    });
+
+    let error = llmshim::completion(&router(&server.url()), &request)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        llmshim::error::ShimError::ProviderError { status: 502, ref body, .. }
+            if body == DERIVED_RESPONSE_ERROR
+    ));
+    upstream.assert_async().await;
+}
