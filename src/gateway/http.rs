@@ -55,7 +55,15 @@ pub struct RealDispatch {
 }
 
 impl RealDispatch {
-    fn map_err(err: ShimError) -> DispatchError {
+    fn map_err(
+        err: ShimError,
+        refusal: Option<crate::policy::AttemptPolicyRefusal>,
+    ) -> DispatchError {
+        if refusal.is_some_and(|refusal| {
+            refusal.kind() == crate::policy::AttemptPolicyRefusalKind::Unpriceable
+        }) {
+            return DispatchError::new("llmshim-unpriceable-under-budget");
+        }
         match err {
             ShimError::ProviderError {
                 status: 429,
@@ -89,7 +97,7 @@ impl Dispatch for RealDispatch {
     async fn dispatch(&self, _provider: &str, payload: Value) -> Result<Value, DispatchError> {
         crate::completion_with_logger(self.router.as_ref(), &payload, self.logger.as_ref())
             .await
-            .map_err(Self::map_err)
+            .map_err(|error| Self::map_err(error, None))
     }
 
     async fn dispatch_with_policy(
@@ -98,14 +106,15 @@ impl Dispatch for RealDispatch {
         payload: Value,
         policy_context: crate::policy::DispatchPolicyContext,
     ) -> Result<Value, DispatchError> {
-        crate::completion_with_logger_and_policy(
+        let result = crate::completion_with_logger_and_policy(
             self.router.as_ref(),
             &payload,
             self.logger.as_ref(),
             &policy_context,
         )
-        .await
-        .map_err(Self::map_err)
+        .await;
+        let refusal = policy_context.take_last_refusal();
+        result.map_err(|error| Self::map_err(error, refusal))
     }
 
     async fn dispatch_stream(
@@ -115,7 +124,7 @@ impl Dispatch for RealDispatch {
     ) -> Result<ChunkStream, DispatchError> {
         let upstream = crate::stream(self.router.as_ref(), &payload)
             .await
-            .map_err(Self::map_err)?;
+            .map_err(|error| Self::map_err(error, None))?;
         // Map raw ShimError chunks → GatewayError so the channel type is stable.
         let mapped = upstream.map(|item| item.map_err(|e| GatewayError::Upstream(e.to_string())));
         Ok(Box::pin(mapped))
@@ -127,9 +136,10 @@ impl Dispatch for RealDispatch {
         payload: Value,
         policy_context: crate::policy::DispatchPolicyContext,
     ) -> Result<ChunkStream, DispatchError> {
-        let upstream = crate::stream_with_policy(self.router.as_ref(), &payload, &policy_context)
-            .await
-            .map_err(Self::map_err)?;
+        let opened =
+            crate::stream_with_policy(self.router.as_ref(), &payload, &policy_context).await;
+        let refusal = policy_context.take_last_refusal();
+        let upstream = opened.map_err(|error| Self::map_err(error, refusal))?;
         let mapped = upstream.map(|item| item.map_err(|e| GatewayError::Upstream(e.to_string())));
         Ok(Box::pin(mapped))
     }
@@ -158,8 +168,6 @@ pub struct GatewayState {
     backend: Backend,
     keystore: crate::gateway::auth::KeyStore,
     attempt_coordinator: Arc<crate::gateway::attempt::AttemptCoordinator>,
-    /// Per-identity USD cap, checked before dispatch and charged after.
-    spend: crate::gateway::quota::SpendCap,
     idempotency: crate::gateway::idempotency::IdempotencyCache,
     #[cfg_attr(not(feature = "redis-coordination"), allow(dead_code))]
     idempotency_ttl_secs: u64,
@@ -191,7 +199,6 @@ impl GatewayState {
             backend: Backend::Local(scheduler),
             keystore: crate::gateway::auth::KeyStore::from_env(),
             attempt_coordinator,
-            spend: crate::gateway::quota::SpendCap::in_memory(),
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(
                 std::time::Duration::from_secs(idem_ttl_secs()),
             ),
@@ -243,15 +250,11 @@ impl GatewayState {
             .map(String::from)
             .collect();
         gateway.spawn_workers(providers);
-        // Spend is shared through the same Redis the queue uses, so a dollar
-        // cap means the same thing on every replica.
-        let spend = crate::gateway::quota::SpendCap::with_store(gateway.clone());
         Ok(Arc::new(Self {
             router,
             backend: Backend::Distributed(gateway),
             keystore: crate::gateway::auth::KeyStore::from_env(),
             attempt_coordinator,
-            spend,
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(
                 std::time::Duration::from_secs(idem_ttl_secs()),
             ),
@@ -262,6 +265,28 @@ impl GatewayState {
             ),
             overloaded_retry_after: config.overloaded_retry_after,
         }))
+    }
+
+    async fn trusted_policy_scope(
+        &self,
+        identity: &crate::gateway::auth::Identity,
+    ) -> Result<crate::gateway::attempt::TrustedPolicyScope, GatewayError> {
+        let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(identity);
+        #[cfg(feature = "redis-coordination")]
+        let mut policy_scope = policy_scope;
+        #[cfg(feature = "redis-coordination")]
+        if identity.budget_usd.is_some() {
+            if let Backend::Distributed(gateway) = &self.backend {
+                let _ = gateway;
+                self.attempt_coordinator
+                    .retain_legacy_spend_floor(&identity.tenant, &mut policy_scope)
+                    .await
+                    .map_err(|_| {
+                        GatewayError::Upstream("llmshim-coordinator-unavailable".into())
+                    })?;
+            }
+        }
+        Ok(policy_scope)
     }
 
     fn prepare_submission(
@@ -447,68 +472,6 @@ impl GatewayState {
     }
 }
 
-impl GatewayState {
-    /// Reject a caller that has already spent its window's budget. Dollars are
-    /// fungible across providers, so the ledger is keyed by tenant alone.
-    async fn enforce_budget(
-        &self,
-        identity: &crate::gateway::auth::Identity,
-        provider: &str,
-        model: &str,
-    ) -> Result<(), ApiError> {
-        use crate::gateway::quota::BudgetRefusal;
-        match self.spend.check(identity, provider, model).await {
-            Ok(()) => {
-                // An operator who opted in still gets told, every time. An
-                // accepted risk that stops being visible becomes an assumption.
-                if crate::gateway::quota::SpendCap::is_unpriced_under_cap(identity, provider, model)
-                {
-                    crate::gateway::metrics::incr(
-                        crate::gateway::metrics::UNPRICED_UNDER_CAP,
-                        &[("provider", provider), ("model", model)],
-                    );
-                    eprintln!(
-                        "gateway: tenant {} running {provider}/{model} unpriced under a spend \
-                         cap; this spend is NOT charged against the budget \
-                         (budget_allow_unpriced is set)",
-                        identity.tenant
-                    );
-                }
-                Ok(())
-            }
-            Err(BudgetRefusal::Exhausted(retry)) => {
-                crate::gateway::metrics::incr(
-                    crate::gateway::metrics::REJECTED,
-                    &[("provider", provider), ("reason", "tenant_budget")],
-                );
-                Err(ApiError::RateLimited(retry))
-            }
-            Err(BudgetRefusal::Unpriceable) => {
-                crate::gateway::metrics::incr(
-                    crate::gateway::metrics::REJECTED,
-                    &[
-                        ("provider", provider),
-                        ("reason", "unpriceable_under_budget"),
-                    ],
-                );
-                // Not a 429: retrying never clears this. The catalog has no
-                // price for the target, so the cap cannot be enforced against it.
-                Err(ApiError::Shim(crate::error::ShimError::ProviderError {
-                    status: 400,
-                    body: format!(
-                        "{{\"error\":{{\"message\":\"no catalog price for '{provider}/{model}', \
-                         so it cannot be charged against this key's spend budget. Use a priced \
-                         model, add a local price override, or set budget_allow_unpriced on the \
-                         key to run it uncharged.\",\"type\":\"invalid_request_error\",\
-                         \"param\":\"model\",\"code\":\"unpriceable_under_budget\"}}}}"
-                    ),
-                    retry_after: None,
-                }))
-            }
-        }
-    }
-}
-
 /// Idempotency cache TTL (seconds) from the environment (default 300).
 fn idem_ttl_secs() -> u64 {
     std::env::var("LLMSHIM_GATEWAY_IDEMPOTENCY_TTL_SECS")
@@ -611,6 +574,21 @@ fn gateway_err_to_api(state: &GatewayState, err: GatewayError) -> ApiError {
                 retry_after: None,
             })
         }
+        GatewayError::Upstream(message) if message == "llmshim-unpriceable-under-budget" => {
+            ApiError::from(ShimError::ProviderError {
+                status: 400,
+                body: json!({
+                    "error": {
+                        "message": "the selected request has no enforceable spend bound",
+                        "type": "invalid_request_error",
+                        "param": "model",
+                        "code": "unpriceable_under_budget"
+                    }
+                })
+                .to_string(),
+                retry_after: None,
+            })
+        }
         GatewayError::Upstream(message) => ApiError::from(ShimError::ProviderError {
             status: 502,
             body: message,
@@ -637,7 +615,7 @@ async fn chat(
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let (provider_name, budget_model, gw, identified_caller) =
+    let (provider_name, _budget_model, gw, identified_caller) =
         build_request(&state, &headers, &req)?;
     let identity = &identified_caller.identity;
     let idempotency_context = idem_key.as_ref().map(|client_key| {
@@ -649,14 +627,13 @@ async fn chat(
             &gw.payload,
         )
     });
-    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(identity);
+    let policy_scope = state
+        .trusted_policy_scope(identity)
+        .await
+        .map_err(|error| gateway_err_to_api(&state, error))?;
     let prepared_submission = state
         .prepare_submission(gw, policy_scope, false)
         .map_err(|error| gateway_err_to_api(&state, error))?;
-
-    state
-        .enforce_budget(identity, &provider_name, &budget_model)
-        .await?;
 
     // Retry-safety: a repeated Idempotency-Key returns the first result.
     if let Some(context) = &idempotency_context {
@@ -684,10 +661,6 @@ async fn chat(
             if let Some(context) = &idempotency_context {
                 state.idem_store(context, &resp).await;
             }
-            state
-                .spend
-                .record(identity, crate::cost::stamped(&resp["usage"]))
-                .await;
             let elapsed = timer.elapsed().as_millis() as u64;
             Ok(Json(value_to_response(&resp, &provider_name, elapsed)).into_response())
         }
@@ -715,23 +688,20 @@ async fn chat_stream_inner(
     req: ChatRequest,
     prequeue_permit: PrequeuePreparationPermit,
 ) -> Response {
-    let (provider_name, budget_model, gw, identified_caller) =
+    let (_provider_name, _budget_model, gw, identified_caller) =
         match build_request(&state, &headers, &req) {
             Ok(t) => t,
             Err(e) => return e.into_response(),
         };
     let identity = identified_caller.identity;
-    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
+    let policy_scope = match state.trusted_policy_scope(&identity).await {
+        Ok(scope) => scope,
+        Err(error) => return gateway_err_to_api(&state, error).into_response(),
+    };
     let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {
         Ok(prepared) => prepared,
         Err(error) => return gateway_err_to_api(&state, error).into_response(),
     };
-    if let Err(e) = state
-        .enforce_budget(&identity, &provider_name, &budget_model)
-        .await
-    {
-        return e.into_response();
-    }
     // Admission (queue + rate) happens up front so a rejection is a proper
     // 429/503 before the SSE response begins, not an SSE error event.
     let mut rx = match state
@@ -742,16 +712,11 @@ async fn chat_stream_inner(
         Err(err) => return gateway_err_to_api(&state, err).into_response(),
     };
 
-    let ledger = state.clone();
     let event_stream = async_stream::stream! {
         while let Some(item) = rx.recv().await {
             match item {
                 Ok(chunk) => {
                     for event in chunk_to_events(&chunk) {
-                        // A stream's cost arrives with its terminal usage event.
-                        if let crate::proxy::types::StreamEvent::Usage(usage) = &event {
-                            ledger.spend.record(&identity, usage.cost_usd).await;
-                        }
                         let event_type = stream_event_type(&event);
                         if let Ok(data) = serde_json::to_string(&event) {
                             yield Ok(Event::default().event(event_type).data(data));
@@ -1063,6 +1028,38 @@ mod native_tests {
         requests_per_minute: Option<u32>,
         tokens_per_minute: Option<u32>,
     ) -> Arc<GatewayState> {
+        configured_state_with_router_and_identity(
+            router,
+            crate::gateway::auth::Identity {
+                tenant: "test-tenant".into(),
+                tier: 1,
+                rpm: requests_per_minute,
+                tpm: tokens_per_minute,
+                budget_usd: None,
+                budget_window_secs: None,
+                budget_allow_unpriced: false,
+            },
+        )
+    }
+
+    fn configured_state_with_router_and_identity(
+        router: Router,
+        identity: crate::gateway::auth::Identity,
+    ) -> Arc<GatewayState> {
+        let config = GatewayConfig::default();
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local(
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        );
+        configured_state_with_router_identity_and_coordinator(router, identity, attempt_coordinator)
+    }
+
+    fn configured_state_with_router_identity_and_coordinator(
+        router: Router,
+        identity: crate::gateway::auth::Identity,
+        attempt_coordinator: Arc<crate::gateway::attempt::AttemptCoordinator>,
+    ) -> Arc<GatewayState> {
         let router = Arc::new(router);
         let config = GatewayConfig::default();
         let limiter = Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
@@ -1076,30 +1073,15 @@ mod native_tests {
                 logger: None,
             }),
         );
-        let identity = crate::gateway::auth::Identity {
-            tenant: "test-tenant".into(),
-            tier: 1,
-            rpm: requests_per_minute,
-            tpm: tokens_per_minute,
-            budget_usd: None,
-            budget_window_secs: None,
-            budget_allow_unpriced: false,
-        };
         let keys = std::collections::HashMap::from([
             ("test-key".into(), identity.clone()),
             ("second-key".into(), identity),
         ]);
-        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local(
-            crate::proxy::ratelimit::RateLimitConfig::default(),
-            config.max_concurrency_per_provider,
-            config.max_wait,
-        );
         Arc::new(GatewayState {
             router,
             backend: Backend::Local(scheduler),
             keystore: crate::gateway::auth::KeyStore::enforced(keys),
             attempt_coordinator,
-            spend: crate::gateway::quota::SpendCap::in_memory(),
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
                 30,
             )),
@@ -1149,7 +1131,6 @@ mod native_tests {
                 ("test-key".into(), identity),
             ])),
             attempt_coordinator,
-            spend: crate::gateway::quota::SpendCap::in_memory(),
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
                 30,
             )),
@@ -1342,7 +1323,6 @@ mod native_tests {
                 ("reassigned-key".into(), identity),
             ])),
             attempt_coordinator,
-            spend: crate::gateway::quota::SpendCap::with_store(gateway),
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
                 30,
             )),
@@ -1462,6 +1442,251 @@ mod native_tests {
             .unwrap();
         assert_eq!(tenant_b_replay.headers()["idempotency-replayed"], "true");
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn authenticated_scope_imports_legacy_spend_without_serializing_the_tenant() {
+        use redis::AsyncCommands;
+
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let tenant = format!("legacy-http-{}", uuid::Uuid::new_v4());
+        let window_secs = 3_600;
+        let config = GatewayConfig::default();
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::redis(
+            &redis_url,
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        )
+        .unwrap();
+        let gateway = crate::gateway::distributed::DistributedGateway::connect_with_coordinator(
+            &redis_url,
+            Arc::new(CountingDispatch {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+            Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
+                crate::proxy::ratelimit::RateLimitConfig::default(),
+            )),
+            config.clone(),
+            attempt_coordinator.clone(),
+        )
+        .await
+        .unwrap();
+        let identity = crate::gateway::auth::Identity {
+            tenant: tenant.clone(),
+            tier: 1,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(1.0),
+            budget_window_secs: Some(window_secs),
+            budget_allow_unpriced: false,
+        };
+        let mut connection = gateway.connection_for_test();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_index = redis_time.0 / window_secs;
+        let legacy_key = format!("llmshim:spend:{tenant}:{window_index}");
+        let _: () = connection.set(&legacy_key, "0.00000005").await.unwrap();
+        let state = GatewayState {
+            router: Arc::new(Router::new()),
+            backend: Backend::Distributed(gateway),
+            keystore: crate::gateway::auth::KeyStore::Open,
+            attempt_coordinator,
+            idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
+                30,
+            )),
+            idempotency_ttl_secs: 30,
+            prequeue_backpressure: Backpressure::new(
+                config.max_concurrency_per_provider,
+                config.max_wait,
+            ),
+            overloaded_retry_after: config.overloaded_retry_after,
+        };
+        let serialized =
+            serde_json::to_string(&state.trusted_policy_scope(&identity).await.unwrap()).unwrap();
+        assert!(!serialized.contains(&tenant));
+        let value: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["legacy_spend_floor"]["window_index"], window_index);
+        assert_eq!(value["legacy_spend_floor"]["amount_nanos"], 50);
+        let tenant_key = value["tenant_key"].as_str().unwrap();
+        let known_floor_key = format!(
+            "llmshim:gw:budget:v1:{tenant_key}:{window_secs}:{window_index}:legacy-known-floor"
+        );
+        assert_eq!(
+            connection.get::<_, u64>(&known_floor_key).await.unwrap(),
+            50
+        );
+        let _: i64 = connection
+            .zrem(
+                crate::gateway::attempt::REDIS_ACCOUNTING_INDEX_KEY,
+                &known_floor_key,
+            )
+            .await
+            .unwrap();
+        let _: i64 = connection.del((legacy_key, known_floor_key)).await.unwrap();
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn authenticated_replay_retains_fresh_legacy_floor_without_new_attempt() {
+        use redis::AsyncCommands;
+        use sha2::Digest;
+
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let namespace = uuid::Uuid::new_v4();
+        let tenant = format!("origin-replay-{namespace}");
+        let provider_name = format!("origin-replay-{namespace}");
+        let router = Arc::new(Router::new().register(
+            &provider_name,
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                provider_name.clone(),
+                "http://127.0.0.1:1",
+                None,
+            )),
+        ));
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let config = GatewayConfig::default();
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::redis(
+            &redis_url,
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        )
+        .unwrap();
+        let gateway = crate::gateway::distributed::DistributedGateway::connect_with_coordinator(
+            &redis_url,
+            Arc::new(CountingDispatch {
+                calls: call_count.clone(),
+            }),
+            Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
+                crate::proxy::ratelimit::RateLimitConfig::default(),
+            )),
+            config.clone(),
+            attempt_coordinator.clone(),
+        )
+        .await
+        .unwrap();
+        gateway.spawn_workers(vec![provider_name.clone()]);
+        let identity = crate::gateway::auth::Identity {
+            tenant: tenant.clone(),
+            tier: 1,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(1.0),
+            budget_window_secs: Some(3_600),
+            budget_allow_unpriced: true,
+        };
+        let state = Arc::new(GatewayState {
+            router,
+            backend: Backend::Distributed(gateway.clone()),
+            keystore: crate::gateway::auth::KeyStore::enforced(std::collections::HashMap::from([
+                ("origin-key".into(), identity),
+            ])),
+            attempt_coordinator,
+            idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
+                30,
+            )),
+            idempotency_ttl_secs: 30,
+            prequeue_backpressure: Backpressure::new(
+                config.max_concurrency_per_provider,
+                config.max_wait,
+            ),
+            overloaded_retry_after: config.overloaded_retry_after,
+        });
+        let application = app(state);
+        let mut connection = gateway.connection_for_test();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_index = redis_time.0 / 3_600;
+        let legacy_key = format!("llmshim:spend:{tenant}:{window_index}");
+        let model = format!("{provider_name}/test");
+        let idempotency_key = format!("origin-replay-{namespace}");
+
+        let _: () = connection.set(&legacy_key, "0.00000005").await.unwrap();
+        let first_response = application
+            .clone()
+            .oneshot(canonical_request_for_model(
+                "origin-key",
+                &idempotency_key,
+                "same-request",
+                &model,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let tenant_key = format!("{:x}", sha2::Sha256::digest(tenant.as_bytes()));
+        let scoped_members_before_replay: Vec<String> = connection
+            .zrange(crate::gateway::attempt::REDIS_ACCOUNTING_INDEX_KEY, 0, -1)
+            .await
+            .unwrap();
+        let scoped_members_before_replay: Vec<String> = scoped_members_before_replay
+            .into_iter()
+            .filter(|member| member.contains(&tenant_key))
+            .collect();
+        assert_eq!(scoped_members_before_replay.len(), 1);
+
+        let _: () = connection.set(&legacy_key, "0.00000009").await.unwrap();
+        let replay_response = application
+            .oneshot(canonical_request_for_model(
+                "origin-key",
+                &idempotency_key,
+                "same-request",
+                &model,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        assert_eq!(replay_response.headers()["idempotency-replayed"], "true");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let total_key = format!("llmshim:gw:budget:v1:{tenant_key}:3600:{window_index}");
+        assert_eq!(
+            connection
+                .get::<_, u64>(format!("{total_key}:legacy-known-floor"))
+                .await
+                .unwrap(),
+            90
+        );
+        assert!(!connection.exists::<_, bool>(&total_key).await.unwrap());
+        assert!(!connection
+            .exists::<_, bool>(format!("{total_key}:legacy-floor"))
+            .await
+            .unwrap());
+        let scoped_members_after_replay: Vec<String> = connection
+            .zrange(crate::gateway::attempt::REDIS_ACCOUNTING_INDEX_KEY, 0, -1)
+            .await
+            .unwrap();
+        let scoped_members_after_replay: Vec<String> = scoped_members_after_replay
+            .into_iter()
+            .filter(|member| member.contains(&tenant_key))
+            .collect();
+        assert_eq!(scoped_members_after_replay, scoped_members_before_replay);
+
+        for member in scoped_members_after_replay {
+            let _: usize = connection
+                .zrem(crate::gateway::attempt::REDIS_ACCOUNTING_INDEX_KEY, &member)
+                .await
+                .unwrap();
+            let _: i64 = connection.del(member).await.unwrap();
+        }
+        let _: i64 = connection
+            .del((
+                legacy_key,
+                total_key.clone(),
+                format!("{total_key}:legacy-floor"),
+                format!("{total_key}:legacy-known-floor"),
+            ))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1584,6 +1809,927 @@ mod native_tests {
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "60");
+        upstream.assert_async().await;
+    }
+
+    fn budgeted_identity(limit_usd: f64, allow_unpriced: bool) -> crate::gateway::auth::Identity {
+        crate::gateway::auth::Identity {
+            tenant: format!("budget-test-{}", uuid::Uuid::new_v4()),
+            tier: 1,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(limit_usd),
+            budget_window_secs: Some(3600),
+            budget_allow_unpriced: allow_unpriced,
+        }
+    }
+
+    async fn assert_chat_stream_budget_finality(
+        events: Vec<Value>,
+        expected_second_status: StatusCode,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let mut stream_body = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        stream_body.push_str("data: [DONE]\n\n");
+        let expected_calls = usize::from(expected_second_status == StatusCode::OK) + 1;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_header("content-type", "text/event-stream")
+            .with_body(stream_body)
+            .expect(expected_calls)
+            .create_async()
+            .await;
+        let router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(server.url()),
+            ),
+        );
+        let application = app(configured_state_with_router_and_identity(
+            router,
+            budgeted_identity(10.0, false),
+        ));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/stream")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "openrouter/x-ai/grok-4.7",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let first = application.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = to_bytes(first.into_body(), 100_000).await.unwrap();
+        let second = application.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), expected_second_status);
+        if second.status() == StatusCode::OK {
+            let _ = to_bytes(second.into_body(), 100_000).await.unwrap();
+        }
+        upstream.assert_async().await;
+    }
+
+    async fn assert_gemini_stream_budget_finality(
+        events: Vec<Value>,
+        expected_second_status: StatusCode,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let stream_body = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let expected_calls = usize::from(expected_second_status == StatusCode::OK) + 1;
+        let upstream = server
+            .mock("POST", Matcher::Regex("/models/.*".into()))
+            .with_header("content-type", "text/event-stream")
+            .with_body(stream_body)
+            .expect(expected_calls)
+            .create_async()
+            .await;
+        let router = Router::new().register(
+            "gemini",
+            Box::new(
+                crate::providers::gemini::Gemini::new("test-key".into())
+                    .with_base_url(server.url()),
+            ),
+        );
+        let application = app(configured_state_with_router_and_identity(
+            router,
+            budgeted_identity(10.0, true),
+        ));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/stream")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini/gemini-3.8-flash",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let first = application.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = to_bytes(first.into_body(), 100_000).await.unwrap();
+        let second = application.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), expected_second_status);
+        if second.status() == StatusCode::OK {
+            let _ = to_bytes(second.into_body(), 100_000).await.unwrap();
+        }
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn budget_rejects_unknown_and_surcharged_requests_before_send() {
+        let mut unknown_server = mockito::Server::new_async().await;
+        let unknown_upstream = unknown_server
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let unknown_router = Router::new().register(
+            "local",
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                "local",
+                unknown_server.url(),
+                None,
+            )),
+        );
+        let unknown_response = app(configured_state_with_router_and_identity(
+            unknown_router,
+            budgeted_identity(100.0, false),
+        ))
+        .oneshot(refusal_request("/v1/chat", false))
+        .await
+        .unwrap();
+        assert_eq!(unknown_response.status(), StatusCode::BAD_REQUEST);
+        unknown_upstream.assert_async().await;
+
+        let mut surcharge_server = mockito::Server::new_async().await;
+        let surcharge_upstream = surcharge_server
+            .mock("POST", "/responses")
+            .expect(0)
+            .create_async()
+            .await;
+        let surcharge_router = Router::new().register(
+            "openai",
+            Box::new(
+                crate::providers::openai::OpenAi::new("test-key".into())
+                    .with_base_url(surcharge_server.url()),
+            ),
+        );
+        let surcharge_state = configured_state_with_router_and_identity(
+            surcharge_router,
+            budgeted_identity(100.0, false),
+        );
+        let unverified_response = app(surcharge_state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::from(
+                        json!({
+                            "model": "openai/gpt-5.6-luna",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unverified_response.status(), StatusCode::BAD_REQUEST);
+        let surcharge_request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-key")
+            .body(Body::from(
+                json!({
+                    "model": "openai/gpt-5.6-luna",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "provider_config": {"speed": "fast"}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let surcharge_response = app(surcharge_state)
+            .oneshot(surcharge_request)
+            .await
+            .unwrap();
+        assert_eq!(surcharge_response.status(), StatusCode::BAD_REQUEST);
+        surcharge_upstream.assert_async().await;
+
+        let mut cache_server = mockito::Server::new_async().await;
+        let cache_upstream = cache_server
+            .mock("POST", "/messages")
+            .expect(0)
+            .create_async()
+            .await;
+        let cache_router = Router::new().register(
+            "anthropic",
+            Box::new(
+                crate::providers::anthropic::Anthropic::new("test-key".into())
+                    .with_base_url(cache_server.url()),
+            ),
+        );
+        let cache_request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-key")
+            .body(Body::from(
+                json!({
+                    "model": "anthropic/claude-sonnet-4-6",
+                    "messages": [{
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": "hi",
+                            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                        }]
+                    }]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let cache_response = app(configured_state_with_router_and_identity(
+            cache_router,
+            budgeted_identity(100.0, false),
+        ))
+        .oneshot(cache_request)
+        .await
+        .unwrap();
+        assert_eq!(cache_response.status(), StatusCode::BAD_REQUEST);
+        cache_upstream.assert_async().await;
+
+        let mut openrouter_server = mockito::Server::new_async().await;
+        let openrouter_upstream = openrouter_server
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let openrouter_router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(openrouter_server.url()),
+            ),
+        );
+        let openrouter_state = configured_state_with_router_and_identity(
+            openrouter_router,
+            budgeted_identity(100.0, false),
+        );
+        for provider_config in [
+            json!({"n": 2}),
+            json!({"x-openrouter": {"route": "fallback"}}),
+        ] {
+            let response = app(openrouter_state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-key")
+                        .body(Body::from(
+                            json!({
+                                "model": "openrouter/x-ai/grok-4.7",
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "provider_config": provider_config
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let mutable_route = app(openrouter_state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::from(
+                        json!({
+                            "model": "openrouter/openrouter/free",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mutable_route.status(), StatusCode::BAD_REQUEST);
+        openrouter_upstream.assert_async().await;
+
+        let mut gemini_server = mockito::Server::new_async().await;
+        let gemini_upstream = gemini_server
+            .mock("POST", Matcher::Regex("/models/.*".into()))
+            .expect(0)
+            .create_async()
+            .await;
+        let gemini_router = Router::new().register(
+            "gemini",
+            Box::new(
+                crate::providers::gemini::Gemini::new("test-key".into())
+                    .with_base_url(gemini_server.url()),
+            ),
+        );
+        let gemini_response = app(configured_state_with_router_and_identity(
+            gemini_router,
+            budgeted_identity(100.0, false),
+        ))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini/gemini-3.8-flash",
+                        "messages": [{
+                            "role": "user",
+                            "content": [{
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AA=="}
+                            }]
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gemini_response.status(), StatusCode::BAD_REQUEST);
+        gemini_upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_repair_settles_both_provider_responses_before_502() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "response",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "1"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+                })
+                .to_string(),
+            )
+            .expect(2)
+            .create_async()
+            .await;
+        let router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(server.url()),
+            ),
+        );
+        let identity = budgeted_identity(100.0, false);
+        let scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
+        let state = configured_state_with_router_and_identity(router, identity);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-key")
+            .body(Body::from(
+                json!({
+                    "model": "openrouter/x-ai/grok-4.7",
+                    "messages": [{"role": "user", "content": "answer"}],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "answer",
+                            "schema": {"type": "integer", "minimum": 3}
+                        }
+                    },
+                    "x-shim": {"structured_output": "prompt"}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = app(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        upstream.assert_async().await;
+        let charged_nanos = state
+            .attempt_coordinator
+            .budget_total_for_test(&scope)
+            .await
+            .unwrap();
+        assert!(
+            charged_nanos > 0,
+            "known usage from both attempts is charged"
+        );
+        let one_attempt_usd = crate::cost::cost_usd(
+            "openrouter",
+            "x-ai/grok-4.7",
+            &json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}),
+        )
+        .unwrap();
+        assert_eq!(
+            charged_nanos,
+            (one_attempt_usd * 1_000_000_000.0).ceil() as u64 * 2
+        );
+    }
+
+    #[tokio::test]
+    async fn semaphore_wait_crossing_short_windows_quotes_at_actual_acquisition() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "response",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(server.url()),
+            ),
+        );
+        let mut identity = budgeted_identity(10.0, false);
+        identity.budget_window_secs = Some(1);
+        let coordinator = crate::gateway::attempt::AttemptCoordinator::local(
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            1,
+            Duration::from_secs(5),
+        );
+        let held = coordinator.hold_provider_for_test("openrouter").await;
+        let state =
+            configured_state_with_router_identity_and_coordinator(router, identity, coordinator);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "openrouter/x-ai/grok-4.7",
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let application = app(state);
+        let waiting = tokio::spawn(application.clone().oneshot(request()));
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        let subsecond = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_millis() as u64;
+        tokio::time::sleep(Duration::from_millis(1_020 - subsecond)).await;
+        drop(held);
+
+        let first = waiting.await.unwrap().unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = application.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_zero_releases_only_a_verified_bounded_quote() {
+        let response_body = json!({
+            "id": "response",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+        })
+        .to_string();
+        let request_for = |model: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let mut bounded_server = mockito::Server::new_async().await;
+        let bounded_upstream = bounded_server
+            .mock("POST", "/chat/completions")
+            .with_body(&response_body)
+            .expect(2)
+            .create_async()
+            .await;
+        let bounded_router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(bounded_server.url()),
+            ),
+        );
+        let bounded_application = app(configured_state_with_router_and_identity(
+            bounded_router,
+            budgeted_identity(10.0, false),
+        ));
+        for _ in 0..2 {
+            let response = bounded_application
+                .clone()
+                .oneshot(request_for("openrouter/x-ai/grok-4.7"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        bounded_upstream.assert_async().await;
+
+        let mut unpriced_server = mockito::Server::new_async().await;
+        let unpriced_upstream = unpriced_server
+            .mock("POST", "/chat/completions")
+            .with_body(response_body)
+            .expect(1)
+            .create_async()
+            .await;
+        let unpriced_router = Router::new().register(
+            "local",
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                "local",
+                unpriced_server.url(),
+                None,
+            )),
+        );
+        let unpriced_application = app(configured_state_with_router_and_identity(
+            unpriced_router,
+            budgeted_identity(1.0, true),
+        ));
+        let first = unpriced_application
+            .clone()
+            .oneshot(request_for("local/test"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = unpriced_application
+            .oneshot(request_for("local/test"))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        unpriced_upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn incomplete_unary_and_partial_stream_usage_retain_the_full_quote() {
+        let request_for = |stream: bool| {
+            Request::builder()
+                .method("POST")
+                .uri(if stream {
+                    "/v1/chat/stream"
+                } else {
+                    "/v1/chat"
+                })
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "openrouter/x-ai/grok-4.7",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": stream
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let mut unary_server = mockito::Server::new_async().await;
+        let unary_upstream = unary_server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "response",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 7}
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let unary_router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(unary_server.url()),
+            ),
+        );
+        let unary_application = app(configured_state_with_router_and_identity(
+            unary_router,
+            budgeted_identity(10.0, false),
+        ));
+        assert_eq!(
+            unary_application
+                .clone()
+                .oneshot(request_for(false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            unary_application
+                .oneshot(request_for(false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        unary_upstream.assert_async().await;
+
+        let mut stream_server = mockito::Server::new_async().await;
+        let partial_stream = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id":"r","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}),
+            json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":7}}),
+            json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+        );
+        let stream_upstream = stream_server
+            .mock("POST", "/chat/completions")
+            .with_header("content-type", "text/event-stream")
+            .with_body(partial_stream)
+            .expect(1)
+            .create_async()
+            .await;
+        let stream_router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(stream_server.url()),
+            ),
+        );
+        let stream_application = app(configured_state_with_router_and_identity(
+            stream_router,
+            budgeted_identity(10.0, false),
+        ));
+        let stream_response = stream_application
+            .clone()
+            .oneshot(request_for(true))
+            .await
+            .unwrap();
+        assert_eq!(stream_response.status(), StatusCode::OK);
+        let _ = to_bytes(stream_response.into_body(), 100_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            stream_application
+                .oneshot(request_for(false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        stream_upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn later_chat_and_gemini_activity_revokes_early_terminal_usage_authority() {
+        let chat_unsafe = vec![
+            vec![
+                json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                json!({"choices":[{"index":0,"delta":{"content":"later"},"finish_reason":null}]}),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+            ],
+            vec![
+                json!({"choices":[
+                    {"index":0,"delta":{},"finish_reason":"stop"},
+                    {"index":1,"delta":{},"finish_reason":null}
+                ],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                json!({"choices":[{"index":1,"delta":{"content":"later"},"finish_reason":null}]}),
+                json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+            ],
+            vec![
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                json!({"choices":[{"index":1,"delta":{"content":"new"},"finish_reason":null}]}),
+                json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+            ],
+        ];
+        for sequence in chat_unsafe {
+            assert_chat_stream_budget_finality(sequence, StatusCode::TOO_MANY_REQUESTS).await;
+        }
+        assert_chat_stream_budget_finality(
+            vec![
+                json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+        assert_chat_stream_budget_finality(
+            vec![
+                json!({
+                    "choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}],
+                    "usage":{"cost":1.0}
+                }),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            ],
+            StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
+        assert_chat_stream_budget_finality(
+            vec![
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
+                json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}}),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+        assert_chat_stream_budget_finality(
+            vec![
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
+                json!({"choices":[{"index":1,"delta":{"content":"later"},"finish_reason":null}]}),
+                json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}}),
+            ],
+            StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
+
+        let gemini_unsafe = vec![
+            vec![
+                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
+                json!({"candidates":[{"index":0,"content":{"parts":[{"text":"later"}]}}]}),
+                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}]}),
+            ],
+            vec![
+                json!({"candidates":[
+                    {"index":0,"finishReason":"STOP","content":{"parts":[]}},
+                    {"index":1,"content":{"parts":[]}}
+                ],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
+                json!({"candidates":[{"index":1,"content":{"parts":[{"text":"later"}]}}]}),
+                json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+            ],
+            vec![
+                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
+                json!({"candidates":[{"index":1,"content":{"parts":[{"text":"new"}]}}]}),
+                json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+            ],
+        ];
+        for sequence in gemini_unsafe {
+            assert_gemini_stream_budget_finality(sequence, StatusCode::TOO_MANY_REQUESTS).await;
+        }
+        assert_gemini_stream_budget_finality(
+            vec![
+                json!({"candidates":[{"index":0,"content":{"parts":[{"text":"ok"}]}}]}),
+                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}]}),
+                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+        assert_gemini_stream_budget_finality(
+            vec![
+                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"cost":0.25}}),
+                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+        assert_gemini_stream_budget_finality(
+            vec![
+                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"cost":0.25}}),
+                json!({"candidates":[{"index":1,"content":{"parts":[{"text":"later"}]}}]}),
+                json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+            ],
+            StatusCode::TOO_MANY_REQUESTS,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_budget_policy_fields_cannot_unfreeze_a_key() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/responses")
+            .expect(0)
+            .create_async()
+            .await;
+        let router = Router::new().register(
+            "openai",
+            Box::new(
+                crate::providers::openai::OpenAi::new("test-key".into())
+                    .with_base_url(server.url()),
+            ),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-key")
+            .body(Body::from(
+                json!({
+                    "model": "openai/gpt-5.6-luna",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "provider_config": {
+                        "tenant": "forged",
+                        "budget_usd": 1000000,
+                        "budget_allow_unpriced": true
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app(configured_state_with_router_and_identity(
+            router,
+            budgeted_identity(0.0, false),
+        ))
+        .oneshot(request)
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        upstream.assert_async().await;
+
+        let mut free_server = mockito::Server::new_async().await;
+        let free_upstream = free_server
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let free_router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(free_server.url()),
+            ),
+        );
+        let free_request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-key")
+            .body(Body::from(
+                json!({
+                    "model": "openrouter/openrouter/free",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let free_response = app(configured_state_with_router_and_identity(
+            free_router,
+            budgeted_identity(0.0, false),
+        ))
+        .oneshot(free_request)
+        .await
+        .unwrap();
+        assert_eq!(free_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        free_upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn upstream_body_cannot_forge_an_unpriceable_policy_refusal() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_status(400)
+            .with_body("attempt cannot be admitted under the active policy")
+            .expect(1)
+            .create_async()
+            .await;
+        let state = configured_state(&server.url());
+        let response = app(state)
+            .oneshot(refusal_request("/v1/chat", false))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         upstream.assert_async().await;
     }
 
@@ -1789,7 +2935,6 @@ mod native_tests {
                     config.max_wait,
                 )
                 .unwrap(),
-                spend: crate::gateway::quota::SpendCap::in_memory(),
                 idempotency: crate::gateway::idempotency::IdempotencyCache::new(
                     Duration::from_secs(30),
                 ),

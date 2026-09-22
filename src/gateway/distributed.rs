@@ -68,17 +68,43 @@ fn deadline_score(tier: u8, enqueue_ms: u64, aging_step_ms: u64) -> f64 {
     enqueue_ms as f64 - (tier as u64 * aging_step_ms) as f64
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueProtocol {
+    LegacyUnscoped,
+    ScopedV1,
+}
+
+fn protocol_key(protocol: QueueProtocol, kind: &str, identifier: &str) -> String {
+    match protocol {
+        QueueProtocol::LegacyUnscoped => format!("llmshim:gw:{kind}:{identifier}"),
+        QueueProtocol::ScopedV1 => format!("llmshim:gw:scoped:v1:{kind}:{identifier}"),
+    }
+}
+
+fn protocol_queue_key(protocol: QueueProtocol, provider: &str) -> String {
+    protocol_key(protocol, "q", provider)
+}
+fn protocol_processing_key(protocol: QueueProtocol, provider: &str) -> String {
+    protocol_key(protocol, "proc", provider)
+}
+fn protocol_leased_key(protocol: QueueProtocol, provider: &str) -> String {
+    protocol_key(protocol, "leased", provider)
+}
+fn protocol_response_channel(protocol: QueueProtocol, id: &str) -> String {
+    protocol_key(protocol, "resp", id)
+}
+
+#[cfg(test)]
 fn queue_key(provider: &str) -> String {
-    format!("llmshim:gw:q:{provider}")
+    protocol_queue_key(QueueProtocol::LegacyUnscoped, provider)
 }
+#[cfg(test)]
 fn processing_key(provider: &str) -> String {
-    format!("llmshim:gw:proc:{provider}")
+    protocol_processing_key(QueueProtocol::LegacyUnscoped, provider)
 }
+#[cfg(test)]
 fn leased_key(provider: &str) -> String {
-    format!("llmshim:gw:leased:{provider}")
-}
-fn response_channel(id: &str) -> String {
-    format!("llmshim:gw:resp:{id}")
+    protocol_leased_key(QueueProtocol::LegacyUnscoped, provider)
 }
 fn scoped_idempotency_key(context: &crate::gateway::idempotency::IdempotencyContext) -> String {
     format!("llmshim:gw:idem:v2:{}", context.storage_key())
@@ -142,6 +168,10 @@ struct JobDescriptor {
     tier: u8,
     permits: u32,
     payload: Value,
+    #[serde(default)]
+    policy_envelope_version: u8,
+    #[serde(default)]
+    trusted_unscoped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy_scope: Option<crate::gateway::attempt::TrustedPolicyScope>,
     #[serde(default)]
@@ -155,6 +185,7 @@ struct JobDescriptor {
 pub(crate) struct PreparedSubmission {
     descriptor: JobDescriptor,
     member: String,
+    protocol: QueueProtocol,
 }
 
 pub(crate) struct AcceptedSubmission {
@@ -165,20 +196,42 @@ pub(crate) struct AcceptedSubmission {
 impl PreparedSubmission {
     fn new(descriptor: JobDescriptor) -> Result<Self, GatewayError> {
         let member = serde_json::to_string(&descriptor).map_err(|error| redis_err(&error))?;
-        Ok(Self { descriptor, member })
+        let protocol = if descriptor.policy_scope.is_some() {
+            QueueProtocol::ScopedV1
+        } else {
+            QueueProtocol::LegacyUnscoped
+        };
+        Ok(Self {
+            descriptor,
+            member,
+            protocol,
+        })
     }
 }
 
-fn done_key(id: &str) -> String {
-    format!("llmshim:gw:done:{id}")
-}
-fn attempts_key(id: &str) -> String {
-    format!("llmshim:gw:attempts:{id}")
-}
-fn dlq_key(provider: &str) -> String {
-    format!("llmshim:gw:dlq:{provider}")
+fn descriptor_matches_protocol(protocol: QueueProtocol, descriptor: &JobDescriptor) -> bool {
+    match protocol {
+        QueueProtocol::LegacyUnscoped => descriptor.policy_scope.is_none(),
+        QueueProtocol::ScopedV1 => {
+            descriptor.policy_envelope_version == 1
+                && !descriptor.trusted_unscoped
+                && descriptor
+                    .policy_scope
+                    .as_ref()
+                    .is_some_and(crate::gateway::attempt::TrustedPolicyScope::is_current)
+        }
+    }
 }
 
+fn protocol_done_key(protocol: QueueProtocol, id: &str) -> String {
+    protocol_key(protocol, "done", id)
+}
+fn protocol_attempts_key(protocol: QueueProtocol, id: &str) -> String {
+    protocol_key(protocol, "attempts", id)
+}
+fn protocol_dlq_key(protocol: QueueProtocol, provider: &str) -> String {
+    protocol_key(protocol, "dlq", provider)
+}
 /// A message on a request's response channel.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
@@ -337,13 +390,25 @@ impl DistributedGateway {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
+    pub(crate) fn connection_for_test(&self) -> ConnectionManager {
+        self.conn.clone()
+    }
+
     /// Waiting-queue depth per provider (for metrics / introspection).
     pub async fn queue_depths(&self, providers: &[String]) -> Vec<(String, usize)> {
         let mut conn = self.conn.clone();
         let mut out = Vec::with_capacity(providers.len());
         for p in providers {
-            let n: u64 = conn.zcard(queue_key(p)).await.unwrap_or(0);
-            out.push((p.clone(), n as usize));
+            let legacy: u64 = conn
+                .zcard(protocol_queue_key(QueueProtocol::LegacyUnscoped, p))
+                .await
+                .unwrap_or(0);
+            let scoped: u64 = conn
+                .zcard(protocol_queue_key(QueueProtocol::ScopedV1, p))
+                .await
+                .unwrap_or(0);
+            out.push((p.clone(), legacy.saturating_add(scoped) as usize));
         }
         out
     }
@@ -361,13 +426,20 @@ impl DistributedGateway {
     /// with `Overloaded` if the waiting queue is at capacity.
     async fn enqueue(&self, prepared_submission: &PreparedSubmission) -> Result<(), GatewayError> {
         let descriptor = &prepared_submission.descriptor;
-        let provider_queue_key = queue_key(&descriptor.provider);
+        let provider_queue_key =
+            protocol_queue_key(prepared_submission.protocol, &descriptor.provider);
+        let other_protocol = match prepared_submission.protocol {
+            QueueProtocol::LegacyUnscoped => QueueProtocol::ScopedV1,
+            QueueProtocol::ScopedV1 => QueueProtocol::LegacyUnscoped,
+        };
+        let other_provider_queue_key = protocol_queue_key(other_protocol, &descriptor.provider);
         let mut connection = self.conn.clone();
         let priority_score =
             deadline_score(descriptor.tier, descriptor.enqueue_ms, self.aging_step_ms());
         let admitted = admission::enqueue(
             &mut connection,
             &provider_queue_key,
+            &other_provider_queue_key,
             self.config.max_queue_depth,
             priority_score,
             &prepared_submission.member,
@@ -407,7 +479,7 @@ impl DistributedGateway {
         &self,
         prepared: PreparedSubmission,
     ) -> Result<AcceptedSubmission, GatewayError> {
-        let channel = response_channel(&prepared.descriptor.id);
+        let channel = protocol_response_channel(prepared.protocol, &prepared.descriptor.id);
 
         // Subscribe BEFORE enqueue so we can't miss the (fire-and-forget) publish.
         let mut pubsub = self
@@ -473,7 +545,10 @@ impl DistributedGateway {
     ) -> mpsc::Receiver<StreamChunk> {
         let (chunk_tx, chunk_rx) = mpsc::channel(16);
         let request_timeout = self.config.request_timeout;
-        let key = queue_key(&accepted.prepared.descriptor.provider);
+        let key = protocol_queue_key(
+            accepted.prepared.protocol,
+            &accepted.prepared.descriptor.provider,
+        );
         let member = accepted.prepared.member;
         let conn = self.conn.clone();
 
@@ -533,6 +608,8 @@ impl DistributedGateway {
             tier: req.tier,
             permits: req.permits.max(1),
             payload: req.payload,
+            policy_envelope_version: 1,
+            trusted_unscoped: policy_scope.is_none(),
             policy_scope,
             stream,
             enqueue_ms: now_ms(),
@@ -546,72 +623,96 @@ impl DistributedGateway {
         (self.config.lease_timeout.as_secs() * 3).max(60)
     }
 
-    async fn is_done(&self, id: &str) -> bool {
+    async fn is_done(&self, protocol: QueueProtocol, id: &str) -> bool {
         let mut conn = self.conn.clone();
-        conn.exists(done_key(id)).await.unwrap_or(false)
+        conn.exists(protocol_done_key(protocol, id))
+            .await
+            .unwrap_or(false)
     }
 
-    async fn mark_done(&self, id: &str) {
+    async fn mark_done(&self, protocol: QueueProtocol, id: &str) {
         let mut conn = self.conn.clone();
-        let _: Result<(), _> = conn.set_ex(done_key(id), 1, self.marker_ttl_secs()).await;
+        let _: Result<(), _> = conn
+            .set_ex(protocol_done_key(protocol, id), 1, self.marker_ttl_secs())
+            .await;
     }
 
     /// Increment and return this job's delivery-attempt count.
-    async fn bump_attempts(&self, id: &str) -> u32 {
+    async fn bump_attempts(&self, protocol: QueueProtocol, id: &str) -> u32 {
         let mut conn = self.conn.clone();
-        let key = attempts_key(id);
+        let key = protocol_attempts_key(protocol, id);
         let n: u64 = conn.incr(&key, 1).await.unwrap_or(1);
         let _: Result<bool, _> = conn.expire(&key, self.marker_ttl_secs() as i64).await;
         n as u32
     }
 
-    async fn dead_letter(&self, provider: &str, member: &str) {
+    async fn dead_letter(&self, protocol: QueueProtocol, provider: &str, member: &str) {
         let mut conn = self.conn.clone();
-        let _: Result<i64, _> = conn.lpush(dlq_key(provider), member).await;
+        let _: Result<i64, _> = conn
+            .lpush(protocol_dlq_key(protocol, provider), member)
+            .await;
     }
 
     /// Number of dead-lettered jobs for a provider (introspection).
     pub async fn dead_letter_len(&self, provider: &str) -> usize {
         let mut conn = self.conn.clone();
-        let n: u64 = conn.llen(dlq_key(provider)).await.unwrap_or(0);
-        n as usize
+        let legacy: u64 = conn
+            .llen(protocol_dlq_key(QueueProtocol::LegacyUnscoped, provider))
+            .await
+            .unwrap_or(0);
+        let scoped: u64 = conn
+            .llen(protocol_dlq_key(QueueProtocol::ScopedV1, provider))
+            .await
+            .unwrap_or(0);
+        legacy.saturating_add(scoped) as usize
     }
 
     async fn remove_from_queue(&self, prepared: &PreparedSubmission) {
         let mut conn = self.conn.clone();
         let _: Result<i64, _> = conn
-            .zrem(queue_key(&prepared.descriptor.provider), &prepared.member)
+            .zrem(
+                protocol_queue_key(prepared.protocol, &prepared.descriptor.provider),
+                &prepared.member,
+            )
             .await;
     }
 
     /// Spawn one worker loop per provider plus a reaper for redelivery.
     pub fn spawn_workers(self: &Arc<Self>, providers: Vec<String>) -> Vec<JoinHandle<()>> {
-        let mut handles: Vec<JoinHandle<()>> = providers
-            .iter()
-            .cloned()
-            .map(|provider| {
+        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(providers.len() * 2 + 1);
+        for provider in &providers {
+            let preparation_capacity = Arc::new(Semaphore::new(
+                self.config.max_concurrency_per_provider.max(1),
+            ));
+            for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
                 let me = self.clone();
-                tokio::spawn(async move { me.worker(provider).await })
-            })
-            .collect();
+                let provider = provider.clone();
+                let preparation_capacity = preparation_capacity.clone();
+                handles.push(tokio::spawn(async move {
+                    me.worker(provider, protocol, preparation_capacity).await
+                }));
+            }
+        }
         let me = self.clone();
         handles.push(tokio::spawn(async move { me.reaper(providers).await }));
         handles
     }
 
-    async fn worker(self: Arc<Self>, provider: String) {
+    async fn worker(
+        self: Arc<Self>,
+        provider: String,
+        protocol: QueueProtocol,
+        preparation_capacity: Arc<Semaphore>,
+    ) {
         const IDLE_POLL: Duration = Duration::from_millis(50);
-        let qkey = queue_key(&provider);
-        let pkey = processing_key(&provider);
-        let lkey = leased_key(&provider);
+        let qkey = protocol_queue_key(protocol, &provider);
+        let pkey = protocol_processing_key(protocol, &provider);
+        let lkey = protocol_leased_key(protocol, &provider);
         let rate_key = RateKey::provider(provider.clone());
-        let sem = Arc::new(Semaphore::new(
-            self.config.max_concurrency_per_provider.max(1),
-        ));
         let mut conn = self.conn.clone();
 
         loop {
-            let preparation_permit = match sem.clone().acquire_owned().await {
+            let preparation_permit = match preparation_capacity.clone().acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => break,
             };
@@ -641,26 +742,37 @@ impl DistributedGateway {
             let desc: JobDescriptor = match serde_json::from_str(&member) {
                 Ok(d) => d,
                 Err(_) => {
-                    self.ack_lease(&provider, &member).await; // drop a corrupt entry
+                    self.ack_lease(protocol, &provider, &member).await;
                     continue;
                 }
             };
 
+            if !descriptor_matches_protocol(protocol, &desc) {
+                self.publish(
+                    &protocol_response_channel(protocol, &desc.id),
+                    &BusMessage::Error("llmshim-coordinator-unavailable".into()),
+                )
+                .await;
+                self.mark_done(protocol, &desc.id).await;
+                self.ack_lease(protocol, &provider, &member).await;
+                continue;
+            }
+
             // Idempotency: a job that already completed (then got redelivered by
             // the reaper) is skipped.
-            if self.is_done(&desc.id).await {
-                self.ack_lease(&provider, &member).await;
+            if self.is_done(protocol, &desc.id).await {
+                self.ack_lease(protocol, &provider, &member).await;
                 continue;
             }
             // Poison-job guard: dead-letter after too many delivery attempts.
-            let attempts = self.bump_attempts(&desc.id).await;
+            let attempts = self.bump_attempts(protocol, &desc.id).await;
             if attempts > self.config.max_attempts {
                 eprintln!(
                     "gateway worker[{provider}]: dead-lettering job {} after {attempts} attempts",
                     desc.id
                 );
-                self.dead_letter(&provider, &member).await;
-                self.ack_lease(&provider, &member).await;
+                self.dead_letter(protocol, &provider, &member).await;
+                self.ack_lease(protocol, &provider, &member).await;
                 crate::gateway::metrics::incr(
                     crate::gateway::metrics::REJECTED,
                     &[("provider", &provider), ("reason", "dead_letter")],
@@ -679,7 +791,7 @@ impl DistributedGateway {
                     let me = self.clone();
                     tokio::spawn(async move {
                         let _preparation_permit = preparation_permit;
-                        me.run_and_publish(desc, member).await;
+                        me.run_and_publish(protocol, desc, member).await;
                     });
                 }
                 Err(RetryAfter(wait)) => {
@@ -702,9 +814,9 @@ impl DistributedGateway {
 
     /// Dispatch a leased job, publish result(s) to its channel, then mark it done
     /// (idempotency) and ack the lease.
-    async fn run_and_publish(&self, desc: JobDescriptor, member: String) {
+    async fn run_and_publish(&self, protocol: QueueProtocol, desc: JobDescriptor, member: String) {
         use crate::gateway::metrics;
-        let channel = response_channel(&desc.id);
+        let channel = protocol_response_channel(protocol, &desc.id);
         let provider = desc.provider.clone();
         let plabels: &[(&str, &str)] = &[("provider", &provider)];
         let _inflight = metrics::inflight(&provider);
@@ -723,7 +835,7 @@ impl DistributedGateway {
                     &BusMessage::Error("llmshim-coordinator-unavailable".into()),
                 )
                 .await;
-                self.ack_lease(&provider, &member).await;
+                self.ack_lease(protocol, &provider, &member).await;
                 return;
             }
             (None, _) => None,
@@ -757,7 +869,7 @@ impl DistributedGateway {
                         // Keep the lease alive so the reaper doesn't redeliver a
                         // long-running stream mid-flight.
                         if now_ms() >= next_refresh {
-                            self.refresh_lease(&provider, &member).await;
+                            self.refresh_lease(protocol, &provider, &member).await;
                             next_refresh = now_ms() + refresh_every.as_millis() as u64;
                         }
                     }
@@ -815,8 +927,8 @@ impl DistributedGateway {
 
         // Idempotency marker so a late redelivery of this (now-complete) job is
         // skipped, then release the lease.
-        self.mark_done(&desc.id).await;
-        self.ack_lease(&provider, &member).await;
+        self.mark_done(protocol, &desc.id).await;
+        self.ack_lease(protocol, &provider, &member).await;
     }
 
     async fn publish(&self, channel: &str, msg: &BusMessage) {
@@ -826,23 +938,23 @@ impl DistributedGateway {
         }
     }
 
-    async fn ack_lease(&self, provider: &str, member: &str) {
+    async fn ack_lease(&self, protocol: QueueProtocol, provider: &str, member: &str) {
         let mut conn = self.conn.clone();
         let _: Result<i64, _> = self
             .ack
-            .key(processing_key(provider))
-            .key(leased_key(provider))
+            .key(protocol_processing_key(protocol, provider))
+            .key(protocol_leased_key(protocol, provider))
             .arg(member)
             .invoke_async(&mut conn)
             .await;
     }
 
-    async fn refresh_lease(&self, provider: &str, member: &str) {
+    async fn refresh_lease(&self, protocol: QueueProtocol, provider: &str, member: &str) {
         let deadline = now_ms() + self.config.lease_timeout.as_millis() as u64;
         let mut conn = self.conn.clone();
         // XX: only refresh if still leased (not acked/reaped).
         let _: Result<i64, _> = redis::cmd("ZADD")
-            .arg(processing_key(provider))
+            .arg(protocol_processing_key(protocol, provider))
             .arg("XX")
             .arg(deadline)
             .arg(member)
@@ -865,9 +977,13 @@ impl DistributedGateway {
         loop {
             tokio::time::sleep(interval).await;
             for provider in &providers {
-                let reaped = self.reap_once(provider).await;
-                if reaped > 0 {
-                    eprintln!("gateway reaper[{provider}]: redelivered {reaped} expired lease(s)");
+                for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
+                    let reaped = self.reap_once_protocol(protocol, provider).await;
+                    if reaped > 0 {
+                        eprintln!(
+                            "gateway reaper[{provider}]: redelivered {reaped} expired lease(s)"
+                        );
+                    }
                 }
             }
         }
@@ -877,11 +993,21 @@ impl DistributedGateway {
     /// Returns how many were redelivered. Public so a fleet can also drive
     /// reaping from an external scheduler.
     pub async fn reap_once(&self, provider: &str) -> i64 {
+        let legacy = self
+            .reap_once_protocol(QueueProtocol::LegacyUnscoped, provider)
+            .await;
+        let scoped = self
+            .reap_once_protocol(QueueProtocol::ScopedV1, provider)
+            .await;
+        legacy.saturating_add(scoped)
+    }
+
+    async fn reap_once_protocol(&self, protocol: QueueProtocol, provider: &str) -> i64 {
         let mut conn = self.conn.clone();
         self.reap
-            .key(processing_key(provider))
-            .key(queue_key(provider))
-            .key(leased_key(provider))
+            .key(protocol_processing_key(protocol, provider))
+            .key(protocol_queue_key(protocol, provider))
+            .key(protocol_leased_key(protocol, provider))
             .arg(now_ms())
             .arg(256)
             .invoke_async(&mut conn)
@@ -988,6 +1114,8 @@ mod tests {
             tier: 3,
             permits: 42,
             payload: serde_json::json!({"model": "gpt-5.5"}),
+            policy_envelope_version: 1,
+            trusted_unscoped: false,
             policy_scope: Some(policy_scope),
             stream: true,
             enqueue_ms: 1_700_000_000_000,
@@ -1004,6 +1132,54 @@ mod tests {
         let prepared_descriptor: JobDescriptor = serde_json::from_str(&prepared.member).unwrap();
         assert_eq!(prepared_descriptor.id, "abc-1");
         assert!(prepared_descriptor.stream);
+
+        let legacy: JobDescriptor = serde_json::from_value(serde_json::json!({
+            "id": "old",
+            "provider": "openai",
+            "tier": 1,
+            "permits": 1,
+            "payload": {"model": "gpt-5.5"},
+            "policy_scope": {"tenant_key":"old-hash","rpm":1,"tpm":10}
+        }))
+        .unwrap();
+        assert!(!descriptor_matches_protocol(
+            QueueProtocol::ScopedV1,
+            &legacy
+        ));
+        assert!(!descriptor_matches_protocol(
+            QueueProtocol::LegacyUnscoped,
+            &legacy
+        ));
+
+        let legacy_custom: JobDescriptor = serde_json::from_value(serde_json::json!({
+            "id": "old-custom",
+            "provider": "custom",
+            "tier": 0,
+            "permits": 1,
+            "payload": {}
+        }))
+        .unwrap();
+        assert!(descriptor_matches_protocol(
+            QueueProtocol::LegacyUnscoped,
+            &legacy_custom
+        ));
+
+        let trusted_unscoped = JobDescriptor {
+            id: "custom".into(),
+            provider: "custom".into(),
+            tier: 0,
+            permits: 1,
+            payload: serde_json::json!({}),
+            policy_envelope_version: 1,
+            trusted_unscoped: true,
+            policy_scope: None,
+            stream: false,
+            enqueue_ms: 0,
+        };
+        assert!(descriptor_matches_protocol(
+            QueueProtocol::LegacyUnscoped,
+            &trusted_unscoped
+        ));
 
         for msg in [
             BusMessage::Unary(serde_json::json!({"a": 1})),
@@ -1114,6 +1290,8 @@ mod tests {
                 tier,
                 permits: 1,
                 payload: serde_json::json!({"request": request_id}),
+                policy_envelope_version: 1,
+                trusted_unscoped: true,
                 policy_scope: None,
                 stream: false,
                 enqueue_ms: 1_700_000_000_000,
@@ -1155,6 +1333,98 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_queue_depth_limit_is_shared_across_scoped_and_legacy_protocols() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("queue-protocol-cap-{}", uuid::Uuid::new_v4());
+        let config = GatewayConfig {
+            max_queue_depth: 2,
+            ..GatewayConfig::default()
+        };
+        let first = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            config.clone(),
+        )
+        .await
+        .unwrap();
+        let second =
+            DistributedGateway::connect(&redis_url, Arc::new(EchoDispatch), unlimited(), config)
+                .await
+                .unwrap();
+        let existing = first
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"id":"existing"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        first.enqueue(&existing).await.unwrap();
+        let scoped = first
+            .prepare_with_policy(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 1,
+                    permits: 1,
+                    payload: serde_json::json!({"id":"scoped"}),
+                },
+                false,
+                crate::gateway::attempt::TrustedPolicyScope::from_identity(
+                    &crate::gateway::auth::Identity {
+                        tenant: "queue-protocol-cap".into(),
+                        tier: 0,
+                        rpm: None,
+                        tpm: None,
+                        budget_usd: None,
+                        budget_window_secs: None,
+                        budget_allow_unpriced: false,
+                    },
+                ),
+            )
+            .unwrap();
+        let competing_legacy = second
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 2,
+                    permits: 1,
+                    payload: serde_json::json!({"id":"legacy"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let (scoped_result, legacy_result) =
+            tokio::join!(first.enqueue(&scoped), second.enqueue(&competing_legacy));
+        assert_eq!(
+            usize::from(scoped_result.is_ok()) + usize::from(legacy_result.is_ok()),
+            1
+        );
+        let mut connection = first.conn.clone();
+        let legacy_depth: u64 = connection
+            .zcard(protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider))
+            .await
+            .unwrap();
+        let scoped_depth: u64 = connection
+            .zcard(protocol_queue_key(QueueProtocol::ScopedV1, &provider))
+            .await
+            .unwrap();
+        assert_eq!(legacy_depth + scoped_depth, 2);
+        for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
+            let _: i64 = connection
+                .del(protocol_queue_key(protocol, &provider))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn redis_queue_admission_zero_capacity_and_storage_errors_fail_closed() {
         let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
         let provider_name = format!("queue-failure-{}", uuid::Uuid::new_v4());
@@ -1176,6 +1446,8 @@ mod tests {
             tier: 0,
             permits: 1,
             payload: serde_json::json!({"request": "synthetic payload"}),
+            policy_envelope_version: 1,
+            trusted_unscoped: true,
             policy_scope: None,
             stream: false,
             enqueue_ms: 1_700_000_000_000,
@@ -1201,6 +1473,176 @@ mod tests {
         let stored_value: String = connection.get(&provider_queue_key).await.unwrap();
         assert_eq!(stored_value, "existing value");
         let _: i64 = connection.del(provider_queue_key).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_scoped_protocol_is_invisible_to_released_workers_and_reapers() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct ReleasedPolicyScope {
+            tenant_key: String,
+            rpm: Option<u32>,
+            tpm: Option<u32>,
+        }
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct ReleasedJobDescriptor {
+            id: String,
+            provider: String,
+            tier: u8,
+            permits: u32,
+            payload: Value,
+            policy_scope: Option<ReleasedPolicyScope>,
+            stream: bool,
+            enqueue_ms: u64,
+        }
+
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("mixed-version-{}", uuid::Uuid::new_v4().simple());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            GatewayConfig::default(),
+        )
+        .await
+        .unwrap();
+        let identity = crate::gateway::auth::Identity {
+            tenant: format!("raw-tenant-{}", uuid::Uuid::new_v4()),
+            tier: 0,
+            rpm: Some(10),
+            tpm: Some(100),
+            budget_usd: Some(1.0),
+            budget_window_secs: Some(60),
+            budget_allow_unpriced: false,
+        };
+        let raw_tenant = identity.tenant.clone();
+        let prepared = gateway
+            .prepare_with_policy(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"model":"synthetic"}),
+                },
+                false,
+                crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity),
+            )
+            .unwrap();
+        assert_eq!(prepared.protocol, QueueProtocol::ScopedV1);
+        assert!(!prepared.member.contains(&raw_tenant));
+        let released: ReleasedJobDescriptor = serde_json::from_str(&prepared.member).unwrap();
+        assert!(released.policy_scope.is_some());
+
+        let mut connection = gateway.conn.clone();
+        let legacy_queue = protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider);
+        let scoped_queue = protocol_queue_key(QueueProtocol::ScopedV1, &provider);
+        let scoped_processing = protocol_processing_key(QueueProtocol::ScopedV1, &provider);
+        let scoped_leased = protocol_leased_key(QueueProtocol::ScopedV1, &provider);
+        for key in [
+            legacy_queue.clone(),
+            scoped_queue.clone(),
+            scoped_processing.clone(),
+            scoped_leased.clone(),
+        ] {
+            let _: i64 = connection.del(key).await.unwrap();
+        }
+        gateway.enqueue(&prepared).await.unwrap();
+        assert_eq!(connection.zcard::<_, u64>(&legacy_queue).await.unwrap(), 0);
+        assert_eq!(connection.zcard::<_, u64>(&scoped_queue).await.unwrap(), 1);
+
+        let released_worker_lease: Option<(String, String)> = gateway
+            .lease
+            .key(&legacy_queue)
+            .key(protocol_processing_key(
+                QueueProtocol::LegacyUnscoped,
+                &provider,
+            ))
+            .key(protocol_leased_key(
+                QueueProtocol::LegacyUnscoped,
+                &provider,
+            ))
+            .arg(1_u64)
+            .invoke_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(released_worker_lease.is_none());
+
+        let scoped_lease: Option<(String, String)> = gateway
+            .lease
+            .key(&scoped_queue)
+            .key(&scoped_processing)
+            .key(&scoped_leased)
+            .arg(1_u64)
+            .invoke_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(scoped_lease.is_some());
+        assert_eq!(
+            gateway
+                .reap_once_protocol(QueueProtocol::LegacyUnscoped, &provider)
+                .await,
+            0
+        );
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(&scoped_processing)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            gateway
+                .reap_once_protocol(QueueProtocol::ScopedV1, &provider)
+                .await,
+            1
+        );
+
+        let old_scoped_member = serde_json::json!({
+            "id": "released-scoped",
+            "provider": provider,
+            "tier": 0,
+            "permits": 1,
+            "payload": {},
+            "policy_scope": {"tenant_key":"old-hash","rpm":10,"tpm":100},
+            "stream": false,
+            "enqueue_ms": 1_700_000_000_000_u64
+        })
+        .to_string();
+        let _: usize = connection
+            .zadd(&legacy_queue, &old_scoped_member, 0_u64)
+            .await
+            .unwrap();
+        let newly_leased: Option<(String, String)> = gateway
+            .lease
+            .key(&legacy_queue)
+            .key(protocol_processing_key(
+                QueueProtocol::LegacyUnscoped,
+                &provider,
+            ))
+            .key(protocol_leased_key(
+                QueueProtocol::LegacyUnscoped,
+                &provider,
+            ))
+            .arg(now_ms() + 1_000)
+            .invoke_async(&mut connection)
+            .await
+            .unwrap();
+        let (member, _) = newly_leased.unwrap();
+        let parsed: JobDescriptor = serde_json::from_str(&member).unwrap();
+        assert!(!descriptor_matches_protocol(
+            QueueProtocol::LegacyUnscoped,
+            &parsed
+        ));
+        gateway
+            .ack_lease(QueueProtocol::LegacyUnscoped, &provider, &member)
+            .await;
+
+        for key in [legacy_queue, scoped_queue, scoped_processing, scoped_leased] {
+            let _: i64 = connection.del(key).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1365,6 +1807,115 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_scoped_and_legacy_workers_share_one_provider_capacity() {
+        let Some(redis_url) = std::env::var("LLMSHIM_REDIS_URL").ok() else {
+            return;
+        };
+        let provider = format!("mixed-capacity-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let first_dispatch_started = dispatch_started.notified();
+        let release_dispatches = Arc::new(Semaphore::new(0));
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(LatchBlockedDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: dispatch_started.clone(),
+                release_dispatches: release_dispatches.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                max_concurrency_per_provider: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let legacy = gateway
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"kind":"legacy"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let scoped = gateway
+            .prepare_with_policy(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"kind":"scoped"}),
+                },
+                false,
+                crate::gateway::attempt::TrustedPolicyScope::from_identity(
+                    &crate::gateway::auth::Identity {
+                        tenant: "synthetic-scoped".into(),
+                        tier: 0,
+                        rpm: None,
+                        tpm: None,
+                        budget_usd: None,
+                        budget_window_secs: None,
+                        budget_allow_unpriced: false,
+                    },
+                ),
+            )
+            .unwrap();
+        gateway.enqueue(&legacy).await.unwrap();
+        gateway.enqueue(&scoped).await.unwrap();
+
+        let preparation_capacity = Arc::new(Semaphore::new(1));
+        let legacy_worker = tokio::spawn(gateway.clone().worker(
+            provider.clone(),
+            QueueProtocol::LegacyUnscoped,
+            preparation_capacity.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), first_dispatch_started)
+            .await
+            .expect("legacy dispatch should hold the shared capacity");
+        let scoped_worker = tokio::spawn(gateway.clone().worker(
+            provider.clone(),
+            QueueProtocol::ScopedV1,
+            preparation_capacity,
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut connection = gateway.conn.clone();
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(protocol_queue_key(QueueProtocol::ScopedV1, &provider))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(protocol_processing_key(QueueProtocol::ScopedV1, &provider))
+                .await
+                .unwrap(),
+            0
+        );
+
+        legacy_worker.abort();
+        scoped_worker.abort();
+        release_dispatches.add_permits(1);
+        for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
+            for key in [
+                protocol_queue_key(protocol, &provider),
+                protocol_processing_key(protocol, &provider),
+                protocol_leased_key(protocol, &provider),
+            ] {
+                let _: i64 = connection.del(key).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn redis_reaper_redelivers_expired_lease() {
         let provider = "itest-reap";
         let Some(gw) = test_gateway(provider).await else {
@@ -1403,22 +1954,35 @@ mod tests {
             return;
         };
         let mut conn = gw.conn.clone();
-        for k in [done_key("job-x"), attempts_key("job-y"), dlq_key(provider)] {
+        for k in [
+            protocol_done_key(QueueProtocol::LegacyUnscoped, "job-x"),
+            protocol_attempts_key(QueueProtocol::LegacyUnscoped, "job-y"),
+            protocol_dlq_key(QueueProtocol::LegacyUnscoped, provider),
+        ] {
             let _: Result<i64, _> = conn.del(k).await;
         }
 
         // Idempotency marker.
-        assert!(!gw.is_done("job-x").await);
-        gw.mark_done("job-x").await;
-        assert!(gw.is_done("job-x").await);
+        assert!(!gw.is_done(QueueProtocol::LegacyUnscoped, "job-x").await);
+        gw.mark_done(QueueProtocol::LegacyUnscoped, "job-x").await;
+        assert!(gw.is_done(QueueProtocol::LegacyUnscoped, "job-x").await);
 
         // Attempt counter increments per delivery.
-        assert_eq!(gw.bump_attempts("job-y").await, 1);
-        assert_eq!(gw.bump_attempts("job-y").await, 2);
+        assert_eq!(
+            gw.bump_attempts(QueueProtocol::LegacyUnscoped, "job-y")
+                .await,
+            1
+        );
+        assert_eq!(
+            gw.bump_attempts(QueueProtocol::LegacyUnscoped, "job-y")
+                .await,
+            2
+        );
 
         // Dead-letter queue.
         assert_eq!(gw.dead_letter_len(provider).await, 0);
-        gw.dead_letter(provider, "poison-member").await;
+        gw.dead_letter(QueueProtocol::LegacyUnscoped, provider, "poison-member")
+            .await;
         assert_eq!(gw.dead_letter_len(provider).await, 1);
     }
 

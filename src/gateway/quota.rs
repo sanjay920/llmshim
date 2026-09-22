@@ -204,13 +204,12 @@ impl SpendStore for InMemorySpend {
     }
 }
 
-/// A dollar budget enforced per identity, alongside the RPM/TPM buckets.
+/// A standalone post-charge spend helper retained for Rust API compatibility.
 ///
-/// Cost is only knowable *after* a response, so this is check-before-dispatch
-/// and charge-after: a caller is admitted while it is under budget and rejected
-/// on the first request after it crosses. One in-flight request can therefore
-/// overshoot the cap; a hard pre-authorization would need a cost estimate, and
-/// an estimate that is wrong in the operator's favour is its own hazard.
+/// The built-in authenticated gateway uses its private per-attempt reservation
+/// ledger instead, atomically with provider and tenant rate admission. Embedders
+/// that call this helper directly keep its historical check-before/charge-after
+/// behavior.
 pub struct SpendCap {
     store: Arc<dyn SpendStore>,
 }

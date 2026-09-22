@@ -23,8 +23,9 @@ module Llmshim
         cache_write_tokens: hash.fetch("cache_write_tokens", 0),
         # nil means the server could not price the model, never free.
         cost_usd: hash["cost_usd"],
-        # "provider" when the number is the bill the provider reported for this
-        # generation, "catalog" when it was computed from catalog prices.
+        # "provider" for an exact terminal bill, "provider_floor" for the
+        # highest partial provider bill observed (a lower bound), or "catalog"
+        # for an estimate.
         cost_source: hash["cost_source"]
       )
     end

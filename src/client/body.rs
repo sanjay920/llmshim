@@ -78,22 +78,23 @@ pub(super) async fn read_json(
         .map_err(BodyReadError::Http)
 }
 
-pub(super) async fn read_text(
+pub(super) async fn read_text_and_bytes(
     response: reqwest::Response,
     maximum_bytes: usize,
-) -> Result<String, BodyReadError> {
+) -> Result<(String, Vec<u8>), BodyReadError> {
     let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
     let decoded_body = read(response, maximum_bytes).await?;
-    let mut bounded_response = http::Response::new(decoded_body);
+    let mut bounded_response = http::Response::new(decoded_body.clone());
     if let Some(content_type) = content_type {
         bounded_response
             .headers_mut()
             .insert(http::header::CONTENT_TYPE, content_type);
     }
-    reqwest::Response::from(bounded_response)
+    let text = reqwest::Response::from(bounded_response)
         .text()
         .await
-        .map_err(BodyReadError::Http)
+        .map_err(BodyReadError::Http)?;
+    Ok((text, decoded_body))
 }
 
 #[cfg(test)]
@@ -273,9 +274,11 @@ mod tests {
             .text()
             .await
             .unwrap();
-        let bounded_text = read_text(http_client.get(response_url).send().await.unwrap(), 4)
-            .await
-            .unwrap();
+        let bounded_text =
+            read_text_and_bytes(http_client.get(response_url).send().await.unwrap(), 4)
+                .await
+                .unwrap()
+                .0;
         assert_eq!(bounded_text, original_text);
         response_mock.assert_async().await;
     }

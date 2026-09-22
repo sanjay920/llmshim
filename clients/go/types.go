@@ -177,13 +177,12 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
-	// CostUSD is the USD charged for this response. A nil pointer means the
-	// server could not price the model — it never means free.
+	// CostUSD is USD accounting for this response. A provider floor is a lower
+	// bound; nil means unknown and never means free.
 	CostUSD *float64 `json:"cost_usd,omitempty"`
-	// CostSource says where CostUSD came from: "provider" when the provider
-	// reported what it charged for this generation (OpenRouter does),
-	// "catalog" when it was computed from catalog prices, which is an
-	// upper-bound estimate.
+	// CostSource says where CostUSD came from: "provider" for an exact terminal
+	// provider bill, "provider_floor" for the highest partial provider bill
+	// observed (a lower bound), or "catalog" for an estimate.
 	CostSource string `json:"cost_source,omitempty"`
 }
 
@@ -234,9 +233,11 @@ type StreamEvent struct {
 	TotalTokens      int `json:"total_tokens,omitempty"`
 	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
-	// CostUSD is nil when the server could not price the model, never 0.
+	// CostUSD may be a lower bound when CostSource is "provider_floor"; nil means
+	// unknown and never means free.
 	CostUSD *float64 `json:"cost_usd,omitempty"`
-	// CostSource is "provider" for a reported bill, "catalog" for an estimate.
+	// CostSource is "provider" for an exact terminal bill, "provider_floor" for
+	// a partial provider lower bound, or "catalog" for an estimate.
 	CostSource string `json:"cost_source,omitempty"`
 
 	// error

@@ -30,20 +30,19 @@ pub struct Identity {
     pub rpm: Option<u32>,
     #[serde(default)]
     pub tpm: Option<u32>,
-    /// Optional USD spend cap per window, enforced by
-    /// [`crate::gateway::quota::SpendCap`] alongside the rate buckets.
+    /// Optional USD spend cap per window, reserved and settled per actual
+    /// provider attempt alongside the rate buckets.
     #[serde(default)]
     pub budget_usd: Option<f64>,
     /// Window the cap applies to, in seconds. Defaults to one day.
     #[serde(default)]
     pub budget_window_secs: Option<u64>,
-    /// Permit requests the catalog cannot price while a budget is set.
+    /// Permit requests for which a finite reservation cannot be derived while a
+    /// budget is set.
     ///
-    /// Defaults to **false**, which refuses them. An unpriced response cannot be
-    /// charged, so under a cap it is spend the ledger never sees — the budget
-    /// silently stops binding and nothing says so. Setting this to `true` is an
-    /// operator accepting that risk knowingly; the requests are still counted and
-    /// reported so the hole is visible rather than assumed absent.
+    /// Defaults to **false**, which refuses them. Setting this to `true` accepts
+    /// the unknown pre-send liability; known usage is still recorded and later
+    /// attempts are rejected once known spend reaches the cap.
     #[serde(default)]
     pub budget_allow_unpriced: bool,
 }

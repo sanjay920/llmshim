@@ -4,7 +4,8 @@ use llmshim::{
     policy::{
         AttemptAccounting, AttemptEvent, AttemptIdentity, AttemptKind, AttemptOutcome,
         AttemptPolicy, AttemptPolicyError, AttemptPolicyErrorKind, AttemptPolicyFuture,
-        AttemptPolicyRefusal, AttemptPolicyRefusalKind, DispatchPolicyContext, PreparedAttempt,
+        AttemptPolicyRefusal, AttemptPolicyRefusalKind, AttemptUsageObservation,
+        DispatchPolicyContext, PreparedAttempt,
     },
     provider::{Provider, ProviderRequest},
     providers::{
@@ -13,6 +14,7 @@ use llmshim::{
         gemini::Gemini,
         openai::OpenAi,
         openai_compat::OpenAiCompatible,
+        openrouter::OpenRouter,
         xai::Xai,
     },
 };
@@ -128,6 +130,9 @@ enum RecordedEvent {
     Usage {
         id: uuid::Uuid,
         usage: Value,
+        terminal: bool,
+        counters_complete: bool,
+        explicit_zero: bool,
     },
     Finished {
         id: uuid::Uuid,
@@ -274,6 +279,9 @@ impl AttemptPolicy for RecordingPolicy {
                     RecordedEvent::Usage {
                         id: attempt.id(),
                         usage: usage.clone(),
+                        terminal: false,
+                        counters_complete: false,
+                        explicit_zero: false,
                     },
                     FailingEvent::Usage,
                 ),
@@ -287,6 +295,28 @@ impl AttemptPolicy for RecordingPolicy {
             };
             self.events.lock().unwrap().push(recorded);
             if self.failing_event == Some(event_kind) {
+                return Err(AttemptPolicyError::new(
+                    AttemptPolicyErrorKind::CoordinatorUnavailable,
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn observe_usage<'a>(
+        &'a self,
+        attempt: &'a AttemptIdentity,
+        observation: AttemptUsageObservation<'a>,
+    ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>> {
+        Box::pin(async move {
+            self.events.lock().unwrap().push(RecordedEvent::Usage {
+                id: attempt.id(),
+                usage: observation.usage().clone(),
+                terminal: observation.terminal(),
+                counters_complete: observation.counters_complete(),
+                explicit_zero: observation.explicit_zero(),
+            });
+            if self.failing_event == Some(FailingEvent::Usage) {
                 return Err(AttemptPolicyError::new(
                     AttemptPolicyErrorKind::CoordinatorUnavailable,
                 ));
@@ -360,6 +390,76 @@ fn successful_stream(content: &str) -> String {
         json!({"id":"response","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
         json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}),
     )
+}
+
+async fn record_chat_stream(events: Vec<Value>) -> Vec<RecordedEvent> {
+    let mut server = mockito::Server::new_async().await;
+    let mut body = events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+    body.push_str("data: [DONE]\n\n");
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+    let chunks: Vec<_> = ShimClient::new()
+        .stream_with_policy(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+    upstream.assert_async().await;
+    policy.events()
+}
+
+async fn record_gemini_stream(events: Vec<Value>) -> Vec<RecordedEvent> {
+    let mut server = mockito::Server::new_async().await;
+    let body = events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+    let upstream = server
+        .mock("POST", mockito::Matcher::Regex("/models/.*".into()))
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = Gemini::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+    let chunks: Vec<_> = ShimClient::new()
+        .stream_with_policy(
+            &provider,
+            "gemini-3.8-flash",
+            &request("gemini/gemini-3.8-flash"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+    upstream.assert_async().await;
+    policy.events()
+}
+
+fn terminal_usage_count(events: &[RecordedEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, RecordedEvent::Usage { terminal: true, .. }))
+        .count()
 }
 
 #[tokio::test]
@@ -1008,6 +1108,555 @@ async fn failed_repair_observes_each_usage_before_returning_the_error() {
             .count(),
         2
     );
+}
+
+#[tokio::test]
+async fn bounded_http_error_observes_reported_bill_before_preserving_provider_error() {
+    let mut server = mockito::Server::new_async().await;
+    let error_body = json!({
+        "error": {"message": "provider-specific failure"},
+        "usage": {"cost": 12_345_678.0}
+    })
+    .to_string();
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_status(400)
+        .with_body(&error_body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+
+    let error = ShimClient::new()
+        .completion_with_policy(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        llmshim::error::ShimError::ProviderError {
+            status: 400,
+            ref body,
+            ..
+        } if body == &error_body
+    ));
+    upstream.assert_async().await;
+    let events = policy.events();
+    let usage_index = events
+        .iter()
+        .position(|event| matches!(event, RecordedEvent::Usage { .. }))
+        .unwrap();
+    let finish_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RecordedEvent::Finished {
+                    outcome: AttemptOutcome::HttpFailure {
+                        status: 400,
+                        accounting: AttemptAccounting::UsageObserved
+                    },
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(usage_index < finish_index);
+    let RecordedEvent::Usage { usage, .. } = &events[usage_index] else {
+        unreachable!()
+    };
+    assert_eq!(usage["cost_source"], "provider");
+    assert_eq!(usage["cost_usd"], 12_345_678.0);
+}
+
+#[tokio::test]
+async fn retryable_http_error_does_not_retry_after_usage_observer_failure() {
+    let mut server = mockito::Server::new_async().await;
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_status(500)
+        .with_body(json!({"error": "retryable", "usage": {"cost": 1.0}}).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::failing(FailingEvent::Usage));
+
+    let error = ShimClient::new()
+        .completion_with_policy(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("coordinator unavailable"));
+    upstream.assert_async().await;
+    assert_eq!(
+        policy
+            .events()
+            .iter()
+            .filter(|event| matches!(event, RecordedEvent::Acquired { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn unary_usage_requires_present_input_and_output_counters_for_terminal_release() {
+    let mut server = mockito::Server::new_async().await;
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_body(
+            json!({
+                "id": "response",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7}
+            })
+            .to_string(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+    ShimClient::new()
+        .completion_with_policy(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap();
+    upstream.assert_async().await;
+    assert!(policy.events().iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            terminal: true,
+            counters_complete: false,
+            explicit_zero: false,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn unary_explicit_zero_counters_are_complete_but_provider_bill_needs_no_counters() {
+    for (usage, expected_complete, expected_zero, expected_source) in [
+        (
+            json!({"prompt_tokens": 0, "completion_tokens": 0}),
+            true,
+            true,
+            "catalog",
+        ),
+        (json!({"cost": 0.0}), false, false, "provider"),
+    ] {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "response",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": usage
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+        let policy = Arc::new(RecordingPolicy::default());
+        ShimClient::new()
+            .completion_with_policy(
+                &provider,
+                "x-ai/grok-4.7",
+                &request("openrouter/x-ai/grok-4.7"),
+                &context(policy.clone()),
+            )
+            .await
+            .unwrap();
+        upstream.assert_async().await;
+        assert!(policy.events().iter().any(|event| matches!(
+            event,
+            RecordedEvent::Usage {
+                usage,
+                terminal: true,
+                counters_complete,
+                explicit_zero,
+                ..
+            } if *counters_complete == expected_complete
+                && *explicit_zero == expected_zero
+                && usage["cost_source"] == expected_source
+        )));
+    }
+}
+
+#[tokio::test]
+async fn chat_stream_partial_usage_followed_by_clean_finish_is_not_terminal_accounting() {
+    let mut server = mockito::Server::new_async().await;
+    let stream_body = format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"id":"r","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}),
+        json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":7}}),
+        json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+    );
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(stream_body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+    let chunks: Vec<_> = ShimClient::new()
+        .stream_with_policy(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(chunks.iter().all(Result::is_ok));
+    upstream.assert_async().await;
+    assert!(policy.events().iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            terminal: false,
+            counters_complete: false,
+            ..
+        }
+    )));
+    assert!(!policy
+        .events()
+        .iter()
+        .any(|event| matches!(event, RecordedEvent::Usage { terminal: true, .. })));
+}
+
+#[tokio::test]
+async fn chat_terminal_authority_survives_only_without_later_choice_activity() {
+    let complete_usage = json!({"prompt_tokens": 7, "completion_tokens": 3});
+    let unsafe_sequences = vec![
+        vec![
+            json!({"id":"r","choices":[],"usage":complete_usage}),
+            json!({"id":"r","choices":[{"index":0,"delta":{"content":"later"},"finish_reason":null}]}),
+            json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        ],
+        vec![
+            json!({"id":"r","choices":[
+                {"index":0,"delta":{},"finish_reason":"stop"},
+                {"index":1,"delta":{},"finish_reason":null}
+            ],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            json!({"id":"r","choices":[{"index":1,"delta":{"content":"later"},"finish_reason":null}]}),
+            json!({"id":"r","choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+        ],
+        vec![
+            json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            json!({"id":"r","choices":[{"index":1,"delta":{"content":"new"},"finish_reason":null}]}),
+            json!({"id":"r","choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+        ],
+    ];
+    for sequence in unsafe_sequences {
+        let events = record_chat_stream(sequence).await;
+        assert_eq!(terminal_usage_count(&events), 0, "{events:?}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RecordedEvent::Usage {
+                terminal: false,
+                counters_complete: true,
+                ..
+            }
+        )));
+    }
+
+    let valid = record_chat_stream(vec![
+        json!({"id":"r","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}),
+        json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        json!({"id":"r","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+    ])
+    .await;
+    assert_eq!(terminal_usage_count(&valid), 1, "{valid:?}");
+}
+
+#[tokio::test]
+async fn partial_provider_cost_precedes_lower_terminal_catalog_candidate() {
+    let events = record_chat_stream(vec![
+        json!({
+            "id":"r",
+            "choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}],
+            "usage":{"cost":1.0}
+        }),
+        json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        json!({
+            "id":"r",
+            "choices":[],
+            "usage":{"prompt_tokens":7,"completion_tokens":3}
+        }),
+    ])
+    .await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: false,
+            ..
+        } if usage["cost_source"] == "provider" && usage["cost_usd"] == 1.0
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: true,
+            ..
+        } if usage["cost_source"] == "catalog"
+            && usage["cost_usd"].as_f64().is_some_and(|cost| cost < 1.0)
+    )));
+}
+
+#[tokio::test]
+async fn terminal_provider_candidate_survives_catalog_trailer_until_later_activity() {
+    let corrected_chat = record_chat_stream(vec![
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
+        json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}}),
+    ])
+    .await;
+    assert!(corrected_chat.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: true,
+            ..
+        } if usage["cost_source"] == "provider" && usage["cost_usd"] == 0.25
+    )));
+
+    let invalidated_chat = record_chat_stream(vec![
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
+        json!({"choices":[{"index":1,"delta":{"content":"later"},"finish_reason":null}]}),
+        json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}}),
+    ])
+    .await;
+    assert!(invalidated_chat.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: true,
+            ..
+        } if usage["cost_source"] == "catalog"
+    )));
+
+    let corrected_gemini = record_gemini_stream(vec![
+        json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"cost":0.25}}),
+        json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+    ])
+    .await;
+    assert!(corrected_gemini.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: true,
+            ..
+        } if usage["cost_source"] == "provider" && usage["cost_usd"] == 0.25
+    )));
+
+    let invalidated_gemini = record_gemini_stream(vec![
+        json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"cost":0.25}}),
+        json!({"candidates":[{"index":1,"content":{"parts":[{"text":"later"}]}}]}),
+        json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+        json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+    ])
+    .await;
+    assert!(invalidated_gemini.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            usage,
+            terminal: true,
+            ..
+        } if usage["cost_source"] == "catalog"
+    )));
+}
+
+#[tokio::test]
+async fn public_terminal_usage_keeps_explicit_terminal_provider_correction() {
+    let mut server = mockito::Server::new_async().await;
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
+        json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}})
+    );
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let chunks: Vec<_> = ShimClient::new()
+        .stream(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+        )
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    upstream.assert_async().await;
+    assert!(chunks
+        .iter()
+        .filter_map(|chunk| serde_json::from_str::<Value>(chunk).ok())
+        .any(|chunk| {
+            chunk["usage"]["cost_source"] == "provider" && chunk["usage"]["cost_usd"] == 0.25
+        }));
+}
+
+#[tokio::test]
+async fn public_terminal_usage_preserves_partial_provider_floor_separately() {
+    let mut server = mockito::Server::new_async().await;
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}],"usage":{"cost":1.0}}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}})
+    );
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let chunks: Vec<_> = ShimClient::new()
+        .stream(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+        )
+        .await
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    upstream.assert_async().await;
+    let terminal_usage = chunks
+        .iter()
+        .filter_map(|chunk| serde_json::from_str::<Value>(chunk).ok())
+        .find_map(|chunk| {
+            chunk
+                .get("usage")
+                .filter(|usage| usage["provider_cost_floor_usd"].is_number())
+                .cloned()
+        })
+        .unwrap();
+    assert_eq!(terminal_usage["provider_cost_floor_usd"], 1.0);
+    assert_eq!(terminal_usage["cost_source"], "provider_floor");
+    assert_eq!(terminal_usage["cost_usd"], 1.0);
+    assert!(terminal_usage.get("cost").is_none());
+}
+
+#[tokio::test]
+async fn gemini_terminal_authority_survives_only_without_later_candidate_activity() {
+    let unsafe_sequences = vec![
+        vec![
+            json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+            json!({"candidates":[{"index":0,"content":{"parts":[{"text":"later"}]}}]}),
+            json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}]}),
+        ],
+        vec![
+            json!({"candidates":[
+                {"index":0,"finishReason":"STOP","content":{"parts":[]}},
+                {"index":1,"content":{"parts":[]}}
+            ],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+            json!({"candidates":[{"index":1,"content":{"parts":[{"text":"later"}]}}]}),
+            json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+        ],
+        vec![
+            json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+            json!({"candidates":[{"index":1,"content":{"parts":[{"text":"new"}]}}]}),
+            json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+        ],
+    ];
+    for sequence in unsafe_sequences {
+        let events = record_gemini_stream(sequence).await;
+        assert_eq!(terminal_usage_count(&events), 0, "{events:?}");
+    }
+
+    let valid = record_gemini_stream(vec![
+        json!({"candidates":[{"index":0,"content":{"parts":[{"text":"ok"}]}}]}),
+        json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}]}),
+        json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+    ])
+    .await;
+    assert_eq!(terminal_usage_count(&valid), 1, "{valid:?}");
+}
+
+#[tokio::test]
+async fn anthropic_terminal_empty_usage_cannot_bless_earlier_partial_counters() {
+    let mut server = mockito::Server::new_async().await;
+    let stream_body = format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
+        json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":0}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{}}),
+        json!({"type":"message_stop"})
+    );
+    let upstream = server
+        .mock("POST", "/messages")
+        .with_header("content-type", "text/event-stream")
+        .with_body(stream_body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = Anthropic::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+    let chunks: Vec<_> = ShimClient::new()
+        .stream_with_policy(
+            &provider,
+            "claude-sonnet-4-6",
+            &request("anthropic/claude-sonnet-4-6"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+    upstream.assert_async().await;
+    assert!(!policy.events().iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            terminal: true,
+            counters_complete: true,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -1735,16 +2384,26 @@ async fn cumulative_and_duplicate_stream_usage_share_one_attempt_identity() {
     let usage_events: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            RecordedEvent::Usage { id, usage } => Some((*id, usage["total_tokens"].as_u64())),
+            RecordedEvent::Usage { id, usage, .. } => Some((*id, usage["total_tokens"].as_u64())),
             _ => None,
         })
         .collect();
-    assert_eq!(usage_events.len(), 3);
+    assert_eq!(usage_events.len(), 4);
     assert_eq!(usage_events[0].1, Some(8));
     assert_eq!(usage_events[1].1, Some(8));
     assert_eq!(usage_events[2].1, Some(10));
+    assert_eq!(usage_events[3].1, Some(10));
     assert_eq!(usage_events[0].0, usage_events[1].0);
     assert_eq!(usage_events[1].0, usage_events[2].0);
+    assert_eq!(usage_events[2].0, usage_events[3].0);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            terminal: true,
+            usage,
+            ..
+        } if usage["total_tokens"] == 10
+    )));
     let finished_id = events.iter().find_map(|event| match event {
         RecordedEvent::Finished {
             id,

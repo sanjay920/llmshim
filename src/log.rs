@@ -18,13 +18,12 @@ pub struct LogEntry {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub total_tokens: u64,
-    /// USD charged for this response, or `null` when it cannot be known.
-    /// Never `0.0` for an unknown price — see `crate::cost`.
+    /// USD accounting for this response. A provider floor is a lower bound;
+    /// `null` means unknown and never means free.
     pub cost_usd: Option<f64>,
-    /// Where `cost_usd` came from: `"provider"` when the provider reported what
-    /// it charged for this generation, `"catalog"` when it was computed from
-    /// catalog prices. Reading spend off a log means knowing which of the two
-    /// it is — one is the invoice, the other an upper-bound estimate.
+    /// Where `cost_usd` came from: `"provider"` for an exact terminal bill,
+    /// `"provider_floor"` for the highest partial provider bill observed (a
+    /// lower bound), or `"catalog"` for an estimate.
     pub cost_source: Option<String>,
     pub status: String,
     pub gateway_integrity: crate::providers::anthropic_signature::Integrity,

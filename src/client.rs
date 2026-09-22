@@ -258,7 +258,14 @@ impl ShimClient {
                             retry_after_wait(resp.headers(), self.retry.cap).unwrap_or_else(|| {
                                 backoff_with_jitter(attempt, self.retry.base, self.retry.cap)
                             });
-                        let _ = body::read(resp, self.response_body_limits.error_bytes).await;
+                        let error_body =
+                            body::read(resp, self.response_body_limits.error_bytes).await;
+                        if let (Ok(error_body), Some(target)) =
+                            (error_body.as_ref(), prepared_target)
+                        {
+                            observe_bounded_error_usage(target, error_body, &mut attempt_tracker)
+                                .await?;
+                        }
                         if let Some(tracker) = attempt_tracker.as_mut() {
                             let accounting = tracker.accounting(false);
                             tracker
@@ -277,7 +284,14 @@ impl ShimClient {
                     // above this client gets to honour it too.
                     let retry_after = parse_retry_after(resp.headers());
                     let error_body =
-                        body::read_text(resp, self.response_body_limits.error_bytes).await;
+                        body::read_text_and_bytes(resp, self.response_body_limits.error_bytes)
+                            .await;
+                    if let (Ok((_, error_body)), Some(target)) =
+                        (error_body.as_ref(), prepared_target)
+                    {
+                        observe_bounded_error_usage(target, error_body, &mut attempt_tracker)
+                            .await?;
+                    }
                     if let Some(tracker) = attempt_tracker.as_mut() {
                         let accounting = tracker.accounting(false);
                         tracker
@@ -289,7 +303,7 @@ impl ShimClient {
                             .map_err(DispatchFailure::PolicyObservation)?;
                     }
                     let body = match error_body {
-                        Ok(error_body_text) => error_body_text,
+                        Ok((error_body_text, _)) => error_body_text,
                         Err(body::BodyReadError::TooLarge) => {
                             return Err(body::BodyReadError::TooLarge.into_dispatch_failure());
                         }
@@ -741,15 +755,32 @@ async fn observe_native_response_usage(
     let Some(tracker) = tracker.as_mut() else {
         return Ok(());
     };
-    if let Some(mut usage) = crate::usage::normalize_native_response_usage(target, native_response)
+    if let Some(mut observation) =
+        crate::usage::normalize_native_response_usage_observation(target, native_response)
     {
-        stamp_usage(target, &mut usage);
+        stamp_usage(target, &mut observation.usage);
         tracker
-            .usage(&usage)
+            .usage(
+                &observation.usage,
+                observation.terminal,
+                observation.counters_complete,
+                observation.explicit_zero,
+            )
             .await
             .map_err(DispatchFailure::PolicyObservation)?;
     }
     Ok(())
+}
+
+async fn observe_bounded_error_usage(
+    target: &ReplayTarget,
+    bounded_body: &[u8],
+    tracker: &mut Option<AttemptTracker>,
+) -> DispatchResult<()> {
+    let Ok(native_error) = serde_json::from_slice::<serde_json::Value>(bounded_body) else {
+        return Ok(());
+    };
+    observe_native_response_usage(target, &native_error, tracker).await
 }
 
 async fn finish_completed_response(tracker: &mut Option<AttemptTracker>) -> DispatchResult<()> {
@@ -808,9 +839,18 @@ fn observe_stream(
                     return None;
                 }
                 match state.inner.next().await {
-                    Some(Ok(SseOutput::Usage(mut usage))) => {
-                        stamp_usage(&state.target, &mut usage);
-                        if let Err(error) = state.tracker.usage(&usage).await {
+                    Some(Ok(SseOutput::Usage(mut observation))) => {
+                        stamp_usage(&state.target, &mut observation.usage);
+                        if let Err(error) = state
+                            .tracker
+                            .usage(
+                                &observation.usage,
+                                observation.terminal,
+                                observation.counters_complete,
+                                observation.explicit_zero,
+                            )
+                            .await
+                        {
                             record_policy_failure(&state.policy_failure, error);
                             state.ended = true;
                             return Some((Err(error.into_shim_error()), state));
@@ -1124,6 +1164,9 @@ impl Stream for SseStream {
                 }
             }
             if self.normalizer.is_finished() {
+                if let Some(observation) = self.native_usage.take_terminal_candidate() {
+                    return Poll::Ready(Some(Ok(SseOutput::Usage(observation))));
+                }
                 return Poll::Ready(None);
             }
             let data = match self.inner.as_mut().poll_next(cx) {
@@ -1135,7 +1178,11 @@ impl Stream for SseStream {
                 Poll::Ready(None) => {
                     return Poll::Ready(match self.normalizer.finish() {
                         Ok(Some(chunk)) => Some(Ok(SseOutput::Chunk(chunk))),
-                        Ok(None) => None,
+                        Ok(None) => self
+                            .native_usage
+                            .take_terminal_candidate()
+                            .map(SseOutput::Usage)
+                            .map(Ok),
                         Err(error) => Some(Err(error)),
                     })
                 }
@@ -1160,7 +1207,7 @@ impl Stream for SseStream {
 }
 
 enum SseOutput {
-    Usage(serde_json::Value),
+    Usage(crate::usage::NativeUsageObservation),
     Chunk(String),
 }
 
