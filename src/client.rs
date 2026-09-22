@@ -1,5 +1,6 @@
 use crate::breaker::ProviderBreaker;
 use crate::error::{Result, ShimError};
+use crate::policy::{AttemptKind, AttemptOutcome, AttemptTracker, DispatchPolicyContext};
 use crate::provider::{Provider, ProviderRequest};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -141,9 +142,37 @@ impl ShimClient {
     const RETRYABLE_STATUSES: &'static [u16] = &[429, 500, 502, 503, 504, 529];
 
     pub async fn send(&self, req: &ProviderRequest) -> Result<reqwest::Response> {
+        self.send_prepared(None, AttemptKind::Completion, "", "", req)
+            .await
+            .map(|attempt_response| attempt_response.response)
+    }
+
+    async fn send_prepared(
+        &self,
+        policy_context: Option<&DispatchPolicyContext>,
+        attempt_kind: AttemptKind,
+        provider_name: &str,
+        resolved_model: &str,
+        req: &ProviderRequest,
+    ) -> Result<AttemptResponse> {
         let max_retries = self.retry.max_retries;
 
         for attempt in 0..=max_retries {
+            let mut attempt_tracker = match policy_context {
+                Some(context) => Some(
+                    context
+                        .acquire(
+                            attempt_kind,
+                            provider_name,
+                            resolved_model,
+                            &req.url,
+                            &req.body,
+                        )
+                        .await
+                        .map_err(|refusal| refusal.into_shim_error())?,
+                ),
+                None => None,
+            };
             let mut builder = self.http.post(&req.url);
             for (k, v) in &req.headers {
                 builder = builder.header(k, v);
@@ -153,8 +182,14 @@ impl ShimClient {
             match builder.send().await {
                 Ok(resp) => {
                     let status = resp.status();
+                    if let Some(tracker) = attempt_tracker.as_ref() {
+                        tracker.response_headers(status.as_u16()).await;
+                    }
                     if status.is_success() {
-                        return Ok(resp);
+                        return Ok(AttemptResponse {
+                            response: resp,
+                            tracker: attempt_tracker,
+                        });
                     }
                     let status_code = status.as_u16();
                     if Self::RETRYABLE_STATUSES.contains(&status_code) && attempt < max_retries {
@@ -166,6 +201,15 @@ impl ShimClient {
                             });
                         // Consume body before retrying (can't reuse response)
                         let _ = resp.text().await;
+                        if let Some(tracker) = attempt_tracker.as_mut() {
+                            let accounting = tracker.accounting(false);
+                            tracker
+                                .finish(AttemptOutcome::HttpFailure {
+                                    status: status_code,
+                                    accounting,
+                                })
+                                .await;
+                        }
                         tokio::time::sleep(wait).await;
                         continue;
                     }
@@ -174,6 +218,15 @@ impl ShimClient {
                     // above this client gets to honour it too.
                     let retry_after = parse_retry_after(resp.headers());
                     let body = resp.text().await.unwrap_or_default();
+                    if let Some(tracker) = attempt_tracker.as_mut() {
+                        let accounting = tracker.accounting(false);
+                        tracker
+                            .finish(AttemptOutcome::HttpFailure {
+                                status: status_code,
+                                accounting,
+                            })
+                            .await;
+                    }
                     return Err(ShimError::ProviderError {
                         status: status_code,
                         body,
@@ -182,6 +235,12 @@ impl ShimClient {
                 }
                 // Transport errors carry no headers: always jittered backoff.
                 Err(e) if Self::is_retryable_transport(&e) && attempt < max_retries => {
+                    if let Some(tracker) = attempt_tracker.as_mut() {
+                        let accounting = tracker.accounting(false);
+                        tracker
+                            .finish(AttemptOutcome::TransportFailure { accounting })
+                            .await;
+                    }
                     tokio::time::sleep(backoff_with_jitter(
                         attempt,
                         self.retry.base,
@@ -190,7 +249,15 @@ impl ShimClient {
                     .await;
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    if let Some(tracker) = attempt_tracker.as_mut() {
+                        let accounting = tracker.accounting(false);
+                        tracker
+                            .finish(AttemptOutcome::TransportFailure { accounting })
+                            .await;
+                    }
+                    return Err(error.into());
+                }
             }
         }
         unreachable!()
@@ -208,8 +275,26 @@ impl ShimClient {
         model: &str,
         request: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let result = self.completion_unobserved(provider, model, request).await;
+        let result = self
+            .completion_unobserved(provider, model, request, None)
+            .await;
         self.observe(provider, result.as_ref().map(|_| ())).await;
+        result
+    }
+
+    pub async fn completion_with_policy(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &serde_json::Value,
+        policy_context: &DispatchPolicyContext,
+    ) -> Result<serde_json::Value> {
+        let result = self
+            .completion_unobserved(provider, model, request, Some(policy_context))
+            .await;
+        if !result.as_ref().is_err_and(crate::policy::is_refusal) {
+            self.observe(provider, result.as_ref().map(|_| ())).await;
+        }
         result
     }
 
@@ -218,6 +303,7 @@ impl ShimClient {
         provider: &dyn Provider,
         model: &str,
         request: &serde_json::Value,
+        policy_context: Option<&DispatchPolicyContext>,
     ) -> Result<serde_json::Value> {
         let plan = crate::shim::Plan::new(
             provider.name(),
@@ -230,7 +316,7 @@ impl ShimClient {
         let mut usage = serde_json::json!({});
         for attempt in 0..2 {
             let (mut result, target) = self
-                .completion_once(provider, model, &rendered)
+                .completion_once(provider, model, &rendered, policy_context)
                 .await
                 .map_err(|e| plan.dispatch_error(e))?;
             crate::shim::add_usage(&mut usage, &result);
@@ -259,22 +345,55 @@ impl ShimClient {
         provider: &dyn Provider,
         model: &str,
         request: &serde_json::Value,
+        policy_context: Option<&DispatchPolicyContext>,
     ) -> Result<(serde_json::Value, crate::reasoning::ReplayTarget)> {
         let provider_req = provider.prepare_request(model, request).await?;
         let target = provider.request_replay_target(model, &provider_req);
-        let resp = self.send(&provider_req).await?;
+        let AttemptResponse {
+            response,
+            mut tracker,
+        } = self
+            .send_prepared(
+                policy_context,
+                AttemptKind::Completion,
+                provider.name(),
+                model,
+                &provider_req,
+            )
+            .await?;
         if provider.name() == "chatgpt"
             && target.wire == crate::reasoning::WireFormat::OpenAiResponses
         {
-            let mut result = crate::providers::chatgpt::collect_response(model, resp).await?;
+            let mut result =
+                match crate::providers::chatgpt::collect_response(model, response).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        finish_invalid_response(&mut tracker).await;
+                        return Err(error);
+                    }
+                };
             crate::reasoning::bind_response_context(&mut result, &target);
             crate::toolcall::bind_response_context(&mut result, &target);
+            observe_completed_response(provider.name(), model, &mut result, &mut tracker).await;
             return Ok((result, target));
         }
-        let body: serde_json::Value = resp.json().await?;
-        let mut result = provider.transform_response(model, body)?;
+        let body: serde_json::Value = match response.json().await {
+            Ok(body) => body,
+            Err(error) => {
+                finish_invalid_response(&mut tracker).await;
+                return Err(error.into());
+            }
+        };
+        let mut result = match provider.transform_response(model, body) {
+            Ok(result) => result,
+            Err(error) => {
+                finish_invalid_response(&mut tracker).await;
+                return Err(error);
+            }
+        };
         crate::reasoning::bind_response_context(&mut result, &target);
         crate::toolcall::bind_response_context(&mut result, &target);
+        observe_completed_response(provider.name(), model, &mut result, &mut tracker).await;
         Ok((result, target))
     }
 
@@ -286,8 +405,24 @@ impl ShimClient {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
         // A stream's health verdict is whether it opened; per-chunk failures
         // are the transport's business, not the breaker's.
-        let opened = self.stream_unobserved(provider, model, request).await;
+        let opened = self.stream_unobserved(provider, model, request, None).await;
         self.observe(provider, opened.as_ref().map(|_| ())).await;
+        opened
+    }
+
+    pub async fn stream_with_policy(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &serde_json::Value,
+        policy_context: &DispatchPolicyContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        let opened = self
+            .stream_unobserved(provider, model, request, Some(policy_context))
+            .await;
+        if !opened.as_ref().is_err_and(crate::policy::is_refusal) {
+            self.observe(provider, opened.as_ref().map(|_| ())).await;
+        }
         opened
     }
 
@@ -296,6 +431,7 @@ impl ShimClient {
         provider: &dyn Provider,
         model: &str,
         request: &serde_json::Value,
+        policy_context: Option<&DispatchPolicyContext>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
         let plan = crate::shim::Plan::new(
             provider.name(),
@@ -306,14 +442,14 @@ impl ShimClient {
         let mut rendered = plan.render()?;
         if !plan.buffered() {
             return self
-                .stream_once(provider, model, &rendered)
+                .stream_once(provider, model, &rendered, policy_context)
                 .await
                 .map(|(stream, _)| stream);
         }
         let mut usage = serde_json::json!({});
         for attempt in 0..2 {
             let (stream, target) = self
-                .stream_once(provider, model, &rendered)
+                .stream_once(provider, model, &rendered, policy_context)
                 .await
                 .map_err(|e| plan.dispatch_error(e))?;
             let mut result = crate::shim::collect(stream)
@@ -349,10 +485,32 @@ impl ShimClient {
         // Observed on the open only. A buffered plan's repair re-opens inside
         // the returned stream; that second dial is not a separate verdict.
         let opened = self
-            .stream_owned_unobserved(provider.clone(), model, request)
+            .stream_owned_unobserved(provider.clone(), model, request, None)
             .await;
         self.observe(provider.as_ref(), opened.as_ref().map(|_| ()))
             .await;
+        opened
+    }
+
+    pub async fn stream_owned_with_policy(
+        &self,
+        provider: Arc<dyn Provider>,
+        model: &str,
+        request: &serde_json::Value,
+        policy_context: &DispatchPolicyContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        let opened = self
+            .stream_owned_unobserved(
+                provider.clone(),
+                model,
+                request,
+                Some(policy_context.clone()),
+            )
+            .await;
+        if !opened.as_ref().is_err_and(crate::policy::is_refusal) {
+            self.observe(provider.as_ref(), opened.as_ref().map(|_| ()))
+                .await;
+        }
         opened
     }
 
@@ -361,6 +519,7 @@ impl ShimClient {
         provider: Arc<dyn Provider>,
         model: &str,
         request: &serde_json::Value,
+        policy_context: Option<DispatchPolicyContext>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
         let plan = crate::shim::Plan::new(
             provider.name(),
@@ -370,7 +529,7 @@ impl ShimClient {
         )?;
         let rendered = plan.render()?;
         let (first, target) = self
-            .stream_once(provider.as_ref(), model, &rendered)
+            .stream_once(provider.as_ref(), model, &rendered, policy_context.as_ref())
             .await
             .map_err(|e| plan.dispatch_error(e))?;
         if !plan.buffered() {
@@ -390,7 +549,12 @@ impl ShimClient {
                 }
                 let rendered = plan.repair(&feedback)?;
                 let (second, target) = client
-                    .stream_once(provider.as_ref(), &model, &rendered)
+                    .stream_once(
+                        provider.as_ref(),
+                        &model,
+                        &rendered,
+                        policy_context.as_ref(),
+                    )
                     .await
                     .map_err(|e| plan.dispatch_error(e))?;
                 result = crate::shim::collect(second)
@@ -411,6 +575,7 @@ impl ShimClient {
         provider: &dyn Provider,
         model: &str,
         request: &serde_json::Value,
+        policy_context: Option<&DispatchPolicyContext>,
     ) -> Result<(
         Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
         crate::reasoning::ReplayTarget,
@@ -420,8 +585,16 @@ impl ShimClient {
 
         let provider_req = provider.prepare_request(model, &req_value).await?;
         let target = provider.request_replay_target(model, &provider_req);
-        let resp = self.send(&provider_req).await?;
-        let events = native_events(resp.bytes_stream());
+        let AttemptResponse { response, tracker } = self
+            .send_prepared(
+                policy_context,
+                AttemptKind::Stream,
+                provider.name(),
+                model,
+                &provider_req,
+            )
+            .await?;
+        let events = native_events(response.bytes_stream());
         let sse = SseStream {
             inner: events,
             normalizer: crate::streaming::StreamNormalizer::new(target.clone()),
@@ -430,11 +603,104 @@ impl ShimClient {
         // Cost rides on whichever chunk carries usage, the same way the cache
         // counters do. Chunks without usage are passed through untouched.
         let (name, model) = (provider.name().to_owned(), model.to_owned());
-        let priced =
-            sse.map(move |item| item.map(|chunk| crate::cost::stamp_chunk(&name, &model, chunk)));
+        let priced: Pin<Box<dyn Stream<Item = Result<String>> + Send>> = Box::pin(
+            sse.map(move |item| item.map(|chunk| crate::cost::stamp_chunk(&name, &model, chunk))),
+        );
 
-        Ok((Box::pin(priced), target))
+        let observed = match tracker {
+            Some(tracker) => observe_stream(priced, tracker),
+            None => priced,
+        };
+
+        Ok((observed, target))
     }
+}
+
+struct AttemptResponse {
+    response: reqwest::Response,
+    tracker: Option<AttemptTracker>,
+}
+
+async fn observe_completed_response(
+    provider_name: &str,
+    model: &str,
+    result: &mut serde_json::Value,
+    tracker: &mut Option<AttemptTracker>,
+) {
+    let Some(tracker) = tracker.as_mut() else {
+        return;
+    };
+    crate::cost::stamp(provider_name, model, result);
+    if let Some(usage) = result.get("usage").filter(|usage| usage.is_object()) {
+        tracker.usage(usage).await;
+    }
+    let accounting = tracker.accounting(true);
+    tracker
+        .finish(AttemptOutcome::Completed { accounting })
+        .await;
+}
+
+async fn finish_invalid_response(tracker: &mut Option<AttemptTracker>) {
+    let Some(tracker) = tracker.as_mut() else {
+        return;
+    };
+    let accounting = tracker.accounting(false);
+    tracker
+        .finish(AttemptOutcome::InvalidResponse { accounting })
+        .await;
+}
+
+struct PolicyStreamState {
+    inner: Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
+    tracker: AttemptTracker,
+    ended: bool,
+}
+
+fn observe_stream(
+    stream: Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
+    tracker: AttemptTracker,
+) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
+    Box::pin(futures::stream::unfold(
+        PolicyStreamState {
+            inner: stream,
+            tracker,
+            ended: false,
+        },
+        |mut state| async move {
+            if state.ended {
+                return None;
+            }
+            match state.inner.next().await {
+                Some(Ok(chunk)) => {
+                    if let Some(usage) = serde_json::from_str::<serde_json::Value>(&chunk)
+                        .ok()
+                        .and_then(|value| value.get("usage").cloned())
+                        .filter(|usage| usage.is_object())
+                    {
+                        state.tracker.usage(&usage).await;
+                    }
+                    Some((Ok(chunk), state))
+                }
+                Some(Err(error)) => {
+                    let accounting = state.tracker.accounting(false);
+                    state
+                        .tracker
+                        .finish(AttemptOutcome::StreamFailure { accounting })
+                        .await;
+                    state.ended = true;
+                    Some((Err(error), state))
+                }
+                None => {
+                    let accounting = state.tracker.accounting(true);
+                    state
+                        .tracker
+                        .finish(AttemptOutcome::Completed { accounting })
+                        .await;
+                    None
+                }
+            }
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
