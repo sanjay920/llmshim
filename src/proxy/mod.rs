@@ -3,7 +3,7 @@ pub(crate) mod convert;
 pub(crate) mod error;
 mod handlers;
 pub mod health;
-mod lifetime;
+pub(crate) mod lifetime;
 pub(crate) mod origin;
 pub mod ratelimit;
 pub mod types;

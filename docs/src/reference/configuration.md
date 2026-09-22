@@ -179,6 +179,34 @@ event ended at a valid boundary; expiry in a partial event ends the body with a
 transport error. A unary response whose headers are already committed also
 ends with a transport error.
 
+## Gateway local job lifetimes
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `LLMSHIM_GATEWAY_UNARY_JOB_TIMEOUT_MS` | `7200000` | Absolute local unary job and HTTP response lifetime |
+| `LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS` | `21600000` | Absolute local stream job and HTTP response lifetime |
+
+Values must be positive and form a finite deadline; otherwise the finite
+default remains active. The HTTP clock starts after authentication and ingress
+preparation admission. Its prequeue permit still ends when the scheduler or
+distributed queue accepts the job. For the local scheduler, the same absolute
+deadline spans queueing, provider preparation, retries, repair/fallback,
+stream opening, forwarding, and final HTTP-body production. Direct Rust
+`Scheduler` callers receive an equivalent submission-anchored job clock.
+
+A local stream reserves one bounded channel slot for a terminal timeout error,
+so a retained unpolled receiver can resume through buffered chunks and observe
+the timeout instead of clean EOF. Dropping unary or stream receivers cancels
+cooperative local dispatch and releases scheduler capacity. Custom `Dispatch`
+implementations remain trusted code: the scheduler bounds their cooperative
+future and owned resources, but cannot preempt synchronous blocking code or
+provide the built-in client's pre-send guarantee inside that code.
+
+Distributed HTTP origins use the outer HTTP clock to bound origin resources.
+That does not by itself cancel an already accepted remote worker job; worker
+lifetime and origin-to-worker cancellation use the distributed protocol's
+separate controls.
+
 ## JSONL request logging
 
 Set `LLMSHIM_LOG` to append one JSON object per completed request to a file:
