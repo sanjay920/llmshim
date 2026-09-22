@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import io
 import os
+import signal
 import socket
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -118,7 +122,9 @@ def test_real_managed_child_ignores_requested_port_and_refreshes_after_exit(monk
     monkeypatch.setenv("LLMSHIM_PORT", str(unrelated.getsockname()[1]))
     _server._stop_server()
 
+    original_sigterm = signal.getsignal(signal.SIGTERM)
     first = _server.ensure_managed_server()
+    assert signal.getsignal(signal.SIGTERM) is original_sigterm
     assert first.port != unrelated.getsockname()[1]
     unrelated.close()
     _server._terminate_process(first.process)
@@ -159,3 +165,64 @@ def test_real_managed_child_ignores_requested_port_and_refreshes_after_exit(monk
     assert second.port != first.port
     assert llmshim.health()["status"] == "ok"
     _server._stop_server()
+
+
+def process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def wait_for_process_gone(pid: int, timeout: float = 4.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_exists(pid):
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"process {pid} survived parent termination")
+
+
+@pytest.mark.parametrize(
+    "termination_signal",
+    [signal.SIGTERM] + ([signal.SIGKILL] if hasattr(signal, "SIGKILL") else []),
+)
+@pytest.mark.skipif(
+    not os.environ.get("LLMSHIM_TEST_BINARY") or sys.platform == "win32",
+    reason="requires the real managed binary and POSIX termination signals",
+)
+def test_parent_termination_reaps_managed_child(termination_signal):
+    binary = Path(os.environ["LLMSHIM_TEST_BINARY"])
+    package_root = Path(__file__).parents[1]
+    environment = os.environ.copy()
+    environment["PATH"] = f"{binary.parent}{os.pathsep}{environment.get('PATH', '')}"
+    environment["PYTHONPATH"] = str(package_root)
+    environment["VLLM_BASE_URL"] = "http://127.0.0.1:9/v1"
+    code = (
+        "from llmshim import _server\n"
+        "import time\n"
+        "server = _server.ensure_managed_server()\n"
+        "print(server.process.pid, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-c", code],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    managed_pid = None
+    try:
+        assert parent.stdout is not None
+        managed_pid = int(_server._read_readiness_line(parent.stdout, 10.0))
+        os.kill(parent.pid, termination_signal)
+        assert parent.wait(timeout=3) == -termination_signal
+        wait_for_process_gone(managed_pid)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=2)
+        if managed_pid is not None and process_exists(managed_pid):
+            os.kill(managed_pid, signal.SIGKILL)

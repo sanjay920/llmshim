@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
+use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -203,6 +204,20 @@ pub(crate) async fn serve(
         MANAGED_HANDSHAKE_TIMEOUT,
         MANAGED_HEADER_TIMEOUT,
     )?;
+    let shutdown_handle = axum_server::Handle::<LimitedAddress>::new();
+    let parent_liveness_handle = shutdown_handle.clone();
+    tokio::spawn(async move {
+        // Managed parents retain stdin's write end; EOF ends this exact child even after a crash.
+        let mut parent_liveness = tokio::io::stdin();
+        let mut buffer = [0_u8; 64];
+        loop {
+            match parent_liveness.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        parent_liveness_handle.graceful_shutdown(Some(Duration::from_secs(2)));
+    });
 
     let readiness = ReadinessRecord {
         protocol: MANAGED_PROTOCOL,
@@ -220,6 +235,7 @@ pub(crate) async fn serve(
 
     eprintln!("llmshim managed proxy starting on https://{address}");
     server
+        .handle(shutdown_handle)
         .serve(app.into_make_service())
         .await
         .map_err(|error| format!("managed proxy failed: {error}"))
@@ -228,7 +244,6 @@ pub(crate) async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
     use tokio_rustls::rustls::{ClientConfig, RootCertStore};
     use tokio_rustls::TlsConnector;
 

@@ -1,17 +1,20 @@
-// Tests for the pure platform-mapping logic in server.ts (the auto-spawn
-// binary resolution). Does NOT spawn any process or touch the filesystem for
-// a real binary — those paths need a real bundled binary and are covered
-// manually by scripts/manual-smoke-check.mjs instead. Fully mocked, $0 to run.
+// Managed startup unit tests plus opt-in real-binary lifecycle coverage.
+// Every network fixture stays on ephemeral loopback and uses no provider key.
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { request as rawHttpsRequest } from "node:https";
 import { createConnection } from "node:net";
 import { createServer } from "node:net";
 import { delimiter, dirname } from "node:path";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { Client, ensureServer, platformPackageName } from "../dist/index.js";
 import { __testing } from "../dist/server.js";
@@ -43,6 +46,73 @@ function readiness(overrides = {}) {
     certificate_pem: testCertificate,
     ...overrides,
   }) + "\n");
+}
+
+function readJsonLine(stream) {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    stream.setEncoding("utf8");
+    const onData = (chunk) => {
+      buffer += chunk;
+      const newline = buffer.indexOf("\n");
+      if (newline === -1) return;
+      stream.off("data", onData);
+      try {
+        resolve(JSON.parse(buffer.slice(0, newline)));
+      } catch (error) {
+        reject(error);
+      }
+    };
+    stream.on("data", onData);
+    stream.once("error", reject);
+    stream.once("end", () => reject(new Error("fixture stdout ended before a JSON line")));
+  });
+}
+
+function waitForExit(child, timeoutMs = 3_000) {
+  return new Promise((resolve, reject) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve({ code: child.exitCode, signal: child.signalCode });
+      return;
+    }
+    const timeout = setTimeout(() => reject(new Error("fixture process did not exit")), timeoutMs);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timeout);
+      resolve({ code, signal });
+    });
+  });
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+async function waitForProcessGone(pid, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processExists(pid)) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`process ${pid} survived cleanup`);
+}
+
+async function readPidFile(path, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      return Number(await readFile(path, "utf8"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  throw new Error("startup child did not publish its pid");
 }
 
 /** Run `fn` with process.platform/arch temporarily overridden. */
@@ -193,6 +263,166 @@ test("replacement listener receives no prompt or managed token before TLS reject
 });
 
 test(
+  "SIGTERM reaps the exact live managed child and preserves default termination",
+  { skip: !process.env.LLMSHIM_TEST_BINARY || process.platform === "win32" },
+  async () => {
+    const binary = process.env.LLMSHIM_TEST_BINARY;
+    const fixture = spawn(process.execPath, [fileURLToPath(new URL("../scripts/managed-parent-fixture.mjs", import.meta.url))], {
+      cwd: dirname(fileURLToPath(import.meta.url)),
+      env: {
+        ...process.env,
+        PATH: `${dirname(binary)}${delimiter}${process.env.PATH ?? ""}`,
+        VLLM_BASE_URL: "http://127.0.0.1:9/v1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const ready = await readJsonLine(fixture.stdout);
+    assert.equal(ready.ready, true);
+    try {
+      fixture.kill("SIGTERM");
+      const exited = await waitForExit(fixture);
+      assert.equal(exited.code, null);
+      assert.equal(exited.signal, "SIGTERM");
+      await waitForProcessGone(ready.childPid);
+    } finally {
+      if (processExists(ready.childPid)) process.kill(ready.childPid, "SIGKILL");
+      if (fixture.exitCode === null && fixture.signalCode === null) fixture.kill("SIGKILL");
+    }
+  },
+);
+
+test(
+  "a host-owned SIGTERM can keep the parent, relay, and managed child alive",
+  { skip: !process.env.LLMSHIM_TEST_BINARY || process.platform === "win32" },
+  async () => {
+    const binary = process.env.LLMSHIM_TEST_BINARY;
+    const fixture = spawn(process.execPath, [fileURLToPath(new URL("../scripts/managed-parent-fixture.mjs", import.meta.url))], {
+      cwd: dirname(fileURLToPath(import.meta.url)),
+      env: {
+        ...process.env,
+        PATH: `${dirname(binary)}${delimiter}${process.env.PATH ?? ""}`,
+        VLLM_BASE_URL: "http://127.0.0.1:9/v1",
+        LLMSHIM_FIXTURE_HOST_SIGNAL: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const ready = await readJsonLine(fixture.stdout);
+    const hostSignalLine = readJsonLine(fixture.stdout);
+    try {
+      fixture.kill("SIGTERM");
+      assert.deepEqual(await hostSignalLine, { hostSignalCount: 1 });
+      assert.equal(fixture.exitCode, null);
+      assert.equal(processExists(ready.childPid), true);
+      fixture.kill("SIGKILL");
+      const exited = await waitForExit(fixture);
+      assert.equal(exited.signal, "SIGKILL");
+      await waitForProcessGone(ready.childPid);
+    } finally {
+      if (processExists(ready.childPid)) process.kill(ready.childPid, "SIGKILL");
+      if (fixture.exitCode === null && fixture.signalCode === null) fixture.kill("SIGKILL");
+    }
+  },
+);
+
+test(
+  "parent SIGKILL closes an active provider stream within the child shutdown bound",
+  { skip: !process.env.LLMSHIM_TEST_BINARY || process.platform === "win32" },
+  async () => {
+    let providerClosedResolve;
+    const providerClosed = new Promise((resolve) => {
+      providerClosedResolve = resolve;
+    });
+    const provider = createHttpServer((request, response) => {
+      request.resume();
+      request.once("end", () => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write(
+          `data: ${JSON.stringify({
+            id: "chatcmpl-parent-liveness",
+            object: "chat.completion.chunk",
+            model: "test",
+            choices: [{ index: 0, delta: { content: "first" }, finish_reason: null }],
+          })}\n\n`,
+        );
+        const interval = setInterval(() => response.write(": keepalive\n\n"), 25);
+        response.once("close", () => {
+          clearInterval(interval);
+          providerClosedResolve();
+        });
+      });
+    });
+    await new Promise((resolve, reject) => {
+      provider.once("error", reject);
+      provider.listen(0, "127.0.0.1", resolve);
+    });
+    const providerAddress = provider.address();
+    assert.ok(providerAddress && typeof providerAddress === "object");
+    const binary = process.env.LLMSHIM_TEST_BINARY;
+    const fixture = spawn(process.execPath, [fileURLToPath(new URL("../scripts/managed-parent-fixture.mjs", import.meta.url))], {
+      cwd: dirname(fileURLToPath(import.meta.url)),
+      env: {
+        ...process.env,
+        PATH: `${dirname(binary)}${delimiter}${process.env.PATH ?? ""}`,
+        VLLM_BASE_URL: `http://127.0.0.1:${providerAddress.port}/v1`,
+        LLMSHIM_FIXTURE_ACTIVE_STREAM: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let ready;
+    try {
+      ready = await readJsonLine(fixture.stdout);
+      fixture.kill("SIGKILL");
+      assert.equal((await waitForExit(fixture)).signal, "SIGKILL");
+      await Promise.race([
+        providerClosed,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("active provider stream stayed open")), 3_000)),
+      ]);
+      await waitForProcessGone(ready.childPid, 3_000);
+    } finally {
+      if (ready?.childPid && processExists(ready.childPid)) process.kill(ready.childPid, "SIGKILL");
+      if (fixture.exitCode === null && fixture.signalCode === null) fixture.kill("SIGKILL");
+      await new Promise((resolve) => provider.close(resolve));
+    }
+  },
+);
+
+test(
+  "SIGTERM reaps a managed child that is still starting",
+  { skip: process.platform === "win32" },
+  async () => {
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), "llmshim-managed-startup-"));
+    const fakeBinary = join(temporaryDirectory, "llmshim");
+    const pidFile = join(temporaryDirectory, "child.pid");
+    await writeFile(
+      fakeBinary,
+      "#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.LLMSHIM_FAKE_PID_FILE, String(process.pid));\nprocess.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\nsetInterval(() => {}, 1000);\n",
+    );
+    await chmod(fakeBinary, 0o755);
+    const fixture = spawn(process.execPath, [fileURLToPath(new URL("../scripts/managed-parent-fixture.mjs", import.meta.url))], {
+      cwd: dirname(fileURLToPath(import.meta.url)),
+      env: {
+        ...process.env,
+        PATH: `${temporaryDirectory}${delimiter}${process.env.PATH ?? ""}`,
+        LLMSHIM_FAKE_PID_FILE: pidFile,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let childPid;
+    try {
+      childPid = await readPidFile(pidFile);
+      fixture.kill("SIGTERM");
+      const exited = await waitForExit(fixture);
+      assert.equal(exited.signal, "SIGTERM");
+      await waitForProcessGone(childPid);
+    } finally {
+      if (childPid && processExists(childPid)) process.kill(childPid, "SIGKILL");
+      if (fixture.exitCode === null && fixture.signalCode === null) fixture.kill("SIGKILL");
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "real managed lifecycle uses child-selected ports, guarded auth, and fresh children",
   { skip: !process.env.LLMSHIM_TEST_BINARY },
   async () => {
@@ -306,5 +536,98 @@ test(
     assert.equal(replacementConnections, 1);
     assert.equal(wire.includes(Buffer.from(prompt)), false);
     assert.equal(wire.includes(Buffer.from(firstChild.authToken)), false);
+  },
+);
+
+test(
+  "early managed stream return closes the provider connection and preserves later requests",
+  { skip: !process.env.LLMSHIM_TEST_BINARY },
+  async () => {
+    let finishNormally = false;
+    let cancelledResolve;
+    const providerCancelled = new Promise((resolve) => {
+      cancelledResolve = resolve;
+    });
+    let cancelledConnections = 0;
+    const provider = createHttpServer((request, response) => {
+      request.resume();
+      request.once("end", () => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        const firstChunk = JSON.stringify({
+          id: "chatcmpl-managed-stream",
+          object: "chat.completion.chunk",
+          model: "test",
+          choices: [{ index: 0, delta: { content: "first" }, finish_reason: null }],
+        });
+        response.write(`data: ${firstChunk}\n\n`);
+        if (finishNormally) {
+          const terminalChunk = JSON.stringify({
+            id: "chatcmpl-managed-stream",
+            object: "chat.completion.chunk",
+            model: "test",
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          });
+          response.end(`data: ${terminalChunk}\n\ndata: [DONE]\n\n`);
+          return;
+        }
+        const interval = setInterval(() => response.write(": keepalive\n\n"), 25);
+        response.once("close", () => {
+          clearInterval(interval);
+          if (!response.writableEnded) {
+            cancelledConnections += 1;
+            cancelledResolve();
+          }
+        });
+      });
+    });
+    await new Promise((resolve, reject) => {
+      provider.once("error", reject);
+      provider.listen(0, "127.0.0.1", resolve);
+    });
+    const providerAddress = provider.address();
+    assert.ok(providerAddress && typeof providerAddress === "object");
+    process.env.VLLM_BASE_URL = `http://127.0.0.1:${providerAddress.port}/v1`;
+    const previousChild = __testing.stopManagedChild();
+    if (previousChild?.process.exitCode === null) {
+      await new Promise((resolve) => previousChild.process.once("exit", resolve));
+    }
+
+    try {
+      const client = new Client();
+      const stream = client.stream({ model: "vllm/test", messages: [{ role: "user", content: "stream" }] });
+      const first = await stream.next();
+      assert.equal(first.done, false);
+      assert.equal(first.value.type, "content");
+      assert.equal(first.value.text, "first");
+      await stream.return();
+      await Promise.race([
+        providerCancelled,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("provider stream stayed open")), 1_000)),
+      ]);
+      assert.equal(cancelledConnections, 1);
+
+      const childAfterCancellation = __testing.managedChildSnapshot();
+      assert.ok(childAfterCancellation);
+      assert.equal((await client.health()).status, "ok");
+      assert.equal(__testing.managedChildSnapshot()?.process, childAfterCancellation.process);
+
+      finishNormally = true;
+      const completedEvents = [];
+      for await (const event of client.stream({
+        model: "vllm/test",
+        messages: [{ role: "user", content: "complete" }],
+      })) {
+        completedEvents.push(event.type);
+      }
+      assert.ok(completedEvents.includes("content"));
+      assert.ok(completedEvents.includes("done"));
+      assert.equal(cancelledConnections, 1);
+    } finally {
+      const child = __testing.stopManagedChild();
+      if (child?.process.exitCode === null) {
+        await new Promise((resolve) => child.process.once("exit", resolve));
+      }
+      await new Promise((resolve) => provider.close(resolve));
+    }
   },
 );
