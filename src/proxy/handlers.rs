@@ -27,6 +27,22 @@ fn dispatch_error(error: crate::error::ShimError, overload_wait: std::time::Dura
     }
 }
 
+fn is_attempt_policy_error(error: &crate::error::ShimError) -> bool {
+    matches!(
+        error,
+        crate::error::ShimError::ProviderError { body, .. }
+            if matches!(
+                body.as_str(),
+                "provider attempt limit exceeded"
+                    | "tenant attempt limit exceeded"
+                    | "attempt policy coordinator unavailable"
+                    | "attempt budget exhausted"
+                    | "attempt cannot be admitted under the active policy"
+                    | "attempt refused by policy"
+            )
+    )
+}
+
 /// POST /v1/chat — non-streaming completion (or streaming if stream=true)
 pub async fn chat(
     State(state): State<Arc<AppState>>,
@@ -110,16 +126,21 @@ async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
     };
     let value = prepared_request.payload;
     let policy_context = super::attempt::context(state.limiter.clone(), state.backpressure.clone());
-    let mut upstream_stream =
-        match crate::stream_with_policy(&state.router, &value, &policy_context).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                return dispatch_error(error, state.backpressure.queue_timeout()).into_response()
-            }
-        };
+    let stream_result = crate::stream_with_policy(&state.router, &value, &policy_context).await;
+    if let Err(error) = &stream_result {
+        if is_attempt_policy_error(error) {
+            return dispatch_error(
+                stream_result.err().expect("matched error"),
+                state.backpressure.queue_timeout(),
+            )
+            .into_response();
+        }
+    }
 
     let event_stream = async_stream::stream! {
-        while let Some(chunk) = upstream_stream.next().await {
+        match stream_result {
+            Ok(mut upstream_stream) => {
+                while let Some(chunk) = upstream_stream.next().await {
                     match chunk {
                         Ok(chunk_json) => {
                             let events = convert::chunk_to_events(&chunk_json);
@@ -145,6 +166,14 @@ async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
                             break;
                         }
                     }
+                }
+            }
+            Err(error) => {
+                let error_event = super::error::stream_error(&error.to_string());
+                if let Ok(data) = serde_json::to_string(&error_event) {
+                    yield Ok(Event::default().event("error").data(data));
+                }
+            }
         }
     };
 
