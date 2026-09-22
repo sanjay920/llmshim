@@ -764,10 +764,24 @@ fn proxy_assistant_message_round_trips_reasoning_without_projection_loss() {
 pub fn chunk_to_events(chunk_json: &str) -> Vec<StreamEvent> {
     let mut events = Vec::new();
 
-    let parsed: Value = match serde_json::from_str(chunk_json) {
-        Ok(v) => v,
-        Err(_) => return events,
-    };
+    let parsed: Value =
+        match crate::json_bounds::parse_str(chunk_json, crate::json_bounds::Limits::SSE) {
+            Ok(value) => value,
+            Err(crate::json_bounds::ParseError::Malformed(_)) => return events,
+            Err(crate::json_bounds::ParseError::Complexity) => {
+                return vec![StreamEvent::Error {
+                    message: "stream JSON exceeds complexity limit".into(),
+                }]
+            }
+        };
+    if parsed["type"] == "error" {
+        return vec![StreamEvent::Error {
+            message: parsed["message"]
+                .as_str()
+                .unwrap_or("upstream stream failed")
+                .to_owned(),
+        }];
+    }
 
     let choice = parsed["choices"]
         .as_array()

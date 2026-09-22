@@ -937,6 +937,9 @@ fn app_with_origin_policy_and_deadlines(
             state.clone(),
             native_translate,
         ))
+        .layer(axum::middleware::from_fn(
+            crate::proxy::wire::bound_inference_request_json,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             default_receipt_store,
             crate::proxy::wire::install_default_receipt_store,

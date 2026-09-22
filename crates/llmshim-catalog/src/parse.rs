@@ -114,7 +114,8 @@ pub(crate) fn models_dev(
     data: &str,
     fetched_at: Option<DateTime<Utc>>,
 ) -> Result<Vec<ModelInfo>, CatalogError> {
-    let root: Value = serde_json::from_str(data)?;
+    let root: Value = crate::bounded_json::parse_str(data, crate::bounded_json::Limits::CATALOG)
+        .map_err(|_| CatalogError::Invalid("catalog JSON is invalid or too complex"))?;
     let providers = root
         .as_object()
         .ok_or(CatalogError::Invalid("catalog must be an object"))?;

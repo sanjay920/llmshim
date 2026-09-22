@@ -93,7 +93,16 @@ impl StreamNormalizer {
         if data.trim().is_empty() {
             return Ok(None);
         }
-        let mut native: Value = serde_json::from_str(data)?;
+        let mut native: Value =
+            match crate::json_bounds::parse_str(data, crate::json_bounds::Limits::SSE) {
+                Ok(value) => value,
+                Err(crate::json_bounds::ParseError::Malformed(error)) => return Err(error.into()),
+                Err(crate::json_bounds::ParseError::Complexity) => {
+                    return Err(ShimError::Stream(
+                        "upstream JSON exceeds complexity limit".into(),
+                    ))
+                }
+            };
         if matches!(native["type"].as_str(), Some("error" | "response.failed"))
             || native.get("error").is_some_and(|v| !v.is_null())
         {
@@ -277,5 +286,34 @@ mod retention_tests {
         assert_eq!(stream.budget.retained(), Default::default());
         assert!(stream.active_choices.is_empty());
         assert!(stream.seen_choices.is_empty());
+    }
+
+    #[test]
+    fn atomic_tool_arguments_are_bounded_before_completeness_parse() {
+        let arguments = format!(
+            "[{}]",
+            std::iter::repeat_n("0", 20_000)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut stream = StreamNormalizer::new(ReplayTarget::new(
+            "openrouter",
+            "vendor/model",
+            WireFormat::OpenAiChat,
+        ));
+        let error = stream
+            .push(
+                &serde_json::json!({
+                    "choices":[{"index":0,"delta":{"tool_calls":[{
+                        "id":"call-1",
+                        "type":"function",
+                        "function":{"name":"read","arguments":arguments}
+                    }]}}]
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("complexity limit"));
+        assert_eq!(stream.budget.retained(), Default::default());
     }
 }
