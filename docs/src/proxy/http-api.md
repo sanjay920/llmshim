@@ -126,6 +126,12 @@ an upper bound on replay availability, and some responses are never retained.
 Clients must therefore tolerate a fresh execution and must not treat this as an
 exactly-once guarantee.
 
+Distributed requests also hold a finite origin lease. Dropping a unary request
+future or streaming response body requests durable cancellation; process loss is
+detected when the lease expires. Cancellation can stop queued or locally active
+work, but it cannot prove that an external provider did not accept a send that
+was already in flight. Known usage and uncertain spend liability are retained.
+
 These local limits use a conservative in-process footprint estimate, not an RSS
 measurement. In a distributed deployment, completed responses remain in the
 bounded lifecycle terminal pool and the idempotency cache retains a bounded

@@ -362,6 +362,9 @@ detection and is capped at five minutes. Redis server time decides expiry.
 Dropped unary futures and quiet streaming bodies request cancellation through
 one bounded gateway pump; a fixed-batch Redis expiry index covers process loss
 and pump saturation without detached per-drop tasks.
+Unary terminals remain readable after response-bus loss. Stream chunks remain
+transient, so a lost stream bus is reported as an error rather than treating a
+durable End marker as proof that every chunk reached the origin.
 
 Lifecycle storage defaults to 10,000 retained jobs, 512 MiB of request/metadata
 bytes, and a separate 512 MiB terminal pool. Environment overrides are
