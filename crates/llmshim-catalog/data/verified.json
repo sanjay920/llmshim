@@ -39,5 +39,8 @@
     "forced_tool_choice": true,
     "cost": {"input": 1.6, "cache_read": 0.4, "output": 4.8},
     "context_cost_tiers": [{"above_input_tokens": 200000, "cost": {"input": 3.2, "cache_read": 0.8, "output": 9.6}}]
+  },
+  "openrouter/deepseek/deepseek-v4.1-flash": {
+    "cost": {"input": 0.3, "output": 1.2, "cache_read": 0.006}
   }
 }

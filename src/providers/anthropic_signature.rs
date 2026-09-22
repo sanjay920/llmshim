@@ -103,7 +103,7 @@ fn field(bytes: &[u8], wanted: u64) -> Option<&[u8]> {
 
 fn comparison_id(model: &str) -> String {
     let name = model.strip_prefix("anthropic/").unwrap_or(model);
-    let metadata = crate::catalog::resolve(&format!("anthropic/{name}"));
+    let metadata = crate::catalog::lookup_id(&format!("anthropic/{name}"));
     let mut normalized = metadata
         .as_ref()
         .map(|m| m.name.as_str())

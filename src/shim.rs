@@ -4,7 +4,7 @@ use crate::{
     catalog::{ModelCapabilities, Support},
     error::{Result, ShimError},
     reasoning::{ReasoningBlock, ReplayTarget, WireFormat},
-    schema::{self, OutputSchema, Target},
+    schema::{self, BudgetLimits, OutputSchema, RequestBudget, Target},
     toolcall::{ToolCallMap, WireToolId},
 };
 use serde::{Deserialize, Serialize};
@@ -67,8 +67,8 @@ fn target(wire: WireFormat) -> Target {
 
 struct Output {
     original: Value,
-    resolved: Value,
     validator: jsonschema::Validator,
+    optional_omissions: schema::validate::OptionalOmissions,
     wire: OutputSchema,
 }
 struct Tool {
@@ -94,8 +94,10 @@ impl Plan {
         let handle = crate::catalog::global()
             .map_err(|_| invalid("model catalog configuration is invalid"))?;
         let snapshot = handle.snapshot();
+        // `lookup_id` normalizes a known OpenRouter variant suffix (`:nitro`,
+        // `:floor`, …) for this capability lookup only.
         let caps = snapshot
-            .resolve(&format!("{provider}/{model}"))
+            .lookup_id(&format!("{provider}/{model}"))
             .map(|m| m.capabilities)
             .unwrap_or_default();
         Self::with_capabilities(wire, request, caps)
@@ -106,8 +108,27 @@ impl Plan {
         request: &Value,
         caps: ModelCapabilities,
     ) -> Result<Self> {
+        Self::with_capabilities_and_budget_limits(wire, request, caps, BudgetLimits::default())
+    }
+
+    fn with_capabilities_and_budget_limits(
+        wire: WireFormat,
+        request: &Value,
+        caps: ModelCapabilities,
+        budget_limits: BudgetLimits,
+    ) -> Result<Self> {
         if !request.is_object() {
             return Err(invalid("request must be an object"));
+        }
+        let mut schema_budget = RequestBudget::with_limits(budget_limits);
+        for _ in 0..3 {
+            schema_budget.reserve_request_schemas(request)?;
+        }
+        if request["response_format"]["type"] == "json_object" {
+            let generated = json!({"type":"object"});
+            for _ in 0..3 {
+                schema_budget.reserve_retained(&generated)?;
+            }
         }
         let mut request = request.clone();
         if request["response_format"]["type"] == "json_object" {
@@ -134,21 +155,35 @@ impl Plan {
             mode => mode,
         };
         let output = if request["response_format"]["type"] == "json_schema" {
-            let original = request
+            let original_schema = request
                 .pointer("/response_format/json_schema/schema")
-                .cloned()
                 .ok_or_else(|| invalid("response_format.json_schema.schema is required"))?;
+            schema_budget.reserve_retained(original_schema)?;
+            let original = original_schema.clone();
+            schema_budget.reserve_validator(&original)?;
             let validator = schema::validate::compile(&original)?;
+            schema_budget.reserve_retained(&original)?;
             let mut resolved = original.clone();
-            schema::normalize_for(Target::Mcp, &mut resolved);
+            schema::normalize_with_budget(
+                &schema::Options::for_target(Target::Mcp),
+                &mut resolved,
+                &mut schema_budget,
+            )?;
+            let optional_omissions =
+                schema::validate::OptionalOmissions::compile(&resolved, &mut schema_budget)?;
             let strict = request["response_format"]["json_schema"]["strict"]
                 .as_bool()
                 .unwrap_or(true);
-            let output = schema::normalize_output_for(target(wire), &original, strict);
+            let output = schema::normalize_output_for_budget(
+                target(wire),
+                &original,
+                strict,
+                &mut schema_budget,
+            )?;
             Some(Output {
                 original,
-                resolved,
                 validator,
+                optional_omissions,
                 wire: output,
             })
         } else {
@@ -179,11 +214,18 @@ impl Plan {
                         .as_str()
                         .filter(|s| !s.is_empty())
                         .ok_or_else(|| invalid("tool name is required"))?;
-                    let raw = function
+                    let raw = if let Some(raw) = function
                         .get("parameters")
                         .or_else(|| function.get("inputSchema"))
-                        .cloned()
-                        .unwrap_or(json!({"type":"object"}));
+                    {
+                        schema_budget.reserve_retained(raw)?;
+                        raw.clone()
+                    } else {
+                        let generated = json!({"type":"object"});
+                        schema_budget.reserve_retained(&generated)?;
+                        generated
+                    };
+                    schema_budget.reserve_validator(&raw)?;
                     let validator = schema::validate::compile(&raw)?;
                     if tools
                         .insert(
@@ -198,6 +240,30 @@ impl Plan {
                         return Err(invalid("tool names must be unique"));
                     }
                 }
+            }
+        }
+        if prompt_tools || capture {
+            for tool in tools.values() {
+                schema_budget.reserve_retained(&tool.schema)?;
+                schema_budget.reserve_prompt_schema(&tool.schema)?;
+            }
+        }
+        if structured == StructuredOutput::Prompt || prompt_tools || capture {
+            if let Some(output) = &output {
+                schema_budget.reserve_prompt_schema(&output.original)?;
+            }
+        }
+        let synthetic_call = capture_native
+            || (!capture
+                && output.is_some()
+                && structured == StructuredOutput::ForcedTool
+                && !(capture || (prompt_tools && !tools.is_empty())));
+        if synthetic_call {
+            if capture {
+                let generated = json!({"type":"object","properties":{"text":{"type":"string"}}});
+                schema_budget.reserve_retained(&generated)?;
+            } else if let Some(output) = &output {
+                schema_budget.reserve_retained(&output.wire.schema)?;
             }
         }
         let mut synthetic = if capture { "think" } else { "final_output" }.to_string();
@@ -481,7 +547,7 @@ impl Plan {
                         && self.structured != StructuredOutput::Prompt
                         && output.wire.normalization.strict
                     {
-                        schema::validate::restore_optional_omissions(&output.resolved, &mut value);
+                        output.optional_omissions.restore(&mut value);
                     }
                     let errors = schema::validate::errors(&output.validator, &value);
                     if !errors.is_empty() {
@@ -682,48 +748,55 @@ fn strip_reasoning(obj: &mut serde_json::Map<String, Value>) {
 
 /// Apply canonical response-format fields after provider-native overrides.
 /// This also serves direct transform_request users who select native formats.
-pub(crate) fn native_format(request: &Value, wire: WireFormat, body: &mut Value) {
+pub(crate) fn native_format(
+    request: &Value,
+    wire: WireFormat,
+    body: &mut Value,
+    budget: &mut RequestBudget,
+) -> Result<()> {
     if let Some(object) = body.as_object_mut() {
         object.remove("x-shim");
     }
     let format = &request["response_format"];
-    if format["type"] != "json_schema" {
-        return;
+    if format["type"] == "json_schema" {
+        if let Some(schema) = format.pointer("/json_schema/schema") {
+            let output = schema::normalize_output_for_budget(
+                target(wire),
+                schema,
+                format["json_schema"]["strict"].as_bool().unwrap_or(true),
+                budget,
+            )?;
+            let name = format["json_schema"]["name"].as_str().unwrap_or("response");
+            match wire {
+                WireFormat::OpenAiChat => {
+                    body["response_format"] = json!({"type":"json_schema","json_schema":{"name":name,"schema":output.schema,"strict":output.normalization.strict}})
+                }
+                WireFormat::OpenAiResponses => {
+                    if !body["text"].is_object() {
+                        body["text"] = json!({});
+                    }
+                    body["text"]["format"] = json!({"type":"json_schema","name":name,"schema":output.schema,"strict":output.normalization.strict});
+                    body.as_object_mut().unwrap().remove("response_format");
+                }
+                WireFormat::AnthropicMessages => {
+                    if !body["output_config"].is_object() {
+                        body["output_config"] = json!({});
+                    }
+                    body["output_config"]["format"] =
+                        json!({"type":"json_schema","schema":output.schema});
+                }
+                WireFormat::GoogleGenerateContent => {
+                    if !body["generationConfig"].is_object() {
+                        body["generationConfig"] = json!({});
+                    }
+                    body["generationConfig"]["responseMimeType"] = json!("application/json");
+                    body["generationConfig"]["responseSchema"] = output.schema;
+                }
+            }
+        }
     }
-    let Some(schema) = format.pointer("/json_schema/schema") else {
-        return;
-    };
-    let output = schema::normalize_output_for(
-        target(wire),
-        schema,
-        format["json_schema"]["strict"].as_bool().unwrap_or(true),
-    );
-    let name = format["json_schema"]["name"].as_str().unwrap_or("response");
-    match wire {
-        WireFormat::OpenAiChat => {
-            body["response_format"] = json!({"type":"json_schema","json_schema":{"name":name,"schema":output.schema,"strict":output.normalization.strict}})
-        }
-        WireFormat::OpenAiResponses => {
-            if !body["text"].is_object() {
-                body["text"] = json!({});
-            }
-            body["text"]["format"] = json!({"type":"json_schema","name":name,"schema":output.schema,"strict":output.normalization.strict});
-            body.as_object_mut().unwrap().remove("response_format");
-        }
-        WireFormat::AnthropicMessages => {
-            if !body["output_config"].is_object() {
-                body["output_config"] = json!({});
-            }
-            body["output_config"]["format"] = json!({"type":"json_schema","schema":output.schema});
-        }
-        WireFormat::GoogleGenerateContent => {
-            if !body["generationConfig"].is_object() {
-                body["generationConfig"] = json!({});
-            }
-            body["generationConfig"]["responseMimeType"] = json!("application/json");
-            body["generationConfig"]["responseSchema"] = output.schema;
-        }
-    }
+    budget.reserve_request_schemas(body)?;
+    Ok(())
 }
 
 pub(crate) fn add_usage(total: &mut Value, response: &Value) {
@@ -872,6 +945,85 @@ pub async fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_budget_error(error: ShimError) {
+        match error {
+            ShimError::ProviderError { status, body, .. } => {
+                assert_eq!(status, 400);
+                assert_eq!(body, "request schema budget exceeded");
+            }
+            error => panic!("unexpected error: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_tool_validators_share_a_fixed_pre_dispatch_budget() {
+        let request = json!({
+            "messages": [{"role":"user","content":"test"}],
+            "tools": [
+                {"type":"function","function":{"name":"first","parameters":{"type":"object"}}},
+                {"type":"function","function":{"name":"second","parameters":{"type":"object"}}}
+            ],
+            "x-shim": {"tool_calling":"prompt"}
+        });
+        let budget_limits = BudgetLimits {
+            validators: 1,
+            ..BudgetLimits::default()
+        };
+        let error = Plan::with_capabilities_and_budget_limits(
+            WireFormat::OpenAiChat,
+            &request,
+            ModelCapabilities::unknown(),
+            budget_limits,
+        )
+        .err()
+        .expect("the second validator must be rejected");
+        assert_budget_error(error);
+    }
+
+    #[test]
+    fn prompt_schema_rendering_is_reserved_before_a_plan_can_dispatch() {
+        let request = json!({
+            "messages": [{"role":"user","content":"test"}],
+            "response_format": {"type":"json_schema","json_schema":{"schema":{"type":"object"}}},
+            "x-shim": {"structured_output":"prompt"}
+        });
+        let budget_limits = BudgetLimits {
+            prompt_bytes: 1,
+            ..BudgetLimits::default()
+        };
+        let error = Plan::with_capabilities_and_budget_limits(
+            WireFormat::OpenAiChat,
+            &request,
+            ModelCapabilities::unknown(),
+            budget_limits,
+        )
+        .err()
+        .expect("prompt serialization must be rejected before rendering");
+        assert_budget_error(error);
+    }
+
+    #[test]
+    fn final_native_override_schemas_share_the_tool_and_output_budget() {
+        let request = json!({"messages":[]});
+        let mut body = json!({
+            "tools":[{"type":"function","name":"tool","parameters":{"type":"object"}}],
+            "text":{"format":{"type":"json_schema","schema":{"type":"object"}}}
+        });
+        let budget_limits = BudgetLimits {
+            schema_copies: 1,
+            ..BudgetLimits::default()
+        };
+        let mut budget = RequestBudget::with_limits(budget_limits);
+        let error = native_format(
+            &request,
+            WireFormat::OpenAiResponses,
+            &mut body,
+            &mut budget,
+        )
+        .unwrap_err();
+        assert_budget_error(error);
+    }
 
     #[test]
     fn a_repair_bills_both_attempts_rather_than_reverting_to_the_catalog() {
