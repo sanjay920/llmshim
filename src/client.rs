@@ -755,11 +755,17 @@ async fn observe_native_response_usage(
     let Some(tracker) = tracker.as_mut() else {
         return Ok(());
     };
-    if let Some(mut usage) = crate::usage::normalize_native_response_usage(target, native_response)
+    if let Some(mut observation) =
+        crate::usage::normalize_native_response_usage_observation(target, native_response)
     {
-        stamp_usage(target, &mut usage);
+        stamp_usage(target, &mut observation.usage);
         tracker
-            .usage(&usage)
+            .usage(
+                &observation.usage,
+                observation.terminal,
+                observation.counters_complete,
+                observation.explicit_zero,
+            )
             .await
             .map_err(DispatchFailure::PolicyObservation)?;
     }
@@ -833,9 +839,18 @@ fn observe_stream(
                     return None;
                 }
                 match state.inner.next().await {
-                    Some(Ok(SseOutput::Usage(mut usage))) => {
-                        stamp_usage(&state.target, &mut usage);
-                        if let Err(error) = state.tracker.usage(&usage).await {
+                    Some(Ok(SseOutput::Usage(mut observation))) => {
+                        stamp_usage(&state.target, &mut observation.usage);
+                        if let Err(error) = state
+                            .tracker
+                            .usage(
+                                &observation.usage,
+                                observation.terminal,
+                                observation.counters_complete,
+                                observation.explicit_zero,
+                            )
+                            .await
+                        {
                             record_policy_failure(&state.policy_failure, error);
                             state.ended = true;
                             return Some((Err(error.into_shim_error()), state));
@@ -1185,7 +1200,7 @@ impl Stream for SseStream {
 }
 
 enum SseOutput {
-    Usage(serde_json::Value),
+    Usage(crate::usage::NativeUsageObservation),
     Chunk(String),
 }
 
