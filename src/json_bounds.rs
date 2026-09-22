@@ -1,4 +1,6 @@
-pub(crate) use llmshim_catalog::bounded_json::{parse_slice, parse_str, Limits, ParseError};
+pub(crate) use llmshim_catalog::bounded_json::{
+    measure_value, parse_slice, parse_slice_with_usage, parse_str, Limits, ParseError, Usage,
+};
 
 pub(crate) fn enforce_sse_complexity(input: &str) -> crate::error::Result<()> {
     match parse_str(input, Limits::SSE) {

@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     convert::Infallible,
+    io::{self, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, OnceLock,
@@ -33,6 +34,8 @@ const RECEIPT_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5
 pub(crate) struct DefaultReceiptStore {
     receipts: Arc<Receipts>,
     executor: ReceiptExecutor,
+    restoration_limits: receipts::RestorationLimits,
+    canonical_maximum_bytes: usize,
 }
 
 impl DefaultReceiptStore {
@@ -44,6 +47,22 @@ impl DefaultReceiptStore {
         Self {
             receipts,
             executor: ReceiptExecutor::new(),
+            restoration_limits: receipts::RestorationLimits::default(),
+            canonical_maximum_bytes: receipts::REQUEST_MAX_SERIALIZED_BYTES,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_request_limits(
+        receipts: Arc<Receipts>,
+        restoration_limits: receipts::RestorationLimits,
+        canonical_maximum_bytes: usize,
+    ) -> Self {
+        Self {
+            receipts,
+            executor: ReceiptExecutor::new(),
+            restoration_limits,
+            canonical_maximum_bytes,
         }
     }
 }
@@ -246,6 +265,53 @@ pub enum Wire {
     Messages,
 }
 type Result<T> = std::result::Result<T, String>;
+
+struct BoundedCanonicalWriter {
+    bytes: Vec<u8>,
+    maximum_bytes: usize,
+}
+
+impl Write for BoundedCanonicalWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let remaining = self
+            .maximum_bytes
+            .checked_sub(self.bytes.len())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    receipts::REQUEST_LIMIT_ERROR_MESSAGE,
+                )
+            })?;
+        if buffer.len() > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                receipts::REQUEST_LIMIT_ERROR_MESSAGE,
+            ));
+        }
+        self.bytes.try_reserve_exact(buffer.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                receipts::REQUEST_LIMIT_ERROR_MESSAGE,
+            )
+        })?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_canonical_request(value: &Value, maximum_bytes: usize) -> Result<Vec<u8>> {
+    let mut writer = BoundedCanonicalWriter {
+        bytes: Vec::new(),
+        maximum_bytes,
+    };
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|_| receipts::REQUEST_LIMIT_ERROR_MESSAGE.to_owned())?;
+    Ok(writer.bytes)
+}
 fn array<'a>(value: &'a Value, name: &str) -> Result<&'a Vec<Value>> {
     value
         .as_array()
@@ -270,8 +336,13 @@ fn call_content(call: &Value) -> Result<Value> {
         };
     Ok(json!({"id":call["id"],"name":call["function"]["name"],"arguments":value}))
 }
-fn import_call(call: &Value, receipts: &Receipts, scope: &str) -> Result<Value> {
-    if let Some(issued) = receipts.get(scope, "call", &call["id"])? {
+fn import_call(
+    call: &Value,
+    receipts: &Receipts,
+    scope: &str,
+    restoration_budget: &mut receipts::RestorationBudget,
+) -> Result<Value> {
+    if let Some(issued) = receipts.get_bounded(scope, "call", &call["id"], restoration_budget)? {
         if call_content(&issued)? != call_content(call)? {
             return Err("issued tool call was modified".into());
         }
@@ -308,6 +379,23 @@ pub fn request_to_chat(
     receipts: &Receipts,
     scope: &str,
 ) -> Result<Value> {
+    request_to_chat_with_limits(
+        native,
+        wire,
+        receipts,
+        scope,
+        receipts::RestorationLimits::default(),
+    )
+}
+
+fn request_to_chat_with_limits(
+    native: &Value,
+    wire: Wire,
+    receipts: &Receipts,
+    scope: &str,
+    restoration_limits: receipts::RestorationLimits,
+) -> Result<Value> {
+    let mut restoration_budget = receipts::RestorationBudget::new(restoration_limits);
     let obj = native.as_object().ok_or("request must be an object")?;
     let model = native["model"]
         .as_str()
@@ -360,14 +448,21 @@ pub fn request_to_chat(
                 canonical.as_object_mut().unwrap().remove(field);
             }
             if role == "assistant" {
-                if let Some(reasoning) = receipts.get(scope, "reasoning", &message_key(message))? {
+                if let Some(reasoning) = receipts.get_bounded(
+                    scope,
+                    "reasoning",
+                    &message_key(message),
+                    &mut restoration_budget,
+                )? {
                     canonical["reasoning"] = reasoning;
                 }
                 if let Some(calls) = message.get("tool_calls") {
-                    canonical["tool_calls"] = json!(array(calls, "tool_calls")?
-                        .iter()
-                        .map(|call| import_call(call, receipts, scope))
-                        .collect::<Result<Vec<_>>>()?);
+                    canonical["tool_calls"] = Value::Array(
+                        array(calls, "tool_calls")?
+                            .iter()
+                            .map(|call| import_call(call, receipts, scope, &mut restoration_budget))
+                            .collect::<Result<Vec<_>>>()?,
+                    );
                 }
             }
             messages.push(canonical);
@@ -389,7 +484,7 @@ pub fn request_to_chat(
             match block["type"].as_str() {
                 Some("tool_use") if role == "assistant" => {
                     let call = json!({"id":block["id"],"type":"function","function":{"name":block["name"],"arguments":block["input"].to_string()}});
-                    let mut call = import_call(&call, receipts, scope)?;
+                    let mut call = import_call(&call, receipts, scope, &mut restoration_budget)?;
                     if let Some(cache) = block.get("cache_control") {
                         call["cache_control"] = cache.clone();
                     }
@@ -408,7 +503,9 @@ pub fn request_to_chat(
                     messages.push(result);
                 }
                 Some("thinking" | "redacted_thinking") if role == "assistant" => {
-                    if let Some(original) = receipts.get(scope, "block", block)? {
+                    if let Some(original) =
+                        receipts.get_bounded(scope, "block", block, &mut restoration_budget)?
+                    {
                         reasoning.push(original);
                     }
                 }
@@ -421,19 +518,25 @@ pub fn request_to_chat(
         if !content.is_empty() || !calls.is_empty() || !reasoning.is_empty() {
             let mut canonical = json!({"role":role,"content":content});
             if !calls.is_empty() {
-                canonical["tool_calls"] = json!(calls);
+                canonical["tool_calls"] = Value::Array(calls);
             }
             if !reasoning.is_empty() {
-                canonical["reasoning"] = json!(reasoning);
+                canonical["reasoning"] = Value::Array(reasoning);
             }
             messages.push(canonical);
         }
         boundaries.push(messages.len().checked_sub(1));
     }
-    let mut config = obj.clone();
-    for key in ["model", "messages", "system", "stream", "n"] {
-        config.remove(key);
-    }
+    let mut config = obj
+        .iter()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "model" | "messages" | "system" | "stream" | "n"
+            )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<String, Value>>();
     if let Some(segments) = config
         .get_mut("x-cache")
         .and_then(|cache| cache.get_mut("segments"))
@@ -485,9 +588,23 @@ pub fn request_to_chat(
             }
         }
     }
-    Ok(
-        json!({"model":model,"messages":messages,"stream":native["stream"].as_bool().unwrap_or(false),"fallback":native["fallback"],"provider_config":config}),
+    let mut canonical = json!({
+        "model": model,
+        "stream": native["stream"].as_bool().unwrap_or(false),
+        "fallback": native["fallback"],
+    });
+    canonical["messages"] = Value::Array(messages);
+    canonical["provider_config"] = Value::Object(config);
+    crate::json_bounds::measure_value(
+        &canonical,
+        crate::json_bounds::Limits {
+            max_depth: crate::json_bounds::Limits::INBOUND.max_depth,
+            max_nodes: restoration_limits.max_nodes,
+            max_owned_bytes: restoration_limits.max_owned_bytes,
+        },
     )
+    .map_err(|_| receipts::REQUEST_LIMIT_ERROR_MESSAGE.to_owned())?;
+    Ok(canonical)
 }
 
 pub fn response_from_chat(
@@ -674,6 +791,8 @@ pub async fn translate(request: Request, next: Next) -> Response {
         .cloned()
         .unwrap_or_else(|| default_store.receipts.clone());
     let receipt_executor = default_store.executor;
+    let restoration_limits = default_store.restoration_limits;
+    let canonical_maximum_bytes = default_store.canonical_maximum_bytes;
     let (mut parts, body) = request.into_parts();
     normalize_auth(&mut parts.headers);
     let identity = parts
@@ -728,12 +847,31 @@ pub async fn translate(request: Request, next: Next) -> Response {
     let request_scope = scope.clone();
     let chat = match receipt_executor
         .run(ReceiptWorkKind::Ingress, move || {
-            request_to_chat(&native, wire, &request_receipts, &request_scope)
+            request_to_chat_with_limits(
+                &native,
+                wire,
+                &request_receipts,
+                &request_scope,
+                restoration_limits,
+            )
         })
         .await
     {
         Ok(value) => value,
+        Err(ReceiptWorkError::Failed(message))
+            if message == receipts::REQUEST_LIMIT_ERROR_MESSAGE =>
+        {
+            return fail(
+                wire,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                receipts::REQUEST_LIMIT_ERROR_MESSAGE,
+            )
+        }
         Err(error) => return receipt_work_failure(wire, error, StatusCode::BAD_REQUEST),
+    };
+    let serialized_chat = match serialize_canonical_request(&chat, canonical_maximum_bytes) {
+        Ok(serialized) => serialized,
+        Err(message) => return fail(wire, StatusCode::PAYLOAD_TOO_LARGE, &message),
     };
     parts.headers.insert(
         header::CONTENT_TYPE,
@@ -741,7 +879,7 @@ pub async fn translate(request: Request, next: Next) -> Response {
     );
     parts.headers.remove(header::CONTENT_LENGTH);
     let response = next
-        .run(Request::from_parts(parts, Body::from(chat.to_string())))
+        .run(Request::from_parts(parts, Body::from(serialized_chat)))
         .await;
     let (mut parts, body) = response.into_parts();
     parts.headers.remove(header::CONTENT_LENGTH);
@@ -994,6 +1132,20 @@ mod async_receipt_tests {
     use std::{convert::Infallible, fs::OpenOptions, sync::atomic::AtomicUsize, time::Duration};
     use tower::ServiceExt;
 
+    fn anonymous_scope() -> String {
+        format!("{:x}", Sha256::digest(b"anonymous"))
+    }
+
+    fn issued_call(id: &str) -> Value {
+        json!({
+            "id":id,
+            "type":"function",
+            "function":{"name":"read","arguments":"{}"},
+            "thought_signature":{"data":"ordinary-signature","origin":{"provider":"gemini","model":"model","family":null,"wire":"google-generate-content","received_at":"2026-09-22T00:00:00Z"}},
+            "wire_ids":[{"provider":"gemini","wire":"google-generate-content","scope":"scope","part_id":"0","id":null}]
+        })
+    }
+
     fn canonical_response() -> Value {
         json!({
             "id":"response-id",
@@ -1036,6 +1188,202 @@ mod async_receipt_tests {
                     .to_string(),
             ))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeated_valid_receipt_refuses_before_handler_and_releases_for_next_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipts = Arc::new(Receipts::new(directory.path().to_owned()));
+        let call = issued_call("call_ls_budget");
+        receipts
+            .put(&anonymous_scope(), "call", &call["id"], &call)
+            .unwrap();
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let counted = handler_calls.clone();
+        let application = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move || {
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        Json(canonical_response())
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(translate))
+            .layer(axum::middleware::from_fn(bound_inference_request_json))
+            .layer(axum::middleware::from_fn_with_state(
+                DefaultReceiptStore::with_request_limits(
+                    receipts.clone(),
+                    receipts::RestorationLimits {
+                        max_serialized_bytes: 64 * 1024,
+                        max_owned_bytes: 64 * 1024,
+                        max_nodes: 256,
+                        max_occurrences: 1,
+                    },
+                    2 * 1024 * 1024,
+                ),
+                install_default_receipt_store,
+            ));
+        let native_call = native_call(&call);
+        let repeated = json!({
+            "model":"local/test",
+            "messages":[{"role":"assistant","content":null,"tool_calls":[native_call.clone(),native_call.clone()]}]
+        });
+        let refused = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(repeated.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            receipts
+                .get(&anonymous_scope(), "call", &call["id"])
+                .unwrap(),
+            Some(call.clone())
+        );
+
+        let valid = json!({
+            "model":"local/test",
+            "messages":[{"role":"assistant","content":null,"tool_calls":[native_call]}]
+        });
+        let accepted = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(valid.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn canonical_serialization_limit_refuses_before_handler() {
+        let receipts = Arc::new(Receipts::new(tempfile::tempdir().unwrap().keep()));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let counted = handler_calls.clone();
+        let application = Router::new()
+            .route(
+                "/v1/messages",
+                post(move || {
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        Json(canonical_response())
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(translate))
+            .layer(axum::middleware::from_fn(bound_inference_request_json))
+            .layer(axum::middleware::from_fn_with_state(
+                DefaultReceiptStore::with_request_limits(
+                    receipts,
+                    receipts::RestorationLimits::default(),
+                    64,
+                ),
+                install_default_receipt_store,
+            ));
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model":"local/test","messages":[{"role":"user","content":"ordinary"}]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tool_and_reasoning_restores_share_one_occurrence_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipts = Receipts::new(directory.path().to_owned());
+        let scope = "mixed-scope";
+        let call = issued_call("call_ls_mixed");
+        receipts.put(scope, "call", &call["id"], &call).unwrap();
+        let exported_block = json!({"type":"redacted_thinking","data":"lsr_mixed"});
+        let canonical_block = json!({
+            "kind":"redacted",
+            "data":"ordinary-redacted-data",
+            "origin":{"provider":"openai","model":"model","family":null,"wire":"openai-responses","received_at":"2026-09-22T00:00:00Z"},
+            "payload":{"type":"reasoning","encrypted_content":"ordinary-redacted-data"}
+        });
+        receipts
+            .put(scope, "block", &exported_block, &canonical_block)
+            .unwrap();
+        let native = json!({
+            "model":"local/test",
+            "messages":[{"role":"assistant","content":[
+                {"type":"tool_use","id":"call_ls_mixed","name":"read","input":{}},
+                exported_block
+            ]}]
+        });
+        let error = request_to_chat_with_limits(
+            &native,
+            Wire::Messages,
+            &receipts,
+            scope,
+            receipts::RestorationLimits {
+                max_serialized_bytes: 64 * 1024,
+                max_owned_bytes: 64 * 1024,
+                max_nodes: 256,
+                max_occurrences: 1,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, receipts::REQUEST_LIMIT_ERROR_MESSAGE);
+
+        let restored = request_to_chat(&native, Wire::Messages, &receipts, scope).unwrap();
+        assert_eq!(restored["messages"][0]["reasoning"][0], canonical_block);
+        assert_eq!(restored["messages"][0]["tool_calls"][0], call);
+    }
+
+    #[test]
+    fn canonical_node_limit_is_checked_before_serialization() {
+        let receipts = Receipts::new(tempfile::tempdir().unwrap().keep());
+        let native = json!({
+            "model":"local/test",
+            "messages":[{"role":"user","content":"ordinary"}]
+        });
+        let error = request_to_chat_with_limits(
+            &native,
+            Wire::Chat,
+            &receipts,
+            "scope",
+            receipts::RestorationLimits {
+                max_serialized_bytes: 1024,
+                max_owned_bytes: 1024,
+                max_nodes: 4,
+                max_occurrences: 4,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, receipts::REQUEST_LIMIT_ERROR_MESSAGE);
+        assert_eq!(native["messages"][0]["content"], "ordinary");
     }
 
     #[tokio::test]
