@@ -82,7 +82,7 @@ fn structured_block_footprint(
     }?
     .checked_add(payload["id"].as_str().map(str::len).unwrap_or(0))?
     .checked_add(field.map(str::len).unwrap_or(0))?;
-    let mut footprint = DerivedFootprint::record(size_of::<ReasoningBlock>())
+    let mut footprint = DerivedFootprint::record(size_of::<ReasoningBlock>())?
         .checked_add(crate::derived_response::origin_footprint(target)?)?
         .checked_add(DerivedFootprint::strings(copied_string_bytes))?;
     if include_payload {
@@ -112,6 +112,7 @@ fn reserve_plain_block(
     copied_string_bytes: usize,
 ) -> crate::error::Result<()> {
     let footprint = DerivedFootprint::record(size_of::<ReasoningBlock>())
+        .ok_or_else(|| budget.error())?
         .checked_add(
             crate::derived_response::origin_footprint(target).ok_or_else(|| budget.error())?,
         )
@@ -130,6 +131,13 @@ fn structured_block_with_budget(
     budget: &mut DerivedResponseBudget,
 ) -> crate::error::Result<Option<ReasoningBlock>> {
     if !recognized_structured_block(payload) {
+        return Ok(None);
+    }
+    if matches!(
+        payload["type"].as_str(),
+        Some("redacted_thinking" | "reasoning.encrypted")
+    ) && payload["data"].as_str().is_none()
+    {
         return Ok(None);
     }
     let footprint = structured_block_footprint(payload, target, field, include_payload)
@@ -253,6 +261,7 @@ pub(super) fn chat_blocks(
         ])
         .ok_or_else(|| budget.error())?;
         let footprint = DerivedFootprint::record(size_of::<ReasoningBlock>())
+            .ok_or_else(|| budget.error())?
             .checked_add(
                 crate::derived_response::origin_footprint(target).ok_or_else(|| budget.error())?,
             )
@@ -275,6 +284,7 @@ pub(super) fn chat_blocks(
     }
     if let Some(data) = message["redacted_reasoning_content"].as_str() {
         let footprint = DerivedFootprint::record(size_of::<ReasoningBlock>())
+            .ok_or_else(|| budget.error())?
             .checked_add(
                 crate::derived_response::origin_footprint(target).ok_or_else(|| budget.error())?,
             )
@@ -385,6 +395,7 @@ fn stamp_tool_signatures(
         for call in calls {
             if let Some(data) = call["thought_signature"].as_str() {
                 let footprint = DerivedFootprint::record(size_of::<ThoughtSignature>())
+                    .ok_or_else(|| budget.error())?
                     .checked_add(
                         crate::derived_response::origin_footprint(target)
                             .ok_or_else(|| budget.error())?,

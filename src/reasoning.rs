@@ -2,6 +2,8 @@
 //! Opaque data is never inspected to decide where a block may be sent.
 mod normalize;
 pub(crate) use normalize::capture_response_with_budget;
+#[cfg(test)]
+pub(crate) use normalize::capture_stream_with_budget;
 pub use normalize::{capture_response, capture_stream, reasoning_text, ReasoningAccumulator};
 
 use crate::catalog::{self, ModelFamily};
@@ -587,6 +589,8 @@ pub(crate) fn enforce_stateless(body: &mut Value) -> crate::error::Result<()> {
 /// Rebind adapter-created metadata to the immutable HTTP request context. This
 /// matters when OAuth credentials/account selection change while a stream runs.
 pub(crate) fn bind_response_context_unchecked(response: &mut Value, target: &ReplayTarget) {
+    let target_family = json!(target.family);
+    let target_wire = json!(target.wire);
     let Some(choices) = response.get_mut("choices").and_then(Value::as_array_mut) else {
         return;
     };
@@ -597,29 +601,32 @@ pub(crate) fn bind_response_context_unchecked(response: &mut Value, target: &Rep
             };
             if let Some(blocks) = message.get_mut("reasoning").and_then(Value::as_array_mut) {
                 for block in blocks {
-                    bind_origin(&mut block["origin"], target);
+                    bind_origin(&mut block["origin"], target, &target_family, &target_wire);
                 }
             }
             if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 for call in calls {
                     if let Some(origin) = call.pointer_mut("/thought_signature/origin") {
-                        bind_origin(origin, target);
+                        bind_origin(origin, target, &target_family, &target_wire);
                     }
                 }
             }
         }
     }
 }
-fn bind_origin(origin: &mut Value, target: &ReplayTarget) {
+fn bind_origin(
+    origin: &mut Value,
+    target: &ReplayTarget,
+    target_family: &Value,
+    target_wire: &Value,
+) {
     replace_string_if_changed(origin, "provider", &target.provider);
     replace_string_if_changed(origin, "model", &target.model);
-    let family = json!(target.family);
-    if origin["family"] != family {
-        origin["family"] = family;
+    if origin["family"] != *target_family {
+        origin["family"] = target_family.clone();
     }
-    let wire = json!(target.wire);
-    if origin["wire"] != wire {
-        origin["wire"] = wire;
+    if origin["wire"] != *target_wire {
+        origin["wire"] = target_wire.clone();
     }
     if let Some(account) = &target.account {
         replace_string_if_changed(origin, "account", account);

@@ -749,6 +749,7 @@ impl ToolStream {
             let binding_footprint = crate::derived_response::DerivedFootprint::record(
                 std::mem::size_of::<WireToolId>(),
             )
+            .ok_or_else(|| frame_budget.error())?
             .checked_add(crate::derived_response::DerivedFootprint::strings(
                 binding_string_bytes,
             ))
@@ -769,6 +770,7 @@ impl ToolStream {
                     crate::derived_response::DerivedFootprint::record(std::mem::size_of::<
                         ThoughtSignature,
                     >())
+                    .ok_or_else(|| frame_budget.error())?
                     .checked_add(crate::derived_response::DerivedFootprint::strings(
                         signature_string_bytes,
                     ))

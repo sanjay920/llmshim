@@ -163,7 +163,7 @@ fn binding_footprint(
         .checked_add(id.map(str::len).unwrap_or(0))?
         .checked_add(item.map(str::len).unwrap_or(0))?
         .checked_add(40)?;
-    DerivedFootprint::record(size_of::<WireToolId>())
+    DerivedFootprint::record(size_of::<WireToolId>())?
         .checked_add(DerivedFootprint::strings(string_bytes))?
         .checked_multiply(2)
 }
@@ -295,6 +295,7 @@ pub(crate) fn capture_response_with_budget(
             {
                 let signature_footprint =
                     DerivedFootprint::record(size_of::<crate::reasoning::ThoughtSignature>())
+                        .ok_or_else(|| budget.error())?
                         .checked_add(
                             crate::derived_response::origin_footprint(target)
                                 .ok_or_else(|| budget.error())?,
@@ -714,6 +715,7 @@ pub(crate) fn validate_native(body: &Value, target: &ReplayTarget) -> Result<()>
 }
 
 pub(crate) fn bind_response_context_unchecked(response: &mut Value, target: &ReplayTarget) {
+    let target_wire = json!(target.wire);
     let Some(choices) = response.get_mut("choices").and_then(Value::as_array_mut) else {
         return;
     };
@@ -731,9 +733,8 @@ pub(crate) fn bind_response_context_unchecked(response: &mut Value, target: &Rep
                         if b["provider"].as_str() != Some(&target.provider) {
                             b["provider"] = Value::String(target.provider.clone());
                         }
-                        let target_wire = json!(target.wire);
                         if b["wire"] != target_wire {
-                            b["wire"] = target_wire;
+                            b["wire"] = target_wire.clone();
                         }
                     }
                 }
