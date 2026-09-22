@@ -18,7 +18,8 @@ fn anonymous() -> String {
 }
 
 /// Who a request belongs to, resolved from its API key (or the header in open
-/// mode). `rpm`/`tpm` are optional per-tenant limits enforced by the gateway.
+/// mode). `rpm`/`tpm` are optional per-tenant limits enforced by the gateway;
+/// omitted means unlimited and an explicit zero denies every request.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Identity {
     #[serde(default = "anonymous")]
