@@ -126,14 +126,14 @@ impl Logger {
             use std::os::unix::fs::OpenOptionsExt;
             file_options.mode(0o600);
         }
-        let file = file_options.open(path)?;
+        let log_file = file_options.open(path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            log_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
         Ok(Self {
-            writer: Arc::new(Mutex::new(Box::new(file))),
+            writer: Arc::new(Mutex::new(Box::new(log_file))),
         })
     }
 
