@@ -312,7 +312,9 @@ Known-floor records share the finite retained-accounting index. If that index
 cannot retain newly learned spend, the same origin transaction sets one fleet
 freeze marker through the longest affected retention horizon. It remains in
 force if a slot later frees, so a stale descriptor cannot exploit discarded
-knowledge.
+knowledge. A malformed, negative, non-finite, or wrong-type active legacy value
+also sets or extends that marker before the origin fails closed; its amount is
+unknown, so older queued snapshots cannot safely proceed.
 Keep each identity's `budget_window_secs` unchanged through this transition so
 the old and new counters name the same tumbling window.
 
@@ -322,6 +324,10 @@ workers from weakening new-origin jobs, but cannot retrofit atomic accounting
 into old ingress. Stop old ingress before claiming one fleet-wide hard cap for
 the rest of the transition window. After old ingress is stopped, queued legacy
 scoped jobs fail closed on new workers; custom unscoped jobs remain compatible.
+If Redis cannot execute or persist the origin transaction at all, it cannot
+durably record a freeze. Worker coordination fails while Redis is unavailable;
+after recovery, require a fresh successful origin retention before treating
+previously queued transition work as safe.
 
 Do not infer capacity from llmshim's implementation details alone. The
 [README benchmarks](https://github.com/sanjay920/llmshim#benchmarks) are the
