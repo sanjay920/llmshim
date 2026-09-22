@@ -717,7 +717,7 @@ pub async fn translate(request: Request, next: Next) -> Response {
                             yield Ok(Event::default().event("content_block_delta").data(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":data["text"]}}).to_string()));
                         }
                     },
-                    Some("reasoning")=>reasoning.push(&json!({"reasoning":data["blocks"]})),
+                    Some("reasoning")=>if reasoning.push(&json!({"reasoning":data["blocks"]})).is_err(){yield Ok(Event::default().event("error").data(error_body(wire,crate::stream_retention::RETENTION_ERROR).to_string()));return;},
                     Some("tool_call")=>{if !response["message"]["tool_calls"].is_array(){response["message"]["tool_calls"]=json!([]);}
                         let mut call=json!({"id":data["id"],"type":"function","function":{"name":data["name"],"arguments":data["arguments"]},"wire_ids":data["wire_ids"]});if let Some(sig)=data.get("thought_signature"){call["thought_signature"]=sig.clone();}
                         response["message"]["tool_calls"].as_array_mut().unwrap().push(call);response["finish_reason"]=json!("tool_calls");},

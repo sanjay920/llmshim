@@ -1367,7 +1367,11 @@ async fn main() {
                                 served_model = Some(served.clone());
                             }
                             let delta = &parsed["choices"][0]["delta"];
-                            reasoning.push(delta);
+                            if let Err(error) = reasoning.push(delta) {
+                                eprintln!("\n{error}");
+                                stream_failed = true;
+                                break;
+                            }
                             let reasoning_text = llmshim::reasoning::reasoning_text(delta);
                             if !reasoning_text.is_empty() {
                                 if !in_reasoning {
