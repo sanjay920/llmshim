@@ -1,8 +1,8 @@
 use crate::breaker::ProviderBreaker;
 use crate::error::{Result, ShimError};
 use crate::policy::{
-    AttemptKind, AttemptOutcome, AttemptPolicyError, AttemptPolicyRefusal, AttemptTracker,
-    DispatchPolicyContext,
+    AttemptAcquireError, AttemptKind, AttemptOutcome, AttemptPolicyError, AttemptPolicyRefusal,
+    AttemptTracker, DispatchPolicyContext,
 };
 use crate::provider::{Provider, ProviderRequest};
 use crate::reasoning::ReplayTarget;
@@ -36,6 +36,7 @@ pub(crate) enum DispatchFailure {
     Upstream(ShimError),
     Local(ShimError),
     LocalTimeout(ShimError),
+    LogicalTimeout(ShimError),
     PolicyRefusal(AttemptPolicyRefusal),
     PolicyObservation(AttemptPolicyError),
 }
@@ -45,7 +46,10 @@ pub(crate) type DispatchResult<T> = std::result::Result<T, DispatchFailure>;
 impl DispatchFailure {
     pub(crate) fn into_public(self) -> ShimError {
         match self {
-            Self::Upstream(error) | Self::Local(error) | Self::LocalTimeout(error) => error,
+            Self::Upstream(error)
+            | Self::Local(error)
+            | Self::LocalTimeout(error)
+            | Self::LogicalTimeout(error) => error,
             Self::PolicyRefusal(refusal) => refusal.into_shim_error(),
             Self::PolicyObservation(error) => error.into_shim_error(),
         }
@@ -155,6 +159,21 @@ fn timeout_504() -> DispatchFailure {
     })
 }
 
+fn logical_timeout_504() -> DispatchFailure {
+    DispatchFailure::LogicalTimeout(ShimError::ProviderError {
+        status: 504,
+        body: "proxy logical request timed out".into(),
+        retry_after: None,
+    })
+}
+
+fn map_attempt_acquire_error(error: AttemptAcquireError) -> DispatchFailure {
+    match error {
+        AttemptAcquireError::Refusal(refusal) => DispatchFailure::PolicyRefusal(refusal),
+        AttemptAcquireError::LogicalDeadline => logical_timeout_504(),
+    }
+}
+
 async fn finish_transport_failure(
     tracker: &mut Option<AttemptTracker>,
     callback_timeout: Duration,
@@ -254,6 +273,7 @@ impl ShimClient {
             Err(
                 DispatchFailure::Local(_)
                 | DispatchFailure::LocalTimeout(_)
+                | DispatchFailure::LogicalTimeout(_)
                 | DispatchFailure::PolicyRefusal(_)
                 | DispatchFailure::PolicyObservation(_),
             ) => None,
@@ -333,17 +353,26 @@ impl ShimClient {
                         )
                         .await
                         {
-                            Ok(result) => result.map_err(DispatchFailure::PolicyRefusal)?,
+                            Ok(result) => result.map_err(map_attempt_acquire_error)?,
                             Err(()) => {
+                                if context.ensure_logical_active().is_err() {
+                                    return Err(logical_timeout_504());
+                                }
                                 return Err(DispatchFailure::PolicyRefusal(
                                     coordinator_timeout_refusal(),
-                                ))
+                                ));
                             }
                         },
                     )
                 }
                 None => None,
             };
+
+            if let Some(context) = policy_context {
+                context
+                    .ensure_logical_active()
+                    .map_err(|_| logical_timeout_504())?;
+            }
 
             let header_deadline = earlier_deadline(
                 attempt_deadline,
