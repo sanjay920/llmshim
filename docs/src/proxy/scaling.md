@@ -306,6 +306,12 @@ worker that has lost its lease can no longer publish or mutate the replacement
 delivery. Lease creation, refresh, and reaping use Redis `TIME`, so host clock
 skew cannot expire another worker's healthy lease.
 
+Cancellation is ordered in the same Redis transitions as stream publication,
+terminal completion, rate release, reaping and DLQ movement. Once cancellation
+wins, later response chunks and provider content are suppressed and the durable
+terminal is the fixed cancellation envelope. Usage already observed from a
+provider remains settled; cancellation does not infer a refund.
+
 Distributed worker jobs have a finite six-hour lifetime by default. Redis
 lease operations are bounded to five seconds or one quarter of the configured
 lease, whichever is shorter. Positive millisecond overrides are available as
@@ -315,10 +321,10 @@ the finite defaults. A worker deadline drops local provider work while retaining
 the heartbeat, then publishes its error, records completion, and removes lease
 state in one owner-fenced Redis transaction.
 
-Finite Redis waits also cover distributed connection setup, readiness, queue
-and DLQ statistics, lifecycle reserve/activate/cancel/readback and the bounded
-generic and scoped idempotency caches. A leased request and its metadata retain
-hard expiry headroom for the full worker lifetime plus cleanup grace.
+Caller-side Redis deadlines also cover distributed connection setup, readiness,
+queue and DLQ statistics, lifecycle reserve/activate/cancel/readback and the
+bounded generic and scoped idempotency caches. A leased request and its metadata
+retain hard expiry headroom for the full worker lifetime plus cleanup grace.
 
 The queue remains at-least-once across an actual worker crash or coordination
 partition. If a provider accepted a request before ownership became uncertain,
@@ -353,10 +359,20 @@ Terminal envelopes are retained durably for bus-loss readback. Scoped
 idempotency stores a bounded pointer to that single terminal copy instead of a
 second response. The deprecated generic Redis cache is separately bounded to
 100,000 entries, 1 MiB per value, 64 MiB total, and at most one day of TTL.
-Expired lifecycle records are removed in fixed-size batches; state movement
-between waiting, processing, requeue, terminal, and DLQ does not double-count
-request bytes. New DLQ retention is limited to 1,000 entries, 64 MiB and 24
-hours.
+Both cache kinds use per-entry Redis expiry; bounded reservation indexes let a
+restarted janitor recover count and byte accounting after the value has expired.
+The pointer and its terminal extension use the same capped effective TTL; a
+terminal's existing longer default retention is not shortened.
+Concurrent first-request cache misses are not coalesced and may execute more
+than once. Expired lifecycle records are removed in fixed-size batches;
+authoritative bounded reservation indexes retain the state, scope and charges
+needed to release counters and queue/DLQ ownership even after payload and
+metadata hard expiry. State movement between waiting, processing, requeue,
+terminal, and DLQ does not double-count request bytes. Pending/waiting
+cancellation and DLQ diagnostic envelopes fit inside each job's 4 KiB base
+metadata allowance; processing cancellation and provider response terminals
+use pre-reserved terminal capacity. New DLQ retention is limited to 1,000
+entries, 64 MiB and 24 hours.
 
 Lifecycle-v1 ingress remains disabled while any known older waiting or
 processing namespace is nonempty. Stop old ingress and let matching old workers
