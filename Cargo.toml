@@ -44,6 +44,9 @@ base64 = "0.22"
 tempfile = "3"
 fs2 = "0.4"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Proxy dependencies (feature-gated)
 axum = { version = "0.8", features = ["json"], optional = true }
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"], optional = true }

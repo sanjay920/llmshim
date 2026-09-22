@@ -85,6 +85,75 @@ fn config_save_replaces_existing_permissive_file_with_private_modes() {
 
 #[cfg(unix)]
 #[test]
+fn config_load_repairs_legacy_default_file_and_directory_modes() {
+    let temporary_home_directory = tempfile::tempdir().unwrap();
+    let config_directory_path = temporary_home_directory.path().join(".llmshim");
+    let config_file_path = config_directory_path.join("config.toml");
+    std::fs::create_dir_all(&config_directory_path).unwrap();
+    std::fs::write(&config_file_path, "[keys]\nopenai = \"test-placeholder\"\n").unwrap();
+    std::fs::set_permissions(
+        &config_directory_path,
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config_file_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let command_output = Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args(["get", "openai"])
+        .env("HOME", temporary_home_directory.path())
+        .env("LLMSHIM_CATALOG_OFFLINE", "1")
+        .output()
+        .unwrap();
+
+    assert!(command_output.status.success());
+    assert!(!String::from_utf8_lossy(&command_output.stdout).contains("(not set)"));
+    assert_eq!(
+        std::fs::metadata(&config_directory_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&config_file_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_load_rejects_a_default_path_symlink_without_reading_its_target() {
+    let temporary_home_directory = tempfile::tempdir().unwrap();
+    let config_directory_path = temporary_home_directory.path().join(".llmshim");
+    let target_path = temporary_home_directory.path().join("config-target.toml");
+    std::fs::create_dir_all(&config_directory_path).unwrap();
+    std::fs::write(&target_path, "[keys]\nopenai = \"target-value\"\n").unwrap();
+    std::os::unix::fs::symlink(&target_path, config_directory_path.join("config.toml")).unwrap();
+
+    let command_output = Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args(["get", "openai"])
+        .env("HOME", temporary_home_directory.path())
+        .env("LLMSHIM_CATALOG_OFFLINE", "1")
+        .output()
+        .unwrap();
+
+    assert!(command_output.status.success());
+    assert!(String::from_utf8_lossy(&command_output.stdout).contains("(not set)"));
+    assert!(String::from_utf8_lossy(&command_output.stderr)
+        .contains("default configuration file could not be safely loaded"));
+    assert_eq!(
+        std::fs::read_to_string(target_path).unwrap(),
+        "[keys]\nopenai = \"target-value\"\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn malformed_config_diagnostic_excludes_source_marker_and_retains_location() {
     let temporary_home_directory = tempfile::tempdir().unwrap();
     let config_directory_path = temporary_home_directory.path().join(".llmshim");

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fs::File,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -133,6 +133,7 @@ pub struct DeviceCode {
 #[derive(Clone)]
 pub struct ChatGptAuth {
     path: PathBuf,
+    protect_default_path: bool,
     base_url: String,
     http: Client,
 }
@@ -145,16 +146,23 @@ impl Default for ChatGptAuth {
 
 impl ChatGptAuth {
     pub fn from_env() -> Self {
-        let dir = std::env::var_os("CHATGPT_TOKEN_DIR")
+        let token_directory_override = std::env::var_os("CHATGPT_TOKEN_DIR");
+        let auth_file_override = std::env::var_os("CHATGPT_AUTH_FILE");
+        let use_default_path = token_directory_override.is_none() && auth_file_override.is_none();
+        let dir = token_directory_override
+            .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| crate::config::config_dir().join("chatgpt"));
-        let file = std::env::var_os("CHATGPT_AUTH_FILE").unwrap_or_else(|| "auth.json".into());
-        Self::new(dir.join(file))
+        let file = auth_file_override.unwrap_or_else(|| "auth.json".into());
+        let mut auth = Self::new(dir.join(file));
+        auth.protect_default_path = use_default_path;
+        auth
     }
 
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
+            protect_default_path: false,
             base_url: AUTH_BASE.into(),
             http: Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -179,10 +187,24 @@ impl ChatGptAuth {
     }
 
     fn read(&self) -> Result<Option<Tokens>> {
-        let data = match std::fs::read(&self.path) {
-            Ok(data) => data,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(storage_error(e)),
+        let mut data = Vec::new();
+        if self.protect_default_path {
+            let mut file_handle = crate::default_secret_file::open_default_secret_file(
+                &crate::config::config_dir(),
+                &["chatgpt"],
+                "auth.json",
+            )
+            .map_err(storage_error)?;
+            let Some(file_handle) = file_handle.as_mut() else {
+                return Ok(None);
+            };
+            file_handle.read_to_end(&mut data).map_err(storage_error)?;
+        } else {
+            data = match std::fs::read(&self.path) {
+                Ok(data) => data,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(storage_error(e)),
+            };
         };
         let mut tokens: Tokens = serde_json::from_slice(&data)
             .map_err(|_| auth_error(401, "invalid OAuth cache; run `llmshim login chatgpt`"))?;
