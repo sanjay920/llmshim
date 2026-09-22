@@ -15,7 +15,181 @@ use futures::StreamExt;
 pub use receipts::Receipts;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{convert::Infallible, sync::Arc};
+use std::{
+    convert::Infallible,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
+};
+use tokio::sync::Semaphore;
+
+const RECEIPT_WORKERS: usize = 2;
+const RECEIPT_INGRESS_CAPACITY: usize = 8;
+const RECEIPT_EGRESS_CAPACITY: usize = 4;
+const RECEIPT_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Clone, Debug)]
+pub(crate) struct DefaultReceiptStore {
+    receipts: Arc<Receipts>,
+    executor: ReceiptExecutor,
+}
+
+impl DefaultReceiptStore {
+    pub(crate) fn from_env() -> Self {
+        Self::new(Arc::new(Receipts::from_env()))
+    }
+
+    pub(crate) fn new(receipts: Arc<Receipts>) -> Self {
+        Self {
+            receipts,
+            executor: ReceiptExecutor::new(),
+        }
+    }
+}
+
+pub(crate) async fn install_default_receipt_store(
+    axum::extract::State(default_store): axum::extract::State<DefaultReceiptStore>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if request.extensions().get::<DefaultReceiptStore>().is_none() {
+        request.extensions_mut().insert(default_store);
+    }
+    next.run(request).await
+}
+
+fn fallback_receipt_store() -> DefaultReceiptStore {
+    static STORE: OnceLock<DefaultReceiptStore> = OnceLock::new();
+    STORE.get_or_init(DefaultReceiptStore::from_env).clone()
+}
+
+#[derive(Clone, Debug)]
+struct ReceiptExecutor {
+    workers: Arc<Semaphore>,
+    ingress_worker: Arc<Semaphore>,
+    ingress_capacity: Arc<Semaphore>,
+    egress_capacity: Arc<Semaphore>,
+    lock_timeout: std::time::Duration,
+}
+
+#[derive(Clone, Copy)]
+enum ReceiptWorkKind {
+    Ingress,
+    Egress,
+}
+
+struct ReceiptWorkPermits {
+    _capacity: tokio::sync::OwnedSemaphorePermit,
+    _ingress_worker: Option<tokio::sync::OwnedSemaphorePermit>,
+    _worker: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
+enum ReceiptWorkError {
+    Busy,
+    Failed(String),
+}
+
+struct CancelReceiptWork {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for CancelReceiptWork {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl ReceiptExecutor {
+    fn new() -> Self {
+        Self {
+            workers: Arc::new(Semaphore::new(RECEIPT_WORKERS)),
+            ingress_worker: Arc::new(Semaphore::new(1)),
+            ingress_capacity: Arc::new(Semaphore::new(RECEIPT_INGRESS_CAPACITY)),
+            egress_capacity: Arc::new(Semaphore::new(RECEIPT_EGRESS_CAPACITY)),
+            lock_timeout: receipts::configured_http_lock_timeout(),
+        }
+    }
+
+    async fn acquire(
+        &self,
+        kind: ReceiptWorkKind,
+    ) -> std::result::Result<ReceiptWorkPermits, ReceiptWorkError> {
+        let capacity = match kind {
+            ReceiptWorkKind::Ingress => self.ingress_capacity.clone(),
+            ReceiptWorkKind::Egress => self.egress_capacity.clone(),
+        }
+        .try_acquire_owned()
+        .map_err(|_| ReceiptWorkError::Busy)?;
+        let acquire = async {
+            let ingress_worker = match kind {
+                ReceiptWorkKind::Ingress => Some(
+                    self.ingress_worker
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| ReceiptWorkError::Busy)?,
+                ),
+                ReceiptWorkKind::Egress => None,
+            };
+            let worker = self
+                .workers
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| ReceiptWorkError::Busy)?;
+            Ok(ReceiptWorkPermits {
+                _capacity: capacity,
+                _ingress_worker: ingress_worker,
+                _worker: worker,
+            })
+        };
+        tokio::time::timeout(RECEIPT_QUEUE_WAIT, acquire)
+            .await
+            .map_err(|_| ReceiptWorkError::Busy)?
+    }
+
+    async fn run<T, F>(
+        &self,
+        kind: ReceiptWorkKind,
+        operation: F,
+    ) -> std::result::Result<T, ReceiptWorkError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        let permits = self.acquire(kind).await?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let lock_timeout = self.lock_timeout;
+        let mut cancellation = CancelReceiptWork {
+            cancelled,
+            armed: true,
+        };
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permits = permits;
+            if worker_cancelled.load(Ordering::Acquire) {
+                return Err(ReceiptWorkError::Busy);
+            }
+            receipts::with_http_lock_timeout(lock_timeout, operation).map_err(|message| {
+                if message == receipts::BUSY_ERROR_MESSAGE {
+                    ReceiptWorkError::Busy
+                } else {
+                    ReceiptWorkError::Failed(message)
+                }
+            })
+        });
+        let result = worker.await.map_err(|_| {
+            ReceiptWorkError::Failed("native replay metadata is unavailable".into())
+        })?;
+        cancellation.armed = false;
+        result
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wire {
@@ -385,6 +559,27 @@ fn error_from_event(wire: Wire, event: &Value) -> Value {
 pub(crate) fn fail(wire: Wire, status: StatusCode, message: &str) -> Response {
     (status, Json(error_for_status(wire, status, message))).into_response()
 }
+
+fn receipt_work_failure(
+    wire: Wire,
+    error: ReceiptWorkError,
+    conversion_status: StatusCode,
+) -> Response {
+    match error {
+        ReceiptWorkError::Failed(message) => fail(wire, conversion_status, &message),
+        ReceiptWorkError::Busy => {
+            let mut response = fail(
+                wire,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "native replay metadata is busy; retry the request",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+            response
+        }
+    }
+}
 fn error_for_status(wire: Wire, status: StatusCode, message: &str) -> Value {
     native_error_body(wire, message, fallback_error_type(wire, status))
 }
@@ -410,11 +605,17 @@ pub async fn translate(request: Request, next: Next) -> Response {
         "/v1/messages" => Wire::Messages,
         _ => return next.run(request).await,
     };
+    let default_store = request
+        .extensions()
+        .get::<DefaultReceiptStore>()
+        .cloned()
+        .unwrap_or_else(fallback_receipt_store);
     let receipts = request
         .extensions()
         .get::<Arc<Receipts>>()
         .cloned()
-        .unwrap_or_else(|| Arc::new(Receipts::from_env()));
+        .unwrap_or_else(|| default_store.receipts.clone());
+    let receipt_executor = default_store.executor;
     let (mut parts, body) = request.into_parts();
     normalize_auth(&mut parts.headers);
     let identity = parts
@@ -454,9 +655,17 @@ pub async fn translate(request: Request, next: Next) -> Response {
         Ok(v) => v,
         Err(_) => return fail(wire, StatusCode::BAD_REQUEST, "invalid JSON request"),
     };
-    let chat = match request_to_chat(&native, wire, &receipts, &scope) {
-        Ok(v) => v,
-        Err(error) => return fail(wire, StatusCode::BAD_REQUEST, &error),
+    let request_native = native.clone();
+    let request_receipts = receipts.clone();
+    let request_scope = scope.clone();
+    let chat = match receipt_executor
+        .run(ReceiptWorkKind::Ingress, move || {
+            request_to_chat(&request_native, wire, &request_receipts, &request_scope)
+        })
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => return receipt_work_failure(wire, error, StatusCode::BAD_REQUEST),
     };
     parts.headers.insert(
         header::CONTENT_TYPE,
@@ -521,7 +730,13 @@ pub async fn translate(request: Request, next: Next) -> Response {
             }
             if !done {yield Ok(Event::default().event("error").data(error_body(wire,"stream ended before completion").to_string()));return;}
             let blocks=reasoning.blocks();if !blocks.is_empty(){response["message"]["reasoning"]=json!(blocks);}
-            let native=match response_from_chat(&response,wire,&receipts,&scope){Ok(v)=>v,Err(error)=>{yield Ok(Event::default().event("error").data(error_body(wire,&error).to_string()));return;}};
+            let response_receipts=receipts.clone();
+            let response_scope=scope.clone();
+            let native=match receipt_executor.run(ReceiptWorkKind::Egress, move || response_from_chat(&response,wire,&response_receipts,&response_scope)).await {
+                Ok(value)=>value,
+                Err(ReceiptWorkError::Failed(error))=>{yield Ok(Event::default().event("error").data(error_body(wire,&error).to_string()));return;},
+                Err(ReceiptWorkError::Busy)=>{yield Ok(Event::default().event("error").data(error_body(wire,"native replay metadata is busy; retry the request").to_string()));return;},
+            };
             let mut native=native;
             if wire==Wire::Chat {
                 // Text was already streamed. Emit completed reasoning/calls once.
@@ -565,9 +780,18 @@ pub async fn translate(request: Request, next: Next) -> Response {
         }
     };
     let native = if parts.status.is_success() {
-        match response_from_chat(&value, wire, &receipts, &scope) {
-            Ok(v) => v,
-            Err(error) => return fail(wire, StatusCode::INTERNAL_SERVER_ERROR, &error),
+        let response_receipts = receipts.clone();
+        let response_scope = scope.clone();
+        match receipt_executor
+            .run(ReceiptWorkKind::Egress, move || {
+                response_from_chat(&value, wire, &response_receipts, &response_scope)
+            })
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return receipt_work_failure(wire, error, StatusCode::INTERNAL_SERVER_ERROR)
+            }
         }
     } else {
         if let Some(error) = parts.extensions.get::<crate::error::NormalizedError>() {
@@ -684,5 +908,314 @@ pub(crate) fn normalize_auth(headers: &mut axum::http::HeaderMap) {
                 headers.insert(header::AUTHORIZATION, value);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod async_receipt_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+        response::{sse::Event, IntoResponse, Sse},
+        routing::post,
+        Extension, Router,
+    };
+    use fs2::FileExt;
+    use futures::stream;
+    use std::{convert::Infallible, fs::OpenOptions, sync::atomic::AtomicUsize, time::Duration};
+    use tower::ServiceExt;
+
+    fn canonical_response() -> Value {
+        json!({
+            "id":"response-id",
+            "model":"local/test",
+            "message":{
+                "role":"assistant",
+                "content":"",
+                "tool_calls":[{
+                    "id":"call_ls_shared",
+                    "type":"function",
+                    "function":{"name":"read","arguments":"{}"}
+                }]
+            },
+            "finish_reason":"tool_calls",
+            "usage":{}
+        })
+    }
+
+    fn native_app(default_store: DefaultReceiptStore) -> Router {
+        Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|| async { Json(canonical_response()) }),
+            )
+            .layer(axum::middleware::from_fn(translate))
+            .layer(axum::middleware::from_fn_with_state(
+                default_store,
+                install_default_receipt_store,
+            ))
+    }
+
+    fn request() -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model":"local/test","messages":[{"role":"user","content":"hi"}]})
+                    .to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn gated_native_app(
+        default_store: DefaultReceiptStore,
+        reached_handler: Arc<tokio::sync::Notify>,
+        release_handler: Arc<tokio::sync::Notify>,
+        streaming: bool,
+    ) -> Router {
+        Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move || {
+                    let reached_handler = reached_handler.clone();
+                    let release_handler = release_handler.clone();
+                    async move {
+                        reached_handler.notify_one();
+                        release_handler.notified().await;
+                        if streaming {
+                            let events = vec![
+                                Ok::<_, Infallible>(Event::default().data(
+                                    json!({"type":"tool_call","id":"call_ls_overlap","name":"read","arguments":"{}"}).to_string(),
+                                )),
+                                Ok(Event::default().data(
+                                    json!({"type":"done","finish_reason":"tool_calls"}).to_string(),
+                                )),
+                            ];
+                            Sse::new(stream::iter(events)).into_response()
+                        } else {
+                            Json(canonical_response()).into_response()
+                        }
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(translate))
+            .layer(axum::middleware::from_fn_with_state(
+                default_store,
+                install_default_receipt_store,
+            ))
+    }
+
+    #[tokio::test]
+    async fn native_http_reuses_default_index_and_honors_explicit_receipts() {
+        let default_directory = tempfile::tempdir().unwrap();
+        let default_receipts = Arc::new(Receipts::new(default_directory.path().to_owned()));
+        let application = native_app(DefaultReceiptStore::new(default_receipts.clone()));
+
+        for _ in 0..2 {
+            let response = application.clone().oneshot(request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        }
+        assert_eq!(default_receipts.full_reload_count(), 1);
+
+        let sentinel_directory = tempfile::tempdir().unwrap();
+        let sentinel_receipts = Arc::new(Receipts::new(sentinel_directory.path().to_owned()));
+        let override_directory = tempfile::tempdir().unwrap();
+        let override_receipts = Arc::new(Receipts::new(override_directory.path().to_owned()));
+        let overridden = native_app(DefaultReceiptStore::new(sentinel_receipts.clone()))
+            .layer(Extension(override_receipts.clone()));
+        let response = overridden.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(override_receipts.full_reload_count(), 1);
+        assert_eq!(sentinel_receipts.full_reload_count(), 0);
+        assert!(std::fs::read_dir(sentinel_directory.path())
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn reserved_egress_completes_unary_and_streams_during_ingress_overlap() {
+        for streaming in [false, true] {
+            let receipt_directory = tempfile::tempdir().unwrap();
+            let store = DefaultReceiptStore::new(Arc::new(Receipts::new(
+                receipt_directory.path().to_owned(),
+            )));
+            let reached_handler = Arc::new(tokio::sync::Notify::new());
+            let release_handler = Arc::new(tokio::sync::Notify::new());
+            let application = gated_native_app(
+                store.clone(),
+                reached_handler.clone(),
+                release_handler.clone(),
+                streaming,
+            );
+            let mut native_request = request();
+            if streaming {
+                *native_request.body_mut() = Body::from(
+                    json!({"model":"local/test","stream":true,"messages":[{"role":"user","content":"hi"}]}).to_string(),
+                );
+            }
+            let response_task = tokio::spawn(application.oneshot(native_request));
+            reached_handler.notified().await;
+
+            let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+            let (release_sender, release_receiver) = std::sync::mpsc::channel();
+            let executor = store.executor.clone();
+            let ingress_task = tokio::spawn(async move {
+                executor
+                    .run(ReceiptWorkKind::Ingress, move || {
+                        let _ = started_sender.send(());
+                        release_receiver.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            });
+            started_receiver.await.unwrap();
+            release_handler.notify_one();
+
+            let response = tokio::time::timeout(Duration::from_secs(2), response_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains("call_ls_"), "{body}");
+            if streaming {
+                assert!(body.contains("data: [DONE]"), "{body}");
+                assert!(!body.contains("event: error"), "{body}");
+            }
+            release_sender.send(()).unwrap();
+            assert!(ingress_task.await.unwrap().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_cancellation_never_schedules_late_ingress_work() {
+        let executor = ReceiptExecutor::new();
+        let (active_started_sender, active_started_receiver) = tokio::sync::oneshot::channel();
+        let (active_release_sender, active_release_receiver) = std::sync::mpsc::channel();
+        let active_executor = executor.clone();
+        let active = tokio::spawn(async move {
+            active_executor
+                .run(ReceiptWorkKind::Ingress, move || {
+                    let _ = active_started_sender.send(());
+                    active_release_receiver.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        active_started_receiver.await.unwrap();
+        active.abort();
+
+        let executed = Arc::new(AtomicUsize::new(0));
+        let mut queued = Vec::new();
+        for _ in 0..(RECEIPT_INGRESS_CAPACITY - 1) {
+            let executor = executor.clone();
+            let executed = executed.clone();
+            queued.push(tokio::spawn(async move {
+                executor
+                    .run(ReceiptWorkKind::Ingress, move || {
+                        executed.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    })
+                    .await
+            }));
+        }
+        tokio::task::yield_now().await;
+        queued[0].abort();
+        tokio::task::yield_now().await;
+
+        let replacement_executor = executor.clone();
+        let replacement_executed = executed.clone();
+        queued.push(tokio::spawn(async move {
+            replacement_executor
+                .run(ReceiptWorkKind::Ingress, move || {
+                    replacement_executed.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })
+                .await
+        }));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executor.ingress_capacity.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            executor.run(ReceiptWorkKind::Ingress, || Ok(())).await,
+            Err(ReceiptWorkError::Busy)
+        ));
+        assert_eq!(executed.load(Ordering::Relaxed), 0);
+
+        assert_eq!(
+            executor
+                .run(ReceiptWorkKind::Egress, || Ok(42_u8))
+                .await
+                .unwrap(),
+            42
+        );
+        active_release_sender.send(()).unwrap();
+        for task in queued.into_iter().skip(1) {
+            assert!(task.await.unwrap().is_ok());
+        }
+        assert_eq!(
+            executed.load(Ordering::Relaxed),
+            RECEIPT_INGRESS_CAPACITY - 1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lock_contention_keeps_runtime_live_and_times_out_safely() {
+        let receipt_directory = tempfile::tempdir().unwrap();
+        let mut receipts = Receipts::new(receipt_directory.path().to_owned());
+        receipts.set_lock_timeout(Duration::from_millis(100));
+        let receipts = Arc::new(receipts);
+        receipts.get("scope", "call", &json!("initialize")).unwrap();
+        let lock_path = receipt_directory.path().join(".receipt-retention-v1.lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        lock_file.lock_exclusive().unwrap();
+
+        let application = native_app(DefaultReceiptStore::new(receipts));
+        let blocked_application = application.clone();
+        let blocked = tokio::spawn(async move { blocked_application.oneshot(request()).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::timeout(Duration::from_millis(100), tokio::task::yield_now())
+            .await
+            .unwrap();
+        let overloaded = tokio::time::timeout(Duration::from_millis(500), blocked)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()[header::RETRY_AFTER], "1");
+
+        lock_file.unlock().unwrap();
+        let restored = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = application.clone().oneshot(request()).await.unwrap();
+                if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+                    return response;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(restored.status(), StatusCode::OK);
     }
 }
