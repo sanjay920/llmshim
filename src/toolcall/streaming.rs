@@ -387,12 +387,20 @@ impl ToolStream {
                             return Err(upstream("tool fragment has no unambiguous part index"));
                         };
                         let part = format!("chat:{choice_index}:{index}");
-                        let atomic = explicit.is_none()
+                        let atomic = if explicit.is_none()
                             && call["id"].is_string()
                             && call["function"]["name"].is_string()
-                            && call["function"]["arguments"]
-                                .as_str()
-                                .is_some_and(|a| serde_json::from_str::<Value>(a).is_ok());
+                        {
+                            match call["function"]["arguments"].as_str() {
+                                Some(arguments) => crate::json_bounds::bounded_json_complete(
+                                    arguments,
+                                    crate::json_bounds::Limits::SSE,
+                                )?,
+                                None => false,
+                            }
+                        } else {
+                            false
+                        };
                         if let Some(id) = call["id"].as_str() {
                             self.update(
                                 &part,

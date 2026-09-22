@@ -110,6 +110,9 @@ fn app_with_origin_policy_and_deadlines(
         .route("/v1/models", get(handlers::list_models))
         .route("/health", get(handlers::health))
         .layer(axum::middleware::from_fn(wire::translate))
+        .layer(axum::middleware::from_fn(
+            wire::bound_inference_request_json,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             default_receipt_store,
             wire::install_default_receipt_store,

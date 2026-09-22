@@ -650,9 +650,19 @@ impl Plan {
         Ok(result)
     }
 }
+pub(crate) const JSON_COMPLEXITY_ERROR: &str = "answer exceeds JSON complexity limit";
+
 fn parse_json(text: Option<&str>) -> std::result::Result<Value, Vec<String>> {
-    serde_json::from_str(text.ok_or_else(|| vec!["missing JSON answer".into()])?)
-        .map_err(|_| vec!["answer is not valid JSON".into()])
+    match crate::json_bounds::parse_str(
+        text.ok_or_else(|| vec!["missing JSON answer".into()])?,
+        crate::json_bounds::Limits::UNARY,
+    ) {
+        Ok(value) => Ok(value),
+        Err(crate::json_bounds::ParseError::Malformed(_)) => {
+            Err(vec!["answer is not valid JSON".into()])
+        }
+        Err(crate::json_bounds::ParseError::Complexity) => Err(vec![JSON_COMPLEXITY_ERROR.into()]),
+    }
 }
 fn prepend_instruction(request: &mut Value, instruction: &str) -> Result<()> {
     let messages = request["messages"]
@@ -875,7 +885,16 @@ pub async fn collect(
                 "buffered response exceeded size limit".into(),
             ));
         }
-        let chunk: Value = serde_json::from_str(&data)?;
+        let chunk: Value =
+            match crate::json_bounds::parse_str(&data, crate::json_bounds::Limits::SSE) {
+                Ok(value) => value,
+                Err(crate::json_bounds::ParseError::Malformed(error)) => return Err(error.into()),
+                Err(crate::json_bounds::ParseError::Complexity) => {
+                    return Err(ShimError::Stream(
+                        "stream JSON exceeds complexity limit".into(),
+                    ))
+                }
+            };
         // `provider` is an aggregator's statement of which upstream actually
         // served the call (OpenRouter sends it on every chunk). Rebuilding a
         // buffered response without it loses the only record of that, so it is

@@ -322,3 +322,4 @@ impl Catalog {
         Ok(())
     }
 }
+pub mod bounded_json;

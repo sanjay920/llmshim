@@ -240,8 +240,16 @@ pub fn stamp_chunk(provider: &str, model: &str, chunk: String) -> String {
     if !chunk.contains("\"usage\":{") {
         return chunk;
     }
-    let Ok(mut value) = serde_json::from_str::<Value>(&chunk) else {
-        return chunk;
+    let mut value = match crate::json_bounds::parse_str(&chunk, crate::json_bounds::Limits::SSE) {
+        Ok(value) => value,
+        Err(crate::json_bounds::ParseError::Malformed(_)) => return chunk,
+        Err(crate::json_bounds::ParseError::Complexity) => {
+            return serde_json::json!({
+                "type":"error",
+                "message":"stream JSON exceeds complexity limit"
+            })
+            .to_string()
+        }
     };
     if !value["usage"].is_object() {
         return chunk;
