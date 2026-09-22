@@ -241,6 +241,31 @@ pub(crate) async fn serve(
         .map_err(|error| format!("managed proxy failed: {error}"))
 }
 
+async fn authorize(request: Request, next: Next, expected_token_hash: &[u8; 32]) -> Response {
+    let provided_token = request
+        .headers()
+        .get(MANAGED_AUTH_HEADER)
+        .and_then(|value: &HeaderValue| value.to_str().ok());
+    let authorized = provided_token.is_some_and(|token| {
+        let provided_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        bool::from(provided_hash.ct_eq(expected_token_hash))
+    });
+    if authorized {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "code": "unauthorized",
+                    "message": "managed proxy authentication required"
+                }
+            })),
+        )
+            .into_response()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,30 +361,5 @@ mod tests {
             Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof),
         }
         task.abort();
-    }
-}
-
-async fn authorize(request: Request, next: Next, expected_token_hash: &[u8; 32]) -> Response {
-    let provided_token = request
-        .headers()
-        .get(MANAGED_AUTH_HEADER)
-        .and_then(|value: &HeaderValue| value.to_str().ok());
-    let authorized = provided_token.is_some_and(|token| {
-        let provided_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-        bool::from(provided_hash.ct_eq(expected_token_hash))
-    });
-    if authorized {
-        next.run(request).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({
-                "error": {
-                    "code": "unauthorized",
-                    "message": "managed proxy authentication required"
-                }
-            })),
-        )
-            .into_response()
     }
 }
