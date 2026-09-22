@@ -1,6 +1,7 @@
 //! Trusted, out-of-band policy hooks for individual provider attempts.
 
 use crate::error::ShimError;
+use crate::reasoning::{ReplayTarget, WireFormat};
 use serde_json::Value;
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
@@ -19,20 +20,19 @@ impl DispatchPolicyContext {
     pub(crate) async fn acquire(
         &self,
         kind: AttemptKind,
-        provider_name: &str,
         resolved_model: &str,
+        prepared_target: &ReplayTarget,
         endpoint: &str,
         native_body: &Value,
     ) -> Result<AttemptTracker, AttemptPolicyRefusal> {
         let identity = AttemptIdentity {
             id: uuid::Uuid::new_v4(),
             kind,
-            provider_name: provider_name.to_owned(),
+            provider_name: prepared_target.provider.clone(),
             resolved_model: resolved_model.to_owned(),
-            native_model: native_body
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            native_model: prepared_target.model.clone(),
+            wire: prepared_target.wire,
+            account_fingerprint: prepared_target.account.clone(),
             endpoint: sanitized_endpoint(endpoint),
         };
         let prepared_attempt = PreparedAttempt {
@@ -49,8 +49,12 @@ impl DispatchPolicyContext {
         })
     }
 
-    async fn observe(&self, identity: &AttemptIdentity, event: AttemptEvent<'_>) {
-        self.policy.observe(identity, event).await;
+    async fn observe(
+        &self,
+        identity: &AttemptIdentity,
+        event: AttemptEvent<'_>,
+    ) -> Result<(), AttemptPolicyError> {
+        self.policy.observe(identity, event).await
     }
 }
 
@@ -63,6 +67,9 @@ impl std::fmt::Debug for DispatchPolicyContext {
 }
 
 pub trait AttemptPolicy: Send + Sync {
+    /// Admission must retain any conservative liability until a successful
+    /// terminal observation resolves it. Callback failure, cancellation, and
+    /// stream abandonment must never release that liability as zero.
     fn acquire<'a>(
         &'a self,
         attempt: &'a PreparedAttempt<'a>,
@@ -72,9 +79,15 @@ pub trait AttemptPolicy: Send + Sync {
         &'a self,
         attempt: &'a AttemptIdentity,
         event: AttemptEvent<'a>,
-    ) -> AttemptPolicyFuture<'a, ()>;
+    ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>>;
 
-    fn observe_abandoned(&self, attempt: &AttemptIdentity, outcome: AttemptOutcome);
+    /// The acquire-time liability remains authoritative when this best-effort
+    /// drop notification fails.
+    fn observe_abandoned(
+        &self,
+        attempt: &AttemptIdentity,
+        outcome: AttemptOutcome,
+    ) -> Result<(), AttemptPolicyError>;
 }
 
 pub struct PreparedAttempt<'a> {
@@ -114,7 +127,9 @@ pub struct AttemptIdentity {
     kind: AttemptKind,
     provider_name: String,
     resolved_model: String,
-    native_model: Option<String>,
+    native_model: String,
+    wire: WireFormat,
+    account_fingerprint: Option<String>,
     endpoint: String,
 }
 
@@ -135,8 +150,16 @@ impl AttemptIdentity {
         &self.resolved_model
     }
 
-    pub fn native_model(&self) -> Option<&str> {
-        self.native_model.as_deref()
+    pub fn native_model(&self) -> &str {
+        &self.native_model
+    }
+
+    pub fn wire(&self) -> WireFormat {
+        self.wire
+    }
+
+    pub fn account_fingerprint(&self) -> Option<&str> {
+        self.account_fingerprint.as_deref()
     }
 
     pub fn endpoint(&self) -> &str {
@@ -153,6 +176,11 @@ impl std::fmt::Debug for AttemptIdentity {
             .field("provider_name", &self.provider_name)
             .field("resolved_model", &self.resolved_model)
             .field("native_model", &self.native_model)
+            .field("wire", &self.wire)
+            .field(
+                "account_fingerprint",
+                &self.account_fingerprint.as_ref().map(|_| "<redacted>"),
+            )
             .field("endpoint", &"<redacted>")
             .finish()
     }
@@ -266,28 +294,52 @@ impl std::fmt::Display for AttemptPolicyRefusal {
 
 impl std::error::Error for AttemptPolicyRefusal {}
 
-pub(crate) fn is_refusal(error: &ShimError) -> bool {
-    let ShimError::ProviderError { body, .. } = error else {
-        return false;
-    };
-    matches!(
-        body.as_str(),
-        "provider attempt limit exceeded"
-            | "tenant attempt limit exceeded"
-            | "attempt budget exhausted"
-            | "attempt cannot be admitted under the active policy"
-            | "attempt policy coordinator unavailable"
-            | "attempt refused by policy"
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptPolicyErrorKind {
+    CoordinatorUnavailable,
+    Other,
 }
 
-pub(crate) fn terminates_fallback(error: &ShimError) -> bool {
-    is_refusal(error)
-        && !matches!(
-            error,
-            ShimError::ProviderError { body, .. } if body == "provider attempt limit exceeded"
-        )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttemptPolicyError {
+    kind: AttemptPolicyErrorKind,
 }
+
+impl AttemptPolicyError {
+    pub fn new(kind: AttemptPolicyErrorKind) -> Self {
+        Self { kind }
+    }
+
+    pub fn kind(&self) -> AttemptPolicyErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_shim_error(self) -> ShimError {
+        ShimError::ProviderError {
+            status: 503,
+            body: match self.kind {
+                AttemptPolicyErrorKind::CoordinatorUnavailable => {
+                    "attempt policy coordinator unavailable"
+                }
+                AttemptPolicyErrorKind::Other => "attempt policy observation failed",
+            }
+            .to_owned(),
+            retry_after: None,
+        }
+    }
+}
+
+impl std::fmt::Display for AttemptPolicyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "attempt policy observation failed ({:?})",
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for AttemptPolicyError {}
 
 pub(crate) struct AttemptTracker {
     context: DispatchPolicyContext,
@@ -297,17 +349,18 @@ pub(crate) struct AttemptTracker {
 }
 
 impl AttemptTracker {
-    pub(crate) async fn response_headers(&self, status: u16) {
+    pub(crate) async fn response_headers(&self, status: u16) -> Result<(), AttemptPolicyError> {
         self.context
             .observe(&self.identity, AttemptEvent::ResponseHeaders { status })
-            .await;
+            .await
     }
 
-    pub(crate) async fn usage(&mut self, usage: &Value) {
+    pub(crate) async fn usage(&mut self, usage: &Value) -> Result<(), AttemptPolicyError> {
         self.context
             .observe(&self.identity, AttemptEvent::Usage { usage })
-            .await;
+            .await?;
         self.usage_observed = true;
+        Ok(())
     }
 
     pub(crate) fn accounting(&self, completed: bool) -> AttemptAccounting {
@@ -320,14 +373,18 @@ impl AttemptTracker {
         }
     }
 
-    pub(crate) async fn finish(&mut self, outcome: AttemptOutcome) {
+    pub(crate) async fn finish(
+        &mut self,
+        outcome: AttemptOutcome,
+    ) -> Result<(), AttemptPolicyError> {
         if self.finished {
-            return;
+            return Ok(());
         }
         self.context
             .observe(&self.identity, AttemptEvent::Finished(outcome))
-            .await;
+            .await?;
         self.finished = true;
+        Ok(())
     }
 }
 
@@ -337,7 +394,7 @@ impl Drop for AttemptTracker {
             return;
         }
         let accounting = self.accounting(false);
-        self.context.policy.observe_abandoned(
+        let _ = self.context.policy.observe_abandoned(
             &self.identity,
             AttemptOutcome::Abandoned {
                 kind: self.identity.kind,

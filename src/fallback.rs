@@ -139,14 +139,21 @@ async fn completion_with_fallback_inner(
             let timer = RequestTimer::start();
             // Keep OAuth preparation, SSE-only providers, reasoning provenance,
             // and tool normalization identical to an ordinary completion.
-            let outcome = match policy_context {
-                Some(context) => {
-                    client
-                        .completion_with_policy(provider, &model, &req, context)
-                        .await
-                }
-                None => client.completion(provider, &model, &req).await,
-            };
+            let dispatch_outcome = client
+                .completion_dispatch(provider, &model, &req, policy_context)
+                .await;
+            if let Some(outcome) = crate::client::ShimClient::breaker_outcome(&dispatch_outcome) {
+                client.observe(provider, outcome).await;
+            }
+            let terminal_policy_failure = matches!(
+                &dispatch_outcome,
+                Err(crate::client::DispatchFailure::PolicyRefusal(refusal))
+                    if refusal.kind() != crate::policy::AttemptPolicyRefusalKind::ProviderLimit
+            ) || matches!(
+                &dispatch_outcome,
+                Err(crate::client::DispatchFailure::PolicyObservation(_))
+            );
+            let outcome = dispatch_outcome.map_err(crate::client::DispatchFailure::into_public);
             match outcome {
                 Ok(result) => {
                     if let Some(logger) = logger {
@@ -160,7 +167,7 @@ async fn completion_with_fallback_inner(
                     return Ok(result);
                 }
                 Err(e) => {
-                    if policy_context.is_some() && crate::policy::terminates_fallback(&e) {
+                    if terminal_policy_failure {
                         if let Some(logger) = logger {
                             logger.log(&LogEntry::from_error(
                                 provider.name(),
