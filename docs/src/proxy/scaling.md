@@ -166,31 +166,42 @@ buckets. A gateway key's identity may carry `budget_usd` and an optional
 `budget_usd` must be finite, non-negative, and no greater than
 `9007199.254740992`. The ledger stores nano-USD integers and keeps every Redis
 value within Lua's exact-integer range; invalid limits fail closed.
+An explicit zero freezes the identity, including models whose configured token
+rates are zero.
 
 Every actual provider send reserves a conservative amount before it consumes
-RPM or TPM. The reservation uses the final provider-native model and body, the
-catalog context ceiling, the request's output/reasoning bound (or the catalog
-output ceiling), and the applicable catalog price tier. The rate debits and USD
-reservation commit together, so a budget refusal consumes neither allowance.
+RPM or TPM. The reservation uses the final provider-native model and body,
+trusted per-field catalog facts, the request's output/reasoning bound (or a
+trusted catalog output ceiling), and the applicable trusted price tier. Local
+operator policy is authoritative; verified built-in prices and built-in or
+provider-reported limits are accepted. Community `models.dev` values alone do
+not establish a hard-cap policy. The rate debits and USD reservation commit
+together, so a budget refusal consumes neither allowance.
 The full context ceiling is used for input rather than treating a tokenizer
 heuristic as a guarantee, so admission can be deliberately conservative even
 for a short prompt.
 Repeated usage snapshots upsert one attempt by UUID; they are never summed as
 separate bills. A terminal response with known usage replaces its reservation
 with the known charge. Failed repair responses are therefore charged even when
-the caller ultimately receives a local `502`.
+the caller ultimately receives a local `502`. Bounded provider error bodies are
+also inspected for native usage or a provider-reported bill before retry or
+return; the original error body and size limit remain unchanged.
 
 Transport uncertainty, cancellation, stream abandonment, worker loss, and a
 failed settlement keep the original reservation in its acquisition window.
-Rollover never moves that liability into a later window. This makes the cap a
+The window is selected only after concurrency admission; Redis selects it from
+server time inside the atomic transaction. Rollover never moves that liability
+into a later window, and attempt tombstones remain available for late settlement
+for 24 hours after the acquisition window ends. This makes the cap a
 hard ceiling under the configured catalog pricing policy. Catalog prices are
 still estimates rather than provider invoices: an external price change or fee
 missing from the policy cannot be guaranteed by llmshim.
 
 Strict admission rejects a request when it cannot form that bound. This includes
 an unknown price or context/output ceiling, variable OpenRouter routing,
-priority/fast service controls, provider-hosted tools, and cache-creation
-controls whose fee dimension is not bounded. The rejection happens before send:
+multi-candidate output, priority/fast service controls, provider-hosted tools,
+unbounded media, unknown native controls, and cache-creation controls whose fee
+dimension is not bounded. The rejection happens before send:
 
 ```
 400 {"error":{"code":"unpriceable_under_budget","param":"model", …}}

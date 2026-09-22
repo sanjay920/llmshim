@@ -14,6 +14,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 const ZERO_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
+const LATE_SETTLEMENT_RETENTION_SECS: u64 = 86_400;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct TrustedPolicyScope {
@@ -67,7 +68,7 @@ trait AttemptRates: Send + Sync {
         scope: &TrustedPolicyScope,
         permits: u32,
         attempt_id: uuid::Uuid,
-        reservation: Option<crate::gateway::budget::BudgetReservation>,
+        quote: Option<crate::gateway::budget::BudgetQuote>,
     ) -> Result<(), RateRefusal>;
 
     async fn penalize(&self, provider: &str, duration: Duration) -> Result<(), ()>;
@@ -190,6 +191,136 @@ impl LocalAttemptRates {
             }),
         }
     }
+
+    async fn acquire_at_epoch(
+        &self,
+        provider: &str,
+        scope: &TrustedPolicyScope,
+        permits: u32,
+        attempt_id: uuid::Uuid,
+        quote: Option<crate::gateway::budget::BudgetQuote>,
+        test_epoch_secs: Option<u64>,
+    ) -> Result<(), RateRefusal> {
+        let global_limit = self.config.resolve(provider);
+        let tenant_key = format!("{}:{provider}", scope.tenant_key);
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        let now_epoch_secs = test_epoch_secs.unwrap_or_else(epoch_secs);
+        purge_expired_budget_state(&mut state, now_epoch_secs);
+        let mut provider_wait = None;
+        let mut tenant_wait = None;
+        for wait in [
+            check_dimension(&mut state.global.rpm, provider, global_limit.rpm, 1.0, now),
+            check_dimension(
+                &mut state.global.tpm,
+                provider,
+                global_limit.tpm,
+                permits.max(1) as f64,
+                now,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            provider_wait = Some(provider_wait.map_or(wait, |current: Duration| current.max(wait)));
+        }
+        for wait in [
+            check_dimension(&mut state.tenant.rpm, &tenant_key, scope.rpm, 1.0, now),
+            check_dimension(
+                &mut state.tenant.tpm,
+                &tenant_key,
+                scope.tpm,
+                permits.max(1) as f64,
+                now,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            tenant_wait = Some(tenant_wait.map_or(wait, |current: Duration| current.max(wait)));
+        }
+
+        if let Some(wait) = tenant_wait {
+            return Err(RateRefusal::Tenant(wait));
+        }
+        if let Some(wait) = provider_wait {
+            return Err(RateRefusal::Provider(wait));
+        }
+
+        let budget_commit = match (&scope.budget, quote) {
+            (None, None) => None,
+            (Some(policy), Some(mut quote)) => {
+                if state.budget_attempts.contains_key(&attempt_id) {
+                    return Err(RateRefusal::Unavailable);
+                }
+                let window_index = now_epoch_secs / policy.window_secs;
+                let window_key = BudgetWindowKey {
+                    tenant_key: scope.tenant_key.clone(),
+                    window_secs: policy.window_secs,
+                    window_index,
+                };
+                let current = state.budget_totals.get(&window_key).copied().unwrap_or(0);
+                let admitted = policy.limit_nanos != 0
+                    && if quote.bounded {
+                        current
+                            .checked_add(quote.amount_nanos)
+                            .is_some_and(|next| next <= policy.limit_nanos)
+                    } else {
+                        current < policy.limit_nanos
+                    };
+                if !admitted {
+                    return Err(RateRefusal::Budget(budget_wait(
+                        policy.window_secs,
+                        now_epoch_secs,
+                    )));
+                }
+                if !quote.bounded {
+                    quote.amount_nanos = policy.limit_nanos - current;
+                }
+                let next_window = window_index
+                    .saturating_add(1)
+                    .saturating_mul(policy.window_secs);
+                Some((
+                    window_key,
+                    quote,
+                    next_window.saturating_add(LATE_SETTLEMENT_RETENTION_SECS),
+                ))
+            }
+            _ => return Err(RateRefusal::Unavailable),
+        };
+
+        debit_dimension(&mut state.global.rpm, provider, global_limit.rpm, 1.0);
+        debit_dimension(
+            &mut state.global.tpm,
+            provider,
+            global_limit.tpm,
+            permits.max(1) as f64,
+        );
+        debit_dimension(&mut state.tenant.rpm, &tenant_key, scope.rpm, 1.0);
+        debit_dimension(
+            &mut state.tenant.tpm,
+            &tenant_key,
+            scope.tpm,
+            permits.max(1) as f64,
+        );
+        if let Some((window_key, quote, expires_at_epoch_secs)) = budget_commit {
+            let total = state.budget_totals.entry(window_key.clone()).or_insert(0);
+            *total = total
+                .checked_add(quote.amount_nanos)
+                .ok_or(RateRefusal::Unavailable)?;
+            state.budget_attempts.insert(
+                attempt_id,
+                AttemptLiability {
+                    window_key,
+                    liability_nanos: quote.amount_nanos,
+                    observed_nanos: None,
+                    finalized: false,
+                    expires_at_epoch_secs,
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 fn epoch_secs() -> u64 {
@@ -257,118 +388,10 @@ impl AttemptRates for LocalAttemptRates {
         scope: &TrustedPolicyScope,
         permits: u32,
         attempt_id: uuid::Uuid,
-        reservation: Option<crate::gateway::budget::BudgetReservation>,
+        quote: Option<crate::gateway::budget::BudgetQuote>,
     ) -> Result<(), RateRefusal> {
-        let global_limit = self.config.resolve(provider);
-        let now = Instant::now();
-        let tenant_key = format!("{}:{provider}", scope.tenant_key);
-        let mut state = self.state.lock().await;
-        let now_epoch_secs = epoch_secs();
-        purge_expired_budget_state(&mut state, now_epoch_secs);
-        let mut provider_wait = None;
-        let mut tenant_wait = None;
-        for wait in [
-            check_dimension(&mut state.global.rpm, provider, global_limit.rpm, 1.0, now),
-            check_dimension(
-                &mut state.global.tpm,
-                provider,
-                global_limit.tpm,
-                permits.max(1) as f64,
-                now,
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            provider_wait = Some(provider_wait.map_or(wait, |current: Duration| current.max(wait)));
-        }
-        for wait in [
-            check_dimension(&mut state.tenant.rpm, &tenant_key, scope.rpm, 1.0, now),
-            check_dimension(
-                &mut state.tenant.tpm,
-                &tenant_key,
-                scope.tpm,
-                permits.max(1) as f64,
-                now,
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            tenant_wait = Some(tenant_wait.map_or(wait, |current: Duration| current.max(wait)));
-        }
-
-        if let Some(wait) = tenant_wait {
-            return Err(RateRefusal::Tenant(wait));
-        }
-        if let Some(wait) = provider_wait {
-            return Err(RateRefusal::Provider(wait));
-        }
-
-        let budget_commit = match (&scope.budget, reservation) {
-            (None, None) => None,
-            (Some(policy), Some(mut reservation)) => {
-                if state.budget_attempts.contains_key(&attempt_id) {
-                    return Err(RateRefusal::Unavailable);
-                }
-                let window_key = BudgetWindowKey {
-                    tenant_key: scope.tenant_key.clone(),
-                    window_secs: policy.window_secs,
-                    window_index: reservation.window_index,
-                };
-                let current = state.budget_totals.get(&window_key).copied().unwrap_or(0);
-                let admitted = if reservation.bounded {
-                    current
-                        .checked_add(reservation.amount_nanos)
-                        .is_some_and(|next| next <= policy.limit_nanos)
-                } else {
-                    current < policy.limit_nanos
-                };
-                if !admitted {
-                    return Err(RateRefusal::Budget(budget_wait(
-                        policy.window_secs,
-                        now_epoch_secs,
-                    )));
-                }
-                if !reservation.bounded {
-                    reservation.amount_nanos = policy.limit_nanos - current;
-                }
-                Some((window_key, reservation))
-            }
-            _ => return Err(RateRefusal::Unavailable),
-        };
-
-        debit_dimension(&mut state.global.rpm, provider, global_limit.rpm, 1.0);
-        debit_dimension(
-            &mut state.global.tpm,
-            provider,
-            global_limit.tpm,
-            permits.max(1) as f64,
-        );
-        debit_dimension(&mut state.tenant.rpm, &tenant_key, scope.rpm, 1.0);
-        debit_dimension(
-            &mut state.tenant.tpm,
-            &tenant_key,
-            scope.tpm,
-            permits.max(1) as f64,
-        );
-        if let Some((window_key, reservation)) = budget_commit {
-            let total = state.budget_totals.entry(window_key.clone()).or_insert(0);
-            *total = total
-                .checked_add(reservation.amount_nanos)
-                .ok_or(RateRefusal::Unavailable)?;
-            state.budget_attempts.insert(
-                attempt_id,
-                AttemptLiability {
-                    window_key,
-                    liability_nanos: reservation.amount_nanos,
-                    observed_nanos: None,
-                    finalized: false,
-                    expires_at_epoch_secs: reservation.expires_at_epoch_secs,
-                },
-            );
-        }
-        Ok(())
+        self.acquire_at_epoch(provider, scope, permits, attempt_id, quote, None)
+            .await
     }
 
     async fn penalize(&self, provider: &str, duration: Duration) -> Result<(), ()> {
@@ -427,7 +450,10 @@ impl AttemptRates for LocalAttemptRates {
         };
         if let Some((window_key, delta)) = increase {
             let total = state.budget_totals.get_mut(&window_key).ok_or(())?;
-            *total = total.checked_add(delta).ok_or(())?;
+            *total = total
+                .checked_add(delta)
+                .unwrap_or(crate::gateway::budget::MAX_EXACT_REDIS_NANOS)
+                .min(crate::gateway::budget::MAX_EXACT_REDIS_NANOS);
         }
         Ok(())
     }
@@ -587,11 +613,6 @@ impl AttemptCoordinator {
                 None,
             ));
         }
-        let reservation =
-            crate::gateway::budget::reservation(scope.budget.as_ref(), attempt, epoch_secs())
-                .map_err(|_| {
-                    AttemptPolicyRefusal::new(AttemptPolicyRefusalKind::Unpriceable, None)
-                })?;
         let provider = attempt.identity().provider_name();
         let semaphore = {
             let mut semaphores = self.semaphores.lock().unwrap();
@@ -610,20 +631,16 @@ impl AttemptCoordinator {
                     Some(self.concurrency_wait),
                 )
             })?;
+        let quote = crate::gateway::budget::quote(scope.budget.as_ref(), attempt)
+            .map_err(|_| AttemptPolicyRefusal::new(AttemptPolicyRefusalKind::Unpriceable, None))?;
         let permits = crate::proxy::ratelimit::estimate_attempt_tokens(attempt);
         match self
             .rates
-            .acquire(
-                provider,
-                scope,
-                permits,
-                attempt.identity().id(),
-                reservation,
-            )
+            .acquire(provider, scope, permits, attempt.identity().id(), quote)
             .await
         {
             Ok(()) => {
-                if reservation.is_some_and(|reservation| !reservation.bounded) {
+                if quote.is_some_and(|quote| !quote.bounded) {
                     crate::gateway::metrics::incr(
                         crate::gateway::metrics::UNPRICED_UNDER_CAP,
                         &[
@@ -674,7 +691,7 @@ impl AttemptRates for UnavailableAttemptRates {
         _scope: &TrustedPolicyScope,
         _permits: u32,
         _attempt_id: uuid::Uuid,
-        _reservation: Option<crate::gateway::budget::BudgetReservation>,
+        _quote: Option<crate::gateway::budget::BudgetQuote>,
     ) -> Result<(), RateRefusal> {
         Err(RateRefusal::Unavailable)
     }
@@ -780,7 +797,8 @@ mod redis_rates {
 
     const KEY_TTL_MS: u64 = 3_600_000;
     const COMBINED_RATE_LUA: &str = r#"
-        local now = tonumber(ARGV[1])
+        local redis_time = redis.call('TIME')
+        local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
         local ttl = tonumber(ARGV[2])
         local admitted = 1
         local wait = 0
@@ -825,24 +843,39 @@ mod redis_rates {
         local budget_enabled = tonumber(ARGV[19]) == 1
         local budget_next = 0
         local reservation = 0
+        local budget_total_key = KEYS[5]
+        local budget_ttl = 1
         if budget_enabled then
             local bounded = tonumber(ARGV[20]) == 1
             local budget_limit = tonumber(ARGV[21])
             reservation = tonumber(ARGV[22])
-            local current = tonumber(redis.call('GET', KEYS[5])) or 0
+            local window_secs = tonumber(ARGV[23])
+            local retention_secs = tonumber(ARGV[24])
+            local epoch_secs = math.floor(now / 1000)
+            local window_index = math.floor(epoch_secs / window_secs)
+            budget_total_key = KEYS[5] .. window_index
+            budget_ttl = math.max(1,
+                ((window_index + 1) * window_secs + retention_secs) * 1000 - now)
+            local current = tonumber(redis.call('GET', budget_total_key)) or 0
             if redis.call('EXISTS', KEYS[6]) == 1 then
                 admitted = 0
                 refusal = 4
+            elseif budget_limit == 0 then
+                admitted = 0
+                refusal = 3
+                wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
             elseif bounded then
                 if reservation > budget_limit or current > budget_limit - reservation then
                     admitted = 0
                     refusal = 3
+                    wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
                 else
                     budget_next = current + reservation
                 end
             elseif current >= budget_limit then
                 admitted = 0
                 refusal = 3
+                wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
             else
                 reservation = budget_limit - current
                 budget_next = budget_limit
@@ -857,13 +890,13 @@ mod redis_rates {
                 end
             end
             if budget_enabled then
-                redis.call('SET', KEYS[5], budget_next, 'PX', ARGV[23])
+                redis.call('SET', budget_total_key, budget_next, 'PX', budget_ttl)
                 redis.call('HSET', KEYS[6],
                     'liability', reservation,
                     'observed', -1,
                     'finalized', 0,
-                    'total_key', KEYS[5])
-                redis.call('PEXPIRE', KEYS[6], ARGV[23])
+                    'total_key', budget_total_key)
+                redis.call('PEXPIRE', KEYS[6], budget_ttl)
             end
         end
 
@@ -970,9 +1003,9 @@ mod redis_rates {
             )
         }
 
-        pub(super) fn budget_total_key(scope: &TrustedPolicyScope, window_index: u64) -> String {
+        fn budget_total_prefix(scope: &TrustedPolicyScope) -> String {
             format!(
-                "llmshim:gw:budget:v1:{}:{}:{window_index}",
+                "llmshim:gw:budget:v1:{}:{}:",
                 scope.tenant_key,
                 scope.budget.as_ref().map_or(0, |budget| budget.window_secs)
             )
@@ -1033,7 +1066,7 @@ mod redis_rates {
             scope: &TrustedPolicyScope,
             permits: u32,
             attempt_id: uuid::Uuid,
-            reservation: Option<crate::gateway::budget::BudgetReservation>,
+            quote: Option<crate::gateway::budget::BudgetQuote>,
         ) -> Result<(), RateRefusal> {
             let global = self.config.resolve(provider);
             if scope.rpm == Some(0) || scope.tpm == Some(0) {
@@ -1046,20 +1079,16 @@ mod redis_rates {
                 .connection()
                 .await
                 .map_err(|_| RateRefusal::Unavailable)?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or_default();
             let mut invocation = self.combined_script.prepare_invoke();
             invocation
                 .key(Self::global_key(provider, "rpm"))
                 .key(Self::global_key(provider, "tpm"))
                 .key(Self::tenant_key(scope, provider, "rpm"))
                 .key(Self::tenant_key(scope, provider, "tpm"));
-            match (&scope.budget, reservation) {
-                (Some(_), Some(reservation)) => {
+            match (&scope.budget, quote) {
+                (Some(_), Some(_)) => {
                     invocation
-                        .key(Self::budget_total_key(scope, reservation.window_index))
+                        .key(Self::budget_total_prefix(scope))
                         .key(Self::budget_attempt_key(scope, attempt_id));
                 }
                 (None, None) => {
@@ -1069,27 +1098,23 @@ mod redis_rates {
                 }
                 _ => return Err(RateRefusal::Unavailable),
             }
-            invocation.arg(now).arg(KEY_TTL_MS);
+            invocation.arg(0).arg(KEY_TTL_MS);
             Self::add_dimension(&mut invocation, global.rpm, 1.0);
             Self::add_dimension(&mut invocation, global.tpm, permits.max(1) as f64);
             Self::add_dimension(&mut invocation, scope.rpm, 1.0);
             Self::add_dimension(&mut invocation, scope.tpm, permits.max(1) as f64);
-            match (&scope.budget, reservation) {
-                (Some(policy), Some(reservation)) => {
-                    let ttl_ms = reservation
-                        .expires_at_epoch_secs
-                        .saturating_sub(now / 1000)
-                        .saturating_mul(1000)
-                        .max(1);
+            match (&scope.budget, quote) {
+                (Some(policy), Some(quote)) => {
                     invocation
                         .arg(1)
-                        .arg(i32::from(reservation.bounded))
+                        .arg(i32::from(quote.bounded))
                         .arg(policy.limit_nanos)
-                        .arg(reservation.amount_nanos)
-                        .arg(ttl_ms);
+                        .arg(quote.amount_nanos)
+                        .arg(policy.window_secs)
+                        .arg(LATE_SETTLEMENT_RETENTION_SECS);
                 }
                 (None, None) => {
-                    invocation.arg(0).arg(0).arg(0).arg(0).arg(1);
+                    invocation.arg(0).arg(0).arg(0).arg(0).arg(1).arg(1);
                 }
                 _ => return Err(RateRefusal::Unavailable),
             }
@@ -1100,13 +1125,9 @@ mod redis_rates {
             if admitted == 1 {
                 Ok(())
             } else if refusal == 3 {
-                let wait = scope
-                    .budget
-                    .as_ref()
-                    .map_or(ZERO_LIMIT_RETRY_AFTER, |budget| {
-                        budget_wait(budget.window_secs, now / 1000)
-                    });
-                Err(RateRefusal::Budget(wait))
+                Err(RateRefusal::Budget(Duration::from_millis(
+                    wait_ms.max(1) as u64
+                )))
             } else if refusal == 4 {
                 Err(RateRefusal::Unavailable)
             } else if refusal == 2 {
@@ -1206,14 +1227,9 @@ mod tests {
         }
     }
 
-    fn reservation(
-        amount_nanos: u64,
-        window_index: u64,
-    ) -> crate::gateway::budget::BudgetReservation {
-        crate::gateway::budget::BudgetReservation {
+    fn quote(amount_nanos: u64) -> crate::gateway::budget::BudgetQuote {
+        crate::gateway::budget::BudgetQuote {
             amount_nanos,
-            window_index,
-            expires_at_epoch_secs: epoch_secs().saturating_add(120),
             bounded: true,
         }
     }
@@ -1241,7 +1257,7 @@ mod tests {
                     &denied_scope,
                     1,
                     uuid::Uuid::new_v4(),
-                    Some(reservation(51, 10)),
+                    Some(quote(51)),
                 )
                 .await,
             Err(RateRefusal::Budget(_))
@@ -1260,38 +1276,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_budget_reservations_are_concurrent_and_window_owned() {
-        let rates = LocalAttemptRates::new(RateLimitConfig::default());
-        let tenant = budget_scope("window-owner", 100);
-        assert!(rates
-            .acquire(
-                "provider",
-                &tenant,
-                1,
-                uuid::Uuid::new_v4(),
-                Some(reservation(60, 10)),
-            )
-            .await
-            .is_ok());
+    async fn zero_budget_freezes_even_a_zero_cost_quote_without_rate_debit() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::with_global(Some(1), None));
+        let frozen = budget_scope("zero-budget", 0);
         assert!(matches!(
             rates
-                .acquire(
-                    "provider",
-                    &tenant,
-                    1,
-                    uuid::Uuid::new_v4(),
-                    Some(reservation(50, 10)),
-                )
+                .acquire("provider", &frozen, 1, uuid::Uuid::new_v4(), Some(quote(0)))
                 .await,
             Err(RateRefusal::Budget(_))
         ));
         assert!(rates
             .acquire(
                 "provider",
+                &scope("after-zero-budget", None, None),
+                1,
+                uuid::Uuid::new_v4(),
+                None,
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_budget_reservations_are_concurrent_and_window_owned() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let tenant = budget_scope("window-owner", 100);
+        assert!(rates
+            .acquire_at_epoch(
+                "provider",
                 &tenant,
                 1,
                 uuid::Uuid::new_v4(),
-                Some(reservation(50, 11)),
+                Some(quote(60)),
+                Some(600),
+            )
+            .await
+            .is_ok());
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(50)),
+                    Some(600),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert!(rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                uuid::Uuid::new_v4(),
+                Some(quote(50)),
+                Some(660),
             )
             .await
             .is_ok());
@@ -1306,12 +1347,13 @@ mod tests {
         let tenant = budget_scope("cumulative", 100);
         let settled_attempt = uuid::Uuid::new_v4();
         rates
-            .acquire(
+            .acquire_at_epoch(
                 "provider",
                 &tenant,
                 1,
                 settled_attempt,
-                Some(reservation(80, 20)),
+                Some(quote(80)),
+                Some(1200),
             )
             .await
             .unwrap();
@@ -1348,12 +1390,13 @@ mod tests {
 
         let abandoned_attempt = uuid::Uuid::new_v4();
         rates
-            .acquire(
+            .acquire_at_epoch(
                 "provider",
                 &tenant,
                 1,
                 abandoned_attempt,
-                Some(reservation(70, 20)),
+                Some(quote(70)),
+                Some(1200),
             )
             .await
             .unwrap();
@@ -1367,12 +1410,13 @@ mod tests {
         }
         assert!(matches!(
             rates
-                .acquire(
+                .acquire_at_epoch(
                     "provider",
                     &tenant,
                     1,
                     uuid::Uuid::new_v4(),
-                    Some(reservation(1, 20)),
+                    Some(quote(1)),
+                    Some(1200),
                 )
                 .await,
             Err(RateRefusal::Budget(_))
@@ -1387,10 +1431,17 @@ mod tests {
         let window_index = 30;
         for observed in [60, 50] {
             let attempt_id = uuid::Uuid::new_v4();
-            let mut unbounded = reservation(0, window_index);
+            let mut unbounded = quote(0);
             unbounded.bounded = false;
             rates
-                .acquire("provider", &tenant, 1, attempt_id, Some(unbounded))
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    attempt_id,
+                    Some(unbounded),
+                    Some(window_index * 60),
+                )
                 .await
                 .unwrap();
             rates
@@ -1412,20 +1463,139 @@ mod tests {
             let state = rates.state.lock().await;
             assert_eq!(total_for(&state, &tenant, window_index), 110);
         }
-        let mut unbounded = reservation(0, window_index);
+        let mut unbounded = quote(0);
         unbounded.bounded = false;
         assert!(matches!(
             rates
-                .acquire(
+                .acquire_at_epoch(
                     "provider",
                     &tenant,
                     1,
                     uuid::Uuid::new_v4(),
                     Some(unbounded),
+                    Some(window_index * 60),
                 )
                 .await,
             Err(RateRefusal::Budget(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn oversized_known_cost_saturates_and_duplicate_settlement_is_idempotent() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let tenant = budget_scope(
+            "known-overflow",
+            crate::gateway::budget::MAX_EXACT_REDIS_NANOS,
+        );
+        let attempt_id = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                attempt_id,
+                Some(quote(10)),
+                Some(2400),
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            rates
+                .observe_usage(
+                    &tenant,
+                    attempt_id,
+                    Some(crate::gateway::budget::MAX_EXACT_REDIS_NANOS),
+                )
+                .await
+                .unwrap();
+        }
+        for _ in 0..2 {
+            rates
+                .finish(
+                    &tenant,
+                    attempt_id,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(
+                total_for(&state, &tenant, 40),
+                crate::gateway::budget::MAX_EXACT_REDIS_NANOS
+            );
+        }
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(1)),
+                    Some(2400),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn late_settlement_keeps_the_acquisition_window_tombstone() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let mut tenant = budget_scope("late-settlement", 100);
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let old_attempt = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                old_attempt,
+                Some(quote(80)),
+                Some(10),
+            )
+            .await
+            .unwrap();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                uuid::Uuid::new_v4(),
+                Some(quote(100)),
+                Some(13),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, old_attempt, Some(25))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                old_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        let state = rates.state.lock().await;
+        let old_window = BudgetWindowKey {
+            tenant_key: tenant.tenant_key.clone(),
+            window_secs: 1,
+            window_index: 10,
+        };
+        assert_eq!(state.budget_totals.get(&old_window), Some(&25));
+        assert!(state
+            .budget_attempts
+            .get(&old_attempt)
+            .is_some_and(|attempt| attempt.finalized));
     }
 
     #[tokio::test]
@@ -1608,30 +1778,25 @@ mod tests {
             return;
         };
         let provider = format!("attempt-budget-{}", uuid::Uuid::new_v4().simple());
-        let tenant = budget_scope(&format!("redis-{}", uuid::Uuid::new_v4()), 100);
+        let mut tenant = budget_scope(&format!("redis-{}", uuid::Uuid::new_v4()), 100);
+        tenant.budget.as_mut().unwrap().window_secs = 1;
         let first = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
         let second = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
-        let window_index = epoch_secs() / 60;
+        let frozen = budget_scope(&format!("redis-zero-{}", uuid::Uuid::new_v4()), 0);
+        assert!(matches!(
+            first
+                .acquire(&provider, &frozen, 1, uuid::Uuid::new_v4(), Some(quote(0)),)
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
         let first_attempt = uuid::Uuid::new_v4();
         first
-            .acquire(
-                &provider,
-                &tenant,
-                1,
-                first_attempt,
-                Some(reservation(60, window_index)),
-            )
+            .acquire(&provider, &tenant, 1, first_attempt, Some(quote(60)))
             .await
             .unwrap();
         assert!(matches!(
             second
-                .acquire(
-                    &provider,
-                    &tenant,
-                    1,
-                    uuid::Uuid::new_v4(),
-                    Some(reservation(50, window_index)),
-                )
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(50)),)
                 .await,
             Err(RateRefusal::Budget(_))
         ));
@@ -1650,22 +1815,17 @@ mod tests {
             .await
             .unwrap();
         assert!(second
-            .acquire(
-                &provider,
-                &tenant,
-                1,
-                uuid::Uuid::new_v4(),
-                Some(reservation(70, window_index)),
-            )
+            .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(70)),)
             .await
             .is_ok());
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
         assert!(second
             .acquire(
                 &provider,
                 &tenant,
                 1,
                 uuid::Uuid::new_v4(),
-                Some(reservation(100, window_index + 1)),
+                Some(quote(100)),
             )
             .await
             .is_ok());
@@ -1683,22 +1843,15 @@ mod tests {
         let provider = format!("attempt-settle-{}", uuid::Uuid::new_v4().simple());
         let tenant = budget_scope(&format!("redis-{}", uuid::Uuid::new_v4()), 100);
         let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
-        let window_index = epoch_secs() / 60;
         let attempt_id = uuid::Uuid::new_v4();
         rates
-            .acquire(
-                &provider,
-                &tenant,
-                1,
-                attempt_id,
-                Some(reservation(80, window_index)),
-            )
+            .acquire(&provider, &tenant, 1, attempt_id, Some(quote(80)))
             .await
             .unwrap();
 
         let mut connection = rates.connection().await.unwrap();
         let attempt_key = RedisAttemptRates::budget_attempt_key(&tenant, attempt_id);
-        let total_key = RedisAttemptRates::budget_total_key(&tenant, window_index);
+        let total_key: String = connection.hget(&attempt_key, "total_key").await.unwrap();
         let _: usize = connection.del(attempt_key).await.unwrap();
         assert!(rates
             .observe_usage(&tenant, attempt_id, Some(10))
@@ -1708,15 +1861,73 @@ mod tests {
         assert_eq!(retained, 80);
         assert!(matches!(
             rates
-                .acquire(
-                    &provider,
-                    &tenant,
-                    1,
-                    uuid::Uuid::new_v4(),
-                    Some(reservation(21, window_index)),
-                )
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(21)),)
                 .await,
             Err(RateRefusal::Budget(_))
         ));
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_late_oversized_settlement_saturates_and_keeps_its_tombstone() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-late-{}", uuid::Uuid::new_v4().simple());
+        let mut tenant = budget_scope(
+            &format!("redis-{}", uuid::Uuid::new_v4()),
+            crate::gateway::budget::MAX_EXACT_REDIS_NANOS,
+        );
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let attempt_id = uuid::Uuid::new_v4();
+        rates
+            .acquire(&provider, &tenant, 1, attempt_id, Some(quote(10)))
+            .await
+            .unwrap();
+        let mut connection = rates.connection().await.unwrap();
+        let attempt_key = RedisAttemptRates::budget_attempt_key(&tenant, attempt_id);
+        let total_key: String = connection.hget(&attempt_key, "total_key").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        for _ in 0..2 {
+            rates
+                .observe_usage(
+                    &tenant,
+                    attempt_id,
+                    Some(crate::gateway::budget::MAX_EXACT_REDIS_NANOS),
+                )
+                .await
+                .unwrap();
+        }
+        for _ in 0..2 {
+            rates
+                .finish(
+                    &tenant,
+                    attempt_id,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let retained: u64 = connection.get(&total_key).await.unwrap();
+        assert_eq!(retained, crate::gateway::budget::MAX_EXACT_REDIS_NANOS);
+        let tombstone_exists: bool = connection.exists(&attempt_key).await.unwrap();
+        assert!(tombstone_exists);
+        assert!(rates
+            .acquire(
+                &provider,
+                &tenant,
+                1,
+                uuid::Uuid::new_v4(),
+                Some(quote(100)),
+            )
+            .await
+            .is_ok());
     }
 }
