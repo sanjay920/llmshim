@@ -238,7 +238,7 @@ impl GatewayState {
         match &self.backend {
             Backend::Local(_) => self.idempotency.lookup(context),
             #[cfg(feature = "redis-coordination")]
-            Backend::Distributed(gateway) => gateway.idem_get(context).await,
+            Backend::Distributed(gateway) => gateway.scoped_idem_lookup(context).await,
         }
     }
 
@@ -253,7 +253,7 @@ impl GatewayState {
             #[cfg(feature = "redis-coordination")]
             Backend::Distributed(gateway) => {
                 gateway
-                    .idem_put(context, value, self.idempotency_ttl_secs)
+                    .scoped_idem_store(context, value, self.idempotency_ttl_secs)
                     .await
             }
         }
@@ -494,6 +494,7 @@ async fn chat(
 
     let idempotency_context = idem_key.as_ref().map(|client_key| {
         crate::gateway::idempotency::IdempotencyContext::new(
+            &identity.tenant,
             &identified_caller.credential_scope,
             uri.path(),
             client_key,
@@ -796,6 +797,15 @@ mod native_tests {
     }
 
     fn canonical_request(api_key: &str, idempotency_key: &str, prompt: &str) -> Request<Body> {
+        canonical_request_for_model(api_key, idempotency_key, prompt, "local/test")
+    }
+
+    fn canonical_request_for_model(
+        api_key: &str,
+        idempotency_key: &str,
+        prompt: &str,
+        model: &str,
+    ) -> Request<Body> {
         Request::builder()
             .method("POST")
             .uri("/v1/chat")
@@ -804,12 +814,162 @@ mod native_tests {
             .header("idempotency-key", idempotency_key)
             .body(Body::from(
                 json!({
-                    "model": "local/test",
+                    "model": model,
                     "messages": [{"role": "user", "content": prompt}]
                 })
                 .to_string(),
             ))
             .unwrap()
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    struct CountingDispatch {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[async_trait::async_trait]
+    impl Dispatch for CountingDispatch {
+        async fn dispatch(&self, _provider: &str, payload: Value) -> Result<Value, DispatchError> {
+            let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(json!({
+                "id": format!("response-{call_number}"),
+                "model": payload["model"],
+                "choices": [{
+                    "message": {"role": "assistant", "content": format!("private-{call_number}")},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            }))
+        }
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    fn distributed_state_for_tenant(
+        router: Arc<Router>,
+        gateway: Arc<crate::gateway::distributed::DistributedGateway>,
+        config: &GatewayConfig,
+        tenant: &str,
+    ) -> Arc<GatewayState> {
+        let identity = crate::gateway::auth::Identity {
+            tenant: tenant.to_string(),
+            tier: 1,
+            rpm: None,
+            tpm: None,
+            budget_usd: None,
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+        };
+        Arc::new(GatewayState {
+            router,
+            backend: Backend::Distributed(gateway.clone()),
+            keystore: crate::gateway::auth::KeyStore::enforced(std::collections::HashMap::from([
+                ("reassigned-key".into(), identity),
+            ])),
+            quota: crate::gateway::quota::TenantQuota::new(),
+            spend: crate::gateway::quota::SpendCap::with_store(gateway),
+            idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
+                30,
+            )),
+            idempotency_ttl_secs: 30,
+            overloaded_retry_after: config.overloaded_retry_after,
+        })
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_http_cache_does_not_cross_a_bearer_tenant_reassignment() {
+        let Some(redis_url) = std::env::var("LLMSHIM_REDIS_URL").ok() else {
+            return;
+        };
+        let provider_name = format!("itest-reassigned-{}", uuid::Uuid::new_v4().simple());
+        let router = Arc::new(Router::new().register(
+            &provider_name,
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                provider_name.clone(),
+                "http://127.0.0.1:1",
+                None,
+            )),
+        ));
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let config = GatewayConfig::default();
+        let limiter = Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+        ));
+        let gateway = crate::gateway::distributed::DistributedGateway::connect(
+            &redis_url,
+            Arc::new(CountingDispatch {
+                calls: call_count.clone(),
+            }),
+            limiter,
+            config.clone(),
+        )
+        .await
+        .unwrap();
+        gateway.spawn_workers(vec![provider_name.clone()]);
+
+        let tenant_a_application = app(distributed_state_for_tenant(
+            router.clone(),
+            gateway.clone(),
+            &config,
+            "tenant-a",
+        ));
+        let tenant_b_application = app(distributed_state_for_tenant(
+            router, gateway, &config, "tenant-b",
+        ));
+        let model = format!("{provider_name}/test");
+        let idempotency_key = format!("reassignment-{}", uuid::Uuid::new_v4());
+
+        let tenant_a_response = tenant_a_application
+            .oneshot(canonical_request_for_model(
+                "reassigned-key",
+                &idempotency_key,
+                "same-request",
+                &model,
+            ))
+            .await
+            .unwrap();
+        let tenant_a_body: Value = serde_json::from_slice(
+            &to_bytes(tenant_a_response.into_body(), 10000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tenant_a_body["message"]["content"], "private-1");
+
+        let tenant_b_response = tenant_b_application
+            .clone()
+            .oneshot(canonical_request_for_model(
+                "reassigned-key",
+                &idempotency_key,
+                "same-request",
+                &model,
+            ))
+            .await
+            .unwrap();
+        assert!(!tenant_b_response
+            .headers()
+            .contains_key("idempotency-replayed"));
+        let tenant_b_body: Value = serde_json::from_slice(
+            &to_bytes(tenant_b_response.into_body(), 10000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tenant_b_body["message"]["content"], "private-2");
+
+        let tenant_b_replay = tenant_b_application
+            .oneshot(canonical_request_for_model(
+                "reassigned-key",
+                &idempotency_key,
+                "same-request",
+                &model,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tenant_b_replay.headers()["idempotency-replayed"], "true");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -934,7 +1094,10 @@ mod native_tests {
     async fn native_idempotency_request_mismatch_is_a_native_shaped_conflict() {
         let mut server = mockito::Server::new_async().await;
         let upstream=server.mock("POST","/chat/completions").with_body(json!({"id":"r","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{}}).to_string()).expect(1).create_async().await;
-        let application = app(configured_state(&server.url()));
+        let receipts_directory = tempfile::tempdir().unwrap();
+        let application = app(configured_state(&server.url())).layer(Extension(Arc::new(
+            crate::proxy::wire::Receipts::new(receipts_directory.path().to_owned()),
+        )));
 
         let native_request = |prompt: &str| {
             Request::builder()
@@ -973,6 +1136,59 @@ mod native_tests {
         .unwrap();
         assert_eq!(conflict_body["error"]["type"], "invalid_request_error");
         assert_eq!(conflict_body["error"]["code"], "idempotency_key_reused");
+
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn messages_idempotency_mismatch_is_anthropic_shaped_without_cached_content() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream=server.mock("POST","/chat/completions").with_body(json!({"id":"r","choices":[{"message":{"role":"assistant","content":"private-cached-content"},"finish_reason":"stop"}],"usage":{}}).to_string()).expect(1).create_async().await;
+        let receipts_directory = tempfile::tempdir().unwrap();
+        let application = app(configured_state(&server.url())).layer(Extension(Arc::new(
+            crate::proxy::wire::Receipts::new(receipts_directory.path().to_owned()),
+        )));
+
+        let messages_request = |prompt: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-api-key", "test-key")
+                .header("idempotency-key", "messages-client-key")
+                .body(Body::from(
+                    json!({
+                        "model": "local/test",
+                        "max_tokens": 64,
+                        "messages": [{"role": "user", "content": prompt}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let first_response = application
+            .clone()
+            .oneshot(messages_request("first"))
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+
+        let conflicting_response = application
+            .oneshot(messages_request("changed"))
+            .await
+            .unwrap();
+        assert_eq!(conflicting_response.status(), StatusCode::CONFLICT);
+        let conflict_body: Value = serde_json::from_slice(
+            &to_bytes(conflicting_response.into_body(), 10000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(conflict_body["type"], "error");
+        assert_eq!(conflict_body["error"]["type"], "invalid_request_error");
+        assert!(conflict_body["error"].get("code").is_none());
+        assert!(!conflict_body.to_string().contains("private-cached-content"));
 
         upstream.assert_async().await;
     }

@@ -77,6 +77,15 @@ fn leased_key(provider: &str) -> String {
 fn response_channel(id: &str) -> String {
     format!("llmshim:gw:resp:{id}")
 }
+fn scoped_idempotency_key(context: &crate::gateway::idempotency::IdempotencyContext) -> String {
+    format!("llmshim:gw:idem:v2:{}", context.storage_key())
+}
+fn generic_idempotency_key(client_key: &str) -> String {
+    format!(
+        "llmshim:gw:idem:generic:v1:{}",
+        crate::gateway::idempotency::generic_storage_key(client_key)
+    )
+}
 
 // Atomic lease: pop the earliest-deadline job, move it to `processing` with a
 // visibility deadline, and record its score for redelivery. KEYS: queue,
@@ -208,14 +217,36 @@ impl DistributedGateway {
         }))
     }
 
-    /// Client-idempotency lookup for one credential-, route-, and request-bound key.
-    pub(crate) async fn idem_get(
+    /// Generic Redis cache lookup retained for API compatibility.
+    #[deprecated(note = "gateway HTTP replay uses credential-scoped idempotency")]
+    pub async fn idem_get(&self, key: &str) -> Option<Value> {
+        let mut connection = self.conn.clone();
+        let serialized_value: Option<String> = connection
+            .get(generic_idempotency_key(key))
+            .await
+            .unwrap_or(None);
+        serialized_value.and_then(|value| serde_json::from_str(&value).ok())
+    }
+
+    /// Generic Redis cache insertion retained for API compatibility.
+    #[deprecated(note = "gateway HTTP replay uses credential-scoped idempotency")]
+    pub async fn idem_put(&self, key: &str, value: &Value, ttl_secs: u64) {
+        if let Ok(serialized_value) = serde_json::to_string(value) {
+            let mut connection = self.conn.clone();
+            let _: Result<(), _> = connection
+                .set_ex(generic_idempotency_key(key), serialized_value, ttl_secs)
+                .await;
+        }
+    }
+
+    /// HTTP-gateway lookup for one credential-, route-, and request-bound key.
+    pub(crate) async fn scoped_idem_lookup(
         &self,
         context: &crate::gateway::idempotency::IdempotencyContext,
     ) -> crate::gateway::idempotency::IdempotencyLookup {
         let mut conn = self.conn.clone();
         let raw: Option<String> = conn
-            .get(format!("llmshim:gw:idem:v2:{}", context.storage_key()))
+            .get(scoped_idempotency_key(context))
             .await
             .unwrap_or(None);
         raw.and_then(|serialized| serde_json::from_str(&serialized).ok())
@@ -227,8 +258,8 @@ impl DistributedGateway {
             )
     }
 
-    /// Cache a completed response under its request-bound idempotency context.
-    pub(crate) async fn idem_put(
+    /// Store an HTTP-gateway response under its request-bound context.
+    pub(crate) async fn scoped_idem_store(
         &self,
         context: &crate::gateway::idempotency::IdempotencyContext,
         value: &Value,
@@ -240,7 +271,7 @@ impl DistributedGateway {
             let mut conn = self.conn.clone();
             let _: Result<(), _> = conn
                 .set_ex(
-                    format!("llmshim:gw:idem:v2:{}", context.storage_key()),
+                    scoped_idempotency_key(context),
                     serialized_response,
                     ttl_secs,
                 )
@@ -988,56 +1019,134 @@ mod tests {
             return;
         };
         let original_context = crate::gateway::idempotency::IdempotencyContext::new(
+            "tenant-a",
             "credential-a",
             "/v1/chat",
             "client-key",
             &serde_json::json!({"prompt": "one"}),
         );
         let changed_request_context = crate::gateway::idempotency::IdempotencyContext::new(
+            "tenant-a",
             "credential-a",
             "/v1/chat",
             "client-key",
             &serde_json::json!({"prompt": "two"}),
         );
         let other_credential_context = crate::gateway::idempotency::IdempotencyContext::new(
+            "tenant-a",
             "credential-b",
             "/v1/chat",
             "client-key",
             &serde_json::json!({"prompt": "one"}),
         );
+        let reassigned_tenant_context = crate::gateway::idempotency::IdempotencyContext::new(
+            "tenant-b",
+            "credential-a",
+            "/v1/chat",
+            "client-key",
+            &serde_json::json!({"prompt": "one"}),
+        );
         let mut connection = gateway.conn.clone();
-        let _: Result<i64, _> = connection
-            .del(format!(
-                "llmshim:gw:idem:v2:{}",
-                original_context.storage_key()
-            ))
-            .await;
+        let scoped_storage_key = scoped_idempotency_key(&original_context);
+        let unsafe_legacy_key = "llmshim:gw:idem:client-key";
+        let _: Result<i64, _> = connection.del(&scoped_storage_key).await;
+        let _: Result<i64, _> = connection.del(unsafe_legacy_key).await;
 
         assert_eq!(
-            gateway.idem_get(&original_context).await,
+            gateway.scoped_idem_lookup(&original_context).await,
             crate::gateway::idempotency::IdempotencyLookup::Miss
         );
         gateway
-            .idem_put(
+            .scoped_idem_store(
                 &original_context,
                 &serde_json::json!({"private": "response"}),
                 60,
             )
             .await;
         assert_eq!(
-            gateway.idem_get(&original_context).await,
+            gateway.scoped_idem_lookup(&original_context).await,
             crate::gateway::idempotency::IdempotencyLookup::Replay(
                 serde_json::json!({"private": "response"})
             )
         );
         assert_eq!(
-            gateway.idem_get(&changed_request_context).await,
+            gateway.scoped_idem_lookup(&changed_request_context).await,
             crate::gateway::idempotency::IdempotencyLookup::Conflict
         );
         assert_eq!(
-            gateway.idem_get(&other_credential_context).await,
+            gateway.scoped_idem_lookup(&other_credential_context).await,
             crate::gateway::idempotency::IdempotencyLookup::Miss
         );
+        assert_eq!(
+            gateway.scoped_idem_lookup(&reassigned_tenant_context).await,
+            crate::gateway::idempotency::IdempotencyLookup::Miss
+        );
+
+        let _: () = connection
+            .set_ex(
+                unsafe_legacy_key,
+                serde_json::json!({"private": "legacy-response"}).to_string(),
+                60,
+            )
+            .await
+            .unwrap();
+        let _: i64 = connection.del(&scoped_storage_key).await.unwrap();
+        assert_eq!(
+            gateway.scoped_idem_lookup(&original_context).await,
+            crate::gateway::idempotency::IdempotencyLookup::Miss
+        );
+
+        let _: () = connection
+            .set_ex(&scoped_storage_key, "not-json", 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            gateway.scoped_idem_lookup(&original_context).await,
+            crate::gateway::idempotency::IdempotencyLookup::Miss
+        );
+
+        let unknown_version = serde_json::json!({
+            "version": 2,
+            "request_fingerprint": "unused",
+            "response": {"private": "unknown-version"}
+        });
+        let _: () = connection
+            .set_ex(&scoped_storage_key, unknown_version.to_string(), 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            gateway.scoped_idem_lookup(&original_context).await,
+            crate::gateway::idempotency::IdempotencyLookup::Miss
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    #[allow(deprecated)]
+    async fn redis_generic_idempotency_api_uses_an_isolated_namespace() {
+        let provider = "itest-generic-idempotency";
+        let Some(gateway) = test_gateway(provider).await else {
+            return;
+        };
+        let client_key = format!("generic-{}", uuid::Uuid::new_v4());
+        let mut connection = gateway.conn.clone();
+        let generic_key = generic_idempotency_key(&client_key);
+        let unsafe_legacy_key = format!("llmshim:gw:idem:{client_key}");
+        let _: Result<i64, _> = connection.del(&generic_key).await;
+        let _: Result<i64, _> = connection.del(&unsafe_legacy_key).await;
+
+        gateway
+            .idem_put(&client_key, &serde_json::json!({"generic": true}), 60)
+            .await;
+        assert_eq!(
+            gateway.idem_get(&client_key).await,
+            Some(serde_json::json!({"generic": true}))
+        );
+        assert!(connection.exists::<_, bool>(&generic_key).await.unwrap());
+        assert!(!connection
+            .exists::<_, bool>(&unsafe_legacy_key)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
