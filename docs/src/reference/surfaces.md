@@ -70,7 +70,10 @@ same error-body buffer limit; oversized bodies are dropped before another attemp
 These limits apply through the Rust completion API, CLI, proxy, and gateway.
 They bound decoded body bytes; JSON allocations and process memory have
 additional overhead. Successful raw responses returned by the low-level
-`ShimClient::send` API remain the caller's responsibility.
+`ShimClient::send` API use the configured connect and response-header
+deadlines. After headers are returned, body size, decoding, idle time, total
+lifetime, and cancellation remain the caller's responsibility; llmshim does not
+attach a hidden body task or timer to that raw response.
 
 Normal provider streams, ChatGPT's collected SSE replies, and native HTTP
 facades use one bounded SSE data decoder. It checks input before growing its

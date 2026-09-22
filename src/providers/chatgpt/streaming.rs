@@ -80,13 +80,33 @@ pub(crate) struct CollectedResponse {
 }
 
 pub(crate) async fn collect_response_with_terminal(
-    model: &str,
+    _model: &str,
     response: reqwest::Response,
+    semantic_idle_timeout: std::time::Duration,
+    attempt_deadline: tokio::time::Instant,
 ) -> CollectedResponse {
     let mut events = native_stream(response);
     let mut items = BTreeMap::new();
     let mut texts: BTreeMap<u64, BTreeMap<u64, Value>> = BTreeMap::new();
-    while let Some(event) = events.next().await {
+    loop {
+        let Some(semantic_idle_deadline) =
+            tokio::time::Instant::now().checked_add(semantic_idle_timeout)
+        else {
+            return CollectedResponse {
+                result: Err(timeout_error()),
+                native_terminal: None,
+            };
+        };
+        let event = tokio::select! {
+            event = events.next() => event,
+            _ = tokio::time::sleep_until(semantic_idle_deadline) => {
+                return CollectedResponse { result: Err(timeout_error()), native_terminal: None };
+            }
+            _ = tokio::time::sleep_until(attempt_deadline) => {
+                return CollectedResponse { result: Err(timeout_error()), native_terminal: None };
+            }
+        };
+        let Some(event) = event else { break };
         let event = match event {
             Ok(event) => event,
             Err(error) => {
@@ -133,8 +153,7 @@ pub(crate) async fn collect_response_with_terminal(
                     response["output"] = json!(items.into_values().collect::<Vec<_>>());
                 }
                 return CollectedResponse {
-                    result: terminal_validation
-                        .and_then(|_| transform_response(model, response.clone())),
+                    result: terminal_validation.map(|_| response.clone()),
                     native_terminal: Some(response),
                 };
             }
@@ -144,6 +163,14 @@ pub(crate) async fn collect_response_with_terminal(
     CollectedResponse {
         result: Err(stream_error("missing terminal response")),
         native_terminal: None,
+    }
+}
+
+fn timeout_error() -> ShimError {
+    ShimError::ProviderError {
+        status: 504,
+        body: "upstream response body timed out".into(),
+        retry_after: None,
     }
 }
 
@@ -165,4 +192,45 @@ pub(crate) fn transform_chunk(model: &str, chunk: &str) -> Result<Option<String>
         }).to_string()));
     }
     translator().transform_stream_chunk(&format!("chatgpt/{model}"), chunk)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn comments_and_silence_expire_without_a_terminal_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nd\r\n: keepalive\n\n\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/responses"))
+            .send()
+            .await
+            .unwrap();
+        let collected = collect_response_with_terminal(
+            "test-model",
+            response,
+            std::time::Duration::from_millis(20),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(
+            collected.result,
+            Err(ShimError::ProviderError { status: 504, .. })
+        ));
+        assert!(collected.native_terminal.is_none());
+    }
 }

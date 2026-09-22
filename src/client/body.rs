@@ -22,6 +22,7 @@ impl Default for ResponseBodyLimits {
 pub(super) enum BodyReadError {
     Http(reqwest::Error),
     TooLarge,
+    Timeout,
 }
 
 impl BodyReadError {
@@ -33,6 +34,11 @@ impl BodyReadError {
                 body: "upstream response body exceeds size limit".into(),
                 retry_after: None,
             }),
+            Self::Timeout => DispatchFailure::LocalTimeout(ShimError::ProviderError {
+                status: 504,
+                body: "upstream response body timed out".into(),
+                retry_after: None,
+            }),
         }
     }
 }
@@ -40,6 +46,8 @@ impl BodyReadError {
 pub(super) async fn read(
     response: reqwest::Response,
     maximum_bytes: usize,
+    idle_timeout: std::time::Duration,
+    total_deadline: tokio::time::Instant,
 ) -> Result<Vec<u8>, BodyReadError> {
     if response
         .content_length()
@@ -47,16 +55,35 @@ pub(super) async fn read(
     {
         return Err(BodyReadError::TooLarge);
     }
-    collect_decoded_chunks(response.bytes_stream(), maximum_bytes).await
+    collect_decoded_chunks(
+        response.bytes_stream(),
+        maximum_bytes,
+        idle_timeout,
+        total_deadline,
+    )
+    .await
 }
 
 async fn collect_decoded_chunks(
     response_chunks: impl Stream<Item = Result<Bytes, reqwest::Error>>,
     maximum_bytes: usize,
+    idle_timeout: std::time::Duration,
+    total_deadline: tokio::time::Instant,
 ) -> Result<Vec<u8>, BodyReadError> {
     futures::pin_mut!(response_chunks);
     let mut decoded_body = Vec::new();
-    while let Some(response_chunk) = response_chunks.next().await {
+    loop {
+        let idle_deadline = tokio::time::Instant::now()
+            .checked_add(idle_timeout)
+            .ok_or(BodyReadError::Timeout)?;
+        let response_chunk = tokio::select! {
+            response_chunk = response_chunks.next() => response_chunk,
+            _ = tokio::time::sleep_until(idle_deadline) => return Err(BodyReadError::Timeout),
+            _ = tokio::time::sleep_until(total_deadline) => return Err(BodyReadError::Timeout),
+        };
+        let Some(response_chunk) = response_chunk else {
+            break;
+        };
         let response_chunk = response_chunk.map_err(BodyReadError::Http)?;
         if response_chunk.len() > maximum_bytes.saturating_sub(decoded_body.len()) {
             return Err(BodyReadError::TooLarge);
@@ -69,8 +96,10 @@ async fn collect_decoded_chunks(
 pub(super) async fn read_json(
     response: reqwest::Response,
     maximum_bytes: usize,
+    idle_timeout: std::time::Duration,
+    total_deadline: tokio::time::Instant,
 ) -> Result<serde_json::Value, BodyReadError> {
-    let decoded_body = read(response, maximum_bytes).await?;
+    let decoded_body = read(response, maximum_bytes, idle_timeout, total_deadline).await?;
     // Retain reqwest's public decode-error type after the body is bounded.
     reqwest::Response::from(http::Response::new(decoded_body))
         .json()
@@ -81,9 +110,11 @@ pub(super) async fn read_json(
 pub(super) async fn read_text_and_bytes(
     response: reqwest::Response,
     maximum_bytes: usize,
+    idle_timeout: std::time::Duration,
+    total_deadline: tokio::time::Instant,
 ) -> Result<(String, Vec<u8>), BodyReadError> {
     let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
-    let decoded_body = read(response, maximum_bytes).await?;
+    let decoded_body = read(response, maximum_bytes, idle_timeout, total_deadline).await?;
     let mut bounded_response = http::Response::new(decoded_body.clone());
     if let Some(content_type) = content_type {
         bounded_response
@@ -141,7 +172,14 @@ mod tests {
             Ok(Bytes::from_static(b"def")),
         ]);
         assert_eq!(
-            collect_decoded_chunks(exact_chunks, 6).await.unwrap(),
+            collect_decoded_chunks(
+                exact_chunks,
+                6,
+                Duration::from_secs(1),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap(),
             b"abcdef"
         );
 
@@ -152,11 +190,44 @@ mod tests {
         .chain(futures::stream::pending());
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            collect_decoded_chunks(overflowing_chunks, 5),
+            collect_decoded_chunks(
+                overflowing_chunks,
+                5,
+                Duration::from_secs(1),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            ),
         )
         .await
         .expect("the reader must not wait for EOF after crossing the limit");
         assert!(matches!(result, Err(BodyReadError::TooLarge)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn decoded_body_idle_timeout_is_independent_of_size_limit() {
+        let result = collect_decoded_chunks(
+            futures::stream::pending(),
+            64,
+            Duration::from_millis(5),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(BodyReadError::Timeout)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn decoded_body_total_timeout_does_not_reset_on_progress() {
+        let chunks = futures::stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(4)).await;
+            Some((Ok(Bytes::from_static(b"x")), ()))
+        });
+        let result = collect_decoded_chunks(
+            chunks,
+            64,
+            Duration::from_millis(5),
+            tokio::time::Instant::now() + Duration::from_millis(10),
+        )
+        .await;
+        assert!(matches!(result, Err(BodyReadError::Timeout)));
     }
 
     #[tokio::test]
@@ -179,7 +250,13 @@ mod tests {
                 .send()
                 .await
                 .unwrap();
-            let result = read(response, maximum_bytes).await;
+            let result = read(
+                response,
+                maximum_bytes,
+                Duration::from_secs(1),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
             if maximum_bytes == 64 {
                 assert!(matches!(result, Err(BodyReadError::TooLarge)));
             } else {
@@ -249,7 +326,12 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(matches!(read_json(response, 64).await,
+        assert!(matches!(read_json(
+            response,
+            64,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ).await,
             Err(BodyReadError::Http(error)) if error.is_decode()));
         response_mock.assert_async().await;
     }
@@ -274,11 +356,15 @@ mod tests {
             .text()
             .await
             .unwrap();
-        let bounded_text =
-            read_text_and_bytes(http_client.get(response_url).send().await.unwrap(), 4)
-                .await
-                .unwrap()
-                .0;
+        let bounded_text = read_text_and_bytes(
+            http_client.get(response_url).send().await.unwrap(),
+            4,
+            Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(bounded_text, original_text);
         response_mock.assert_async().await;
     }
@@ -286,6 +372,178 @@ mod tests {
     #[derive(Default)]
     struct RecordingPolicy {
         outcomes: Mutex<Vec<AttemptOutcome>>,
+    }
+
+    struct PendingAcquirePolicy;
+
+    impl AttemptPolicy for PendingAcquirePolicy {
+        fn acquire<'a>(
+            &'a self,
+            _attempt: &'a PreparedAttempt<'a>,
+        ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyRefusal>> {
+            Box::pin(futures::future::pending())
+        }
+
+        fn observe<'a>(
+            &'a self,
+            _attempt: &'a AttemptIdentity,
+            _event: AttemptEvent<'a>,
+        ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn observe_abandoned(
+            &self,
+            _attempt: &AttemptIdentity,
+            _outcome: AttemptOutcome,
+        ) -> Result<(), AttemptPolicyError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PendingObservation {
+        Headers,
+        Usage,
+        Finish,
+    }
+
+    struct PendingObservationPolicy {
+        pending: PendingObservation,
+        abandoned: std::sync::atomic::AtomicBool,
+    }
+
+    impl AttemptPolicy for PendingObservationPolicy {
+        fn acquire<'a>(
+            &'a self,
+            _attempt: &'a PreparedAttempt<'a>,
+        ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyRefusal>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn observe<'a>(
+            &'a self,
+            _attempt: &'a AttemptIdentity,
+            event: AttemptEvent<'a>,
+        ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>> {
+            let should_wait = matches!(
+                (self.pending, event),
+                (
+                    PendingObservation::Headers,
+                    AttemptEvent::ResponseHeaders { .. }
+                ) | (PendingObservation::Usage, AttemptEvent::Usage { .. })
+                    | (PendingObservation::Finish, AttemptEvent::Finished(_))
+            );
+            Box::pin(async move {
+                if should_wait {
+                    futures::future::pending().await
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn observe_abandoned(
+            &self,
+            _attempt: &AttemptIdentity,
+            _outcome: AttemptOutcome,
+        ) -> Result<(), AttemptPolicyError> {
+            self.abandoned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_policy_acquire_returns_local_503_without_sending() {
+        let mut upstream_server = mockito::Server::new_async().await;
+        let response_mock = upstream_server
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let provider = crate::providers::openai_compat::OpenAiCompatible::new(
+            "test-provider",
+            upstream_server.url(),
+            None,
+        );
+        let deadlines = crate::client::AttemptDeadlines::default()
+            .with_policy_callback_timeout(Duration::from_millis(5))
+            .unwrap();
+        let client = ShimClient::new().with_attempt_deadlines(deadlines).unwrap();
+        let context = DispatchPolicyContext::new(Arc::new(PendingAcquirePolicy));
+        let error = client
+            .completion_with_policy(
+                &provider,
+                "test-model",
+                &json!({"messages": [{"role": "user", "content": "test"}]}),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ShimError::ProviderError { status: 503, .. }
+        ));
+        response_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pending_header_usage_and_finish_callbacks_are_bounded_and_abandoned() {
+        for pending in [
+            PendingObservation::Headers,
+            PendingObservation::Usage,
+            PendingObservation::Finish,
+        ] {
+            let mut upstream_server = mockito::Server::new_async().await;
+            let response_mock = upstream_server
+                .mock("POST", "/chat/completions")
+                .with_status(200)
+                .with_body(
+                    json!({
+                        "id": "response",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    })
+                    .to_string(),
+                )
+                .expect(1)
+                .create_async()
+                .await;
+            let provider = crate::providers::openai_compat::OpenAiCompatible::new(
+                "test-provider",
+                upstream_server.url(),
+                None,
+            );
+            let deadlines = crate::client::AttemptDeadlines::default()
+                .with_policy_callback_timeout(Duration::from_millis(20))
+                .unwrap();
+            let client = ShimClient::new().with_attempt_deadlines(deadlines).unwrap();
+            let policy = Arc::new(PendingObservationPolicy {
+                pending,
+                abandoned: std::sync::atomic::AtomicBool::new(false),
+            });
+            let context = DispatchPolicyContext::new(policy.clone());
+            let error = client
+                .completion_with_policy(
+                    &provider,
+                    "test-model",
+                    &json!({"messages": [{"role": "user", "content": "test"}]}),
+                    &context,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ShimError::ProviderError { status: 503, .. }),
+                "unexpected {pending:?} error: {error:?}"
+            );
+            assert!(policy.abandoned.load(std::sync::atomic::Ordering::SeqCst));
+            response_mock.assert_async().await;
+        }
     }
 
     impl AttemptPolicy for RecordingPolicy {
