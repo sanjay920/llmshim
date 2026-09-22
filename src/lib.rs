@@ -17,6 +17,7 @@ pub mod provider;
 pub mod providers;
 pub mod reasoning;
 pub mod router;
+mod sse;
 pub mod streaming;
 pub mod toolcall;
 pub mod usage;

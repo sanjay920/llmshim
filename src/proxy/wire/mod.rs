@@ -11,7 +11,6 @@ use axum::{
     },
     Json,
 };
-use eventsource_stream::Eventsource;
 use futures::StreamExt;
 pub use receipts::Receipts;
 use serde_json::{json, Value};
@@ -478,7 +477,7 @@ pub async fn translate(request: Request, next: Next) -> Response {
     {
         let model = native["model"].clone();
         let events = async_stream::stream! {
-            let mut stream=Box::pin(body.into_data_stream().eventsource());
+            let mut stream = Box::pin(crate::sse::data(body.into_data_stream()));
             let mut response=json!({"id":format!("msg_{}",uuid::Uuid::new_v4().simple()),"model":model,"message":{"role":"assistant","content":""},"usage":{},"finish_reason":"stop"});
             response["created"]=json!(chrono::Utc::now().timestamp());
             let mut text_started=false;
@@ -493,9 +492,9 @@ pub async fn translate(request: Request, next: Next) -> Response {
             let mut reasoning=crate::reasoning::ReasoningAccumulator::default();let mut size=0usize;let mut done=false;
             while let Some(event)=stream.next().await {
                 let event=match event{Ok(event)=>event,Err(_)=>{yield Ok::<Event,Infallible>(Event::default().event("error").data(error_body(wire,"upstream stream failed").to_string()));return;}};
-                size=size.saturating_add(event.data.len());
+                size=size.saturating_add(event.len());
                 if size>32*1024*1024 {yield Ok(Event::default().event("error").data(error_body(wire,"response exceeds size limit").to_string()));return;}
-                let data:Value=match serde_json::from_str(&event.data){Ok(data)=>data,Err(_)=>continue};
+                let data:Value=match serde_json::from_str(&event){Ok(data)=>data,Err(_)=>continue};
                 match data["type"].as_str() {
                     Some("content")=>{
                         let text=response["message"]["content"].as_str().unwrap_or("").to_owned()+data["text"].as_str().unwrap_or("");response["message"]["content"]=json!(text);
