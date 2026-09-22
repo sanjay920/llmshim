@@ -395,8 +395,7 @@ impl ReasoningAccumulator {
             } else if let Some(block) = self.parts.get_mut(&key) {
                 for field in ["text", "signature", "data"] {
                     if let Some(text) = fragment[field].as_str() {
-                        let existing = block[field].as_str().unwrap_or("");
-                        block[field] = json!(format!("{existing}{text}"));
+                        crate::streaming::append_string_fragment(&mut block[field], text);
                     }
                 }
                 if let Some(payload) = fragment.get("payload") {
@@ -410,10 +409,9 @@ impl ReasoningAccumulator {
                                 "text" | "signature" | "data" | "summary" | "thinking"
                             ) && value.is_string()
                             {
-                                let old = previous.get(field).and_then(Value::as_str).unwrap_or("");
-                                previous.insert(
-                                    field.clone(),
-                                    json!(format!("{old}{}", value.as_str().unwrap())),
+                                crate::streaming::append_string_fragment(
+                                    previous.entry(field.clone()).or_insert(Value::Null),
+                                    value.as_str().unwrap(),
                                 );
                             } else {
                                 previous.insert(field.clone(), value.clone());
