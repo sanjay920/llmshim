@@ -17,6 +17,7 @@ use llmshim::{
         openrouter::OpenRouter,
         xai::Xai,
     },
+    streaming::StreamRetentionLimits,
 };
 use serde_json::{json, Value};
 use std::sync::{
@@ -2106,6 +2107,91 @@ async fn chatgpt_terminal_usage_and_account_binding_survive_collection_failure()
         account.starts_with("sha256:") && !account.contains("private-account")
     }));
     assert!(!format!("{events:?}").contains("private-account"));
+}
+
+#[tokio::test]
+async fn chatgpt_usage_precedes_terminal_retention_failure_on_the_public_client_path() {
+    let mut server = mockito::Server::new_async().await;
+    let auth_directory = tempfile::tempdir().unwrap();
+    let auth = ChatGptAuth::new(auth_directory.path().join("auth.json"));
+    std::fs::write(
+        auth.auth_path(),
+        json!({
+            "access_token":"test-access",
+            "refresh_token":"test-refresh",
+            "account_id":"test-account",
+            "expires_at":chrono::Utc::now().timestamp() + 3600
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let terminal = json!({
+        "type":"response.completed",
+        "response":{
+            "id":"response",
+            "status":"completed",
+            "output":[{
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":"x".repeat(4_096)}]
+            }],
+            "usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}
+        }
+    });
+    let upstream = server
+        .mock("POST", "/responses")
+        .with_header("content-type", "text/event-stream")
+        .with_body(format!("data:{terminal}\n\n"))
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = ChatGpt::new(auth).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+    let client = ShimClient::new()
+        .with_stream_retention_limits(StreamRetentionLimits::new(512, 64, 4 * 1024, 64).unwrap())
+        .unwrap();
+
+    let error = client
+        .completion_with_policy(
+            &provider,
+            "gpt-6-astra",
+            &request("chatgpt/gpt-6-astra"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap_err();
+
+    upstream.assert_async().await;
+    assert!(error
+        .to_string()
+        .contains("upstream stream retained state exceeds limit"));
+    let events = policy.events();
+    let usage_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RecordedEvent::Usage { usage, terminal: true, .. }
+                    if usage["total_tokens"] == 10
+            )
+        })
+        .unwrap();
+    let failure_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RecordedEvent::Finished {
+                    outcome: AttemptOutcome::InvalidResponse {
+                        accounting: AttemptAccounting::UsageObserved
+                    },
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(usage_index < failure_index);
+    assert!(!format!("{events:?}").contains(&"x".repeat(128)));
 }
 
 async fn assert_native_stream_usage_precedes_failure(
