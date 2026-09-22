@@ -87,14 +87,6 @@ impl InboundReasoningBudget {
     }
 }
 
-fn emitted_legacy_block(payload: &Value) -> bool {
-    match payload["type"].as_str() {
-        Some("reasoning" | "thinking" | "reasoning.text" | "reasoning.summary") => true,
-        Some("redacted_thinking" | "reasoning.encrypted") => payload["data"].is_string(),
-        _ => payload["thought"] == true,
-    }
-}
-
 fn reserve_repeated_block(
     budget: &mut InboundReasoningBudget,
     origin: &Value,
@@ -132,7 +124,7 @@ fn preflight_legacy_message(message: &Value, budget: &mut InboundReasoningBudget
         let mut emitted_any = false;
         for payload in message[field].as_array().into_iter().flatten() {
             budget.reserve_value_copies(payload, SOURCE_VALUE_COPIES, 1)?;
-            if emitted_legacy_block(payload) {
+            if super::normalize::legacy_structured_block_emits(payload) {
                 emitted_any = true;
                 reserve_repeated_block(budget, origin, payload)?;
             }
@@ -268,6 +260,23 @@ mod tests {
         }]});
         assert!(preflight_request_with_limits(&request, usize::MAX, 2).is_ok());
         assert!(preflight_request_with_limits(&request, usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn malformed_opaque_rows_do_not_multiply_origin_before_later_valid_field() {
+        let request = json!({"messages":[{
+            "role":"assistant",
+            "reasoning_origin":origin(8 * 1024),
+            "reasoning_details":[
+                {"type":"redacted_thinking"},
+                {"type":"redacted_thinking","data":null},
+                {"type":"reasoning.encrypted","data":7},
+                {"type":"reasoning.encrypted","data":[]}
+            ],
+            "thinking_blocks":[{"type":"thinking","thinking":"kept","signature":"sig"}]
+        }]});
+        assert!(preflight_request_with_limits(&request, 80 * 1024, 5).is_ok());
+        assert!(preflight_request_with_limits(&request, usize::MAX, 4).is_err());
     }
 
     #[test]
