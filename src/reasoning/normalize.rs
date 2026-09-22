@@ -1,11 +1,150 @@
 use super::*;
+use crate::derived_response::{DerivedFootprint, DerivedResponseBudget};
+use std::mem::size_of;
 
-fn structured_block(
+fn checked_string_bytes(strings: impl IntoIterator<Item = usize>) -> Option<usize> {
+    strings
+        .into_iter()
+        .try_fold(0_usize, |total, length| total.checked_add(length))
+}
+
+fn recognized_structured_block(payload: &Value) -> bool {
+    matches!(
+        payload["type"].as_str(),
+        Some(
+            "reasoning"
+                | "redacted_thinking"
+                | "reasoning.encrypted"
+                | "thinking"
+                | "reasoning.text"
+                | "reasoning.summary"
+        )
+    ) || payload["thought"] == true
+}
+
+fn summary_text_length(payload: &Value) -> Option<usize> {
+    let joined_length = |field: &str, kind: Option<&str>| {
+        let mut total = 0_usize;
+        let mut count = 0_usize;
+        for text in payload[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|part| kind.is_none_or(|kind| part["type"] == kind))
+            .filter_map(|part| part["text"].as_str())
+        {
+            total = total.checked_add(text.len())?;
+            count = count.checked_add(1)?;
+        }
+        total.checked_add(count.saturating_sub(1))
+    };
+    let summary = joined_length("summary", None)?;
+    if summary == 0 {
+        joined_length("content", Some("reasoning_text"))
+    } else {
+        Some(summary)
+    }
+}
+
+fn structured_block_footprint(
     payload: &Value,
-    origin: &ReasoningOrigin,
+    target: &ReplayTarget,
     field: Option<&str>,
-) -> Option<ReasoningBlock> {
-    let mut b = ReasoningBlock::text("", origin.clone());
+    include_payload: bool,
+) -> Option<DerivedFootprint> {
+    if !recognized_structured_block(payload) {
+        return None;
+    }
+    let kind = payload["type"].as_str().unwrap_or("");
+    let copied_string_bytes = match kind {
+        "reasoning" => payload["encrypted_content"]
+            .as_str()
+            .map(str::len)
+            .or_else(|| summary_text_length(payload)),
+        "redacted_thinking" | "reasoning.encrypted" => Some(payload["data"].as_str()?.len()),
+        "thinking" => checked_string_bytes([
+            payload["thinking"].as_str().unwrap_or("").len(),
+            payload["signature"].as_str().map(str::len).unwrap_or(0),
+        ]),
+        "reasoning.text" => checked_string_bytes([
+            payload["text"].as_str().unwrap_or("").len(),
+            payload["signature"].as_str().map(str::len).unwrap_or(0),
+        ]),
+        "reasoning.summary" => Some(payload["summary"].as_str().unwrap_or("").len()),
+        _ if payload["thought"] == true => checked_string_bytes([
+            payload["text"].as_str().unwrap_or("").len(),
+            payload["thoughtSignature"]
+                .as_str()
+                .map(str::len)
+                .unwrap_or(0),
+        ]),
+        _ => return None,
+    }?
+    .checked_add(payload["id"].as_str().map(str::len).unwrap_or(0))?
+    .checked_add(field.map(str::len).unwrap_or(0))?;
+    let mut footprint = DerivedFootprint::record(size_of::<ReasoningBlock>())?
+        .checked_add(crate::derived_response::origin_footprint(target)?)?
+        .checked_add(DerivedFootprint::strings(copied_string_bytes))?;
+    if include_payload {
+        footprint =
+            footprint.checked_add(crate::derived_response::value_footprint(payload).ok()?)?;
+    }
+    footprint.checked_multiply(2)
+}
+
+fn ensure_origin(
+    origin: &mut Option<ReasoningOrigin>,
+    target: &ReplayTarget,
+    budget: &mut DerivedResponseBudget,
+) -> crate::error::Result<()> {
+    if origin.is_none() {
+        let footprint =
+            crate::derived_response::origin_footprint(target).ok_or_else(|| budget.error())?;
+        budget.reserve(footprint)?;
+        *origin = Some(target.origin());
+    }
+    Ok(())
+}
+
+fn reserve_plain_block(
+    target: &ReplayTarget,
+    budget: &mut DerivedResponseBudget,
+    copied_string_bytes: usize,
+) -> crate::error::Result<()> {
+    let footprint = DerivedFootprint::record(size_of::<ReasoningBlock>())
+        .ok_or_else(|| budget.error())?
+        .checked_add(
+            crate::derived_response::origin_footprint(target).ok_or_else(|| budget.error())?,
+        )
+        .and_then(|value| value.checked_add(DerivedFootprint::strings(copied_string_bytes)))
+        .and_then(|value| value.checked_multiply(2))
+        .ok_or_else(|| budget.error())?;
+    budget.reserve(footprint)
+}
+
+fn structured_block_with_budget(
+    payload: &Value,
+    target: &ReplayTarget,
+    origin: &mut Option<ReasoningOrigin>,
+    field: Option<&str>,
+    include_payload: bool,
+    budget: &mut DerivedResponseBudget,
+) -> crate::error::Result<Option<ReasoningBlock>> {
+    if !recognized_structured_block(payload) {
+        return Ok(None);
+    }
+    if matches!(
+        payload["type"].as_str(),
+        Some("redacted_thinking" | "reasoning.encrypted")
+    ) && payload["data"].as_str().is_none()
+    {
+        return Ok(None);
+    }
+    let footprint = structured_block_footprint(payload, target, field, include_payload)
+        .ok_or_else(|| budget.error())?;
+    budget.reserve(footprint)?;
+    ensure_origin(origin, target, budget)?;
+    let mut b = ReasoningBlock::text("", origin.as_ref().unwrap().clone());
     let kind = payload["type"].as_str().unwrap_or("");
     match kind {
         "reasoning" => {
@@ -21,12 +160,18 @@ fn structured_block(
         "redacted_thinking" => {
             b.kind = ReasoningKind::Redacted;
             b.text = None;
-            b.data = Some(payload["data"].as_str()?.into());
+            let Some(data) = payload["data"].as_str() else {
+                return Ok(None);
+            };
+            b.data = Some(data.into());
         }
         "reasoning.encrypted" => {
             b.kind = ReasoningKind::Encrypted;
             b.text = None;
-            b.data = Some(payload["data"].as_str()?.into());
+            let Some(data) = payload["data"].as_str() else {
+                return Ok(None);
+            };
+            b.data = Some(data.into());
         }
         "thinking" => {
             b.text = Some(payload["thinking"].as_str().unwrap_or("").into());
@@ -43,11 +188,13 @@ fn structured_block(
             b.text = Some(payload["text"].as_str().unwrap_or("").into());
             b.signature = payload["thoughtSignature"].as_str().map(str::to_owned);
         }
-        _ => return None,
+        _ => return Ok(None),
     }
-    b.payload = Some(payload.clone());
+    if include_payload {
+        b.payload = Some(payload.clone());
+    }
     b.source_field = field.map(str::to_owned);
-    Some(b)
+    Ok(Some(b))
 }
 
 /// The readable text of a Responses `reasoning` item. OpenAI's hosted models
@@ -76,16 +223,23 @@ fn summary_text(payload: &Value) -> String {
     }
 }
 
-pub(super) fn chat_blocks(message: &Value, origin: &ReasoningOrigin) -> Vec<ReasoningBlock> {
+pub(super) fn chat_blocks(
+    message: &Value,
+    target: &ReplayTarget,
+    origin: &mut Option<ReasoningOrigin>,
+    budget: &mut DerivedResponseBudget,
+) -> crate::error::Result<Vec<ReasoningBlock>> {
     for field in ["reasoning_details", "thinking_blocks"] {
-        let blocks: Vec<_> = message[field]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|p| structured_block(p, origin, Some(field)))
-            .collect();
+        let mut blocks = Vec::new();
+        for payload in message[field].as_array().into_iter().flatten() {
+            if let Some(block) =
+                structured_block_with_budget(payload, target, origin, Some(field), true, budget)?
+            {
+                blocks.push(block);
+            }
+        }
         if !blocks.is_empty() {
-            return blocks;
+            return Ok(blocks);
         }
     }
     let mut blocks = Vec::new();
@@ -93,7 +247,30 @@ pub(super) fn chat_blocks(message: &Value, origin: &ReasoningOrigin) -> Vec<Reas
         .as_str()
         .or_else(|| message["reasoning"].as_str());
     if let Some(text) = text {
-        let mut b = ReasoningBlock::text(text, origin.clone());
+        let copied = checked_string_bytes([
+            text.len(),
+            message["reasoning_signature"]
+                .as_str()
+                .map(str::len)
+                .unwrap_or(0),
+            if message["reasoning_content"].is_string() {
+                "reasoning_content".len()
+            } else {
+                "reasoning".len()
+            },
+        ])
+        .ok_or_else(|| budget.error())?;
+        let footprint = DerivedFootprint::record(size_of::<ReasoningBlock>())
+            .ok_or_else(|| budget.error())?
+            .checked_add(
+                crate::derived_response::origin_footprint(target).ok_or_else(|| budget.error())?,
+            )
+            .and_then(|value| value.checked_add(DerivedFootprint::strings(copied)))
+            .and_then(|value| value.checked_multiply(2))
+            .ok_or_else(|| budget.error())?;
+        budget.reserve(footprint)?;
+        ensure_origin(origin, target, budget)?;
+        let mut b = ReasoningBlock::text(text, origin.as_ref().unwrap().clone());
         b.signature = message["reasoning_signature"].as_str().map(str::to_owned);
         b.source_field = Some(
             if message["reasoning_content"].is_string() {
@@ -106,70 +283,238 @@ pub(super) fn chat_blocks(message: &Value, origin: &ReasoningOrigin) -> Vec<Reas
         blocks.push(b);
     }
     if let Some(data) = message["redacted_reasoning_content"].as_str() {
-        let mut b = ReasoningBlock::text("", origin.clone());
+        let footprint = DerivedFootprint::record(size_of::<ReasoningBlock>())
+            .ok_or_else(|| budget.error())?
+            .checked_add(
+                crate::derived_response::origin_footprint(target).ok_or_else(|| budget.error())?,
+            )
+            .and_then(|value| value.checked_add(DerivedFootprint::strings(data.len())))
+            .and_then(|value| value.checked_multiply(2))
+            .ok_or_else(|| budget.error())?;
+        budget.reserve(footprint)?;
+        ensure_origin(origin, target, budget)?;
+        let mut b = ReasoningBlock::text("", origin.as_ref().unwrap().clone());
         b.kind = ReasoningKind::Redacted;
         b.text = None;
         b.data = Some(data.into());
         blocks.push(b);
     }
+    Ok(blocks)
+}
+
+pub(super) fn legacy_chat_blocks(message: &Value, origin: &ReasoningOrigin) -> Vec<ReasoningBlock> {
+    for field in ["reasoning_details", "thinking_blocks"] {
+        let mut blocks = Vec::new();
+        for payload in message[field].as_array().into_iter().flatten() {
+            if !recognized_structured_block(payload) {
+                continue;
+            }
+            let mut block = ReasoningBlock::text("", origin.clone());
+            match payload["type"].as_str().unwrap_or("") {
+                "reasoning" => {
+                    block.item_id = payload["id"].as_str().map(str::to_owned);
+                    if let Some(data) = payload["encrypted_content"].as_str() {
+                        block.kind = ReasoningKind::Encrypted;
+                        block.text = None;
+                        block.data = Some(data.into());
+                    } else {
+                        block.text = Some(summary_text(payload));
+                    }
+                }
+                "redacted_thinking" | "reasoning.encrypted" => {
+                    let Some(data) = payload["data"].as_str() else {
+                        continue;
+                    };
+                    block.kind = if payload["type"] == "redacted_thinking" {
+                        ReasoningKind::Redacted
+                    } else {
+                        ReasoningKind::Encrypted
+                    };
+                    block.text = None;
+                    block.data = Some(data.into());
+                }
+                "thinking" => {
+                    block.text = Some(payload["thinking"].as_str().unwrap_or("").into());
+                    block.signature = payload["signature"].as_str().map(str::to_owned);
+                }
+                "reasoning.text" => {
+                    block.text = Some(payload["text"].as_str().unwrap_or("").into());
+                    block.signature = payload["signature"].as_str().map(str::to_owned);
+                }
+                "reasoning.summary" => {
+                    block.text = Some(payload["summary"].as_str().unwrap_or("").into());
+                }
+                _ if payload["thought"] == true => {
+                    block.text = Some(payload["text"].as_str().unwrap_or("").into());
+                    block.signature = payload["thoughtSignature"].as_str().map(str::to_owned);
+                }
+                _ => continue,
+            }
+            block.payload = Some(payload.clone());
+            block.source_field = Some(field.into());
+            blocks.push(block);
+        }
+        if !blocks.is_empty() {
+            return blocks;
+        }
+    }
+    let mut blocks = Vec::new();
+    if let Some(text) = message["reasoning_content"]
+        .as_str()
+        .or_else(|| message["reasoning"].as_str())
+    {
+        let mut block = ReasoningBlock::text(text, origin.clone());
+        block.signature = message["reasoning_signature"].as_str().map(str::to_owned);
+        block.source_field = Some(
+            if message["reasoning_content"].is_string() {
+                "reasoning_content"
+            } else {
+                "reasoning"
+            }
+            .into(),
+        );
+        blocks.push(block);
+    }
+    if let Some(data) = message["redacted_reasoning_content"].as_str() {
+        let mut block = ReasoningBlock::text("", origin.clone());
+        block.kind = ReasoningKind::Redacted;
+        block.text = None;
+        block.data = Some(data.into());
+        blocks.push(block);
+    }
     blocks
 }
 
-fn stamp_tool_signatures(message: &mut Value, origin: &ReasoningOrigin) {
+fn stamp_tool_signatures(
+    message: &mut Value,
+    target: &ReplayTarget,
+    origin: &mut Option<ReasoningOrigin>,
+    budget: &mut DerivedResponseBudget,
+) -> crate::error::Result<()> {
     if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
         for call in calls {
-            if let Some(data) = call["thought_signature"].as_str().map(str::to_owned) {
+            if let Some(signature) = call.get("thought_signature") {
+                let Some(data) = signature.as_str() else {
+                    return Err(budget.error());
+                };
+                let footprint = DerivedFootprint::record(size_of::<ThoughtSignature>())
+                    .ok_or_else(|| budget.error())?
+                    .checked_add(
+                        crate::derived_response::origin_footprint(target)
+                            .ok_or_else(|| budget.error())?,
+                    )
+                    .and_then(|value| value.checked_add(DerivedFootprint::strings(data.len())))
+                    .and_then(|value| value.checked_multiply(2))
+                    .ok_or_else(|| budget.error())?;
+                budget.reserve(footprint)?;
+                ensure_origin(origin, target, budget)?;
                 call["thought_signature"] = json!(ThoughtSignature {
-                    data,
-                    origin: origin.clone()
+                    data: data.to_owned(),
+                    origin: origin.as_ref().unwrap().clone()
                 });
             }
         }
     }
+    Ok(())
 }
 
 /// Normalize from the original native response, before lossy text projections
 /// can discard ordered blocks, ids, signatures, or encrypted item contents.
-pub fn capture_response(target: &ReplayTarget, native: &Value, response: &mut Value) {
-    let origin = target.origin();
+pub fn capture_response(
+    target: &ReplayTarget,
+    native: &Value,
+    response: &mut Value,
+) -> crate::error::Result<()> {
+    let mut budget = DerivedResponseBudget::unary();
+    capture_response_with_budget(target, native, response, &mut budget)
+}
+
+pub(crate) fn capture_response_with_budget(
+    target: &ReplayTarget,
+    native: &Value,
+    response: &mut Value,
+    budget: &mut DerivedResponseBudget,
+) -> crate::error::Result<()> {
+    let mut origin = None;
     if let Some(choices) = response.get_mut("choices").and_then(Value::as_array_mut) {
         for (index, choice) in choices.iter_mut().enumerate() {
             let Some(message) = choice.get_mut("message") else {
                 continue;
             };
             let blocks: Vec<ReasoningBlock> = match target.wire {
-                WireFormat::AnthropicMessages => native["content"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|p| structured_block(p, &origin, None))
-                    .collect(),
-                WireFormat::OpenAiResponses => native["output"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|p| p["type"] == "reasoning")
-                    .filter_map(|p| structured_block(p, &origin, None))
-                    .collect(),
-                WireFormat::OpenAiChat => {
-                    chat_blocks(&native["choices"][index]["message"], &origin)
+                WireFormat::AnthropicMessages => {
+                    let mut blocks = Vec::new();
+                    for payload in native["content"].as_array().into_iter().flatten() {
+                        if let Some(block) = structured_block_with_budget(
+                            payload,
+                            target,
+                            &mut origin,
+                            None,
+                            true,
+                            budget,
+                        )? {
+                            blocks.push(block);
+                        }
+                    }
+                    blocks
                 }
-                WireFormat::GoogleGenerateContent => native["candidates"][index]["content"]
-                    ["parts"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|p| structured_block(p, &origin, None))
-                    .collect(),
+                WireFormat::OpenAiResponses => {
+                    let mut blocks = Vec::new();
+                    for payload in native["output"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|payload| payload["type"] == "reasoning")
+                    {
+                        if let Some(block) = structured_block_with_budget(
+                            payload,
+                            target,
+                            &mut origin,
+                            None,
+                            true,
+                            budget,
+                        )? {
+                            blocks.push(block);
+                        }
+                    }
+                    blocks
+                }
+                WireFormat::OpenAiChat => chat_blocks(
+                    &native["choices"][index]["message"],
+                    target,
+                    &mut origin,
+                    budget,
+                )?,
+                WireFormat::GoogleGenerateContent => {
+                    let mut blocks = Vec::new();
+                    for payload in native["candidates"][index]["content"]["parts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(block) = structured_block_with_budget(
+                            payload,
+                            target,
+                            &mut origin,
+                            None,
+                            true,
+                            budget,
+                        )? {
+                            blocks.push(block);
+                        }
+                    }
+                    blocks
+                }
             };
             strip_fields(message);
             if !blocks.is_empty() {
                 message["reasoning"] = json!(blocks);
             }
-            stamp_tool_signatures(message, &origin);
+            stamp_tool_signatures(message, target, &mut origin, budget)?;
         }
     }
     crate::providers::anthropic_signature::observe(response, &target.model);
+    Ok(())
 }
 
 fn delta(mut block: ReasoningBlock, index: Value, replace: bool) -> Value {
@@ -192,7 +537,17 @@ pub fn capture_stream(
     native: &Value,
     normalized: Option<String>,
 ) -> crate::error::Result<Option<String>> {
-    let origin = target.origin();
+    let mut budget = DerivedResponseBudget::stream();
+    capture_stream_with_budget(target, native, normalized, &mut budget)
+}
+
+pub(crate) fn capture_stream_with_budget(
+    target: &ReplayTarget,
+    native: &Value,
+    normalized: Option<String>,
+    budget: &mut DerivedResponseBudget,
+) -> crate::error::Result<Option<String>> {
+    let mut origin = None;
     let mut chunk: Value = match normalized {
         Some(data) => serde_json::from_str(&data)?,
         None => json!({
@@ -218,21 +573,35 @@ pub fn capture_stream(
     match target.wire {
         WireFormat::AnthropicMessages => match native["type"].as_str() {
             Some("content_block_start") => {
-                if let Some(b) = structured_block(&native["content_block"], &origin, None) {
+                if let Some(b) = structured_block_with_budget(
+                    &native["content_block"],
+                    target,
+                    &mut origin,
+                    None,
+                    true,
+                    budget,
+                )? {
                     reasoning.push(delta(b, index, true));
                 }
             }
             Some("content_block_delta") => {
                 let d = &native["delta"];
-                let mut b = ReasoningBlock::text("", origin.clone());
                 match d["type"].as_str() {
                     Some("thinking_delta") => {
-                        b.text = Some(d["thinking"].as_str().unwrap_or("").into());
+                        let text = d["thinking"].as_str().unwrap_or("");
+                        reserve_plain_block(target, budget, text.len())?;
+                        ensure_origin(&mut origin, target, budget)?;
+                        let mut b = ReasoningBlock::text("", origin.as_ref().unwrap().clone());
+                        b.text = Some(text.into());
                         reasoning.push(delta(b, index, false));
                     }
                     Some("signature_delta") => {
+                        let signature = d["signature"].as_str().unwrap_or("");
+                        reserve_plain_block(target, budget, signature.len())?;
+                        ensure_origin(&mut origin, target, budget)?;
+                        let mut b = ReasoningBlock::text("", origin.as_ref().unwrap().clone());
                         b.text = None;
-                        b.signature = Some(d["signature"].as_str().unwrap_or("").into());
+                        b.signature = Some(signature.into());
                         reasoning.push(delta(b, index, false));
                     }
                     _ => {}
@@ -242,13 +611,29 @@ pub fn capture_stream(
         },
         WireFormat::OpenAiResponses => match native["type"].as_str() {
             Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
-                let mut b =
-                    ReasoningBlock::text(native["delta"].as_str().unwrap_or(""), origin.clone());
+                let text = native["delta"].as_str().unwrap_or("");
+                let item_id_bytes = native["item_id"].as_str().map(str::len).unwrap_or(0);
+                reserve_plain_block(
+                    target,
+                    budget,
+                    text.len()
+                        .checked_add(item_id_bytes)
+                        .ok_or_else(|| budget.error())?,
+                )?;
+                ensure_origin(&mut origin, target, budget)?;
+                let mut b = ReasoningBlock::text(text, origin.as_ref().unwrap().clone());
                 b.item_id = native["item_id"].as_str().map(str::to_owned);
                 reasoning.push(delta(b, index, false));
             }
             Some("response.output_item.done") if native["item"]["type"] == "reasoning" => {
-                if let Some(b) = structured_block(&native["item"], &origin, None) {
+                if let Some(b) = structured_block_with_budget(
+                    &native["item"],
+                    target,
+                    &mut origin,
+                    None,
+                    true,
+                    budget,
+                )? {
                     reasoning.push(delta(b, index, true));
                 }
             }
@@ -260,7 +645,14 @@ pub fn capture_stream(
                     .enumerate()
                 {
                     if item["type"] == "reasoning" {
-                        if let Some(b) = structured_block(item, &origin, None) {
+                        if let Some(b) = structured_block_with_budget(
+                            item,
+                            target,
+                            &mut origin,
+                            None,
+                            true,
+                            budget,
+                        )? {
                             reasoning.push(delta(b, json!(index), true));
                         }
                     }
@@ -275,10 +667,9 @@ pub fn capture_stream(
                 .flatten()
                 .enumerate()
             {
-                if let Some(mut b) = structured_block(part, &origin, None) {
-                    // Text streams append; the completed payload is reconstructed
-                    // from fragments rather than replaying only the last fragment.
-                    b.payload = None;
+                if let Some(b) =
+                    structured_block_with_budget(part, target, &mut origin, None, false, budget)?
+                {
                     reasoning.push(delta(b, json!(i), false));
                 }
             }
@@ -290,7 +681,7 @@ pub fn capture_stream(
                     let Some(d) = choice.get_mut("delta") else {
                         continue;
                     };
-                    let values: Vec<_> = chat_blocks(raw, &origin)
+                    let values: Vec<_> = chat_blocks(raw, target, &mut origin, budget)?
                         .into_iter()
                         .enumerate()
                         .map(|(i, b)| {
@@ -307,7 +698,7 @@ pub fn capture_stream(
                     if !values.is_empty() {
                         d["reasoning"] = json!(values);
                     }
-                    stamp_tool_signatures(d, &origin);
+                    stamp_tool_signatures(d, target, &mut origin, budget)?;
                 }
             }
             let useful = chunk.get("usage").is_some()
@@ -327,7 +718,7 @@ pub fn capture_stream(
         if !reasoning.is_empty() {
             d["reasoning"] = json!(reasoning);
         }
-        stamp_tool_signatures(d, &origin);
+        stamp_tool_signatures(d, target, &mut origin, budget)?;
     }
     let useful = chunk
         .pointer("/choices/0/delta")

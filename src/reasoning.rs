@@ -1,6 +1,9 @@
 //! Typed, lossless reasoning and a single fail-closed replay policy.
 //! Opaque data is never inspected to decide where a block may be sent.
 mod normalize;
+pub(crate) use normalize::capture_response_with_budget;
+#[cfg(test)]
+pub(crate) use normalize::capture_stream_with_budget;
 pub use normalize::{capture_response, capture_stream, reasoning_text, ReasoningAccumulator};
 
 use crate::catalog::{self, ModelFamily};
@@ -243,7 +246,7 @@ fn legacy_blocks(message: &Value) -> Vec<Value> {
         dropped(DropReason::Malformed);
         return Vec::new();
     };
-    normalize::chat_blocks(message, &origin)
+    normalize::legacy_chat_blocks(message, &origin)
         .into_iter()
         .map(|b| json!(b))
         .collect()
@@ -585,7 +588,9 @@ pub(crate) fn enforce_stateless(body: &mut Value) -> crate::error::Result<()> {
 
 /// Rebind adapter-created metadata to the immutable HTTP request context. This
 /// matters when OAuth credentials/account selection change while a stream runs.
-pub(crate) fn bind_response_context(response: &mut Value, target: &ReplayTarget) {
+pub(crate) fn bind_response_context_unchecked(response: &mut Value, target: &ReplayTarget) {
+    let target_family = json!(target.family);
+    let target_wire = json!(target.wire);
     let Some(choices) = response.get_mut("choices").and_then(Value::as_array_mut) else {
         return;
     };
@@ -596,27 +601,42 @@ pub(crate) fn bind_response_context(response: &mut Value, target: &ReplayTarget)
             };
             if let Some(blocks) = message.get_mut("reasoning").and_then(Value::as_array_mut) {
                 for block in blocks {
-                    bind_origin(&mut block["origin"], target);
+                    bind_origin(&mut block["origin"], target, &target_family, &target_wire);
                 }
             }
             if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 for call in calls {
                     if let Some(origin) = call.pointer_mut("/thought_signature/origin") {
-                        bind_origin(origin, target);
+                        bind_origin(origin, target, &target_family, &target_wire);
                     }
                 }
             }
         }
     }
 }
-fn bind_origin(origin: &mut Value, target: &ReplayTarget) {
-    origin["provider"] = json!(target.provider);
-    origin["model"] = json!(target.model);
-    origin["family"] = json!(target.family);
-    origin["wire"] = json!(target.wire);
+fn bind_origin(
+    origin: &mut Value,
+    target: &ReplayTarget,
+    target_family: &Value,
+    target_wire: &Value,
+) {
+    replace_string_if_changed(origin, "provider", &target.provider);
+    replace_string_if_changed(origin, "model", &target.model);
+    if origin["family"] != *target_family {
+        origin["family"] = target_family.clone();
+    }
+    if origin["wire"] != *target_wire {
+        origin["wire"] = target_wire.clone();
+    }
     if let Some(account) = &target.account {
-        origin["account"] = json!(account);
+        replace_string_if_changed(origin, "account", account);
     } else if let Some(obj) = origin.as_object_mut() {
         obj.remove("account");
+    }
+}
+
+fn replace_string_if_changed(container: &mut Value, field: &str, replacement: &str) {
+    if container[field].as_str() != Some(replacement) {
+        container[field] = Value::String(replacement.to_owned());
     }
 }

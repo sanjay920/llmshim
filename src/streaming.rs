@@ -203,7 +203,7 @@ impl StreamNormalizer {
                     .reserve(crate::stream_retention::RetainedFootprint::record(0))?;
             }
         }
-        crate::reasoning::bind_response_context(&mut value, &self.target);
+        crate::derived_response::bind_stream_context(&mut value, &self.target)?;
         if self.target.wire == WireFormat::AnthropicMessages {
             self.reasoning.push(&value["choices"][0]["delta"])?;
             if self.seen_terminal && !self.observed_integrity {
@@ -218,7 +218,6 @@ impl StreamNormalizer {
                 }
             }
         }
-        crate::toolcall::bind_response_context(&mut value, &self.target);
         let data = value.to_string();
         if self.target.wire == WireFormat::OpenAiChat {
             self.usage.defer_chat_terminal(data).map(Some)

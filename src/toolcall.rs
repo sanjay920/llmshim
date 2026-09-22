@@ -3,12 +3,16 @@ mod streaming;
 pub use streaming::{ToolDelta, ToolStream, ToolUpdate};
 
 use crate::{
+    derived_response::{DerivedFootprint, DerivedResponseBudget},
     error::{Result, ShimError},
     reasoning::{ReplayTarget, WireFormat},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem::size_of,
+};
 
 const PREFIX: &str = "call_ls_";
 fn mint() -> String {
@@ -144,9 +148,56 @@ pub(crate) fn binding(
     }
 }
 
+fn binding_footprint(
+    target: &ReplayTarget,
+    scope: &str,
+    part: usize,
+    id: Option<&str>,
+    item: Option<&str>,
+) -> Option<DerivedFootprint> {
+    let container_bytes = 7_usize
+        .checked_mul(64_usize.checked_add(size_of::<Value>())?)?
+        .checked_add("providerwirescopepart_ididitem_idsignature_field".len())?;
+    let string_bytes = target
+        .provider
+        .len()
+        .checked_add(scope.len())?
+        .checked_add(part.to_string().len())?
+        .checked_add(id.map(str::len).unwrap_or(0))?
+        .checked_add(item.map(str::len).unwrap_or(0))?
+        .checked_add(72)?;
+    DerivedFootprint::record(size_of::<WireToolId>().checked_add(container_bytes)?)?
+        .checked_add(DerivedFootprint::strings(string_bytes))?
+        .checked_multiply(2)
+}
+
+fn budgeted_binding(
+    target: &ReplayTarget,
+    scope: &str,
+    part: usize,
+    id: Option<&str>,
+    item: Option<&str>,
+    budget: &mut DerivedResponseBudget,
+) -> Result<WireToolId> {
+    let footprint =
+        binding_footprint(target, scope, part, id, item).ok_or_else(|| budget.error())?;
+    budget.reserve(footprint)?;
+    Ok(binding(target, scope, part, id, item))
+}
+
 /// Capture the original correlation ids before any provider adapter projection
 /// can confuse a Responses `id` with `call_id` or synthesize a Gemini id.
 pub fn capture_response(target: &ReplayTarget, native: &Value, response: &mut Value) -> Result<()> {
+    let mut budget = DerivedResponseBudget::unary();
+    capture_response_with_budget(target, native, response, &mut budget)
+}
+
+pub(crate) fn capture_response_with_budget(
+    target: &ReplayTarget,
+    native: &Value,
+    response: &mut Value,
+    budget: &mut DerivedResponseBudget,
+) -> Result<()> {
     // Upstreams may reuse response/call ids across completed turns. Only a
     // locally owned response scope can make their wire identities unambiguous.
     let scope = uuid::Uuid::new_v4().to_string();
@@ -161,31 +212,41 @@ pub fn capture_response(target: &ReplayTarget, native: &Value, response: &mut Va
                 .flatten()
                 .enumerate()
                 .filter(|(_, p)| p["type"] == "tool_use")
-                .map(|(i, p)| binding(target, &scope, i, p["id"].as_str(), None))
-                .collect(),
+                .map(|(i, p)| budgeted_binding(target, &scope, i, p["id"].as_str(), None, budget))
+                .collect::<Result<Vec<_>>>()?,
             WireFormat::OpenAiResponses => native["output"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .enumerate()
                 .filter(|(_, p)| p["type"] == "function_call")
-                .map(|(i, p)| binding(target, &scope, i, p["call_id"].as_str(), p["id"].as_str()))
-                .collect(),
+                .map(|(i, p)| {
+                    budgeted_binding(
+                        target,
+                        &scope,
+                        i,
+                        p["call_id"].as_str(),
+                        p["id"].as_str(),
+                        budget,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?,
             WireFormat::OpenAiChat => native["choices"][choice_index]["message"]["tool_calls"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .enumerate()
                 .map(|(i, p)| {
-                    binding(
+                    budgeted_binding(
                         target,
                         &format!("{scope}/choice:{choice_index}"),
                         i,
                         p["id"].as_str(),
                         None,
+                        budget,
                     )
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
             WireFormat::GoogleGenerateContent => native["candidates"][choice_index]["content"]
                 ["parts"]
                 .as_array()
@@ -194,15 +255,16 @@ pub fn capture_response(target: &ReplayTarget, native: &Value, response: &mut Va
                 .enumerate()
                 .filter(|(_, p)| p.get("functionCall").is_some())
                 .map(|(i, p)| {
-                    binding(
+                    budgeted_binding(
                         target,
                         &format!("{scope}/choice:{choice_index}"),
                         i,
                         p["functionCall"]["id"].as_str(),
                         None,
+                        budget,
                     )
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
         };
         let Some(calls) = choice
             .pointer_mut("/message/tool_calls")
@@ -233,11 +295,26 @@ pub fn capture_response(target: &ReplayTarget, native: &Value, response: &mut Va
             if let Some(sig) = call
                 .pointer("/extra_content/google/thought_signature")
                 .and_then(Value::as_str)
-                .map(str::to_owned)
             {
-                binding.signature_field = Some("extra_content.google.thought_signature".into());
+                let signature_field = "extra_content.google.thought_signature";
+                let signature_field_footprint = DerivedFootprint::record(signature_field.len())
+                    .and_then(|footprint| footprint.checked_multiply(2))
+                    .ok_or_else(|| budget.error())?;
+                budget.reserve(signature_field_footprint)?;
+                let signature_footprint =
+                    DerivedFootprint::record(size_of::<crate::reasoning::ThoughtSignature>())
+                        .ok_or_else(|| budget.error())?
+                        .checked_add(
+                            crate::derived_response::origin_footprint(target)
+                                .ok_or_else(|| budget.error())?,
+                        )
+                        .and_then(|value| value.checked_add(DerivedFootprint::strings(sig.len())))
+                        .and_then(|value| value.checked_multiply(2))
+                        .ok_or_else(|| budget.error())?;
+                budget.reserve(signature_footprint)?;
+                binding.signature_field = Some(signature_field.into());
                 call["thought_signature"] = json!(crate::reasoning::ThoughtSignature {
-                    data: sig,
+                    data: sig.to_owned(),
                     origin: target.origin()
                 });
             }
@@ -645,7 +722,8 @@ pub(crate) fn validate_native(body: &Value, target: &ReplayTarget) -> Result<()>
     validate_history(&canonical)
 }
 
-pub(crate) fn bind_response_context(response: &mut Value, target: &ReplayTarget) {
+pub(crate) fn bind_response_context_unchecked(response: &mut Value, target: &ReplayTarget) {
+    let target_wire = json!(target.wire);
     let Some(choices) = response.get_mut("choices").and_then(Value::as_array_mut) else {
         return;
     };
@@ -660,8 +738,12 @@ pub(crate) fn bind_response_context(response: &mut Value, target: &ReplayTarget)
             {
                 if let Some(bindings) = call.get_mut("wire_ids").and_then(Value::as_array_mut) {
                     for b in bindings {
-                        b["provider"] = json!(target.provider);
-                        b["wire"] = json!(target.wire);
+                        if b["provider"].as_str() != Some(&target.provider) {
+                            b["provider"] = Value::String(target.provider.clone());
+                        }
+                        if b["wire"] != target_wire {
+                            b["wire"] = target_wire.clone();
+                        }
                     }
                 }
             }

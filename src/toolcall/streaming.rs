@@ -152,6 +152,25 @@ impl ToolStream {
             }
             _ => {}
         }
+        if let ToolUpdate::Signature(data) = &delta.update {
+            let previous_footprint =
+                part_footprint(&delta.part_id, self.parts.get(&delta.part_id).unwrap());
+            let projected_footprint = part_footprint_with_signature(
+                &delta.part_id,
+                self.parts.get(&delta.part_id).unwrap(),
+                &self.target,
+                data.len(),
+            );
+            self.replace(previous_footprint, projected_footprint)?;
+            self.parts.get_mut(&delta.part_id).unwrap().signature = Some(ThoughtSignature {
+                data: fallible_string(data)?,
+                origin: self.target.origin(),
+            });
+            let actual_footprint =
+                part_footprint(&delta.part_id, self.parts.get(&delta.part_id).unwrap());
+            self.replace(projected_footprint, actual_footprint)?;
+            return Ok(());
+        }
         let part = self.parts.get_mut(&delta.part_id).unwrap();
         let previous_footprint = part_footprint(&delta.part_id, part);
         match delta.update {
@@ -172,12 +191,7 @@ impl ToolStream {
                 part.arguments = v;
                 part.initial = false;
             }
-            ToolUpdate::Signature(v) => {
-                part.signature = Some(ThoughtSignature {
-                    data: v,
-                    origin: self.target.origin(),
-                })
-            }
+            ToolUpdate::Signature(_) => unreachable!("signature handled before allocation"),
             ToolUpdate::SignatureField(v) => part.signature_field = Some(v),
             ToolUpdate::End => {
                 validate_arguments(&part.arguments, true)?;
@@ -682,7 +696,11 @@ impl ToolStream {
         Ok(())
     }
 
-    fn complete(&mut self, choice: u64) -> Result<BTreeMap<u64, Vec<Value>>> {
+    fn complete(
+        &mut self,
+        choice: u64,
+        frame_budget: &mut crate::derived_response::DerivedResponseBudget,
+    ) -> Result<BTreeMap<u64, Vec<Value>>> {
         if self.emitted.contains(&choice) {
             return Ok(BTreeMap::new());
         }
@@ -709,6 +727,56 @@ impl ToolStream {
                 if !ids.insert((part.choice, id.clone())) {
                     return Err(upstream("duplicate correlation id"));
                 }
+            }
+            let projected_scope_bytes = self
+                .scope
+                .len()
+                .checked_add(32)
+                .ok_or_else(|| frame_budget.error())?;
+            let binding_string_bytes = self
+                .target
+                .provider
+                .len()
+                .checked_add(projected_scope_bytes)
+                .and_then(|bytes| bytes.checked_add(key.len()))
+                .and_then(|bytes| bytes.checked_add(part.wire_id.as_deref().map_or(0, str::len)))
+                .and_then(|bytes| bytes.checked_add(part.item_id.as_deref().map_or(0, str::len)))
+                .and_then(|bytes| {
+                    bytes.checked_add(part.signature_field.as_deref().map_or(0, str::len))
+                })
+                .and_then(|bytes| bytes.checked_add(40))
+                .ok_or_else(|| frame_budget.error())?;
+            let binding_footprint = crate::derived_response::DerivedFootprint::record(
+                std::mem::size_of::<WireToolId>(),
+            )
+            .ok_or_else(|| frame_budget.error())?
+            .checked_add(crate::derived_response::DerivedFootprint::strings(
+                binding_string_bytes,
+            ))
+            .and_then(|footprint| footprint.checked_multiply(2))
+            .ok_or_else(|| frame_budget.error())?;
+            frame_budget.reserve(binding_footprint)?;
+            if let Some(signature) = &part.signature {
+                let signature_string_bytes = signature
+                    .data
+                    .len()
+                    .checked_add(signature.origin.provider.len())
+                    .and_then(|bytes| bytes.checked_add(signature.origin.model.len()))
+                    .and_then(|bytes| {
+                        bytes.checked_add(signature.origin.account.as_deref().map_or(0, str::len))
+                    })
+                    .ok_or_else(|| frame_budget.error())?;
+                let signature_footprint =
+                    crate::derived_response::DerivedFootprint::record(std::mem::size_of::<
+                        ThoughtSignature,
+                    >())
+                    .ok_or_else(|| frame_budget.error())?
+                    .checked_add(crate::derived_response::DerivedFootprint::strings(
+                        signature_string_bytes,
+                    ))
+                    .and_then(|footprint| footprint.checked_multiply(2))
+                    .ok_or_else(|| frame_budget.error())?;
+                frame_budget.reserve(signature_footprint)?;
             }
             let mut binding = binding(
                 &self.target,
@@ -805,6 +873,8 @@ impl ToolStream {
                 }
             }
         }
+        let mut frame_budget = crate::derived_response::DerivedResponseBudget::stream();
+        crate::derived_response::reserve_existing_metadata(&value, &mut frame_budget)?;
         if self.target.wire == WireFormat::GoogleGenerateContent {
             if let Some(index) = event["candidates"][0]["index"].as_u64() {
                 if let Some(first) = value["choices"].as_array_mut().and_then(|c| c.first_mut()) {
@@ -846,7 +916,7 @@ impl ToolStream {
             .collect();
         let terminal = !terminals.is_empty();
         for done in terminals {
-            for (index, calls) in self.complete(done)? {
+            for (index, calls) in self.complete(done, &mut frame_budget)? {
                 let choices = value["choices"].as_array_mut().unwrap();
                 let position = choices
                     .iter()
@@ -965,11 +1035,51 @@ fn part_footprint_with_capacity(
     }
     if let Some(signature) = &part.signature {
         bytes = bytes
+            .saturating_add(std::mem::size_of::<ThoughtSignature>())
             .saturating_add(signature.data.capacity())
             .saturating_add(signature.origin.provider.capacity())
-            .saturating_add(signature.origin.model.capacity());
+            .saturating_add(signature.origin.model.capacity())
+            .saturating_add(
+                signature
+                    .origin
+                    .account
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            );
     }
     crate::stream_retention::RetainedFootprint::record(bytes)
+}
+
+fn part_footprint_with_signature(
+    key: &str,
+    part: &Part,
+    target: &ReplayTarget,
+    signature_bytes: usize,
+) -> crate::stream_retention::RetainedFootprint {
+    let mut projected = part_footprint(key, part);
+    let previous_signature_bytes = part.signature.as_ref().map_or(0, |signature| {
+        std::mem::size_of::<ThoughtSignature>()
+            .saturating_add(signature.data.capacity())
+            .saturating_add(signature.origin.provider.capacity())
+            .saturating_add(signature.origin.model.capacity())
+            .saturating_add(
+                signature
+                    .origin
+                    .account
+                    .as_ref()
+                    .map_or(0, String::capacity),
+            )
+    });
+    let replacement_signature_bytes = std::mem::size_of::<ThoughtSignature>()
+        .saturating_add(signature_bytes)
+        .saturating_add(target.provider.len())
+        .saturating_add(target.model.len())
+        .saturating_add(target.account.as_deref().map_or(0, str::len));
+    projected.bytes = projected
+        .bytes
+        .saturating_sub(previous_signature_bytes)
+        .saturating_add(replacement_signature_bytes);
+    projected
 }
 
 fn part_string_length(part: &Part, field: PartStringField) -> usize {
