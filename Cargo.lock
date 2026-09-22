@@ -1316,6 +1316,7 @@ dependencies = [
  "http",
  "hyper-util",
  "jsonschema",
+ "libc",
  "llmshim-catalog",
  "mockito",
  "rcgen",
