@@ -12,7 +12,7 @@
 //! ```text
 //!  submit(req) ──enqueue──► [per-provider priority queue] ──dequeue──► dispatcher
 //!      ▲ await oneshot                                                    │
-//!      └──────────────────── result ◄──── Dispatch::dispatch ◄── RateLimiter.acquire
+//!      └──────────────────── result ◄──── Dispatch::dispatch ◄── attempt policy
 //! ```
 //!
 //! * **[`Scheduler`]** owns one lane (queue + dispatcher task) per provider, so a
@@ -24,9 +24,9 @@
 //!   notify; on a rate-limit miss it requeues and sleeps for exactly the
 //!   [`RetryAfter`] the [`RateLimiter`] reports (waking early if new work
 //!   arrives) — no busy-waiting, no `RateLimiter` changes.
-//! * Reuses the proxy's [`RateLimiter`] (token buckets, per-provider RPM/TPM)
-//!   and [`RetryAfter`]; the [`Dispatch`] trait is injected so the scheduler is
-//!   testable without real HTTP.
+//! * Built-in HTTP dispatch attaches a trusted policy context that gates every
+//!   prepared provider send. Unscoped custom [`Dispatch`] implementations retain
+//!   the scheduler's legacy [`RateLimiter`] behavior for compatibility.
 //!
 //! Beyond the basics this also implements: **tier fairness/aging** (a starved
 //! low tier eventually overtakes a high-tier flood — see [`InMemoryQueue`]),
@@ -37,6 +37,7 @@
 //! is caller-supplied. Remaining follow-up: an actual AWS deployment; a
 //! redelivered distributed request may run twice (at-least-once semantics).
 
+mod attempt;
 pub mod auth;
 pub mod http;
 pub mod idempotency;
@@ -133,6 +134,17 @@ impl DispatchError {
 pub trait Dispatch: Send + Sync {
     async fn dispatch(&self, provider: &str, payload: Value) -> Result<Value, DispatchError>;
 
+    /// Dispatch with a trusted out-of-band policy context. Built-in HTTP paths
+    /// override this; custom embedders retain their existing behavior.
+    async fn dispatch_with_policy(
+        &self,
+        provider: &str,
+        payload: Value,
+        _policy_context: crate::policy::DispatchPolicyContext,
+    ) -> Result<Value, DispatchError> {
+        self.dispatch(provider, payload).await
+    }
+
     /// Open a streaming upstream call, yielding raw provider chunks. Defaults to
     /// unsupported so non-streaming dispatchers need not implement it.
     async fn dispatch_stream(
@@ -143,6 +155,15 @@ pub trait Dispatch: Send + Sync {
         Err(DispatchError::new(
             "streaming not supported by this dispatcher",
         ))
+    }
+
+    async fn dispatch_stream_with_policy(
+        &self,
+        provider: &str,
+        payload: Value,
+        _policy_context: crate::policy::DispatchPolicyContext,
+    ) -> Result<ChunkStream, DispatchError> {
+        self.dispatch_stream(provider, payload).await
     }
 }
 
@@ -170,6 +191,7 @@ pub struct Job {
     key: PriorityKey,
     permits: u32,
     payload: Value,
+    policy_context: Option<crate::policy::DispatchPolicyContext>,
     delivery: Delivery,
     /// Fires the instant the dispatcher commits to the upstream call, so
     /// `max_wait` bounds only **queue residence** — not the (possibly long)
@@ -489,6 +511,14 @@ impl Scheduler {
     /// Enqueue a request and await its result. The queueing is internal: the
     /// caller sees a normal response, an `Overloaded` shed, or a `Timeout`.
     pub async fn submit(self: &Arc<Self>, req: GatewayRequest) -> Result<Value, GatewayError> {
+        self.submit_inner(req, None).await
+    }
+
+    async fn submit_inner(
+        self: &Arc<Self>,
+        req: GatewayRequest,
+        policy_context: Option<crate::policy::DispatchPolicyContext>,
+    ) -> Result<Value, GatewayError> {
         let provider = req.provider.clone();
         let tier = req.tier;
         let queue = self.lane_for(&provider);
@@ -502,6 +532,7 @@ impl Scheduler {
             },
             permits: req.permits.max(1),
             payload: req.payload,
+            policy_context,
             delivery: Delivery::Unary(tx),
             started: started_tx,
             enqueued_at: Instant::now(),
@@ -548,12 +579,36 @@ impl Scheduler {
         result
     }
 
+    pub(crate) async fn submit_with_policy(
+        self: &Arc<Self>,
+        req: GatewayRequest,
+        policy_context: crate::policy::DispatchPolicyContext,
+    ) -> Result<Value, GatewayError> {
+        self.submit_inner(req, Some(policy_context)).await
+    }
+
     /// Like [`submit`](Self::submit) but for a streaming request: enqueues by
     /// priority and, once dispatched, returns a channel of raw provider chunks.
     /// `max_wait` bounds queue residence only; the stream itself is unbounded.
     pub async fn submit_stream(
         self: &Arc<Self>,
         req: GatewayRequest,
+    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
+        self.submit_stream_inner(req, None).await
+    }
+
+    pub(crate) async fn submit_stream_with_policy(
+        self: &Arc<Self>,
+        req: GatewayRequest,
+        policy_context: crate::policy::DispatchPolicyContext,
+    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
+        self.submit_stream_inner(req, Some(policy_context)).await
+    }
+
+    async fn submit_stream_inner(
+        self: &Arc<Self>,
+        req: GatewayRequest,
+        policy_context: Option<crate::policy::DispatchPolicyContext>,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
         let provider = req.provider.clone();
         let tier = req.tier;
@@ -568,6 +623,7 @@ impl Scheduler {
             },
             permits: req.permits.max(1),
             payload: req.payload,
+            policy_context,
             delivery: Delivery::Stream(result_tx),
             started: started_tx,
             enqueued_at: Instant::now(),
@@ -697,15 +753,25 @@ async fn dispatcher_loop(
         // Bound in-flight upstream calls *before* spending a rate token, so a
         // saturated concurrency semaphore never wastes a token nor holds one
         // idle while a lane waits for a slot.
-        let permit = match sem.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => break, // semaphore closed (shutdown)
+        let policy_gated = job.policy_context.is_some();
+        let permit = if policy_gated {
+            None
+        } else {
+            match sem.clone().acquire_owned().await {
+                Ok(permit) => Some(permit),
+                Err(_) => break,
+            }
         };
         if job.is_cancelled() {
             continue; // gave up while waiting for a concurrency slot
         }
 
-        match limiter.acquire(&key, job.permits).await {
+        let rate_admission = if policy_gated {
+            Ok(())
+        } else {
+            limiter.acquire(&key, job.permits).await
+        };
+        match rate_admission {
             Ok(()) => {
                 if job.is_cancelled() {
                     continue; // gave up during the token wait
@@ -718,6 +784,7 @@ async fn dispatcher_loop(
                 );
                 let Job {
                     payload,
+                    policy_context,
                     delivery,
                     started,
                     ..
@@ -735,7 +802,14 @@ async fn dispatcher_loop(
                     let started_at = Instant::now();
                     let plabels: &[(&str, &str)] = &[("provider", &provider)];
                     match delivery {
-                        Delivery::Unary(tx) => match dispatch.dispatch(&provider, payload).await {
+                        Delivery::Unary(tx) => match match policy_context {
+                            Some(context) => {
+                                dispatch
+                                    .dispatch_with_policy(&provider, payload, context)
+                                    .await
+                            }
+                            None => dispatch.dispatch(&provider, payload).await,
+                        } {
                             Ok(value) => {
                                 metrics::incr(metrics::DISPATCHED, plabels);
                                 metrics::observe_ms(
@@ -750,12 +824,22 @@ async fn dispatcher_loop(
                                     metrics::REJECTED,
                                     &[("provider", &provider), ("reason", "upstream")],
                                 );
-                                penalize_if_429(&limiter, &provider, &err).await;
+                                if !policy_gated {
+                                    penalize_if_429(&limiter, &provider, &err).await;
+                                }
                                 let _ = tx.send(Err(GatewayError::Upstream(err.message)));
                             }
                         },
                         Delivery::Stream(tx) => {
-                            match dispatch.dispatch_stream(&provider, payload).await {
+                            let opened = match policy_context {
+                                Some(context) => {
+                                    dispatch
+                                        .dispatch_stream_with_policy(&provider, payload, context)
+                                        .await
+                                }
+                                None => dispatch.dispatch_stream(&provider, payload).await,
+                            };
+                            match opened {
                                 Ok(mut upstream) => {
                                     metrics::incr(metrics::DISPATCHED, plabels);
                                     let (chunk_tx, chunk_rx) = mpsc::channel(16);
@@ -783,7 +867,9 @@ async fn dispatcher_loop(
                                         metrics::REJECTED,
                                         &[("provider", &provider), ("reason", "upstream")],
                                     );
-                                    penalize_if_429(&limiter, &provider, &err).await;
+                                    if !policy_gated {
+                                        penalize_if_429(&limiter, &provider, &err).await;
+                                    }
                                     let _ = tx.send(Err(GatewayError::Upstream(err.message)));
                                 }
                             }
@@ -937,6 +1023,7 @@ mod tests {
                 key: PriorityKey { tier, seqno },
                 permits: 1,
                 payload: json!({ "id": seqno }),
+                policy_context: None,
                 delivery: Delivery::Unary(tx),
                 started,
                 enqueued_at: Instant::now(),
