@@ -29,6 +29,7 @@ impl DispatchPolicyContext {
         }
     }
 
+    #[cfg(any(feature = "proxy", test))]
     pub(crate) fn with_logical_deadline(self, deadline: tokio::time::Instant) -> Self {
         *self.state.logical_deadline.lock().unwrap() = Some(deadline);
         self

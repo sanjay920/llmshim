@@ -529,6 +529,9 @@ impl ShimClient {
                         }
                         Err(body::BodyReadError::Http(_)) => String::new(),
                         Err(body::BodyReadError::Timeout) => "upstream error body timed out".into(),
+                        Err(body::BodyReadError::Complexity) => {
+                            "upstream error body exceeds JSON complexity limit".into()
+                        }
                     };
                     return Err(DispatchFailure::Upstream(ShimError::ProviderError {
                         status: status_code,
@@ -635,6 +638,17 @@ impl ShimClient {
                     // so a repaired answer is costed on both attempts' tokens.
                     crate::cost::stamp(&target.provider, &target.model, &mut result);
                     return Ok(result);
+                }
+                Err(feedback)
+                    if feedback
+                        .iter()
+                        .any(|error| error == crate::shim::JSON_COMPLEXITY_ERROR) =>
+                {
+                    return Err(DispatchFailure::Local(ShimError::ProviderError {
+                        status: 502,
+                        body: "upstream JSON exceeds complexity limit".into(),
+                        retry_after: None,
+                    }));
                 }
                 Err(feedback) if attempt == 0 && plan.can_repair(&result) => {
                     rendered = plan.repair(&feedback).map_err(DispatchFailure::Local)?;
@@ -860,6 +874,17 @@ impl ShimClient {
                     crate::cost::stamp(&target.provider, &target.model, &mut result);
                     return Ok(Box::pin(futures::stream::iter(crate::shim::chunks(result))));
                 }
+                Err(feedback)
+                    if feedback
+                        .iter()
+                        .any(|error| error == crate::shim::JSON_COMPLEXITY_ERROR) =>
+                {
+                    return Err(DispatchFailure::Local(ShimError::ProviderError {
+                        status: 502,
+                        body: "upstream JSON exceeds complexity limit".into(),
+                        retry_after: None,
+                    }));
+                }
                 Err(feedback) if attempt == 0 && plan.can_repair(&result) => {
                     rendered = plan.repair(&feedback).map_err(DispatchFailure::Local)?
                 }
@@ -945,6 +970,16 @@ impl ShimClient {
             let mut usage = serde_json::json!({});
             crate::shim::add_usage(&mut usage, &result);
             if let Err(feedback) = plan.finish(&mut result, &target) {
+                if feedback
+                    .iter()
+                    .any(|error| error == crate::shim::JSON_COMPLEXITY_ERROR)
+                {
+                    return Err(ShimError::ProviderError {
+                        status: 502,
+                        body: "upstream JSON exceeds complexity limit".into(),
+                        retry_after: None,
+                    });
+                }
                 if !plan.can_repair(&result) {
                     return Err(crate::shim::failed());
                 }
@@ -1077,7 +1112,9 @@ async fn observe_bounded_error_usage(
     callback_timeout: Duration,
     attempt_deadline: tokio::time::Instant,
 ) -> DispatchResult<()> {
-    let Ok(native_error) = serde_json::from_slice::<serde_json::Value>(bounded_body) else {
+    let Ok(native_error) =
+        crate::json_bounds::parse_slice(bounded_body, crate::json_bounds::Limits::UNARY)
+    else {
         return Ok(());
     };
     observe_native_response_usage(
@@ -1369,7 +1406,22 @@ async fn run_eager_stream_producer(
             continue;
         }
         semantic_idle_remaining = deadlines.stream_semantic_idle;
-        let observation = native_usage.ingest(&data);
+        let observation = match native_usage.ingest_bounded(&data) {
+            Ok(observation) => observation,
+            Err(error) => {
+                normalizer.abort();
+                finish_stream_failure(
+                    &mut tracker,
+                    deadlines.policy_callback,
+                    attempt_deadline,
+                    &policy_failure,
+                    &mut cancellation,
+                )
+                .await;
+                set_stream_terminal(&terminal, Err(error));
+                return;
+            }
+        };
         let normalized = normalizer.push(&data);
         if let Some(observation) = observation {
             if observe_stream_usage(

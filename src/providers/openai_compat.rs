@@ -291,6 +291,7 @@ impl Provider for OpenAiCompatible {
     }
 
     fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        crate::json_bounds::enforce_sse_complexity(chunk)?;
         let result = match self.wire {
             WireFormat::OpenAiResponses => self
                 .responses_adapter()

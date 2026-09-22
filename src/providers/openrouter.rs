@@ -277,6 +277,7 @@ impl Provider for OpenRouter {
     }
 
     fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        crate::json_bounds::enforce_sse_complexity(chunk)?;
         let result = self.transform_stream_chunk_native(model, chunk)?;
         let native: Value = match serde_json::from_str(chunk) {
             Ok(v) => v,
