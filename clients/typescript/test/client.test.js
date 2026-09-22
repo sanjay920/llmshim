@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { createServer } from "node:http";
 
-import { Client, LlmshimError, createClient } from "../dist/index.js";
+import { Client, LlmshimError, createClient, parseSse } from "../dist/index.js";
 
 /** @type {import('node:http').Server} */
 let server;
@@ -136,6 +136,39 @@ test("stream() honors [DONE] termination and split chunk boundaries", async () =
   assert.equal(events[1].type, "done");
 });
 
+test("parseSse() cancels its source when the consumer returns early", async () => {
+  let cancelled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('event: content\ndata: {"text":"first"}\n\n'));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const stream = parseSse(body);
+  assert.deepEqual(await stream.next(), { done: false, value: { type: "content", text: "first" } });
+  await stream.return();
+  assert.equal(cancelled, true);
+});
+
+test("parseSse() does not cancel a normally completed source", async () => {
+  let cancelled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("event: done\ndata: {}\n\n"));
+      controller.close();
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const events = [];
+  for await (const event of parseSse(body)) events.push(event);
+  assert.deepEqual(events, [{ type: "done" }]);
+  assert.equal(cancelled, false);
+});
+
 test("models() parses ModelsResponse", async () => {
   handler = (req, res) => {
     assert.equal(req.url, "/v1/models");
@@ -163,6 +196,19 @@ test("health() parses HealthResponse", async () => {
   const res = await client.health();
   assert.equal(res.status, "ok");
   assert.deepEqual(res.providers, ["anthropic", "openai"]);
+});
+
+test("explicit baseUrl does not install managed signal handlers", async () => {
+  handler = (_req, res) => json(res, 200, { status: "ok", providers: [] });
+  const before = {
+    sigint: process.listenerCount("SIGINT"),
+    sigterm: process.listenerCount("SIGTERM"),
+  };
+  await new Client({ baseUrl }).health();
+  assert.deepEqual(
+    { sigint: process.listenerCount("SIGINT"), sigterm: process.listenerCount("SIGTERM") },
+    before,
+  );
 });
 
 test("non-2xx ErrorResponse throws a typed LlmshimError", async () => {

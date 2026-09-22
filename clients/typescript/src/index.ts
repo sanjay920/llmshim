@@ -245,6 +245,7 @@ export async function* parseSse(
   const decoder = new TextDecoder();
   const reader = body.getReader();
   let buffer = "";
+  let completed = false;
 
   try {
     while (true) {
@@ -263,13 +264,19 @@ export async function* parseSse(
         if (parsed) yield parsed;
       }
 
-      if (done) break;
+      if (done) {
+        completed = true;
+        break;
+      }
     }
 
     // Flush any trailing event that wasn't terminated by a blank line.
     const parsed = parseEventBlock(buffer);
     if (parsed) yield parsed;
   } finally {
+    if (!completed) {
+      await reader.cancel("llmshim stream consumer stopped").catch(() => {});
+    }
     reader.releaseLock();
   }
 }

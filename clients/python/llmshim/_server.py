@@ -8,7 +8,6 @@ import os
 import platform
 import queue
 import re
-import signal
 import ssl
 import subprocess
 import threading
@@ -67,7 +66,6 @@ _server_process: Optional[subprocess.Popen] = None
 _server_port: Optional[int] = None
 _managed_server: Optional[ManagedServer] = None
 _cleanup_registered = False
-_sigterm_registered = False
 
 
 def _find_binary() -> str:
@@ -233,7 +231,7 @@ def _start_managed_server() -> ManagedServer:
     process = subprocess.Popen(
         [binary, "proxy", "--managed"],
         env=os.environ.copy(),
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -310,24 +308,7 @@ def _stop_server() -> None:
 
 
 def _register_cleanup() -> None:
-    global _cleanup_registered, _sigterm_registered
+    global _cleanup_registered
     if not _cleanup_registered:
         atexit.register(_stop_server)
         _cleanup_registered = True
-    if not _sigterm_registered:
-        try:
-            original_handler = signal.getsignal(signal.SIGTERM)
-
-            def _handle_sigterm(signum, frame):
-                _stop_server()
-                if callable(original_handler) and original_handler not in (
-                    signal.SIG_DFL,
-                    signal.SIG_IGN,
-                ):
-                    original_handler(signum, frame)
-                raise SystemExit(0)
-
-            signal.signal(signal.SIGTERM, _handle_sigterm)
-            _sigterm_registered = True
-        except (ValueError, OSError):
-            pass

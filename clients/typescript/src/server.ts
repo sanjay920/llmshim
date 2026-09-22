@@ -3,7 +3,12 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { accessSync, constants as fsConstants } from "node:fs";
-import { createServer, type IncomingHttpHeaders, type Server as HttpServer } from "node:http";
+import {
+  createServer,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type Server as HttpServer,
+} from "node:http";
 import { request as httpsRequest } from "node:https";
 import { createRequire } from "node:module";
 import { delimiter, join } from "node:path";
@@ -56,6 +61,7 @@ interface ReadinessRecord {
 
 let managedChild: ManagedChild | null = null;
 let startingChild: Promise<ManagedChild> | null = null;
+let startingChildProcess: ChildProcess | null = null;
 let relayServer: HttpServer | null = null;
 let relayBaseUrl: string | null = null;
 let startingRelay: Promise<string> | null = null;
@@ -304,8 +310,9 @@ function startManagedChild(): Promise<ManagedChild> {
   const binary = findBinary();
   const childProcess = spawn(binary, ["proxy", "--managed"], {
     env: { ...process.env },
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
+  startingChildProcess = childProcess;
   let stderr = "";
   childProcess.stderr?.on("data", (chunk: Buffer) => {
     stderr = (stderr + chunk.toString()).slice(-MAX_STDERR_BYTES);
@@ -321,6 +328,7 @@ function startManagedChild(): Promise<ManagedChild> {
         if (managedChild?.process === childProcess) managedChild = null;
       });
       childProcess.unref();
+      (childProcess.stdin as NodeJS.WritableStream & { unref?: () => void } | null)?.unref?.();
       (childProcess.stderr as NodeJS.ReadableStream & { unref?: () => void } | null)?.unref?.();
       return child;
     } catch (error) {
@@ -329,6 +337,7 @@ function startManagedChild(): Promise<ManagedChild> {
       } catch {
         // The child already exited.
       }
+      if (startingChildProcess === childProcess) startingChildProcess = null;
       if (stderr.includes("No providers configured")) {
         throw new Error(
           "No API keys configured. Set them via environment variables " +
@@ -358,6 +367,7 @@ async function ensureManagedChild(): Promise<ManagedChild> {
   try {
     const child = await thisStart;
     managedChild = child;
+    if (startingChildProcess === child.process) startingChildProcess = null;
     return child;
   } finally {
     if (startingChild === thisStart) startingChild = null;
@@ -409,9 +419,27 @@ function startRelay(): Promise<string> {
     }
 
     const upstream = pinnedRequest(child, incoming.method ?? "GET", targetPath, relayHeaders(incoming.headers));
+    let upstreamResponse: IncomingMessage | null = null;
+    let upstreamFinished = false;
+    let upstreamCancelled = false;
+    const cancelUpstream = () => {
+      if (upstreamFinished || upstreamCancelled) return;
+      upstreamCancelled = true;
+      upstreamResponse?.destroy();
+      upstream.destroy();
+    };
+    outgoing.once("close", cancelUpstream);
+    outgoing.once("finish", () => {
+      upstreamFinished = true;
+    });
     let responseStarted = false;
     upstream.once("response", (response) => {
       responseStarted = true;
+      upstreamResponse = response;
+      response.once("end", () => {
+        upstreamFinished = true;
+      });
+      response.once("error", (error) => outgoing.destroy(error));
       const headers: IncomingHttpHeaders = {};
       for (const [name, value] of Object.entries(response.headers)) {
         if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) headers[name] = value;
@@ -430,7 +458,7 @@ function startRelay(): Promise<string> {
       outgoing.writeHead(502, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) });
       outgoing.end(payload);
     });
-    incoming.once("aborted", () => upstream.destroy());
+    incoming.once("aborted", cancelUpstream);
     incoming.pipe(upstream);
   });
   configureRelayLimits(server, DEFAULT_RELAY_LIMITS);
@@ -467,11 +495,26 @@ async function ensureRelay(): Promise<string> {
 
 function stopAll(): void {
   const child = managedChild;
+  const startingProcess = startingChildProcess;
   managedChild = null;
+  startingChildProcess = null;
   if (child) stopChild(child);
+  if (startingProcess && startingProcess !== child?.process) {
+    try {
+      startingProcess.kill();
+    } catch {
+      // The exact startup child already exited.
+    }
+  }
   relayServer?.close();
   relayServer = null;
   relayBaseUrl = null;
+}
+
+function registerCleanup(): void {
+  if (cleanupRegistered) return;
+  process.once("exit", stopAll);
+  cleanupRegistered = true;
 }
 
 /**
@@ -479,10 +522,7 @@ function stopAll(): void {
  * The returned URL remains usable until this Node process exits.
  */
 export async function ensureServer(): Promise<string> {
-  if (!cleanupRegistered) {
-    process.once("exit", stopAll);
-    cleanupRegistered = true;
-  }
+  registerCleanup();
   const relay = await ensureRelay();
   await ensureManagedChild();
   return relay;
