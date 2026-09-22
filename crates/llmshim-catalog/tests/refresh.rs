@@ -1,4 +1,6 @@
-use llmshim_catalog::{Catalog, CatalogHandle, CatalogOptions, RefreshOutcome, Support};
+use llmshim_catalog::{
+    Catalog, CatalogError, CatalogHandle, CatalogOptions, RefreshOutcome, Support,
+};
 use serde_json::json;
 use std::time::Duration;
 
@@ -171,12 +173,44 @@ async fn catalog_transport_errors_do_not_expose_query_credentials() {
             Some("synthetic-bearer-credential"),
         )
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(!error.contains(query_credential));
-    assert!(!error.contains("synthetic-bearer-credential"));
-    assert!(!error.contains("/models"));
+        .unwrap_err();
+    let CatalogError::Http(http_error) = &error else {
+        panic!("expected the provider HTTP status to retain its error class");
+    };
+    assert_eq!(http_error.status().map(|status| status.as_u16()), Some(503));
+    for diagnostic in [error.to_string(), format!("{error:?}")] {
+        assert!(!diagnostic.contains(query_credential));
+        assert!(!diagnostic.contains("synthetic-bearer-credential"));
+        assert!(!diagnostic.contains("/models"));
+    }
     failed_provider.assert_async().await;
+}
+
+#[tokio::test]
+async fn send_failures_preserve_reqwest_kind_without_query_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let query_credential = "synthetic-send-query-credential";
+    let handle = CatalogHandle::load(options(
+        &dir,
+        format!("http://127.0.0.1:1/catalog?key={query_credential}"),
+    ))
+    .unwrap();
+    let error = handle
+        .discover_provider(
+            "fixture",
+            &format!("http://127.0.0.1:1/models?key={query_credential}"),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let CatalogError::Http(http_error) = &error else {
+        panic!("expected a transport error");
+    };
+    assert!(http_error.is_connect());
+    for diagnostic in [error.to_string(), format!("{error:?}")] {
+        assert!(!diagnostic.contains(query_credential));
+        assert!(!diagnostic.contains("/models"));
+    }
 }
 
 #[tokio::test]
@@ -209,7 +243,7 @@ async fn provider_discovery_does_not_follow_redirects_or_forward_bearer_credenti
         .to_string();
     assert_eq!(
         error,
-        "invalid catalog: provider catalog server returned an error"
+        "invalid catalog: provider catalog redirects are not allowed"
     );
     redirect.assert_async().await;
     redirected_request.assert_async().await;

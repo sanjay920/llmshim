@@ -14,10 +14,10 @@ use std::{
 
 const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
 
-fn transport_error() -> CatalogError {
+fn transport_error(error: reqwest::Error) -> CatalogError {
     // reqwest includes the request URL in its Display implementation. Catalog
     // endpoints may use query credentials, so keep transport diagnostics URL-free.
-    CatalogError::Invalid("catalog transport failed")
+    CatalogError::Http(error.without_url())
 }
 
 async fn bounded_response_body(
@@ -25,7 +25,7 @@ async fn bounded_response_body(
     size_error: &'static str,
 ) -> Result<Vec<u8>, CatalogError> {
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| transport_error())? {
+    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
         if bytes.len().saturating_add(chunk.len()) > MAX_CATALOG_BYTES {
             return Err(CatalogError::Invalid(size_error));
         }
@@ -231,7 +231,7 @@ impl CatalogHandle {
         if let Some(etag) = meta.and_then(|m| m.etag.as_deref()) {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
         }
-        let response = request.send().await.map_err(|_| transport_error())?;
+        let response = request.send().await.map_err(transport_error)?;
         let not_modified = response.status() == reqwest::StatusCode::NOT_MODIFIED;
         let etag = response
             .headers()
@@ -253,8 +253,14 @@ impl CatalogHandle {
                 .map(|(data, _)| data)
                 .ok_or(CatalogError::Invalid("304 without a validated cache"))?
         } else {
+            if response.status().is_redirection() {
+                return Err(CatalogError::Invalid("catalog redirects are not allowed"));
+            }
+            let response = response.error_for_status().map_err(transport_error)?;
             if !response.status().is_success() {
-                return Err(CatalogError::Invalid("catalog server returned an error"));
+                return Err(CatalogError::Invalid(
+                    "catalog returned an unexpected status",
+                ));
             }
             let bytes = bounded_response_body(response, "catalog exceeds size limit").await?;
             String::from_utf8(bytes).map_err(|_| CatalogError::Invalid("catalog is not UTF-8"))?
@@ -311,10 +317,16 @@ impl CatalogHandle {
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }
-        let response = request.send().await.map_err(|_| transport_error())?;
+        let response = request.send().await.map_err(transport_error)?;
+        if response.status().is_redirection() {
+            return Err(CatalogError::Invalid(
+                "provider catalog redirects are not allowed",
+            ));
+        }
+        let response = response.error_for_status().map_err(transport_error)?;
         if !response.status().is_success() {
             return Err(CatalogError::Invalid(
-                "provider catalog server returned an error",
+                "provider catalog returned an unexpected status",
             ));
         }
         let bytes = bounded_response_body(response, "provider catalog exceeds size limit").await?;
