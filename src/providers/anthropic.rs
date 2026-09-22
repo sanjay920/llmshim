@@ -441,6 +441,21 @@ impl Provider for Anthropic {
         "anthropic"
     }
 
+    fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
+        crate::provider::RequestAdmissionPolicy::namespaced(
+            "x-anthropic",
+            &["model", "messages"],
+            &[
+                "system",
+                "tools",
+                "tool_choice",
+                "thinking",
+                "output_config",
+            ],
+            &["max_tokens"],
+        )
+    }
+
     fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
         crate::reasoning::ReplayTarget::new(
             self.name(),

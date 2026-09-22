@@ -73,7 +73,25 @@ rejection is `429` with `Retry-After`.
 
 When neither RPM nor TPM is set, proactive rate limiting is disabled;
 concurrency backpressure still applies. Token permits are estimates based on
-request size and requested output, not provider billing measurements.
+the route-expanded request and selected provider. They include messages, tool
+and response schemas, Anthropic `output_config.format`, active native controls,
+recognized native reasoning budgets, and the effective output limit.
+Anthropic's omitted output limit uses
+the adapter's 8,192-token default; other known models use the catalog output
+ceiling when the provider leaves the limit unspecified. Unknown hosted models
+use a conservative provider-family ceiling; unknown self-hosted models retain
+the 1,024-token fallback because the server's launch configuration is not
+visible to llmshim. OpenRouter `models` fallbacks remain supported; when no
+explicit output limit is present, every listed model contributes its catalog
+ceiling and an unknown listed model uses a one-million-token ceiling.
+
+These permits are conservative estimates, not provider billing measurements.
+The input side uses serialized characters divided by four; provider tokenizers,
+images, caching, and unknown self-hosted model defaults can differ. Admission
+currently occurs once per logical HTTP request. Client transport retries,
+fallback attempts, and managed schema repairs can issue additional provider
+requests without reacquiring RPM or TPM for each attempt, so these controls do
+not yet provide attempt-exact quotas during those flows.
 
 For an authenticated gateway identity, an omitted `rpm` or `tpm` field means
 that dimension is unlimited. An explicit `0` means that dimension admits no

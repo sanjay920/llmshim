@@ -36,7 +36,12 @@ issued reasoning and tool IDs; see [native endpoints](../proxy/native-apis.md).
 
 The proxy's `provider_config` object is merged into the OpenAI-shaped engine
 request. That is why tools and native namespaces move under it without changing
-their inner shapes.
+their inner shapes. Root `model` and `messages` are reserved. After route and
+alias resolution, the selected provider's namespace also cannot replace its
+native model or main history/input container. Native system and instruction
+controls remain supported. Explicit fallback targets receive the same checks,
+so a namespace is inert only when no selected fallback or route can activate
+it.
 
 ## Build features
 

@@ -1,5 +1,6 @@
 use crate::error::{Result, ShimError};
 use crate::log::{LogEntry, Logger, RequestTimer};
+use crate::policy::DispatchPolicyContext;
 use crate::router::Router;
 use serde_json::Value;
 use std::time::Duration;
@@ -62,6 +63,26 @@ pub async fn completion_with_fallback(
     config: &FallbackConfig,
     logger: Option<&Logger>,
 ) -> Result<Value> {
+    completion_with_fallback_inner(router, request, config, logger, None).await
+}
+
+pub async fn completion_with_fallback_and_policy(
+    router: &Router,
+    request: &Value,
+    config: &FallbackConfig,
+    logger: Option<&Logger>,
+    policy_context: &DispatchPolicyContext,
+) -> Result<Value> {
+    completion_with_fallback_inner(router, request, config, logger, Some(policy_context)).await
+}
+
+async fn completion_with_fallback_inner(
+    router: &Router,
+    request: &Value,
+    config: &FallbackConfig,
+    logger: Option<&Logger>,
+    policy_context: Option<&DispatchPolicyContext>,
+) -> Result<Value> {
     let models = if config.models.is_empty() {
         // No fallback configured — just use the model from the request
         vec![request
@@ -74,6 +95,9 @@ pub async fn completion_with_fallback(
     };
 
     let mut errors: Vec<String> = Vec::new();
+    let mut policy_limited_providers = std::collections::HashSet::new();
+    let mut provider_limit_error: Option<ShimError> = None;
+    let mut attempted_distinct_provider_after_limit = false;
     // Every attempt below is counted by the client against this router's
     // breaker; the loop only asks `admit` before dialling.
     let client = crate::bound_client(router);
@@ -98,6 +122,17 @@ pub async fn completion_with_fallback(
                 continue;
             }
         };
+        if policy_limited_providers.contains(provider.name()) {
+            errors.push(format!(
+                "{}: skipped provider {} after attempt policy refusal",
+                model_str,
+                provider.name()
+            ));
+            continue;
+        }
+        if !policy_limited_providers.is_empty() {
+            attempted_distinct_provider_after_limit = true;
+        }
 
         let mut backoff = config.initial_backoff;
 
@@ -118,8 +153,13 @@ pub async fn completion_with_fallback(
             let timer = RequestTimer::start();
             // Keep OAuth preparation, SSE-only providers, reasoning provenance,
             // and tool normalization identical to an ordinary completion.
-            let outcome = client.completion(provider, &model, &req).await;
-            match outcome {
+            let dispatch_outcome = client
+                .completion_dispatch(provider, &model, &req, policy_context)
+                .await;
+            if let Some(outcome) = crate::client::ShimClient::breaker_outcome(&dispatch_outcome) {
+                client.observe(provider, outcome).await;
+            }
+            match dispatch_outcome {
                 Ok(result) => {
                     if let Some(logger) = logger {
                         logger.log(&LogEntry::from_response(
@@ -131,10 +171,16 @@ pub async fn completion_with_fallback(
                     }
                     return Ok(result);
                 }
-                Err(e) => {
-                    if is_retryable(&e, &config.retryable_statuses) && attempt < config.max_retries
+                Err(crate::client::DispatchFailure::Upstream(error)) => {
+                    if is_retryable(&error, &config.retryable_statuses)
+                        && attempt < config.max_retries
                     {
-                        errors.push(format!("{} (attempt {}): {}", model_str, attempt + 1, e));
+                        errors.push(format!(
+                            "{} (attempt {}): {}",
+                            model_str,
+                            attempt + 1,
+                            error
+                        ));
                         tokio::time::sleep(backoff).await;
                         backoff *= 2;
                         continue;
@@ -143,16 +189,67 @@ pub async fn completion_with_fallback(
                         logger.log(&LogEntry::from_error(
                             provider.name(),
                             model_str,
-                            &e.to_string(),
+                            &error.to_string(),
                             timer.elapsed(),
                         ));
                     }
-                    errors.push(format!("{}: {}", model_str, e));
+                    errors.push(format!("{}: {}", model_str, error));
                     break; // move to next model
+                }
+                Err(crate::client::DispatchFailure::Local(error)) => {
+                    if let Some(logger) = logger {
+                        logger.log(&LogEntry::from_error(
+                            provider.name(),
+                            model_str,
+                            &error.to_string(),
+                            timer.elapsed(),
+                        ));
+                    }
+                    errors.push(format!("{}: {}", model_str, error));
+                    break;
+                }
+                Err(crate::client::DispatchFailure::PolicyRefusal(refusal))
+                    if refusal.kind() == crate::policy::AttemptPolicyRefusalKind::ProviderLimit =>
+                {
+                    let error = refusal.into_shim_error();
+                    errors.push(format!("{}: {}", model_str, error));
+                    policy_limited_providers.insert(provider.name().to_owned());
+                    provider_limit_error = Some(error);
+                    attempted_distinct_provider_after_limit = false;
+                    break;
+                }
+                Err(crate::client::DispatchFailure::PolicyRefusal(refusal)) => {
+                    let error = refusal.into_shim_error();
+                    if let Some(logger) = logger {
+                        logger.log(&LogEntry::from_error(
+                            provider.name(),
+                            model_str,
+                            &error.to_string(),
+                            timer.elapsed(),
+                        ));
+                    }
+                    return Err(error);
+                }
+                Err(crate::client::DispatchFailure::PolicyObservation(policy_error)) => {
+                    let error = policy_error.into_shim_error();
+                    if let Some(logger) = logger {
+                        logger.log(&LogEntry::from_error(
+                            provider.name(),
+                            model_str,
+                            &error.to_string(),
+                            timer.elapsed(),
+                        ));
+                    }
+                    return Err(error);
                 }
             }
         }
     }
 
+    if !attempted_distinct_provider_after_limit {
+        if let Some(error) = provider_limit_error {
+            return Err(error);
+        }
+    }
     Err(ShimError::AllFailed(errors))
 }
