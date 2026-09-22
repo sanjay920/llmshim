@@ -140,13 +140,15 @@ fn generic_idempotency_key(client_key: &str) -> String {
 
 // Atomic lease: pop the earliest-deadline job, move it to `processing` with a
 // visibility deadline, and record its score for redelivery. KEYS: queue,
-// processing, leased, owners. ARGV: visibility_deadline_ms, owner_token.
+// processing, leased, owners. ARGV: lease_duration_ms, owner_token.
 const LEASE_LUA: &str = r#"
     local top = redis.call('ZPOPMIN', KEYS[1], 1)
     if #top == 0 then return false end
     local m = top[1]
     local s = top[2]
-    redis.call('ZADD', KEYS[2], ARGV[1], m)
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    redis.call('ZADD', KEYS[2], now_ms + ARGV[1], m)
     redis.call('HSET', KEYS[3], m, s)
     redis.call('HSET', KEYS[4], m, ARGV[2])
     return {m, s}
@@ -174,9 +176,11 @@ const RELEASE_LUA: &str = r#"
 "#;
 
 // Reap expired leases back to the queue with their original score. KEYS:
-// processing, queue, leased, owners. ARGV: now_ms, limit.
+// processing, queue, leased, owners. ARGV: limit.
 const REAP_LUA: &str = r#"
-    local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now_ms, 'LIMIT', 0, ARGV[1])
     local n = 0
     for _, m in ipairs(expired) do
         local s = redis.call('HGET', KEYS[3], m)
@@ -190,11 +194,13 @@ const REAP_LUA: &str = r#"
 "#;
 
 // Extend only the caller's current delivery. KEYS: processing, owners.
-// ARGV: member, owner_token, visibility_deadline_ms.
+// ARGV: member, owner_token, lease_duration_ms.
 const REFRESH_LUA: &str = r#"
     if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return 0 end
     if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
-    redis.call('ZADD', KEYS[1], 'XX', ARGV[3], ARGV[1])
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    redis.call('ZADD', KEYS[1], 'XX', now_ms + ARGV[3], ARGV[1])
     return 1
 "#;
 
@@ -212,6 +218,20 @@ const PUBLISH_LUA: &str = r#"
 const COMPLETE_LUA: &str = r#"
     if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 0 end
     if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
+    redis.call('SET', KEYS[4], 1, 'EX', ARGV[3])
+    redis.call('ZREM', KEYS[1], ARGV[1])
+    redis.call('HDEL', KEYS[2], ARGV[1])
+    redis.call('HDEL', KEYS[3], ARGV[1])
+    return 1
+"#;
+
+// Publish a deadline error and complete the same owned delivery atomically.
+// KEYS: processing, leased, owners, done. ARGV: member, owner_token,
+// ttl_secs, channel, payload.
+const TERMINAL_PUBLISH_COMPLETE_LUA: &str = r#"
+    if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 0 end
+    if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
+    redis.call('PUBLISH', ARGV[4], ARGV[5])
     redis.call('SET', KEYS[4], 1, 'EX', ARGV[3])
     redis.call('ZREM', KEYS[1], ARGV[1])
     redis.call('HDEL', KEYS[2], ARGV[1])
@@ -351,10 +371,13 @@ pub struct DistributedGateway {
     refresh: redis::Script,
     fenced_publish: redis::Script,
     complete: redis::Script,
+    terminal_publish_complete: redis::Script,
     dead_letter_transition: redis::Script,
     bump_attempts_script: redis::Script,
     redis_operation_timeout: Duration,
     worker_job_timeout: Duration,
+    #[cfg(test)]
+    terminal_operation_delay: Duration,
 }
 
 impl DistributedGateway {
@@ -422,10 +445,13 @@ impl DistributedGateway {
             refresh: redis::Script::new(REFRESH_LUA),
             fenced_publish: redis::Script::new(PUBLISH_LUA),
             complete: redis::Script::new(COMPLETE_LUA),
+            terminal_publish_complete: redis::Script::new(TERMINAL_PUBLISH_COMPLETE_LUA),
             dead_letter_transition: redis::Script::new(DEAD_LETTER_LUA),
             bump_attempts_script: redis::Script::new(BUMP_ATTEMPTS_LUA),
             redis_operation_timeout,
             worker_job_timeout,
+            #[cfg(test)]
+            terminal_operation_delay: Duration::ZERO,
         }))
     }
 
@@ -851,13 +877,13 @@ impl DistributedGateway {
                 Err(_) => break,
             };
             let owner_token = uuid::Uuid::new_v4().simple().to_string();
-            let deadline = now_ms().saturating_add(self.config.lease_timeout.as_millis() as u64);
+            let lease_duration_ms = duration_millis_u64(self.config.lease_timeout);
             let mut lease_invocation = self.lease.key(&qkey);
             lease_invocation
                 .key(&pkey)
                 .key(&lkey)
                 .key(protocol_owners_key(protocol, &provider))
-                .arg(deadline)
+                .arg(lease_duration_ms)
                 .arg(&owner_token);
             let lease_operation = lease_invocation.invoke_async(&mut conn);
             let leased: Option<(String, String)> =
@@ -914,36 +940,37 @@ impl DistributedGateway {
             _ = &mut deadline => LeasedJobOutcome::DeadlineExceeded,
         };
 
-        drop(job);
-        drop(heartbeat);
-        drop(deadline);
-
         match outcome {
-            LeasedJobOutcome::Finished => {}
+            LeasedJobOutcome::Finished => {
+                drop(job);
+                drop(heartbeat);
+                drop(deadline);
+            }
             LeasedJobOutcome::OwnershipLost => {
+                drop(job);
+                drop(heartbeat);
+                drop(deadline);
                 eprintln!(
                     "gateway worker[{}]: lease ownership lost; abandoning local work",
                     ownership.provider
                 );
             }
             LeasedJobOutcome::DeadlineExceeded => {
-                let descriptor: Option<JobDescriptor> =
-                    serde_json::from_str(&ownership.member).ok();
-                if let Some(descriptor) = descriptor {
-                    let channel = protocol_response_channel(ownership.protocol, &descriptor.id);
-                    if self
-                        .publish_owned(
-                            &ownership,
-                            &channel,
-                            &BusMessage::Error("distributed worker deadline exceeded".into()),
-                        )
-                        .await
-                    {
-                        let _ = self.complete_owned(&ownership, &descriptor.id).await;
+                drop(job);
+                drop(deadline);
+                let mut terminal = Box::pin(self.deadline_cleanup_owned(&ownership));
+                tokio::select! {
+                    biased;
+                    _ = &mut terminal => {}
+                    _ = &mut heartbeat => {
+                        eprintln!(
+                            "gateway worker[{}]: lease ownership lost during deadline cleanup",
+                            ownership.provider
+                        );
                     }
-                } else {
-                    let _ = self.ack_owned(&ownership).await;
                 }
+                drop(terminal);
+                drop(heartbeat);
             }
         }
     }
@@ -1152,6 +1179,40 @@ impl DistributedGateway {
         let _ = self.complete_owned(ownership, &desc.id).await;
     }
 
+    async fn deadline_cleanup_owned(&self, ownership: &LeaseOwnership) -> bool {
+        #[cfg(test)]
+        if !self.terminal_operation_delay.is_zero() {
+            tokio::time::sleep(self.terminal_operation_delay).await;
+        }
+        let Ok(descriptor) = serde_json::from_str::<JobDescriptor>(&ownership.member) else {
+            return self.ack_owned(ownership).await;
+        };
+        let message = BusMessage::Error("distributed worker deadline exceeded".into());
+        let Ok(payload) = serde_json::to_string(&message) else {
+            return false;
+        };
+        let channel = protocol_response_channel(ownership.protocol, &descriptor.id);
+        let mut connection = self.conn.clone();
+        let mut invocation = self.terminal_publish_complete.key(protocol_processing_key(
+            ownership.protocol,
+            &ownership.provider,
+        ));
+        invocation
+            .key(protocol_leased_key(ownership.protocol, &ownership.provider))
+            .key(protocol_owners_key(ownership.protocol, &ownership.provider))
+            .key(protocol_done_key(ownership.protocol, &descriptor.id))
+            .arg(&ownership.member)
+            .arg(&ownership.owner_token)
+            .arg(self.marker_ttl_secs())
+            .arg(channel)
+            .arg(payload);
+        let operation = invocation.invoke_async::<i64>(&mut connection);
+        matches!(
+            tokio::time::timeout(self.redis_operation_timeout, operation).await,
+            Ok(Ok(1))
+        )
+    }
+
     async fn publish_owned(
         &self,
         ownership: &LeaseOwnership,
@@ -1198,7 +1259,7 @@ impl DistributedGateway {
     }
 
     async fn refresh_owned(&self, ownership: &LeaseOwnership) -> bool {
-        let deadline = now_ms().saturating_add(self.config.lease_timeout.as_millis() as u64);
+        let lease_duration_ms = duration_millis_u64(self.config.lease_timeout);
         let mut connection = self.conn.clone();
         let mut invocation = self.refresh.key(protocol_processing_key(
             ownership.protocol,
@@ -1208,7 +1269,7 @@ impl DistributedGateway {
             .key(protocol_owners_key(ownership.protocol, &ownership.provider))
             .arg(&ownership.member)
             .arg(&ownership.owner_token)
-            .arg(deadline);
+            .arg(lease_duration_ms);
         let operation = invocation.invoke_async::<i64>(&mut connection);
         matches!(
             tokio::time::timeout(self.redis_operation_timeout, operation).await,
@@ -1324,7 +1385,6 @@ impl DistributedGateway {
             .key(protocol_queue_key(protocol, provider))
             .key(protocol_leased_key(protocol, provider))
             .key(protocol_owners_key(protocol, provider))
-            .arg(now_ms())
             .arg(256);
         let operation = invocation.invoke_async(&mut conn);
         tokio::time::timeout(self.redis_operation_timeout, operation)
@@ -1342,6 +1402,10 @@ fn positive_duration_from_env(name: &str, fallback: Duration) -> Duration {
         .filter(|milliseconds| *milliseconds > 0)
         .map(Duration::from_millis)
         .unwrap_or(fallback)
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 /// Wrap any error as a gateway upstream error (redis failures fail the request,
@@ -1632,6 +1696,14 @@ mod tests {
 
     fn unlimited() -> Arc<dyn RateLimiter> {
         Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default()))
+    }
+
+    async fn redis_server_time_ms(connection: &mut ConnectionManager) -> u64 {
+        let (seconds, microseconds): (u64, u64) =
+            redis::cmd("TIME").query_async(connection).await.unwrap();
+        seconds
+            .saturating_mul(1_000)
+            .saturating_add(microseconds / 1_000)
     }
 
     async fn test_gateway(provider_seed: &str) -> Option<Arc<DistributedGateway>> {
@@ -2043,7 +2115,7 @@ mod tests {
                 QueueProtocol::LegacyUnscoped,
                 &provider,
             ))
-            .arg(now_ms() + 1_000)
+            .arg(1_000_u64)
             .arg("legacy-owner")
             .invoke_async(&mut connection)
             .await
@@ -2280,14 +2352,16 @@ mod tests {
             }),
             unlimited(),
             GatewayConfig {
-                lease_timeout: Duration::from_millis(600),
+                lease_timeout: Duration::from_millis(300),
                 request_timeout: Duration::from_secs(2),
                 ..GatewayConfig::default()
             },
         )
         .await
         .unwrap();
-        Arc::get_mut(&mut gateway).unwrap().worker_job_timeout = Duration::from_millis(180);
+        let mutable_gateway = Arc::get_mut(&mut gateway).unwrap();
+        mutable_gateway.worker_job_timeout = Duration::from_millis(290);
+        mutable_gateway.terminal_operation_delay = Duration::from_millis(70);
         let preparation_capacity = Arc::new(Semaphore::new(1));
         let worker = tokio::spawn(gateway.clone().worker(
             provider.clone(),
@@ -2311,6 +2385,26 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), first_dispatch_started)
             .await
             .expect("dispatch should start");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut connection = gateway.conn.clone();
+        let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
+        let processing_members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
+        assert_eq!(processing_members.len(), 1);
+        let near_expiry = redis_server_time_ms(&mut connection)
+            .await
+            .saturating_add(40);
+        let _: () = connection
+            .zadd(&processing, &processing_members[0], near_expiry)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            gateway
+                .reap_once_protocol(QueueProtocol::LegacyUnscoped, &provider)
+                .await,
+            0,
+            "deadline cleanup heartbeat must refresh a near-expiry delivery"
+        );
         tokio::time::timeout(Duration::from_secs(1), dropped)
             .await
             .expect("worker deadline should drop dispatch");
@@ -2323,8 +2417,6 @@ mod tests {
                 .unwrap(),
             Err(GatewayError::Upstream(message)) if message == "distributed worker deadline exceeded"
         ));
-        let mut connection = gateway.conn.clone();
-        let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if connection.zcard::<_, u64>(&processing).await.unwrap() == 0 {
@@ -2487,7 +2579,7 @@ mod tests {
             .key(&processing)
             .key(&leased)
             .key(&owners)
-            .arg(now_ms().saturating_add(2_000))
+            .arg(2_000_u64)
             .arg(owner_token)
             .invoke_async(&mut connection)
             .await
@@ -2801,6 +2893,92 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_visibility_uses_coordinator_time_despite_client_clock_skew() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("lease-time-{}", uuid::Uuid::new_v4().simple());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(500),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let prepared = gateway
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"coordinator time"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        gateway.enqueue(&prepared).await.unwrap();
+
+        let protocol = QueueProtocol::LegacyUnscoped;
+        let queue = protocol_queue_key(protocol, &provider);
+        let processing = protocol_processing_key(protocol, &provider);
+        let leased = protocol_leased_key(protocol, &provider);
+        let owners = protocol_owners_key(protocol, &provider);
+        let owner_token = "coordinator-time-owner";
+        let mut connection = gateway.conn.clone();
+        let server_before_lease = redis_server_time_ms(&mut connection).await;
+        let leased_delivery: Option<(String, String)> = gateway
+            .lease
+            .key(&queue)
+            .key(&processing)
+            .key(&leased)
+            .key(&owners)
+            .arg(500_u64)
+            .arg(owner_token)
+            .invoke_async(&mut connection)
+            .await
+            .unwrap();
+        let (member, original_score) = leased_delivery.expect("job should lease");
+        let server_after_lease = redis_server_time_ms(&mut connection).await;
+        let lease_deadline = connection
+            .zscore::<_, _, f64>(&processing, &member)
+            .await
+            .unwrap() as u64;
+        assert!(lease_deadline >= server_before_lease.saturating_add(500));
+        assert!(lease_deadline <= server_after_lease.saturating_add(500));
+
+        let ownership = LeaseOwnership {
+            protocol,
+            provider: provider.clone(),
+            member: member.clone(),
+            original_score,
+            owner_token: owner_token.into(),
+        };
+        let simulated_behind_client = server_before_lease.saturating_sub(86_400_000);
+        let simulated_ahead_client = server_after_lease.saturating_add(86_400_000);
+        assert!(simulated_behind_client < lease_deadline);
+        assert!(simulated_ahead_client > lease_deadline);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let server_before_refresh = redis_server_time_ms(&mut connection).await;
+        assert!(gateway.refresh_owned(&ownership).await);
+        let server_after_refresh = redis_server_time_ms(&mut connection).await;
+        let refreshed_deadline = connection
+            .zscore::<_, _, f64>(&processing, &member)
+            .await
+            .unwrap() as u64;
+        assert!(refreshed_deadline >= server_before_refresh.saturating_add(500));
+        assert!(refreshed_deadline <= server_after_refresh.saturating_add(500));
+        assert_eq!(gateway.reap_once_protocol(protocol, &provider).await, 0);
+
+        tokio::time::sleep(Duration::from_millis(525)).await;
+        assert_eq!(gateway.reap_once_protocol(protocol, &provider).await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn redis_stale_owner_cannot_mutate_or_publish_for_replacement_delivery() {
         let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
         let provider = format!("lease-fence-{}", uuid::Uuid::new_v4().simple());
@@ -2843,7 +3021,7 @@ mod tests {
             .key(&processing)
             .key(&leased)
             .key(&owners)
-            .arg(now_ms().saturating_add(400))
+            .arg(400_u64)
             .arg(first_token)
             .invoke_async(&mut connection)
             .await
@@ -2866,7 +3044,7 @@ mod tests {
             .key(&processing)
             .key(&leased)
             .key(&owners)
-            .arg(now_ms().saturating_add(1_000))
+            .arg(1_000_u64)
             .arg(replacement_token)
             .invoke_async(&mut connection)
             .await
