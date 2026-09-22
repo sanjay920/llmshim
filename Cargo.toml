@@ -1,6 +1,6 @@
 [package]
 name = "llmshim"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 description = "Blazing fast LLM API translation layer in pure Rust"
 license = "MIT OR Apache-2.0"
