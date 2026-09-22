@@ -754,13 +754,9 @@ async fn dispatcher_loop(
         // saturated concurrency semaphore never wastes a token nor holds one
         // idle while a lane waits for a slot.
         let policy_gated = job.policy_context.is_some();
-        let permit = if policy_gated {
-            None
-        } else {
-            match sem.clone().acquire_owned().await {
-                Ok(permit) => Some(permit),
-                Err(_) => break,
-            }
+        let permit = match sem.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
         };
         if job.is_cancelled() {
             continue; // gave up while waiting for a concurrency slot
@@ -849,11 +845,18 @@ async fn dispatcher_loop(
                                         return;
                                     }
                                     use futures::StreamExt;
-                                    while let Some(item) = upstream.next().await {
-                                        // Client disconnected → stop pulling
-                                        // upstream and free capacity.
-                                        if chunk_tx.send(item).await.is_err() {
-                                            break;
+                                    loop {
+                                        tokio::select! {
+                                            biased;
+                                            _ = chunk_tx.closed() => break,
+                                            item = upstream.next() => match item {
+                                                Some(item) => {
+                                                    if chunk_tx.send(item).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                                None => break,
+                                            }
                                         }
                                     }
                                     metrics::observe_ms(
@@ -955,6 +958,61 @@ mod tests {
             // Emit three chunks tagged with the job id.
             let chunks: Vec<StreamChunk> = (0..3).map(|n| Ok(format!("{id}:{n}"))).collect();
             Ok(Box::pin(futures::stream::iter(chunks)))
+        }
+    }
+
+    struct NoopAttemptPolicy;
+
+    impl crate::policy::AttemptPolicy for NoopAttemptPolicy {
+        fn acquire<'a>(
+            &'a self,
+            _attempt: &'a crate::policy::PreparedAttempt<'a>,
+        ) -> crate::policy::AttemptPolicyFuture<'a, Result<(), crate::policy::AttemptPolicyRefusal>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn observe<'a>(
+            &'a self,
+            _attempt: &'a crate::policy::AttemptIdentity,
+            _event: crate::policy::AttemptEvent<'a>,
+        ) -> crate::policy::AttemptPolicyFuture<'a, Result<(), crate::policy::AttemptPolicyError>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn observe_abandoned(
+            &self,
+            _attempt: &crate::policy::AttemptIdentity,
+            _outcome: crate::policy::AttemptOutcome,
+        ) -> Result<(), crate::policy::AttemptPolicyError> {
+            Ok(())
+        }
+    }
+
+    struct LatchBlockedDispatch {
+        preparation_starts: Arc<std::sync::atomic::AtomicUsize>,
+        preparation_started: Arc<Notify>,
+        preparation_latch: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Dispatch for LatchBlockedDispatch {
+        async fn dispatch(&self, _provider: &str, _payload: Value) -> Result<Value, DispatchError> {
+            unreachable!("policy-gated test uses dispatch_with_policy")
+        }
+
+        async fn dispatch_with_policy(
+            &self,
+            _provider: &str,
+            payload: Value,
+            _policy_context: crate::policy::DispatchPolicyContext,
+        ) -> Result<Value, DispatchError> {
+            self.preparation_starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.preparation_started.notify_one();
+            self.preparation_latch.notified().await;
+            Ok(payload)
         }
     }
 
@@ -1131,6 +1189,58 @@ mod tests {
 
         // tier3 (id2), tier2 (id4), then tier1 FIFO (id1 before id3).
         assert_eq!(*order.lock().unwrap(), vec![2, 4, 1, 3]);
+    }
+
+    #[tokio::test]
+    async fn policy_dispatch_preparation_is_bounded_by_scheduler_concurrency() {
+        let preparation_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let preparation_started = Arc::new(Notify::new());
+        let first_preparation_started = preparation_started.notified();
+        let preparation_latch = Arc::new(Notify::new());
+        let scheduler = Scheduler::new(
+            GatewayConfig {
+                max_concurrency_per_provider: 1,
+                ..Default::default()
+            },
+            Arc::new(FakeLimiter::new(100)),
+            Arc::new(LatchBlockedDispatch {
+                preparation_starts: preparation_starts.clone(),
+                preparation_started: preparation_started.clone(),
+                preparation_latch: preparation_latch.clone(),
+            }),
+        );
+        let policy_context = crate::policy::DispatchPolicyContext::new(Arc::new(NoopAttemptPolicy));
+        let mut request_handles = Vec::new();
+        for id in 0..3 {
+            let scheduler = scheduler.clone();
+            let policy_context = policy_context.clone();
+            request_handles.push(tokio::spawn(async move {
+                scheduler
+                    .submit_with_policy(
+                        GatewayRequest {
+                            provider: "blocked".into(),
+                            tier: 0,
+                            permits: 1,
+                            payload: json!({"id": id}),
+                        },
+                        policy_context,
+                    )
+                    .await
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), first_preparation_started)
+            .await
+            .expect("first request should enter dispatch preparation");
+        assert_eq!(
+            preparation_starts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        for request_handle in request_handles {
+            request_handle.abort();
+        }
+        preparation_latch.notify_waiters();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1416,5 +1526,73 @@ mod tests {
         yield_many().await;
         let b = emitted.load(O::SeqCst);
         assert_eq!(a, b, "forwarding must stop once the client disconnects");
+    }
+
+    #[tokio::test]
+    async fn quiet_stream_releases_capacity_when_receiver_drops() {
+        struct QuietStreamDispatch {
+            unary_dispatches: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Dispatch for QuietStreamDispatch {
+            async fn dispatch(
+                &self,
+                _provider: &str,
+                payload: Value,
+            ) -> Result<Value, DispatchError> {
+                self.unary_dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(payload)
+            }
+
+            async fn dispatch_stream(
+                &self,
+                _provider: &str,
+                _payload: Value,
+            ) -> Result<ChunkStream, DispatchError> {
+                Ok(Box::pin(futures::stream::pending()))
+            }
+        }
+
+        let unary_dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scheduler = Scheduler::new(
+            GatewayConfig {
+                max_concurrency_per_provider: 1,
+                ..Default::default()
+            },
+            Arc::new(FakeLimiter::new(100)),
+            Arc::new(QuietStreamDispatch {
+                unary_dispatches: unary_dispatches.clone(),
+            }),
+        );
+        let stream_receiver = scheduler
+            .submit_stream(GatewayRequest {
+                provider: "quiet".into(),
+                tier: 0,
+                permits: 1,
+                payload: json!({}),
+            })
+            .await
+            .expect("quiet stream should open");
+        drop(stream_receiver);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            scheduler.submit(GatewayRequest {
+                provider: "quiet".into(),
+                tier: 0,
+                permits: 1,
+                payload: json!({"id": 2}),
+            }),
+        )
+        .await
+        .expect("receiver close should promptly release capacity")
+        .expect("second request should dispatch");
+        assert_eq!(response["id"], 2);
+        assert_eq!(
+            unary_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }
