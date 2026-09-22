@@ -837,17 +837,17 @@ fn estimate_native_attempt_tokens(
             .get("max_completion_tokens")
             .or_else(|| native_body.get("max_tokens"))
             .and_then(|value| value.as_u64()),
-        crate::reasoning::WireFormat::GoogleGenerateContent => native_body
-            .pointer("/generationConfig/maxOutputTokens")
-            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::GoogleGenerateContent => {
+            native_u64_at_paths(native_body, GEMINI_OUTPUT_TOKEN_PATHS)
+        }
     };
     let reasoning_output = match wire {
         crate::reasoning::WireFormat::AnthropicMessages => native_body
             .pointer("/thinking/budget_tokens")
             .and_then(|value| value.as_u64()),
-        crate::reasoning::WireFormat::GoogleGenerateContent => native_body
-            .pointer("/generationConfig/thinkingConfig/thinkingBudget")
-            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::GoogleGenerateContent => {
+            native_u64_at_paths(native_body, GEMINI_THINKING_BUDGET_PATHS)
+        }
         crate::reasoning::WireFormat::OpenAiResponses
         | crate::reasoning::WireFormat::OpenAiChat => native_body
             .pointer("/reasoning/max_tokens")
@@ -855,13 +855,87 @@ fn estimate_native_attempt_tokens(
     }
     .unwrap_or_default();
     let default_output = omitted_native_output_budget(provider, model, native_body);
+    let Some(output_candidate_count) = native_output_candidate_count(wire, native_body) else {
+        return u32::MAX;
+    };
+    if output_candidate_count == u64::MAX {
+        return u32::MAX;
+    }
     prompt_tokens
         .saturating_add(
             explicit_output
                 .unwrap_or(default_output)
-                .max(reasoning_output),
+                .max(reasoning_output)
+                .saturating_mul(output_candidate_count),
         )
         .clamp(1, u32::MAX as u64) as u32
+}
+
+fn native_output_candidate_count(
+    wire: crate::reasoning::WireFormat,
+    native_body: &serde_json::Value,
+) -> Option<u64> {
+    let candidate_controls: Vec<&serde_json::Value> = match wire {
+        crate::reasoning::WireFormat::OpenAiChat => ["n", "best_of", "bestOf"]
+            .into_iter()
+            .filter_map(|field| native_body.get(field))
+            .collect(),
+        crate::reasoning::WireFormat::GoogleGenerateContent => {
+            native_values_at_paths(native_body, GEMINI_CANDIDATE_COUNT_PATHS)
+        }
+        crate::reasoning::WireFormat::AnthropicMessages
+        | crate::reasoning::WireFormat::OpenAiResponses => Vec::new(),
+    };
+
+    candidate_controls
+        .iter()
+        .map(|value| value.as_u64().filter(|count| *count > 0))
+        .try_fold(1u64, |maximum_candidate_count, count| {
+            count.map(|count| maximum_candidate_count.max(count))
+        })
+}
+
+const GEMINI_OUTPUT_TOKEN_PATHS: &[&[&str]] = &[
+    &["generationConfig", "maxOutputTokens"],
+    &["generationConfig", "max_output_tokens"],
+    &["generation_config", "maxOutputTokens"],
+    &["generation_config", "max_output_tokens"],
+];
+const GEMINI_CANDIDATE_COUNT_PATHS: &[&[&str]] = &[
+    &["generationConfig", "candidateCount"],
+    &["generationConfig", "candidate_count"],
+    &["generation_config", "candidateCount"],
+    &["generation_config", "candidate_count"],
+];
+const GEMINI_THINKING_BUDGET_PATHS: &[&[&str]] = &[
+    &["generationConfig", "thinkingConfig", "thinkingBudget"],
+    &["generationConfig", "thinkingConfig", "thinking_budget"],
+    &["generationConfig", "thinking_config", "thinkingBudget"],
+    &["generationConfig", "thinking_config", "thinking_budget"],
+    &["generation_config", "thinkingConfig", "thinkingBudget"],
+    &["generation_config", "thinkingConfig", "thinking_budget"],
+    &["generation_config", "thinking_config", "thinkingBudget"],
+    &["generation_config", "thinking_config", "thinking_budget"],
+];
+
+fn native_values_at_paths<'a>(
+    native_body: &'a serde_json::Value,
+    paths: &[&[&str]],
+) -> Vec<&'a serde_json::Value> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            path.iter()
+                .try_fold(native_body, |value, field| value.get(*field))
+        })
+        .collect()
+}
+
+fn native_u64_at_paths(native_body: &serde_json::Value, paths: &[&[&str]]) -> Option<u64> {
+    native_values_at_paths(native_body, paths)
+        .into_iter()
+        .filter_map(serde_json::Value::as_u64)
+        .max()
 }
 
 fn catalog_output_budget(provider: &str, model: &str) -> Option<u64> {
@@ -1887,6 +1961,190 @@ mod tests {
         assert!(openai >= 7_000);
         assert!(anthropic >= 6_000);
         assert!(gemini >= 5_000);
+    }
+
+    #[test]
+    fn native_attempt_estimate_counts_final_wire_output_candidates() {
+        let openai_body = serde_json::json!({
+            "model": "served",
+            "messages": [],
+            "max_tokens": 100,
+            "n": 2,
+            "best_of": 3,
+        });
+        let openai_prompt_tokens = serde_json::to_string(&openai_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "vllm",
+                "served",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &openai_body,
+            ),
+            openai_prompt_tokens.saturating_add(300) as u32,
+        );
+
+        let gemini_body = serde_json::json!({
+            "contents": [],
+            "generationConfig": {"maxOutputTokens": 100, "candidateCount": 2},
+        });
+        let gemini_prompt_tokens = serde_json::to_string(&gemini_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "gemini",
+                "served",
+                crate::reasoning::WireFormat::GoogleGenerateContent,
+                &gemini_body,
+            ),
+            gemini_prompt_tokens.saturating_add(200) as u32,
+        );
+
+        use crate::provider::Provider as _;
+        let gemini = crate::providers::gemini::Gemini::new("test-key".into());
+        let gemini_prepared_request = gemini
+            .transform_request(
+                "gemini-3.8-flash",
+                &serde_json::json!({
+                    "model": "gemini-3.8-flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "x-gemini": {
+                        "generation_config": {
+                            "max_output_tokens": 7,
+                            "candidate_count": 3,
+                            "thinking_config": {"thinking_budget": 5},
+                        },
+                    },
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            gemini_prepared_request.body["generation_config"]["candidate_count"],
+            3,
+        );
+        let gemini_alias_prompt_tokens = serde_json::to_string(&gemini_prepared_request.body)
+            .unwrap()
+            .len() as u64
+            / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "gemini",
+                "gemini-3.8-flash",
+                crate::reasoning::WireFormat::GoogleGenerateContent,
+                &gemini_prepared_request.body,
+            ),
+            gemini_alias_prompt_tokens.saturating_add(21) as u32,
+        );
+    }
+
+    #[test]
+    fn native_attempt_candidate_controls_fail_closed_without_walking_tool_schemas() {
+        for candidate_control in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("2"),
+            serde_json::json!(true),
+        ] {
+            let body = serde_json::json!({
+                "model": "served",
+                "messages": [],
+                "max_tokens": 1,
+                "n": candidate_control,
+            });
+            assert_eq!(
+                estimate_native_attempt_tokens(
+                    "vllm",
+                    "served",
+                    crate::reasoning::WireFormat::OpenAiChat,
+                    &body,
+                ),
+                u32::MAX,
+            );
+        }
+
+        for (wire, body) in [
+            (
+                crate::reasoning::WireFormat::OpenAiChat,
+                serde_json::json!({
+                    "model": "served",
+                    "messages": [],
+                    "max_tokens": 0,
+                    "n": "64",
+                }),
+            ),
+            (
+                crate::reasoning::WireFormat::GoogleGenerateContent,
+                serde_json::json!({
+                    "contents": [],
+                    "generationConfig": {"maxOutputTokens": 0, "candidateCount": "64"},
+                }),
+            ),
+        ] {
+            assert_eq!(
+                estimate_native_attempt_tokens("served", "served", wire, &body),
+                u32::MAX,
+            );
+        }
+
+        let overflow_body = serde_json::json!({
+            "model": "served",
+            "messages": [],
+            "max_tokens": 2,
+            "n": u64::MAX,
+        });
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "vllm",
+                "served",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &overflow_body,
+            ),
+            u32::MAX,
+        );
+
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "vllm",
+                "served",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &serde_json::json!({
+                    "model": "served",
+                    "messages": [],
+                    "max_tokens": 0,
+                    "n": u64::MAX,
+                }),
+            ),
+            u32::MAX,
+        );
+
+        for wire in [
+            crate::reasoning::WireFormat::AnthropicMessages,
+            crate::reasoning::WireFormat::OpenAiResponses,
+            crate::reasoning::WireFormat::OpenAiChat,
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+        ] {
+            assert_eq!(
+                native_output_candidate_count(wire, &serde_json::json!({})),
+                Some(1),
+            );
+        }
+
+        let tool_schema_body = serde_json::json!({
+            "model": "served",
+            "messages": [],
+            "max_tokens": 2,
+            "tools": [{"function": {"parameters": {"properties": {"n": {"default": 99}}}}}],
+        });
+        let tool_schema_prompt_tokens =
+            serde_json::to_string(&tool_schema_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "vllm",
+                "served",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &tool_schema_body,
+            ),
+            tool_schema_prompt_tokens.saturating_add(2) as u32,
+        );
     }
 
     #[test]
