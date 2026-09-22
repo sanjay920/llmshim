@@ -64,9 +64,12 @@ logical slot.
 
 The authenticated gateway checks credentials before acquiring its short-lived
 prequeue preparation slot. It releases that slot after native conversion,
-route expansion, and token estimation, before waiting in the priority queue.
-Queued dispatch and each final provider attempt keep their independent capacity
-and rate-policy gates.
+route expansion, token estimation, keyed request fingerprinting, and policy
+checks. Distributed mode retains it through finite-queue admission and then
+releases it before waiting for execution or results; local mode releases before
+its synchronous in-memory enqueue. Queued dispatch and each final provider
+attempt keep their independent capacity and rate-policy gates. Post-queue
+gateway response projection is outside this short-lived prequeue slot.
 
 | Variable | Default | Meaning |
 |---|---:|---|

@@ -143,6 +143,15 @@ enum Backend {
     Distributed(Arc<crate::gateway::distributed::DistributedGateway>),
 }
 
+enum PreparedGatewaySubmission {
+    Local {
+        request: GatewayRequest,
+        policy_scope: crate::gateway::attempt::TrustedPolicyScope,
+    },
+    #[cfg(feature = "redis-coordination")]
+    Distributed(crate::gateway::distributed::PreparedSubmission),
+}
+
 /// Shared state for the gateway HTTP handlers.
 pub struct GatewayState {
     router: Arc<Router>,
@@ -255,37 +264,88 @@ impl GatewayState {
         }))
     }
 
-    async fn submit(
+    fn prepare_submission(
         &self,
         req: GatewayRequest,
         policy_scope: crate::gateway::attempt::TrustedPolicyScope,
-    ) -> Result<Value, GatewayError> {
+        stream: bool,
+    ) -> Result<PreparedGatewaySubmission, GatewayError> {
+        #[cfg(not(feature = "redis-coordination"))]
+        let _ = stream;
         match &self.backend {
-            Backend::Local(scheduler) => {
-                scheduler
-                    .submit_with_policy(req, self.attempt_coordinator.context(policy_scope))
-                    .await
-            }
+            Backend::Local(_) => Ok(PreparedGatewaySubmission::Local {
+                request: req,
+                policy_scope,
+            }),
             #[cfg(feature = "redis-coordination")]
-            Backend::Distributed(gateway) => gateway.submit_with_policy(req, policy_scope).await,
+            Backend::Distributed(gateway) => gateway
+                .prepare_with_policy(req, stream, policy_scope)
+                .map(PreparedGatewaySubmission::Distributed),
         }
     }
 
-    async fn submit_stream(
+    async fn submit_prepared(
         &self,
-        req: GatewayRequest,
-        policy_scope: crate::gateway::attempt::TrustedPolicyScope,
-    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
-        match &self.backend {
-            Backend::Local(scheduler) => {
-                scheduler
-                    .submit_stream_with_policy(req, self.attempt_coordinator.context(policy_scope))
-                    .await
-            }
+        prepared: PreparedGatewaySubmission,
+        prequeue_permit: PrequeuePreparationPermit,
+    ) -> Result<Value, GatewayError> {
+        match prepared {
+            PreparedGatewaySubmission::Local {
+                request,
+                policy_scope,
+            } => match &self.backend {
+                Backend::Local(scheduler) => {
+                    drop(prequeue_permit);
+                    scheduler
+                        .submit_with_policy(request, self.attempt_coordinator.context(policy_scope))
+                        .await
+                }
+                #[cfg(feature = "redis-coordination")]
+                Backend::Distributed(_) => unreachable!("prepared backend changed"),
+            },
             #[cfg(feature = "redis-coordination")]
-            Backend::Distributed(gateway) => {
-                gateway.submit_stream_with_policy(req, policy_scope).await
-            }
+            PreparedGatewaySubmission::Distributed(prepared) => match &self.backend {
+                Backend::Distributed(gateway) => {
+                    let accepted = gateway.accept_prepared(prepared).await?;
+                    drop(prequeue_permit);
+                    gateway.await_accepted(accepted).await
+                }
+                Backend::Local(_) => unreachable!("prepared backend changed"),
+            },
+        }
+    }
+
+    async fn submit_stream_prepared(
+        &self,
+        prepared: PreparedGatewaySubmission,
+        prequeue_permit: PrequeuePreparationPermit,
+    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
+        match prepared {
+            PreparedGatewaySubmission::Local {
+                request,
+                policy_scope,
+            } => match &self.backend {
+                Backend::Local(scheduler) => {
+                    drop(prequeue_permit);
+                    scheduler
+                        .submit_stream_with_policy(
+                            request,
+                            self.attempt_coordinator.context(policy_scope),
+                        )
+                        .await
+                }
+                #[cfg(feature = "redis-coordination")]
+                Backend::Distributed(_) => unreachable!("prepared backend changed"),
+            },
+            #[cfg(feature = "redis-coordination")]
+            PreparedGatewaySubmission::Distributed(prepared) => match &self.backend {
+                Backend::Distributed(gateway) => {
+                    let accepted = gateway.accept_prepared(prepared).await?;
+                    drop(prequeue_permit);
+                    Ok(gateway.stream_accepted(accepted))
+                }
+                Backend::Local(_) => unreachable!("prepared backend changed"),
+            },
         }
     }
 
@@ -579,13 +639,7 @@ async fn chat(
         .map(str::to_string);
     let (provider_name, budget_model, gw, identified_caller) =
         build_request(&state, &headers, &req)?;
-    drop(prequeue_permit);
     let identity = &identified_caller.identity;
-    state
-        .enforce_budget(identity, &provider_name, &budget_model)
-        .await?;
-    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(identity);
-
     let idempotency_context = idem_key.as_ref().map(|client_key| {
         crate::gateway::idempotency::IdempotencyContext::new(
             &identity.tenant,
@@ -595,6 +649,14 @@ async fn chat(
             &gw.payload,
         )
     });
+    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(identity);
+    let prepared_submission = state
+        .prepare_submission(gw, policy_scope, false)
+        .map_err(|error| gateway_err_to_api(&state, error))?;
+
+    state
+        .enforce_budget(identity, &provider_name, &budget_model)
+        .await?;
 
     // Retry-safety: a repeated Idempotency-Key returns the first result.
     if let Some(context) = &idempotency_context {
@@ -614,7 +676,10 @@ async fn chat(
     }
 
     let timer = RequestTimer::start();
-    match state.submit(gw, policy_scope).await {
+    match state
+        .submit_prepared(prepared_submission, prequeue_permit)
+        .await
+    {
         Ok(resp) => {
             if let Some(context) = &idempotency_context {
                 state.idem_store(context, &resp).await;
@@ -655,19 +720,24 @@ async fn chat_stream_inner(
             Ok(t) => t,
             Err(e) => return e.into_response(),
         };
-    drop(prequeue_permit);
     let identity = identified_caller.identity;
+    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
+    let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {
+        Ok(prepared) => prepared,
+        Err(error) => return gateway_err_to_api(&state, error).into_response(),
+    };
     if let Err(e) = state
         .enforce_budget(&identity, &provider_name, &budget_model)
         .await
     {
         return e.into_response();
     }
-    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
-
     // Admission (queue + rate) happens up front so a rejection is a proper
     // 429/503 before the SSE response begins, not an SSE error event.
-    let mut rx = match state.submit_stream(gw, policy_scope).await {
+    let mut rx = match state
+        .submit_stream_prepared(prepared_submission, prequeue_permit)
+        .await
+    {
         Ok(rx) => rx,
         Err(err) => return gateway_err_to_api(&state, err).into_response(),
     };
@@ -1139,7 +1209,19 @@ mod native_tests {
         let mut server = mockito::Server::new_async().await;
         let upstream = server
             .mock("POST", "/chat/completions")
-            .expect(0)
+            .with_body(
+                json!({
+                    "id": "keyed-ingress-response",
+                    "model": "test",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {}
+                })
+                .to_string(),
+            )
+            .expect(1)
             .create_async()
             .await;
         let mut state = configured_state(&server.url());
@@ -1174,17 +1256,12 @@ mod native_tests {
 
         let released = tokio::time::timeout(
             Duration::from_secs(1),
-            app(state).oneshot(canonical_request_for_model(
-                "test-key",
-                "released-ingress",
-                "hi",
-                "unknown/model",
-            )),
+            app(state).oneshot(canonical_request("test-key", "keyed-ingress", "hi")),
         )
         .await
         .expect("released prequeue capacity should not stall the next request")
         .unwrap();
-        assert_eq!(released.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(released.status(), StatusCode::OK);
         upstream.assert_async().await;
     }
 
