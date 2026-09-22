@@ -696,7 +696,7 @@ impl DistributedGateway {
             (Some(_), None) => {
                 self.publish(
                     &channel,
-                    &BusMessage::Error("trusted attempt coordinator unavailable".into()),
+                    &BusMessage::Error("llmshim-coordinator-unavailable".into()),
                 )
                 .await;
                 self.ack_lease(&provider, &member).await;
@@ -705,6 +705,7 @@ impl DistributedGateway {
             (None, _) => None,
         };
 
+        let policy_gated = desc.policy_scope.is_some();
         if desc.stream {
             let opened = match policy_context {
                 Some(context) => {
@@ -748,7 +749,9 @@ impl DistributedGateway {
                         metrics::REJECTED,
                         &[("provider", &provider), ("reason", "upstream")],
                     );
-                    self.penalize_if_429(&provider, &err).await;
+                    if !policy_gated {
+                        self.penalize_if_429(&provider, &err).await;
+                    }
                     self.publish(&channel, &BusMessage::Error(err.message))
                         .await;
                 }
@@ -777,7 +780,9 @@ impl DistributedGateway {
                         metrics::REJECTED,
                         &[("provider", &provider), ("reason", "upstream")],
                     );
-                    self.penalize_if_429(&provider, &err).await;
+                    if !policy_gated {
+                        self.penalize_if_429(&provider, &err).await;
+                    }
                     BusMessage::Error(err.message)
                 }
             };
