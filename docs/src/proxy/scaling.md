@@ -279,6 +279,16 @@ Connection pools and concurrency limits remain per process. If the Redis client
 cannot be initialized—or the binary lacks the feature—the compact proxy warns
 and falls back to in-memory buckets.
 
+Shared rate, health, and attempt coordination use the Redis driver's finite
+500 ms response and one-second connection defaults. Healthy operations reuse a
+cached multiplexed connection. If an operation fails or its future is canceled
+after it may have sent a command, llmshim retires that exact cached connection
+generation; new operations create a fresh generation while existing healthy
+leases may finish on the old one. An uncertain mutating command is never
+replayed, refunded, or treated as a zero charge. The compact rate and health
+paths retain their documented fail-open behavior, while authenticated gateway
+attempt and spend coordination remains fail-closed.
+
 With `gateway-redis`, admitting a new job checks the current fenced queues and
 the released legacy/scoped queues' combined provider waiting depth, then inserts
 the job in one Lua transaction. Concurrent current origins cannot claim the
