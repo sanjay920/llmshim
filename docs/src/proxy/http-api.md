@@ -127,9 +127,15 @@ Clients must therefore tolerate a fresh execution and must not treat this as an
 exactly-once guarantee.
 
 These local limits use a conservative in-process footprint estimate, not an RSS
-measurement. They do not bound Redis-backed idempotency retention in a
-distributed deployment, which remains TTL-based, or temporary upstream response
-buffering before a response reaches the local cache.
+measurement. In a distributed deployment, completed responses remain in the
+bounded lifecycle terminal pool and the idempotency cache retains a bounded
+credential/request-scoped pointer to that terminal. Pointer values have native
+Redis expiry and share limits of 100,000 entries and 64 MiB; their TTL is capped
+at one day and terminal extension uses the same effective TTL without shortening
+an existing longer terminal retention. Concurrent first
+requests that both miss the cache are not coalesced and can both execute. Each
+job is independently admitted and charged, so callers must not use an
+idempotency key as a single-flight or exactly-once guarantee.
 
 ## Streaming response
 
