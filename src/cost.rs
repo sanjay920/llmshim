@@ -10,8 +10,9 @@
 //! silently under-reports, so unknown is unrepresentable as a number here.
 //!
 //! **A reported bill outranks the catalog.** Some providers return what they
-//! actually charged for the generation — OpenRouter does, as `usage.cost`, when
-//! the request asked for accounting. That number *is* the invoice; the catalog
+//! actually charged for the generation — OpenRouter does, as `usage.cost`, on
+//! every call, with no parameter needed to ask for it (measured 2026-09-22;
+//! see `providers/openrouter.rs`). That number *is* the invoice; the catalog
 //! product is an estimate of it, and deliberately an upper bound where a model
 //! prices some token classes and not others. Letting the estimate overwrite the
 //! invoice would throw away the only exact figure in the response, so
@@ -98,10 +99,11 @@ pub fn price(usage: &Value, cost: &Cost) -> Option<f64> {
 }
 
 /// The catalog's price for a model string, in any spelling it carries
-/// (`provider/model`, a bare name, or an alias). `None` when the model is
-/// unknown or carries no pricing.
+/// (`provider/model`, a bare name, or an alias), normalizing a known
+/// OpenRouter variant suffix (`:nitro`, `:floor`, …) for the lookup. `None`
+/// when the model is unknown or carries no pricing.
 pub fn for_model(model: &str) -> Option<Cost> {
-    crate::catalog::resolve(model)?.cost
+    crate::catalog::lookup_id(model)?.cost
 }
 
 /// Price for a dispatch target. The catalog keys models as `provider/name`;
@@ -113,9 +115,9 @@ pub fn for_target(provider: &str, model: &str) -> Option<Cost> {
 
 /// USD cost of one response's usage, or `None` when it cannot be known.
 pub fn cost_usd(provider: &str, model: &str, usage: &Value) -> Option<f64> {
-    let info = crate::catalog::resolve(&format!("{provider}/{model}"))
+    let info = crate::catalog::lookup_id(&format!("{provider}/{model}"))
         .filter(|m| m.cost.is_some())
-        .or_else(|| crate::catalog::resolve(model))?;
+        .or_else(|| crate::catalog::lookup_id(model))?;
     // Normalized uncached input excludes reads/writes for every provider.
     // Tier selection includes them; subtracting cache hits would undercharge
     // long cached conversations. Legacy usage falls back to its prompt total.
@@ -144,8 +146,9 @@ pub const SOURCE_PROVIDER: &str = "provider";
 pub const SOURCE_CATALOG: &str = "catalog";
 
 /// The bill the provider itself reported for this generation, if it reported
-/// one. OpenRouter returns it as `usage.cost` (USD) when the request asked for
-/// accounting; the field is absent on every provider that does not.
+/// one. OpenRouter returns it as `usage.cost` (USD) on every call, unconditionally
+/// (measured 2026-09-22; see `providers/openrouter.rs`); the field is absent
+/// on every provider that does not.
 ///
 /// A reported `0.0` is kept. Unlike a catalog miss it is not missing data — it
 /// is a free generation the provider is telling us about, and the "absent price
@@ -413,5 +416,52 @@ mod tests {
             json!({"usage": {"prompt_tokens": 1}}).to_string(),
         );
         assert!(stamped.contains("cost_usd"));
+    }
+
+    // ============================================================
+    // OpenRouter variant suffix (MOH-240): the lookup normalizes, the wire
+    // id it is passed for never changes here — that guarantee is `router.rs`
+    // and `providers/openrouter.rs`'s to keep; this only covers pricing.
+    // ============================================================
+
+    #[test]
+    fn an_openrouter_variant_suffix_prices_the_same_as_its_base_model() {
+        let base = for_target("openrouter", "deepseek/deepseek-v4.1-flash");
+        assert!(
+            base.is_some(),
+            "base id must be priced by the vendored catalog"
+        );
+        for suffix in [":nitro", ":floor", ":free", ":exacto", ":online"] {
+            let suffixed = for_target(
+                "openrouter",
+                &format!("deepseek/deepseek-v4.1-flash{suffix}"),
+            );
+            assert_eq!(
+                suffixed, base,
+                "suffix {suffix} must price like the base id"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_suffix_is_not_treated_as_an_openrouter_variant() {
+        // ":beta" is not in the closed suffix list, so this must stay
+        // unpriced rather than silently falling back to the base model.
+        assert_eq!(
+            for_target("openrouter", "deepseek/deepseek-v4.1-flash:beta"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_ollama_style_colon_tag_is_not_mistaken_for_an_openrouter_suffix() {
+        // `for_target` still returns None here (this repo's vendored catalog
+        // has no Ollama pricing), but the point is *why*: the colon must not
+        // be stripped just because it looks similar to `:nitro`.
+        assert_eq!(
+            crate::catalog::strip_variant_suffix("llama3:8b"),
+            "llama3:8b"
+        );
+        assert_eq!(for_target("ollama", "llama3:8b"), None);
     }
 }
