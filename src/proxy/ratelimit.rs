@@ -414,7 +414,6 @@ impl RateLimiter for InMemoryRateLimiter {
 mod redis_impl {
     use super::*;
     use redis::aio::ConnectionManager;
-    use tokio::sync::OnceCell;
 
     /// Atomically checks the configured RPM and TPM buckets in one Redis Lua
     /// invocation. Each bucket stores `tokens`, last refill `ts` (ms), and a
@@ -548,8 +547,7 @@ mod redis_impl {
     /// (and logs) rather than taking the proxy down — the reactive layer in
     /// [`crate::client`] still protects against provider 429s.
     pub struct RedisRateLimiter {
-        client: redis::Client,
-        connection_manager: OnceCell<ConnectionManager>,
+        connections: crate::redis_operation::RedisConnectionManagerCache,
         config: RateLimitConfig,
         rate_limit_script: redis::Script,
         penalty_script: redis::Script,
@@ -560,20 +558,13 @@ mod redis_impl {
         /// established lazily on first use, so this stays synchronous and can be
         /// called from the non-async `app()` builder.
         pub fn new(url: &str, config: RateLimitConfig) -> redis::RedisResult<Self> {
+            let client = redis::Client::open(url)?;
             Ok(Self {
-                client: redis::Client::open(url)?,
-                connection_manager: OnceCell::new(),
+                connections: crate::redis_operation::RedisConnectionManagerCache::new(client),
                 config,
                 rate_limit_script: redis::Script::new(RATE_LIMIT_LUA),
                 penalty_script: redis::Script::new(PENALTY_LUA),
             })
-        }
-
-        async fn connection(&self) -> redis::RedisResult<ConnectionManager> {
-            self.connection_manager
-                .get_or_try_init(|| ConnectionManager::new(self.client.clone()))
-                .await
-                .cloned()
         }
 
         fn redis_key(bucket_dimension: &str, rate_key: &RateKey) -> String {
@@ -635,16 +626,12 @@ mod redis_impl {
             if limit.has_zero_limit() {
                 return Err(RetryAfter(ZERO_LIMIT_RETRY_AFTER));
             }
-            let mut connection = match self.connection().await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("warning: redis rate limiter unavailable ({e}); failing open");
-                    return Ok(());
-                }
-            };
-
             match self
-                .check_and_debit(&mut connection, key, limit.rpm, limit.tpm, permits)
+                .connections
+                .run(|mut connection| async move {
+                    self.check_and_debit(&mut connection, key, limit.rpm, limit.tpm, permits)
+                        .await
+                })
                 .await
             {
                 Ok(Some(wait)) => Err(RetryAfter(wait)),
@@ -661,22 +648,23 @@ mod redis_impl {
             if limit.is_unlimited() || limit.has_zero_limit() {
                 return;
             }
-            let mut connection = match self.connection().await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("warning: redis penalize skipped, connection failed ({e})");
-                    return;
-                }
-            };
             let penalty_deadline_ms = current_timestamp_ms() + retry_after.as_millis() as u64;
-            for bucket_dimension in ["rpm", "tpm"] {
-                let _: Result<i64, _> = self
-                    .penalty_script
-                    .key(Self::redis_key(bucket_dimension, key))
-                    .arg(penalty_deadline_ms)
-                    .arg(KEY_TTL_MS)
-                    .invoke_async(&mut connection)
-                    .await;
+            if let Err(error) = self
+                .connections
+                .run(|mut connection| async move {
+                    for bucket_dimension in ["rpm", "tpm"] {
+                        self.penalty_script
+                            .key(Self::redis_key(bucket_dimension, key))
+                            .arg(penalty_deadline_ms)
+                            .arg(KEY_TTL_MS)
+                            .invoke_async::<i64>(&mut connection)
+                            .await?;
+                    }
+                    Ok(())
+                })
+                .await
+            {
+                eprintln!("warning: redis penalize skipped, operation failed ({error})");
             }
         }
     }
