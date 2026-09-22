@@ -78,7 +78,7 @@ never replayed. See [reasoning replay](../guides/reasoning.md#preserve-reasoning
 | `messages` | array | Portable | top-level `messages` |
 | `stream` | boolean | Transport | selects SSE only on `/v1/chat` |
 | `config` | object | Portable | recognized children become top-level engine controls |
-| `provider_config` | object | Passthrough container | each child is merged into the engine request |
+| `provider_config` | object | Passthrough container | each non-reserved child is merged into the engine request |
 | `fallback` | array of strings | Proxy orchestration | ordered non-streaming backup routes; not sent to a provider |
 | `x-cache` | object | Caller stability annotations | native breakpoints or `prompt_cache_key`; never forwarded verbatim |
 
@@ -110,6 +110,21 @@ becomes engine fields named `reasoning_effort`, `tools`, and `x-anthropic`.
 Because `provider_config` is merged after `config`, a same-named child there
 overrides the portable value. Prefer the `x-*` namespace for an intentional
 native override; it makes that loss of portability visible.
+
+`model` and `messages` are reserved at the `provider_config` root. After named
+route defaults and aliases are resolved, the proxy validates only the selected
+provider's active namespace and wire. Every resolvable explicit fallback is
+validated the same way before the primary request runs. The proxy rejects
+fields that would replace the admitted model or main history/input container:
+`x-openai.model/input`, `x-chatgpt.input`,
+`x-anthropic.model/messages`, `x-gemini.contents`,
+`x-openrouter.model/messages`, and the corresponding model plus
+`messages`/`input` fields for any `OpenAiCompatible` provider's configured
+namespace and wire. A namespace is inactive only when neither the primary nor
+an explicit fallback or route can select its provider. Native `system` and
+`instructions`, tool definitions, schemas, output limits, OpenRouter routing
+preferences, and other documented controls remain valid and are included in
+the estimate when active.
 
 ## Output contracts
 

@@ -8,6 +8,46 @@ pub struct ProviderRequest {
     pub body: Value,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestAdmissionPolicy {
+    native_namespace: Option<String>,
+    protected_native_fields: &'static [&'static str],
+    native_prompt_fields: &'static [&'static str],
+    native_output_limit_fields: &'static [&'static str],
+}
+
+impl RequestAdmissionPolicy {
+    pub fn namespaced(
+        native_namespace: impl Into<String>,
+        protected_native_fields: &'static [&'static str],
+        native_prompt_fields: &'static [&'static str],
+        native_output_limit_fields: &'static [&'static str],
+    ) -> Self {
+        Self {
+            native_namespace: Some(native_namespace.into()),
+            protected_native_fields,
+            native_prompt_fields,
+            native_output_limit_fields,
+        }
+    }
+
+    pub fn native_namespace(&self) -> Option<&str> {
+        self.native_namespace.as_deref()
+    }
+
+    pub fn protected_native_fields(&self) -> &'static [&'static str] {
+        self.protected_native_fields
+    }
+
+    pub fn native_prompt_fields(&self) -> &'static [&'static str] {
+        self.native_prompt_fields
+    }
+
+    pub fn native_output_limit_fields(&self) -> &'static [&'static str] {
+        self.native_output_limit_fields
+    }
+}
+
 impl ProviderRequest {
     /// Check endpoint, credentials, settings and prefix for a continuation.
     /// Dispatch still sends a full stateless request.
@@ -22,6 +62,12 @@ impl ProviderRequest {
 /// Takes OpenAI-format JSON in, emits provider-native JSON out, and back again.
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
+
+    /// Describe native request fields that affect proxy admission. Providers
+    /// without a merged native namespace keep the empty default.
+    fn request_admission_policy(&self) -> RequestAdmissionPolicy {
+        RequestAdmissionPolicy::default()
+    }
 
     /// Native wire and issuer used by shared reasoning replay. Custom
     /// Chat-Completions adapters inherit a conservative unbound account.

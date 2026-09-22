@@ -2,6 +2,8 @@
 //! boundary; consumers never need to recognize a provider's usage dialect.
 use serde_json::{json, Value};
 
+use crate::reasoning::{ReplayTarget, WireFormat};
+
 fn counter(usage: &Value, paths: &[&str]) -> u64 {
     paths
         .iter()
@@ -113,6 +115,119 @@ pub fn normalize_cache(native: &Value, normalized: &mut Value) {
         ]
     ));
     normalized["uncached_input_tokens"] = json!(uncached_input(native));
+}
+
+pub(crate) fn normalize_native_response_usage(
+    target: &ReplayTarget,
+    native_response: &Value,
+) -> Option<Value> {
+    let native_usage = match target.wire {
+        WireFormat::AnthropicMessages | WireFormat::OpenAiChat | WireFormat::OpenAiResponses => {
+            native_response.get("usage")?
+        }
+        WireFormat::GoogleGenerateContent => native_response.get("usageMetadata")?,
+    };
+    normalize_native_usage(target.wire, native_usage)
+}
+
+fn normalize_native_usage(wire: WireFormat, native_usage: &Value) -> Option<Value> {
+    if !native_usage.is_object() {
+        return None;
+    }
+    let mut normalized = native_usage.clone();
+    match wire {
+        WireFormat::OpenAiResponses => {
+            normalized["prompt_tokens"] = native_usage
+                .get("input_tokens")
+                .cloned()
+                .unwrap_or(json!(0));
+            normalized["completion_tokens"] = native_usage
+                .get("output_tokens")
+                .cloned()
+                .unwrap_or(json!(0));
+            normalized["total_tokens"] = native_usage
+                .get("total_tokens")
+                .cloned()
+                .unwrap_or(json!(0));
+            if let Some(details) = native_usage.get("output_tokens_details") {
+                normalized["completion_tokens_details"] = details.clone();
+                if let Some(reasoning_tokens) = details.get("reasoning_tokens") {
+                    normalized["reasoning_tokens"] = reasoning_tokens.clone();
+                }
+            }
+        }
+        WireFormat::AnthropicMessages => {
+            let input = counter(native_usage, &["/input_tokens"]);
+            let output = counter(native_usage, &["/output_tokens"]);
+            let cache_read = counter(native_usage, &["/cache_read_input_tokens"]);
+            let cache_write = counter(native_usage, &["/cache_creation_input_tokens"]);
+            normalized["prompt_tokens"] = json!(input);
+            normalized["completion_tokens"] = json!(output);
+            normalized["total_tokens"] = json!(input
+                .saturating_add(output)
+                .saturating_add(cache_read)
+                .saturating_add(cache_write));
+        }
+        WireFormat::GoogleGenerateContent => {
+            normalized["prompt_tokens"] = native_usage
+                .get("promptTokenCount")
+                .cloned()
+                .unwrap_or(json!(0));
+            normalized["completion_tokens"] = native_usage
+                .get("candidatesTokenCount")
+                .cloned()
+                .unwrap_or(json!(0));
+            normalized["total_tokens"] = native_usage
+                .get("totalTokenCount")
+                .cloned()
+                .unwrap_or(json!(0));
+        }
+        WireFormat::OpenAiChat => {}
+    }
+    normalize_cache(native_usage, &mut normalized);
+    Some(normalized)
+}
+
+pub(crate) struct NativeStreamUsage {
+    target: ReplayTarget,
+    anthropic_usage: Value,
+}
+
+impl NativeStreamUsage {
+    pub(crate) fn new(target: ReplayTarget) -> Self {
+        Self {
+            target,
+            anthropic_usage: json!({}),
+        }
+    }
+
+    pub(crate) fn ingest(&mut self, native_event_text: &str) -> Option<Value> {
+        let native_event: Value = serde_json::from_str(native_event_text).ok()?;
+        match self.target.wire {
+            WireFormat::AnthropicMessages => {
+                let usage_path = match native_event["type"].as_str() {
+                    Some("message_start") => "/message/usage",
+                    Some("message_delta") => "/usage",
+                    _ if native_event["usage"].is_object() => "/usage",
+                    _ => return None,
+                };
+                let incoming = native_event.pointer(usage_path)?.as_object()?;
+                for (key, value) in incoming {
+                    self.anthropic_usage[key] = value.clone();
+                }
+                normalize_native_usage(self.target.wire, &self.anthropic_usage)
+            }
+            WireFormat::OpenAiResponses => native_event
+                .get("response")
+                .and_then(|response| normalize_native_response_usage(&self.target, response)),
+            WireFormat::OpenAiChat => native_event
+                .get("usage")
+                .and_then(|usage| normalize_native_usage(self.target.wire, usage)),
+            WireFormat::GoogleGenerateContent => native_event
+                .get("usageMetadata")
+                .and_then(|usage| normalize_native_usage(self.target.wire, usage)),
+        }
+    }
 }
 
 pub(crate) fn normalize_response(response: &mut Value) {

@@ -36,7 +36,12 @@ issued reasoning and tool IDs; see [native endpoints](../proxy/native-apis.md).
 
 The proxy's `provider_config` object is merged into the OpenAI-shaped engine
 request. That is why tools and native namespaces move under it without changing
-their inner shapes.
+their inner shapes. Root `model` and `messages` are reserved. After route and
+alias resolution, the selected provider's namespace also cannot replace its
+native model or main history/input container. Native system and instruction
+controls remain supported. Explicit fallback targets receive the same checks,
+so a namespace is inert only when no selected fallback or route can activate
+it.
 
 ## Build features
 
@@ -53,6 +58,38 @@ running proxy.
 
 All language clients expose reasoning blocks and the tool-call signature object
 (`data` plus `origin`). Preserve those objects for replay.
+
+## Upstream response limits
+
+The engine limits ordinary JSON completion bodies to 32 MiB and provider error
+bodies to 64 KiB, measured after HTTP decompression. It checks decoded chunks
+before adding them to its body buffer. Oversized final bodies return a fixed
+502 error without including a truncated provider response. Retry bodies use the
+same error-body buffer limit; oversized bodies are dropped before another attempt.
+
+These limits apply through the Rust completion API, CLI, proxy, and gateway.
+They bound decoded body bytes; JSON allocations and process memory have
+additional overhead. Successful raw responses returned by the low-level
+`ShimClient::send` API remain the caller's responsibility.
+
+Normal provider streams, ChatGPT's collected SSE replies, and native HTTP
+facades use one bounded SSE data decoder. It checks input before growing its
+line and frame buffers:
+
+| Per-stream limit | Maximum |
+|---|---:|
+| Decoded transport bytes | 32 MiB |
+| Line content | 8 MiB |
+| Frame bytes, with CRLF treated as one line ending | 8 MiB |
+| Blank-line-delimited frames, including empty frames | 100,000 |
+| Input chunks, including empty chunks | 1,048,576 |
+
+The decoder handles UTF-8 fragments, an initial byte-order mark, multiline
+`data` fields, comments, and LF/CRLF/CR line endings. Provider transforms consume
+the data fields; unused SSE metadata is discarded. Limits terminate the stream
+with a fixed error and release its input source. EOF does not manufacture a
+completed event from an unterminated frame. These are framing limits, not an
+RSS ceiling or a transport timeout.
 
 For shape details, continue to the [request field map](request-fields.md) and
 [HTTP API](../proxy/http-api.md).

@@ -3,7 +3,6 @@ use crate::{
     error::{Result, ShimError},
     provider::Provider,
 };
-use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, pin::Pin};
@@ -36,7 +35,7 @@ fn terminal(event: &Value) -> Result<bool> {
 fn native_stream(response: reqwest::Response) -> NativeStream {
     // This parser handles multiline SSE, CRLF, comments, and UTF-8 split across
     // network chunks. Never treat EOF/[DONE] alone as a successful completion.
-    let events = Box::pin(response.bytes_stream().eventsource());
+    let events = Box::pin(crate::sse::data(response.bytes_stream()));
     Box::pin(futures::stream::unfold(
         (events, false),
         |(mut events, finished)| async move {
@@ -45,20 +44,28 @@ fn native_stream(response: reqwest::Response) -> NativeStream {
             }
             loop {
                 let value = match events.next().await {
-                    Some(Ok(event)) if event.data.trim().is_empty() => continue,
-                    Some(Ok(event)) if event.data.trim() == "[DONE]" => {
+                    Some(Ok(event)) if event.trim().is_empty() => continue,
+                    Some(Ok(event)) if event.trim() == "[DONE]" => {
                         Err(stream_error("stream ended before a terminal response"))
                     }
-                    Some(Ok(event)) => serde_json::from_str(&event.data)
+                    Some(Ok(event)) => serde_json::from_str::<Value>(&event)
                         .map_err(|_| stream_error("invalid SSE JSON")),
                     Some(Err(_)) => Err(stream_error("could not read upstream SSE")),
                     None => Err(stream_error("stream ended before a terminal response")),
                 };
                 let (value, finished) = match value {
-                    Ok(value) => match terminal(&value) {
-                        Ok(done) => (Ok(value), done),
-                        Err(e) => (Err(e), true),
-                    },
+                    Ok(value) => {
+                        let finished = matches!(
+                            value["type"].as_str(),
+                            Some(
+                                "error"
+                                    | "response.failed"
+                                    | "response.completed"
+                                    | "response.incomplete"
+                            )
+                        );
+                        (Ok(value), finished)
+                    }
                     Err(e) => (Err(e), true),
                 };
                 return Some((value, (events, finished)));
@@ -67,13 +74,38 @@ fn native_stream(response: reqwest::Response) -> NativeStream {
     ))
 }
 
-pub(crate) async fn collect_response(model: &str, response: reqwest::Response) -> Result<Value> {
+pub(crate) struct CollectedResponse {
+    pub(crate) result: Result<Value>,
+    pub(crate) native_terminal: Option<Value>,
+}
+
+pub(crate) async fn collect_response_with_terminal(
+    model: &str,
+    response: reqwest::Response,
+) -> CollectedResponse {
     let mut events = native_stream(response);
     let mut items = BTreeMap::new();
     let mut texts: BTreeMap<u64, BTreeMap<u64, Value>> = BTreeMap::new();
     while let Some(event) = events.next().await {
-        let event = event?;
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                return CollectedResponse {
+                    result: Err(error),
+                    native_terminal: None,
+                }
+            }
+        };
         match event["type"].as_str() {
+            Some("error" | "response.failed") => {
+                return CollectedResponse {
+                    result: Err(auth_error(502, "upstream response failed")),
+                    native_terminal: event
+                        .get("response")
+                        .filter(|value| value.is_object())
+                        .cloned(),
+                }
+            }
             Some("response.output_item.done") if event["item"].is_object() => {
                 if let Some(index) = event["output_index"].as_u64() {
                     items.insert(index, event["item"].clone());
@@ -92,6 +124,7 @@ pub(crate) async fn collect_response(model: &str, response: reqwest::Response) -
             }
             Some("response.completed" | "response.incomplete") => {
                 let mut response = event["response"].clone();
+                let terminal_validation = terminal(&event);
                 // Some backend versions put output only in output_item.done.
                 if response["output"].as_array().is_none_or(Vec::is_empty) {
                     for (index, parts) in texts {
@@ -99,12 +132,19 @@ pub(crate) async fn collect_response(model: &str, response: reqwest::Response) -
                     }
                     response["output"] = json!(items.into_values().collect::<Vec<_>>());
                 }
-                return transform_response(model, response);
+                return CollectedResponse {
+                    result: terminal_validation
+                        .and_then(|_| transform_response(model, response.clone())),
+                    native_terminal: Some(response),
+                };
             }
             _ => {}
         }
     }
-    Err(stream_error("missing terminal response"))
+    CollectedResponse {
+        result: Err(stream_error("missing terminal response")),
+        native_terminal: None,
+    }
 }
 
 pub(crate) fn transform_chunk(model: &str, chunk: &str) -> Result<Option<String>> {

@@ -1,9 +1,7 @@
 use super::convert;
 use super::error::ApiError;
-use super::ratelimit::{estimate_request_tokens, penalty_duration, RateKey, RetryAfter};
 use super::types::*;
 use super::AppState;
-use crate::error::ShimError;
 use crate::log::RequestTimer;
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
@@ -12,55 +10,37 @@ use axum::Json;
 use futures::StreamExt;
 use std::convert::Infallible;
 use std::sync::Arc;
-use tokio::sync::OwnedSemaphorePermit;
 
-/// A granted admission: holds the concurrency permit (released on drop) and the
-/// rate-limit key so a subsequent upstream 429 can penalize the right bucket.
-struct Admission {
-    /// Held for the request's (or stream's) lifetime; frees a slot when dropped.
-    _permit: OwnedSemaphorePermit,
-    /// `None` when the model's provider couldn't be resolved (limiting skipped).
-    key: Option<RateKey>,
-}
-
-/// Proactive admission control, run before every upstream dispatch:
-///   1. Acquire an instance concurrency permit (bounded wait → 503 on timeout).
-///   2. Acquire a rate-limit token for the provider (→ 429 with Retry-After).
-async fn admit(state: &Arc<AppState>, req: &ChatRequest) -> Result<Admission, ApiError> {
-    // (1) Backpressure: bounded queue for a concurrency slot.
-    let permit = state
-        .backpressure
-        .acquire()
-        .await
-        .map_err(|_| ApiError::Overloaded(state.backpressure.queue_timeout()))?;
-
-    // (2) Rate limit: only if we can resolve the provider (else let the normal
-    // dispatch path surface the proper "unknown provider" error).
-    let key = state
-        .router
-        .resolve(&req.model)
-        .ok()
-        .map(|(p, _)| RateKey::provider(p.name()));
-
-    if let Some(k) = &key {
-        let permits = estimate_request_tokens(req);
-        if let Err(RetryAfter(wait)) = state.limiter.acquire(k, permits).await {
-            return Err(ApiError::RateLimited(wait));
+fn dispatch_error(error: crate::error::ShimError, overload_wait: std::time::Duration) -> ApiError {
+    match &error {
+        crate::error::ShimError::ProviderError {
+            status: 429,
+            retry_after: Some(wait),
+            ..
+        } => ApiError::RateLimited(*wait),
+        crate::error::ShimError::ProviderError {
+            status: 503, body, ..
+        } if body == "attempt policy coordinator unavailable" => {
+            ApiError::Overloaded(overload_wait)
         }
+        _ => ApiError::from(error),
     }
-
-    Ok(Admission {
-        _permit: permit,
-        key,
-    })
 }
 
-/// After an upstream failure, back the bucket off if it was a 429 so the whole
-/// fleet (when Redis-coordinated) slows down together.
-async fn penalize_on_429(state: &AppState, key: &Option<RateKey>, err: &ShimError) {
-    if let (Some(k), ShimError::ProviderError { status: 429, .. }) = (key.as_ref(), err) {
-        state.limiter.penalize(k, penalty_duration()).await;
-    }
+fn is_attempt_policy_error(error: &crate::error::ShimError) -> bool {
+    matches!(
+        error,
+        crate::error::ShimError::ProviderError { body, .. }
+            if matches!(
+                body.as_str(),
+                "provider attempt limit exceeded"
+                    | "tenant attempt limit exceeded"
+                    | "attempt policy coordinator unavailable"
+                    | "attempt budget exhausted"
+                    | "attempt cannot be admitted under the active policy"
+                    | "attempt refused by policy"
+            )
+    )
 }
 
 /// POST /v1/chat — non-streaming completion (or streaming if stream=true)
@@ -68,35 +48,49 @@ pub async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
-    convert::validate_request(&req)?;
     if req.stream {
         // Delegate to streaming (which runs its own admission control).
         return Ok(chat_stream_inner(state, req).await);
     }
-
-    // Admission control: concurrency permit + rate-limit token. The permit is
-    // held until `admission` drops at the end of this function.
-    let admission = admit(&state, &req).await?;
+    let prepared_request = convert::prepare_request(&state.router, &req)?;
+    if let Some(fallback_models) = &req.fallback {
+        convert::validate_resolvable_fallbacks(
+            &state.router,
+            &prepared_request.payload,
+            fallback_models,
+        )?;
+    }
 
     let timer = RequestTimer::start();
-    let value = convert::request_to_value(&req);
+    let value = prepared_request.payload;
+    let policy_context = super::attempt::context(state.limiter.clone(), state.backpressure.clone());
 
     let result = if let Some(fallback_models) = &req.fallback {
         // Build fallback chain: primary model + fallback models
         let mut models = vec![req.model.clone()];
         models.extend(fallback_models.iter().cloned());
         let config = crate::FallbackConfig::new(models);
-        crate::completion_with_fallback(&state.router, &value, &config, state.logger.as_ref()).await
+        crate::completion_with_fallback_and_policy(
+            &state.router,
+            &value,
+            &config,
+            state.logger.as_ref(),
+            &policy_context,
+        )
+        .await
     } else {
-        crate::completion_with_logger(&state.router, &value, state.logger.as_ref()).await
+        crate::completion_with_logger_and_policy(
+            &state.router,
+            &value,
+            state.logger.as_ref(),
+            &policy_context,
+        )
+        .await
     };
 
     let resp = match result {
         Ok(resp) => resp,
-        Err(e) => {
-            penalize_on_429(&state, &admission.key, &e).await;
-            return Err(e.into());
-        }
+        Err(error) => return Err(dispatch_error(error, state.backpressure.queue_timeout())),
     };
 
     // Resolve provider name from the response (it may have fallen back to a different model)
@@ -126,29 +120,27 @@ pub async fn chat_stream(
 }
 
 async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
-    if let Err(error) = convert::validate_request(&req) {
-        return ApiError::from(error).into_response();
-    }
-    // Admission control up front: reject with 429/503 (+ Retry-After) before we
-    // commit to a stream, rather than emitting a rejection as an SSE event.
-    let admission = match admit(&state, &req).await {
-        Ok(a) => a,
-        Err(e) => return e.into_response(),
+    let prepared_request = match convert::prepare_request(&state.router, &req) {
+        Ok(prepared_request) => prepared_request,
+        Err(error) => return ApiError::from(error).into_response(),
     };
-
-    let value = convert::request_to_value(&req);
-    let stream_result = crate::stream(&state.router, &value).await;
-
-    if let Err(e) = &stream_result {
-        penalize_on_429(&state, &admission.key, e).await;
+    let value = prepared_request.payload;
+    let policy_context = super::attempt::context(state.limiter.clone(), state.backpressure.clone());
+    let stream_result = crate::stream_with_policy(&state.router, &value, &policy_context).await;
+    if let Err(error) = &stream_result {
+        if is_attempt_policy_error(error) {
+            return dispatch_error(
+                stream_result.err().expect("matched error"),
+                state.backpressure.queue_timeout(),
+            )
+            .into_response();
+        }
     }
 
     let event_stream = async_stream::stream! {
-        // Hold the concurrency permit for the whole stream lifetime.
-        let _admission = admission;
         match stream_result {
-            Ok(mut stream) => {
-                while let Some(chunk) = stream.next().await {
+            Ok(mut upstream_stream) => {
+                while let Some(chunk) = upstream_stream.next().await {
                     match chunk {
                         Ok(chunk_json) => {
                             let events = convert::chunk_to_events(&chunk_json);
@@ -176,8 +168,8 @@ async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
                     }
                 }
             }
-            Err(e) => {
-                let error_event = super::error::stream_error(&e.to_string());
+            Err(error) => {
+                let error_event = super::error::stream_error(&error.to_string());
                 if let Ok(data) = serde_json::to_string(&error_event) {
                     yield Ok(Event::default().event("error").data(data));
                 }
@@ -231,7 +223,7 @@ mod tests {
     };
     use super::super::{app_with_origin_policy, app_with_state, AppState};
     use crate::router::Router;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use std::time::Duration;
@@ -260,6 +252,232 @@ mod tests {
         .unwrap()
     }
 
+    async fn post_json(
+        app: axum::Router,
+        path: &str,
+        payload: serde_json::Value,
+    ) -> axum::http::Response<Body> {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    struct RecordingLimiter {
+        penalized: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RateLimiter for RecordingLimiter {
+        async fn acquire(
+            &self,
+            _key: &RateKey,
+            _permits: u32,
+        ) -> Result<(), super::super::ratelimit::RetryAfter> {
+            Ok(())
+        }
+
+        async fn penalize(&self, key: &RateKey, _retry_after: Duration) {
+            self.penalized.lock().unwrap().push(key.provider.clone());
+        }
+    }
+
+    fn compatible_response(content: serde_json::Value) -> String {
+        serde_json::json!({
+            "id": "response",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn provider_rpm_one_allows_exactly_one_real_send() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_status(500)
+            .with_body("retryable")
+            .expect(1)
+            .create_async()
+            .await;
+        let state = Arc::new(AppState {
+            router: Router::new().register(
+                "local",
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    "local",
+                    server.url(),
+                    None,
+                )),
+            ),
+            logger: None,
+            limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::with_global(
+                Some(1),
+                None,
+            ))),
+            backpressure: Backpressure::new(8, Duration::from_secs(1)),
+        });
+        let response = post_chat(app_with_state(state), "/v1/chat", "local/test").await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn repair_requires_a_fresh_provider_gate() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(compatible_response(serde_json::json!("1")))
+            .expect(1)
+            .create_async()
+            .await;
+        let state = Arc::new(AppState {
+            router: Router::new().register(
+                "local",
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    "local",
+                    server.url(),
+                    None,
+                )),
+            ),
+            logger: None,
+            limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::with_global(
+                Some(1),
+                None,
+            ))),
+            backpressure: Backpressure::new(8, Duration::from_secs(1)),
+        });
+        let response = post_json(
+            app_with_state(state),
+            "/v1/chat",
+            serde_json::json!({
+                "model": "local/test",
+                "messages": [{"role": "user", "content": "answer"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": {"type": "integer", "minimum": 3}
+                    }
+                },
+                "x-shim": {"structured_output": "prompt"}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fallback_charges_the_actual_provider_lane() {
+        let mut primary_server = mockito::Server::new_async().await;
+        let primary = primary_server
+            .mock("POST", "/chat/completions")
+            .with_status(500)
+            .with_body("retryable")
+            .expect(1)
+            .create_async()
+            .await;
+        let mut secondary_server = mockito::Server::new_async().await;
+        let secondary = secondary_server
+            .mock("POST", "/chat/completions")
+            .with_body(compatible_response(serde_json::json!("ok")))
+            .expect(1)
+            .create_async()
+            .await;
+        let router = Router::new()
+            .register(
+                "primary",
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    "primary",
+                    primary_server.url(),
+                    None,
+                )),
+            )
+            .register(
+                "secondary",
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    "secondary",
+                    secondary_server.url(),
+                    None,
+                )),
+            );
+        let state = Arc::new(AppState {
+            router,
+            logger: None,
+            limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::with_global(
+                Some(1),
+                None,
+            ))),
+            backpressure: Backpressure::new(8, Duration::from_secs(1)),
+        });
+        let response = post_json(
+            app_with_state(state.clone()),
+            "/v1/chat",
+            serde_json::json!({
+                "model": "primary/test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "fallback": ["secondary/test"]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let direct_secondary = post_chat(app_with_state(state), "/v1/chat", "secondary/test").await;
+        assert_eq!(direct_secondary.status(), StatusCode::TOO_MANY_REQUESTS);
+        primary.assert_async().await;
+        secondary.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn intermediate_429_penalizes_its_actual_provider_before_success() {
+        let mut server = mockito::Server::new_async().await;
+        let rate_limited = server
+            .mock("POST", "/chat/completions")
+            .with_status(429)
+            .with_header("retry-after", "0")
+            .with_body("slow down")
+            .expect(1)
+            .create_async()
+            .await;
+        let successful = server
+            .mock("POST", "/chat/completions")
+            .with_body(compatible_response(serde_json::json!("ok")))
+            .expect(1)
+            .create_async()
+            .await;
+        let limiter = Arc::new(RecordingLimiter {
+            penalized: std::sync::Mutex::new(Vec::new()),
+        });
+        let state = Arc::new(AppState {
+            router: Router::new().register(
+                "actual",
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    "actual",
+                    server.url(),
+                    None,
+                )),
+            ),
+            logger: None,
+            limiter: limiter.clone(),
+            backpressure: Backpressure::new(8, Duration::from_secs(1)),
+        });
+        let response = post_chat(app_with_state(state), "/v1/chat", "actual/test").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(limiter.penalized.lock().unwrap().as_slice(), ["actual"]);
+        rate_limited.assert_async().await;
+        successful.assert_async().await;
+    }
+
     #[tokio::test]
     async fn backpressure_timeout_returns_503_with_retry_after() {
         // Cap of 1, and we hold the only permit → the request's admission times
@@ -268,7 +486,10 @@ mod tests {
         let _held = bp.acquire().await.expect("hold the only permit");
 
         let state = Arc::new(AppState {
-            router: Router::new(),
+            router: Router::new().register(
+                "openai",
+                Box::new(crate::providers::openai::OpenAi::new("test-key".into())),
+            ),
             logger: None,
             limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default())),
             backpressure: bp.clone(),
@@ -512,5 +733,117 @@ mod tests {
             "https://trusted.example"
         );
         upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_provider_config_admission_overrides_before_dispatch() {
+        let state = Arc::new(AppState {
+            router: Router::new().register(
+                "openai",
+                Box::new(crate::providers::openai::OpenAi::new("test-key".into())),
+            ),
+            logger: None,
+            limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default())),
+            backpressure: Backpressure::new(256, Duration::from_millis(50)),
+        });
+        for (path, provider_config) in [
+            (
+                "/v1/chat",
+                serde_json::json!({"model": "anthropic/claude-opus-5"}),
+            ),
+            (
+                "/v1/chat/stream",
+                serde_json::json!({"x-openai": {"input": "sensitive-prompt-material"}}),
+            ),
+        ] {
+            let response = app_with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "model": "openai/gpt-5.6-luna",
+                                "messages": [{"role": "user", "content": "canonical"}],
+                                "provider_config": provider_config,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let response_body = to_bytes(response.into_body(), 10_000).await.unwrap();
+            let response_text = String::from_utf8_lossy(&response_body);
+            assert!(response_text.contains("invalid_request"));
+            assert!(!response_text.contains("sensitive-prompt-material"));
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_fallback_namespace_activation_before_primary_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let openai_upstream = server
+            .mock("POST", "/responses")
+            .expect(0)
+            .create_async()
+            .await;
+        let anthropic_upstream = server
+            .mock("POST", "/messages")
+            .expect(0)
+            .create_async()
+            .await;
+        let router = Router::new()
+            .register(
+                "openai",
+                Box::new(
+                    crate::providers::openai::OpenAi::new("test-key".into())
+                        .with_base_url(server.url()),
+                ),
+            )
+            .register(
+                "anthropic",
+                Box::new(
+                    crate::providers::anthropic::Anthropic::new("test-key".into())
+                        .with_base_url(server.url()),
+                ),
+            );
+        let state = Arc::new(AppState {
+            router,
+            logger: None,
+            limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default())),
+            backpressure: Backpressure::new(256, Duration::from_millis(50)),
+        });
+        for request_body in [
+            serde_json::json!({
+                "model":"openai/gpt-5.6-luna",
+                "messages":[{"role":"user","content":"canonical"}],
+                "fallback":["anthropic/claude-sonnet-5"],
+                "provider_config":{"x-anthropic":{"model":"claude-opus-5","messages":[]}}
+            }),
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5",
+                "messages":[{"role":"user","content":"canonical"}],
+                "fallback":["openai/gpt-5.6-luna"],
+                "provider_config":{"x-openai":{"input":"replacement"}}
+            }),
+        ] {
+            let response = app_with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        openai_upstream.assert_async().await;
+        anthropic_upstream.assert_async().await;
     }
 }

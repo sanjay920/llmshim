@@ -1,5 +1,23 @@
 use super::types::{ChatRequest, ChatResponse, ResponseMessage, StreamEvent, Usage};
+use crate::provider::{Provider, RequestAdmissionPolicy};
+use crate::router::Router;
 use serde_json::{json, Value};
+
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionTarget {
+    #[cfg(any(feature = "gateway", test))]
+    pub provider_name: String,
+    #[cfg(any(feature = "gateway", test))]
+    pub model: String,
+    pub policy: RequestAdmissionPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedRequest {
+    pub payload: Value,
+    #[cfg(any(feature = "gateway", test))]
+    pub target: AdmissionTarget,
+}
 
 /// Convert our ChatRequest into the OpenAI-format Value that lib.rs expects.
 pub fn request_to_value(req: &ChatRequest) -> Value {
@@ -51,23 +69,532 @@ pub fn request_to_value(req: &ChatRequest) -> Value {
     if let Some(format) = &req.response_format {
         v["response_format"] = format.clone();
     }
+    // Routing and canonical history always come from the typed proxy envelope.
+    // Validation rejects conflicting passthrough fields, and these assignments
+    // keep the conversion safe if a future internal caller skips validation.
+    v["model"] = json!(req.model);
+    v["messages"] = json!(req.messages);
     v
 }
 
-/// Validate canonical history before HTTP/SSE admission. Providers additionally
-/// validate their native projection after applying native overrides.
-pub(crate) fn validate_request(req: &ChatRequest) -> crate::error::Result<()> {
-    let request = request_to_value(req);
+fn invalid_request_override(field: &str) -> crate::error::ShimError {
+    crate::error::ShimError::ProviderError {
+        status: 400,
+        body: format!("{field} cannot replace a field admitted from the proxy request"),
+        retry_after: None,
+    }
+}
+
+fn validate_provider_config_envelope(req: &ChatRequest) -> crate::error::Result<()> {
+    let Some(provider_config) = req.provider_config.as_ref() else {
+        return Ok(());
+    };
+    let Some(provider_config) = provider_config.as_object() else {
+        return Err(crate::error::ShimError::ProviderError {
+            status: 400,
+            body: "provider_config must be an object".into(),
+            retry_after: None,
+        });
+    };
+
+    for protected_field in ["model", "messages"] {
+        if provider_config.contains_key(protected_field) {
+            return Err(invalid_request_override(&format!(
+                "provider_config.{protected_field}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(any(feature = "gateway", test))]
+pub(crate) fn active_native_namespace(target: &AdmissionTarget) -> Option<&str> {
+    target.policy.native_namespace()
+}
+
+fn validate_active_native_overrides(
+    request: &Value,
+    target: &AdmissionTarget,
+) -> crate::error::Result<()> {
+    let Some(namespace) = target.policy.native_namespace() else {
+        return Ok(());
+    };
+    let Some(native_config) = request.get(namespace).and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for protected_field in target.policy.protected_native_fields() {
+        if native_config.contains_key(*protected_field) {
+            return Err(invalid_request_override(&format!(
+                "{namespace}.{protected_field}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn admission_target(provider: &dyn Provider, resolved_model: String) -> AdmissionTarget {
+    #[cfg(not(any(feature = "gateway", test)))]
+    drop(resolved_model);
+    AdmissionTarget {
+        #[cfg(any(feature = "gateway", test))]
+        provider_name: provider.name().to_string(),
+        policy: provider.request_admission_policy(),
+        #[cfg(any(feature = "gateway", test))]
+        model: resolved_model,
+    }
+}
+
+fn prepare_resolved_request(
+    request: Value,
+    provider: &dyn Provider,
+    resolved_model: String,
+) -> crate::error::Result<PreparedRequest> {
+    let target = admission_target(provider, resolved_model);
+    validate_active_native_overrides(&request, &target)?;
     if let Some(messages) = request["messages"].as_array() {
         crate::toolcall::validate_history(messages)?;
     }
+    Ok(PreparedRequest {
+        payload: request,
+        #[cfg(any(feature = "gateway", test))]
+        target,
+    })
+}
+
+pub(crate) fn prepare_engine_request(
+    router: &Router,
+    request: Value,
+) -> crate::error::Result<PreparedRequest> {
+    let request = router.expand_route(&request)?.into_owned();
+    let addressed_model = request["model"]
+        .as_str()
+        .ok_or(crate::error::ShimError::MissingModel)?;
+    let (provider, resolved_model) = router.resolve(addressed_model)?;
+    prepare_resolved_request(request, provider, resolved_model)
+}
+
+pub(crate) fn validate_resolvable_fallbacks(
+    router: &Router,
+    base_request: &Value,
+    fallback_models: &[String],
+) -> crate::error::Result<()> {
+    for fallback_model in fallback_models {
+        let mut fallback_request = base_request.clone();
+        fallback_request["model"] = Value::String(fallback_model.clone());
+        let fallback_request = match router.expand_route(&fallback_request) {
+            Ok(expanded) => expanded.into_owned(),
+            Err(_) => continue,
+        };
+        let (provider, resolved_model) = match router.resolve(fallback_model) {
+            Ok(resolved) => resolved,
+            Err(_) => continue,
+        };
+        prepare_resolved_request(fallback_request, provider, resolved_model)?;
+    }
     Ok(())
+}
+
+/// Build the route-expanded engine request and immutable admission target.
+pub(crate) fn prepare_request(
+    router: &Router,
+    req: &ChatRequest,
+) -> crate::error::Result<PreparedRequest> {
+    validate_provider_config_envelope(req)?;
+    prepare_engine_request(router, request_to_value(req))
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::reasoning::WireFormat;
+
+    fn router() -> Router {
+        Router::new().register(
+            "openai",
+            Box::new(crate::providers::openai::OpenAi::new("test".into())),
+        )
+    }
+
+    fn request_with_provider_config(provider_config: Value) -> ChatRequest {
+        serde_json::from_value(json!({
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "canonical"}],
+            "provider_config": provider_config,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn canonical_model_and_messages_cannot_be_replaced_at_the_merge_root() {
+        for provider_config in [
+            json!({"model": "anthropic/claude-opus-5"}),
+            json!({"messages": [{"role": "user", "content": "replacement"}]}),
+        ] {
+            let request = request_with_provider_config(provider_config);
+            assert!(prepare_request(&router(), &request).is_err());
+            let converted = request_to_value(&request);
+            assert_eq!(converted["model"], "openai/gpt-5.6-luna");
+            assert_eq!(converted["messages"][0]["content"], "canonical");
+        }
+    }
+
+    #[test]
+    fn native_namespaces_cannot_replace_the_admitted_model_or_prompt() {
+        for protected_field in ["model", "input"] {
+            let request = request_with_provider_config(json!({
+                "x-openai": {(protected_field): "replacement"}
+            }));
+            let error = prepare_request(&router(), &request)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("x-openai.{protected_field}")));
+        }
+    }
+
+    #[test]
+    fn active_override_rules_follow_each_provider_wire() {
+        let cases = [
+            (
+                "openai",
+                WireFormat::OpenAiResponses,
+                "x-openai",
+                &["input"] as &'static [&'static str],
+            ),
+            (
+                "chatgpt",
+                WireFormat::OpenAiResponses,
+                "x-chatgpt",
+                &["input"],
+            ),
+            (
+                "anthropic",
+                WireFormat::AnthropicMessages,
+                "x-anthropic",
+                &["messages"],
+            ),
+            (
+                "gemini",
+                WireFormat::GoogleGenerateContent,
+                "x-gemini",
+                &["contents"],
+            ),
+            (
+                "openrouter",
+                WireFormat::OpenAiChat,
+                "x-openrouter",
+                &["messages"],
+            ),
+            ("vllm", WireFormat::OpenAiChat, "x-vllm", &["messages"]),
+            (
+                "sglang",
+                WireFormat::OpenAiResponses,
+                "x-sglang",
+                &["input"],
+            ),
+        ];
+        for (provider_name, _wire, namespace, protected_fields) in cases {
+            let target = AdmissionTarget {
+                provider_name: provider_name.into(),
+                model: "test".into(),
+                policy: RequestAdmissionPolicy::namespaced(namespace, protected_fields, &[], &[]),
+            };
+            let request = json!({(namespace): {(protected_fields[0]): []}});
+            assert!(validate_active_native_overrides(&request, &target).is_err());
+        }
+
+        let xai_target = AdmissionTarget {
+            provider_name: "xai".into(),
+            model: "grok-4.7".into(),
+            policy: RequestAdmissionPolicy::default(),
+        };
+        assert!(validate_active_native_overrides(
+            &json!({"x-xai":{"input":"ignored"}}),
+            &xai_target
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn inactive_namespaces_and_nested_data_fields_remain_available() {
+        let request = request_with_provider_config(json!({
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object", "properties": {
+                "model": {"type": "string"}, "messages": {"type": "string"},
+                "input": {"type": "string"}, "contents": {"type": "string"}
+            }}}}],
+            "x-openai": {"reasoning": {"effort": "high"}, "max_output_tokens": 2048, "messages": "non-overriding native data"},
+            "x-anthropic": {"input": "inactive data"},
+            "x-unknown": {"model": "inactive data"},
+            "x-openrouter": {"provider": {"sort": "throughput"}},
+        }));
+        let prepared = prepare_request(&router(), &request).unwrap();
+        assert_eq!(prepared.payload["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(prepared.payload["x-openai"]["reasoning"]["effort"], "high");
+        assert_eq!(
+            prepared.payload["x-openrouter"]["provider"]["sort"],
+            "throughput"
+        );
+    }
+
+    #[test]
+    fn named_route_defaults_are_expanded_before_override_validation() {
+        let routed = router().route(
+            "large",
+            crate::config::Route {
+                model: "openai/gpt-5.6-luna".into(),
+                settings: std::collections::BTreeMap::from([
+                    ("max_tokens".into(), json!(32_000)),
+                    ("x-openai".into(), json!({"input": "replacement"})),
+                ]),
+            },
+        );
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "route/large",
+            "messages": [{"role": "user", "content": "canonical"}]
+        }))
+        .unwrap();
+        let error = prepare_request(&routed, &request).unwrap_err().to_string();
+        assert!(error.contains("x-openai.input"));
+    }
+
+    #[test]
+    fn named_route_and_alias_target_are_prepared_for_admission_and_dispatch() {
+        let routed = router()
+            .alias("fast", "openai/gpt-5.6-luna")
+            .route(
+                "large",
+                crate::config::Route {
+                    model: "fast".into(),
+                    settings: std::collections::BTreeMap::from([
+                        ("max_tokens".into(), json!(32_000)),
+                        (
+                            "tools".into(),
+                            json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]),
+                        ),
+                    ]),
+                },
+            );
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "route/large",
+            "messages": [{"role": "user", "content": "canonical"}]
+        }))
+        .unwrap();
+        let prepared = prepare_request(&routed, &request).unwrap();
+        assert_eq!(prepared.target.provider_name, "openai");
+        assert_eq!(prepared.target.model, "gpt-5.6-luna");
+        assert_eq!(prepared.payload["model"], "fast");
+        assert_eq!(prepared.payload["max_tokens"], 32_000);
+        assert_eq!(prepared.payload["tools"][0]["function"]["name"], "lookup");
+        assert!(crate::proxy::ratelimit::estimate_prepared_request_tokens(&prepared) >= 32_000);
+    }
+
+    #[test]
+    fn openrouter_model_routing_controls_remain_supported() {
+        let router = Router::new().register(
+            "openrouter",
+            Box::new(crate::providers::openrouter::OpenRouter::new("test".into())),
+        );
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model":"openrouter/anthropic/claude-sonnet-5",
+            "messages":[{"role":"user","content":"hello"}],
+            "provider_config":{"x-openrouter":{
+                "models":["anthropic/claude-sonnet-5","openai/gpt-5.6-luna"],
+                "provider":{"sort":"throughput"},
+                "route":"fallback"
+            }}
+        }))
+        .unwrap();
+        let prepared = prepare_request(&router, &request).unwrap();
+        assert_eq!(prepared.target.provider_name, "openrouter");
+        assert_eq!(
+            prepared.payload["x-openrouter"]["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            prepared.payload["x-openrouter"]["provider"]["sort"],
+            "throughput"
+        );
+    }
+
+    #[test]
+    fn every_resolvable_fallback_target_is_validated_before_dispatch() {
+        let router = Router::new()
+            .register(
+                "openai",
+                Box::new(crate::providers::openai::OpenAi::new("test".into())),
+            )
+            .register(
+                "anthropic",
+                Box::new(crate::providers::anthropic::Anthropic::new("test".into())),
+            );
+        let openai_primary: ChatRequest = serde_json::from_value(json!({
+            "model":"openai/gpt-5.6-luna",
+            "messages":[{"role":"user","content":"canonical"}],
+            "provider_config":{"x-anthropic":{
+                "model":"claude-opus-5",
+                "messages":[{"role":"user","content":"replacement"}]
+            }}
+        }))
+        .unwrap();
+        let prepared = prepare_request(&router, &openai_primary).unwrap();
+        let error = validate_resolvable_fallbacks(
+            &router,
+            &prepared.payload,
+            &["anthropic/claude-sonnet-5".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("x-anthropic.model"));
+
+        let anthropic_primary: ChatRequest = serde_json::from_value(json!({
+            "model":"anthropic/claude-sonnet-5",
+            "messages":[{"role":"user","content":"canonical"}],
+            "provider_config":{"x-openai":{"input":"replacement"}}
+        }))
+        .unwrap();
+        let prepared = prepare_request(&router, &anthropic_primary).unwrap();
+        let error = validate_resolvable_fallbacks(
+            &router,
+            &prepared.payload,
+            &["openai/gpt-5.6-luna".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("x-openai.input"));
+
+        assert!(validate_resolvable_fallbacks(
+            &router,
+            &prepared.payload,
+            &["missing-provider/model".into()]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn fallback_routes_and_aliases_are_validated_after_expansion() {
+        let router = Router::new()
+            .register(
+                "openai",
+                Box::new(crate::providers::openai::OpenAi::new("test".into())),
+            )
+            .register(
+                "anthropic",
+                Box::new(crate::providers::anthropic::Anthropic::new("test".into())),
+            )
+            .alias("claude-route-target", "anthropic/claude-sonnet-5")
+            .route(
+                "dangerous-fallback",
+                crate::config::Route {
+                    model: "claude-route-target".into(),
+                    settings: std::collections::BTreeMap::from([(
+                        "x-anthropic".into(),
+                        json!({"messages":[{"role":"user","content":"replacement"}]}),
+                    )]),
+                },
+            );
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model":"openai/gpt-5.6-luna",
+            "messages":[{"role":"user","content":"canonical"}]
+        }))
+        .unwrap();
+        let prepared = prepare_request(&router, &request).unwrap();
+        let error = validate_resolvable_fallbacks(
+            &router,
+            &prepared.payload,
+            &["route/dangerous-fallback".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("x-anthropic.messages"));
+    }
+
+    #[test]
+    fn arbitrary_openai_compatible_names_own_their_namespace_and_wire_policy() {
+        for (wire, prompt_field, output_field) in [
+            (WireFormat::OpenAiChat, "messages", "max_tokens"),
+            (WireFormat::OpenAiResponses, "input", "max_output_tokens"),
+        ] {
+            let router = Router::new().register(
+                "local",
+                Box::new(
+                    crate::providers::openai_compat::OpenAiCompatible::new(
+                        "local",
+                        "http://127.0.0.1:9",
+                        None,
+                    )
+                    .with_wire(wire),
+                ),
+            );
+            for protected_field in ["model", prompt_field] {
+                let request: ChatRequest = serde_json::from_value(json!({
+                    "model":"local/declared",
+                    "messages":[{"role":"user","content":"canonical"}],
+                    "provider_config":{"x-local":{(protected_field):"replacement"}}
+                }))
+                .unwrap();
+                let error = prepare_request(&router, &request).unwrap_err().to_string();
+                assert!(error.contains(&format!("x-local.{protected_field}")));
+            }
+
+            let request: ChatRequest = serde_json::from_value(json!({
+                "model":"local/declared",
+                "messages":[{"role":"user","content":"canonical"}],
+                "provider_config":{"x-local":{(output_field):7_000}}
+            }))
+            .unwrap();
+            let prepared = prepare_request(&router, &request).unwrap();
+            assert!(crate::proxy::ratelimit::estimate_prepared_request_tokens(&prepared) >= 7_000);
+        }
+    }
+
+    #[test]
+    fn arbitrary_openai_compatible_fallback_names_activate_their_namespace() {
+        for (wire, protected_field) in [
+            (WireFormat::OpenAiChat, "messages"),
+            (WireFormat::OpenAiResponses, "input"),
+        ] {
+            let router = Router::new()
+                .register(
+                    "openai",
+                    Box::new(crate::providers::openai::OpenAi::new("test".into())),
+                )
+                .register(
+                    "local",
+                    Box::new(
+                        crate::providers::openai_compat::OpenAiCompatible::new(
+                            "local",
+                            "http://127.0.0.1:9",
+                            None,
+                        )
+                        .with_wire(wire),
+                    ),
+                );
+            let request: ChatRequest = serde_json::from_value(json!({
+                "model":"openai/gpt-5.6-luna",
+                "messages":[{"role":"user","content":"canonical"}],
+                "provider_config":{"x-local":{(protected_field):"replacement"}}
+            }))
+            .unwrap();
+            let prepared = prepare_request(&router, &request).unwrap();
+            let error = validate_resolvable_fallbacks(
+                &router,
+                &prepared.payload,
+                &["local/declared".into()],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(&format!("x-local.{protected_field}")));
+        }
+    }
 }
 
 /// Release date as a Unix timestamp. The OpenAI list shape types `created` as
 /// an integer, so an undated model reports `0` rather than a null.
 fn released_at(id: &str) -> i64 {
-    crate::catalog::resolve(id)
+    crate::catalog::lookup_id(id)
         .and_then(|info| info.release_date)
         .and_then(|date| date.and_hms_opt(0, 0, 0))
         .map(|at| at.and_utc().timestamp())

@@ -401,6 +401,15 @@ impl Provider for Gemini {
         "gemini"
     }
 
+    fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
+        crate::provider::RequestAdmissionPolicy::namespaced(
+            "x-gemini",
+            &["contents"],
+            &["systemInstruction", "tools", "toolConfig", "thinkingConfig"],
+            &[],
+        )
+    }
+
     fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
         crate::reasoning::ReplayTarget::new(
             self.name(),
@@ -411,7 +420,8 @@ impl Provider for Gemini {
     }
 
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
-        let request = crate::schema::prepare_request(request);
+        let mut schema_budget = crate::schema::RequestBudget::new();
+        let request = crate::schema::prepare_request(request, &mut schema_budget)?;
         let request = crate::cache::prepare_request(
             &request,
             crate::reasoning::WireFormat::GoogleGenerateContent,
@@ -561,12 +571,17 @@ impl Provider for Gemini {
         }
 
         crate::toolcall::validate_native(&body, &self.replay_target(model))?;
-        crate::schema::normalize_native_tools(crate::schema::Target::Google, &mut body);
+        crate::schema::normalize_native_tools(
+            crate::schema::Target::Google,
+            &mut body,
+            &mut schema_budget,
+        )?;
         crate::shim::native_format(
             &request,
             crate::reasoning::WireFormat::GoogleGenerateContent,
             &mut body,
-        );
+            &mut schema_budget,
+        )?;
         crate::cache::finish_request(
             &request,
             &mut body,

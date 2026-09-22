@@ -43,7 +43,7 @@ Both chat endpoints accept the same body:
 | `messages` | array, required | Full conversation history |
 | `stream` | boolean | On `/v1/chat`, switch the response from JSON to typed SSE; default `false` |
 | `config` | object | Portable generation controls |
-| `provider_config` | object | Fields merged into the engine request, including tools and `x-*` namespaces |
+| `provider_config` | object | Non-reserved fields merged into the engine request, including tools and `x-*` namespaces |
 | `fallback` | string array | Ordered backup models for non-streaming requests only |
 | `response_format` | object | Validated JSON output contract |
 | `x-shim` | object | Capability path selection |
@@ -74,6 +74,14 @@ are dropped.
 `provider_config` is merged as top-level engine fields. For example, tools go
 at `provider_config.tools`, while an OpenAI-native override goes at
 `provider_config["x-openai"]`. See the [request field map](../reference/request-fields.md).
+The typed `model` and `messages` fields remain authoritative: passthrough
+configuration cannot replace them through the selected provider's native
+model or main messages/input/contents container. Native system or instruction
+controls remain supported and are estimated when active. Validation happens
+after named-route defaults and aliases are resolved and covers every
+resolvable explicit fallback before the primary request runs. Another
+provider's namespace is inert only when no primary, fallback, or route can
+select that provider.
 
 Fallback first retries an eligible failure on the current route, then moves
 through the listed routes. It is ignored by both streaming paths. See
@@ -105,6 +113,23 @@ through the listed routes. It is ignored by both streaming paths. See
 `message.tool_calls` appears when the model requests tools. `reasoning` appears
 when the provider returns reasoning text. `reasoning_tokens` is omitted when
 zero; the other usage fields are always present.
+
+## Idempotency replay retention
+
+For completed unary gateway requests, an idempotency key enables a process-local
+replay only when its tenant, credential, route, and canonical request match. This is
+best-effort replay: the local cache has shared limits for entry count, retained
+response footprint, and JSON complexity across the current scoped API and its
+deprecated generic compatibility API. An entry that exceeds those limits, or a
+new entry when live retained entries already fill them, is not stored. A TTL is
+an upper bound on replay availability, and some responses are never retained.
+Clients must therefore tolerate a fresh execution and must not treat this as an
+exactly-once guarantee.
+
+These local limits use a conservative in-process footprint estimate, not an RSS
+measurement. They do not bound Redis-backed idempotency retention in a
+distributed deployment, which remains TTL-based, or temporary upstream response
+buffering before a response reaches the local cache.
 
 ## Streaming response
 

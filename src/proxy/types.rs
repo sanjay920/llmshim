@@ -21,7 +21,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub config: Option<Config>,
 
-    /// Raw provider-specific JSON, merged into the underlying request
+    /// Provider-specific JSON merged into the underlying request. Routing and
+    /// canonical prompt fields remain authoritative in this typed envelope.
     #[serde(default)]
     pub provider_config: Option<Value>,
 

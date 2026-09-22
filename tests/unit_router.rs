@@ -318,6 +318,27 @@ fn router_resolves_catalog_spellings_without_rerouting_reseller_models() {
     assert_eq!(name, "anthropic/claude-haiku-4.5");
 }
 
+#[test]
+fn router_resolve_keeps_an_openrouter_variant_suffix_on_the_wire_model() {
+    // MOH-240 guard: the catalog carries a row for the base id
+    // (`deepseek/deepseek-v4.1-flash`), which is exactly the case that could
+    // tempt `resolve_key` into a catalog hit that replaces the returned
+    // model with the catalog's un-suffixed spelling. It must not — the
+    // suffix has to survive as the model `resolve` hands back, since that's
+    // what goes straight onto the wire.
+    let router = Router::new().register(
+        "openrouter",
+        Box::new(llmshim::providers::openrouter::OpenRouter::new(
+            "test".into(),
+        )),
+    );
+    let (p, name) = router
+        .resolve("openrouter/deepseek/deepseek-v4.1-flash:nitro")
+        .unwrap();
+    assert_eq!(p.name(), "openrouter");
+    assert_eq!(name, "deepseek/deepseek-v4.1-flash:nitro");
+}
+
 // ============================================================
 // Named routes
 // ============================================================

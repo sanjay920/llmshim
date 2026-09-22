@@ -20,6 +20,8 @@
 //! The token-bucket math is factored into a small pure [`TokenBucket`] type so
 //! it can be unit-tested deterministically with `tokio::time` paused.
 
+#[cfg(any(feature = "gateway", test))]
+use super::convert::{active_native_namespace, AdmissionTarget, PreparedRequest};
 use super::types::ChatRequest;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -414,50 +416,124 @@ mod redis_impl {
     use redis::aio::ConnectionManager;
     use tokio::sync::OnceCell;
 
-    /// Atomic token-bucket step in a single round-trip. Stores `tokens`, last
-    /// refill `ts` (ms) and a `penalty` deadline (ms) in one hash. Returns
-    /// `{allowed, wait_ms}`.
-    const BUCKET_LUA: &str = r#"
-        local cap    = tonumber(ARGV[1])
-        local refill = tonumber(ARGV[2])
-        local now    = tonumber(ARGV[3])
-        local want   = tonumber(ARGV[4])
-        local ttl    = tonumber(ARGV[5])
+    /// Atomically checks the configured RPM and TPM buckets in one Redis Lua
+    /// invocation. Each bucket stores `tokens`, last refill `ts` (ms), and a
+    /// `penalty` deadline (ms). Returns `{request_admitted, retry_after_ms}`.
+    const RATE_LIMIT_LUA: &str = r#"
+        local current_timestamp_ms = tonumber(ARGV[1])
+        local key_ttl_ms = tonumber(ARGV[2])
 
-        local h = redis.call('HMGET', KEYS[1], 'tokens', 'ts', 'penalty')
-        local tokens = tonumber(h[1])
-        local ts = tonumber(h[2])
-        local penalty = tonumber(h[3]) or 0
-        if tokens == nil then tokens = cap end
-        if ts == nil then ts = now end
+        local rpm_enabled = tonumber(ARGV[3]) == 1
+        local rpm_capacity = tonumber(ARGV[4])
+        local rpm_refill_per_second = tonumber(ARGV[5])
+        local rpm_required_tokens = tonumber(ARGV[6])
 
-        local elapsed = now - ts
-        if elapsed < 0 then elapsed = 0 end
-        tokens = math.min(cap, tokens + (elapsed / 1000.0) * refill)
-        ts = now
+        local tpm_enabled = tonumber(ARGV[7]) == 1
+        local tpm_capacity = tonumber(ARGV[8])
+        local tpm_refill_per_second = tonumber(ARGV[9])
+        local tpm_required_tokens = tonumber(ARGV[10])
 
-        local allowed = 0
-        local wait = 0
-        if penalty > now then
-            wait = penalty - now
-        elseif tokens >= want then
-            tokens = tokens - want
-            allowed = 1
-        else
-            local deficit = want - tokens
-            wait = math.ceil(deficit / refill * 1000.0)
+        local function load_bucket(bucket_key, capacity, refill_per_second)
+            local stored_bucket_values = redis.call('HMGET', bucket_key, 'tokens', 'ts', 'penalty')
+            local token_balance = tonumber(stored_bucket_values[1])
+            local last_refill_timestamp_ms = tonumber(stored_bucket_values[2])
+            local penalty_deadline_ms = tonumber(stored_bucket_values[3]) or 0
+            if token_balance == nil then token_balance = capacity end
+            if last_refill_timestamp_ms == nil then last_refill_timestamp_ms = current_timestamp_ms end
+
+            local elapsed_ms = current_timestamp_ms - last_refill_timestamp_ms
+            if elapsed_ms < 0 then elapsed_ms = 0 end
+            token_balance = math.min(
+                capacity,
+                token_balance + (elapsed_ms / 1000.0) * refill_per_second
+            )
+            return token_balance, current_timestamp_ms, penalty_deadline_ms
         end
 
-        redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', ts, 'penalty', penalty)
-        redis.call('PEXPIRE', KEYS[1], ttl)
-        return {allowed, wait}
+        local function retry_after_ms(token_balance, penalty_deadline_ms, refill_per_second, required_tokens)
+            if penalty_deadline_ms > current_timestamp_ms then
+                return penalty_deadline_ms - current_timestamp_ms
+            end
+            if token_balance >= required_tokens then
+                return nil
+            end
+            return math.ceil((required_tokens - token_balance) / refill_per_second * 1000.0)
+        end
+
+        local rpm_token_balance, rpm_last_refill_timestamp_ms, rpm_penalty_deadline_ms
+        if rpm_enabled then
+            rpm_token_balance, rpm_last_refill_timestamp_ms, rpm_penalty_deadline_ms = load_bucket(
+                KEYS[1], rpm_capacity, rpm_refill_per_second
+            )
+        end
+
+        local tpm_token_balance, tpm_last_refill_timestamp_ms, tpm_penalty_deadline_ms
+        if tpm_enabled then
+            tpm_token_balance, tpm_last_refill_timestamp_ms, tpm_penalty_deadline_ms = load_bucket(
+                KEYS[2], tpm_capacity, tpm_refill_per_second
+            )
+        end
+
+        local request_admitted = 1
+        local maximum_retry_after_ms = 0
+        if rpm_enabled then
+            local rpm_retry_after_ms = retry_after_ms(
+                rpm_token_balance,
+                rpm_penalty_deadline_ms,
+                rpm_refill_per_second,
+                rpm_required_tokens
+            )
+            if rpm_retry_after_ms ~= nil then
+                request_admitted = 0
+                maximum_retry_after_ms = math.max(maximum_retry_after_ms, rpm_retry_after_ms)
+            end
+        end
+        if tpm_enabled then
+            local tpm_retry_after_ms = retry_after_ms(
+                tpm_token_balance,
+                tpm_penalty_deadline_ms,
+                tpm_refill_per_second,
+                tpm_required_tokens
+            )
+            if tpm_retry_after_ms ~= nil then
+                request_admitted = 0
+                maximum_retry_after_ms = math.max(maximum_retry_after_ms, tpm_retry_after_ms)
+            end
+        end
+
+        if request_admitted == 1 then
+            if rpm_enabled then rpm_token_balance = rpm_token_balance - rpm_required_tokens end
+            if tpm_enabled then tpm_token_balance = tpm_token_balance - tpm_required_tokens end
+        end
+
+        if rpm_enabled then
+            redis.call(
+                'HSET',
+                KEYS[1],
+                'tokens', rpm_token_balance,
+                'ts', rpm_last_refill_timestamp_ms,
+                'penalty', rpm_penalty_deadline_ms
+            )
+            redis.call('PEXPIRE', KEYS[1], key_ttl_ms)
+        end
+        if tpm_enabled then
+            redis.call(
+                'HSET',
+                KEYS[2],
+                'tokens', tpm_token_balance,
+                'ts', tpm_last_refill_timestamp_ms,
+                'penalty', tpm_penalty_deadline_ms
+            )
+            redis.call('PEXPIRE', KEYS[2], key_ttl_ms)
+        end
+        return {request_admitted, maximum_retry_after_ms}
     "#;
 
     const PENALTY_LUA: &str = r#"
-        local until_ms = tonumber(ARGV[1])
-        local ttl = tonumber(ARGV[2])
-        redis.call('HSET', KEYS[1], 'penalty', until_ms, 'tokens', 0)
-        redis.call('PEXPIRE', KEYS[1], ttl)
+        local penalty_deadline_ms = tonumber(ARGV[1])
+        local key_ttl_ms = tonumber(ARGV[2])
+        redis.call('HSET', KEYS[1], 'penalty', penalty_deadline_ms, 'tokens', 0)
+        redis.call('PEXPIRE', KEYS[1], key_ttl_ms)
         return 1
     "#;
 
@@ -473,9 +549,9 @@ mod redis_impl {
     /// [`crate::client`] still protects against provider 429s.
     pub struct RedisRateLimiter {
         client: redis::Client,
-        conn: OnceCell<ConnectionManager>,
+        connection_manager: OnceCell<ConnectionManager>,
         config: RateLimitConfig,
-        bucket_script: redis::Script,
+        rate_limit_script: redis::Script,
         penalty_script: redis::Script,
     }
 
@@ -486,54 +562,65 @@ mod redis_impl {
         pub fn new(url: &str, config: RateLimitConfig) -> redis::RedisResult<Self> {
             Ok(Self {
                 client: redis::Client::open(url)?,
-                conn: OnceCell::new(),
+                connection_manager: OnceCell::new(),
                 config,
-                bucket_script: redis::Script::new(BUCKET_LUA),
+                rate_limit_script: redis::Script::new(RATE_LIMIT_LUA),
                 penalty_script: redis::Script::new(PENALTY_LUA),
             })
         }
 
         async fn connection(&self) -> redis::RedisResult<ConnectionManager> {
-            self.conn
+            self.connection_manager
                 .get_or_try_init(|| ConnectionManager::new(self.client.clone()))
                 .await
                 .cloned()
         }
 
-        fn redis_key(kind: &str, key: &RateKey) -> String {
-            format!("llmshim:rl:{}:{}", key.as_str(), kind)
+        fn redis_key(bucket_dimension: &str, rate_key: &RateKey) -> String {
+            format!("llmshim:rl:{}:{}", rate_key.as_str(), bucket_dimension)
         }
 
-        /// Run the bucket script for one dimension. `Ok(None)` = admitted,
-        /// `Ok(Some(wait))` = denied, `Err` = redis error (caller fails open).
-        async fn step(
+        /// Atomically check and debit the configured RPM and TPM dimensions.
+        /// `Ok(None)` = admitted, `Ok(Some(wait))` = denied, `Err` = Redis
+        /// failure (the caller preserves the documented fail-open behavior).
+        async fn check_and_debit(
             &self,
-            conn: &mut ConnectionManager,
-            kind: &str,
-            key: &RateKey,
-            per_minute: u32,
-            want: f64,
+            connection: &mut ConnectionManager,
+            rate_key: &RateKey,
+            rpm: Option<u32>,
+            tpm: Option<u32>,
+            tpm_permits: u32,
         ) -> redis::RedisResult<Option<Duration>> {
-            if per_minute == 0 {
-                return Ok(Some(ZERO_LIMIT_RETRY_AFTER));
-            }
-            let cap = (per_minute as f64).max(1.0);
-            let refill = (per_minute as f64 / 60.0).max(f64::MIN_POSITIVE);
-            let now_ms = now_ms();
-            let (allowed, wait_ms): (i64, i64) = self
-                .bucket_script
-                .key(Self::redis_key(kind, key))
-                .arg(cap)
-                .arg(refill)
-                .arg(now_ms)
-                .arg(want)
+            let rpm_enabled = if rpm.is_some() { 1 } else { 0 };
+            let rpm_per_minute = rpm.unwrap_or(0) as f64;
+            let rpm_capacity = rpm_per_minute.max(1.0);
+            let rpm_refill_per_second = (rpm_per_minute / 60.0).max(f64::MIN_POSITIVE);
+
+            let tpm_enabled = if tpm.is_some() { 1 } else { 0 };
+            let tpm_per_minute = tpm.unwrap_or(0) as f64;
+            let tpm_capacity = tpm_per_minute.max(1.0);
+            let tpm_refill_per_second = (tpm_per_minute / 60.0).max(f64::MIN_POSITIVE);
+            let current_timestamp_ms = current_timestamp_ms();
+            let (request_admitted, retry_after_ms): (i64, i64) = self
+                .rate_limit_script
+                .key(Self::redis_key("rpm", rate_key))
+                .key(Self::redis_key("tpm", rate_key))
+                .arg(current_timestamp_ms)
                 .arg(KEY_TTL_MS)
-                .invoke_async(conn)
+                .arg(rpm_enabled)
+                .arg(rpm_capacity)
+                .arg(rpm_refill_per_second)
+                .arg(1.0)
+                .arg(tpm_enabled)
+                .arg(tpm_capacity)
+                .arg(tpm_refill_per_second)
+                .arg(tpm_permits.max(1) as f64)
+                .invoke_async(connection)
                 .await?;
-            if allowed == 1 {
+            if request_admitted == 1 {
                 Ok(None)
             } else {
-                Ok(Some(Duration::from_millis(wait_ms.max(0) as u64)))
+                Ok(Some(Duration::from_millis(retry_after_ms.max(0) as u64)))
             }
         }
     }
@@ -548,7 +635,7 @@ mod redis_impl {
             if limit.has_zero_limit() {
                 return Err(RetryAfter(ZERO_LIMIT_RETRY_AFTER));
             }
-            let mut conn = match self.connection().await {
+            let mut connection = match self.connection().await {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("warning: redis rate limiter unavailable ({e}); failing open");
@@ -556,32 +643,16 @@ mod redis_impl {
                 }
             };
 
-            let mut wait: Option<Duration> = None;
-            if let Some(rpm) = limit.rpm {
-                match self.step(&mut conn, "rpm", key, rpm, 1.0).await {
-                    Ok(Some(w)) => wait = Some(wait.map_or(w, |c| c.max(w))),
-                    Ok(None) => {}
-                    Err(e) => {
-                        eprintln!("warning: redis rpm check failed ({e}); failing open");
-                        return Ok(());
-                    }
+            match self
+                .check_and_debit(&mut connection, key, limit.rpm, limit.tpm, permits)
+                .await
+            {
+                Ok(Some(wait)) => Err(RetryAfter(wait)),
+                Ok(None) => Ok(()),
+                Err(error) => {
+                    eprintln!("warning: redis rate-limit check failed ({error}); failing open");
+                    Ok(())
                 }
-            }
-            if let Some(tpm) = limit.tpm {
-                let want = (permits.max(1)) as f64;
-                match self.step(&mut conn, "tpm", key, tpm, want).await {
-                    Ok(Some(w)) => wait = Some(wait.map_or(w, |c| c.max(w))),
-                    Ok(None) => {}
-                    Err(e) => {
-                        eprintln!("warning: redis tpm check failed ({e}); failing open");
-                        return Ok(());
-                    }
-                }
-            }
-
-            match wait {
-                Some(w) => Err(RetryAfter(w)),
-                None => Ok(()),
             }
         }
 
@@ -590,27 +661,27 @@ mod redis_impl {
             if limit.is_unlimited() || limit.has_zero_limit() {
                 return;
             }
-            let mut conn = match self.connection().await {
+            let mut connection = match self.connection().await {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("warning: redis penalize skipped, connection failed ({e})");
                     return;
                 }
             };
-            let until = now_ms() + retry_after.as_millis() as u64;
-            for kind in ["rpm", "tpm"] {
+            let penalty_deadline_ms = current_timestamp_ms() + retry_after.as_millis() as u64;
+            for bucket_dimension in ["rpm", "tpm"] {
                 let _: Result<i64, _> = self
                     .penalty_script
-                    .key(Self::redis_key(kind, key))
-                    .arg(until)
+                    .key(Self::redis_key(bucket_dimension, key))
+                    .arg(penalty_deadline_ms)
                     .arg(KEY_TTL_MS)
-                    .invoke_async(&mut conn)
+                    .invoke_async(&mut connection)
                     .await;
             }
         }
     }
 
-    fn now_ms() -> u64 {
+    fn current_timestamp_ms() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -682,53 +753,314 @@ impl Backpressure {
 // Token estimation & limiter construction
 // ===========================================================================
 
-/// Rough token footprint of a request, for the TPM bucket. Not exact — a
-/// conservative-ish `chars / 4` over message content plus the requested (or
-/// default) output budget. Errs toward over-counting so we protect the limit.
+/// Target-independent token estimate for callers that only have the typed
+/// proxy envelope. HTTP admission uses the route-expanded, provider-aware
+/// estimator internally.
 pub fn estimate_request_tokens(req: &ChatRequest) -> u32 {
-    let mut input_chars = 0usize;
-    for m in &req.messages {
-        input_chars += m.role.len();
-        input_chars += content_len(&m.content);
-        if let Some(tc) = &m.tool_calls {
-            input_chars += tc.to_string().len();
-        }
+    let mut input_chars = serde_json::to_string(&req.messages)
+        .map(|messages| messages.len())
+        .unwrap_or(0);
+    for prompt_bearing_value in [req.provider_config.as_ref(), req.response_format.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        input_chars = input_chars.saturating_add(prompt_bearing_value.to_string().len());
     }
-    let input_tokens = (input_chars / 4) as u64;
-    let output_tokens = req
+    let input_tokens = u64::try_from(input_chars / 4).unwrap_or(u64::MAX);
+    let configured_output_tokens = req.config.as_ref().and_then(|config| config.max_tokens);
+    let provider_output_tokens = req
         .provider_config
         .as_ref()
-        .and_then(|config| {
-            config
-                .get("max_tokens")
-                .or_else(|| config.get("max_completion_tokens"))
-        })
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| req.config.as_ref().and_then(|c| c.max_tokens))
+        .and_then(largest_provider_output_budget);
+    let output_tokens = configured_output_tokens
+        .into_iter()
+        .chain(provider_output_tokens)
+        .max()
         .unwrap_or(DEFAULT_MAX_TOKENS_ESTIMATE);
     input_tokens
         .saturating_add(output_tokens)
         .clamp(1, u32::MAX as u64) as u32
 }
 
-/// Character length of a message `content` field, which may be a plain string
-/// or an array of content blocks.
-fn content_len(content: &serde_json::Value) -> usize {
-    match content {
-        serde_json::Value::String(s) => s.len(),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .map(|it| {
-                it.get("text")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.len())
-                    // Non-text blocks (images, etc.): count serialized size.
-                    .unwrap_or_else(|| it.to_string().len())
-            })
-            .sum(),
-        serde_json::Value::Null => 0,
-        other => other.to_string().len(),
+#[cfg(any(feature = "gateway", test))]
+pub(crate) fn estimate_prepared_request_tokens(prepared: &PreparedRequest) -> u32 {
+    let mut prompt_characters = 0usize;
+    for field in ["messages", "tools", "response_format", "x-shim"] {
+        if let Some(value) = prepared.payload.get(field) {
+            prompt_characters = prompt_characters.saturating_add(value.to_string().len());
+        }
     }
+    if prepared.target.provider_name == "anthropic" {
+        if let Some(output_configuration) = prepared.payload.get("output_config") {
+            prompt_characters =
+                prompt_characters.saturating_add(output_configuration.to_string().len());
+        }
+    }
+    prompt_characters = prompt_characters.saturating_add(active_native_prompt_characters(prepared));
+    let estimated_input_tokens = u64::try_from(prompt_characters / 4).unwrap_or(u64::MAX);
+    let estimated_output_tokens = effective_output_budget(prepared);
+    estimated_input_tokens
+        .saturating_add(estimated_output_tokens)
+        .clamp(1, u32::MAX as u64) as u32
+}
+
+/// Estimate the final immutable provider-native body seen by the per-attempt
+/// policy hook. This is deliberately separate from logical-request admission:
+/// retries reuse the same prepared body, while repairs and fallback targets
+/// arrive here with their own authoritative wire body and target.
+pub(crate) fn estimate_attempt_tokens(attempt: &crate::policy::PreparedAttempt<'_>) -> u32 {
+    estimate_native_attempt_tokens(
+        attempt.identity().provider_name(),
+        attempt.identity().native_model(),
+        attempt.identity().wire(),
+        attempt.native_body(),
+    )
+}
+
+fn estimate_native_attempt_tokens(
+    provider: &str,
+    model: &str,
+    wire: crate::reasoning::WireFormat,
+    native_body: &serde_json::Value,
+) -> u32 {
+    let prompt_tokens = serde_json::to_string(native_body)
+        .map(|serialized| serialized.len() as u64 / 4)
+        .unwrap_or(u64::MAX);
+    let explicit_output = match wire {
+        crate::reasoning::WireFormat::AnthropicMessages => native_body
+            .get("max_tokens")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::OpenAiResponses => native_body
+            .get("max_output_tokens")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::OpenAiChat => native_body
+            .get("max_completion_tokens")
+            .or_else(|| native_body.get("max_tokens"))
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::GoogleGenerateContent => native_body
+            .pointer("/generationConfig/maxOutputTokens")
+            .and_then(|value| value.as_u64()),
+    };
+    let reasoning_output = match wire {
+        crate::reasoning::WireFormat::AnthropicMessages => native_body
+            .pointer("/thinking/budget_tokens")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::GoogleGenerateContent => native_body
+            .pointer("/generationConfig/thinkingConfig/thinkingBudget")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::OpenAiResponses
+        | crate::reasoning::WireFormat::OpenAiChat => native_body
+            .pointer("/reasoning/max_tokens")
+            .and_then(|value| value.as_u64()),
+    }
+    .unwrap_or_default();
+    let default_output = omitted_native_output_budget(provider, model, native_body);
+    prompt_tokens
+        .saturating_add(
+            explicit_output
+                .unwrap_or(default_output)
+                .max(reasoning_output),
+        )
+        .clamp(1, u32::MAX as u64) as u32
+}
+
+fn catalog_output_budget(provider: &str, model: &str) -> Option<u64> {
+    crate::catalog::lookup_id(&format!("{provider}/{model}"))
+        .or_else(|| crate::catalog::lookup_id(model))
+        .and_then(|model| model.max_output_tokens)
+        .map(u64::from)
+}
+
+fn omitted_native_output_budget(
+    provider: &str,
+    model: &str,
+    native_body: &serde_json::Value,
+) -> u64 {
+    let primary_budget = catalog_output_budget(provider, model).unwrap_or(match provider {
+        "anthropic" => 8_192,
+        "gemini" => 65_536,
+        "openai" | "chatgpt" | "xai" => 128_000,
+        "openrouter" => 1_048_576,
+        _ => 1_024,
+    });
+    if provider != "openrouter" {
+        return primary_budget;
+    }
+    native_body
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|routed_model| catalog_output_budget("openrouter", routed_model).unwrap_or(1_048_576))
+        .fold(primary_budget, u64::max)
+}
+
+#[cfg(any(feature = "gateway", test))]
+fn active_native_prompt_characters(prepared: &PreparedRequest) -> usize {
+    let Some(active_namespace) = active_native_namespace(&prepared.target) else {
+        return 0;
+    };
+    let Some(native_configuration) = prepared
+        .payload
+        .get(active_namespace)
+        .and_then(serde_json::Value::as_object)
+    else {
+        return 0;
+    };
+    prepared
+        .target
+        .policy
+        .native_prompt_fields()
+        .iter()
+        .fold(0usize, |total, field| {
+            total.saturating_add(
+                native_configuration
+                    .get(*field)
+                    .map(|value| value.to_string().len())
+                    .unwrap_or_default(),
+            )
+        })
+}
+
+#[cfg(any(feature = "gateway", test))]
+fn portable_output_budget(request: &serde_json::Value) -> Option<u64> {
+    request
+        .get("max_tokens")
+        .or_else(|| request.get("max_completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+}
+
+#[cfg(any(feature = "gateway", test))]
+fn native_u64(request: &serde_json::Value, namespace: &str, path: &[&str]) -> Option<u64> {
+    let mut value = request.get(namespace)?;
+    for field in path {
+        value = value.get(*field)?;
+    }
+    value.as_u64()
+}
+
+#[cfg(any(feature = "gateway", test))]
+fn native_direct_output_budget(
+    request: &serde_json::Value,
+    target: &AdmissionTarget,
+) -> Option<u64> {
+    let namespace = active_native_namespace(target)?;
+    target
+        .policy
+        .native_output_limit_fields()
+        .iter()
+        .filter_map(|field| native_u64(request, namespace, &[*field]))
+        .max()
+}
+
+#[cfg(any(feature = "gateway", test))]
+fn reasoning_output_budget(request: &serde_json::Value, target: &AdmissionTarget) -> Option<u64> {
+    let namespace = active_native_namespace(target)?;
+    match target.provider_name.as_str() {
+        "openrouter" | "chatgpt" => native_u64(request, namespace, &["reasoning", "max_tokens"]),
+        "anthropic" => {
+            if request
+                .get(namespace)
+                .and_then(|configuration| configuration.get("thinking"))
+                .is_some()
+            {
+                native_u64(request, namespace, &["thinking", "budget_tokens"])
+            } else {
+                request
+                    .pointer("/thinking/budget_tokens")
+                    .and_then(serde_json::Value::as_u64)
+            }
+        }
+        "gemini" => native_u64(request, namespace, &["thinkingConfig", "thinkingBudget"]),
+        _ => None,
+    }
+}
+
+#[cfg(any(feature = "gateway", test))]
+fn omitted_output_budget(target: &AdmissionTarget) -> u64 {
+    if target.provider_name == "anthropic" {
+        return 8_192;
+    }
+    crate::catalog::resolve(&format!("{}/{}", target.provider_name, target.model))
+        .or_else(|| crate::catalog::resolve(&target.model))
+        .and_then(|model| model.max_output_tokens)
+        .map(u64::from)
+        .unwrap_or_else(|| match target.provider_name.as_str() {
+            "openai" | "chatgpt" | "xai" => 128_000,
+            "gemini" => 65_536,
+            "openrouter" => 1_048_576,
+            _ => DEFAULT_MAX_TOKENS_ESTIMATE,
+        })
+}
+
+#[cfg(any(feature = "gateway", test))]
+fn omitted_prepared_output_budget(prepared: &PreparedRequest) -> u64 {
+    let primary_budget = omitted_output_budget(&prepared.target);
+    if prepared.target.provider_name != "openrouter" {
+        return primary_budget;
+    }
+    prepared
+        .payload
+        .pointer("/x-openrouter/models")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|model| {
+            crate::catalog::resolve(&format!("openrouter/{model}"))
+                .or_else(|| crate::catalog::resolve(model))
+                .and_then(|model| model.max_output_tokens)
+                .map(u64::from)
+                .unwrap_or(1_048_576)
+        })
+        .fold(primary_budget, u64::max)
+}
+
+#[cfg(any(feature = "gateway", test))]
+fn effective_output_budget(prepared: &PreparedRequest) -> u64 {
+    let requested_output_budget = if prepared.target.provider_name == "chatgpt" {
+        None
+    } else {
+        native_direct_output_budget(&prepared.payload, &prepared.target)
+            .or_else(|| portable_output_budget(&prepared.payload))
+    }
+    .unwrap_or_else(|| omitted_prepared_output_budget(prepared));
+    requested_output_budget
+        .max(reasoning_output_budget(&prepared.payload, &prepared.target).unwrap_or_default())
+}
+
+fn direct_output_budget(config: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    [
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "maxOutputTokens",
+    ]
+    .into_iter()
+    .filter_map(|field| config.get(field).and_then(serde_json::Value::as_u64))
+    .max()
+}
+
+fn largest_provider_output_budget(provider_config: &serde_json::Value) -> Option<u64> {
+    let provider_config = provider_config.as_object()?;
+    let mut largest_budget = direct_output_budget(provider_config);
+    for (field, native_config) in provider_config {
+        if !field.starts_with("x-") {
+            continue;
+        }
+        let Some(native_config) = native_config.as_object() else {
+            continue;
+        };
+        largest_budget = largest_budget.max(direct_output_budget(native_config));
+        if let Some(generation_config) = native_config
+            .get("generationConfig")
+            .and_then(serde_json::Value::as_object)
+        {
+            largest_budget = largest_budget.max(direct_output_budget(generation_config));
+        }
+    }
+    largest_budget
 }
 
 /// Build the configured limiter from the environment.
@@ -1093,6 +1425,38 @@ mod tests {
         assert!(limiter.acquire(&anthropic, 1).await.is_ok()); // anthropic independent
     }
 
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires an isolated Redis at LLMSHIM_REDIS_URL"]
+    async fn redis_oversized_tpm_rejection_does_not_debit_rpm() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL")
+            .expect("the ignored integration test requires LLMSHIM_REDIS_URL");
+        let unique_provider = format!(
+            "atomic-rate-debits-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        );
+        let limiter =
+            RedisRateLimiter::new(&redis_url, RateLimitConfig::with_global(Some(1), Some(10)))
+                .expect("valid Redis URL");
+        let key = RateKey::provider(unique_provider);
+
+        assert!(
+            limiter.acquire(&key, 11).await.is_err(),
+            "request exceeding TPM must be rejected"
+        );
+        assert!(
+            limiter.acquire(&key, 1).await.is_ok(),
+            "rejected oversized work must not consume shared RPM capacity"
+        );
+        assert!(
+            limiter.acquire(&key, 1).await.is_err(),
+            "the admitted request consumes the configured RPM capacity"
+        );
+    }
+
     // --- Backpressure: concurrency cap + queue timeout ----------------------
 
     #[tokio::test(start_paused = true)]
@@ -1170,6 +1534,406 @@ mod tests {
         .unwrap();
         // Should not panic and should include output budget.
         assert!(estimate_request_tokens(&req) >= 10);
+    }
+
+    #[test]
+    fn estimate_counts_tool_schemas_and_namespaced_output_limits() {
+        let large_description = "x".repeat(8_000);
+        let req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+            "config": {"max_tokens": 10},
+            "provider_config": {
+                "tools": [{"type": "function", "function": {
+                    "name": "lookup",
+                    "description": large_description,
+                    "parameters": {"type": "object", "properties": {}}
+                }}],
+                "x-openai": {"max_output_tokens": 4_000}
+            }
+        }))
+        .unwrap();
+        assert!(
+            estimate_request_tokens(&req) >= 6_000,
+            "the native output limit and serialized tool schema must both consume permits"
+        );
+    }
+
+    #[test]
+    fn estimate_counts_namespaced_native_prompt_content() {
+        let native_input = "x".repeat(8_000);
+        let req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider_config": {"x-openai": {"input": native_input}}
+        }))
+        .unwrap();
+        assert!(estimate_request_tokens(&req) >= 3_000);
+    }
+
+    fn prepared_request(
+        provider_name: &str,
+        model: &str,
+        wire: crate::reasoning::WireFormat,
+        payload: serde_json::Value,
+    ) -> PreparedRequest {
+        let policy = match provider_name {
+            "openai" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-openai",
+                &["model", "input"],
+                &["instructions", "prompt", "text", "tools", "tool_choice"],
+                &["max_output_tokens"],
+            ),
+            "chatgpt" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-chatgpt",
+                &["input"],
+                &["instructions", "text", "tools", "tool_choice", "reasoning"],
+                &[],
+            ),
+            "anthropic" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-anthropic",
+                &["model", "messages"],
+                &[
+                    "system",
+                    "tools",
+                    "tool_choice",
+                    "thinking",
+                    "output_config",
+                ],
+                &["max_tokens"],
+            ),
+            "gemini" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-gemini",
+                &["contents"],
+                &["systemInstruction", "tools", "toolConfig", "thinkingConfig"],
+                &[],
+            ),
+            "openrouter" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-openrouter",
+                &["model", "messages"],
+                &["tools", "tool_choice", "response_format", "reasoning"],
+                &["max_tokens", "max_completion_tokens"],
+            ),
+            "vllm" | "sglang" => match wire {
+                crate::reasoning::WireFormat::OpenAiResponses => {
+                    crate::provider::RequestAdmissionPolicy::namespaced(
+                        format!("x-{provider_name}"),
+                        &["model", "input"],
+                        &["instructions", "tools", "tool_choice"],
+                        &["max_output_tokens"],
+                    )
+                }
+                _ => crate::provider::RequestAdmissionPolicy::namespaced(
+                    format!("x-{provider_name}"),
+                    &["model", "messages"],
+                    &["tools", "tool_choice", "response_format"],
+                    &["max_tokens", "max_completion_tokens"],
+                ),
+            },
+            _ => crate::provider::RequestAdmissionPolicy::default(),
+        };
+        PreparedRequest {
+            payload,
+            target: AdmissionTarget {
+                provider_name: provider_name.into(),
+                model: model.into(),
+                policy,
+            },
+        }
+    }
+
+    #[test]
+    fn prepared_estimate_uses_provider_defaults_and_nested_reasoning_budgets() {
+        let anthropic = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({"model":"anthropic/claude-sonnet-5","messages":[]}),
+        );
+        assert_eq!(effective_output_budget(&anthropic), 8_192);
+
+        let openrouter = prepared_request(
+            "openrouter",
+            "anthropic/claude-sonnet-5",
+            crate::reasoning::WireFormat::OpenAiChat,
+            serde_json::json!({
+                "model":"openrouter/anthropic/claude-sonnet-5","messages":[],
+                "max_tokens": 500,
+                "x-openrouter":{"reasoning":{"max_tokens":12_000}}
+            }),
+        );
+        assert_eq!(effective_output_budget(&openrouter), 12_000);
+        let openrouter_routing = prepared_request(
+            "openrouter",
+            "anthropic/claude-sonnet-5",
+            crate::reasoning::WireFormat::OpenAiChat,
+            serde_json::json!({
+                "model":"openrouter/anthropic/claude-sonnet-5","messages":[],
+                "x-openrouter":{"models":["unknown/provider-model"]}
+            }),
+        );
+        assert_eq!(effective_output_budget(&openrouter_routing), 1_048_576);
+
+        let anthropic_thinking = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":4_000,
+                "thinking":{"type":"enabled","budget_tokens":3_000},
+                "x-anthropic":{"thinking":{"type":"enabled","budget_tokens":6_000}}
+            }),
+        );
+        assert_eq!(effective_output_budget(&anthropic_thinking), 6_000);
+
+        let gemini = prepared_request(
+            "gemini",
+            "gemini-3.8-flash",
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+            serde_json::json!({
+                "model":"gemini/gemini-3.8-flash","messages":[],"max_tokens":1_000,
+                "x-gemini":{"thinkingConfig":{"thinkingBudget":9_000}}
+            }),
+        );
+        assert_eq!(effective_output_budget(&gemini), 9_000);
+    }
+
+    #[test]
+    fn prepared_estimate_ignores_inactive_namespaces_and_schema_property_names() {
+        let baseline = prepared_request(
+            "openai",
+            "gpt-5.6-luna",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model":"openai/gpt-5.6-luna","messages":[],"max_tokens":200,
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{
+                    "type":"object","properties":{"max_tokens":{"const":u64::MAX},"input":{"type":"string"}}
+                }}}]
+            }),
+        );
+        let with_inactive_namespace = prepared_request(
+            "openai",
+            "gpt-5.6-luna",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model":"openai/gpt-5.6-luna","messages":[],"max_tokens":200,
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{
+                    "type":"object","properties":{"max_tokens":{"const":u64::MAX},"input":{"type":"string"}}
+                }}}],
+                "x-anthropic":{"max_tokens":u64::MAX,"input":"x".repeat(8_000)},
+                "x-unknown":{"max_output_tokens":u64::MAX}
+            }),
+        );
+        assert_eq!(effective_output_budget(&baseline), 200);
+        assert_eq!(effective_output_budget(&with_inactive_namespace), 200);
+        assert_eq!(
+            estimate_prepared_request_tokens(&baseline),
+            estimate_prepared_request_tokens(&with_inactive_namespace)
+        );
+
+        let active_instructions = prepared_request(
+            "openai",
+            "gpt-5.6-luna",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model":"openai/gpt-5.6-luna","messages":[],"max_tokens":200,
+                "x-openai":{"instructions":"x".repeat(8_000)}
+            }),
+        );
+        assert!(
+            estimate_prepared_request_tokens(&active_instructions)
+                >= estimate_prepared_request_tokens(&baseline).saturating_add(1_900)
+        );
+    }
+
+    #[test]
+    fn prepared_estimate_counts_compact_anthropic_output_schemas() {
+        let baseline = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":100
+            }),
+        );
+        let root_schema = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":100,
+                "output_config":{"format":{"type":"json_schema","schema":{
+                    "type":"object","description":"x".repeat(8_000)
+                }}}
+            }),
+        );
+        let namespaced_schema = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":100,
+                "x-anthropic":{"output_config":{"format":{"type":"json_schema","schema":{
+                    "type":"object","description":"x".repeat(8_000)
+                }}}}
+            }),
+        );
+        let baseline_permits = estimate_prepared_request_tokens(&baseline);
+        assert!(
+            estimate_prepared_request_tokens(&root_schema)
+                >= baseline_permits.saturating_add(1_900)
+        );
+        assert!(
+            estimate_prepared_request_tokens(&namespaced_schema)
+                >= baseline_permits.saturating_add(1_900)
+        );
+    }
+
+    #[test]
+    fn prepared_estimate_tracks_chatgpt_and_self_hosted_wire_semantics() {
+        let openai = prepared_request(
+            "openai",
+            "gpt-5.6-luna",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({"model":"openai/gpt-5.6-luna","messages":[]}),
+        );
+        assert_eq!(effective_output_budget(&openai), 128_000);
+        let unknown_openai_target = AdmissionTarget {
+            provider_name: "openai".into(),
+            model: "gpt-unknown".into(),
+            policy: crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-openai",
+                &["model", "input"],
+                &["instructions"],
+                &["max_output_tokens"],
+            ),
+        };
+        assert_eq!(omitted_output_budget(&unknown_openai_target), 128_000);
+
+        let chatgpt = prepared_request(
+            "chatgpt",
+            "gpt-5.6-luna",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model":"chatgpt/gpt-5.6-luna","messages":[],
+                "max_tokens":1,"x-chatgpt":{"max_output_tokens":2}
+            }),
+        );
+        assert_eq!(
+            effective_output_budget(&chatgpt),
+            omitted_output_budget(&chatgpt.target)
+        );
+
+        let vllm_chat = prepared_request(
+            "vllm",
+            "served",
+            crate::reasoning::WireFormat::OpenAiChat,
+            serde_json::json!({
+                "model":"vllm/served","messages":[],"max_tokens":100,
+                "x-vllm":{"max_tokens":7_000}
+            }),
+        );
+        assert_eq!(effective_output_budget(&vllm_chat), 7_000);
+
+        let sglang_responses = prepared_request(
+            "sglang",
+            "served",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model":"sglang/served","messages":[],"max_tokens":100,
+                "x-sglang":{"max_output_tokens":8_000}
+            }),
+        );
+        assert_eq!(effective_output_budget(&sglang_responses), 8_000);
+    }
+
+    #[test]
+    fn native_attempt_estimate_uses_authoritative_wire_fields() {
+        let openai = estimate_native_attempt_tokens(
+            "openai",
+            "unknown-test-model",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            &serde_json::json!({
+                "model": "unknown-test-model",
+                "input": "short",
+                "max_output_tokens": 7_000,
+                "max_tokens": 1
+            }),
+        );
+        let anthropic = estimate_native_attempt_tokens(
+            "anthropic",
+            "unknown-test-model",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            &serde_json::json!({
+                "model": "unknown-test-model",
+                "messages": [{"role": "user", "content": "short"}],
+                "max_tokens": 2_000,
+                "thinking": {"budget_tokens": 6_000}
+            }),
+        );
+        let gemini = estimate_native_attempt_tokens(
+            "gemini",
+            "unknown-test-model",
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+            &serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "short"}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 3_000,
+                    "thinkingConfig": {"thinkingBudget": 5_000}
+                }
+            }),
+        );
+
+        assert!(openai >= 7_000);
+        assert!(anthropic >= 6_000);
+        assert!(gemini >= 5_000);
+    }
+
+    #[test]
+    fn native_openrouter_routing_uses_every_final_body_model_ceiling() {
+        let unknown_routing_body = serde_json::json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{"role": "user", "content": "short"}],
+            "models": ["anthropic/claude-sonnet-5", "vendor/unknown-model"]
+        });
+        let serialized_prompt_tokens =
+            serde_json::to_string(&unknown_routing_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "openrouter",
+                "anthropic/claude-sonnet-5",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &unknown_routing_body,
+            ),
+            serialized_prompt_tokens.saturating_add(1_048_576) as u32
+        );
+
+        let base_budget = catalog_output_budget("openrouter", "openai/gpt-oss-20b")
+            .expect("vendored OpenRouter model metadata");
+        assert_eq!(
+            catalog_output_budget("openrouter", "openai/gpt-oss-20b:nitro"),
+            Some(base_budget),
+            "known OpenRouter variants must use their base model metadata"
+        );
+
+        let explicit_limit_body = serde_json::json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [],
+            "models": ["vendor/unknown-model"],
+            "max_tokens": 4_096
+        });
+        let explicit_prompt_tokens =
+            serde_json::to_string(&explicit_limit_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "openrouter",
+                "anthropic/claude-sonnet-5",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &explicit_limit_body,
+            ),
+            explicit_prompt_tokens.saturating_add(4_096) as u32,
+            "an explicit final-body limit remains authoritative"
+        );
     }
 
     // --- Trait object dispatch ----------------------------------------------
