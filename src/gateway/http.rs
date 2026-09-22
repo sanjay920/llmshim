@@ -30,7 +30,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 use crate::error::ShimError;
 use crate::gateway::{
@@ -40,7 +40,9 @@ use crate::gateway::{
 use crate::log::{Logger, RequestTimer};
 use crate::proxy::convert::{chunk_to_events, value_to_response};
 use crate::proxy::error::ApiError;
-use crate::proxy::ratelimit::{build_limiter, estimate_prepared_request_tokens, penalty_duration};
+use crate::proxy::ratelimit::{
+    build_limiter, estimate_prepared_request_tokens, penalty_duration, Backpressure,
+};
 use crate::proxy::types::{ChatRequest, HealthResponse, ModelsResponse, StreamEvent};
 use crate::router::Router;
 
@@ -141,6 +143,15 @@ enum Backend {
     Distributed(Arc<crate::gateway::distributed::DistributedGateway>),
 }
 
+enum PreparedGatewaySubmission {
+    Local {
+        request: GatewayRequest,
+        policy_scope: crate::gateway::attempt::TrustedPolicyScope,
+    },
+    #[cfg(feature = "redis-coordination")]
+    Distributed(crate::gateway::distributed::PreparedSubmission),
+}
+
 /// Shared state for the gateway HTTP handlers.
 pub struct GatewayState {
     router: Arc<Router>,
@@ -152,6 +163,7 @@ pub struct GatewayState {
     idempotency: crate::gateway::idempotency::IdempotencyCache,
     #[cfg_attr(not(feature = "redis-coordination"), allow(dead_code))]
     idempotency_ttl_secs: u64,
+    prequeue_backpressure: Backpressure,
     /// `Retry-After` suggested when a job's queue wait times out.
     overloaded_retry_after: Duration,
 }
@@ -184,6 +196,10 @@ impl GatewayState {
                 std::time::Duration::from_secs(idem_ttl_secs()),
             ),
             idempotency_ttl_secs: idem_ttl_secs(),
+            prequeue_backpressure: Backpressure::new(
+                config.max_concurrency_per_provider,
+                config.max_wait,
+            ),
             overloaded_retry_after: config.overloaded_retry_after,
         })
     }
@@ -240,41 +256,96 @@ impl GatewayState {
                 std::time::Duration::from_secs(idem_ttl_secs()),
             ),
             idempotency_ttl_secs: idem_ttl_secs(),
+            prequeue_backpressure: Backpressure::new(
+                config.max_concurrency_per_provider,
+                config.max_wait,
+            ),
             overloaded_retry_after: config.overloaded_retry_after,
         }))
     }
 
-    async fn submit(
+    fn prepare_submission(
         &self,
         req: GatewayRequest,
         policy_scope: crate::gateway::attempt::TrustedPolicyScope,
-    ) -> Result<Value, GatewayError> {
+        stream: bool,
+    ) -> Result<PreparedGatewaySubmission, GatewayError> {
+        #[cfg(not(feature = "redis-coordination"))]
+        let _ = stream;
         match &self.backend {
-            Backend::Local(scheduler) => {
-                scheduler
-                    .submit_with_policy(req, self.attempt_coordinator.context(policy_scope))
-                    .await
-            }
+            Backend::Local(_) => Ok(PreparedGatewaySubmission::Local {
+                request: req,
+                policy_scope,
+            }),
             #[cfg(feature = "redis-coordination")]
-            Backend::Distributed(gateway) => gateway.submit_with_policy(req, policy_scope).await,
+            Backend::Distributed(gateway) => gateway
+                .prepare_with_policy(req, stream, policy_scope)
+                .map(PreparedGatewaySubmission::Distributed),
         }
     }
 
-    async fn submit_stream(
+    async fn submit_prepared(
         &self,
-        req: GatewayRequest,
-        policy_scope: crate::gateway::attempt::TrustedPolicyScope,
-    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
-        match &self.backend {
-            Backend::Local(scheduler) => {
-                scheduler
-                    .submit_stream_with_policy(req, self.attempt_coordinator.context(policy_scope))
-                    .await
-            }
+        prepared: PreparedGatewaySubmission,
+        prequeue_permit: PrequeuePreparationPermit,
+    ) -> Result<Value, GatewayError> {
+        match prepared {
+            PreparedGatewaySubmission::Local {
+                request,
+                policy_scope,
+            } => match &self.backend {
+                Backend::Local(scheduler) => {
+                    drop(prequeue_permit);
+                    scheduler
+                        .submit_with_policy(request, self.attempt_coordinator.context(policy_scope))
+                        .await
+                }
+                #[cfg(feature = "redis-coordination")]
+                Backend::Distributed(_) => unreachable!("prepared backend changed"),
+            },
             #[cfg(feature = "redis-coordination")]
-            Backend::Distributed(gateway) => {
-                gateway.submit_stream_with_policy(req, policy_scope).await
-            }
+            PreparedGatewaySubmission::Distributed(prepared) => match &self.backend {
+                Backend::Distributed(gateway) => {
+                    let accepted = gateway.accept_prepared(prepared).await?;
+                    drop(prequeue_permit);
+                    gateway.await_accepted(accepted).await
+                }
+                Backend::Local(_) => unreachable!("prepared backend changed"),
+            },
+        }
+    }
+
+    async fn submit_stream_prepared(
+        &self,
+        prepared: PreparedGatewaySubmission,
+        prequeue_permit: PrequeuePreparationPermit,
+    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
+        match prepared {
+            PreparedGatewaySubmission::Local {
+                request,
+                policy_scope,
+            } => match &self.backend {
+                Backend::Local(scheduler) => {
+                    drop(prequeue_permit);
+                    scheduler
+                        .submit_stream_with_policy(
+                            request,
+                            self.attempt_coordinator.context(policy_scope),
+                        )
+                        .await
+                }
+                #[cfg(feature = "redis-coordination")]
+                Backend::Distributed(_) => unreachable!("prepared backend changed"),
+            },
+            #[cfg(feature = "redis-coordination")]
+            PreparedGatewaySubmission::Distributed(prepared) => match &self.backend {
+                Backend::Distributed(gateway) => {
+                    let accepted = gateway.accept_prepared(prepared).await?;
+                    drop(prequeue_permit);
+                    Ok(gateway.stream_accepted(accepted))
+                }
+                Backend::Local(_) => unreachable!("prepared backend changed"),
+            },
         }
     }
 
@@ -552,12 +623,14 @@ fn gateway_err_to_api(state: &GatewayState, err: GatewayError) -> ApiError {
 /// Delegates to the streaming path when `stream: true`.
 async fn chat(
     State(state): State<Arc<GatewayState>>,
+    installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
     headers: HeaderMap,
     uri: Uri,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
+    let prequeue_permit = prequeue_permit(&state, installed_prequeue_permit).await?;
     if req.stream {
-        return Ok(chat_stream_inner(state, headers, req).await);
+        return Ok(chat_stream_inner(state, headers, req, prequeue_permit).await);
     }
 
     let idem_key = headers
@@ -567,11 +640,6 @@ async fn chat(
     let (provider_name, budget_model, gw, identified_caller) =
         build_request(&state, &headers, &req)?;
     let identity = &identified_caller.identity;
-    state
-        .enforce_budget(identity, &provider_name, &budget_model)
-        .await?;
-    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(identity);
-
     let idempotency_context = idem_key.as_ref().map(|client_key| {
         crate::gateway::idempotency::IdempotencyContext::new(
             &identity.tenant,
@@ -581,6 +649,14 @@ async fn chat(
             &gw.payload,
         )
     });
+    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(identity);
+    let prepared_submission = state
+        .prepare_submission(gw, policy_scope, false)
+        .map_err(|error| gateway_err_to_api(&state, error))?;
+
+    state
+        .enforce_budget(identity, &provider_name, &budget_model)
+        .await?;
 
     // Retry-safety: a repeated Idempotency-Key returns the first result.
     if let Some(context) = &idempotency_context {
@@ -600,7 +676,10 @@ async fn chat(
     }
 
     let timer = RequestTimer::start();
-    match state.submit(gw, policy_scope).await {
+    match state
+        .submit_prepared(prepared_submission, prequeue_permit)
+        .await
+    {
         Ok(resp) => {
             if let Some(context) = &idempotency_context {
                 state.idem_store(context, &resp).await;
@@ -619,16 +698,22 @@ async fn chat(
 /// POST /v1/chat/stream — always SSE, queued by priority.
 async fn chat_stream(
     State(state): State<Arc<GatewayState>>,
+    installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    chat_stream_inner(state, headers, req).await
+    let prequeue_permit = match prequeue_permit(&state, installed_prequeue_permit).await {
+        Ok(permit) => permit,
+        Err(error) => return error.into_response(),
+    };
+    chat_stream_inner(state, headers, req, prequeue_permit).await
 }
 
 async fn chat_stream_inner(
     state: Arc<GatewayState>,
     headers: HeaderMap,
     req: ChatRequest,
+    prequeue_permit: PrequeuePreparationPermit,
 ) -> Response {
     let (provider_name, budget_model, gw, identified_caller) =
         match build_request(&state, &headers, &req) {
@@ -636,17 +721,23 @@ async fn chat_stream_inner(
             Err(e) => return e.into_response(),
         };
     let identity = identified_caller.identity;
+    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
+    let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {
+        Ok(prepared) => prepared,
+        Err(error) => return gateway_err_to_api(&state, error).into_response(),
+    };
     if let Err(e) = state
         .enforce_budget(&identity, &provider_name, &budget_model)
         .await
     {
         return e.into_response();
     }
-    let policy_scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
-
     // Admission (queue + rate) happens up front so a rejection is a proper
     // 429/503 before the SSE response begins, not an SSE error event.
-    let mut rx = match state.submit_stream(gw, policy_scope).await {
+    let mut rx = match state
+        .submit_stream_prepared(prepared_submission, prequeue_permit)
+        .await
+    {
         Ok(rx) => rx,
         Err(err) => return gateway_err_to_api(&state, err).into_response(),
     };
@@ -793,12 +884,105 @@ pub(crate) fn app_with_origin_policy(
             state.clone(),
             native_translate,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admit_ingress_preparation,
+        ))
         .layer(axum::middleware::from_fn(request_id))
         .layer(origin_policy.cors_layer())
         .layer(axum::middleware::from_fn(move |request, next| {
             crate::proxy::origin::admit_browser_origin(origin_policy.clone(), request, next)
         }))
         .with_state(state)
+}
+
+#[derive(Clone)]
+struct PrequeuePreparationPermit {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+async fn prequeue_permit(
+    state: &GatewayState,
+    installed_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
+) -> Result<PrequeuePreparationPermit, ApiError> {
+    match installed_permit {
+        Some(axum::Extension(permit)) => Ok(permit),
+        None => state
+            .prequeue_backpressure
+            .acquire_preparation()
+            .await
+            .map(|permit| PrequeuePreparationPermit {
+                _permit: Arc::new(permit),
+            })
+            .map_err(|_| ApiError::Overloaded(state.prequeue_backpressure.queue_timeout())),
+    }
+}
+
+async fn admit_ingress_preparation(
+    State(state): State<Arc<GatewayState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let inference_path = request.uri().path();
+    let requires_preparation = request.method() == axum::http::Method::POST
+        && matches!(
+            inference_path,
+            "/v1/chat" | "/v1/chat/stream" | "/v1/chat/completions" | "/v1/messages"
+        );
+    if !requires_preparation {
+        return next.run(request).await;
+    }
+
+    let native_wire = match inference_path {
+        "/v1/chat/completions" => Some(crate::proxy::wire::Wire::Chat),
+        "/v1/messages" => Some(crate::proxy::wire::Wire::Messages),
+        _ => None,
+    };
+    if native_wire.is_some() {
+        crate::proxy::wire::normalize_auth(request.headers_mut());
+    }
+    if state.keystore.identify(request.headers()).is_err() {
+        return match native_wire {
+            Some(wire) => crate::proxy::wire::fail(
+                wire,
+                StatusCode::UNAUTHORIZED,
+                "Missing or invalid API key",
+            ),
+            None => ApiError::Unauthorized.into_response(),
+        };
+    }
+
+    let permit = match state.prequeue_backpressure.acquire_preparation().await {
+        Ok(permit) => PrequeuePreparationPermit {
+            _permit: Arc::new(permit),
+        },
+        Err(()) => {
+            return match native_wire {
+                Some(wire) => {
+                    let mut response = crate::proxy::wire::fail(
+                        wire,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Gateway is at capacity; retry after the suggested delay",
+                    );
+                    insert_retry_after(&mut response, state.prequeue_backpressure.queue_timeout());
+                    response
+                }
+                None => ApiError::Overloaded(state.prequeue_backpressure.queue_timeout())
+                    .into_response(),
+            }
+        }
+    };
+    request.extensions_mut().insert(permit);
+    next.run(request).await
+}
+
+fn insert_retry_after(response: &mut Response, wait: Duration) {
+    let seconds = wait.as_secs() + u64::from(wait.subsec_millis() > 0);
+    if let Ok(value) = HeaderValue::from_str(&seconds.max(1).to_string()) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
 }
 
 async fn native_translate(
@@ -915,6 +1099,10 @@ mod native_tests {
                 30,
             )),
             idempotency_ttl_secs: 30,
+            prequeue_backpressure: Backpressure::new(
+                config.max_concurrency_per_provider,
+                config.max_wait,
+            ),
             overloaded_retry_after: config.overloaded_retry_after,
         })
     }
@@ -961,6 +1149,10 @@ mod native_tests {
                 30,
             )),
             idempotency_ttl_secs: 30,
+            prequeue_backpressure: Backpressure::new(
+                config.max_concurrency_per_provider,
+                config.max_wait,
+            ),
             overloaded_retry_after: config.overloaded_retry_after,
         })
     }
@@ -1010,6 +1202,67 @@ mod native_tests {
                 assert_eq!(body["error"]["type"], expected_native_type);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn ingress_preparation_gate_precedes_native_conversion_and_prequeue_work() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "keyed-ingress-response",
+                    "model": "test",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {}
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let mut state = configured_state(&server.url());
+        Arc::get_mut(&mut state)
+            .expect("test owns the only gateway state reference")
+            .prequeue_backpressure = Backpressure::new(1, Duration::from_millis(20));
+        let held_prequeue_permit = state
+            .prequeue_backpressure
+            .acquire_preparation()
+            .await
+            .expect("hold the only ingress preparation permit");
+
+        let unauthorized = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let unauthorized_body: Value =
+            serde_json::from_slice(&to_bytes(unauthorized.into_body(), 10_000).await.unwrap())
+                .unwrap();
+        assert_eq!(unauthorized_body["error"]["type"], "authentication_error");
+
+        assert_gateway_refusal_surfaces(state.clone(), true).await;
+        drop(held_prequeue_permit);
+
+        let released = tokio::time::timeout(
+            Duration::from_secs(1),
+            app(state).oneshot(canonical_request("test-key", "keyed-ingress", "hi")),
+        )
+        .await
+        .expect("released prequeue capacity should not stall the next request")
+        .unwrap();
+        assert_eq!(released.status(), StatusCode::OK);
+        upstream.assert_async().await;
     }
 
     fn canonical_request(api_key: &str, idempotency_key: &str, prompt: &str) -> Request<Body> {
@@ -1089,6 +1342,10 @@ mod native_tests {
                 30,
             )),
             idempotency_ttl_secs: 30,
+            prequeue_backpressure: Backpressure::new(
+                config.max_concurrency_per_provider,
+                config.max_wait,
+            ),
             overloaded_retry_after: config.overloaded_retry_after,
         })
     }
@@ -1532,6 +1789,10 @@ mod native_tests {
                     Duration::from_secs(30),
                 ),
                 idempotency_ttl_secs: 30,
+                prequeue_backpressure: Backpressure::new(
+                    config.max_concurrency_per_provider,
+                    config.max_wait,
+                ),
                 overloaded_retry_after: config.overloaded_retry_after,
             })
         };
