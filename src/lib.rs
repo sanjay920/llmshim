@@ -9,6 +9,7 @@ pub mod config;
 pub mod cost;
 pub mod credentials;
 mod default_secret_file;
+mod derived_response;
 pub mod env;
 pub mod error;
 pub mod fallback;

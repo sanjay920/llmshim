@@ -5,8 +5,15 @@ mod streaming;
 pub use auth::{ChatGptAuth, DeviceCode, LoginStatus};
 pub(crate) use streaming::collect_response_with_terminal;
 
-pub(crate) fn transform_collected_response(model: &str, response: Value) -> Result<Value> {
-    transform_response(model, response)
+pub(crate) fn transform_collected_response(
+    target: &crate::reasoning::ReplayTarget,
+    model: &str,
+    response: Value,
+) -> Result<Value> {
+    let native = response.clone();
+    let mut transformed = transform_response(model, response)?;
+    crate::derived_response::capture_unary(target, &native, &mut transformed)?;
+    Ok(transformed)
 }
 pub(crate) use streaming::transform_chunk as parse_stream_chunk;
 
@@ -260,8 +267,7 @@ impl Provider for ChatGpt {
     fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
         let native = response.clone();
         let mut result = transform_response(model, response)?;
-        crate::reasoning::capture_response(&self.replay_target(model), &native, &mut result);
-        crate::toolcall::capture_response(&self.replay_target(model), &native, &mut result)?;
+        crate::derived_response::capture_unary(&self.replay_target(model), &native, &mut result)?;
         Ok(result)
     }
 
