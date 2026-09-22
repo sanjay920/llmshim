@@ -210,6 +210,42 @@ fn deepseek_reasoning_echoes_to_same_family_and_drops_on_cross_family_hops() {
 }
 
 #[test]
+fn family_lookup_normalizes_an_openrouter_variant_suffix_but_keeps_the_wire_id() {
+    // MOH-240: a suffixed OpenRouter slug (`:nitro`, `:floor`, …) missed the
+    // catalog entirely, so its family came back `None` and reasoning replay
+    // was dropped as `unknown_family`. The lookup should normalize; the id
+    // ReplayTarget stores (and that goes out on the wire) must not change.
+    let base = ReplayTarget::new(
+        "openrouter",
+        "deepseek/deepseek-v4.1-flash",
+        WireFormat::OpenAiChat,
+    );
+    assert_eq!(base.family, Some(ModelFamily::Deepseek));
+
+    for suffix in [":nitro", ":floor", ":free", ":exacto", ":online"] {
+        let model = format!("deepseek/deepseek-v4.1-flash{suffix}");
+        let suffixed = ReplayTarget::new("openrouter", &model, WireFormat::OpenAiChat);
+        assert_eq!(
+            suffixed.family,
+            Some(ModelFamily::Deepseek),
+            "suffix {suffix} must still resolve a family"
+        );
+        assert_eq!(
+            suffixed.model, model,
+            "the suffix must survive on the target"
+        );
+    }
+
+    // An unrecognized suffix must not be treated as an OpenRouter variant.
+    let unknown = ReplayTarget::new(
+        "openrouter",
+        "deepseek/deepseek-v4.1-flash:beta",
+        WireFormat::OpenAiChat,
+    );
+    assert_eq!(unknown.family, None);
+}
+
+#[test]
 fn chat_details_preserve_objects_and_encoding_with_provenance() {
     let p = OpenRouter::new("key".into());
     let details = json!([{"type":"reasoning.text","text":"first","signature":"sig","format":"anthropic-claude-v1","index":0},{"type":"reasoning.encrypted","data":"opaque","id":"rs_a","index":1}]);

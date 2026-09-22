@@ -12,7 +12,7 @@ pub enum Profile {
 }
 impl Profile {
     pub fn for_model(model: &str) -> Self {
-        let metadata = crate::catalog::resolve(&format!("anthropic/{model}"));
+        let metadata = crate::catalog::lookup_id(&format!("anthropic/{model}"));
         let fallback = crate::catalog::builtin::anthropic_reasoning_options(model);
         let options = metadata
             .as_ref()

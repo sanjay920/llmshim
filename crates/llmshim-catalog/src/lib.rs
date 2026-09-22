@@ -7,6 +7,7 @@ mod merge;
 mod parse;
 mod refresh;
 mod types;
+mod variant;
 
 pub use capabilities::{ModelCapabilities, Support};
 use chrono::{DateTime, Utc};
@@ -15,6 +16,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 pub use types::*;
+pub use variant::strip_suffix as strip_variant_suffix;
 
 pub const VENDORED_SNAPSHOT: &str = include_str!("../data/models.dev.json");
 pub const CATALOG_URL: &str = "https://models.dev/api.json";
@@ -33,6 +35,23 @@ pub fn global() -> Result<&'static CatalogHandle, &'static CatalogError> {
 /// a concurrent refresh; `Catalog::resolve` offers a borrowed equivalent.
 pub fn resolve(id: &str) -> Option<Arc<ModelInfo>> {
     global().ok()?.snapshot().resolve(id).cloned().map(Arc::new)
+}
+
+/// Like [`resolve`], but when `id` carries a known OpenRouter variant suffix
+/// (`:nitro`, `:floor`, `:free`, `:exacto`, `:online`; see [`strip_variant_suffix`])
+/// and there is no catalog row under the exact suffixed id, falls back to the
+/// suffix-stripped base id. `Catalog::lookup_id` offers a borrowed equivalent.
+///
+/// This is for **metadata lookups only** — family, context window, price,
+/// capabilities. A caller building a wire request must keep the original,
+/// suffixed id; normalizing that would silently change what gets sent.
+pub fn lookup_id(id: &str) -> Option<Arc<ModelInfo>> {
+    global()
+        .ok()?
+        .snapshot()
+        .lookup_id(id)
+        .cloned()
+        .map(Arc::new)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +125,20 @@ impl Catalog {
             return None;
         }
         self.models.get(matches.first()?)
+    }
+
+    /// Like [`resolve`](Self::resolve), but falls back to a known OpenRouter
+    /// variant suffix (`:nitro`, `:floor`, `:free`, `:exacto`, `:online`)
+    /// stripped from `id` when the exact suffixed id has no row of its own.
+    /// See [`crate::lookup_id`] for the rationale and the wire-id warning.
+    pub fn lookup_id(&self, id: &str) -> Option<&ModelInfo> {
+        self.resolve(id).or_else(|| {
+            let stripped = variant::strip_suffix(id);
+            if stripped == id {
+                return None;
+            }
+            self.resolve(stripped)
+        })
     }
 
     pub fn alias(&mut self, alias: impl Into<String>, target: impl Into<String>) {
