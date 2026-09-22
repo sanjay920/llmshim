@@ -73,7 +73,31 @@ are stable releases only. Credentials determine which providers are listed.
 
 | ID | Display name |
 |---|---|
-| `xai/grok-4.6` | Grok 4.6 |
+| `xai/grok-4.7` | Grok 4.7 |
+
+Grok 4.7 accepts text and images with a 500,000-token context window.
+Reasoning supports `low`, `medium`, `high` (the upstream default), and `xhigh`;
+llmshim maps `none` to `low` and `max` to `xhigh`. Explicit `xai/grok-4.6`
+requests remain supported, but discovery advertises 4.7.
+
+Native xAI standard rates, USD per million tokens:
+
+| Total input tokens, including cached input | Input | Cached input | Output |
+|---|---:|---:|---:|
+| Up to 200,000 | $2 | $0.50 | $6 |
+| Over 200,000 | $4 | $1 | $12 |
+
+The higher tier applies to the whole request. These are native xAI rates;
+OpenRouter has its own prices. See the [release notes](https://docs.x.ai/developers/release-notes).
+Grok 4.7 Fast is available in Cursor/Grok Build, not as a public xAI API model.
+
+For OpenRouter, use `openrouter/x-ai/grok-4.7`. You can append `:nitro` and set
+`x-openrouter.provider.zdr = true` together. Nitro prioritizes throughput and
+allows priority endpoints, whose rates can be higher. On `/v1/chat`, put
+`x-openrouter` inside `provider_config`. These routing options do not enforce
+ZDR on an llmshim fallback to a different provider.
+The Nitro route has replay metadata but no fixed catalog price; its
+`cost_usd` remains `null` unless local policy supplies rates.
 
 ### ChatGPT subscription
 
