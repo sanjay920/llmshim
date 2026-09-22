@@ -4,6 +4,10 @@ mod streaming;
 
 pub use auth::{ChatGptAuth, DeviceCode, LoginStatus};
 pub(crate) use streaming::collect_response_with_terminal;
+
+pub(crate) fn transform_collected_response(model: &str, response: Value) -> Result<Value> {
+    transform_response(model, response)
+}
 pub(crate) use streaming::transform_chunk as parse_stream_chunk;
 
 use crate::{

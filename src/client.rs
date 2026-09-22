@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod body;
+mod deadline;
+pub use deadline::AttemptDeadlines;
 
 /// Retry bounds, resolved once from the environment (with defaults) at
 /// construction time. Internal/additive to `ShimClient` — not part of the
@@ -33,6 +35,7 @@ struct RetryConfig {
 pub(crate) enum DispatchFailure {
     Upstream(ShimError),
     Local(ShimError),
+    LocalTimeout(ShimError),
     PolicyRefusal(AttemptPolicyRefusal),
     PolicyObservation(AttemptPolicyError),
 }
@@ -42,7 +45,7 @@ pub(crate) type DispatchResult<T> = std::result::Result<T, DispatchFailure>;
 impl DispatchFailure {
     pub(crate) fn into_public(self) -> ShimError {
         match self {
-            Self::Upstream(error) | Self::Local(error) => error,
+            Self::Upstream(error) | Self::Local(error) | Self::LocalTimeout(error) => error,
             Self::PolicyRefusal(refusal) => refusal.into_shim_error(),
             Self::PolicyObservation(error) => error.into_shim_error(),
         }
@@ -85,10 +88,97 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok()?.trim().parse().ok()
 }
 
+fn build_http_client(connect_timeout: Duration) -> Client {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect_timeout)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(4)
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_nodelay(true)
+        .build()
+        .expect("failed to build HTTP client")
+}
+
+fn deadline_after(duration: Duration) -> Option<tokio::time::Instant> {
+    tokio::time::Instant::now().checked_add(duration)
+}
+
+fn earlier_deadline(
+    first: tokio::time::Instant,
+    second: tokio::time::Instant,
+) -> tokio::time::Instant {
+    first.min(second)
+}
+
+fn body_deadline(
+    attempt_deadline: tokio::time::Instant,
+    body_total: Duration,
+) -> tokio::time::Instant {
+    deadline_after(body_total)
+        .map(|deadline| earlier_deadline(attempt_deadline, deadline))
+        .unwrap_or(attempt_deadline)
+}
+
+async fn bounded_policy<T>(
+    future: impl std::future::Future<Output = T>,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
+) -> std::result::Result<T, ()> {
+    let callback_deadline = deadline_after(callback_timeout).ok_or(())?;
+    tokio::time::timeout_at(
+        earlier_deadline(attempt_deadline, callback_deadline),
+        future,
+    )
+    .await
+    .map_err(|_| ())
+}
+
+fn coordinator_timeout_refusal() -> AttemptPolicyRefusal {
+    AttemptPolicyRefusal::new(
+        crate::policy::AttemptPolicyRefusalKind::CoordinatorUnavailable,
+        None,
+    )
+}
+
+fn coordinator_timeout_observation() -> DispatchFailure {
+    DispatchFailure::PolicyObservation(AttemptPolicyError::new(
+        crate::policy::AttemptPolicyErrorKind::CoordinatorUnavailable,
+    ))
+}
+
+fn timeout_504() -> DispatchFailure {
+    DispatchFailure::LocalTimeout(ShimError::ProviderError {
+        status: 504,
+        body: "upstream attempt timed out".into(),
+        retry_after: None,
+    })
+}
+
+async fn finish_transport_failure(
+    tracker: &mut Option<AttemptTracker>,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
+) -> DispatchResult<()> {
+    let Some(tracker) = tracker.as_mut() else {
+        return Ok(());
+    };
+    let accounting = tracker.accounting(false);
+    bounded_policy(
+        tracker.finish(AttemptOutcome::TransportFailure { accounting }),
+        callback_timeout,
+        attempt_deadline,
+    )
+    .await
+    .map_err(|_| coordinator_timeout_observation())?
+    .map_err(DispatchFailure::PolicyObservation)
+}
+
 #[derive(Clone)]
 pub struct ShimClient {
     http: Client,
     retry: RetryConfig,
+    deadlines: AttemptDeadlines,
     response_body_limits: body::ResponseBodyLimits,
     /// Provider health, fed by every dispatch this client makes. `None` means
     /// this client reports to nobody — see [`ShimClient::with_breaker`].
@@ -103,21 +193,23 @@ impl Default for ShimClient {
 
 impl ShimClient {
     pub fn new() -> Self {
+        let deadlines = AttemptDeadlines::from_env();
         Self {
-            http: Client::builder()
-                // Prompts and custom provider credentials belong only at the
-                // configured endpoint, never an HTTP Location target.
-                .redirect(reqwest::redirect::Policy::none())
-                .pool_idle_timeout(Duration::from_secs(90))
-                .pool_max_idle_per_host(4)
-                .tcp_keepalive(Duration::from_secs(30))
-                .tcp_nodelay(true)
-                .build()
-                .expect("failed to build HTTP client"),
+            http: build_http_client(deadlines.connect),
             retry: RetryConfig::from_env(),
+            deadlines,
             response_body_limits: body::ResponseBodyLimits::default(),
             breaker: None,
         }
+    }
+
+    pub fn with_attempt_deadlines(
+        mut self,
+        deadlines: AttemptDeadlines,
+    ) -> std::result::Result<Self, &'static str> {
+        self.deadlines = deadlines.validate()?;
+        self.http = build_http_client(self.deadlines.connect);
+        Ok(self)
     }
 
     /// Report every dispatch's outcome to `breaker`.
@@ -161,6 +253,7 @@ impl ShimClient {
             Err(DispatchFailure::Upstream(error)) => Some(Err(error)),
             Err(
                 DispatchFailure::Local(_)
+                | DispatchFailure::LocalTimeout(_)
                 | DispatchFailure::PolicyRefusal(_)
                 | DispatchFailure::PolicyObservation(_),
             ) => None,
@@ -218,6 +311,11 @@ impl ShimClient {
                 .json(&req.body)
                 .build()
                 .map_err(|error| DispatchFailure::Local(error.into()))?;
+            let attempt_total = match attempt_kind {
+                AttemptKind::Completion => self.deadlines.unary_attempt_total,
+                AttemptKind::Stream => self.deadlines.stream_attempt_total,
+            };
+            let attempt_deadline = deadline_after(attempt_total).ok_or_else(timeout_504)?;
             let mut attempt_tracker = match policy_context {
                 Some(context) => {
                     let Some(target) = prepared_target else {
@@ -225,29 +323,76 @@ impl ShimClient {
                             "missing prepared dispatch target".into(),
                         )));
                     };
+                    let acquire =
+                        context.acquire(attempt_kind, resolved_model, target, &req.url, &req.body);
                     Some(
-                        context
-                            .acquire(attempt_kind, resolved_model, target, &req.url, &req.body)
-                            .await
-                            .map_err(DispatchFailure::PolicyRefusal)?,
+                        match bounded_policy(
+                            acquire,
+                            self.deadlines.policy_callback,
+                            attempt_deadline,
+                        )
+                        .await
+                        {
+                            Ok(result) => result.map_err(DispatchFailure::PolicyRefusal)?,
+                            Err(()) => {
+                                return Err(DispatchFailure::PolicyRefusal(
+                                    coordinator_timeout_refusal(),
+                                ))
+                            }
+                        },
                     )
                 }
                 None => None,
             };
 
-            match self.http.execute(http_request).await {
-                Ok(resp) => {
+            let header_deadline = earlier_deadline(
+                attempt_deadline,
+                deadline_after(self.deadlines.response_headers).ok_or_else(timeout_504)?,
+            );
+            let response_result =
+                tokio::time::timeout_at(header_deadline, self.http.execute(http_request)).await;
+            match response_result {
+                Err(_) if attempt < max_retries => {
+                    finish_transport_failure(
+                        &mut attempt_tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
+                    tokio::time::sleep(backoff_with_jitter(
+                        attempt,
+                        self.retry.base,
+                        self.retry.cap,
+                    ))
+                    .await;
+                    continue;
+                }
+                Err(_) => {
+                    finish_transport_failure(
+                        &mut attempt_tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
+                    return Err(timeout_504());
+                }
+                Ok(Ok(resp)) => {
                     let status = resp.status();
                     if let Some(tracker) = attempt_tracker.as_ref() {
-                        tracker
-                            .response_headers(status.as_u16())
-                            .await
-                            .map_err(DispatchFailure::PolicyObservation)?;
+                        bounded_policy(
+                            tracker.response_headers(status.as_u16()),
+                            self.deadlines.policy_callback,
+                            attempt_deadline,
+                        )
+                        .await
+                        .map_err(|_| coordinator_timeout_observation())?
+                        .map_err(DispatchFailure::PolicyObservation)?;
                     }
                     if status.is_success() {
                         return Ok(AttemptResponse {
                             response: resp,
                             tracker: attempt_tracker,
+                            attempt_deadline,
                         });
                     }
                     let status_code = status.as_u16();
@@ -258,23 +403,41 @@ impl ShimClient {
                             retry_after_wait(resp.headers(), self.retry.cap).unwrap_or_else(|| {
                                 backoff_with_jitter(attempt, self.retry.base, self.retry.cap)
                             });
-                        let error_body =
-                            body::read(resp, self.response_body_limits.error_bytes).await;
+                        let error_body_deadline =
+                            body_deadline(attempt_deadline, self.deadlines.error_body_total);
+                        let error_body = body::read(
+                            resp,
+                            self.response_body_limits.error_bytes,
+                            self.deadlines.error_body_idle,
+                            error_body_deadline,
+                        )
+                        .await;
                         if let (Ok(error_body), Some(target)) =
                             (error_body.as_ref(), prepared_target)
                         {
-                            observe_bounded_error_usage(target, error_body, &mut attempt_tracker)
-                                .await?;
+                            observe_bounded_error_usage(
+                                target,
+                                error_body,
+                                &mut attempt_tracker,
+                                self.deadlines.policy_callback,
+                                attempt_deadline,
+                            )
+                            .await?;
                         }
                         if let Some(tracker) = attempt_tracker.as_mut() {
                             let accounting = tracker.accounting(false);
-                            tracker
-                                .finish(AttemptOutcome::HttpFailure {
-                                    status: status_code,
-                                    accounting,
-                                })
-                                .await
-                                .map_err(DispatchFailure::PolicyObservation)?;
+                            let finish = tracker.finish(AttemptOutcome::HttpFailure {
+                                status: status_code,
+                                accounting,
+                            });
+                            bounded_policy(
+                                finish,
+                                self.deadlines.policy_callback,
+                                attempt_deadline,
+                            )
+                            .await
+                            .map_err(|_| coordinator_timeout_observation())?
+                            .map_err(DispatchFailure::PolicyObservation)?;
                         }
                         tokio::time::sleep(wait).await;
                         continue;
@@ -283,23 +446,36 @@ impl ShimClient {
                     // server's own wait, and a caller with its own backoff
                     // above this client gets to honour it too.
                     let retry_after = parse_retry_after(resp.headers());
-                    let error_body =
-                        body::read_text_and_bytes(resp, self.response_body_limits.error_bytes)
-                            .await;
+                    let error_body_deadline =
+                        body_deadline(attempt_deadline, self.deadlines.error_body_total);
+                    let error_body = body::read_text_and_bytes(
+                        resp,
+                        self.response_body_limits.error_bytes,
+                        self.deadlines.error_body_idle,
+                        error_body_deadline,
+                    )
+                    .await;
                     if let (Ok((_, error_body)), Some(target)) =
                         (error_body.as_ref(), prepared_target)
                     {
-                        observe_bounded_error_usage(target, error_body, &mut attempt_tracker)
-                            .await?;
+                        observe_bounded_error_usage(
+                            target,
+                            error_body,
+                            &mut attempt_tracker,
+                            self.deadlines.policy_callback,
+                            attempt_deadline,
+                        )
+                        .await?;
                     }
                     if let Some(tracker) = attempt_tracker.as_mut() {
                         let accounting = tracker.accounting(false);
-                        tracker
-                            .finish(AttemptOutcome::HttpFailure {
-                                status: status_code,
-                                accounting,
-                            })
+                        let finish = tracker.finish(AttemptOutcome::HttpFailure {
+                            status: status_code,
+                            accounting,
+                        });
+                        bounded_policy(finish, self.deadlines.policy_callback, attempt_deadline)
                             .await
+                            .map_err(|_| coordinator_timeout_observation())?
                             .map_err(DispatchFailure::PolicyObservation)?;
                     }
                     let body = match error_body {
@@ -308,6 +484,7 @@ impl ShimClient {
                             return Err(body::BodyReadError::TooLarge.into_dispatch_failure());
                         }
                         Err(body::BodyReadError::Http(_)) => String::new(),
+                        Err(body::BodyReadError::Timeout) => "upstream error body timed out".into(),
                     };
                     return Err(DispatchFailure::Upstream(ShimError::ProviderError {
                         status: status_code,
@@ -316,14 +493,13 @@ impl ShimClient {
                     }));
                 }
                 // Transport errors carry no headers: always jittered backoff.
-                Err(e) if Self::is_retryable_transport(&e) && attempt < max_retries => {
-                    if let Some(tracker) = attempt_tracker.as_mut() {
-                        let accounting = tracker.accounting(false);
-                        tracker
-                            .finish(AttemptOutcome::TransportFailure { accounting })
-                            .await
-                            .map_err(DispatchFailure::PolicyObservation)?;
-                    }
+                Ok(Err(e)) if Self::is_retryable_transport(&e) && attempt < max_retries => {
+                    finish_transport_failure(
+                        &mut attempt_tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
                     tokio::time::sleep(backoff_with_jitter(
                         attempt,
                         self.retry.base,
@@ -332,14 +508,13 @@ impl ShimClient {
                     .await;
                     continue;
                 }
-                Err(error) => {
-                    if let Some(tracker) = attempt_tracker.as_mut() {
-                        let accounting = tracker.accounting(false);
-                        tracker
-                            .finish(AttemptOutcome::TransportFailure { accounting })
-                            .await
-                            .map_err(DispatchFailure::PolicyObservation)?;
-                    }
+                Ok(Err(error)) => {
+                    finish_transport_failure(
+                        &mut attempt_tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
                     return Err(DispatchFailure::Upstream(error.into()));
                 }
             }
@@ -442,6 +617,7 @@ impl ShimClient {
         let AttemptResponse {
             response,
             mut tracker,
+            attempt_deadline,
         } = self
             .send_prepared(
                 policy_context,
@@ -454,41 +630,117 @@ impl ShimClient {
         if provider.name() == "chatgpt"
             && target.wire == crate::reasoning::WireFormat::OpenAiResponses
         {
-            let collected =
-                crate::providers::chatgpt::collect_response_with_terminal(model, response).await;
+            let collected = crate::providers::chatgpt::collect_response_with_terminal(
+                model,
+                response,
+                self.deadlines.stream_semantic_idle,
+                attempt_deadline,
+            )
+            .await;
             if let Some(native_terminal) = collected.native_terminal.as_ref() {
-                observe_native_response_usage(&target, native_terminal, &mut tracker).await?;
+                observe_native_response_usage(
+                    &target,
+                    native_terminal,
+                    &mut tracker,
+                    self.deadlines.policy_callback,
+                    attempt_deadline,
+                )
+                .await?;
             }
-            let mut result = match collected.result {
+            let native_response = match collected.result {
                 Ok(result) => result,
                 Err(error) => {
-                    finish_invalid_response(&mut tracker).await?;
+                    finish_invalid_response(
+                        &mut tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
+                    return Err(
+                        if matches!(
+                            &error,
+                            ShimError::ProviderError { status: 504, body, .. }
+                                if body == "upstream response body timed out"
+                        ) {
+                            DispatchFailure::LocalTimeout(error)
+                        } else {
+                            DispatchFailure::Upstream(error)
+                        },
+                    );
+                }
+            };
+            let mut result = match crate::providers::chatgpt::transform_collected_response(
+                model,
+                native_response,
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    finish_invalid_response(
+                        &mut tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
                     return Err(DispatchFailure::Upstream(error));
                 }
             };
             crate::reasoning::bind_response_context(&mut result, &target);
             crate::toolcall::bind_response_context(&mut result, &target);
-            finish_completed_response(&mut tracker).await?;
+            finish_completed_response(
+                &mut tracker,
+                self.deadlines.policy_callback,
+                attempt_deadline,
+            )
+            .await?;
             return Ok((result, target));
         }
-        let body = match body::read_json(response, self.response_body_limits.success_bytes).await {
+        let body = match body::read_json(
+            response,
+            self.response_body_limits.success_bytes,
+            self.deadlines.unary_body_idle,
+            attempt_deadline,
+        )
+        .await
+        {
             Ok(body) => body,
             Err(error) => {
-                finish_invalid_response(&mut tracker).await?;
+                finish_invalid_response(
+                    &mut tracker,
+                    self.deadlines.policy_callback,
+                    attempt_deadline,
+                )
+                .await?;
                 return Err(error.into_dispatch_failure());
             }
         };
-        observe_native_response_usage(&target, &body, &mut tracker).await?;
+        observe_native_response_usage(
+            &target,
+            &body,
+            &mut tracker,
+            self.deadlines.policy_callback,
+            attempt_deadline,
+        )
+        .await?;
         let mut result = match provider.transform_response(model, body) {
             Ok(result) => result,
             Err(error) => {
-                finish_invalid_response(&mut tracker).await?;
+                finish_invalid_response(
+                    &mut tracker,
+                    self.deadlines.policy_callback,
+                    attempt_deadline,
+                )
+                .await?;
                 return Err(DispatchFailure::Upstream(error));
             }
         };
         crate::reasoning::bind_response_context(&mut result, &target);
         crate::toolcall::bind_response_context(&mut result, &target);
-        finish_completed_response(&mut tracker).await?;
+        finish_completed_response(
+            &mut tracker,
+            self.deadlines.policy_callback,
+            attempt_deadline,
+        )
+        .await?;
         Ok((result, target))
     }
 
@@ -700,7 +952,11 @@ impl ShimClient {
             .await
             .map_err(DispatchFailure::Local)?;
         let target = provider.request_replay_target(model, &provider_req);
-        let AttemptResponse { response, tracker } = self
+        let AttemptResponse {
+            response,
+            tracker,
+            attempt_deadline,
+        } = self
             .send_prepared(
                 policy_context,
                 AttemptKind::Stream,
@@ -709,23 +965,15 @@ impl ShimClient {
                 &provider_req,
             )
             .await?;
-        let events = native_events(response.bytes_stream());
-        let sse = SseStream {
-            inner: events,
-            normalizer: crate::streaming::StreamNormalizer::new(target.clone()),
-            native_usage: crate::usage::NativeStreamUsage::new(target.clone()),
-            pending: None,
-        };
         let policy_failure = Arc::new(std::sync::Mutex::new(None));
-        let stream = match tracker {
-            Some(tracker) => observe_stream(
-                Box::pin(sse),
-                tracker,
-                target.clone(),
-                policy_failure.clone(),
-            ),
-            None => normalized_stream(Box::pin(sse), target.clone()),
-        };
+        let stream = eager_stream(
+            response,
+            tracker,
+            target.clone(),
+            policy_failure.clone(),
+            self.deadlines,
+            attempt_deadline,
+        );
 
         Ok((
             StreamDispatch {
@@ -740,6 +988,7 @@ impl ShimClient {
 struct AttemptResponse {
     response: reqwest::Response,
     tracker: Option<AttemptTracker>,
+    attempt_deadline: tokio::time::Instant,
 }
 
 struct StreamDispatch {
@@ -751,6 +1000,8 @@ async fn observe_native_response_usage(
     target: &ReplayTarget,
     native_response: &serde_json::Value,
     tracker: &mut Option<AttemptTracker>,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
 ) -> DispatchResult<()> {
     let Some(tracker) = tracker.as_mut() else {
         return Ok(());
@@ -759,14 +1010,15 @@ async fn observe_native_response_usage(
         crate::usage::normalize_native_response_usage_observation(target, native_response)
     {
         stamp_usage(target, &mut observation.usage);
-        tracker
-            .usage(
-                &observation.usage,
-                observation.terminal,
-                observation.counters_complete,
-                observation.explicit_zero,
-            )
+        let usage = tracker.usage(
+            &observation.usage,
+            observation.terminal,
+            observation.counters_complete,
+            observation.explicit_zero,
+        );
+        bounded_policy(usage, callback_timeout, attempt_deadline)
             .await
+            .map_err(|_| coordinator_timeout_observation())?
             .map_err(DispatchFailure::PolicyObservation)?;
     }
     Ok(())
@@ -776,33 +1028,58 @@ async fn observe_bounded_error_usage(
     target: &ReplayTarget,
     bounded_body: &[u8],
     tracker: &mut Option<AttemptTracker>,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
 ) -> DispatchResult<()> {
     let Ok(native_error) = serde_json::from_slice::<serde_json::Value>(bounded_body) else {
         return Ok(());
     };
-    observe_native_response_usage(target, &native_error, tracker).await
+    observe_native_response_usage(
+        target,
+        &native_error,
+        tracker,
+        callback_timeout,
+        attempt_deadline,
+    )
+    .await
 }
 
-async fn finish_completed_response(tracker: &mut Option<AttemptTracker>) -> DispatchResult<()> {
+async fn finish_completed_response(
+    tracker: &mut Option<AttemptTracker>,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
+) -> DispatchResult<()> {
     let Some(tracker) = tracker.as_mut() else {
         return Ok(());
     };
     let accounting = tracker.accounting(true);
-    tracker
-        .finish(AttemptOutcome::Completed { accounting })
-        .await
-        .map_err(DispatchFailure::PolicyObservation)
+    bounded_policy(
+        tracker.finish(AttemptOutcome::Completed { accounting }),
+        callback_timeout,
+        attempt_deadline,
+    )
+    .await
+    .map_err(|_| coordinator_timeout_observation())?
+    .map_err(DispatchFailure::PolicyObservation)
 }
 
-async fn finish_invalid_response(tracker: &mut Option<AttemptTracker>) -> DispatchResult<()> {
+async fn finish_invalid_response(
+    tracker: &mut Option<AttemptTracker>,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
+) -> DispatchResult<()> {
     let Some(tracker) = tracker.as_mut() else {
         return Ok(());
     };
     let accounting = tracker.accounting(false);
-    tracker
-        .finish(AttemptOutcome::InvalidResponse { accounting })
-        .await
-        .map_err(DispatchFailure::PolicyObservation)
+    bounded_policy(
+        tracker.finish(AttemptOutcome::InvalidResponse { accounting }),
+        callback_timeout,
+        attempt_deadline,
+    )
+    .await
+    .map_err(|_| coordinator_timeout_observation())?
+    .map_err(DispatchFailure::PolicyObservation)
 }
 
 fn stamp_usage(target: &ReplayTarget, usage: &mut serde_json::Value) {
@@ -811,113 +1088,520 @@ fn stamp_usage(target: &ReplayTarget, usage: &mut serde_json::Value) {
     *usage = response["usage"].take();
 }
 
-struct PolicyStreamState {
-    inner: Pin<Box<dyn Stream<Item = Result<SseOutput>> + Send>>,
-    tracker: AttemptTracker,
+fn eager_stream(
+    response: reqwest::Response,
+    tracker: Option<AttemptTracker>,
     target: ReplayTarget,
     policy_failure: Arc<std::sync::Mutex<Option<AttemptPolicyError>>>,
-    ended: bool,
-}
-
-fn observe_stream(
-    stream: Pin<Box<dyn Stream<Item = Result<SseOutput>> + Send>>,
-    tracker: AttemptTracker,
-    target: ReplayTarget,
-    policy_failure: Arc<std::sync::Mutex<Option<AttemptPolicyError>>>,
+    deadlines: AttemptDeadlines,
+    attempt_deadline: tokio::time::Instant,
 ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
-    Box::pin(futures::stream::unfold(
-        PolicyStreamState {
-            inner: stream,
+    let cancellation_guard = tracker.as_ref().map(AttemptTracker::cancellation_guard);
+    let (output_sender, output_receiver) = tokio::sync::mpsc::channel(1);
+    let (cancellation_sender, cancellation_receiver) = tokio::sync::watch::channel(false);
+    let terminal = Arc::new(std::sync::Mutex::new(None));
+    let producer_terminal = terminal.clone();
+    tokio::spawn(async move {
+        run_eager_stream_producer(
+            response,
             tracker,
             target,
             policy_failure,
-            ended: false,
-        },
-        |mut state| async move {
-            loop {
-                if state.ended {
-                    return None;
-                }
-                match state.inner.next().await {
-                    Some(Ok(SseOutput::Usage(mut observation))) => {
-                        stamp_usage(&state.target, &mut observation.usage);
-                        if let Err(error) = state
-                            .tracker
-                            .usage(
-                                &observation.usage,
-                                observation.terminal,
-                                observation.counters_complete,
-                                observation.explicit_zero,
-                            )
-                            .await
-                        {
-                            record_policy_failure(&state.policy_failure, error);
-                            state.ended = true;
-                            return Some((Err(error.into_shim_error()), state));
-                        }
-                    }
-                    Some(Ok(SseOutput::Chunk(chunk))) => {
-                        let chunk = crate::cost::stamp_chunk(
-                            &state.target.provider,
-                            &state.target.model,
-                            chunk,
-                        );
-                        return Some((Ok(chunk), state));
-                    }
-                    Some(Err(error)) => {
-                        let accounting = state.tracker.accounting(false);
-                        if let Err(policy_error) = state
-                            .tracker
-                            .finish(AttemptOutcome::StreamFailure { accounting })
-                            .await
-                        {
-                            record_policy_failure(&state.policy_failure, policy_error);
-                            state.ended = true;
-                            return Some((Err(policy_error.into_shim_error()), state));
-                        }
-                        state.ended = true;
-                        return Some((Err(error), state));
-                    }
-                    None => {
-                        let accounting = state.tracker.accounting(true);
-                        if let Err(error) = state
-                            .tracker
-                            .finish(AttemptOutcome::Completed { accounting })
-                            .await
-                        {
-                            record_policy_failure(&state.policy_failure, error);
-                            state.ended = true;
-                            return Some((Err(error.into_shim_error()), state));
-                        }
-                        return None;
-                    }
-                }
-            }
-        },
-    ))
+            deadlines,
+            attempt_deadline,
+            output_sender,
+            producer_terminal,
+            cancellation_receiver,
+        )
+        .await;
+    });
+    Box::pin(EagerReceiverStream {
+        receiver: output_receiver,
+        terminal,
+        terminal_emitted: false,
+        cancellation_sender,
+        _cancellation_guard: cancellation_guard,
+    })
 }
 
-fn normalized_stream(
-    stream: Pin<Box<dyn Stream<Item = Result<SseOutput>> + Send>>,
+struct EagerReceiverStream {
+    receiver: tokio::sync::mpsc::Receiver<Result<String>>,
+    terminal: Arc<std::sync::Mutex<Option<Result<String>>>>,
+    terminal_emitted: bool,
+    cancellation_sender: tokio::sync::watch::Sender<bool>,
+    _cancellation_guard: Option<crate::policy::AttemptCancellationGuard>,
+}
+
+impl Stream for EagerReceiverStream {
+    type Item = Result<String>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.receiver.poll_recv(context) {
+            std::task::Poll::Ready(Some(item)) => std::task::Poll::Ready(Some(item)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(None) if !self.terminal_emitted => {
+                self.terminal_emitted = true;
+                std::task::Poll::Ready(
+                    self.terminal
+                        .lock()
+                        .ok()
+                        .and_then(|mut terminal| terminal.take()),
+                )
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+        }
+    }
+}
+
+impl Drop for EagerReceiverStream {
+    fn drop(&mut self) {
+        let _ = self.cancellation_sender.send(true);
+        self.receiver.close();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_eager_stream_producer(
+    response: reqwest::Response,
+    mut tracker: Option<AttemptTracker>,
     target: ReplayTarget,
-) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
-    Box::pin(futures::stream::unfold(
-        (stream, target),
-        |(mut stream, target)| async move {
-            loop {
-                match stream.next().await {
-                    Some(Ok(SseOutput::Usage(_))) => continue,
-                    Some(Ok(SseOutput::Chunk(chunk))) => {
-                        let chunk =
-                            crate::cost::stamp_chunk(&target.provider, &target.model, chunk);
-                        return Some((Ok(chunk), (stream, target)));
-                    }
-                    Some(Err(error)) => return Some((Err(error), (stream, target))),
-                    None => return None,
+    policy_failure: Arc<std::sync::Mutex<Option<AttemptPolicyError>>>,
+    deadlines: AttemptDeadlines,
+    attempt_deadline: tokio::time::Instant,
+    output_sender: tokio::sync::mpsc::Sender<Result<String>>,
+    terminal: Arc<std::sync::Mutex<Option<Result<String>>>>,
+    mut cancellation: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut source = native_events(response.bytes_stream());
+    let mut normalizer = crate::streaming::StreamNormalizer::new(target.clone());
+    let mut native_usage = crate::usage::NativeStreamUsage::new(target.clone());
+    let mut semantic_idle_remaining = deadlines.stream_semantic_idle;
+
+    loop {
+        let source_poll_started = tokio::time::Instant::now();
+        let Some(semantic_idle_deadline) = source_poll_started.checked_add(semantic_idle_remaining)
+        else {
+            set_stream_terminal(&terminal, Err(stream_timeout_error()));
+            return;
+        };
+        let next = tokio::select! {
+            _ = cancellation.changed() => return,
+            _ = output_sender.closed() => return,
+            _ = tokio::time::sleep_until(attempt_deadline) => {
+                settle_stream_timeout(
+                    &mut tracker,
+                    deadlines.policy_callback,
+                    attempt_deadline,
+                    &mut cancellation,
+                ).await;
+                set_stream_terminal(&terminal, Err(stream_timeout_error()));
+                return;
+            }
+            _ = tokio::time::sleep_until(semantic_idle_deadline) => {
+                settle_stream_timeout(
+                    &mut tracker,
+                    deadlines.policy_callback,
+                    attempt_deadline,
+                    &mut cancellation,
+                ).await;
+                set_stream_terminal(&terminal, Err(stream_timeout_error()));
+                return;
+            }
+            next = source.next() => next,
+        };
+        semantic_idle_remaining = semantic_idle_remaining.saturating_sub(
+            tokio::time::Instant::now().saturating_duration_since(source_poll_started),
+        );
+
+        let Some(next) = next else {
+            let normalized_terminal = normalizer.finish();
+            if let Some(observation) = native_usage.take_terminal_candidate() {
+                if observe_stream_usage(
+                    &mut tracker,
+                    &target,
+                    observation,
+                    deadlines.policy_callback,
+                    attempt_deadline,
+                    &policy_failure,
+                    &mut cancellation,
+                )
+                .await
+                .is_err()
+                {
+                    set_stream_terminal(&terminal, Err(coordinator_stream_error()));
+                    return;
                 }
             }
-        },
-    ))
+            match normalized_terminal {
+                Ok(Some(chunk)) => {
+                    let chunk = crate::cost::stamp_chunk(&target.provider, &target.model, chunk);
+                    match send_stream_output(
+                        &output_sender,
+                        Ok(chunk),
+                        attempt_deadline,
+                        &mut cancellation,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(StreamSendFailure::ReceiverDropped) => return,
+                        Err(StreamSendFailure::Deadline) => {
+                            settle_stream_timeout(
+                                &mut tracker,
+                                deadlines.policy_callback,
+                                attempt_deadline,
+                                &mut cancellation,
+                            )
+                            .await;
+                            set_stream_terminal(&terminal, Err(stream_timeout_error()));
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    finish_stream_failure(
+                        &mut tracker,
+                        deadlines.policy_callback,
+                        attempt_deadline,
+                        &policy_failure,
+                        &mut cancellation,
+                    )
+                    .await;
+                    set_stream_terminal(&terminal, Err(error));
+                    return;
+                }
+            }
+            if finish_stream_completed(
+                &mut tracker,
+                deadlines.policy_callback,
+                attempt_deadline,
+                &policy_failure,
+                &mut cancellation,
+            )
+            .await
+            .is_err()
+            {
+                set_stream_terminal(&terminal, Err(coordinator_stream_error()));
+            }
+            return;
+        };
+
+        let data = match next {
+            Ok(data) => data,
+            Err(error) => {
+                normalizer.abort();
+                finish_stream_failure(
+                    &mut tracker,
+                    deadlines.policy_callback,
+                    attempt_deadline,
+                    &policy_failure,
+                    &mut cancellation,
+                )
+                .await;
+                set_stream_terminal(&terminal, Err(error));
+                return;
+            }
+        };
+        if data.trim().is_empty() {
+            continue;
+        }
+        semantic_idle_remaining = deadlines.stream_semantic_idle;
+        let observation = native_usage.ingest(&data);
+        let normalized = normalizer.push(&data);
+        if let Some(observation) = observation {
+            if observe_stream_usage(
+                &mut tracker,
+                &target,
+                observation,
+                deadlines.policy_callback,
+                attempt_deadline,
+                &policy_failure,
+                &mut cancellation,
+            )
+            .await
+            .is_err()
+            {
+                set_stream_terminal(&terminal, Err(coordinator_stream_error()));
+                return;
+            }
+        }
+        match normalized {
+            Ok(Some(chunk)) => {
+                let chunk = crate::cost::stamp_chunk(&target.provider, &target.model, chunk);
+                match send_stream_output(
+                    &output_sender,
+                    Ok(chunk),
+                    attempt_deadline,
+                    &mut cancellation,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(StreamSendFailure::ReceiverDropped) => return,
+                    Err(StreamSendFailure::Deadline) => {
+                        settle_stream_timeout(
+                            &mut tracker,
+                            deadlines.policy_callback,
+                            attempt_deadline,
+                            &mut cancellation,
+                        )
+                        .await;
+                        set_stream_terminal(&terminal, Err(stream_timeout_error()));
+                        return;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                normalizer.abort();
+                finish_stream_failure(
+                    &mut tracker,
+                    deadlines.policy_callback,
+                    attempt_deadline,
+                    &policy_failure,
+                    &mut cancellation,
+                )
+                .await;
+                set_stream_terminal(&terminal, Err(error));
+                return;
+            }
+        }
+        if normalizer.is_finished() {
+            if let Some(observation) = native_usage.take_terminal_candidate() {
+                if observe_stream_usage(
+                    &mut tracker,
+                    &target,
+                    observation,
+                    deadlines.policy_callback,
+                    attempt_deadline,
+                    &policy_failure,
+                    &mut cancellation,
+                )
+                .await
+                .is_err()
+                {
+                    set_stream_terminal(&terminal, Err(coordinator_stream_error()));
+                    return;
+                }
+            }
+            if finish_stream_completed(
+                &mut tracker,
+                deadlines.policy_callback,
+                attempt_deadline,
+                &policy_failure,
+                &mut cancellation,
+            )
+            .await
+            .is_err()
+            {
+                set_stream_terminal(&terminal, Err(coordinator_stream_error()));
+            }
+            return;
+        }
+    }
+}
+
+async fn send_stream_output(
+    sender: &tokio::sync::mpsc::Sender<Result<String>>,
+    item: Result<String>,
+    attempt_deadline: tokio::time::Instant,
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+) -> std::result::Result<(), StreamSendFailure> {
+    tokio::select! {
+        _ = cancellation.changed() => Err(StreamSendFailure::ReceiverDropped),
+        result = sender.send(item) => result.map_err(|_| StreamSendFailure::ReceiverDropped),
+        _ = tokio::time::sleep_until(attempt_deadline) => Err(StreamSendFailure::Deadline),
+    }
+}
+
+enum StreamSendFailure {
+    ReceiverDropped,
+    Deadline,
+}
+
+enum StreamPolicyWaitError {
+    Policy,
+    ReceiverDropped,
+}
+
+async fn await_stream_policy<T>(
+    future: impl std::future::Future<Output = T>,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+) -> std::result::Result<T, StreamPolicyWaitError> {
+    tokio::select! {
+        _ = cancellation.changed() => Err(StreamPolicyWaitError::ReceiverDropped),
+        result = bounded_policy(future, callback_timeout, attempt_deadline) => {
+            result.map_err(|_| StreamPolicyWaitError::Policy)
+        }
+    }
+}
+
+fn set_stream_terminal(
+    terminal: &Arc<std::sync::Mutex<Option<Result<String>>>>,
+    item: Result<String>,
+) {
+    if let Ok(mut slot) = terminal.lock() {
+        *slot = Some(item);
+    }
+}
+
+fn stream_timeout_error() -> ShimError {
+    ShimError::ProviderError {
+        status: 504,
+        body: "upstream stream timed out".into(),
+        retry_after: None,
+    }
+}
+
+fn coordinator_stream_error() -> ShimError {
+    AttemptPolicyError::new(crate::policy::AttemptPolicyErrorKind::CoordinatorUnavailable)
+        .into_shim_error()
+}
+
+async fn observe_stream_usage(
+    tracker: &mut Option<AttemptTracker>,
+    target: &ReplayTarget,
+    mut observation: crate::usage::NativeUsageObservation,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
+    policy_failure: &Arc<std::sync::Mutex<Option<AttemptPolicyError>>>,
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+) -> std::result::Result<(), StreamPolicyWaitError> {
+    let Some(tracker) = tracker.as_mut() else {
+        return Ok(());
+    };
+    stamp_usage(target, &mut observation.usage);
+    match await_stream_policy(
+        tracker.usage(
+            &observation.usage,
+            observation.terminal,
+            observation.counters_complete,
+            observation.explicit_zero,
+        ),
+        callback_timeout,
+        attempt_deadline,
+        cancellation,
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            record_policy_failure(policy_failure, error);
+            Err(StreamPolicyWaitError::Policy)
+        }
+        Err(StreamPolicyWaitError::Policy) => {
+            record_policy_failure(
+                policy_failure,
+                AttemptPolicyError::new(
+                    crate::policy::AttemptPolicyErrorKind::CoordinatorUnavailable,
+                ),
+            );
+            Err(StreamPolicyWaitError::Policy)
+        }
+        Err(StreamPolicyWaitError::ReceiverDropped) => Err(StreamPolicyWaitError::ReceiverDropped),
+    }
+}
+
+async fn finish_stream_completed(
+    tracker: &mut Option<AttemptTracker>,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
+    policy_failure: &Arc<std::sync::Mutex<Option<AttemptPolicyError>>>,
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+) -> std::result::Result<(), StreamPolicyWaitError> {
+    let Some(tracker) = tracker.as_mut() else {
+        return Ok(());
+    };
+    let accounting = tracker.accounting(true);
+    match await_stream_policy(
+        tracker.finish(AttemptOutcome::Completed { accounting }),
+        callback_timeout,
+        attempt_deadline,
+        cancellation,
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            record_policy_failure(policy_failure, error);
+            Err(StreamPolicyWaitError::Policy)
+        }
+        Err(StreamPolicyWaitError::Policy) => {
+            record_policy_failure(
+                policy_failure,
+                AttemptPolicyError::new(
+                    crate::policy::AttemptPolicyErrorKind::CoordinatorUnavailable,
+                ),
+            );
+            Err(StreamPolicyWaitError::Policy)
+        }
+        Err(StreamPolicyWaitError::ReceiverDropped) => Err(StreamPolicyWaitError::ReceiverDropped),
+    }
+}
+
+async fn finish_stream_failure(
+    tracker: &mut Option<AttemptTracker>,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
+    policy_failure: &Arc<std::sync::Mutex<Option<AttemptPolicyError>>>,
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let Some(tracker) = tracker.as_mut() else {
+        return false;
+    };
+    let accounting = tracker.accounting(false);
+    let result = await_stream_policy(
+        tracker.finish(AttemptOutcome::StreamFailure { accounting }),
+        callback_timeout,
+        attempt_deadline,
+        cancellation,
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => false,
+        Ok(Err(error)) => {
+            record_policy_failure(policy_failure, error);
+            false
+        }
+        Err(StreamPolicyWaitError::Policy) => {
+            record_policy_failure(
+                policy_failure,
+                AttemptPolicyError::new(
+                    crate::policy::AttemptPolicyErrorKind::CoordinatorUnavailable,
+                ),
+            );
+            false
+        }
+        Err(StreamPolicyWaitError::ReceiverDropped) => true,
+    }
+}
+
+async fn settle_stream_timeout(
+    tracker: &mut Option<AttemptTracker>,
+    callback_timeout: Duration,
+    attempt_deadline: tokio::time::Instant,
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let Some(tracker) = tracker.as_mut() else {
+        return false;
+    };
+    let accounting = tracker.accounting(false);
+    matches!(
+        await_stream_policy(
+            tracker.finish(AttemptOutcome::StreamFailure { accounting }),
+            callback_timeout,
+            attempt_deadline,
+            cancellation,
+        )
+        .await,
+        Err(StreamPolicyWaitError::ReceiverDropped)
+    )
 }
 
 async fn collect_stream_dispatch(dispatch: StreamDispatch) -> DispatchResult<serde_json::Value> {
@@ -1141,81 +1825,74 @@ fn native_events(
     Box::pin(crate::sse::data(stream))
 }
 
-struct SseStream {
-    inner: Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
-    normalizer: crate::streaming::StreamNormalizer,
-    native_usage: crate::usage::NativeStreamUsage,
-    pending: Option<Result<Option<String>>>,
-}
-
-impl Stream for SseStream {
-    type Item = Result<SseOutput>;
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        use std::task::Poll;
-        loop {
-            if let Some(pending) = self.pending.take() {
-                match pending {
-                    Ok(Some(chunk)) => return Poll::Ready(Some(Ok(SseOutput::Chunk(chunk)))),
-                    Ok(None) => continue,
-                    Err(error) => return Poll::Ready(Some(Err(error))),
-                }
-            }
-            if self.normalizer.is_finished() {
-                if let Some(observation) = self.native_usage.take_terminal_candidate() {
-                    return Poll::Ready(Some(Ok(SseOutput::Usage(observation))));
-                }
-                return Poll::Ready(None);
-            }
-            let data = match self.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(data))) => data,
-                Poll::Ready(Some(Err(error))) => {
-                    self.normalizer.abort();
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Poll::Ready(None) => {
-                    return Poll::Ready(match self.normalizer.finish() {
-                        Ok(Some(chunk)) => Some(Ok(SseOutput::Chunk(chunk))),
-                        Ok(None) => self
-                            .native_usage
-                            .take_terminal_candidate()
-                            .map(SseOutput::Usage)
-                            .map(Ok),
-                        Err(error) => Some(Err(error)),
-                    })
-                }
-                Poll::Pending => return Poll::Pending,
-            };
-            let native_usage = self.native_usage.ingest(&data);
-            let normalized = self.normalizer.push(&data);
-            if let Some(usage) = native_usage {
-                self.pending = Some(normalized);
-                return Poll::Ready(Some(Ok(SseOutput::Usage(usage))));
-            }
-            match normalized {
-                Ok(Some(chunk)) => return Poll::Ready(Some(Ok(SseOutput::Chunk(chunk)))),
-                Ok(None) => continue,
-                Err(error) => {
-                    self.normalizer.abort();
-                    return Poll::Ready(Some(Err(error)));
-                }
-            }
-        }
-    }
-}
-
-enum SseOutput {
-    Usage(crate::usage::NativeUsageObservation),
-    Chunk(String),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
     use reqwest::header::{HeaderMap, HeaderValue};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Clone, Copy, Debug)]
+    enum PendingStreamCallback {
+        Usage,
+        Finish,
+    }
+
+    struct PendingStreamPolicy {
+        pending: PendingStreamCallback,
+        started: tokio::sync::Notify,
+        abandoned: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::policy::AttemptPolicy for PendingStreamPolicy {
+        fn acquire<'a>(
+            &'a self,
+            _attempt: &'a crate::policy::PreparedAttempt<'a>,
+        ) -> crate::policy::AttemptPolicyFuture<
+            'a,
+            std::result::Result<(), crate::policy::AttemptPolicyRefusal>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn observe<'a>(
+            &'a self,
+            _attempt: &'a crate::policy::AttemptIdentity,
+            event: crate::policy::AttemptEvent<'a>,
+        ) -> crate::policy::AttemptPolicyFuture<
+            'a,
+            std::result::Result<(), crate::policy::AttemptPolicyError>,
+        > {
+            let pending = matches!(
+                (self.pending, event),
+                (
+                    PendingStreamCallback::Usage,
+                    crate::policy::AttemptEvent::Usage { .. }
+                ) | (
+                    PendingStreamCallback::Finish,
+                    crate::policy::AttemptEvent::Finished(_)
+                )
+            );
+            Box::pin(async move {
+                if pending {
+                    self.started.notify_one();
+                    futures::future::pending().await
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn observe_abandoned(
+            &self,
+            _attempt: &crate::policy::AttemptIdentity,
+            _outcome: crate::policy::AttemptOutcome,
+        ) -> std::result::Result<(), crate::policy::AttemptPolicyError> {
+            self.abandoned.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     fn fragmented_sse(
         provider: &dyn Provider,
@@ -1235,15 +1912,37 @@ mod tests {
             Box::pin(futures::stream::empty())
         };
         let target = provider.replay_target(model);
-        normalized_stream(
-            Box::pin(SseStream {
-                inner: native_events(futures::stream::iter(bytes).chain(tail)),
-                normalizer: crate::streaming::StreamNormalizer::new(target.clone()),
-                native_usage: crate::usage::NativeStreamUsage::new(target.clone()),
-                pending: None,
-            }),
-            target,
-        )
+        let events = native_events(futures::stream::iter(bytes).chain(tail));
+        Box::pin(futures::stream::unfold(
+            (
+                events,
+                crate::streaming::StreamNormalizer::new(target.clone()),
+                target,
+            ),
+            |(mut events, mut normalizer, target)| async move {
+                loop {
+                    if normalizer.is_finished() {
+                        return None;
+                    }
+                    let normalized = match events.next().await {
+                        Some(Ok(data)) => normalizer.push(&data),
+                        Some(Err(error)) => Err(error),
+                        None => normalizer.finish(),
+                    };
+                    match normalized {
+                        Ok(Some(chunk)) => {
+                            let chunk =
+                                crate::cost::stamp_chunk(&target.provider, &target.model, chunk);
+                            return Some((Ok(chunk), (events, normalizer, target)));
+                        }
+                        Ok(None) => continue,
+                        Err(error) => {
+                            return Some((Err(error), (events, normalizer, target)));
+                        }
+                    }
+                }
+            },
+        ))
     }
 
     #[tokio::test]
@@ -1572,6 +2271,365 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn raw_loopback_request(url: String) -> ProviderRequest {
+        ProviderRequest {
+            url,
+            headers: vec![],
+            body: serde_json::json!({"messages": []}),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_header_timeout_uses_only_the_existing_transport_retry_count() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_accepts = accepts.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                server_accepts.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 1024];
+                    let _ = socket.read(&mut request).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                });
+            }
+        });
+        let deadlines = AttemptDeadlines::default()
+            .with_response_header_timeout(Duration::from_millis(20))
+            .unwrap()
+            .with_unary_timeouts(Duration::from_secs(1), Duration::from_secs(1))
+            .unwrap();
+        let client = ShimClient {
+            retry: RetryConfig {
+                max_retries: 1,
+                base: Duration::ZERO,
+                cap: Duration::ZERO,
+            },
+            ..ShimClient::new().with_attempt_deadlines(deadlines).unwrap()
+        };
+        let error = client
+            .send(&raw_loopback_request(format!("http://{address}/headers")))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ShimError::ProviderError { status: 504, .. }
+        ));
+        server.await.unwrap();
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stalled_error_body_preserves_the_received_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 10\r\n\r\nx")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let deadlines = AttemptDeadlines::default()
+            .with_error_body_timeouts(Duration::from_millis(20), Duration::from_millis(40))
+            .unwrap();
+        let client = ShimClient {
+            retry: RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+            ..ShimClient::new().with_attempt_deadlines(deadlines).unwrap()
+        };
+        let error = client
+            .send(&raw_loopback_request(format!("http://{address}/error")))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ShimError::ProviderError { status: 500, ref body, .. }
+                if body == "upstream error body timed out"
+        ));
+    }
+
+    #[tokio::test]
+    async fn raw_send_returns_after_headers_without_attaching_a_body_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nx")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let deadlines = AttemptDeadlines::default()
+            .with_unary_timeouts(Duration::from_millis(10), Duration::from_millis(20))
+            .unwrap();
+        let client = ShimClient::new().with_attempt_deadlines(deadlines).unwrap();
+        let response = client
+            .send(&raw_loopback_request(format!("http://{address}/raw")))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), response.bytes())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unpolled_stream_releases_source_at_total_and_retains_timeout_terminal() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (source_closed_sender, source_closed_receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let first = serde_json::json!({
+                "choices": [{"index": 0, "delta": {"content": "first"}, "finish_reason": null}]
+            });
+            let second = serde_json::json!({
+                "choices": [{"index": 0, "delta": {"content": "second"}, "finish_reason": null}]
+            });
+            let first_frame = format!("data: {first}\n\n");
+            let second_frame = format!("data: {second}\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n",
+                first_frame.len(),
+                first_frame,
+                second_frame.len(),
+                second_frame,
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            let mut byte = [0_u8; 1];
+            let closed = socket.read(&mut byte).await.unwrap() == 0;
+            let _ = source_closed_sender.send(closed);
+        });
+        let deadlines = AttemptDeadlines::default()
+            .with_stream_timeouts(Duration::from_secs(1), Duration::from_millis(50))
+            .unwrap();
+        let client = ShimClient::new().with_attempt_deadlines(deadlines).unwrap();
+        let provider = crate::providers::openai_compat::OpenAiCompatible::new(
+            "test-provider",
+            format!("http://{address}"),
+            None,
+        );
+        let mut stream = client
+            .stream(
+                &provider,
+                "test-model",
+                &serde_json::json!({"messages": []}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), source_closed_receiver)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ShimError::ProviderError { status: 504, .. })
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn semantic_idle_restarts_after_backpressure_before_total_expiry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for content in ["first", "second"] {
+                let event = serde_json::json!({
+                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
+                });
+                let frame = format!("data: {event}\n\n");
+                let chunk = format!("{:x}\r\n{}\r\n", frame.len(), frame);
+                socket.write_all(chunk.as_bytes()).await.unwrap();
+            }
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let terminal = serde_json::json!({
+                "choices": [{"index": 0, "delta": {"content": "third"}, "finish_reason": "stop"}]
+            });
+            for frame in [format!("data: {terminal}\n\n"), "data: [DONE]\n\n".into()] {
+                let chunk = format!("{:x}\r\n{}\r\n", frame.len(), frame);
+                socket.write_all(chunk.as_bytes()).await.unwrap();
+            }
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let deadlines = AttemptDeadlines::default()
+            .with_stream_timeouts(Duration::from_millis(50), Duration::from_secs(1))
+            .unwrap();
+        let client = ShimClient::new().with_attempt_deadlines(deadlines).unwrap();
+        let provider = crate::providers::openai_compat::OpenAiCompatible::new(
+            "test-provider",
+            format!("http://{address}"),
+            None,
+        );
+        let mut stream = client
+            .stream(
+                &provider,
+                "test-model",
+                &serde_json::json!({"messages": []}),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let chunks: Vec<_> = stream.by_ref().collect().await;
+        assert!(chunks.iter().all(Result::is_ok));
+        let text = chunks
+            .into_iter()
+            .map(|chunk| chunk.unwrap())
+            .collect::<String>();
+        assert!(text.contains("first"));
+        assert!(text.contains("second"));
+        assert!(text.contains("third"));
+    }
+
+    #[tokio::test]
+    async fn receiver_drop_cancels_pending_callbacks_and_closes_provider_source() {
+        for pending in [PendingStreamCallback::Usage, PendingStreamCallback::Finish] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (source_closed_sender, source_closed_receiver) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let event = match pending {
+                    PendingStreamCallback::Usage => serde_json::json!({
+                        "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }),
+                    PendingStreamCallback::Finish => serde_json::json!({
+                        "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]
+                    }),
+                };
+                let frames = format!("data: {event}\n\ndata: [DONE]\n\n");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                    frames.len(), frames
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+                let mut byte = [0_u8; 1];
+                let closed = socket.read(&mut byte).await.unwrap() == 0;
+                let _ = source_closed_sender.send(closed);
+            });
+            let deadlines = AttemptDeadlines::default()
+                .with_policy_callback_timeout(Duration::from_secs(1))
+                .unwrap()
+                .with_stream_timeouts(Duration::from_secs(1), Duration::from_secs(2))
+                .unwrap();
+            let client = ShimClient::new().with_attempt_deadlines(deadlines).unwrap();
+            let provider = crate::providers::openai_compat::OpenAiCompatible::new(
+                "test-provider",
+                format!("http://{address}"),
+                None,
+            );
+            let policy = Arc::new(PendingStreamPolicy {
+                pending,
+                started: tokio::sync::Notify::new(),
+                abandoned: std::sync::atomic::AtomicBool::new(false),
+            });
+            let context = DispatchPolicyContext::new(policy.clone());
+            let mut stream = client
+                .stream_with_policy(
+                    &provider,
+                    "test-model",
+                    &serde_json::json!({"messages": []}),
+                    &context,
+                )
+                .await
+                .unwrap();
+            if matches!(pending, PendingStreamCallback::Finish) {
+                assert!(stream.next().await.unwrap().is_ok());
+            }
+            tokio::time::timeout(Duration::from_secs(1), policy.started.notified())
+                .await
+                .unwrap_or_else(|_| panic!("{pending:?} callback did not start"));
+            drop(stream);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), source_closed_receiver)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+            assert!(policy.abandoned.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn comments_whitespace_and_incomplete_frames_do_not_reset_semantic_idle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for fragment in [": comment\n\n", "data:   \n\n", "data: {"] {
+                let chunk = format!("{:x}\r\n{}\r\n", fragment.len(), fragment);
+                if socket.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let deadlines = AttemptDeadlines::default()
+            .with_stream_timeouts(Duration::from_millis(25), Duration::from_secs(1))
+            .unwrap();
+        let client = ShimClient::new().with_attempt_deadlines(deadlines).unwrap();
+        let provider = crate::providers::openai_compat::OpenAiCompatible::new(
+            "test-provider",
+            format!("http://{address}"),
+            None,
+        );
+        let mut stream = client
+            .stream(
+                &provider,
+                "test-model",
+                &serde_json::json!({"messages": []}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ShimError::ProviderError { status: 504, .. })
+        ));
     }
 
     #[tokio::test]
