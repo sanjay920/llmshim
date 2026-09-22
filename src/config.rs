@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 /// The full config file structure.
@@ -119,11 +120,36 @@ pub fn load() -> Config {
 
 /// Save config to ~/.llmshim/config.toml. Creates the directory if needed.
 pub fn save(config: &Config) -> std::io::Result<()> {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = config_path();
-    let contents = toml::to_string_pretty(config).map_err(std::io::Error::other)?;
-    std::fs::write(&path, contents)
+    let configuration_directory = config_dir();
+    let mut configuration_directory_builder = std::fs::DirBuilder::new();
+    configuration_directory_builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        configuration_directory_builder.mode(0o700);
+    }
+    configuration_directory_builder.create(&configuration_directory)?;
+    restrict_config_directory_permissions(&configuration_directory)?;
+    let serialized_configuration = toml::to_string_pretty(config).map_err(std::io::Error::other)?;
+    let mut temporary_config_file = tempfile::NamedTempFile::new_in(&configuration_directory)?;
+    temporary_config_file.write_all(serialized_configuration.as_bytes())?;
+    temporary_config_file.as_file().sync_all()?;
+    temporary_config_file
+        .persist(config_path())
+        .map(|_| ())
+        .map_err(|persist_error| persist_error.error)
+}
+
+#[cfg(unix)]
+fn restrict_config_directory_permissions(directory_path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(directory_path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn restrict_config_directory_permissions(_: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Apply config keys as environment variables (only if not already set).

@@ -119,12 +119,21 @@ pub struct Logger {
 impl Logger {
     /// Create a logger that writes to a file.
     pub fn to_file(path: &str) -> std::io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut file_options = std::fs::OpenOptions::new();
+        file_options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            file_options.mode(0o600);
+        }
+        let log_file = file_options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            log_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(Self {
-            writer: Arc::new(Mutex::new(Box::new(file))),
+            writer: Arc::new(Mutex::new(Box::new(log_file))),
         })
     }
 
