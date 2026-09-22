@@ -315,6 +315,11 @@ the finite defaults. A worker deadline drops local provider work while retaining
 the heartbeat, then publishes its error, records completion, and removes lease
 state in one owner-fenced Redis transaction.
 
+Finite Redis waits also cover distributed connection setup, readiness, queue
+and DLQ statistics, lifecycle reserve/activate/cancel/readback and the bounded
+generic and scoped idempotency caches. A leased request and its metadata retain
+hard expiry headroom for the full worker lifetime plus cleanup grace.
+
 The queue remains at-least-once across an actual worker crash or coordination
 partition. If a provider accepted a request before ownership became uncertain,
 redelivery can still make another external call; lease fencing prevents stale

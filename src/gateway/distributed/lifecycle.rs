@@ -16,6 +16,7 @@ pub(super) const DEFAULT_STREAM_TERMINAL_BYTES: u64 = 128 * 1024;
 const METADATA_BYTES: u64 = 4 * 1024;
 const ACTIVATION_TTL_MS: u64 = 15_000;
 const CLEANUP_GRACE_MS: u64 = 60 * 60 * 1000;
+const MIN_TERMINAL_BYTES: u64 = 4 * 1024;
 
 fn lifecycle_prefix() -> &'static str {
     "llmshim:gw:lifecycle:v1"
@@ -278,6 +279,11 @@ const EXTEND_TERMINAL_LUA: &str = r#"
     return 1
 "#;
 
+const READ_TERMINAL_LUA: &str = r#"
+    if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1] then return false end
+    return redis.call('GET', KEYS[2])
+"#;
+
 static RESERVE: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(RESERVE_LUA));
 static ACTIVATE: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(ACTIVATE_LUA));
 static CANCEL: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(CANCEL_LUA));
@@ -286,6 +292,8 @@ static CACHE_PUT: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(
 static CACHE_GET: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(CACHE_GET_LUA));
 static EXTEND_TERMINAL: LazyLock<redis::Script> =
     LazyLock::new(|| redis::Script::new(EXTEND_TERMINAL_LUA));
+static READ_TERMINAL: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(READ_TERMINAL_LUA));
 
 #[derive(Clone, Copy)]
 pub(super) struct Limits {
@@ -324,11 +332,13 @@ impl Limits {
             unary_terminal_bytes: positive_env(
                 "LLMSHIM_GATEWAY_UNARY_TERMINAL_BYTES",
                 defaults.unary_terminal_bytes,
-            ),
+            )
+            .max(MIN_TERMINAL_BYTES),
             stream_terminal_bytes: positive_env(
                 "LLMSHIM_GATEWAY_STREAM_TERMINAL_BYTES",
                 defaults.stream_terminal_bytes,
-            ),
+            )
+            .max(MIN_TERMINAL_BYTES),
         }
     }
 }
@@ -448,12 +458,12 @@ pub(super) async fn read_terminal(
     id: &str,
     expected_generation: &str,
 ) -> redis::RedisResult<Option<BusMessage>> {
-    use redis::AsyncCommands;
-    let actual_generation: Option<String> = connection.hget(meta_key(id), "generation").await?;
-    if actual_generation.as_deref() != Some(expected_generation) {
-        return Ok(None);
-    }
-    let serialized: Option<Vec<u8>> = connection.get(terminal_key(id)).await?;
+    let serialized: Option<Vec<u8>> = READ_TERMINAL
+        .key(meta_key(id))
+        .key(terminal_key(id))
+        .arg(expected_generation)
+        .invoke_async(connection)
+        .await?;
     Ok(serialized.and_then(|bytes| serde_json::from_slice(&bytes).ok()))
 }
 
@@ -826,5 +836,23 @@ mod tests {
         .unwrap());
         let payload: String = connection.get(payload_key(&id)).await.unwrap();
         assert_eq!(payload, r#"{"payload":"replacement"}"#);
+        let replacement_terminal = BusMessage::Unary(json!({"generation":"replacement"}));
+        let _: () = connection
+            .set(
+                terminal_key(&id),
+                serde_json::to_vec(&replacement_terminal).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(read_terminal(&mut connection, &id, &first.generation)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            read_terminal(&mut connection, &id, &replacement.generation)
+                .await
+                .unwrap(),
+            Some(BusMessage::Unary(value)) if value == json!({"generation":"replacement"})
+        ));
     }
 }
