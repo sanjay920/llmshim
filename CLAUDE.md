@@ -247,9 +247,9 @@ remain provider errors. Callers must configure the final URL directly.
 **Health is not rate-limit backoff.** The token buckets already slow a provider
 down after a 429 — a 429 means the provider is alive and asking for less. The
 breaker counts what retrying cannot fix: 5xx (500/502/503/504/529) and
-transport failures. Adapted from `rcode-provider`'s `ProviderBreaker`, which we
-own: sliding failure window, open state, and a single half-open probe admitted
-after the cooldown. Config: `LLMSHIM_BREAKER_WINDOW_SECS` (60),
+transport failures. The breaker uses a sliding failure window, an open state,
+and a single half-open probe admitted after the cooldown. Config:
+`LLMSHIM_BREAKER_WINDOW_SECS` (60),
 `LLMSHIM_BREAKER_TRIP_THRESHOLD` (3; `0` disables), `LLMSHIM_BREAKER_COOLDOWN_SECS` (30).
 
 The breaker hangs on the `Router` (`Router::breaker()` / `with_breaker`), but
