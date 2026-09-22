@@ -1142,13 +1142,9 @@ impl DistributedGateway {
         logical_deadline: Option<tokio::time::Instant>,
     ) -> Result<AcceptedSubmission, GatewayError> {
         let now = tokio::time::Instant::now();
-        let worker_deadline = now
-            .checked_add(self.worker_job_timeout)
-            .unwrap_or(now + Duration::from_secs(6 * 60 * 60));
         let configured_deadline = now
             .checked_add(self.config.request_timeout)
-            .unwrap_or(worker_deadline)
-            .min(worker_deadline);
+            .unwrap_or(now + Duration::from_secs(6 * 60 * 60));
         let origin_deadline = logical_deadline
             .map(|deadline| deadline.min(configured_deadline))
             .unwrap_or(configured_deadline);
@@ -3984,7 +3980,7 @@ mod tests {
             }),
             unlimited(),
             GatewayConfig {
-                lease_timeout: Duration::from_millis(90),
+                lease_timeout: Duration::from_millis(300),
                 request_timeout: Duration::from_secs(2),
                 ..GatewayConfig::default()
             },
@@ -4013,7 +4009,11 @@ mod tests {
             .await
             .unwrap();
         let generation = prepared.member.rsplit_once(':').unwrap().1.to_string();
-        let workers = gateway.spawn_workers(vec![provider]);
+        let worker = tokio::spawn(gateway.clone().worker(
+            provider,
+            QueueProtocol::LegacyUnscoped,
+            Arc::new(Semaphore::new(1)),
+        ));
         let started = dispatch_started.notified();
         tokio::time::timeout(Duration::from_secs(1), started)
             .await
@@ -4038,9 +4038,7 @@ mod tests {
                 .unwrap(),
             Some(BusMessage::Error(message)) if message == "distributed origin canceled"
         ));
-        for worker in workers {
-            worker.abort();
-        }
+        worker.abort();
     }
 
     #[tokio::test]
@@ -4319,6 +4317,7 @@ mod tests {
         let mutable_gateway = Arc::get_mut(&mut gateway).unwrap();
         mutable_gateway.worker_job_timeout = Duration::from_millis(290);
         mutable_gateway.terminal_operation_delay = Duration::from_millis(70);
+        mutable_gateway.origin_lease_timeout = Duration::from_secs(2);
         let preparation_capacity = Arc::new(Semaphore::new(1));
         let worker = tokio::spawn(gateway.clone().worker(
             provider.clone(),
@@ -4347,14 +4346,25 @@ mod tests {
         let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
         let processing_members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
         assert_eq!(processing_members.len(), 1);
+        let processing_id = processing_members[0].rsplit_once(':').unwrap().0;
+        let origin_expiry: u64 = connection
+            .hget(lifecycle::meta_key(processing_id), "origin_expires_at_ms")
+            .await
+            .unwrap();
+        assert!(
+            origin_expiry
+                > redis_server_time_ms(&mut connection)
+                    .await
+                    .saturating_add(1_000)
+        );
         let near_expiry = redis_server_time_ms(&mut connection)
             .await
-            .saturating_add(40);
+            .saturating_add(120);
         let _: () = connection
             .zadd(&processing, &processing_members[0], near_expiry)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(160)).await;
         assert_eq!(
             gateway
                 .reap_once_protocol(QueueProtocol::LegacyUnscoped, &provider)
