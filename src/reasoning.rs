@@ -1,6 +1,7 @@
 //! Typed, lossless reasoning and a single fail-closed replay policy.
 //! Opaque data is never inspected to decide where a block may be sent.
 mod normalize;
+pub(crate) use normalize::capture_response_with_budget;
 pub use normalize::{capture_response, capture_stream, reasoning_text, ReasoningAccumulator};
 
 use crate::catalog::{self, ModelFamily};
@@ -243,7 +244,7 @@ fn legacy_blocks(message: &Value) -> Vec<Value> {
         dropped(DropReason::Malformed);
         return Vec::new();
     };
-    normalize::chat_blocks(message, &origin)
+    normalize::legacy_chat_blocks(message, &origin)
         .into_iter()
         .map(|b| json!(b))
         .collect()
@@ -585,7 +586,7 @@ pub(crate) fn enforce_stateless(body: &mut Value) -> crate::error::Result<()> {
 
 /// Rebind adapter-created metadata to the immutable HTTP request context. This
 /// matters when OAuth credentials/account selection change while a stream runs.
-pub(crate) fn bind_response_context(response: &mut Value, target: &ReplayTarget) {
+pub(crate) fn bind_response_context_unchecked(response: &mut Value, target: &ReplayTarget) {
     let Some(choices) = response.get_mut("choices").and_then(Value::as_array_mut) else {
         return;
     };
@@ -610,13 +611,25 @@ pub(crate) fn bind_response_context(response: &mut Value, target: &ReplayTarget)
     }
 }
 fn bind_origin(origin: &mut Value, target: &ReplayTarget) {
-    origin["provider"] = json!(target.provider);
-    origin["model"] = json!(target.model);
-    origin["family"] = json!(target.family);
-    origin["wire"] = json!(target.wire);
+    replace_string_if_changed(origin, "provider", &target.provider);
+    replace_string_if_changed(origin, "model", &target.model);
+    let family = json!(target.family);
+    if origin["family"] != family {
+        origin["family"] = family;
+    }
+    let wire = json!(target.wire);
+    if origin["wire"] != wire {
+        origin["wire"] = wire;
+    }
     if let Some(account) = &target.account {
-        origin["account"] = json!(account);
+        replace_string_if_changed(origin, "account", account);
     } else if let Some(obj) = origin.as_object_mut() {
         obj.remove("account");
+    }
+}
+
+fn replace_string_if_changed(container: &mut Value, field: &str, replacement: &str) {
+    if container[field].as_str() != Some(replacement) {
+        container[field] = Value::String(replacement.to_owned());
     }
 }
