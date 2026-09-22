@@ -1,5 +1,7 @@
 mod cli;
 #[cfg(feature = "proxy")]
+mod http_server;
+#[cfg(feature = "proxy")]
 mod managed_server;
 mod terminal_text;
 
@@ -669,10 +671,7 @@ async fn cmd_proxy(options: &cli::ServerOptions) -> Result<(), String> {
     eprintln!("  POST /v1/chat · POST /v1/chat/stream · POST /v1/messages · POST /v1/chat/completions · GET /v1/models · GET /health");
 
     let app = llmshim::proxy::app(router, logger);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|error| format!("server failed: {error}"))
+    http_server::serve(listener, app, shutdown_signal()).await
 }
 
 /// Resolve on the first SIGTERM (deploys / autoscaler) or Ctrl-C, so the server
@@ -737,10 +736,7 @@ async fn cmd_gateway(options: &cli::ServerOptions) -> Result<(), String> {
     // binary was built with redis coordination; otherwise single-instance.
     let state = build_gateway_state(router, logger).await;
     let app = llmshim::gateway::http::app(state);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|error| format!("server failed: {error}"))
+    http_server::serve(listener, app, shutdown_signal()).await
 }
 
 #[cfg(all(feature = "gateway", feature = "redis-coordination"))]
