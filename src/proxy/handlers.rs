@@ -1,9 +1,9 @@
 use super::convert;
 use super::error::ApiError;
 use super::types::*;
-use super::AppState;
+use super::{AppState, LogicalPreparationPermit};
 use crate::log::RequestTimer;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -46,17 +46,16 @@ fn is_attempt_policy_error(error: &crate::error::ShimError) -> bool {
 /// POST /v1/chat — non-streaming completion (or streaming if stream=true)
 pub async fn chat(
     State(state): State<Arc<AppState>>,
+    installed_preparation_permit: Option<Extension<LogicalPreparationPermit>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
+    let preparation_permit =
+        preparation_permit(state.as_ref(), installed_preparation_permit).await?;
     if req.stream {
         // Delegate to streaming (which runs its own admission control).
-        return Ok(chat_stream_inner(state, req).await);
+        return Ok(chat_stream_inner(state, req, preparation_permit).await);
     }
-    let _preparation_permit = state
-        .backpressure
-        .acquire_preparation()
-        .await
-        .map_err(|_| ApiError::Overloaded(state.backpressure.queue_timeout()))?;
+    let _preparation_permit = preparation_permit;
     let prepared_request = convert::prepare_request(&state.router, &req)?;
     if let Some(fallback_models) = &req.fallback {
         convert::validate_resolvable_fallbacks(
@@ -119,16 +118,34 @@ pub async fn chat(
 /// POST /v1/chat/stream — always streaming SSE
 pub async fn chat_stream(
     State(state): State<Arc<AppState>>,
+    installed_preparation_permit: Option<Extension<LogicalPreparationPermit>>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    chat_stream_inner(state, req).await
+    let preparation_permit =
+        match preparation_permit(state.as_ref(), installed_preparation_permit).await {
+            Ok(permit) => permit,
+            Err(error) => return error.into_response(),
+        };
+    chat_stream_inner(state, req, preparation_permit).await
 }
 
-async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
-    let preparation_permit = match state.backpressure.acquire_preparation().await {
-        Ok(permit) => permit,
-        Err(()) => return ApiError::Overloaded(state.backpressure.queue_timeout()).into_response(),
-    };
+async fn preparation_permit(
+    state: &AppState,
+    installed_permit: Option<Extension<LogicalPreparationPermit>>,
+) -> Result<LogicalPreparationPermit, ApiError> {
+    match installed_permit {
+        Some(Extension(permit)) => Ok(permit),
+        None => LogicalPreparationPermit::acquire(&state.backpressure)
+            .await
+            .map_err(|_| ApiError::Overloaded(state.backpressure.queue_timeout())),
+    }
+}
+
+async fn chat_stream_inner(
+    state: Arc<AppState>,
+    req: ChatRequest,
+    preparation_permit: LogicalPreparationPermit,
+) -> Response {
     let prepared_request = match convert::prepare_request(&state.router, &req) {
         Ok(prepared_request) => prepared_request,
         Err(error) => return ApiError::from(error).into_response(),

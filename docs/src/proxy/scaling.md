@@ -62,6 +62,12 @@ repair releases the completed attempt's slot and must acquire again; fallback
 acquires against the provider it actually targets without reacquiring the
 logical slot.
 
+The authenticated gateway checks credentials before acquiring its short-lived
+prequeue preparation slot. It releases that slot after native conversion,
+route expansion, and token estimation, before waiting in the priority queue.
+Queued dispatch and each final provider attempt keep their independent capacity
+and rate-policy gates.
+
 | Variable | Default | Meaning |
 |---|---:|---|
 | `LLMSHIM_MAX_CONCURRENCY` | `256` | Maximum in-flight upstream requests per replica |
