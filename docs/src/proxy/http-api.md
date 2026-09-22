@@ -119,6 +119,23 @@ zero; the other usage fields are always present.
 `POST /v1/chat/stream` always streams. `POST /v1/chat` does the same when the
 body contains `"stream": true`.
 
+## Idempotency replay retention
+
+For completed unary requests, an idempotency key enables a process-local replay
+only when its credential, route, and canonical request match. This is
+best-effort replay: the local cache has shared limits for entry count, retained
+response footprint, and JSON complexity across the current scoped API and its
+deprecated generic compatibility API. An entry that exceeds those limits, or a
+new entry when live retained entries already fill them, is not stored. Expiry is
+also an upper bound; capacity limits can make a replay unavailable earlier.
+Clients must therefore tolerate a fresh execution and must not treat this as an
+exactly-once guarantee.
+
+These local limits use a conservative in-process footprint estimate, not an RSS
+measurement. They do not bound Redis-backed idempotency retention in a
+distributed deployment, which remains TTL-based, or temporary upstream response
+buffering before a response reaches the local cache.
+
 Each Server-Sent Event has an SSE `event:` name and JSON `data:` whose `type`
 matches that name:
 
