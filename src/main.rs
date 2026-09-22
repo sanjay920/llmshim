@@ -1,4 +1,6 @@
 mod cli;
+#[cfg(feature = "proxy")]
+mod managed_server;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
@@ -637,6 +639,11 @@ async fn cmd_proxy(options: &cli::ServerOptions) -> Result<(), String> {
     let logger = std::env::var("LLMSHIM_LOG")
         .ok()
         .and_then(|path| llmshim::log::Logger::to_file(&path).ok());
+
+    if options.managed {
+        eprintln!("  Providers: {providers:?}");
+        return managed_server::serve(router, logger).await;
+    }
 
     let config = llmshim::config::load();
     let host = std::env::var("LLMSHIM_HOST").unwrap_or(config.proxy.host);

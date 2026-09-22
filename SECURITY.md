@@ -14,9 +14,11 @@ coordinate a fix and disclosure with you.
 
 llmshim is a translation layer, not a security boundary. Its posture:
 
-- **The proxy ships with no authentication and no TLS**, and is intended to run
-  on a trusted network behind your own gateway. Exposing it directly to the
-  public internet is an operator mistake, not a vulnerability.
+- **An operator-started proxy ships with no authentication and no TLS**, and is
+  intended to run on a trusted network behind your own gateway. Exposing it
+  directly to the public internet is an operator mistake, not a vulnerability.
+  The Python and TypeScript packages use a separate internal managed mode with
+  per-launch authentication and certificate pinning.
 - Provider API keys live in the proxy process environment (or `~/.llmshim/`) and
   are never returned to clients. A defect that **leaks a configured key** — into
   a response body, a log line, an error message, or another request's context —

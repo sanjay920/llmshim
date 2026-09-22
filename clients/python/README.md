@@ -241,8 +241,8 @@ llmshim.health()   # {"status": "ok", "providers": [...]}
 
 On first call, the package:
 1. Finds the `llmshim` binary (bundled, on PATH, or in repo)
-2. Starts the proxy on a random localhost port
-3. Routes your request through it
+2. Lets the child bind a random localhost port and reads its private startup record
+3. Pins the child's one-time TLS certificate, authenticates every request, and keeps a parent-liveness pipe open
 4. Server stops automatically when Python exits
 
 No Docker, no background services, no manual server management.
