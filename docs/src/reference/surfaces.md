@@ -86,7 +86,7 @@ line and frame buffers:
 | Frame bytes, with CRLF treated as one line ending | 8 MiB |
 | Blank-line-delimited frames, including empty frames | 100,000 |
 | Input chunks, including empty chunks | 1,048,576 |
-| Retained normalized tool/reasoning/choice state | estimated 16 MiB and 4,096 entries |
+| Retained normalized tool/reasoning/choice and collected ChatGPT state | estimated 16 MiB and 4,096 entries |
 | Retained native usage/finality state | estimated 4 MiB and 4,096 entries |
 
 The decoder handles UTF-8 fragments, an initial byte-order mark, multiline
