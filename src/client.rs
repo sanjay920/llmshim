@@ -8,7 +8,6 @@ use crate::provider::{Provider, ProviderRequest};
 use crate::reasoning::ReplayTarget;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
@@ -1083,11 +1082,7 @@ fn rand_u64() -> u64 {
 fn native_events(
     stream: impl Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static,
 ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
-    Box::pin(stream.eventsource().map(|event| {
-        event
-            .map(|e| e.data)
-            .map_err(|_| ShimError::Stream("could not read upstream SSE".into()))
-    }))
+    Box::pin(crate::sse::data(stream))
 }
 
 struct SseStream {

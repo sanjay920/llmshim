@@ -3,7 +3,6 @@ use crate::{
     error::{Result, ShimError},
     provider::Provider,
 };
-use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, pin::Pin};
@@ -36,7 +35,7 @@ fn terminal(event: &Value) -> Result<bool> {
 fn native_stream(response: reqwest::Response) -> NativeStream {
     // This parser handles multiline SSE, CRLF, comments, and UTF-8 split across
     // network chunks. Never treat EOF/[DONE] alone as a successful completion.
-    let events = Box::pin(response.bytes_stream().eventsource());
+    let events = Box::pin(crate::sse::data(response.bytes_stream()));
     Box::pin(futures::stream::unfold(
         (events, false),
         |(mut events, finished)| async move {
@@ -45,11 +44,11 @@ fn native_stream(response: reqwest::Response) -> NativeStream {
             }
             loop {
                 let value = match events.next().await {
-                    Some(Ok(event)) if event.data.trim().is_empty() => continue,
-                    Some(Ok(event)) if event.data.trim() == "[DONE]" => {
+                    Some(Ok(event)) if event.trim().is_empty() => continue,
+                    Some(Ok(event)) if event.trim() == "[DONE]" => {
                         Err(stream_error("stream ended before a terminal response"))
                     }
-                    Some(Ok(event)) => serde_json::from_str::<Value>(&event.data)
+                    Some(Ok(event)) => serde_json::from_str::<Value>(&event)
                         .map_err(|_| stream_error("invalid SSE JSON")),
                     Some(Err(_)) => Err(stream_error("could not read upstream SSE")),
                     None => Err(stream_error("stream ended before a terminal response")),
