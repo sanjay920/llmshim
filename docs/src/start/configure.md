@@ -44,6 +44,14 @@ Valid key names are `openai`, `anthropic`, `gemini`, `xai`, `proxy.host`, and
 to `set` may remain in your shell history; the interactive command avoids that
 shell-history exposure.
 
+On Unix, loading the default config also repairs its file mode to `0600` and
+the owned `.llmshim` directory mode to `0700`. The default file must be a
+regular file owned by the current user, with no symlink or additional hard
+link; unsafe paths are ignored with a diagnostic. Already-private files need
+no permission change, so read-only loads still work on read-only filesystems.
+Use environment variables for operator-managed secrets outside this default
+storage layout.
+
 ## Option 3: ChatGPT subscription login
 
 ```bash
