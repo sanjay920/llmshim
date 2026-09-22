@@ -175,7 +175,7 @@ export interface Usage {
    * Where `cost_usd` came from: `"provider"` when the provider reported what
    * it charged for this generation (OpenRouter does), `"catalog"` when it was
    * computed from catalog prices, which is an upper-bound estimate. Absent on
-   * servers older than 0.9.
+   * older servers.
    */
   cost_source?: CostSource;
 }

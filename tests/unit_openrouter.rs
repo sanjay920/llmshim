@@ -341,23 +341,31 @@ fn captured_stream() -> Vec<String> {
 }
 
 #[test]
-fn request_asks_for_accounting_by_default() {
-    // The number is the bill. It costs nothing to ask for, so not asking is
-    // never the better default.
+fn request_never_injects_an_accounting_parameter() {
+    // Measured 2026-09-22: OpenRouter returns `usage.cost` unconditionally —
+    // a stream carries it with no `stream_options`, and `include: false` does
+    // not suppress it. Its docs call both parameters deprecated and without
+    // effect. There is therefore nothing to ask for, and injecting a no-op
+    // into every request would be a passthrough inventing a parameter.
     let result = provider()
         .transform_request(
             "deepseek/deepseek-v4.1-flash",
             &json!({"messages": [{"role": "user", "content": "hi"}]}),
         )
         .unwrap();
-    assert_eq!(result.body["usage"], json!({"include": true}));
+    assert!(
+        result.body.get("usage").is_none(),
+        "nothing asked for accounting, so nothing should be sent: {}",
+        result.body
+    );
 }
 
 #[test]
-fn request_forwards_an_explicit_usage_object_and_never_overrides_it() {
-    // A caller who said something about accounting has decided; the default
-    // only fills a silence. Opting *out* has to be possible or the default is
-    // a mandate.
+fn request_forwards_an_explicit_usage_object_unchanged() {
+    // A caller may still be pointing at an OpenRouter-compatible endpoint that
+    // does honour the switch. Dropping their value would be the passthrough
+    // bug this adapter exists to avoid — `usage` was missing from the
+    // forwarded key list entirely.
     let p = provider();
     for asked in [json!({"include": false}), json!({"include": true})] {
         let result = p
@@ -369,17 +377,17 @@ fn request_forwards_an_explicit_usage_object_and_never_overrides_it() {
         assert_eq!(result.body["usage"], asked);
     }
 
-    // `x-openrouter.usage` is the caller deciding too — same as `transforms`.
+    // `x-openrouter.usage` is the same statement in the native namespace.
     let result = p
         .transform_request(
             "deepseek/deepseek-v4.1-flash",
             &json!({
                 "messages": [{"role": "user", "content": "hi"}],
-                "x-openrouter": {"usage": {"include": false}},
+                "x-openrouter": {"usage": {"include": true}},
             }),
         )
         .unwrap();
-    assert_eq!(result.body["usage"], json!({"include": false}));
+    assert_eq!(result.body["usage"], json!({"include": true}));
 }
 
 #[test]

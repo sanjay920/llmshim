@@ -74,9 +74,12 @@ native facades and the four bundled clients carry it through as a nullable
 field. `null` means unknown, not free.
 
 **A provider-reported bill outranks the catalog.** Where a response carries
-`usage.cost` — OpenRouter returns it, and the OpenRouter adapter asks for it by
-default — `stamp` uses that number and records `usage.cost_source:
-"provider"`; otherwise it prices from the catalog and records `"catalog"`. The
+`usage.cost` — OpenRouter returns it on every call, with no parameter to set —
+`stamp` uses that number and records `usage.cost_source: "provider"`;
+otherwise it prices from the catalog and records `"catalog"`. Measured
+2026-09-22 on `deepseek/deepseek-v4.1-flash`: the catalog's rate for the
+OpenRouter slug was half what OpenRouter billed, so the estimate this replaces
+was under-reporting 2:1. A catalog cannot detect that from the inside. The
 catalog product is an estimate of that bill and deliberately an upper bound, so
 it must never overwrite one. `cost_source` rides beside `cost_usd` everywhere
 it goes (`LogEntry`, `proxy::types::Usage`, OpenAPI, the typed clients).
