@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::process::Command;
 
 #[cfg(unix)]
@@ -82,6 +83,7 @@ fn config_save_replaces_existing_permissive_file_with_private_modes() {
     assert!(config_contents.contains("openai = \"old\""));
 }
 
+#[cfg(unix)]
 #[test]
 fn malformed_config_diagnostic_excludes_source_marker_and_retains_location() {
     let temporary_home_directory = tempfile::tempdir().unwrap();
