@@ -42,7 +42,7 @@ fn request_preserves_slug_and_messages() {
 
 #[test]
 fn request_preserves_a_variant_suffix_on_the_wire() {
-    // MOH-240: the catalog lookup normalizes a suffix like `:nitro` off for
+    // The catalog lookup normalizes a suffix like `:nitro` off for
     // metadata (family/window/price/capabilities), but the suffix is a
     // routing hint OpenRouter reads off the wire model string itself, so the
     // built request body must carry it exactly as given.
@@ -332,7 +332,7 @@ fn stream_skips_unparseable() {
 }
 
 // ============================================================
-// Accounting — MOH-228
+// Accounting
 //
 // OpenRouter reports what it actually charged for a generation, and which
 // upstream served it. Both were being thrown away: the request never asked for

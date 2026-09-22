@@ -450,7 +450,7 @@ mod tests {
     }
 
     // ============================================================
-    // OpenRouter variant suffix (MOH-240): the lookup normalizes, the wire
+    // OpenRouter variant suffix: the lookup normalizes, the wire
     // id it is passed for never changes here — that guarantee is `router.rs`
     // and `providers/openrouter.rs`'s to keep; this only covers pricing.
     // ============================================================
