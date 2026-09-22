@@ -66,6 +66,13 @@ pub async fn chat(
         return Ok(chat_stream_inner(state, req).await);
     }
     let prepared_request = convert::prepare_request(&state.router, &req)?;
+    if let Some(fallback_models) = &req.fallback {
+        convert::validate_resolvable_fallbacks(
+            &state.router,
+            &prepared_request.payload,
+            fallback_models,
+        )?;
+    }
 
     // Admission control: concurrency permit + rate-limit token. The permit is
     // held until `admission` drops at the end of this function.
@@ -556,5 +563,70 @@ mod tests {
             assert!(response_text.contains("invalid_request"));
             assert!(!response_text.contains("sensitive-prompt-material"));
         }
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_fallback_namespace_activation_before_primary_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let openai_upstream = server
+            .mock("POST", "/responses")
+            .expect(0)
+            .create_async()
+            .await;
+        let anthropic_upstream = server
+            .mock("POST", "/messages")
+            .expect(0)
+            .create_async()
+            .await;
+        let router = Router::new()
+            .register(
+                "openai",
+                Box::new(
+                    crate::providers::openai::OpenAi::new("test-key".into())
+                        .with_base_url(server.url()),
+                ),
+            )
+            .register(
+                "anthropic",
+                Box::new(
+                    crate::providers::anthropic::Anthropic::new("test-key".into())
+                        .with_base_url(server.url()),
+                ),
+            );
+        let state = Arc::new(AppState {
+            router,
+            logger: None,
+            limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default())),
+            backpressure: Backpressure::new(256, Duration::from_millis(50)),
+        });
+        for request_body in [
+            serde_json::json!({
+                "model":"openai/gpt-5.6-luna",
+                "messages":[{"role":"user","content":"canonical"}],
+                "fallback":["anthropic/claude-sonnet-5"],
+                "provider_config":{"x-anthropic":{"model":"claude-opus-5","messages":[]}}
+            }),
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5",
+                "messages":[{"role":"user","content":"canonical"}],
+                "fallback":["openai/gpt-5.6-luna"],
+                "provider_config":{"x-openai":{"input":"replacement"}}
+            }),
+        ] {
+            let response = app_with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        openai_upstream.assert_async().await;
+        anthropic_upstream.assert_async().await;
     }
 }

@@ -76,8 +76,12 @@ at `provider_config.tools`, while an OpenAI-native override goes at
 `provider_config["x-openai"]`. See the [request field map](../reference/request-fields.md).
 The typed `model` and `messages` fields remain authoritative: passthrough
 configuration cannot replace them through the selected provider's native
-model or prompt fields. Validation happens after named-route defaults and
-aliases are resolved. Namespaces for other providers remain inert data.
+model or main messages/input/contents container. Native system or instruction
+controls remain supported and are estimated when active. Validation happens
+after named-route defaults and aliases are resolved and covers every
+resolvable explicit fallback before the primary request runs. Another
+provider's namespace is inert only when no primary, fallback, or route can
+select that provider.
 
 Fallback first retries an eligible failure on the current route, then moves
 through the listed routes. It is ignored by both streaming paths. See
