@@ -190,15 +190,20 @@ async fn catalog_transport_errors_do_not_expose_query_credentials() {
 async fn send_failures_preserve_reqwest_kind_without_query_credentials() {
     let dir = tempfile::tempdir().unwrap();
     let query_credential = "synthetic-send-query-credential";
+    let refusing_socket = tokio::net::TcpSocket::new_v4().unwrap();
+    refusing_socket
+        .bind("127.0.0.1:0".parse().unwrap())
+        .unwrap();
+    let refusing_address = refusing_socket.local_addr().unwrap();
     let handle = CatalogHandle::load(options(
         &dir,
-        format!("http://127.0.0.1:1/catalog?key={query_credential}"),
+        format!("http://{refusing_address}/catalog?key={query_credential}"),
     ))
     .unwrap();
     let error = handle
         .discover_provider(
             "fixture",
-            &format!("http://127.0.0.1:1/models?key={query_credential}"),
+            &format!("http://{refusing_address}/models?key={query_credential}"),
             None,
         )
         .await
