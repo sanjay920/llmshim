@@ -120,12 +120,19 @@ pub fn load() -> Config {
 
 /// Save config to ~/.llmshim/config.toml. Creates the directory if needed.
 pub fn save(config: &Config) -> std::io::Result<()> {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir)?;
-    restrict_config_directory_permissions(&dir)?;
-    let contents = toml::to_string_pretty(config).map_err(std::io::Error::other)?;
-    let mut temporary_config_file = tempfile::NamedTempFile::new_in(&dir)?;
-    temporary_config_file.write_all(contents.as_bytes())?;
+    let configuration_directory = config_dir();
+    let mut configuration_directory_builder = std::fs::DirBuilder::new();
+    configuration_directory_builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        configuration_directory_builder.mode(0o700);
+    }
+    configuration_directory_builder.create(&configuration_directory)?;
+    restrict_config_directory_permissions(&configuration_directory)?;
+    let serialized_configuration = toml::to_string_pretty(config).map_err(std::io::Error::other)?;
+    let mut temporary_config_file = tempfile::NamedTempFile::new_in(&configuration_directory)?;
+    temporary_config_file.write_all(serialized_configuration.as_bytes())?;
     temporary_config_file.as_file().sync_all()?;
     temporary_config_file
         .persist(config_path())
