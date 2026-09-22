@@ -697,21 +697,24 @@ pub use redis_impl::RedisRateLimiter;
 // Backpressure — per-instance concurrency cap + bounded queue
 // ===========================================================================
 
-/// A per-instance cap on in-flight upstream requests, with a bounded wait.
+/// Per-instance caps on logical preparation and in-flight provider attempts,
+/// with a bounded wait.
 ///
 /// Beyond the cap, requests queue for a permit up to `queue_timeout`; on timeout
 /// the caller should return 503 rather than let memory grow without bound. This
 /// is the load-shedding valve that keeps a replica alive at 10k concurrency.
 #[derive(Clone)]
 pub struct Backpressure {
-    semaphore: Arc<Semaphore>,
+    attempt_semaphore: Arc<Semaphore>,
+    preparation_semaphore: Arc<Semaphore>,
     queue_timeout: Duration,
 }
 
 impl Backpressure {
     pub fn new(max_concurrency: usize, queue_timeout: Duration) -> Self {
         Self {
-            semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+            attempt_semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+            preparation_semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
             queue_timeout,
         }
     }
@@ -735,8 +738,16 @@ impl Backpressure {
     // which the caller maps straight to a 503 — no error detail to carry.
     #[allow(clippy::result_unit_err)]
     pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, ()> {
-        match tokio::time::timeout(self.queue_timeout, self.semaphore.clone().acquire_owned()).await
-        {
+        self.acquire_from(self.attempt_semaphore.clone()).await
+    }
+
+    #[allow(clippy::result_unit_err)]
+    pub(crate) async fn acquire_preparation(&self) -> Result<OwnedSemaphorePermit, ()> {
+        self.acquire_from(self.preparation_semaphore.clone()).await
+    }
+
+    async fn acquire_from(&self, semaphore: Arc<Semaphore>) -> Result<OwnedSemaphorePermit, ()> {
+        match tokio::time::timeout(self.queue_timeout, semaphore.acquire_owned()).await {
             Ok(Ok(permit)) => Ok(permit),
             // Closed semaphore or timeout — both shed load.
             _ => Err(()),
@@ -745,7 +756,7 @@ impl Backpressure {
 
     #[cfg(test)]
     fn available_permits(&self) -> usize {
-        self.semaphore.available_permits()
+        self.attempt_semaphore.available_permits()
     }
 }
 
@@ -1494,6 +1505,19 @@ mod tests {
         tokio::time::advance(Duration::from_millis(100)).await;
         drop(held);
         assert!(waiter.await.unwrap(), "waiter should acquire after release");
+    }
+
+    #[tokio::test]
+    async fn preparation_and_attempt_capacity_are_independent() {
+        let backpressure = Backpressure::new(1, Duration::from_millis(20));
+        let _preparation_permit = backpressure
+            .acquire_preparation()
+            .await
+            .expect("logical request capacity");
+        let _attempt_permit = backpressure
+            .acquire()
+            .await
+            .expect("provider attempt capacity");
     }
 
     // --- Token estimation ---------------------------------------------------
