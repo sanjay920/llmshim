@@ -162,6 +162,12 @@ enum PreparedGatewaySubmission {
     Distributed(crate::gateway::distributed::PreparedSubmission),
 }
 
+struct SubmittedValue {
+    value: Value,
+    #[cfg(feature = "redis-coordination")]
+    lifecycle_reference: Option<crate::gateway::distributed::LifecycleReference>,
+}
+
 /// Shared state for the gateway HTTP handlers.
 pub struct GatewayState {
     router: Arc<Router>,
@@ -314,7 +320,7 @@ impl GatewayState {
         prepared: PreparedGatewaySubmission,
         prequeue_permit: PrequeuePreparationPermit,
         logical_deadline: Option<tokio::time::Instant>,
-    ) -> Result<Value, GatewayError> {
+    ) -> Result<SubmittedValue, GatewayError> {
         match prepared {
             PreparedGatewaySubmission::Local {
                 request,
@@ -323,14 +329,19 @@ impl GatewayState {
                 Backend::Local(scheduler) => {
                     drop(prequeue_permit);
                     let policy_context = self.attempt_coordinator.context(policy_scope);
-                    match logical_deadline {
+                    let value = match logical_deadline {
                         Some(deadline) => {
                             scheduler
                                 .submit_with_policy_deadline(request, policy_context, deadline)
                                 .await
                         }
                         None => scheduler.submit_with_policy(request, policy_context).await,
-                    }
+                    }?;
+                    Ok(SubmittedValue {
+                        value,
+                        #[cfg(feature = "redis-coordination")]
+                        lifecycle_reference: None,
+                    })
                 }
                 #[cfg(feature = "redis-coordination")]
                 Backend::Distributed(_) => unreachable!("prepared backend changed"),
@@ -338,9 +349,14 @@ impl GatewayState {
             #[cfg(feature = "redis-coordination")]
             PreparedGatewaySubmission::Distributed(prepared) => match &self.backend {
                 Backend::Distributed(gateway) => {
-                    let accepted = gateway.accept_prepared(prepared).await?;
                     drop(prequeue_permit);
-                    gateway.await_accepted(accepted).await
+                    let _ = logical_deadline;
+                    gateway.submit_prepared_with_reference(prepared).await.map(
+                        |(value, lifecycle_reference)| SubmittedValue {
+                            value,
+                            lifecycle_reference: Some(lifecycle_reference),
+                        },
+                    )
                 }
                 Backend::Local(_) => unreachable!("prepared backend changed"),
             },
@@ -435,14 +451,19 @@ impl GatewayState {
         &self,
         context: &crate::gateway::idempotency::IdempotencyContext,
         value: &Value,
+        #[cfg(feature = "redis-coordination")] lifecycle_reference: Option<
+            &crate::gateway::distributed::LifecycleReference,
+        >,
     ) {
         match &self.backend {
             Backend::Local(_) => self.idempotency.store(context, value.clone()),
             #[cfg(feature = "redis-coordination")]
             Backend::Distributed(gateway) => {
-                gateway
-                    .scoped_idem_store(context, value, self.idempotency_ttl_secs)
-                    .await
+                if let Some(lifecycle_reference) = lifecycle_reference {
+                    gateway
+                        .scoped_idem_store(context, lifecycle_reference, self.idempotency_ttl_secs)
+                        .await
+                }
             }
         }
     }
@@ -686,12 +707,19 @@ async fn chat(
         .submit_prepared(prepared_submission, prequeue_permit, logical_deadline)
         .await
     {
-        Ok(resp) => {
+        Ok(submitted) => {
             if let Some(context) = &idempotency_context {
-                state.idem_store(context, &resp).await;
+                state
+                    .idem_store(
+                        context,
+                        &submitted.value,
+                        #[cfg(feature = "redis-coordination")]
+                        submitted.lifecycle_reference.as_ref(),
+                    )
+                    .await;
             }
             let elapsed = timer.elapsed().as_millis() as u64;
-            Ok(Json(value_to_response(&resp, &provider_name, elapsed)).into_response())
+            Ok(Json(value_to_response(&submitted.value, &provider_name, elapsed)).into_response())
         }
         Err(err) => Err(gateway_err_to_api(&state, err)),
     }
@@ -1568,7 +1596,7 @@ mod native_tests {
             budget_window_secs: Some(window_secs),
             budget_allow_unpriced: false,
         };
-        let mut connection = gateway.connection_for_test();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let redis_time: (u64, u64) = redis::cmd("TIME")
             .query_async(&mut connection)
             .await
@@ -1684,7 +1712,7 @@ mod native_tests {
             overloaded_retry_after: config.overloaded_retry_after,
         });
         let application = app(state);
-        let mut connection = gateway.connection_for_test();
+        let mut connection = gateway.connection_for_test().await.unwrap();
         let redis_time: (u64, u64) = redis::cmd("TIME")
             .query_async(&mut connection)
             .await
