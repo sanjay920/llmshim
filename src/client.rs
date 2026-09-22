@@ -190,7 +190,7 @@ impl ShimClient {
                     .await;
                     continue;
                 }
-                Err(e) => return Err(ShimError::Http(e)),
+                Err(error) => return Err(error.into()),
             }
         }
         unreachable!()
