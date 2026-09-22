@@ -145,6 +145,44 @@ impl Provider for OpenAiCompatible {
         &self.name
     }
 
+    fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
+        match self.wire {
+            WireFormat::OpenAiResponses => crate::provider::RequestAdmissionPolicy::namespaced(
+                format!("x-{}", self.name),
+                &["model", "input"],
+                &[
+                    "instructions",
+                    "prompt",
+                    "text",
+                    "tools",
+                    "tool_choice",
+                    "guided_json",
+                    "guided_regex",
+                    "guided_ebnf",
+                    "structured_outputs",
+                    "chat_template_kwargs",
+                ],
+                &["max_output_tokens"],
+            ),
+            WireFormat::OpenAiChat => crate::provider::RequestAdmissionPolicy::namespaced(
+                format!("x-{}", self.name),
+                &["model", "messages"],
+                &[
+                    "tools",
+                    "tool_choice",
+                    "response_format",
+                    "guided_json",
+                    "guided_regex",
+                    "guided_ebnf",
+                    "structured_outputs",
+                    "chat_template_kwargs",
+                ],
+                &["max_tokens", "max_completion_tokens"],
+            ),
+            _ => crate::provider::RequestAdmissionPolicy::default(),
+        }
+    }
+
     fn replay_target(&self, model: &str) -> ReplayTarget {
         ReplayTarget::new(self.name(), model, self.wire)
             .bind_account(&self.base_url, self.api_key.as_deref())
