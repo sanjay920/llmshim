@@ -67,6 +67,12 @@ LLMSHIM_HOST=127.0.0.1 LLMSHIM_PORT=8080 llmshim proxy
 in `~/.llmshim/config.toml`. Binding to `127.0.0.1` is a useful default when a
 same-host gateway connects to the proxy.
 
+The bundled ordinary proxy and gateway listeners cap accepted connections and
+apply finite first-header and HTTP/1 header deadlines. Configure
+`LLMSHIM_HTTP_MAX_CONNECTIONS` and `LLMSHIM_HTTP_HEADER_TIMEOUT_MS` for your
+deployment; see [listener configuration](../reference/configuration.md#proxy-listener).
+Keep request-body upload and per-client traffic controls at the front gateway.
+
 ## Keep provider keys server-side
 
 The proxy process reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,

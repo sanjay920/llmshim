@@ -316,6 +316,17 @@ fn native_usage_object(wire: WireFormat, native_response: &Value) -> Option<&Val
     .into()
 }
 
+pub(crate) fn compact_native_response_usage(
+    wire: WireFormat,
+    native_response: &Value,
+) -> Option<Value> {
+    let native_usage = native_usage_object(wire, native_response)?;
+    if !native_usage.is_object() {
+        return None;
+    }
+    Some(json!({"usage": compact_native_usage(wire, native_usage)}))
+}
+
 fn usage_observation(
     wire: WireFormat,
     native_usage: &Value,
