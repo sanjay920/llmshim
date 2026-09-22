@@ -5,7 +5,9 @@ use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionTarget {
+    #[cfg(any(feature = "gateway", test))]
     pub provider_name: String,
+    #[cfg(any(feature = "gateway", test))]
     pub model: String,
     pub policy: RequestAdmissionPolicy,
 }
@@ -13,6 +15,7 @@ pub(crate) struct AdmissionTarget {
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedRequest {
     pub payload: Value,
+    #[cfg(any(feature = "gateway", test))]
     pub target: AdmissionTarget,
 }
 
@@ -105,6 +108,7 @@ fn validate_provider_config_envelope(req: &ChatRequest) -> crate::error::Result<
     Ok(())
 }
 
+#[cfg(any(feature = "gateway", test))]
 pub(crate) fn active_native_namespace(target: &AdmissionTarget) -> Option<&str> {
     target.policy.native_namespace()
 }
@@ -130,9 +134,13 @@ fn validate_active_native_overrides(
 }
 
 fn admission_target(provider: &dyn Provider, resolved_model: String) -> AdmissionTarget {
+    #[cfg(not(any(feature = "gateway", test)))]
+    drop(resolved_model);
     AdmissionTarget {
+        #[cfg(any(feature = "gateway", test))]
         provider_name: provider.name().to_string(),
         policy: provider.request_admission_policy(),
+        #[cfg(any(feature = "gateway", test))]
         model: resolved_model,
     }
 }
@@ -149,6 +157,7 @@ fn prepare_resolved_request(
     }
     Ok(PreparedRequest {
         payload: request,
+        #[cfg(any(feature = "gateway", test))]
         target,
     })
 }
