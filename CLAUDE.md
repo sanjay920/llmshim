@@ -73,15 +73,16 @@ for whichever stream chunk carries usage; `log.rs`, `proxy::types::Usage`, both
 native facades and the four bundled clients carry it through as a nullable
 field. `null` means unknown, not free.
 
-**A provider-reported bill outranks the catalog.** Where a response carries
-`usage.cost` — OpenRouter returns it on every call, with no parameter to set —
-`stamp` uses that number and records `usage.cost_source: "provider"`;
-otherwise it prices from the catalog and records `"catalog"`. Measured
+**A terminal provider-reported bill outranks the catalog.** A validated final
+`usage.cost` produces `usage.cost_source: "provider"`. Partial provider charges
+remain lower bounds: the highest observed charge must not be erased by a lower
+catalog estimate, and `"provider_floor"` identifies that bound. Otherwise the
+source is `"catalog"`. Measured
 2026-09-22 on `deepseek/deepseek-v4.1-flash`: the catalog's rate for the
 OpenRouter slug was half what OpenRouter billed, so the estimate this replaces
 was under-reporting 2:1. A catalog cannot detect that from the inside. The
-catalog product is an estimate of that bill and deliberately an upper bound, so
-it must never overwrite one. `cost_source` rides beside `cost_usd` everywhere
+catalog product is an estimate and must not overwrite a validated final bill.
+`cost_source` rides beside `cost_usd` everywhere
 it goes (`LogEntry`, `proxy::types::Usage`, OpenAPI, the typed clients).
 `shim::add_usage` sums a reported `cost` across a repair's two attempts, because
 two dispatches are two charges.
@@ -97,15 +98,16 @@ keys, and billed API calls. `none` clamps to `low`; named tool choice must be
 flat on the Responses wire. Preserve encrypted reasoning on both normal and
 streaming tool round trips.
 
-`src/gateway/quota.rs` adds a per-identity dollar cap beside the RPM/TPM
-buckets: `budget_usd` + `budget_window_secs` on an `Identity`, checked before
-dispatch and charged after (cost is only knowable once a response exists, so
-one in-flight request can overshoot). Windows tumble rather than slide, because
-the fleet-wide store is one counter per window. `SpendCap::with_store` takes the
-Redis-backed `DistributedGateway` in distributed mode so `$100/day` means one
-hundred dollars fleet-wide, not per replica. **A response the catalog cannot
-price is not charged** — recording zero would let an unpriced model run forever
-under a budget; `cost_usd: null` is the signal that a price is missing.
+`src/gateway/attempt.rs` and `budget.rs` reserve configured `budget_usd` before
+each actual send, including retries, repairs, and fallback attempts. Local and
+Redis admission atomically coordinate rate limits with finite spend reservations.
+Unknown or incomplete accounting retains liability; a partial provider bill is
+a lower bound (`cost_source: "provider_floor"`), while a valid terminal provider
+bill can correct the final amount. Strict caps require trusted pricing and token
+limits. `budget_allow_unpriced` explicitly accepts unknown pre-send liability
+and holds the remaining allowance until authoritative settlement. Distributed
+origins retain legacy spend before queueing; follow the transition requirements
+in `docs/src/proxy/scaling.md` when upgrading a fleet.
 The native Chat Completions streams must use their own parser in the client;
 passing them to the Responses parser silently drops all events.
 
@@ -118,9 +120,11 @@ cargo clippy --workspace --features proxy -- -D warnings
 cargo package -p llmshim-catalog --allow-dirty
 ```
 
-The root package is 0.4.0 because log/proxy usage structs gain fields; no
-release has been performed. Future release workflows must publish the catalog
-dependency before llmshim. Public code, fixtures, artifacts, and docs must use
+The root and language clients prepare version 0.12.0 because the public
+`CostSource` unions gain `provider_floor`; exhaustive consumers must handle it.
+The version metadata does not itself publish a release. Release workflows must
+publish the catalog dependency before llmshim. Public code, fixtures,
+artifacts, and docs must use
 generic examples and contain no private consumer identities or context.
 
 ### Cache annotations and shared schema normalization
