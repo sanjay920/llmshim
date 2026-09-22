@@ -98,6 +98,7 @@ fn response_with_tool_calls() {
             cache_write_tokens: 0,
             total_tokens: 15,
             cost_usd: None,
+            cost_source: None,
         },
         latency_ms: 500,
     };
@@ -133,6 +134,7 @@ fn response_with_reasoning_tokens() {
             cache_write_tokens: 0,
             total_tokens: 65,
             cost_usd: None,
+            cost_source: None,
         },
         latency_ms: 1000,
     };
@@ -189,6 +191,7 @@ fn stream_event_usage_has_tokens() {
         cache_write_tokens: 0,
         total_tokens: 18,
         cost_usd: None,
+        cost_source: None,
     });
     let v: Value = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
     assert_eq!(v["type"], "usage");

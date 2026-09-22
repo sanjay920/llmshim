@@ -59,10 +59,23 @@ Anthropic's `input_tokens` excludes the cache read, while the OpenAI Responses,
 Chat Completions and Gemini prompt totals include it. llmshim resolves the
 disagreement at the transport boundary so one counter means one thing.
 
-`cost_usd` estimates standard token charges: uncached input, output, cache
-reads and cache writes each at their own catalog rate, so a cached prompt is
-never billed twice. **`null` means the catalog carries no price for the model —
-it never means free.** A model priced for input but not for the cache reads a
+`cost_usd` carries one of two numbers, and `cost_source` says which:
+
+- `cost_source: "provider"` — the provider reported what it charged for this
+  generation and `cost_usd` is that figure, not an estimate. OpenRouter does
+  this (as `usage.cost`), unconditionally and on streams too. It needs no
+  catalog entry, so it answers for aggregator slugs the catalog has never
+  heard of.
+- `cost_source: "catalog"` — computed here from catalog prices, as below.
+
+A reported bill always wins. The catalog product is an estimate *of* that bill,
+and deliberately an upper bound, so letting it overwrite the bill would discard
+the only exact figure in the response.
+
+The catalog estimate charges standard token classes: uncached input, output,
+cache reads and cache writes each at their own catalog rate, so a cached prompt
+is never billed twice. **`null` means the catalog carries no price for the
+model — it never means free.** A model priced for input but not for the cache reads a
 response actually used charges that class at the model's highest published
 rate, yielding a conservative estimate. Context tiers include cached input
 when choosing the rate and apply to the entire request. For native Grok 4.7,

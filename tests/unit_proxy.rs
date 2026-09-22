@@ -135,6 +135,7 @@ fn chat_response_serializes() {
             cache_write_tokens: 0,
             total_tokens: 15,
             cost_usd: None,
+            cost_source: None,
         },
         latency_ms: 1200,
     };
@@ -173,6 +174,7 @@ fn chat_response_no_reasoning() {
             cache_write_tokens: 0,
             total_tokens: 7,
             cost_usd: None,
+            cost_source: None,
         },
         latency_ms: 500,
     };
@@ -232,6 +234,7 @@ fn stream_event_usage() {
         cache_write_tokens: 0,
         total_tokens: 170,
         cost_usd: None,
+        cost_source: None,
     });
     let json = serde_json::to_string(&event).unwrap();
     let parsed: Value = serde_json::from_str(&json).unwrap();

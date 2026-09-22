@@ -161,6 +161,16 @@ impl Provider for OpenRouter {
             "seed",
             "stream",
             "stream_options",
+            // `usage: {include: bool}`, OpenRouter's former accounting
+            // switch. Forwarded but never injected: measured 2026-09-22,
+            // accounting is unconditional — a stream carries it with no
+            // `stream_options`, and `include: false` does not suppress it.
+            // OpenRouter's docs now call both parameters deprecated and
+            // without effect. So there is nothing to ask for, and injecting a
+            // no-op would be a passthrough that invents a parameter; an
+            // explicit caller value still rides through for any
+            // OpenRouter-compatible endpoint that does honour it.
+            "usage",
             "tools",
             "tool_choice",
             "parallel_tool_calls",
