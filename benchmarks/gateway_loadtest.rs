@@ -8,6 +8,7 @@
 //!   1. **Zero loss** under a burst far larger than the concurrency limit.
 //!   2. **Priority holds under load** — high-tier p50 latency ≪ low-tier p50
 //!      when the concurrency slots are saturated.
+//!
 //! Exits non-zero if either invariant fails.
 
 use std::sync::atomic::{AtomicU64, Ordering};
