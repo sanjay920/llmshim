@@ -229,7 +229,7 @@ fn deepseek_reasoning_echoes_to_same_family_and_drops_on_cross_family_hops() {
 
 #[test]
 fn family_lookup_normalizes_an_openrouter_variant_suffix_but_keeps_the_wire_id() {
-    // MOH-240: a suffixed OpenRouter slug (`:nitro`, `:floor`, …) missed the
+    // A suffixed OpenRouter slug (`:nitro`, `:floor`, …) missed the
     // catalog entirely, so its family came back `None` and reasoning replay
     // was dropped as `unknown_family`. The lookup should normalize; the id
     // ReplayTarget stores (and that goes out on the wire) must not change.
