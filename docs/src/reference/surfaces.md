@@ -91,5 +91,9 @@ with a fixed error and release its input source. EOF does not manufacture a
 completed event from an unterminated frame. These are framing limits, not an
 RSS ceiling or a transport timeout.
 
+Collected text and refusals, reasoning text and opaque fragments, and native
+facade text append to their existing buffers. Completed reasoning snapshots
+still replace their matching block while preserving its original provenance.
+
 For shape details, continue to the [request field map](request-fields.md) and
 [HTTP API](../proxy/http-api.md).
