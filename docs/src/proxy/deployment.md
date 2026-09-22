@@ -1,7 +1,8 @@
 # Deploy the proxy safely
 
-The llmshim proxy has **no built-in authentication and no TLS**. It also sends
-permissive CORS headers. Do not expose it directly to an untrusted network.
+The llmshim proxy has **no built-in authentication and no TLS**. It rejects
+browser-originated requests by default. Do not expose it directly to an
+untrusted network.
 
 The supported public topology puts an authentication and TLS gateway in front
 of the proxy:
@@ -16,6 +17,24 @@ flowchart LR
 The gateway can be any reverse proxy or API gateway that terminates TLS,
 authenticates callers, authorizes access, and applies your network policy.
 Keep the llmshim listener reachable only from that trusted boundary.
+
+## Browser applications
+
+SDKs and other HTTP clients that do not send an `Origin` header continue to
+work normally. A browser application must be explicitly trusted before the
+proxy or gateway will process its requests:
+
+```bash
+LLMSHIM_TRUSTED_ORIGINS=https://app.example,http://localhost:5173 llmshim proxy
+```
+
+The value is a comma-separated list of exact `http` or `https` origins. Paths,
+queries, fragments, credentials, wildcards, and opaque origins are rejected.
+Each allowed origin receives CORS headers, including the private-network
+preflight permission required by browsers that enforce Private Network Access.
+An unlisted origin is rejected before it can reach a proxy, gateway, or native
+API route. This browser control does not replace proxy authentication, TLS, or
+network access policy.
 
 ## Install a proxy-enabled binary
 

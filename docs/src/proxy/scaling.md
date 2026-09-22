@@ -75,6 +75,13 @@ When neither RPM nor TPM is set, proactive rate limiting is disabled;
 concurrency backpressure still applies. Token permits are estimates based on
 request size and requested output, not provider billing measurements.
 
+For an authenticated gateway identity, an omitted `rpm` or `tpm` field means
+that dimension is unlimited. An explicit `0` means that dimension admits no
+requests; the gateway rejects before dispatch and does not consume the other
+tenant bucket. This tenant policy is separate from the global provider rate
+limiter, whose configured zero values retain its existing provider-level
+behavior.
+
 ## Provider health
 
 Rate limiting and health are different questions. A `429` means the provider is

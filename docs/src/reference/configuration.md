@@ -84,10 +84,13 @@ its lock and temporary files. The stock Docker helper does not mount it.
 |---|---|---|
 | `LLMSHIM_HOST` | config value, then `0.0.0.0` | Bind address |
 | `LLMSHIM_PORT` | config value, then `3000` | Bind port |
+| `LLMSHIM_TRUSTED_ORIGINS` | unset | Comma-separated exact browser origins allowed to call the proxy or gateway |
 
 The environment overrides `[proxy]`. The proxy has no built-in authentication
 or TLS; the bind address is not a security boundary by itself. See
-[Deploy the proxy safely](../proxy/deployment.md).
+[Deploy the proxy safely](../proxy/deployment.md). When `LLMSHIM_TRUSTED_ORIGINS`
+is unset, requests with an `Origin` header are rejected before dispatch; SDK
+requests without one are unchanged.
 
 ## Retries
 

@@ -225,10 +225,11 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
 // ===========================================================================
 #[cfg(test)]
 mod tests {
+    use super::super::origin::OriginPolicy;
     use super::super::ratelimit::{
         Backpressure, InMemoryRateLimiter, RateKey, RateLimitConfig, RateLimiter,
     };
-    use super::super::{app_with_state, AppState};
+    use super::super::{app_with_origin_policy, app_with_state, AppState};
     use crate::router::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -380,5 +381,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn browser_origins_are_admitted_before_preflight_or_provider_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "id": "mock-response",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {}
+                })
+                .to_string(),
+            )
+            .expect(2)
+            .create_async()
+            .await;
+        let router = Router::new().register(
+            "local",
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                "local",
+                server.url(),
+                None,
+            )),
+        );
+        let state = Arc::new(AppState {
+            router,
+            logger: None,
+            limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default())),
+            backpressure: Backpressure::new(256, Duration::from_millis(50)),
+        });
+        let app = app_with_origin_policy(
+            state,
+            OriginPolicy::from_csv("https://trusted.example").expect("trusted origin"),
+        );
+
+        let denied_preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/chat")
+                    .header("origin", "https://untrusted.example")
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_preflight.status(), StatusCode::FORBIDDEN);
+        assert!(!denied_preflight
+            .headers()
+            .contains_key("access-control-allow-origin"));
+
+        let denied_simple_request = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("host", "trusted.example")
+                    .header("origin", "https://untrusted.example")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("browser-simple-request"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_simple_request.status(), StatusCode::FORBIDDEN);
+
+        let trusted_preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/chat")
+                    .header("origin", "https://trusted.example")
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "content-type")
+                    .header("access-control-request-private-network", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(trusted_preflight.status().is_success());
+        assert_eq!(
+            trusted_preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://trusted.example"
+        );
+        assert_eq!(
+            trusted_preflight
+                .headers()
+                .get("access-control-allow-private-network")
+                .unwrap(),
+            "true"
+        );
+
+        let sdk_response = post_chat(app.clone(), "/v1/chat", "local/test").await;
+        assert_eq!(sdk_response.status(), StatusCode::OK);
+
+        let trusted_browser_response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("origin", "https://trusted.example")
+                    .header("content-type", "application/json")
+                    .body(chat_body("local/test"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trusted_browser_response.status(), StatusCode::OK);
+        assert_eq!(
+            trusted_browser_response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://trusted.example"
+        );
+        upstream.assert_async().await;
     }
 }

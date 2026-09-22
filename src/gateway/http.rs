@@ -17,6 +17,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::proxy::origin::OriginPolicy;
 use async_trait::async_trait;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
@@ -28,7 +29,6 @@ use axum::Json;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tower_http::cors::CorsLayer;
 
 use tokio::sync::mpsc;
 
@@ -697,6 +697,13 @@ async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> 
 
 /// Build the gateway axum application.
 pub fn app(state: Arc<GatewayState>) -> axum::Router {
+    app_with_origin_policy(state, OriginPolicy::from_env())
+}
+
+pub(crate) fn app_with_origin_policy(
+    state: Arc<GatewayState>,
+    origin_policy: OriginPolicy,
+) -> axum::Router {
     axum::Router::new()
         .route("/v1/chat", post(chat))
         .route("/v1/chat/completions", post(chat))
@@ -712,7 +719,10 @@ pub fn app(state: Arc<GatewayState>) -> axum::Router {
             native_translate,
         ))
         .layer(axum::middleware::from_fn(request_id))
-        .layer(CorsLayer::permissive())
+        .layer(origin_policy.cors_layer())
+        .layer(axum::middleware::from_fn(move |request, next| {
+            crate::proxy::origin::admit_browser_origin(origin_policy.clone(), request, next)
+        }))
         .with_state(state)
 }
 
@@ -751,6 +761,14 @@ mod native_tests {
     use tower::ServiceExt;
 
     fn configured_state(base_url: &str) -> Arc<GatewayState> {
+        configured_state_with_limits(base_url, None, None)
+    }
+
+    fn configured_state_with_limits(
+        base_url: &str,
+        requests_per_minute: Option<u32>,
+        tokens_per_minute: Option<u32>,
+    ) -> Arc<GatewayState> {
         let router = Arc::new(Router::new().register(
             "local",
             Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
@@ -772,8 +790,8 @@ mod native_tests {
         let identity = crate::gateway::auth::Identity {
             tenant: "test-tenant".into(),
             tier: 1,
-            rpm: None,
-            tpm: None,
+            rpm: requests_per_minute,
+            tpm: tokens_per_minute,
             budget_usd: None,
             budget_window_secs: None,
             budget_allow_unpriced: false,
@@ -1055,6 +1073,47 @@ mod native_tests {
     }
 
     #[tokio::test]
+    async fn zero_tenant_quota_rejects_before_upstream_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "unexpected",
+                    "choices": [{"message": {"role": "assistant", "content": "unexpected"}, "finish_reason": "stop"}],
+                    "usage": {}
+                })
+                .to_string(),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        let state = configured_state_with_limits(&server.url(), Some(0), None);
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::from(
+                        json!({
+                            "model": "local/test",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "60");
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn native_routes_preserve_auth_queue_and_protocol_scoped_idempotency() {
         let mut server = mockito::Server::new_async().await;
         let upstream=server.mock("POST","/chat/completions").with_body(json!({"id":"r","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{}}).to_string()).expect(2).create_async().await;
@@ -1228,5 +1287,64 @@ mod native_tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
         upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn browser_origin_policy_covers_gateway_and_native_routes() {
+        let server = mockito::Server::new_async().await;
+        let state = configured_state(&server.url());
+        let application = app_with_origin_policy(
+            state,
+            OriginPolicy::from_csv("https://trusted.example").expect("trusted origin"),
+        );
+
+        let denied_native_request = application
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("host", "trusted.example")
+                    .header("origin", "https://untrusted.example")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("browser-simple-request"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_native_request.status(), StatusCode::FORBIDDEN);
+
+        let trusted_native_preflight = application
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/messages")
+                    .header("origin", "https://trusted.example")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "authorization,content-type",
+                    )
+                    .header("access-control-request-private-network", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(trusted_native_preflight.status().is_success());
+        assert_eq!(
+            trusted_native_preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://trusted.example"
+        );
+        assert_eq!(
+            trusted_native_preflight
+                .headers()
+                .get("access-control-allow-private-network")
+                .unwrap(),
+            "true"
+        );
     }
 }
