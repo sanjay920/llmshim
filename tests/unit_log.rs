@@ -2,6 +2,9 @@ use llmshim::log::{LogEntry, RequestTimer};
 use serde_json::json;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[test]
 fn log_entry_from_response_extracts_tokens() {
     let resp = json!({
@@ -100,4 +103,40 @@ fn request_timer_measures_elapsed() {
     std::thread::sleep(Duration::from_millis(10));
     let elapsed = timer.elapsed();
     assert!(elapsed.as_millis() >= 10);
+}
+
+#[cfg(unix)]
+#[test]
+fn file_logger_restricts_new_and_existing_log_permissions() {
+    let temporary_directory = tempfile::tempdir().unwrap();
+    let new_log_path = temporary_directory.path().join("new.jsonl");
+    let logger = llmshim::log::Logger::to_file(new_log_path.to_str().unwrap()).unwrap();
+    drop(logger);
+    assert_eq!(
+        std::fs::metadata(&new_log_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let existing_log_path = temporary_directory.path().join("existing.jsonl");
+    std::fs::write(&existing_log_path, "old\n").unwrap();
+    std::fs::set_permissions(&existing_log_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let logger = llmshim::log::Logger::to_file(existing_log_path.to_str().unwrap()).unwrap();
+    logger.log(&LogEntry::from_error(
+        "provider",
+        "model",
+        "sanitized error",
+        Duration::from_millis(1),
+    ));
+    assert_eq!(
+        std::fs::metadata(&existing_log_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
