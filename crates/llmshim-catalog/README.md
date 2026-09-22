@@ -116,6 +116,20 @@ OpenAI-compatible `/models` discovery for self-hosted or entitlement-gated
 providers. The token is only sent to that URL, never to models.dev or the cache.
 Provider discoveries persist in the handle across subsequent catalog refreshes.
 
+Remote imports are preflighted before model records and lookup indexes are
+constructed. Each import has a ceiling of 32,768 rows and 128 MiB of estimated
+identity and index bookkeeping, including repeated provider identifiers and
+lookup aliases. Duplicate provider-listing rows consume this budget too; the
+byte estimate can refuse an import before its row ceiling. Excessive imports
+return a fixed error and preserve the previous snapshot, cached body, and
+retained provider layers. Accepted identifiers use the existing canonicalization
+and lookup alias rules.
+
+This budget controls identity expansion after parsing. The decoded-body and
+parsed-JSON limits separately bound input data; other model metadata, snapshots,
+parser scratch and allocator overhead can coexist with the imported identities.
+It is not a process memory limit.
+
 Known aliases include `google/` → `gemini/`, dotted/dashed Claude versions, and
 unambiguous regional profile names. Regional profile lookup retains the exact
 wire ID; it never silently selects between two regions. Ambiguous bare names

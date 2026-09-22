@@ -3,6 +3,7 @@
 pub mod aliases;
 pub mod builtin;
 mod capabilities;
+mod import_budget;
 mod merge;
 mod parse;
 mod refresh;
@@ -238,6 +239,14 @@ impl Catalog {
         let data = response["data"].as_array().ok_or(CatalogError::Invalid(
             "provider models must contain a data array",
         ))?;
+        let mut import_budget = import_budget::ImportBudget::default();
+        for model_value in data {
+            let model_name = model_value["id"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or(CatalogError::Invalid("provider model has no id"))?;
+            import_budget.admit(provider, model_name)?;
+        }
         let mut models = Vec::new();
         for value in data {
             let name = value["id"]
