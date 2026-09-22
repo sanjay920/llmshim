@@ -208,7 +208,10 @@ async fn native_endpoints_preserve_backpressure_status_and_retry_header() {
         AppState,
     };
     let state = Arc::new(AppState {
-        router: Router::new(),
+        router: Router::new().register(
+            "local",
+            Box::new(OpenAiCompatible::new("local", "http://127.0.0.1:9", None)),
+        ),
         logger: None,
         limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default())),
         backpressure: Backpressure::new(1, std::time::Duration::from_millis(5)),

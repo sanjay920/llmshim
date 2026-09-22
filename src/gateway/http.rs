@@ -38,9 +38,9 @@ use crate::gateway::{
     StreamChunk,
 };
 use crate::log::{Logger, RequestTimer};
-use crate::proxy::convert::{chunk_to_events, request_to_value, value_to_response};
+use crate::proxy::convert::{chunk_to_events, value_to_response};
 use crate::proxy::error::ApiError;
-use crate::proxy::ratelimit::{build_limiter, estimate_request_tokens, penalty_duration};
+use crate::proxy::ratelimit::{build_limiter, estimate_prepared_request_tokens, penalty_duration};
 use crate::proxy::types::{ChatRequest, HealthResponse, ModelsResponse, StreamEvent};
 use crate::router::Router;
 
@@ -408,6 +408,7 @@ fn build_request(
 ) -> Result<
     (
         String,
+        String,
         GatewayRequest,
         crate::gateway::auth::IdentifiedCaller,
     ),
@@ -420,18 +421,17 @@ fn build_request(
         );
         ApiError::Unauthorized
     })?;
-    crate::proxy::convert::validate_request(req)?;
-    let provider_name = {
-        let (provider, _model) = state.router.resolve(&req.model)?;
-        provider.name().to_string()
-    };
+    let prepared_request = crate::proxy::convert::prepare_request(&state.router, req)?;
+    let provider_name = prepared_request.target.provider_name.clone();
+    let budget_model = prepared_request.target.model.clone();
+    let permits = estimate_prepared_request_tokens(&prepared_request);
     let gw = GatewayRequest {
         provider: provider_name.clone(),
         tier: identified_caller.identity.tier,
-        permits: estimate_request_tokens(req),
-        payload: request_to_value(req),
+        permits,
+        payload: prepared_request.payload,
     };
-    Ok((provider_name, gw, identified_caller))
+    Ok((provider_name, budget_model, gw, identified_caller))
 }
 
 fn idempotency_conflict() -> ApiError {
@@ -484,10 +484,10 @@ async fn chat(
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let (provider_name, gw, identified_caller) = build_request(&state, &headers, &req)?;
+    let (provider_name, budget_model, gw, identified_caller) =
+        build_request(&state, &headers, &req)?;
     let identity = &identified_caller.identity;
     state.enforce_quota(identity, &provider_name, gw.permits)?;
-    let (_, budget_model) = state.router.resolve(&req.model)?;
     state
         .enforce_budget(identity, &provider_name, &budget_model)
         .await?;
@@ -550,18 +550,15 @@ async fn chat_stream_inner(
     headers: HeaderMap,
     req: ChatRequest,
 ) -> Response {
-    let (provider_name, gw, identified_caller) = match build_request(&state, &headers, &req) {
-        Ok(t) => t,
-        Err(e) => return e.into_response(),
-    };
+    let (provider_name, budget_model, gw, identified_caller) =
+        match build_request(&state, &headers, &req) {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let identity = identified_caller.identity;
     if let Err(e) = state.enforce_quota(&identity, &provider_name, gw.permits) {
         return e.into_response();
     }
-    let budget_model = match state.router.resolve(&req.model) {
-        Ok((_, m)) => m,
-        Err(e) => return ApiError::from(e).into_response(),
-    };
     if let Err(e) = state
         .enforce_budget(&identity, &provider_name, &budget_model)
         .await
@@ -769,12 +766,37 @@ mod native_tests {
         requests_per_minute: Option<u32>,
         tokens_per_minute: Option<u32>,
     ) -> Arc<GatewayState> {
-        let router = Arc::new(Router::new().register(
+        let router = Router::new().register(
             "local",
             Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
                 "local", base_url, None,
             )),
-        ));
+        );
+        configured_state_with_router_and_limits(router, requests_per_minute, tokens_per_minute)
+    }
+
+    fn configured_state_for_provider(base_url: &str, provider_name: &str) -> Arc<GatewayState> {
+        let router = Router::new().register(
+            provider_name,
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                provider_name,
+                base_url,
+                None,
+            )),
+        );
+        configured_state_with_router(router)
+    }
+
+    fn configured_state_with_router(router: Router) -> Arc<GatewayState> {
+        configured_state_with_router_and_limits(router, None, None)
+    }
+
+    fn configured_state_with_router_and_limits(
+        router: Router,
+        requests_per_minute: Option<u32>,
+        tokens_per_minute: Option<u32>,
+    ) -> Arc<GatewayState> {
+        let router = Arc::new(router);
         let config = GatewayConfig::default();
         let limiter = Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
             crate::proxy::ratelimit::RateLimitConfig::default(),
@@ -1289,6 +1311,109 @@ mod native_tests {
         upstream.assert_async().await;
     }
 
+    #[test]
+    fn gateway_queues_the_route_expanded_target_and_token_estimate() {
+        let router = Router::new()
+            .register(
+                "vllm",
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    "vllm",
+                    "http://127.0.0.1:9",
+                    None,
+                )),
+            )
+            .alias("served-alias", "vllm/served")
+            .route(
+                "large",
+                crate::config::Route {
+                    model: "served-alias".into(),
+                    settings: std::collections::BTreeMap::from([
+                        ("max_tokens".into(), json!(32_000)),
+                        (
+                            "tools".into(),
+                            json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]),
+                        ),
+                    ]),
+                },
+            );
+        let state = configured_state_with_router(router);
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer test-key"),
+        )]);
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model":"route/large",
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        let (provider_name, budget_model, gateway_request, _) =
+            match build_request(&state, &headers, &request) {
+                Ok(prepared) => prepared,
+                Err(_) => panic!("route request should be admitted"),
+            };
+        assert_eq!(provider_name, "vllm");
+        assert_eq!(budget_model, "served");
+        assert_eq!(gateway_request.provider, "vllm");
+        assert_eq!(gateway_request.payload["model"], "served-alias");
+        assert_eq!(gateway_request.payload["max_tokens"], 32_000);
+        assert!(gateway_request.permits >= 32_000);
+    }
+
+    #[test]
+    fn gateway_uses_dynamic_openai_compatible_namespace_and_wire_policy() {
+        for (wire, prompt_field, output_field) in [
+            (
+                crate::reasoning::WireFormat::OpenAiChat,
+                "messages",
+                "max_tokens",
+            ),
+            (
+                crate::reasoning::WireFormat::OpenAiResponses,
+                "input",
+                "max_output_tokens",
+            ),
+        ] {
+            let router = Router::new().register(
+                "local",
+                Box::new(
+                    crate::providers::openai_compat::OpenAiCompatible::new(
+                        "local",
+                        "http://127.0.0.1:9",
+                        None,
+                    )
+                    .with_wire(wire),
+                ),
+            );
+            let state = configured_state_with_router(router);
+            let headers = HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer test-key"),
+            )]);
+
+            for protected_field in ["model", prompt_field] {
+                let request: ChatRequest = serde_json::from_value(json!({
+                    "model":"local/declared",
+                    "messages":[{"role":"user","content":"canonical"}],
+                    "provider_config":{"x-local":{(protected_field):"replacement"}}
+                }))
+                .unwrap();
+                assert!(build_request(&state, &headers, &request).is_err());
+            }
+
+            let request: ChatRequest = serde_json::from_value(json!({
+                "model":"local/declared",
+                "messages":[{"role":"user","content":"canonical"}],
+                "provider_config":{"x-local":{(output_field):7_000}}
+            }))
+            .unwrap();
+            let (_, _, gateway_request, _) = match build_request(&state, &headers, &request) {
+                Ok(prepared) => prepared,
+                Err(_) => panic!("native output limit should remain supported"),
+            };
+            assert!(gateway_request.permits >= 7_000);
+        }
+    }
+
     #[tokio::test]
     async fn browser_origin_policy_covers_gateway_and_native_routes() {
         let server = mockito::Server::new_async().await;
@@ -1346,5 +1471,69 @@ mod native_tests {
                 .unwrap(),
             "true"
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_rejects_provider_config_admission_overrides_before_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let state = configured_state_for_provider(&server.url(), "local");
+        for (path, provider_config) in [
+            ("/v1/chat", json!({"model": "local/unpriced"})),
+            ("/v1/chat/stream", json!({"x-local": {"messages": []}})),
+        ] {
+            let response = app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-key")
+                        .body(Body::from(
+                            json!({
+                                "model": "local/test",
+                                "messages": [{"role": "user", "content": "canonical"}],
+                                "provider_config": provider_config,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let receipt_directory = tempfile::tempdir().unwrap();
+        for path in ["/v1/messages", "/v1/chat/completions"] {
+            let application = app(state.clone()).layer(Extension(Arc::new(
+                crate::proxy::wire::Receipts::new(receipt_directory.path().to_owned()),
+            )));
+            let response = application
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-key")
+                        .body(Body::from(
+                            json!({
+                                "model": "local/test",
+                                "messages": [{"role": "user", "content": "canonical"}],
+                                "x-local": {"messages": []},
+                                "max_tokens": 100
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        upstream.assert_async().await;
     }
 }
