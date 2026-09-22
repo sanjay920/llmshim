@@ -679,12 +679,13 @@ impl ShimClient {
                 response,
                 self.deadlines.stream_semantic_idle,
                 attempt_deadline,
+                self.stream_retention_limits,
             )
             .await;
-            if let Some(native_terminal) = collected.native_terminal.as_ref() {
+            if let Some(native_usage) = collected.native_usage.as_ref() {
                 observe_native_response_usage(
                     &target,
-                    native_terminal,
+                    native_usage,
                     &mut tracker,
                     self.deadlines.policy_callback,
                     attempt_deadline,
