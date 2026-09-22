@@ -20,6 +20,7 @@
 //! The token-bucket math is factored into a small pure [`TokenBucket`] type so
 //! it can be unit-tested deterministically with `tokio::time` paused.
 
+use super::convert::{active_native_namespace, AdmissionTarget, PreparedRequest};
 use super::types::ChatRequest;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -751,53 +752,213 @@ impl Backpressure {
 // Token estimation & limiter construction
 // ===========================================================================
 
-/// Rough token footprint of a request, for the TPM bucket. Not exact — a
-/// conservative-ish `chars / 4` over message content plus the requested (or
-/// default) output budget. Errs toward over-counting so we protect the limit.
+/// Target-independent token estimate for callers that only have the typed
+/// proxy envelope. HTTP admission uses the route-expanded, provider-aware
+/// estimator internally.
 pub fn estimate_request_tokens(req: &ChatRequest) -> u32 {
-    let mut input_chars = 0usize;
-    for m in &req.messages {
-        input_chars += m.role.len();
-        input_chars += content_len(&m.content);
-        if let Some(tc) = &m.tool_calls {
-            input_chars += tc.to_string().len();
-        }
+    let mut input_chars = serde_json::to_string(&req.messages)
+        .map(|messages| messages.len())
+        .unwrap_or(0);
+    for prompt_bearing_value in [req.provider_config.as_ref(), req.response_format.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        input_chars = input_chars.saturating_add(prompt_bearing_value.to_string().len());
     }
-    let input_tokens = (input_chars / 4) as u64;
-    let output_tokens = req
+    let input_tokens = u64::try_from(input_chars / 4).unwrap_or(u64::MAX);
+    let configured_output_tokens = req.config.as_ref().and_then(|config| config.max_tokens);
+    let provider_output_tokens = req
         .provider_config
         .as_ref()
-        .and_then(|config| {
-            config
-                .get("max_tokens")
-                .or_else(|| config.get("max_completion_tokens"))
-        })
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| req.config.as_ref().and_then(|c| c.max_tokens))
+        .and_then(largest_provider_output_budget);
+    let output_tokens = configured_output_tokens
+        .into_iter()
+        .chain(provider_output_tokens)
+        .max()
         .unwrap_or(DEFAULT_MAX_TOKENS_ESTIMATE);
     input_tokens
         .saturating_add(output_tokens)
         .clamp(1, u32::MAX as u64) as u32
 }
 
-/// Character length of a message `content` field, which may be a plain string
-/// or an array of content blocks.
-fn content_len(content: &serde_json::Value) -> usize {
-    match content {
-        serde_json::Value::String(s) => s.len(),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .map(|it| {
-                it.get("text")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.len())
-                    // Non-text blocks (images, etc.): count serialized size.
-                    .unwrap_or_else(|| it.to_string().len())
-            })
-            .sum(),
-        serde_json::Value::Null => 0,
-        other => other.to_string().len(),
+pub(crate) fn estimate_prepared_request_tokens(prepared: &PreparedRequest) -> u32 {
+    let mut prompt_characters = 0usize;
+    for field in ["messages", "tools", "response_format", "x-shim"] {
+        if let Some(value) = prepared.payload.get(field) {
+            prompt_characters = prompt_characters.saturating_add(value.to_string().len());
+        }
     }
+    if prepared.target.provider_name == "anthropic" {
+        if let Some(output_configuration) = prepared.payload.get("output_config") {
+            prompt_characters =
+                prompt_characters.saturating_add(output_configuration.to_string().len());
+        }
+    }
+    prompt_characters = prompt_characters.saturating_add(active_native_prompt_characters(prepared));
+    let estimated_input_tokens = u64::try_from(prompt_characters / 4).unwrap_or(u64::MAX);
+    let estimated_output_tokens = effective_output_budget(prepared);
+    estimated_input_tokens
+        .saturating_add(estimated_output_tokens)
+        .clamp(1, u32::MAX as u64) as u32
+}
+
+fn active_native_prompt_characters(prepared: &PreparedRequest) -> usize {
+    let Some(active_namespace) = active_native_namespace(&prepared.target) else {
+        return 0;
+    };
+    let Some(native_configuration) = prepared
+        .payload
+        .get(active_namespace)
+        .and_then(serde_json::Value::as_object)
+    else {
+        return 0;
+    };
+    prepared
+        .target
+        .policy
+        .native_prompt_fields()
+        .iter()
+        .fold(0usize, |total, field| {
+            total.saturating_add(
+                native_configuration
+                    .get(*field)
+                    .map(|value| value.to_string().len())
+                    .unwrap_or_default(),
+            )
+        })
+}
+
+fn portable_output_budget(request: &serde_json::Value) -> Option<u64> {
+    request
+        .get("max_tokens")
+        .or_else(|| request.get("max_completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn native_u64(request: &serde_json::Value, namespace: &str, path: &[&str]) -> Option<u64> {
+    let mut value = request.get(namespace)?;
+    for field in path {
+        value = value.get(*field)?;
+    }
+    value.as_u64()
+}
+
+fn native_direct_output_budget(
+    request: &serde_json::Value,
+    target: &AdmissionTarget,
+) -> Option<u64> {
+    let namespace = active_native_namespace(target)?;
+    target
+        .policy
+        .native_output_limit_fields()
+        .iter()
+        .filter_map(|field| native_u64(request, namespace, &[*field]))
+        .max()
+}
+
+fn reasoning_output_budget(request: &serde_json::Value, target: &AdmissionTarget) -> Option<u64> {
+    let namespace = active_native_namespace(target)?;
+    match target.provider_name.as_str() {
+        "openrouter" | "chatgpt" => native_u64(request, namespace, &["reasoning", "max_tokens"]),
+        "anthropic" => {
+            if request
+                .get(namespace)
+                .and_then(|configuration| configuration.get("thinking"))
+                .is_some()
+            {
+                native_u64(request, namespace, &["thinking", "budget_tokens"])
+            } else {
+                request
+                    .pointer("/thinking/budget_tokens")
+                    .and_then(serde_json::Value::as_u64)
+            }
+        }
+        "gemini" => native_u64(request, namespace, &["thinkingConfig", "thinkingBudget"]),
+        _ => None,
+    }
+}
+
+fn omitted_output_budget(target: &AdmissionTarget) -> u64 {
+    if target.provider_name == "anthropic" {
+        return 8_192;
+    }
+    crate::catalog::resolve(&format!("{}/{}", target.provider_name, target.model))
+        .or_else(|| crate::catalog::resolve(&target.model))
+        .and_then(|model| model.max_output_tokens)
+        .map(u64::from)
+        .unwrap_or_else(|| match target.provider_name.as_str() {
+            "openai" | "chatgpt" | "xai" => 128_000,
+            "gemini" => 65_536,
+            "openrouter" => 1_048_576,
+            _ => DEFAULT_MAX_TOKENS_ESTIMATE,
+        })
+}
+
+fn omitted_prepared_output_budget(prepared: &PreparedRequest) -> u64 {
+    let primary_budget = omitted_output_budget(&prepared.target);
+    if prepared.target.provider_name != "openrouter" {
+        return primary_budget;
+    }
+    prepared
+        .payload
+        .pointer("/x-openrouter/models")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|model| {
+            crate::catalog::resolve(&format!("openrouter/{model}"))
+                .or_else(|| crate::catalog::resolve(model))
+                .and_then(|model| model.max_output_tokens)
+                .map(u64::from)
+                .unwrap_or(1_048_576)
+        })
+        .fold(primary_budget, u64::max)
+}
+
+fn effective_output_budget(prepared: &PreparedRequest) -> u64 {
+    let requested_output_budget = if prepared.target.provider_name == "chatgpt" {
+        None
+    } else {
+        native_direct_output_budget(&prepared.payload, &prepared.target)
+            .or_else(|| portable_output_budget(&prepared.payload))
+    }
+    .unwrap_or_else(|| omitted_prepared_output_budget(prepared));
+    requested_output_budget
+        .max(reasoning_output_budget(&prepared.payload, &prepared.target).unwrap_or_default())
+}
+
+fn direct_output_budget(config: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    [
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "maxOutputTokens",
+    ]
+    .into_iter()
+    .filter_map(|field| config.get(field).and_then(serde_json::Value::as_u64))
+    .max()
+}
+
+fn largest_provider_output_budget(provider_config: &serde_json::Value) -> Option<u64> {
+    let provider_config = provider_config.as_object()?;
+    let mut largest_budget = direct_output_budget(provider_config);
+    for (field, native_config) in provider_config {
+        if !field.starts_with("x-") {
+            continue;
+        }
+        let Some(native_config) = native_config.as_object() else {
+            continue;
+        };
+        largest_budget = largest_budget.max(direct_output_budget(native_config));
+        if let Some(generation_config) = native_config
+            .get("generationConfig")
+            .and_then(serde_json::Value::as_object)
+        {
+            largest_budget = largest_budget.max(direct_output_budget(generation_config));
+        }
+    }
+    largest_budget
 }
 
 /// Build the configured limiter from the environment.
@@ -1271,6 +1432,317 @@ mod tests {
         .unwrap();
         // Should not panic and should include output budget.
         assert!(estimate_request_tokens(&req) >= 10);
+    }
+
+    #[test]
+    fn estimate_counts_tool_schemas_and_namespaced_output_limits() {
+        let large_description = "x".repeat(8_000);
+        let req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+            "config": {"max_tokens": 10},
+            "provider_config": {
+                "tools": [{"type": "function", "function": {
+                    "name": "lookup",
+                    "description": large_description,
+                    "parameters": {"type": "object", "properties": {}}
+                }}],
+                "x-openai": {"max_output_tokens": 4_000}
+            }
+        }))
+        .unwrap();
+        assert!(
+            estimate_request_tokens(&req) >= 6_000,
+            "the native output limit and serialized tool schema must both consume permits"
+        );
+    }
+
+    #[test]
+    fn estimate_counts_namespaced_native_prompt_content() {
+        let native_input = "x".repeat(8_000);
+        let req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider_config": {"x-openai": {"input": native_input}}
+        }))
+        .unwrap();
+        assert!(estimate_request_tokens(&req) >= 3_000);
+    }
+
+    fn prepared_request(
+        provider_name: &str,
+        model: &str,
+        wire: crate::reasoning::WireFormat,
+        payload: serde_json::Value,
+    ) -> PreparedRequest {
+        let policy = match provider_name {
+            "openai" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-openai",
+                &["model", "input"],
+                &["instructions", "prompt", "text", "tools", "tool_choice"],
+                &["max_output_tokens"],
+            ),
+            "chatgpt" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-chatgpt",
+                &["input"],
+                &["instructions", "text", "tools", "tool_choice", "reasoning"],
+                &[],
+            ),
+            "anthropic" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-anthropic",
+                &["model", "messages"],
+                &[
+                    "system",
+                    "tools",
+                    "tool_choice",
+                    "thinking",
+                    "output_config",
+                ],
+                &["max_tokens"],
+            ),
+            "gemini" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-gemini",
+                &["contents"],
+                &["systemInstruction", "tools", "toolConfig", "thinkingConfig"],
+                &[],
+            ),
+            "openrouter" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-openrouter",
+                &["model", "messages"],
+                &["tools", "tool_choice", "response_format", "reasoning"],
+                &["max_tokens", "max_completion_tokens"],
+            ),
+            "vllm" | "sglang" => match wire {
+                crate::reasoning::WireFormat::OpenAiResponses => {
+                    crate::provider::RequestAdmissionPolicy::namespaced(
+                        format!("x-{provider_name}"),
+                        &["model", "input"],
+                        &["instructions", "tools", "tool_choice"],
+                        &["max_output_tokens"],
+                    )
+                }
+                _ => crate::provider::RequestAdmissionPolicy::namespaced(
+                    format!("x-{provider_name}"),
+                    &["model", "messages"],
+                    &["tools", "tool_choice", "response_format"],
+                    &["max_tokens", "max_completion_tokens"],
+                ),
+            },
+            _ => crate::provider::RequestAdmissionPolicy::default(),
+        };
+        PreparedRequest {
+            payload,
+            target: AdmissionTarget {
+                provider_name: provider_name.into(),
+                model: model.into(),
+                policy,
+            },
+        }
+    }
+
+    #[test]
+    fn prepared_estimate_uses_provider_defaults_and_nested_reasoning_budgets() {
+        let anthropic = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({"model":"anthropic/claude-sonnet-5","messages":[]}),
+        );
+        assert_eq!(effective_output_budget(&anthropic), 8_192);
+
+        let openrouter = prepared_request(
+            "openrouter",
+            "anthropic/claude-sonnet-5",
+            crate::reasoning::WireFormat::OpenAiChat,
+            serde_json::json!({
+                "model":"openrouter/anthropic/claude-sonnet-5","messages":[],
+                "max_tokens": 500,
+                "x-openrouter":{"reasoning":{"max_tokens":12_000}}
+            }),
+        );
+        assert_eq!(effective_output_budget(&openrouter), 12_000);
+        let openrouter_routing = prepared_request(
+            "openrouter",
+            "anthropic/claude-sonnet-5",
+            crate::reasoning::WireFormat::OpenAiChat,
+            serde_json::json!({
+                "model":"openrouter/anthropic/claude-sonnet-5","messages":[],
+                "x-openrouter":{"models":["unknown/provider-model"]}
+            }),
+        );
+        assert_eq!(effective_output_budget(&openrouter_routing), 1_048_576);
+
+        let anthropic_thinking = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":4_000,
+                "thinking":{"type":"enabled","budget_tokens":3_000},
+                "x-anthropic":{"thinking":{"type":"enabled","budget_tokens":6_000}}
+            }),
+        );
+        assert_eq!(effective_output_budget(&anthropic_thinking), 6_000);
+
+        let gemini = prepared_request(
+            "gemini",
+            "gemini-3.8-flash",
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+            serde_json::json!({
+                "model":"gemini/gemini-3.8-flash","messages":[],"max_tokens":1_000,
+                "x-gemini":{"thinkingConfig":{"thinkingBudget":9_000}}
+            }),
+        );
+        assert_eq!(effective_output_budget(&gemini), 9_000);
+    }
+
+    #[test]
+    fn prepared_estimate_ignores_inactive_namespaces_and_schema_property_names() {
+        let baseline = prepared_request(
+            "openai",
+            "gpt-5.6-luna",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model":"openai/gpt-5.6-luna","messages":[],"max_tokens":200,
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{
+                    "type":"object","properties":{"max_tokens":{"const":u64::MAX},"input":{"type":"string"}}
+                }}}]
+            }),
+        );
+        let with_inactive_namespace = prepared_request(
+            "openai",
+            "gpt-5.6-luna",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model":"openai/gpt-5.6-luna","messages":[],"max_tokens":200,
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{
+                    "type":"object","properties":{"max_tokens":{"const":u64::MAX},"input":{"type":"string"}}
+                }}}],
+                "x-anthropic":{"max_tokens":u64::MAX,"input":"x".repeat(8_000)},
+                "x-unknown":{"max_output_tokens":u64::MAX}
+            }),
+        );
+        assert_eq!(effective_output_budget(&baseline), 200);
+        assert_eq!(effective_output_budget(&with_inactive_namespace), 200);
+        assert_eq!(
+            estimate_prepared_request_tokens(&baseline),
+            estimate_prepared_request_tokens(&with_inactive_namespace)
+        );
+
+        let active_instructions = prepared_request(
+            "openai",
+            "gpt-5.6-luna",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model":"openai/gpt-5.6-luna","messages":[],"max_tokens":200,
+                "x-openai":{"instructions":"x".repeat(8_000)}
+            }),
+        );
+        assert!(
+            estimate_prepared_request_tokens(&active_instructions)
+                >= estimate_prepared_request_tokens(&baseline).saturating_add(1_900)
+        );
+    }
+
+    #[test]
+    fn prepared_estimate_counts_compact_anthropic_output_schemas() {
+        let baseline = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":100
+            }),
+        );
+        let root_schema = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":100,
+                "output_config":{"format":{"type":"json_schema","schema":{
+                    "type":"object","description":"x".repeat(8_000)
+                }}}
+            }),
+        );
+        let namespaced_schema = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":100,
+                "x-anthropic":{"output_config":{"format":{"type":"json_schema","schema":{
+                    "type":"object","description":"x".repeat(8_000)
+                }}}}
+            }),
+        );
+        let baseline_permits = estimate_prepared_request_tokens(&baseline);
+        assert!(
+            estimate_prepared_request_tokens(&root_schema)
+                >= baseline_permits.saturating_add(1_900)
+        );
+        assert!(
+            estimate_prepared_request_tokens(&namespaced_schema)
+                >= baseline_permits.saturating_add(1_900)
+        );
+    }
+
+    #[test]
+    fn prepared_estimate_tracks_chatgpt_and_self_hosted_wire_semantics() {
+        let openai = prepared_request(
+            "openai",
+            "gpt-5.6-luna",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({"model":"openai/gpt-5.6-luna","messages":[]}),
+        );
+        assert_eq!(effective_output_budget(&openai), 128_000);
+        let unknown_openai_target = AdmissionTarget {
+            provider_name: "openai".into(),
+            model: "gpt-unknown".into(),
+            policy: crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-openai",
+                &["model", "input"],
+                &["instructions"],
+                &["max_output_tokens"],
+            ),
+        };
+        assert_eq!(omitted_output_budget(&unknown_openai_target), 128_000);
+
+        let chatgpt = prepared_request(
+            "chatgpt",
+            "gpt-5.6-luna",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model":"chatgpt/gpt-5.6-luna","messages":[],
+                "max_tokens":1,"x-chatgpt":{"max_output_tokens":2}
+            }),
+        );
+        assert_eq!(
+            effective_output_budget(&chatgpt),
+            omitted_output_budget(&chatgpt.target)
+        );
+
+        let vllm_chat = prepared_request(
+            "vllm",
+            "served",
+            crate::reasoning::WireFormat::OpenAiChat,
+            serde_json::json!({
+                "model":"vllm/served","messages":[],"max_tokens":100,
+                "x-vllm":{"max_tokens":7_000}
+            }),
+        );
+        assert_eq!(effective_output_budget(&vllm_chat), 7_000);
+
+        let sglang_responses = prepared_request(
+            "sglang",
+            "served",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            serde_json::json!({
+                "model":"sglang/served","messages":[],"max_tokens":100,
+                "x-sglang":{"max_output_tokens":8_000}
+            }),
+        );
+        assert_eq!(effective_output_budget(&sglang_responses), 8_000);
     }
 
     // --- Trait object dispatch ----------------------------------------------
