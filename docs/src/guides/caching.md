@@ -59,12 +59,15 @@ Anthropic's `input_tokens` excludes the cache read, while the OpenAI Responses,
 Chat Completions and Gemini prompt totals include it. llmshim resolves the
 disagreement at the transport boundary so one counter means one thing.
 
-`cost_usd` is the USD charged for the response: uncached input, output, cache
+`cost_usd` estimates standard token charges: uncached input, output, cache
 reads and cache writes each at their own catalog rate, so a cached prompt is
 never billed twice. **`null` means the catalog carries no price for the model —
 it never means free.** A model priced for input but not for the cache reads a
-response actually used also yields `null`, rather than a partial sum that would
-read as a complete one.
+response actually used charges that class at the model's highest published
+rate, yielding a conservative estimate. Context tiers include cached input
+when choosing the rate and apply to the entire request. For native Grok 4.7,
+rates double above 200,000 input tokens. Provider tool fees, regional premiums,
+and priority endpoint surcharges are not included in these catalog estimates.
 
 `ProviderRequest::can_continue_from` compares endpoint, credential headers,
 settings and the full prior input prefix. `include`, `store`, `reasoning`, tool

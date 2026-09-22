@@ -81,6 +81,14 @@ pub struct Cost {
     pub cache_write: Option<f64>,
 }
 
+/// Rates for the entire request when total input (including cached input)
+/// exceeds `above_input_tokens`. Missing rates inherit the previous tier.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ContextCostTier {
+    pub above_input_tokens: u64,
+    pub cost: Cost,
+}
+
 /// Media types are strings so new catalog modalities survive without a release.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -123,6 +131,9 @@ pub struct ModelInfo {
     pub capabilities: crate::ModelCapabilities,
     pub family: Option<ModelFamily>,
     pub cost: Option<Cost>,
+    /// None means unspecified; an explicit empty list disables inherited tiers.
+    #[serde(default)]
+    pub context_cost_tiers: Option<Vec<ContextCostTier>>,
     pub reasoning_options: Vec<ReasoningOption>,
     pub modalities: Modalities,
     pub knowledge_cutoff: Option<NaiveDate>,
@@ -148,6 +159,7 @@ impl ModelInfo {
             capabilities: crate::ModelCapabilities::unknown(),
             family: None,
             cost: None,
+            context_cost_tiers: None,
             reasoning_options: Vec::new(),
             modalities: Modalities::default(),
             knowledge_cutoff: None,
@@ -157,5 +169,49 @@ impl ModelInfo {
             fetched_at: None,
             field_sources: BTreeMap::new(),
         }
+    }
+
+    /// Resolve context-dependent rates without changing the base `Cost` API.
+    /// Higher-priority per-field base overrides also override lower-priority
+    /// tier rates. Tier lists are replaced atomically by a stronger source.
+    pub fn cost_for_input_tokens(&self, input_tokens: u64) -> Option<Cost> {
+        let mut cost = self.cost?;
+        let mut tiers: Vec<_> = self
+            .context_cost_tiers
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| input_tokens > t.above_input_tokens)
+            .collect();
+        tiers.sort_by_key(|t| t.above_input_tokens);
+        let tier_source = self
+            .field_sources
+            .get("context_cost_tiers")
+            .copied()
+            .unwrap_or(self.source);
+        for tier in tiers {
+            for (key, rate, slot) in [
+                ("cost.input", tier.cost.input, &mut cost.input),
+                ("cost.output", tier.cost.output, &mut cost.output),
+                (
+                    "cost.cache_read",
+                    tier.cost.cache_read,
+                    &mut cost.cache_read,
+                ),
+                (
+                    "cost.cache_write",
+                    tier.cost.cache_write,
+                    &mut cost.cache_write,
+                ),
+            ] {
+                let base_source = self.field_sources.get(key).copied().unwrap_or(self.source);
+                if rate.is_some_and(|n| n.is_finite() && n >= 0.0)
+                    && crate::merge::rank(tier_source) >= crate::merge::rank(base_source)
+                {
+                    *slot = rate;
+                }
+            }
+        }
+        Some(cost)
     }
 }

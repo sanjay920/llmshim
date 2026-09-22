@@ -212,7 +212,7 @@ fn tool_choice_anthropic_tool_to_function() {
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "tool_choice": {"type": "tool", "name": "search"}});
     let result = p.transform_request("grok-4.3", &req).unwrap();
     assert_eq!(result.body["tool_choice"]["type"], "function");
-    assert_eq!(result.body["tool_choice"]["function"]["name"], "search");
+    assert_eq!(result.body["tool_choice"]["name"], "search");
 }
 
 #[test]
@@ -660,10 +660,10 @@ fn name_locked_grok_4_20_omits_reasoning_entirely() {
 }
 
 #[test]
-fn reasoning_none_clamps_to_low_for_grok_4_5_and_4_6() {
+fn reasoning_none_clamps_to_low_for_grok_4_5_through_4_7() {
     // grok-4.5 and grok-4.6 400 on effort "none" (verified live) — clamp to "low".
     let p = provider();
-    for model in ["grok-4.5", "grok-4.6"] {
+    for model in ["grok-4.5", "grok-4.6", "grok-4.7"] {
         let req = json!({
             "model": "x",
             "messages": [{"role": "user", "content": "hi"}],

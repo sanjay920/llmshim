@@ -171,7 +171,7 @@ fn translate_tools(tools: &Value) -> Value {
     }
 }
 
-/// Translate tool_choice from Anthropic format if needed.
+/// Named selection on Responses uses a flat name, unlike Chat Completions.
 fn translate_tool_choice(tc: &Value) -> Value {
     if let Some(tc_obj) = tc.as_object() {
         if let Some(tc_type) = tc_obj.get("type").and_then(|t| t.as_str()) {
@@ -181,7 +181,12 @@ fn translate_tool_choice(tc: &Value) -> Value {
                 "none" => json!("none"),
                 "tool" => tc_obj
                     .get("name")
-                    .map(|name| json!({"type": "function", "function": {"name": name}}))
+                    .map(|name| json!({"type": "function", "name": name}))
+                    .unwrap_or_else(|| tc.clone()),
+                "function" => tc
+                    .pointer("/function/name")
+                    .or_else(|| tc.get("name"))
+                    .map(|name| json!({"type": "function", "name": name}))
                     .unwrap_or_else(|| tc.clone()),
                 _ => tc.clone(),
             };
@@ -197,14 +202,13 @@ fn is_reasoning_name_locked(model: &str) -> bool {
     model.to_lowercase().contains("4.20")
 }
 
-/// grok-4.5 / grok-4.6 cannot disable reasoning: `effort: "none"` -> 400 ("does
+/// grok-4.5 / grok-4.6 / grok-4.7 cannot disable reasoning: `effort: "none"` -> 400 ("does
 /// not support `reasoning_effort` value `none`", verified live). Unified effort
 /// "none" clamps to "low". grok-4.3 DOES accept "none".
 fn reasoning_cannot_disable(model: &str) -> bool {
     let m = model.to_lowercase();
-    // grok-4.5 and grok-4.6 both 400 on `reasoning_effort: "none"` (verified
-    // live); unified "none" clamps to "low" for them. grok-4.3 accepts "none".
-    m.contains("4.5") || m.contains("4.6")
+    // Verified live for 4.7 on 2026-09-21. Keep older models' behavior intact.
+    m.contains("4.5") || m.contains("4.6") || m.contains("4.7")
 }
 
 impl Provider for Xai {
