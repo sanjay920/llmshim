@@ -1171,7 +1171,7 @@ pub fn build_limiter() -> Arc<dyn RateLimiter> {
             {
                 match RedisRateLimiter::new(&url, config.clone()) {
                     Ok(limiter) => {
-                        eprintln!("rate limiting: redis coordination enabled ({url})");
+                        eprintln!("rate limiting: redis coordination enabled");
                         return Arc::new(limiter);
                     }
                     Err(e) => {
