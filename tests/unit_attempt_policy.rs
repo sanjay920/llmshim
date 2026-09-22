@@ -13,6 +13,7 @@ use llmshim::{
         gemini::Gemini,
         openai::OpenAi,
         openai_compat::OpenAiCompatible,
+        openrouter::OpenRouter,
         xai::Xai,
     },
 };
@@ -1007,6 +1008,104 @@ async fn failed_repair_observes_each_usage_before_returning_the_error() {
             ))
             .count(),
         2
+    );
+}
+
+#[tokio::test]
+async fn bounded_http_error_observes_reported_bill_before_preserving_provider_error() {
+    let mut server = mockito::Server::new_async().await;
+    let error_body = json!({
+        "error": {"message": "provider-specific failure"},
+        "usage": {"cost": 12_345_678.0}
+    })
+    .to_string();
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_status(400)
+        .with_body(&error_body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+
+    let error = ShimClient::new()
+        .completion_with_policy(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        llmshim::error::ShimError::ProviderError {
+            status: 400,
+            ref body,
+            ..
+        } if body == &error_body
+    ));
+    upstream.assert_async().await;
+    let events = policy.events();
+    let usage_index = events
+        .iter()
+        .position(|event| matches!(event, RecordedEvent::Usage { .. }))
+        .unwrap();
+    let finish_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                RecordedEvent::Finished {
+                    outcome: AttemptOutcome::HttpFailure {
+                        status: 400,
+                        accounting: AttemptAccounting::UsageObserved
+                    },
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(usage_index < finish_index);
+    let RecordedEvent::Usage { usage, .. } = &events[usage_index] else {
+        unreachable!()
+    };
+    assert_eq!(usage["cost_source"], "provider");
+    assert_eq!(usage["cost_usd"], 12_345_678.0);
+}
+
+#[tokio::test]
+async fn retryable_http_error_does_not_retry_after_usage_observer_failure() {
+    let mut server = mockito::Server::new_async().await;
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_status(500)
+        .with_body(json!({"error": "retryable", "usage": {"cost": 1.0}}).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::failing(FailingEvent::Usage));
+
+    let error = ShimClient::new()
+        .completion_with_policy(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("coordinator unavailable"));
+    upstream.assert_async().await;
+    assert_eq!(
+        policy
+            .events()
+            .iter()
+            .filter(|event| matches!(event, RecordedEvent::Acquired { .. }))
+            .count(),
+        1
     );
 }
 

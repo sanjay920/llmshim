@@ -1018,6 +1018,20 @@ mod native_tests {
         router: Router,
         identity: crate::gateway::auth::Identity,
     ) -> Arc<GatewayState> {
+        let config = GatewayConfig::default();
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local(
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        );
+        configured_state_with_router_identity_and_coordinator(router, identity, attempt_coordinator)
+    }
+
+    fn configured_state_with_router_identity_and_coordinator(
+        router: Router,
+        identity: crate::gateway::auth::Identity,
+        attempt_coordinator: Arc<crate::gateway::attempt::AttemptCoordinator>,
+    ) -> Arc<GatewayState> {
         let router = Arc::new(router);
         let config = GatewayConfig::default();
         let limiter = Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
@@ -1035,11 +1049,6 @@ mod native_tests {
             ("test-key".into(), identity.clone()),
             ("second-key".into(), identity),
         ]);
-        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local(
-            crate::proxy::ratelimit::RateLimitConfig::default(),
-            config.max_concurrency_per_provider,
-            config.max_wait,
-        );
         Arc::new(GatewayState {
             router,
             backend: Backend::Local(scheduler),
@@ -1581,6 +1590,29 @@ mod native_tests {
                     .with_base_url(surcharge_server.url()),
             ),
         );
+        let surcharge_state = configured_state_with_router_and_identity(
+            surcharge_router,
+            budgeted_identity(100.0, false),
+        );
+        let unverified_response = app(surcharge_state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::from(
+                        json!({
+                            "model": "openai/gpt-5.6-luna",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unverified_response.status(), StatusCode::BAD_REQUEST);
         let surcharge_request = Request::builder()
             .method("POST")
             .uri("/v1/chat")
@@ -1595,13 +1627,10 @@ mod native_tests {
                 .to_string(),
             ))
             .unwrap();
-        let surcharge_response = app(configured_state_with_router_and_identity(
-            surcharge_router,
-            budgeted_identity(100.0, false),
-        ))
-        .oneshot(surcharge_request)
-        .await
-        .unwrap();
+        let surcharge_response = app(surcharge_state)
+            .oneshot(surcharge_request)
+            .await
+            .unwrap();
         assert_eq!(surcharge_response.status(), StatusCode::BAD_REQUEST);
         surcharge_upstream.assert_async().await;
 
@@ -1647,6 +1676,112 @@ mod native_tests {
         .unwrap();
         assert_eq!(cache_response.status(), StatusCode::BAD_REQUEST);
         cache_upstream.assert_async().await;
+
+        let mut openrouter_server = mockito::Server::new_async().await;
+        let openrouter_upstream = openrouter_server
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let openrouter_router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(openrouter_server.url()),
+            ),
+        );
+        let openrouter_state = configured_state_with_router_and_identity(
+            openrouter_router,
+            budgeted_identity(100.0, false),
+        );
+        for provider_config in [
+            json!({"n": 2}),
+            json!({"x-openrouter": {"route": "fallback"}}),
+        ] {
+            let response = app(openrouter_state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-key")
+                        .body(Body::from(
+                            json!({
+                                "model": "openrouter/x-ai/grok-4.7",
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "provider_config": provider_config
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let mutable_route = app(openrouter_state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::from(
+                        json!({
+                            "model": "openrouter/openrouter/free",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mutable_route.status(), StatusCode::BAD_REQUEST);
+        openrouter_upstream.assert_async().await;
+
+        let mut gemini_server = mockito::Server::new_async().await;
+        let gemini_upstream = gemini_server
+            .mock("POST", Matcher::Regex("/models/.*".into()))
+            .expect(0)
+            .create_async()
+            .await;
+        let gemini_router = Router::new().register(
+            "gemini",
+            Box::new(
+                crate::providers::gemini::Gemini::new("test-key".into())
+                    .with_base_url(gemini_server.url()),
+            ),
+        );
+        let gemini_response = app(configured_state_with_router_and_identity(
+            gemini_router,
+            budgeted_identity(100.0, false),
+        ))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini/gemini-3.8-flash",
+                        "messages": [{
+                            "role": "user",
+                            "content": [{
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AA=="}
+                            }]
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gemini_response.status(), StatusCode::BAD_REQUEST);
+        gemini_upstream.assert_async().await;
     }
 
     #[tokio::test]
@@ -1670,12 +1805,11 @@ mod native_tests {
             .create_async()
             .await;
         let router = Router::new().register(
-            "openai",
-            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
-                "openai",
-                server.url(),
-                None,
-            )),
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(server.url()),
+            ),
         );
         let identity = budgeted_identity(100.0, false);
         let scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
@@ -1687,7 +1821,7 @@ mod native_tests {
             .header("authorization", "Bearer test-key")
             .body(Body::from(
                 json!({
-                    "model": "openai/gpt-5.6-luna",
+                    "model": "openrouter/x-ai/grok-4.7",
                     "messages": [{"role": "user", "content": "answer"}],
                     "response_format": {
                         "type": "json_schema",
@@ -1715,8 +1849,8 @@ mod native_tests {
             "known usage from both attempts is charged"
         );
         let one_attempt_usd = crate::cost::cost_usd(
-            "openai",
-            "gpt-5.6-luna",
+            "openrouter",
+            "x-ai/grok-4.7",
             &json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}),
         )
         .unwrap();
@@ -1724,6 +1858,74 @@ mod native_tests {
             charged_nanos,
             (one_attempt_usd * 1_000_000_000.0).ceil() as u64 * 2
         );
+    }
+
+    #[tokio::test]
+    async fn semaphore_wait_crossing_short_windows_quotes_at_actual_acquisition() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "response",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(server.url()),
+            ),
+        );
+        let mut identity = budgeted_identity(10.0, false);
+        identity.budget_window_secs = Some(1);
+        let coordinator = crate::gateway::attempt::AttemptCoordinator::local(
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            1,
+            Duration::from_secs(5),
+        );
+        let held = coordinator.hold_provider_for_test("openrouter").await;
+        let state =
+            configured_state_with_router_identity_and_coordinator(router, identity, coordinator);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "openrouter/x-ai/grok-4.7",
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let application = app(state);
+        let waiting = tokio::spawn(application.clone().oneshot(request()));
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        let subsecond = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_millis() as u64;
+        tokio::time::sleep(Duration::from_millis(1_020 - subsecond)).await;
+        drop(held);
+
+        let first = waiting.await.unwrap().unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = application.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        upstream.assert_async().await;
     }
 
     #[tokio::test]
@@ -1768,6 +1970,42 @@ mod native_tests {
         .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         upstream.assert_async().await;
+
+        let mut free_server = mockito::Server::new_async().await;
+        let free_upstream = free_server
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let free_router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(free_server.url()),
+            ),
+        );
+        let free_request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-key")
+            .body(Body::from(
+                json!({
+                    "model": "openrouter/openrouter/free",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let free_response = app(configured_state_with_router_and_identity(
+            free_router,
+            budgeted_identity(0.0, false),
+        ))
+        .oneshot(free_request)
+        .await
+        .unwrap();
+        assert_eq!(free_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        free_upstream.assert_async().await;
     }
 
     #[tokio::test]

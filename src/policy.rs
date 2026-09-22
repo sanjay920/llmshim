@@ -65,6 +65,7 @@ impl DispatchPolicyContext {
         self.policy.observe(identity, event).await
     }
 
+    #[cfg(feature = "gateway")]
     pub(crate) fn take_last_refusal(&self) -> Option<AttemptPolicyRefusal> {
         self.last_refusal.lock().unwrap().take()
     }
