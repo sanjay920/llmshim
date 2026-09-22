@@ -36,7 +36,9 @@ issued reasoning and tool IDs; see [native endpoints](../proxy/native-apis.md).
 
 The proxy's `provider_config` object is merged into the OpenAI-shaped engine
 request. That is why tools and native namespaces move under it without changing
-their inner shapes.
+their inner shapes. Its `model` and `messages` fields, including native
+`input`/`contents` equivalents, are reserved so passthrough configuration
+cannot change the request after admission.
 
 ## Build features
 
