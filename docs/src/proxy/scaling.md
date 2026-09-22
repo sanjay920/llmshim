@@ -52,8 +52,10 @@ second layer: **retry the route, then change the route**. See
 
 ## Backpressure and proactive limits
 
-Every proxy request first acquires an instance concurrency slot. Waiting
-longer than the queue timeout returns `503` with `Retry-After`.
+Every actual provider attempt acquires an instance concurrency slot immediately
+before the send. Waiting longer than the queue timeout returns `503` with
+`Retry-After`. A retry or repair releases the completed attempt's slot and must
+acquire again; fallback acquires against the provider it actually targets.
 
 | Variable | Default | Meaning |
 |---|---:|---|
@@ -73,7 +75,26 @@ rejection is `429` with `Retry-After`.
 
 When neither RPM nor TPM is set, proactive rate limiting is disabled;
 concurrency backpressure still applies. Token permits are estimates based on
-request size and requested output, not provider billing measurements.
+the final provider-native body and authoritative prepared target. They include
+the serialized native prompt and schema material, recognized native reasoning
+budgets, and the effective native output limit.
+Anthropic's omitted output limit uses
+the adapter's 8,192-token default; other known models use the catalog output
+ceiling when the provider leaves the limit unspecified. Unknown hosted models
+use a conservative provider-family ceiling; unknown self-hosted models retain
+the 1,024-token fallback because the server's launch configuration is not
+visible to llmshim. OpenRouter `models` fallbacks remain supported; when no
+explicit output limit is present, every listed model contributes its catalog
+ceiling and an unknown listed model uses a one-million-token ceiling.
+
+These permits are conservative estimates, not provider billing measurements.
+The input side uses serialized characters divided by four; provider tokenizers,
+images, caching, and unknown self-hosted model defaults can differ. Admission
+occurs once per actual network attempt. Transport retries, managed schema
+repairs, and supported fallback targets each reacquire RPM and TPM from the lane
+for the provider/body that will be sent. A provider-wide refusal may advance a
+fallback chain only to a distinct provider; an authenticated tenant refusal
+terminates the request.
 
 For an authenticated gateway identity, an omitted `rpm` or `tpm` field means
 that dimension is unlimited. An explicit `0` means that dimension admits no
@@ -119,6 +140,12 @@ passes, so the overshoot bound is **admitted concurrency × the most expensive
 request**, multiplied again across replicas that have not yet shared their
 ledger. Size a cap with that headroom in mind rather than as a hard ceiling.
 
+The current spend ledger charges successful returned usage. A provider response
+that is later discarded by a failed managed repair, and a send whose billing is
+uncertain after a transport failure or worker loss, can still escape settlement.
+Treat this as a soft accounting cap until per-attempt reservation and settlement
+are enabled; RPM/TPM attempt coordination does not close that spend gap.
+
 A response the catalog cannot price at all is **not** charged — recording zero
 would let an unpriced model run forever under a budget. A model that prices only
 *some* token classes is charged at its highest published rate for the rest, so a
@@ -159,13 +186,16 @@ cargo install llmshim --features redis-coordination
 LLMSHIM_REDIS_URL=redis://redis.internal:6379 llmshim proxy
 ```
 
-`redis-coordination` includes the `proxy` feature. Redis coordinates rate-limit
-buckets, provider health and — on the gateway — spend, so a shared limit, a
-dead provider and a dollar cap all mean the same thing on every replica;
-connection pools and concurrency limits remain per process. If
-Redis becomes unavailable at runtime, limiting fails open so requests continue.
-If the Redis client cannot be initialized—or the binary lacks the feature—the
-proxy warns and falls back to in-memory buckets.
+`redis-coordination` includes the `proxy` feature. Redis coordinates provider
+rate-limit buckets, provider health and — on the authenticated gateway — tenant
+RPM/TPM and spend, so these limits mean the same thing on every replica. The
+gateway checks provider and tenant RPM/TPM in one Lua decision: if any dimension
+rejects, none is debited. Its trusted per-attempt coordinator fails closed when
+Redis is unavailable. The compact proxy's standalone Redis limiter keeps its
+documented fail-open behavior. Both paths share the same provider bucket keys.
+Connection pools and concurrency limits remain per process. If the Redis client
+cannot be initialized—or the binary lacks the feature—the compact proxy warns
+and falls back to in-memory buckets.
 
 Do not infer capacity from llmshim's implementation details alone. The
 [README benchmarks](https://github.com/sanjay920/llmshim#benchmarks) are the

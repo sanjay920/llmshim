@@ -86,6 +86,8 @@ impl OpenAiCompatible {
         // The OpenAI adapter reads its overrides from `x-openai`, and applies
         // them before the stateless and native-tool passes. Moving `x-<name>`
         // there keeps that order, so an override cannot re-enable storage.
+        let mut schema_budget = crate::schema::RequestBudget::new();
+        schema_budget.reserve_request_schemas(request)?;
         let mut request = request.clone();
         let namespace = format!("x-{}", self.name);
         if let Some(ext) = request
@@ -96,11 +98,14 @@ impl OpenAiCompatible {
             let target = request["x-openai"].as_object().cloned().unwrap_or_default();
             request["x-openai"] = Value::Object(target.into_iter().chain(ext).collect());
         }
-        let mut sent = self.responses_adapter().transform_request_for_target(
-            model,
-            &request,
-            &self.replay_target(model),
-        )?;
+        let mut sent = self
+            .responses_adapter()
+            .transform_request_for_target_with_budget(
+                model,
+                &request,
+                &self.replay_target(model),
+                &mut schema_budget,
+            )?;
         sent.headers = self.headers();
         Ok(sent)
     }
@@ -145,6 +150,44 @@ impl Provider for OpenAiCompatible {
         &self.name
     }
 
+    fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
+        match self.wire {
+            WireFormat::OpenAiResponses => crate::provider::RequestAdmissionPolicy::namespaced(
+                format!("x-{}", self.name),
+                &["model", "input"],
+                &[
+                    "instructions",
+                    "prompt",
+                    "text",
+                    "tools",
+                    "tool_choice",
+                    "guided_json",
+                    "guided_regex",
+                    "guided_ebnf",
+                    "structured_outputs",
+                    "chat_template_kwargs",
+                ],
+                &["max_output_tokens"],
+            ),
+            WireFormat::OpenAiChat => crate::provider::RequestAdmissionPolicy::namespaced(
+                format!("x-{}", self.name),
+                &["model", "messages"],
+                &[
+                    "tools",
+                    "tool_choice",
+                    "response_format",
+                    "guided_json",
+                    "guided_regex",
+                    "guided_ebnf",
+                    "structured_outputs",
+                    "chat_template_kwargs",
+                ],
+                &["max_tokens", "max_completion_tokens"],
+            ),
+            _ => crate::provider::RequestAdmissionPolicy::default(),
+        }
+    }
+
     fn replay_target(&self, model: &str) -> ReplayTarget {
         ReplayTarget::new(self.name(), model, self.wire)
             .bind_account(&self.base_url, self.api_key.as_deref())
@@ -154,7 +197,8 @@ impl Provider for OpenAiCompatible {
         if self.wire == WireFormat::OpenAiResponses {
             return self.transform_request_responses(model, request);
         }
-        let request = crate::schema::prepare_request(request);
+        let mut schema_budget = crate::schema::RequestBudget::new();
+        let request = crate::schema::prepare_request(request, &mut schema_budget)?;
         let request =
             crate::cache::prepare_request(&request, crate::reasoning::WireFormat::OpenAiChat)?;
         let request = crate::reasoning::prepare_request(&request, &self.replay_target(model));
@@ -212,12 +256,17 @@ impl Provider for OpenAiCompatible {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         crate::toolcall::validate_native(&body, &self.replay_target(model))?;
-        crate::schema::normalize_native_tools(crate::schema::Target::OpenAiChat, &mut body);
+        crate::schema::normalize_native_tools(
+            crate::schema::Target::OpenAiChat,
+            &mut body,
+            &mut schema_budget,
+        )?;
         crate::shim::native_format(
             &request,
             crate::reasoning::WireFormat::OpenAiChat,
             &mut body,
-        );
+            &mut schema_budget,
+        )?;
         crate::cache::finish_request(
             &request,
             &mut body,

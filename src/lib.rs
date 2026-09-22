@@ -12,10 +12,12 @@ pub mod error;
 pub mod fallback;
 pub mod log;
 pub mod models;
+pub mod policy;
 pub mod provider;
 pub mod providers;
 pub mod reasoning;
 pub mod router;
+mod sse;
 pub mod streaming;
 pub mod toolcall;
 pub mod usage;
@@ -29,8 +31,9 @@ pub mod gateway;
 
 use client::ShimClient;
 use error::Result;
-pub use fallback::{completion_with_fallback, FallbackConfig};
+pub use fallback::{completion_with_fallback, completion_with_fallback_and_policy, FallbackConfig};
 use log::{LogEntry, Logger, RequestTimer};
+use policy::DispatchPolicyContext;
 use router::Router;
 use serde_json::Value;
 
@@ -64,11 +67,37 @@ pub async fn completion(router: &Router, request: &Value) -> Result<Value> {
     completion_with_logger(router, request, None).await
 }
 
+pub async fn completion_with_policy(
+    router: &Router,
+    request: &Value,
+    policy_context: &DispatchPolicyContext,
+) -> Result<Value> {
+    completion_with_logger_and_policy(router, request, None, policy_context).await
+}
+
 /// Completion with optional logging.
 pub async fn completion_with_logger(
     router: &Router,
     request: &Value,
     logger: Option<&Logger>,
+) -> Result<Value> {
+    completion_inner(router, request, logger, None).await
+}
+
+pub async fn completion_with_logger_and_policy(
+    router: &Router,
+    request: &Value,
+    logger: Option<&Logger>,
+    policy_context: &DispatchPolicyContext,
+) -> Result<Value> {
+    completion_inner(router, request, logger, Some(policy_context)).await
+}
+
+async fn completion_inner(
+    router: &Router,
+    request: &Value,
+    logger: Option<&Logger>,
+    policy_context: Option<&DispatchPolicyContext>,
 ) -> Result<Value> {
     // A named route resolves to its model and settings before dispatch.
     let request = router.expand_route(request)?;
@@ -85,7 +114,14 @@ pub async fn completion_with_logger(
     // Ordinary traffic feeds provider health too, so a chain's first fallback
     // decision is not the first thing that ever noticed a provider is down.
     // The client does the counting; see `ShimClient::with_breaker`.
-    let result = client.completion(provider, &model, request).await;
+    let result = match policy_context {
+        Some(context) => {
+            client
+                .completion_with_policy(provider, &model, request, context)
+                .await
+        }
+        None => client.completion(provider, &model, request).await,
+    };
 
     match result {
         Ok(resp) => {
@@ -118,6 +154,22 @@ pub async fn stream(
     router: &Router,
     request: &Value,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    stream_inner(router, request, None).await
+}
+
+pub async fn stream_with_policy(
+    router: &Router,
+    request: &Value,
+    policy_context: &DispatchPolicyContext,
+) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    stream_inner(router, request, Some(policy_context)).await
+}
+
+async fn stream_inner(
+    router: &Router,
+    request: &Value,
+    policy_context: Option<&DispatchPolicyContext>,
+) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
     let request = router.expand_route(request)?;
     let request = request.as_ref();
     let model_str = request
@@ -126,12 +178,20 @@ pub async fn stream(
         .ok_or(error::ShimError::MissingModel)?;
 
     let (provider, model) = router.resolve_owned(model_str)?;
-    // Observed but not gated: a single-target call has no alternative, so
-    // refusing here would only convert an upstream failure into a local one.
-    // The breaker refuses where there is somewhere else to go — `fallback.rs`.
-    bound_client(router)
-        .stream_owned(provider, &model, request)
-        .await
+    // The breaker observes a single target without refusing it. An explicit
+    // dispatch policy still gates every actual stream-open attempt below.
+    match policy_context {
+        Some(context) => {
+            bound_client(router)
+                .stream_owned_with_policy(provider, &model, request, context)
+                .await
+        }
+        None => {
+            bound_client(router)
+                .stream_owned(provider, &model, request)
+                .await
+        }
+    }
 }
 
 /// The shared HTTP client, reporting to this router's breaker. The pool is

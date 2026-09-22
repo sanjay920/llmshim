@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: llmshim API
-  version: 0.9.0
+  version: 0.10.1
   description: |
     Multi-provider LLM API proxy. Send requests in a single format,
     llmshim translates to the native API of whichever provider you choose.
@@ -275,7 +275,14 @@ components:
             `x-openai` / `x-chatgpt` / `x-anthropic` / `x-gemini` (native controls) or
             `x-openrouter` / `x-vllm` / `x-sglang` (aggregator / self-hosted
             controls). Also carries `tools`, `response_format`, and
-            `reasoning_summary`.
+            `reasoning_summary`. Root `model` and `messages` are reserved.
+            After named-route and alias resolution, the selected provider's
+            active namespace may not replace its native model or main
+            messages/input/contents container. Every resolvable explicit
+            fallback is checked before the primary request runs. Native system
+            and instruction controls remain supported and are estimated when
+            active; another provider namespace is inert only if no primary,
+            fallback, or route can select it.
           examples:
             - x-anthropic:
                 thinking:

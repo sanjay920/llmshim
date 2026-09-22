@@ -300,7 +300,7 @@ Full API spec: [`api/openapi.yaml`](api/openapi.yaml).
 The proxy is built to run as a horizontally-scaled fleet (Cloud Run, ECS, Kubernetes) without hammering provider rate limits. Two layers protect you:
 
 - **Reactive retry** (always on): on an upstream 429/5xx it honors the provider's `Retry-After` header and reset hints, falling back to full-jitter exponential backoff.
-- **Proactive shedding** (this layer): a per-provider token bucket rejects excess load *before* dispatching, and a per-instance concurrency cap sheds with 503 instead of running out of memory. Rejections carry a `Retry-After` header so clients back off cleanly.
+- **Proactive shedding** (this layer): every actual provider send—including a retry, managed repair, or supported fallback—acquires the target provider's token bucket and a concurrency slot immediately before dispatch. Rejections carry `Retry-After`; concurrency exhaustion sheds with 503.
 
 All configuration is via env vars — everything optional with safe defaults. With no RPM/TPM limits set, only the concurrency cap applies.
 
@@ -316,7 +316,7 @@ All configuration is via env vars — everything optional with safe defaults. Wi
 Two deployment modes:
 
 1. **Sidecar / zero-infra (default).** Each replica limits itself with an in-memory token bucket — no extra services. Running N replicas? Set each instance's limit to `provider_limit / N`.
-2. **Redis-coordinated fleet.** Build with the `redis-coordination` feature and set `LLMSHIM_REDIS_URL`; all replicas share one global token bucket in Redis, so you can set the true provider limit once regardless of replica count. It fails open (keeps serving) if Redis is briefly unreachable.
+2. **Redis-coordinated fleet.** Build with the `redis-coordination` feature and set `LLMSHIM_REDIS_URL`; all replicas share provider buckets in Redis, and authenticated gateway tenant RPM/TPM is fleet-wide. Gateway provider + tenant admission is one atomic decision and fails closed if Redis is unavailable. The compact proxy's standalone Redis limiter keeps its availability-oriented fail-open behavior.
 
 ```bash
 # Zero-infra: cap each instance

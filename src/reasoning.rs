@@ -98,8 +98,11 @@ pub struct ReplayTarget {
 
 impl ReplayTarget {
     pub fn new(provider: &str, model: &str, wire: WireFormat) -> Self {
-        let family = catalog::resolve(&format!("{provider}/{model}"))
-            .or_else(|| catalog::resolve(model))
+        // `lookup_id` normalizes a known OpenRouter variant suffix (`:nitro`,
+        // `:floor`, …) for this lookup only; `model` itself is stored below
+        // unchanged, since it still has to go out on the wire as given.
+        let family = catalog::lookup_id(&format!("{provider}/{model}"))
+            .or_else(|| catalog::lookup_id(model))
             .and_then(|m| m.family);
         Self {
             provider: provider.into(),
@@ -562,6 +565,7 @@ fn strip_untracked_native(value: &mut Value) {
 pub(crate) fn enforce_stateless(body: &mut Value) -> crate::error::Result<()> {
     body["store"] = json!(false);
     body.as_object_mut().unwrap().remove("previous_response_id");
+    body.as_object_mut().unwrap().remove("conversation");
     if body.get("include").is_none() {
         body["include"] = json!([]);
     }
