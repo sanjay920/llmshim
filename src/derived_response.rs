@@ -180,6 +180,9 @@ fn bind_context_with_budget(
                 continue;
             };
             if let Some(reasoning) = message.get("reasoning") {
+                if !reasoning.is_array() {
+                    return Err(budget.error());
+                }
                 budget.reserve_value(reasoning)?;
                 for block in reasoning.as_array().into_iter().flatten() {
                     reserve_origin_changes(&mut budget, block.get("origin"), target)?;
@@ -187,12 +190,29 @@ fn bind_context_with_budget(
             }
             for call in message["tool_calls"].as_array().into_iter().flatten() {
                 if let Some(signature) = call.get("thought_signature") {
+                    if signature.get("data").and_then(Value::as_str).is_none() {
+                        return Err(budget.error());
+                    }
                     budget.reserve_value(signature)?;
                     reserve_origin_changes(&mut budget, signature.get("origin"), target)?;
                 }
                 if let Some(bindings) = call.get("wire_ids") {
+                    if !bindings.is_array() {
+                        return Err(budget.error());
+                    }
                     budget.reserve_value(bindings)?;
                     for binding in bindings.as_array().into_iter().flatten() {
+                        let Some(binding_object) = binding.as_object() else {
+                            return Err(budget.error());
+                        };
+                        if ["provider", "wire", "scope", "part_id"]
+                            .into_iter()
+                            .any(|field| {
+                                binding_object.get(field).and_then(Value::as_str).is_none()
+                            })
+                        {
+                            return Err(budget.error());
+                        }
                         reserve_changed_string(
                             &mut budget,
                             binding.get("provider"),
@@ -240,8 +260,23 @@ fn reserve_origin_changes(
     target: &ReplayTarget,
 ) -> Result<()> {
     let Some(origin) = origin else {
-        return Ok(());
+        return Err(budget.error());
     };
+    let Some(origin_object) = origin.as_object() else {
+        return Err(budget.error());
+    };
+    if ["provider", "model", "wire", "received_at"]
+        .into_iter()
+        .any(|field| origin_object.get(field).and_then(Value::as_str).is_none())
+        || origin_object
+            .get("family")
+            .is_some_and(|family| !family.is_null() && !family.is_string())
+        || origin_object
+            .get("account")
+            .is_some_and(|account| !account.is_string())
+    {
+        return Err(budget.error());
+    }
     reserve_changed_string(budget, origin.get("provider"), &target.provider)?;
     reserve_changed_string(budget, origin.get("model"), &target.model)?;
     budget.reserve(DerivedFootprint::strings(64))?;
@@ -466,6 +501,37 @@ mod tests {
                     && block["origin"]["provider"] == changed.provider
                     && block["origin"]["account"] == changed.account.as_deref().unwrap()
             }));
+    }
+
+    #[test]
+    fn malformed_origin_shapes_refuse_without_mutating_the_response() {
+        let target = chat_target("model");
+        for malformed in [
+            None,
+            Some(Value::Null),
+            Some(json!(7)),
+            Some(json!([])),
+            Some(json!({})),
+        ] {
+            let mut block = json!({"kind":"text","text":"r"});
+            if let Some(origin) = malformed {
+                block["origin"] = origin;
+            }
+            let mut response = json!({
+                "choices":[{"message":{"role":"assistant","reasoning":[block]}}]
+            });
+            let original = response.clone();
+
+            let error =
+                bind_unary_context_with_limits(&mut response, &target, 64 * 1024, 128).unwrap_err();
+
+            assert!(matches!(
+                error,
+                ShimError::ProviderError { status: 502, ref body, .. }
+                    if body == DERIVED_RESPONSE_ERROR
+            ));
+            assert_eq!(response, original);
+        }
     }
 
     #[test]

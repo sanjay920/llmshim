@@ -393,7 +393,10 @@ fn stamp_tool_signatures(
 ) -> crate::error::Result<()> {
     if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
         for call in calls {
-            if let Some(data) = call["thought_signature"].as_str() {
+            if let Some(signature) = call.get("thought_signature") {
+                let Some(data) = signature.as_str() else {
+                    return Err(budget.error());
+                };
                 let footprint = DerivedFootprint::record(size_of::<ThoughtSignature>())
                     .ok_or_else(|| budget.error())?
                     .checked_add(
