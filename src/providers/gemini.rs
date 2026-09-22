@@ -401,6 +401,15 @@ impl Provider for Gemini {
         "gemini"
     }
 
+    fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
+        crate::provider::RequestAdmissionPolicy::namespaced(
+            "x-gemini",
+            &["contents"],
+            &["systemInstruction", "tools", "toolConfig", "thinkingConfig"],
+            &[],
+        )
+    }
+
     fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
         crate::reasoning::ReplayTarget::new(
             self.name(),

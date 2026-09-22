@@ -331,6 +331,15 @@ impl Provider for OpenAi {
         "openai"
     }
 
+    fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
+        crate::provider::RequestAdmissionPolicy::namespaced(
+            "x-openai",
+            &["model", "input"],
+            &["instructions", "prompt", "text", "tools", "tool_choice"],
+            &["max_output_tokens"],
+        )
+    }
+
     fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
         crate::reasoning::ReplayTarget::new(
             self.name(),
