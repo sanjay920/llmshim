@@ -125,6 +125,40 @@ fn accepted_legacy_blocks_preserve_exact_source_and_payload() {
 }
 
 #[test]
+fn malformed_opaque_rows_drop_before_origin_clone_and_preserve_later_fallback() {
+    let provider = OpenRouter::new("key".into());
+    let model = "anthropic/claude-sonnet-4.6";
+    let origin = provider.replay_target(model).origin();
+    let thinking = json!([{
+        "type":"thinking",
+        "thinking":"kept",
+        "signature":"sig"
+    }]);
+    let request = json!({
+        "model":format!("openrouter/{model}"),
+        "messages":[{
+            "role":"assistant",
+            "content":"answer",
+            "reasoning_origin":origin,
+            "reasoning_details":[
+                {"type":"redacted_thinking"},
+                {"type":"redacted_thinking","data":null},
+                {"type":"reasoning.encrypted","data":7},
+                {"type":"reasoning.encrypted","data":[]}
+            ],
+            "thinking_blocks":thinking
+        }]
+    });
+    let original = request.clone();
+    let prepared = provider.transform_request(model, &request).unwrap();
+    assert!(prepared.body["messages"][0]
+        .get("reasoning_details")
+        .is_none());
+    assert_eq!(prepared.body["messages"][0]["thinking_blocks"], thinking);
+    assert_eq!(request, original);
+}
+
+#[test]
 fn public_filter_is_fallible_atomic_and_keeps_small_mismatch_behavior() {
     let provider = OpenAi::new("key".into());
     let target = provider.replay_target("gpt-5.6-luna");
