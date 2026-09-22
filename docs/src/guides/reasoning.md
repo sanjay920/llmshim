@@ -53,6 +53,10 @@ and account binding. Unknown families and missing origins fail closed. Signed
 Anthropic blocks precede text and tools in their original order. Responses
 requests use `store:false`, include encrypted reasoning, and replay those items
 locally. Native overrides cannot turn storage on or bypass reasoning provenance.
+The outbound projection removes both `previous_response_id` and `conversation`,
+including references supplied through native overrides. Send complete history
+in the request: a provider-side conversation can otherwise prepend stored
+items, as described in the [Responses API reference](https://developers.openai.com/api/reference/cli/resources/responses/methods/create).
 OpenAI and xAI use this stateless Responses path; see
 [xAI's encrypted reasoning contract](https://docs.x.ai/developers/model-capabilities/text/reasoning).
 
