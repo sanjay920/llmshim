@@ -86,6 +86,8 @@ line and frame buffers:
 | Frame bytes, with CRLF treated as one line ending | 8 MiB |
 | Blank-line-delimited frames, including empty frames | 100,000 |
 | Input chunks, including empty chunks | 1,048,576 |
+| Retained normalized tool/reasoning/choice state | estimated 16 MiB and 4,096 entries |
+| Retained native usage/finality state | estimated 4 MiB and 4,096 entries |
 
 The decoder handles UTF-8 fragments, an initial byte-order mark, multiline
 `data` fields, comments, and LF/CRLF/CR line endings. Provider transforms consume
@@ -93,6 +95,13 @@ the data fields; unused SSE metadata is discarded. Limits terminate the stream
 with a fixed error and release its input source. EOF does not manufacture a
 completed event from an unterminated frame. These are framing limits, not an
 RSS ceiling or a transport timeout.
+
+The retained-state limits count only data held across events, including map and
+JSON-container overhead. Forwarded text is not charged after its chunk is
+released. Exceeding either retained-state limit ends the response with
+`upstream stream retained state exceeds limit`; no partial tool call or
+reasoning block is emitted. Rust embedders can inject smaller finite limits with
+`StreamRetentionLimits` for testing or a stricter deployment policy.
 
 Collected text and refusals, reasoning text and opaque fragments, and native
 facade text append to their existing buffers. Completed reasoning snapshots
