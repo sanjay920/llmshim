@@ -497,7 +497,10 @@ pub async fn translate(request: Request, next: Next) -> Response {
                 let data:Value=match serde_json::from_str(&event){Ok(data)=>data,Err(_)=>continue};
                 match data["type"].as_str() {
                     Some("content")=>{
-                        let text=response["message"]["content"].as_str().unwrap_or("").to_owned()+data["text"].as_str().unwrap_or("");response["message"]["content"]=json!(text);
+                        crate::streaming::append_string_fragment(
+                            &mut response["message"]["content"],
+                            data["text"].as_str().unwrap_or(""),
+                        );
                         if wire==Wire::Chat {
                             yield Ok(Event::default().data(json!({"id":response["id"],"model":model,"object":"chat.completion.chunk","created":response["created"],"choices":[{"index":0,"delta":{"content":data["text"]},"finish_reason":null}]}).to_string()));
                         } else {
