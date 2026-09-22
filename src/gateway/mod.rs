@@ -48,7 +48,7 @@ pub mod quota;
 #[cfg(feature = "redis-coordination")]
 pub mod distributed;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -200,7 +200,12 @@ pub struct Job {
     started: oneshot::Sender<()>,
     /// When the job entered the queue — drives anti-starvation aging. Preserved
     /// across a rate-limit requeue so a job keeps aging while it waits.
+    timing: Box<JobTiming>,
+}
+
+struct JobTiming {
     enqueued_at: Instant,
+    deadline: Instant,
 }
 
 impl Job {
@@ -208,6 +213,18 @@ impl Job {
         match &self.delivery {
             Delivery::Unary(tx) => tx.is_closed(),
             Delivery::Stream(tx) => tx.is_closed(),
+        }
+    }
+
+    fn send_timeout(self) {
+        let _ = self.started.send(());
+        match self.delivery {
+            Delivery::Unary(sender) => {
+                let _ = sender.send(Err(GatewayError::Timeout));
+            }
+            Delivery::Stream(sender) => {
+                let _ = sender.send(Err(GatewayError::Timeout));
+            }
         }
     }
 }
@@ -257,13 +274,16 @@ pub struct InMemoryQueue {
     max_depth: usize,
     aging_step: Duration,
     max_boost: u32,
+    #[cfg(test)]
+    deadline_index_visits: AtomicU64,
 }
 
 #[derive(Default)]
 struct QueueInner {
-    /// Base tier → FIFO deque of jobs at that tier.
-    tiers: BTreeMap<Tier, VecDeque<Job>>,
-    len: usize,
+    /// Base tier → stable job ids ordered by monotonic submission sequence.
+    tiers: BTreeMap<Tier, BTreeSet<u64>>,
+    jobs: HashMap<u64, Job>,
+    deadlines: BTreeMap<Instant, BTreeSet<u64>>,
 }
 
 impl InMemoryQueue {
@@ -279,6 +299,8 @@ impl InMemoryQueue {
             // A zero step would divide by zero; treat it as "no aging".
             aging_step: aging_step.max(Duration::from_millis(1)),
             max_boost,
+            #[cfg(test)]
+            deadline_index_visits: AtomicU64::new(0),
         }
     }
 
@@ -295,15 +317,11 @@ impl InMemoryQueue {
         let tiers: Vec<Tier> = inner.tiers.keys().copied().collect();
         let mut best: Option<(i64, u64, Tier)> = None; // (eff_prio, seqno, tier)
         for tier in tiers {
-            let dq = inner.tiers.get_mut(&tier).unwrap();
-            // Skip cancelled jobs sitting at the front of this tier.
-            while dq.front().map(|j| j.is_cancelled()).unwrap_or(false) {
-                dq.pop_front();
-                inner.len -= 1;
-            }
-            if let Some(front) = dq.front() {
-                let eff = self.effective_priority(tier, front.enqueued_at, now);
-                let seqno = front.key.seqno;
+            let job_ids = inner.tiers.get(&tier).unwrap();
+            if let Some(job_id) = job_ids.first() {
+                let job = inner.jobs.get(job_id).unwrap();
+                let eff = self.effective_priority(tier, job.timing.enqueued_at, now);
+                let seqno = job.key.seqno;
                 let better = match best {
                     None => true,
                     Some((be, bs, _)) => eff > be || (eff == be && seqno < bs),
@@ -315,15 +333,82 @@ impl InMemoryQueue {
         }
         inner.tiers.retain(|_, dq| !dq.is_empty());
         let (_, _, tier) = best?;
-        let dq = inner.tiers.get_mut(&tier).unwrap();
-        let job = dq.pop_front();
-        if dq.is_empty() {
+        let job_id = *inner.tiers.get(&tier).unwrap().first().unwrap();
+        remove_tier_index(inner, tier, job_id);
+        let job = inner.jobs.remove(&job_id).unwrap();
+        remove_deadline_index(inner, job.timing.deadline, job_id);
+        Some(job)
+    }
+
+    fn expire_and_earliest_deadline(&self, now: Instant) -> Option<Instant> {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            let (&deadline, job_ids) = inner.deadlines.first_key_value()?;
+            let job_id = *job_ids.first().unwrap();
+            #[cfg(test)]
+            self.deadline_index_visits
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            let cancelled = inner.jobs.get(&job_id).is_none_or(Job::is_cancelled);
+            if deadline > now && !cancelled {
+                return Some(deadline);
+            }
+            remove_deadline_index(&mut inner, deadline, job_id);
+            if let Some(job) = inner.jobs.remove(&job_id) {
+                remove_tier_index(&mut inner, job.key.tier, job_id);
+                if !cancelled {
+                    job.send_timeout();
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn deadline_index_visits(&self) -> u64 {
+        self.deadline_index_visits.load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn deadline_index_len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .deadlines
+            .values()
+            .map(BTreeSet::len)
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn tier_index_len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .tiers
+            .values()
+            .map(BTreeSet::len)
+            .sum()
+    }
+}
+
+fn insert_deadline_index(inner: &mut QueueInner, deadline: Instant, job_id: u64) {
+    inner.deadlines.entry(deadline).or_default().insert(job_id);
+}
+
+fn remove_tier_index(inner: &mut QueueInner, tier: Tier, job_id: u64) {
+    if let Some(job_ids) = inner.tiers.get_mut(&tier) {
+        job_ids.remove(&job_id);
+        if job_ids.is_empty() {
             inner.tiers.remove(&tier);
         }
-        if job.is_some() {
-            inner.len -= 1;
+    }
+}
+
+fn remove_deadline_index(inner: &mut QueueInner, deadline: Instant, job_id: u64) {
+    if let Some(job_ids) = inner.deadlines.get_mut(&deadline) {
+        job_ids.remove(&job_id);
+        if job_ids.is_empty() {
+            inner.deadlines.remove(&deadline);
         }
-        job
     }
 }
 
@@ -332,11 +417,15 @@ impl RequestQueue for InMemoryQueue {
     fn enqueue(&self, job: Job) -> Result<(), Job> {
         {
             let mut inner = self.inner.lock().unwrap();
-            if inner.len >= self.max_depth {
+            if inner.jobs.len() >= self.max_depth {
                 return Err(job);
             }
-            inner.len += 1;
-            inner.tiers.entry(job.key.tier).or_default().push_back(job);
+            let job_id = job.key.seqno;
+            let tier = job.key.tier;
+            let deadline = job.timing.deadline;
+            inner.jobs.insert(job_id, job);
+            inner.tiers.entry(tier).or_default().insert(job_id);
+            insert_deadline_index(&mut inner, deadline, job_id);
         }
         // Wake a dispatcher parked on an empty queue or a backoff sleep.
         self.notify.notify_one();
@@ -358,12 +447,15 @@ impl RequestQueue for InMemoryQueue {
 
     fn requeue(&self, job: Job) {
         // No depth check and no notify: this is the dispatcher putting back a
-        // job it just took; notifying here would spin the backoff loop. Front of
-        // its tier — it keeps its original seqno/enqueued_at, so it re-wins its
-        // slot immediately on the next dequeue.
+        // job it just took; notifying here would spin the backoff loop. Its
+        // original monotonic sequence restores the same FIFO position.
         let mut inner = self.inner.lock().unwrap();
-        inner.len += 1;
-        inner.tiers.entry(job.key.tier).or_default().push_front(job);
+        let job_id = job.key.seqno;
+        let tier = job.key.tier;
+        let deadline = job.timing.deadline;
+        inner.jobs.insert(job_id, job);
+        inner.tiers.entry(tier).or_default().insert(job_id);
+        insert_deadline_index(&mut inner, deadline, job_id);
     }
 
     async fn notified(&self) {
@@ -371,7 +463,7 @@ impl RequestQueue for InMemoryQueue {
     }
 
     fn depth(&self) -> usize {
-        self.inner.lock().unwrap().len
+        self.inner.lock().unwrap().jobs.len()
     }
 }
 
@@ -387,6 +479,10 @@ pub struct GatewayConfig {
     pub overloaded_retry_after: Duration,
     /// Max concurrent in-flight upstream calls per provider.
     pub max_concurrency_per_provider: usize,
+    /// Absolute lifetime for one local unary scheduler job.
+    pub unary_job_timeout: Duration,
+    /// Absolute lifetime for one local streaming scheduler job.
+    pub stream_job_timeout: Duration,
     /// Anti-starvation aging: a queued job's *effective* tier rises by 1 for
     /// every `aging_step` it has waited, so a low tier flooded by a high tier
     /// eventually wins. Large by default → normal traffic stays strictly
@@ -417,6 +513,8 @@ impl Default for GatewayConfig {
             max_wait: Duration::from_secs(30),
             overloaded_retry_after: Duration::from_secs(1),
             max_concurrency_per_provider: 256,
+            unary_job_timeout: Duration::from_secs(2 * 60 * 60),
+            stream_job_timeout: Duration::from_secs(6 * 60 * 60),
             aging_step: Duration::from_secs(5),
             max_boost: 16,
             request_timeout: Duration::from_secs(120),
@@ -438,6 +536,15 @@ impl GatewayConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(fallback)
         };
+        let duration_env = |key: &str, fallback: Duration| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|milliseconds| *milliseconds > 0)
+                .map(Duration::from_millis)
+                .filter(|duration| Instant::now().checked_add(*duration).is_some())
+                .unwrap_or(fallback)
+        };
         Self {
             max_queue_depth: usize_env("LLMSHIM_GATEWAY_QUEUE_DEPTH", d.max_queue_depth),
             max_wait: std::env::var("LLMSHIM_GATEWAY_MAX_WAIT_MS")
@@ -449,6 +556,14 @@ impl GatewayConfig {
             max_concurrency_per_provider: usize_env(
                 "LLMSHIM_GATEWAY_MAX_CONCURRENCY",
                 d.max_concurrency_per_provider,
+            ),
+            unary_job_timeout: duration_env(
+                "LLMSHIM_GATEWAY_UNARY_JOB_TIMEOUT_MS",
+                d.unary_job_timeout,
+            ),
+            stream_job_timeout: duration_env(
+                "LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS",
+                d.stream_job_timeout,
             ),
             aging_step: std::env::var("LLMSHIM_GATEWAY_AGING_STEP_MS")
                 .ok()
@@ -478,7 +593,7 @@ impl GatewayConfig {
 }
 
 struct Lane {
-    queue: Arc<dyn RequestQueue>,
+    queue: Arc<InMemoryQueue>,
 }
 
 /// Priority-queue scheduler in front of the LLM calls. Cheaply cloneable via
@@ -512,14 +627,21 @@ impl Scheduler {
     /// Enqueue a request and await its result. The queueing is internal: the
     /// caller sees a normal response, an `Overloaded` shed, or a `Timeout`.
     pub async fn submit(self: &Arc<Self>, req: GatewayRequest) -> Result<Value, GatewayError> {
-        self.submit_inner(req, None).await
+        self.submit_inner(req, None, None).await
     }
 
     async fn submit_inner(
         self: &Arc<Self>,
         req: GatewayRequest,
         policy_context: Option<crate::policy::DispatchPolicyContext>,
+        deadline_override: Option<Instant>,
     ) -> Result<Value, GatewayError> {
+        let deadline = deadline_override.unwrap_or_else(|| {
+            Instant::now()
+                .checked_add(self.config.unary_job_timeout)
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(2 * 60 * 60))
+        });
+        let policy_context = policy_context.map(|context| context.with_logical_deadline(deadline));
         let provider = req.provider.clone();
         let tier = req.tier;
         let queue = self.lane_for(&provider);
@@ -536,7 +658,10 @@ impl Scheduler {
             policy_context,
             delivery: Delivery::Unary(tx),
             started: started_tx,
-            enqueued_at: Instant::now(),
+            timing: Box::new(JobTiming {
+                enqueued_at: Instant::now(),
+                deadline,
+            }),
         };
 
         if queue.enqueue(job).is_err() {
@@ -585,7 +710,17 @@ impl Scheduler {
         req: GatewayRequest,
         policy_context: crate::policy::DispatchPolicyContext,
     ) -> Result<Value, GatewayError> {
-        self.submit_inner(req, Some(policy_context)).await
+        self.submit_inner(req, Some(policy_context), None).await
+    }
+
+    pub(crate) async fn submit_with_policy_deadline(
+        self: &Arc<Self>,
+        req: GatewayRequest,
+        policy_context: crate::policy::DispatchPolicyContext,
+        deadline: Instant,
+    ) -> Result<Value, GatewayError> {
+        self.submit_inner(req, Some(policy_context), Some(deadline))
+            .await
     }
 
     /// Like [`submit`](Self::submit) but for a streaming request: enqueues by
@@ -595,7 +730,7 @@ impl Scheduler {
         self: &Arc<Self>,
         req: GatewayRequest,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
-        self.submit_stream_inner(req, None).await
+        self.submit_stream_inner(req, None, None).await
     }
 
     pub(crate) async fn submit_stream_with_policy(
@@ -603,14 +738,32 @@ impl Scheduler {
         req: GatewayRequest,
         policy_context: crate::policy::DispatchPolicyContext,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
-        self.submit_stream_inner(req, Some(policy_context)).await
+        self.submit_stream_inner(req, Some(policy_context), None)
+            .await
+    }
+
+    pub(crate) async fn submit_stream_with_policy_deadline(
+        self: &Arc<Self>,
+        req: GatewayRequest,
+        policy_context: crate::policy::DispatchPolicyContext,
+        deadline: Instant,
+    ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
+        self.submit_stream_inner(req, Some(policy_context), Some(deadline))
+            .await
     }
 
     async fn submit_stream_inner(
         self: &Arc<Self>,
         req: GatewayRequest,
         policy_context: Option<crate::policy::DispatchPolicyContext>,
+        deadline_override: Option<Instant>,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
+        let deadline = deadline_override.unwrap_or_else(|| {
+            Instant::now()
+                .checked_add(self.config.stream_job_timeout)
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(6 * 60 * 60))
+        });
+        let policy_context = policy_context.map(|context| context.with_logical_deadline(deadline));
         let provider = req.provider.clone();
         let tier = req.tier;
         let queue = self.lane_for(&provider);
@@ -627,7 +780,10 @@ impl Scheduler {
             policy_context,
             delivery: Delivery::Stream(result_tx),
             started: started_tx,
-            enqueued_at: Instant::now(),
+            timing: Box::new(JobTiming {
+                enqueued_at: Instant::now(),
+                deadline,
+            }),
         };
 
         if queue.enqueue(job).is_err() {
@@ -686,12 +842,12 @@ impl Scheduler {
     }
 
     /// Get or create the lane (queue + dispatcher task) for a provider.
-    fn lane_for(self: &Arc<Self>, provider: &str) -> Arc<dyn RequestQueue> {
+    fn lane_for(self: &Arc<Self>, provider: &str) -> Arc<InMemoryQueue> {
         let mut lanes = self.lanes.lock().unwrap();
         if let Some(lane) = lanes.get(provider) {
             return lane.queue.clone();
         }
-        let queue: Arc<dyn RequestQueue> = Arc::new(InMemoryQueue::with_aging(
+        let queue = Arc::new(InMemoryQueue::with_aging(
             self.config.max_queue_depth,
             self.config.aging_step,
             self.config.max_boost,
@@ -737,7 +893,7 @@ async fn penalize_if_429(limiter: &Arc<dyn RateLimiter>, provider: &str, err: &D
 /// per-provider concurrency semaphore).
 async fn dispatcher_loop(
     provider: String,
-    queue: Arc<dyn RequestQueue>,
+    queue: Arc<InMemoryQueue>,
     limiter: Arc<dyn RateLimiter>,
     dispatch: Arc<dyn Dispatch>,
     max_concurrency: usize,
@@ -755,9 +911,16 @@ async fn dispatcher_loop(
         // saturated concurrency semaphore never wastes a token nor holds one
         // idle while a lane waits for a slot.
         let policy_gated = job.policy_context.is_some();
-        let permit = match sem.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
+        let permit = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(job.timing.deadline) => {
+                job.send_timeout();
+                continue;
+            }
+            result = sem.clone().acquire_owned() => match result {
+                Ok(permit) => permit,
+                Err(_) => break,
+            }
         };
         if job.is_cancelled() {
             continue; // gave up while waiting for a concurrency slot
@@ -766,7 +929,14 @@ async fn dispatcher_loop(
         let rate_admission = if policy_gated {
             Ok(())
         } else {
-            limiter.acquire(&key, job.permits).await
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(job.timing.deadline) => {
+                    job.send_timeout();
+                    continue;
+                }
+                result = limiter.acquire(&key, job.permits) => result,
+            }
         };
         match rate_admission {
             Ok(()) => {
@@ -777,15 +947,17 @@ async fn dispatcher_loop(
                 metrics::observe_ms(
                     metrics::QUEUE_WAIT,
                     &[("provider", &provider)],
-                    job.enqueued_at.elapsed().as_millis() as f64,
+                    job.timing.enqueued_at.elapsed().as_millis() as f64,
                 );
                 let Job {
                     payload,
                     policy_context,
                     delivery,
                     started,
+                    timing,
                     ..
                 } = job;
+                let deadline = timing.deadline;
                 // Queue residence is over — release the caller's `max_wait`.
                 let _ = started.send(());
                 let dispatch = dispatch.clone();
@@ -799,64 +971,116 @@ async fn dispatcher_loop(
                     let started_at = Instant::now();
                     let plabels: &[(&str, &str)] = &[("provider", &provider)];
                     match delivery {
-                        Delivery::Unary(tx) => match match policy_context {
-                            Some(context) => {
-                                dispatch
-                                    .dispatch_with_policy(&provider, payload, context)
-                                    .await
-                            }
-                            None => dispatch.dispatch(&provider, payload).await,
-                        } {
-                            Ok(value) => {
-                                metrics::incr(metrics::DISPATCHED, plabels);
-                                metrics::observe_ms(
-                                    metrics::UPSTREAM_LATENCY,
-                                    plabels,
-                                    started_at.elapsed().as_millis() as f64,
-                                );
-                                let _ = tx.send(Ok(value));
-                            }
-                            Err(err) => {
-                                metrics::incr(
-                                    metrics::REJECTED,
-                                    &[("provider", &provider), ("reason", "upstream")],
-                                );
-                                if !policy_gated {
-                                    penalize_if_429(&limiter, &provider, &err).await;
-                                }
-                                let _ = tx.send(Err(GatewayError::Upstream(err.message)));
-                            }
-                        },
-                        Delivery::Stream(tx) => {
-                            let opened = match policy_context {
+                        Delivery::Unary(mut tx) => {
+                            let dispatch_future = match policy_context {
                                 Some(context) => {
-                                    dispatch
-                                        .dispatch_stream_with_policy(&provider, payload, context)
-                                        .await
+                                    dispatch.dispatch_with_policy(&provider, payload, context)
                                 }
-                                None => dispatch.dispatch_stream(&provider, payload).await,
+                                None => dispatch.dispatch(&provider, payload),
                             };
+                            tokio::pin!(dispatch_future);
+                            let dispatch_result = tokio::select! {
+                                biased;
+                                _ = tx.closed() => return,
+                                _ = tokio::time::sleep_until(deadline) => {
+                                    let _ = tx.send(Err(GatewayError::Timeout));
+                                    return;
+                                }
+                                result = &mut dispatch_future => result,
+                            };
+                            if Instant::now() >= deadline {
+                                let _ = tx.send(Err(GatewayError::Timeout));
+                                return;
+                            }
+                            match dispatch_result {
+                                Ok(value) => {
+                                    metrics::incr(metrics::DISPATCHED, plabels);
+                                    metrics::observe_ms(
+                                        metrics::UPSTREAM_LATENCY,
+                                        plabels,
+                                        started_at.elapsed().as_millis() as f64,
+                                    );
+                                    let _ = tx.send(Ok(value));
+                                }
+                                Err(err) => {
+                                    metrics::incr(
+                                        metrics::REJECTED,
+                                        &[("provider", &provider), ("reason", "upstream")],
+                                    );
+                                    if !policy_gated {
+                                        penalize_if_429(&limiter, &provider, &err).await;
+                                    }
+                                    let _ = tx.send(Err(GatewayError::Upstream(err.message)));
+                                }
+                            }
+                        }
+                        Delivery::Stream(mut tx) => {
+                            let open_future = match policy_context {
+                                Some(context) => dispatch
+                                    .dispatch_stream_with_policy(&provider, payload, context),
+                                None => dispatch.dispatch_stream(&provider, payload),
+                            };
+                            tokio::pin!(open_future);
+                            let opened = tokio::select! {
+                                biased;
+                                _ = tx.closed() => return,
+                                _ = tokio::time::sleep_until(deadline) => {
+                                    let _ = tx.send(Err(GatewayError::Timeout));
+                                    return;
+                                }
+                                result = &mut open_future => result,
+                            };
+                            if Instant::now() >= deadline {
+                                let _ = tx.send(Err(GatewayError::Timeout));
+                                return;
+                            }
                             match opened {
                                 Ok(mut upstream) => {
                                     metrics::incr(metrics::DISPATCHED, plabels);
-                                    let (chunk_tx, chunk_rx) = mpsc::channel(16);
+                                    let (chunk_tx, chunk_rx) = mpsc::channel(17);
+                                    let terminal_permit =
+                                        match chunk_tx.clone().reserve_owned().await {
+                                            Ok(permit) => permit,
+                                            Err(_) => return,
+                                        };
                                     // Hand the receiver to the caller; if it's
                                     // already gone, abandon the stream.
                                     if tx.send(Ok(chunk_rx)).is_err() {
                                         return;
                                     }
                                     use futures::StreamExt;
+                                    let mut terminal_permit = Some(terminal_permit);
                                     loop {
                                         tokio::select! {
                                             biased;
                                             _ = chunk_tx.closed() => break,
+                                            _ = tokio::time::sleep_until(deadline) => {
+                                                if let Some(permit) = terminal_permit.take() {
+                                                    permit.send(Err(GatewayError::Timeout));
+                                                }
+                                                break;
+                                            }
                                             item = upstream.next() => match item {
                                                 Some(item) => {
-                                                    if chunk_tx.send(item).await.is_err() {
+                                                    let sent = tokio::select! {
+                                                        biased;
+                                                        _ = chunk_tx.closed() => false,
+                                                        _ = tokio::time::sleep_until(deadline) => {
+                                                            if let Some(permit) = terminal_permit.take() {
+                                                                permit.send(Err(GatewayError::Timeout));
+                                                            }
+                                                            false
+                                                        }
+                                                        result = chunk_tx.send(item) => result.is_ok(),
+                                                    };
+                                                    if !sent {
                                                         break;
                                                     }
                                                 }
-                                                None => break,
+                                                None => {
+                                                    terminal_permit.take();
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -887,8 +1111,16 @@ async fn dispatcher_loop(
                 // early if new (possibly higher-priority) work arrives.
                 drop(permit);
                 queue.requeue(job);
+                let retry_deadline = Instant::now()
+                    .checked_add(wait)
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(60));
+                let earliest_job_deadline = queue
+                    .expire_and_earliest_deadline(Instant::now())
+                    .unwrap_or(retry_deadline);
                 tokio::select! {
-                    _ = tokio::time::sleep(wait) => {}
+                    biased;
+                    _ = tokio::time::sleep_until(earliest_job_deadline) => {}
+                    _ = tokio::time::sleep_until(retry_deadline) => {}
                     _ = queue.notified() => {}
                 }
             }
@@ -901,6 +1133,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::HashMap as Map;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // ---- test doubles -------------------------------------------------------
 
@@ -910,6 +1143,17 @@ mod tests {
     struct FakeLimiter {
         permits: Mutex<Map<String, i64>>,
         default: i64,
+    }
+
+    struct RetryHintLimiter(Duration);
+
+    #[async_trait]
+    impl RateLimiter for RetryHintLimiter {
+        async fn acquire(&self, _key: &RateKey, _permits: u32) -> Result<(), RetryAfter> {
+            Err(RetryAfter(self.0))
+        }
+
+        async fn penalize(&self, _key: &RateKey, _retry_after: Duration) {}
     }
     impl FakeLimiter {
         fn new(default: i64) -> Self {
@@ -995,6 +1239,45 @@ mod tests {
         preparation_starts: Arc<std::sync::atomic::AtomicUsize>,
         preparation_started: Arc<Notify>,
         preparation_latch: Arc<Notify>,
+    }
+
+    struct PendingDispatch {
+        starts: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct DispatchDropGuard(Arc<AtomicBool>);
+
+    impl Drop for DispatchDropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Dispatch for PendingDispatch {
+        async fn dispatch(&self, _provider: &str, _payload: Value) -> Result<Value, DispatchError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let _guard = DispatchDropGuard(self.dropped.clone());
+            futures::future::pending().await
+        }
+
+        async fn dispatch_stream(
+            &self,
+            _provider: &str,
+            _payload: Value,
+        ) -> Result<ChunkStream, DispatchError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let dropped = self.dropped.clone();
+            let stream = async_stream::stream! {
+                let _guard = DispatchDropGuard(dropped);
+                for index in 0..100_u32 {
+                    yield Ok(index.to_string());
+                }
+                futures::future::pending::<()>().await;
+            };
+            Ok(Box::pin(stream))
+        }
     }
 
     #[async_trait]
@@ -1085,7 +1368,10 @@ mod tests {
                 policy_context: None,
                 delivery: Delivery::Unary(tx),
                 started,
-                enqueued_at: Instant::now(),
+                timing: Box::new(JobTiming {
+                    enqueued_at: Instant::now(),
+                    deadline: Instant::now() + Duration::from_secs(60),
+                }),
             },
             rx,
         )
@@ -1108,6 +1394,74 @@ mod tests {
         }
         let order: Vec<(u8, u64)> = got.iter().map(|k| (k.tier, k.seqno)).collect();
         assert_eq!(order, vec![(3, 1), (3, 4), (2, 3), (1, 0), (1, 2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_index_work_is_constant_per_backoff_wake_and_drains_cleanly() {
+        let queue = InMemoryQueue::new(10_000);
+        let shared_deadline = Instant::now() + Duration::from_secs(60);
+        let mut receivers = Vec::new();
+        for sequence in 0..5_000_u64 {
+            let (mut job, receiver) = dummy_job(0, sequence);
+            job.timing.deadline = shared_deadline;
+            assert!(queue.enqueue(job).is_ok());
+            receivers.push(receiver);
+        }
+        for _ in 0..5_000 {
+            assert_eq!(
+                queue.expire_and_earliest_deadline(Instant::now()),
+                Some(shared_deadline)
+            );
+        }
+        assert_eq!(queue.deadline_index_visits(), 5_000);
+        assert_eq!(queue.deadline_index_len(), 5_000);
+
+        for _ in 0..5_000 {
+            let _ = queue.dequeue().await;
+        }
+        assert_eq!(queue.depth(), 0);
+        assert_eq!(queue.deadline_index_len(), 0);
+        drop(receivers);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_expiry_behind_live_tier_head_keeps_every_index_bounded() {
+        let queue = InMemoryQueue::new(1_000);
+        let (mut head, head_receiver) = dummy_job(0, 0);
+        let head_deadline = Instant::now() + Duration::from_secs(1_000);
+        head.timing.deadline = head_deadline;
+        assert!(queue.enqueue(head).is_ok());
+
+        for wave in 0..20_u64 {
+            let deadline = Instant::now() + Duration::from_millis(1);
+            let mut receivers = Vec::new();
+            for offset in 0..100_u64 {
+                let (mut job, receiver) = dummy_job(0, wave * 100 + offset + 1);
+                job.timing.deadline = deadline;
+                assert!(queue.enqueue(job).is_ok());
+                receivers.push(receiver);
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert_eq!(
+                queue.expire_and_earliest_deadline(Instant::now()),
+                Some(head_deadline)
+            );
+            assert_eq!(queue.depth(), 1);
+            assert_eq!(queue.deadline_index_len(), 1);
+            assert_eq!(queue.tier_index_len(), 1);
+            for receiver in receivers {
+                assert!(matches!(
+                    receiver.await.unwrap(),
+                    Err(GatewayError::Timeout)
+                ));
+            }
+        }
+
+        let _ = queue.dequeue().await;
+        assert_eq!(queue.depth(), 0);
+        assert_eq!(queue.deadline_index_len(), 0);
+        assert_eq!(queue.tier_index_len(), 0);
+        drop(head_receiver);
     }
 
     #[tokio::test]
@@ -1386,6 +1740,128 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn unary_deadline_interrupts_long_rate_limit_backoff() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = Scheduler::new(
+            GatewayConfig {
+                max_wait: Duration::from_millis(500),
+                unary_job_timeout: Duration::from_millis(20),
+                ..GatewayConfig::default()
+            },
+            Arc::new(RetryHintLimiter(Duration::from_millis(200))),
+            Arc::new(RecordingDispatch {
+                order: order.clone(),
+            }),
+        );
+        let submitted_scheduler = scheduler.clone();
+        let handle = tokio::spawn(async move {
+            submitted_scheduler
+                .submit(GatewayRequest {
+                    provider: "p".into(),
+                    tier: 0,
+                    permits: 1,
+                    payload: json!({"id": 1}),
+                })
+                .await
+        });
+        yield_many().await;
+        tokio::time::advance(Duration::from_millis(20)).await;
+        yield_many().await;
+        assert!(matches!(handle.await.unwrap(), Err(GatewayError::Timeout)));
+        assert!(order.lock().unwrap().is_empty());
+        assert_eq!(scheduler.queue_depth("p"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_deadline_interrupts_long_rate_limit_backoff() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = Scheduler::new(
+            GatewayConfig {
+                max_wait: Duration::from_millis(500),
+                stream_job_timeout: Duration::from_millis(20),
+                ..GatewayConfig::default()
+            },
+            Arc::new(RetryHintLimiter(Duration::from_millis(200))),
+            Arc::new(RecordingDispatch {
+                order: order.clone(),
+            }),
+        );
+        let submitted_scheduler = scheduler.clone();
+        let handle = tokio::spawn(async move {
+            submitted_scheduler
+                .submit_stream(GatewayRequest {
+                    provider: "p".into(),
+                    tier: 0,
+                    permits: 1,
+                    payload: json!({"id": 1}),
+                })
+                .await
+        });
+        yield_many().await;
+        tokio::time::advance(Duration::from_millis(20)).await;
+        yield_many().await;
+        assert!(matches!(handle.await.unwrap(), Err(GatewayError::Timeout)));
+        assert!(order.lock().unwrap().is_empty());
+        assert_eq!(scheduler.queue_depth("p"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_wakes_for_earliest_deadline_across_priority_tiers() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = Scheduler::new(
+            GatewayConfig {
+                max_wait: Duration::from_secs(1),
+                ..GatewayConfig::default()
+            },
+            Arc::new(RetryHintLimiter(Duration::from_millis(200))),
+            Arc::new(RecordingDispatch {
+                order: order.clone(),
+            }),
+        );
+        let now = Instant::now();
+        let high_scheduler = scheduler.clone();
+        let high = tokio::spawn(async move {
+            high_scheduler
+                .submit_inner(
+                    GatewayRequest {
+                        provider: "p".into(),
+                        tier: 10,
+                        permits: 1,
+                        payload: json!({"id": 10}),
+                    },
+                    None,
+                    Some(now + Duration::from_millis(200)),
+                )
+                .await
+        });
+        yield_many().await;
+        let low_scheduler = scheduler.clone();
+        let low = tokio::spawn(async move {
+            low_scheduler
+                .submit_inner(
+                    GatewayRequest {
+                        provider: "p".into(),
+                        tier: 0,
+                        permits: 1,
+                        payload: json!({"id": 1}),
+                    },
+                    None,
+                    Some(now + Duration::from_millis(20)),
+                )
+                .await
+        });
+        yield_many().await;
+        tokio::time::advance(Duration::from_millis(20)).await;
+        yield_many().await;
+        assert!(matches!(low.await.unwrap(), Err(GatewayError::Timeout)));
+        assert!(order.lock().unwrap().is_empty());
+        high.abort();
+        tokio::time::advance(Duration::from_millis(180)).await;
+        yield_many().await;
+        assert_eq!(scheduler.queue_depth("p"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cancelled_job_is_not_dispatched() {
         let limiter = Arc::new(FakeLimiter::new(0));
         let order = Arc::new(Mutex::new(Vec::new()));
@@ -1464,6 +1940,111 @@ mod tests {
             got.push(item.unwrap());
         }
         assert_eq!(got, vec!["7:0", "7:1", "7:2"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_unary_submitter_cancels_dispatch_and_releases_capacity() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let config = GatewayConfig {
+            max_concurrency_per_provider: 1,
+            unary_job_timeout: Duration::from_secs(30),
+            ..GatewayConfig::default()
+        };
+        let scheduler = Scheduler::new(
+            config,
+            Arc::new(FakeLimiter::new(100)),
+            Arc::new(PendingDispatch {
+                starts: starts.clone(),
+                dropped: dropped.clone(),
+            }),
+        );
+        let first_scheduler = scheduler.clone();
+        let first = tokio::spawn(async move {
+            first_scheduler
+                .submit(GatewayRequest {
+                    provider: "p".into(),
+                    tier: 0,
+                    permits: 1,
+                    payload: json!({}),
+                })
+                .await
+        });
+        while starts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        yield_many().await;
+        assert!(dropped.load(Ordering::SeqCst));
+
+        let second_scheduler = scheduler.clone();
+        let second = tokio::spawn(async move {
+            second_scheduler
+                .submit(GatewayRequest {
+                    provider: "p".into(),
+                    tier: 0,
+                    permits: 1,
+                    payload: json!({}),
+                })
+                .await
+        });
+        while starts.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        second.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unpolled_stream_gets_terminal_timeout_and_releases_capacity() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let config = GatewayConfig {
+            max_concurrency_per_provider: 1,
+            stream_job_timeout: Duration::from_secs(2),
+            ..GatewayConfig::default()
+        };
+        let scheduler = Scheduler::new(
+            config,
+            Arc::new(FakeLimiter::new(100)),
+            Arc::new(PendingDispatch {
+                starts: starts.clone(),
+                dropped: dropped.clone(),
+            }),
+        );
+        let mut first = scheduler
+            .submit_stream(GatewayRequest {
+                provider: "p".into(),
+                tier: 0,
+                permits: 1,
+                payload: json!({}),
+            })
+            .await
+            .unwrap();
+        yield_many().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        yield_many().await;
+        assert!(dropped.load(Ordering::SeqCst));
+
+        let mut saw_timeout = false;
+        while let Some(item) = first.recv().await {
+            if matches!(item, Err(GatewayError::Timeout)) {
+                saw_timeout = true;
+                break;
+            }
+        }
+        assert!(saw_timeout, "deadline must not become clean EOF");
+
+        let second = scheduler
+            .submit_stream(GatewayRequest {
+                provider: "p".into(),
+                tier: 0,
+                permits: 1,
+                payload: json!({}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        drop(second);
     }
 
     #[tokio::test(start_paused = true)]
