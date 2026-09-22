@@ -279,22 +279,55 @@ Connection pools and concurrency limits remain per process. If the Redis client
 cannot be initialized—or the binary lacks the feature—the compact proxy warns
 and falls back to in-memory buckets.
 
-With `gateway-redis`, admitting a new job checks both protocol queues' combined
-provider waiting depth and inserts the job in one Lua transaction. Concurrent
-origins cannot claim the same remaining slot. `LLMSHIM_GATEWAY_QUEUE_DEPTH`
-defaults to 10,000 total waiting jobs per provider; a full queue refuses new
-work with `503` and `Retry-After`. Released origins only count the legacy queue,
-so that combined bound becomes exact after old ingress stops. The two protocol
-queues keep independent priority ordering during the transition; one shared
+With `gateway-redis`, admitting a new job checks the current fenced queues and
+the released legacy/scoped queues' combined provider waiting depth, then inserts
+the job in one Lua transaction. Concurrent current origins cannot claim the
+same remaining slot. `LLMSHIM_GATEWAY_QUEUE_DEPTH` defaults to 10,000 total
+waiting jobs per provider; a full queue refuses new work with `503` and
+`Retry-After`. Released origins cannot include the new queues in their older
+admission script, so the combined bound becomes exact after old ingress stops.
+The current two protocol queues keep independent priority ordering; one shared
 worker-capacity bound prevents them from doubling upstream concurrency.
 
-Authenticated jobs use a versioned scoped queue, lease, response, completion,
-dead-letter, and reaper namespace. Released workers only watch the legacy
-namespace and cannot lease a new scoped job or move its expired lease. New
-workers also serve the legacy namespace for deliberately trusted custom Rust
-jobs, with one per-provider concurrency limit shared across both protocols.
-They reject an older scoped descriptor found in the legacy queue instead of
-running it without its budget policy.
+Authenticated jobs use the fenced `llmshim:gw:scoped:v2:*` namespace. Trusted
+unscoped Rust submissions use `llmshim:gw:fenced:v1:*`. Current workers and
+reapers watch only those two namespaces, with one per-provider concurrency limit
+shared across them. Released workers cannot lease or acknowledge these jobs.
+The released `llmshim:gw:*` and `llmshim:gw:scoped:v1:*` records are preserved
+for their matching old workers; current workers do not silently migrate or
+execute them with a partially upgraded protocol.
+
+Each leased delivery has a random owner token. An independent heartbeat keeps
+that lease current during rate and policy waits, provider preparation, unary
+calls, quiet streams, response publication, and terminal cleanup. Redis checks
+the token in the same transaction that refreshes, publishes, releases,
+completes, acknowledges, or moves the delivery to the dead-letter queue. A
+worker that has lost its lease can no longer publish or mutate the replacement
+delivery. Lease creation, refresh, and reaping use Redis `TIME`, so host clock
+skew cannot expire another worker's healthy lease.
+
+Distributed worker jobs have a finite six-hour lifetime by default. Redis
+lease operations are bounded to five seconds or one quarter of the configured
+lease, whichever is shorter. Positive millisecond overrides are available as
+`LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS` and
+`LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS`; zero and invalid values retain
+the finite defaults. A worker deadline drops local provider work while retaining
+the heartbeat, then publishes its error, records completion, and removes lease
+state in one owner-fenced Redis transaction.
+
+The queue remains at-least-once across an actual worker crash or coordination
+partition. If a provider accepted a request before ownership became uncertain,
+redelivery can still make another external call; lease fencing prevents stale
+local publication and cleanup but cannot make an external provider exactly
+once.
+
+For a rolling upgrade, first stop old ingress. Keep the matching old workers
+until both the waiting and processing sorted sets in each released namespace
+are empty for every provider, then remove those workers. Old work retains its
+old lease and publication guarantees while draining. Do not delete its Redis
+keys to accelerate the transition: those entries represent accepted requests.
+New queue-depth metrics include released waiting entries, but operators must
+also inspect the released processing keys before declaring the drain complete.
 
 During an upgrade from the post-charge spend counter, each new authenticated
 origin uses one Redis-time Lua transaction to read the active legacy
