@@ -181,7 +181,8 @@ fn structured_chat_reasoning_fragments_assemble_the_original_payload() {
             .transform_stream_chunk("deepseek/deepseek-r1", &raw.to_string())
             .unwrap()
             .unwrap();
-        acc.push(&serde_json::from_str::<Value>(&chunk).unwrap()["choices"][0]["delta"]);
+        acc.push(&serde_json::from_str::<Value>(&chunk).unwrap()["choices"][0]["delta"])
+            .unwrap();
     }
     let r = p
         .transform_request(
@@ -228,7 +229,7 @@ fn deepseek_reasoning_echoes_to_same_family_and_drops_on_cross_family_hops() {
 
 #[test]
 fn family_lookup_normalizes_an_openrouter_variant_suffix_but_keeps_the_wire_id() {
-    // MOH-240: a suffixed OpenRouter slug (`:nitro`, `:floor`, …) missed the
+    // A suffixed OpenRouter slug (`:nitro`, `:floor`, …) missed the
     // catalog entirely, so its family came back `None` and reasoning replay
     // was dropped as `unknown_family`. The lookup should normalize; the id
     // ReplayTarget stores (and that goes out on the wire) must not change.
@@ -332,7 +333,7 @@ fn streamed_anthropic_blocks_assemble_separately_and_replay_losslessly() {
             .unwrap();
         let v: Value = serde_json::from_str(&chunk).unwrap();
         assert!(v["choices"][0]["delta"].get("reasoning_content").is_none());
-        acc.push(&v["choices"][0]["delta"]);
+        acc.push(&v["choices"][0]["delta"]).unwrap();
     }
     let req = p
         .transform_request(
@@ -363,7 +364,8 @@ fn completed_responses_item_replaces_summary_fragments_without_duplication() {
             .transform_stream_chunk("gpt-6-astra", &event.to_string())
             .unwrap()
             .unwrap();
-        acc.push(&serde_json::from_str::<Value>(&chunk).unwrap()["choices"][0]["delta"]);
+        acc.push(&serde_json::from_str::<Value>(&chunk).unwrap()["choices"][0]["delta"])
+            .unwrap();
     }
     assert_eq!(acc.blocks().len(), 1);
     let req = p
@@ -390,7 +392,8 @@ fn unkeyed_blocks_in_one_message_stay_separate_blocks() {
     acc.push(&json!({"reasoning": [
         {"kind": "text", "text": "first thought", "origin": origin},
         {"kind": "encrypted", "data": "opaque", "origin": origin},
-    ]}));
+    ]}))
+    .unwrap();
     let blocks = acc.blocks();
     assert_eq!(blocks.len(), 2, "two unkeyed blocks in, two blocks out");
     assert_eq!(blocks[0]["text"], "first thought");
@@ -404,8 +407,10 @@ fn unkeyed_blocks_in_one_message_stay_separate_blocks() {
 #[test]
 fn indexed_fragments_across_chunks_still_assemble_one_block() {
     let mut acc = ReasoningAccumulator::default();
-    acc.push(&json!({"reasoning": [{"index": 0, "text": "the file "}]}));
-    acc.push(&json!({"reasoning": [{"index": 0, "text": "needs replacing"}]}));
+    acc.push(&json!({"reasoning": [{"index": 0, "text": "the file "}]}))
+        .unwrap();
+    acc.push(&json!({"reasoning": [{"index": 0, "text": "needs replacing"}]}))
+        .unwrap();
     let blocks = acc.blocks();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0]["text"], "the file needs replacing");
@@ -433,6 +438,6 @@ fn a_buffered_chunk_folds_back_into_its_separate_blocks() {
     let chunk: Value = serde_json::from_str(chunks[0].as_ref().unwrap()).unwrap();
     assert_eq!(chunk["object"], "chat.completion.chunk");
     let mut acc = ReasoningAccumulator::default();
-    acc.push(&chunk["choices"][0]["delta"]);
+    acc.push(&chunk["choices"][0]["delta"]).unwrap();
     assert_eq!(acc.blocks().len(), 2);
 }

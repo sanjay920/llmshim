@@ -81,10 +81,15 @@ fragments and removes stream framing before storage:
 ```rust
 let mut reasoning = llmshim::reasoning::ReasoningAccumulator::default();
 // For each normalized chunk:
-reasoning.push(&chunk["choices"][0]["delta"]);
+reasoning.push(&chunk["choices"][0]["delta"])?;
 // When the stream has completed successfully:
 assistant["reasoning"] = serde_json::json!(reasoning.blocks());
 ```
+
+`push` returns a `Result` because reasoning text, signatures, encrypted data,
+and block identities share the per-response retained-state budget. Propagate
+that error; an over-budget accumulator never returns an apparently complete
+partial result.
 
 Use `reasoning_text(&message_or_delta)` for display without inspecting opaque
 data. A provider may expose only a summary or no readable reasoning at all.

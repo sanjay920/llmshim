@@ -36,7 +36,7 @@ while let Some(chunk) = stream.next().await {
     let parsed: serde_json::Value = serde_json::from_str(&chunk)?;
 
     let delta = &parsed["choices"][0]["delta"];
-    reasoning.push(delta);
+    reasoning.push(delta)?;
     eprint!("{}", llmshim::reasoning::reasoning_text(delta));
 
     if let Some(text) = parsed
@@ -118,4 +118,3 @@ See the canonical client guides for complete loops:
 [TypeScript](https://github.com/sanjay920/llmshim/blob/main/clients/typescript/README.md#30-second-quickstart),
 [Go](https://github.com/sanjay920/llmshim/blob/main/clients/go/README.md#streaming), and
 [Ruby](https://github.com/sanjay920/llmshim/blob/main/clients/ruby/README.md#streaming).
-

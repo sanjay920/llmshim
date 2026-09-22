@@ -117,12 +117,12 @@ async fn openrouter_tool_call() {
     println!("tool call ok");
 }
 
-/// MOH-228 receipt: the response carries OpenRouter's own bill, llmshim stamps
+/// The response carries OpenRouter's own bill, llmshim stamps
 /// that in preference to the catalog estimate, and both numbers are printed
 /// side by side so the difference between an invoice and an estimate is a
 /// measurement rather than a claim.
 ///
-/// Pinned to one model the owner authorized for live calls. Run with:
+/// Uses a fixed model and makes billed API calls. Run with:
 /// `cargo test --test integration_openrouter -- --ignored --nocapture
 ///  openrouter_reports_its_own_cost`
 const ACCOUNTING_MODEL: &str = "openrouter/deepseek/deepseek-v4.1-flash";

@@ -199,6 +199,7 @@ pub struct ShimClient {
     retry: RetryConfig,
     deadlines: AttemptDeadlines,
     response_body_limits: body::ResponseBodyLimits,
+    stream_retention_limits: crate::streaming::StreamRetentionLimits,
     /// Provider health, fed by every dispatch this client makes. `None` means
     /// this client reports to nobody — see [`ShimClient::with_breaker`].
     breaker: Option<Arc<ProviderBreaker>>,
@@ -218,6 +219,7 @@ impl ShimClient {
             retry: RetryConfig::from_env(),
             deadlines,
             response_body_limits: body::ResponseBodyLimits::default(),
+            stream_retention_limits: crate::streaming::StreamRetentionLimits::default(),
             breaker: None,
         }
     }
@@ -228,6 +230,19 @@ impl ShimClient {
     ) -> std::result::Result<Self, &'static str> {
         self.deadlines = deadlines.validate()?;
         self.http = build_http_client(self.deadlines.connect);
+        Ok(self)
+    }
+
+    pub fn with_stream_retention_limits(
+        mut self,
+        limits: crate::streaming::StreamRetentionLimits,
+    ) -> Result<Self> {
+        self.stream_retention_limits = crate::streaming::StreamRetentionLimits::new(
+            limits.normalizer_bytes,
+            limits.normalizer_entries,
+            limits.native_usage_bytes,
+            limits.native_usage_entries,
+        )?;
         Ok(self)
     }
 
@@ -1002,6 +1017,7 @@ impl ShimClient {
             policy_failure.clone(),
             self.deadlines,
             attempt_deadline,
+            self.stream_retention_limits,
         );
 
         Ok((
@@ -1124,6 +1140,7 @@ fn eager_stream(
     policy_failure: Arc<std::sync::Mutex<Option<AttemptPolicyError>>>,
     deadlines: AttemptDeadlines,
     attempt_deadline: tokio::time::Instant,
+    retention_limits: crate::streaming::StreamRetentionLimits,
 ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
     let cancellation_guard = tracker.as_ref().map(AttemptTracker::cancellation_guard);
     let (output_sender, output_receiver) = tokio::sync::mpsc::channel(1);
@@ -1141,6 +1158,7 @@ fn eager_stream(
             output_sender,
             producer_terminal,
             cancellation_receiver,
+            retention_limits,
         )
         .await;
     });
@@ -1203,10 +1221,21 @@ async fn run_eager_stream_producer(
     output_sender: tokio::sync::mpsc::Sender<Result<String>>,
     terminal: Arc<std::sync::Mutex<Option<Result<String>>>>,
     mut cancellation: tokio::sync::watch::Receiver<bool>,
+    retention_limits: crate::streaming::StreamRetentionLimits,
 ) {
     let mut source = native_events(response.bytes_stream());
-    let mut normalizer = crate::streaming::StreamNormalizer::new(target.clone());
-    let mut native_usage = crate::usage::NativeStreamUsage::new(target.clone());
+    let mut normalizer = match crate::streaming::StreamNormalizer::with_retention_limits(
+        target.clone(),
+        retention_limits,
+    ) {
+        Ok(normalizer) => normalizer,
+        Err(error) => {
+            set_stream_terminal(&terminal, Err(error));
+            return;
+        }
+    };
+    let mut native_usage =
+        crate::usage::NativeStreamUsage::with_limits(target.clone(), retention_limits);
     let mut semantic_idle_remaining = deadlines.stream_semantic_idle;
 
     loop {
@@ -1357,6 +1386,19 @@ async fn run_eager_stream_producer(
                 set_stream_terminal(&terminal, Err(coordinator_stream_error()));
                 return;
             }
+        }
+        if let Some(error) = native_usage.take_retention_error() {
+            normalizer.abort();
+            finish_stream_failure(
+                &mut tracker,
+                deadlines.policy_callback,
+                attempt_deadline,
+                &policy_failure,
+                &mut cancellation,
+            )
+            .await;
+            set_stream_terminal(&terminal, Err(error));
+            return;
         }
         match normalized {
             Ok(Some(chunk)) => {
@@ -1996,7 +2038,8 @@ mod tests {
             acc.push(
                 &serde_json::from_str::<serde_json::Value>(&c.unwrap()).unwrap()["choices"][0]
                     ["delta"],
-            );
+            )
+            .unwrap();
         }
         assert_eq!(acc.blocks()[0]["text"], "é雪🙂");
         assert_eq!(acc.blocks()[0]["signature"], "opaque+/=");
