@@ -802,6 +802,98 @@ pub(crate) fn estimate_prepared_request_tokens(prepared: &PreparedRequest) -> u3
         .clamp(1, u32::MAX as u64) as u32
 }
 
+/// Estimate the final immutable provider-native body seen by the per-attempt
+/// policy hook. This is deliberately separate from logical-request admission:
+/// retries reuse the same prepared body, while repairs and fallback targets
+/// arrive here with their own authoritative wire body and target.
+pub(crate) fn estimate_attempt_tokens(attempt: &crate::policy::PreparedAttempt<'_>) -> u32 {
+    estimate_native_attempt_tokens(
+        attempt.identity().provider_name(),
+        attempt.identity().native_model(),
+        attempt.identity().wire(),
+        attempt.native_body(),
+    )
+}
+
+fn estimate_native_attempt_tokens(
+    provider: &str,
+    model: &str,
+    wire: crate::reasoning::WireFormat,
+    native_body: &serde_json::Value,
+) -> u32 {
+    let prompt_tokens = serde_json::to_string(native_body)
+        .map(|serialized| serialized.len() as u64 / 4)
+        .unwrap_or(u64::MAX);
+    let explicit_output = match wire {
+        crate::reasoning::WireFormat::AnthropicMessages => native_body
+            .get("max_tokens")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::OpenAiResponses => native_body
+            .get("max_output_tokens")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::OpenAiChat => native_body
+            .get("max_completion_tokens")
+            .or_else(|| native_body.get("max_tokens"))
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::GoogleGenerateContent => native_body
+            .pointer("/generationConfig/maxOutputTokens")
+            .and_then(|value| value.as_u64()),
+    };
+    let reasoning_output = match wire {
+        crate::reasoning::WireFormat::AnthropicMessages => native_body
+            .pointer("/thinking/budget_tokens")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::GoogleGenerateContent => native_body
+            .pointer("/generationConfig/thinkingConfig/thinkingBudget")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::OpenAiResponses
+        | crate::reasoning::WireFormat::OpenAiChat => native_body
+            .pointer("/reasoning/max_tokens")
+            .and_then(|value| value.as_u64()),
+    }
+    .unwrap_or_default();
+    let default_output = omitted_native_output_budget(provider, model, native_body);
+    prompt_tokens
+        .saturating_add(
+            explicit_output
+                .unwrap_or(default_output)
+                .max(reasoning_output),
+        )
+        .clamp(1, u32::MAX as u64) as u32
+}
+
+fn catalog_output_budget(provider: &str, model: &str) -> Option<u64> {
+    crate::catalog::lookup_id(&format!("{provider}/{model}"))
+        .or_else(|| crate::catalog::lookup_id(model))
+        .and_then(|model| model.max_output_tokens)
+        .map(u64::from)
+}
+
+fn omitted_native_output_budget(
+    provider: &str,
+    model: &str,
+    native_body: &serde_json::Value,
+) -> u64 {
+    let primary_budget = catalog_output_budget(provider, model).unwrap_or(match provider {
+        "anthropic" => 8_192,
+        "gemini" => 65_536,
+        "openai" | "chatgpt" | "xai" => 128_000,
+        "openrouter" => 1_048_576,
+        _ => 1_024,
+    });
+    if provider != "openrouter" {
+        return primary_budget;
+    }
+    native_body
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(|routed_model| catalog_output_budget("openrouter", routed_model).unwrap_or(1_048_576))
+        .fold(primary_budget, u64::max)
+}
+
 fn active_native_prompt_characters(prepared: &PreparedRequest) -> usize {
     let Some(active_namespace) = active_native_namespace(&prepared.target) else {
         return 0;
@@ -1743,6 +1835,95 @@ mod tests {
             }),
         );
         assert_eq!(effective_output_budget(&sglang_responses), 8_000);
+    }
+
+    #[test]
+    fn native_attempt_estimate_uses_authoritative_wire_fields() {
+        let openai = estimate_native_attempt_tokens(
+            "openai",
+            "unknown-test-model",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            &serde_json::json!({
+                "model": "unknown-test-model",
+                "input": "short",
+                "max_output_tokens": 7_000,
+                "max_tokens": 1
+            }),
+        );
+        let anthropic = estimate_native_attempt_tokens(
+            "anthropic",
+            "unknown-test-model",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            &serde_json::json!({
+                "model": "unknown-test-model",
+                "messages": [{"role": "user", "content": "short"}],
+                "max_tokens": 2_000,
+                "thinking": {"budget_tokens": 6_000}
+            }),
+        );
+        let gemini = estimate_native_attempt_tokens(
+            "gemini",
+            "unknown-test-model",
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+            &serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "short"}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 3_000,
+                    "thinkingConfig": {"thinkingBudget": 5_000}
+                }
+            }),
+        );
+
+        assert!(openai >= 7_000);
+        assert!(anthropic >= 6_000);
+        assert!(gemini >= 5_000);
+    }
+
+    #[test]
+    fn native_openrouter_routing_uses_every_final_body_model_ceiling() {
+        let unknown_routing_body = serde_json::json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [{"role": "user", "content": "short"}],
+            "models": ["anthropic/claude-sonnet-5", "vendor/unknown-model"]
+        });
+        let serialized_prompt_tokens =
+            serde_json::to_string(&unknown_routing_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "openrouter",
+                "anthropic/claude-sonnet-5",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &unknown_routing_body,
+            ),
+            serialized_prompt_tokens.saturating_add(1_048_576) as u32
+        );
+
+        let base_budget = catalog_output_budget("openrouter", "openai/gpt-oss-20b")
+            .expect("vendored OpenRouter model metadata");
+        assert_eq!(
+            catalog_output_budget("openrouter", "openai/gpt-oss-20b:nitro"),
+            Some(base_budget),
+            "known OpenRouter variants must use their base model metadata"
+        );
+
+        let explicit_limit_body = serde_json::json!({
+            "model": "anthropic/claude-sonnet-5",
+            "messages": [],
+            "models": ["vendor/unknown-model"],
+            "max_tokens": 4_096
+        });
+        let explicit_prompt_tokens =
+            serde_json::to_string(&explicit_limit_body).unwrap().len() as u64 / 4;
+        assert_eq!(
+            estimate_native_attempt_tokens(
+                "openrouter",
+                "anthropic/claude-sonnet-5",
+                crate::reasoning::WireFormat::OpenAiChat,
+                &explicit_limit_body,
+            ),
+            explicit_prompt_tokens.saturating_add(4_096) as u32,
+            "an explicit final-body limit remains authoritative"
+        );
     }
 
     // --- Trait object dispatch ----------------------------------------------
