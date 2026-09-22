@@ -18,9 +18,14 @@ pub struct LogEntry {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub total_tokens: u64,
-    /// USD charged for this response, or `null` when the catalog cannot price
-    /// the model. Never `0.0` for an unknown price — see `crate::cost`.
+    /// USD charged for this response, or `null` when it cannot be known.
+    /// Never `0.0` for an unknown price — see `crate::cost`.
     pub cost_usd: Option<f64>,
+    /// Where `cost_usd` came from: `"provider"` when the provider reported what
+    /// it charged for this generation, `"catalog"` when it was computed from
+    /// catalog prices. Reading spend off a log means knowing which of the two
+    /// it is — one is the invoice, the other an upper-bound estimate.
+    pub cost_source: Option<String>,
     pub status: String,
     pub gateway_integrity: crate::providers::anthropic_signature::Integrity,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,6 +46,7 @@ impl LogEntry {
             .get("usage")
             .cloned()
             .unwrap_or(serde_json::json!({}));
+        let (cost, cost_source) = crate::cost::attribute(provider, model, &usage);
         Self {
             ts: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             model: model.to_string(),
@@ -75,8 +81,8 @@ impl LogEntry {
             // Priced at the transport boundary, which is the only place that
             // still knows the dispatch target. Fall back to pricing here when a
             // caller hands us an unstamped response.
-            cost_usd: crate::cost::stamped(&usage)
-                .or_else(|| crate::cost::cost_usd(provider, model, &usage)),
+            cost_usd: cost,
+            cost_source,
             error: None,
             request_id: response
                 .get("id")
@@ -103,6 +109,7 @@ impl LogEntry {
             cache_write_tokens: 0,
             total_tokens: 0,
             cost_usd: None,
+            cost_source: None,
             status: "error".to_string(),
             gateway_integrity: crate::providers::anthropic_signature::Integrity::Unknown,
             error: Some(error.to_string()),

@@ -180,6 +180,11 @@ type Usage struct {
 	// CostUSD is the USD charged for this response. A nil pointer means the
 	// server could not price the model — it never means free.
 	CostUSD *float64 `json:"cost_usd,omitempty"`
+	// CostSource says where CostUSD came from: "provider" when the provider
+	// reported what it charged for this generation (OpenRouter does),
+	// "catalog" when it was computed from catalog prices, which is an
+	// upper-bound estimate.
+	CostSource string `json:"cost_source,omitempty"`
 }
 
 // StreamEventType enumerates the SSE event types.
@@ -231,6 +236,8 @@ type StreamEvent struct {
 	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 	// CostUSD is nil when the server could not price the model, never 0.
 	CostUSD *float64 `json:"cost_usd,omitempty"`
+	// CostSource is "provider" for a reported bill, "catalog" for an estimate.
+	CostSource string `json:"cost_source,omitempty"`
 
 	// error
 	Message      string         `json:"message,omitempty"`

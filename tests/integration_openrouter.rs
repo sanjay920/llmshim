@@ -116,3 +116,109 @@ async fn openrouter_tool_call() {
     assert!(tool_calls.is_some(), "expected a tool call, got: {resp}");
     println!("tool call ok");
 }
+
+/// MOH-228 receipt: the response carries OpenRouter's own bill, llmshim stamps
+/// that in preference to the catalog estimate, and both numbers are printed
+/// side by side so the difference between an invoice and an estimate is a
+/// measurement rather than a claim.
+///
+/// Pinned to one model the owner authorized for live calls. Run with:
+/// `cargo test --test integration_openrouter -- --ignored --nocapture
+///  openrouter_reports_its_own_cost`
+const ACCOUNTING_MODEL: &str = "openrouter/deepseek/deepseek-v4.1-flash";
+
+/// Print what a usage object says about money, and assert the invariant: when
+/// the provider reported a bill, that is the number llmshim stamped.
+fn report(label: &str, body: &Value) {
+    let usage = &body["usage"];
+    let reported = usage["cost"].as_f64();
+    let estimate = llmshim::cost::cost_usd(
+        "openrouter",
+        ACCOUNTING_MODEL.trim_start_matches("openrouter/"),
+        usage,
+    );
+
+    println!("--- {label} ---");
+    println!("  provider (served by) : {}", body["provider"]);
+    println!("  id (generation)      : {}", body["id"]);
+    println!("  usage.cost (reported): {reported:?}");
+    println!("  usage.cost_usd       : {}", usage["cost_usd"]);
+    println!("  usage.cost_source    : {}", usage["cost_source"]);
+    println!("  catalog estimate     : {estimate:?}");
+    println!("  cost_details         : {}", usage["cost_details"]);
+    println!("  is_byok              : {}", usage["is_byok"]);
+    println!(
+        "  tokens p/c/total     : {} / {} / {}",
+        usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"]
+    );
+
+    assert!(
+        body["provider"].is_string(),
+        "an aggregator must say which upstream served the call"
+    );
+    let reported = reported.expect("accounting is on by default, so a bill must come back");
+    assert_eq!(usage["cost_source"], "provider");
+    assert_eq!(
+        usage["cost_usd"].as_f64(),
+        Some(reported),
+        "the stamped cost must be the reported bill, not the catalog estimate"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn openrouter_reports_its_own_cost() {
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        return;
+    }
+    let router = router();
+
+    let Some(resp) = complete_or_skip(
+        &router,
+        &json!({
+            "model": ACCOUNTING_MODEL,
+            "messages": [{"role": "user", "content": "Reply with one short sentence: what is 2+2?"}],
+            "max_tokens": 2000,
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    report("non-stream", &resp);
+
+    // No `stream_options`: measured 2026-09-22, OpenRouter puts usage on the
+    // terminal chunk regardless. The cost rides on it.
+    use futures::StreamExt;
+    let opened = llmshim::stream(
+        &router,
+        &json!({
+            "model": ACCOUNTING_MODEL,
+            "messages": [{"role": "user", "content": "Reply with one short sentence: what is 3+3?"}],
+            "max_tokens": 2000,
+        }),
+    )
+    .await;
+    let mut stream = match opened {
+        Ok(s) => s,
+        // Same skip the rest of this file applies: an account without credits
+        // must not fail the suite.
+        Err(e) if e.to_string().contains("402") => {
+            eprintln!("SKIP stream: OpenRouter account lacks credits ({e})");
+            return;
+        }
+        Err(e) => panic!("stream failed to open: {e}"),
+    };
+
+    let mut terminal = None;
+    while let Some(chunk) = stream.next().await {
+        let parsed: Value = serde_json::from_str(&chunk.expect("chunk")).unwrap();
+        if parsed["usage"].is_object() {
+            terminal = Some(parsed);
+        }
+    }
+    report(
+        "stream (terminal chunk)",
+        &terminal.expect("include_usage must produce a terminal usage chunk"),
+    );
+}

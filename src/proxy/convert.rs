@@ -166,6 +166,7 @@ pub fn extract_usage(usage: &Value) -> Usage {
         cache_read_tokens: usage["cache_read_tokens"].as_u64().unwrap_or(0),
         cache_write_tokens: usage["cache_write_tokens"].as_u64().unwrap_or(0),
         cost_usd: crate::cost::stamped(usage),
+        cost_source: crate::cost::stamped_source(usage).map(str::to_owned),
     }
 }
 
