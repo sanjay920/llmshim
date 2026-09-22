@@ -1,6 +1,6 @@
 use super::convert;
 use super::error::ApiError;
-use super::ratelimit::{estimate_request_tokens, penalty_duration, RateKey, RetryAfter};
+use super::ratelimit::{estimate_prepared_request_tokens, penalty_duration, RateKey, RetryAfter};
 use super::types::*;
 use super::AppState;
 use crate::error::ShimError;
@@ -19,8 +19,7 @@ use tokio::sync::OwnedSemaphorePermit;
 struct Admission {
     /// Held for the request's (or stream's) lifetime; frees a slot when dropped.
     _permit: OwnedSemaphorePermit,
-    /// `None` when the model's provider couldn't be resolved (limiting skipped).
-    key: Option<RateKey>,
+    key: RateKey,
 }
 
 /// Proactive admission control, run before every upstream dispatch:
@@ -28,8 +27,7 @@ struct Admission {
 ///   2. Acquire a rate-limit token for the provider (→ 429 with Retry-After).
 async fn admit(
     state: &Arc<AppState>,
-    req: &ChatRequest,
-    prepared_request: &serde_json::Value,
+    prepared_request: &convert::PreparedRequest,
 ) -> Result<Admission, ApiError> {
     // (1) Backpressure: bounded queue for a concurrency slot.
     let permit = state
@@ -38,23 +36,10 @@ async fn admit(
         .await
         .map_err(|_| ApiError::Overloaded(state.backpressure.queue_timeout()))?;
 
-    // (2) Rate limit: only if we can resolve the provider (else let the normal
-    // dispatch path surface the proper "unknown provider" error).
-    let key = state
-        .router
-        .resolve(
-            prepared_request["model"]
-                .as_str()
-                .ok_or(ShimError::MissingModel)?,
-        )
-        .ok()
-        .map(|(p, _)| RateKey::provider(p.name()));
-
-    if let Some(k) = &key {
-        let permits = estimate_request_tokens(req);
-        if let Err(RetryAfter(wait)) = state.limiter.acquire(k, permits).await {
-            return Err(ApiError::RateLimited(wait));
-        }
+    let key = RateKey::provider(&prepared_request.target.provider_name);
+    let permits = estimate_prepared_request_tokens(prepared_request);
+    if let Err(RetryAfter(wait)) = state.limiter.acquire(&key, permits).await {
+        return Err(ApiError::RateLimited(wait));
     }
 
     Ok(Admission {
@@ -65,9 +50,9 @@ async fn admit(
 
 /// After an upstream failure, back the bucket off if it was a 429 so the whole
 /// fleet (when Redis-coordinated) slows down together.
-async fn penalize_on_429(state: &AppState, key: &Option<RateKey>, err: &ShimError) {
-    if let (Some(k), ShimError::ProviderError { status: 429, .. }) = (key.as_ref(), err) {
-        state.limiter.penalize(k, penalty_duration()).await;
+async fn penalize_on_429(state: &AppState, key: &RateKey, err: &ShimError) {
+    if let ShimError::ProviderError { status: 429, .. } = err {
+        state.limiter.penalize(key, penalty_duration()).await;
     }
 }
 
@@ -76,17 +61,18 @@ pub async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
-    let value = convert::prepare_request(&req)?;
     if req.stream {
         // Delegate to streaming (which runs its own admission control).
         return Ok(chat_stream_inner(state, req).await);
     }
+    let prepared_request = convert::prepare_request(&state.router, &req)?;
 
     // Admission control: concurrency permit + rate-limit token. The permit is
     // held until `admission` drops at the end of this function.
-    let admission = admit(&state, &req, &value).await?;
+    let admission = admit(&state, &prepared_request).await?;
 
     let timer = RequestTimer::start();
+    let value = prepared_request.payload;
 
     let result = if let Some(fallback_models) = &req.fallback {
         // Build fallback chain: primary model + fallback models
@@ -133,17 +119,18 @@ pub async fn chat_stream(
 }
 
 async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
-    let value = match convert::prepare_request(&req) {
-        Ok(value) => value,
+    let prepared_request = match convert::prepare_request(&state.router, &req) {
+        Ok(prepared_request) => prepared_request,
         Err(error) => return ApiError::from(error).into_response(),
     };
     // Admission control up front: reject with 429/503 (+ Retry-After) before we
     // commit to a stream, rather than emitting a rejection as an SSE event.
-    let admission = match admit(&state, &req, &value).await {
+    let admission = match admit(&state, &prepared_request).await {
         Ok(a) => a,
         Err(e) => return e.into_response(),
     };
 
+    let value = prepared_request.payload;
     let stream_result = crate::stream(&state.router, &value).await;
 
     if let Err(e) = &stream_result {
@@ -238,7 +225,7 @@ mod tests {
     };
     use super::super::{app_with_origin_policy, app_with_state, AppState};
     use crate::router::Router;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use std::time::Duration;
@@ -275,7 +262,10 @@ mod tests {
         let _held = bp.acquire().await.expect("hold the only permit");
 
         let state = Arc::new(AppState {
-            router: Router::new(),
+            router: Router::new().register(
+                "openai",
+                Box::new(crate::providers::openai::OpenAi::new("test-key".into())),
+            ),
             logger: None,
             limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default())),
             backpressure: bp.clone(),
@@ -524,7 +514,10 @@ mod tests {
     #[tokio::test]
     async fn proxy_rejects_provider_config_admission_overrides_before_dispatch() {
         let state = Arc::new(AppState {
-            router: Router::new(),
+            router: Router::new().register(
+                "openai",
+                Box::new(crate::providers::openai::OpenAi::new("test-key".into())),
+            ),
             logger: None,
             limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default())),
             backpressure: Backpressure::new(256, Duration::from_millis(50)),
@@ -536,7 +529,7 @@ mod tests {
             ),
             (
                 "/v1/chat/stream",
-                serde_json::json!({"x-openai": {"input": "replacement"}}),
+                serde_json::json!({"x-openai": {"input": "sensitive-prompt-material"}}),
             ),
         ] {
             let response = app_with_state(state.clone())
@@ -558,6 +551,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let response_body = to_bytes(response.into_body(), 10_000).await.unwrap();
+            let response_text = String::from_utf8_lossy(&response_body);
+            assert!(response_text.contains("invalid_request"));
+            assert!(!response_text.contains("sensitive-prompt-material"));
         }
     }
 }
