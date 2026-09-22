@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 const DEFAULT_UNARY_LOGICAL_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
@@ -35,6 +35,20 @@ impl LogicalRequestDeadlines {
             ),
             stream: configured_duration(
                 "LLMSHIM_PROXY_STREAM_TIMEOUT_MS",
+                DEFAULT_STREAM_LOGICAL_LIFETIME,
+            ),
+        }
+    }
+
+    #[cfg(feature = "gateway")]
+    pub(crate) fn gateway_from_env() -> Self {
+        Self {
+            unary: configured_duration(
+                "LLMSHIM_GATEWAY_UNARY_JOB_TIMEOUT_MS",
+                DEFAULT_UNARY_LOGICAL_LIFETIME,
+            ),
+            stream: configured_duration(
+                "LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS",
                 DEFAULT_STREAM_LOGICAL_LIFETIME,
             ),
         }
@@ -90,7 +104,7 @@ struct LogicalRequestLifetimeInner {
 }
 
 impl LogicalRequestLifetime {
-    fn new(path: &str, deadlines: LogicalRequestDeadlines) -> Self {
+    pub(crate) fn new(path: &str, deadlines: LogicalRequestDeadlines) -> Self {
         let admitted_at = Instant::now();
         let unary_deadline = admitted_at
             .checked_add(deadlines.unary)
@@ -136,7 +150,11 @@ impl LogicalRequestLifetime {
         *self.inner.deadline_sender.borrow()
     }
 
-    async fn expired(&self) {
+    pub(crate) fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline()
+    }
+
+    pub(crate) async fn expired(&self) {
         let mut deadline_receiver = self.inner.deadline_sender.subscribe();
         loop {
             let deadline = *deadline_receiver.borrow_and_update();
@@ -183,12 +201,12 @@ pub(crate) async fn admit_preparation(
         _ = lifetime.expired() => return timeout_response(&path),
         response = &mut response_future => response,
     };
-    if Instant::now() >= lifetime.deadline() {
+    if lifetime.is_expired() {
         drop(response);
         drop(preparation_permit);
         return timeout_response(&path);
     }
-    pump_response(response, path, lifetime, preparation_permit)
+    pump_response_with_owner(response, path, lifetime, preparation_permit)
 }
 
 pub(crate) fn timeout_response(path: &str) -> Response {
@@ -216,12 +234,24 @@ pub(crate) fn timeout_response(path: &str) -> Response {
     }
 }
 
-fn pump_response(
+#[cfg(feature = "gateway")]
+pub(crate) fn pump_response(
     response: Response,
     path: String,
     lifetime: LogicalRequestLifetime,
-    preparation_permit: OwnedSemaphorePermit,
 ) -> Response {
+    pump_response_with_owner(response, path, lifetime, ())
+}
+
+fn pump_response_with_owner<Owner>(
+    response: Response,
+    path: String,
+    lifetime: LogicalRequestLifetime,
+    owner: Owner,
+) -> Response
+where
+    Owner: Send + 'static,
+{
     let is_sse = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -233,14 +263,7 @@ fn pump_response(
     let producer_terminal = terminal.clone();
     let deadline = lifetime.deadline();
     tokio::spawn(async move {
-        run_body_pump(
-            body,
-            frame_sender,
-            producer_terminal,
-            deadline,
-            preparation_permit,
-        )
-        .await;
+        run_body_pump(body, frame_sender, producer_terminal, deadline, owner).await;
     });
     let pumped = PumpedBody {
         receiver: frame_receiver,
@@ -262,13 +285,15 @@ enum PumpTerminal {
     BodyError(String),
 }
 
-async fn run_body_pump(
+async fn run_body_pump<Owner>(
     body: Body,
     frame_sender: mpsc::Sender<PumpFrame>,
     terminal: Arc<Mutex<Option<PumpTerminal>>>,
     deadline: Instant,
-    _preparation_permit: OwnedSemaphorePermit,
-) {
+    _owner: Owner,
+) where
+    Owner: Send + 'static,
+{
     let mut source = body.into_data_stream();
     loop {
         let source_item = tokio::select! {
@@ -565,7 +590,7 @@ mod tests {
         )
             .into_response();
         let backpressure = Backpressure::new(1, Duration::from_secs(1));
-        let pumped = pump_response(
+        let pumped = pump_response_with_owner(
             response,
             "/v1/chat/stream".into(),
             test_lifetime(Duration::from_secs(5)),
@@ -592,7 +617,7 @@ mod tests {
         )
             .into_response();
         let backpressure = Backpressure::new(1, Duration::from_secs(1));
-        let pumped = pump_response(
+        let pumped = pump_response_with_owner(
             response,
             "/v1/chat".into(),
             test_lifetime(Duration::from_secs(5)),
@@ -615,7 +640,7 @@ mod tests {
             Body::from(r#"{"answer":"ok"}"#),
         )
             .into_response();
-        let pumped = pump_response(
+        let pumped = pump_response_with_owner(
             response,
             "/v1/chat".into(),
             test_lifetime(Duration::from_secs(30)),
@@ -647,7 +672,7 @@ mod tests {
         let expected = payload.clone();
         let response = Body::from(payload).into_response();
         let backpressure = Backpressure::new(1, Duration::from_secs(1));
-        let pumped = pump_response(
+        let pumped = pump_response_with_owner(
             response,
             "/v1/chat".into(),
             test_lifetime(Duration::from_secs(30)),
@@ -678,7 +703,7 @@ mod tests {
             )
                 .into_response();
             let backpressure = Backpressure::new(1, Duration::from_secs(1));
-            let pumped = pump_response(
+            let pumped = pump_response_with_owner(
                 response,
                 path.into(),
                 test_lifetime(Duration::from_secs(5)),
@@ -722,7 +747,7 @@ mod tests {
         )
             .into_response();
         let backpressure = Backpressure::new(1, Duration::from_secs(1));
-        let pumped = pump_response(
+        let pumped = pump_response_with_owner(
             response,
             "/v1/chat/stream".into(),
             test_lifetime(Duration::from_secs(5)),

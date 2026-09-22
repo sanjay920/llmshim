@@ -258,7 +258,16 @@ fn call_content(call: &Value) -> Result<Value> {
     let args = call["function"]["arguments"]
         .as_str()
         .ok_or("tool arguments must be JSON text")?;
-    let value: Value = serde_json::from_str(args).map_err(|_| "invalid tool argument JSON")?;
+    let value: Value =
+        match crate::json_bounds::parse_str(args, crate::json_bounds::Limits::INBOUND) {
+            Ok(value) => value,
+            Err(crate::json_bounds::ParseError::Malformed(_)) => {
+                return Err("invalid tool argument JSON".into())
+            }
+            Err(crate::json_bounds::ParseError::Complexity) => {
+                return Err("tool arguments exceed JSON complexity limit".into())
+            }
+        };
     Ok(json!({"id":call["id"],"name":call["function"]["name"],"arguments":value}))
 }
 fn import_call(call: &Value, receipts: &Receipts, scope: &str) -> Result<Value> {

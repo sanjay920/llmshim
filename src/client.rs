@@ -639,6 +639,17 @@ impl ShimClient {
                     crate::cost::stamp(&target.provider, &target.model, &mut result);
                     return Ok(result);
                 }
+                Err(feedback)
+                    if feedback
+                        .iter()
+                        .any(|error| error == crate::shim::JSON_COMPLEXITY_ERROR) =>
+                {
+                    return Err(DispatchFailure::Local(ShimError::ProviderError {
+                        status: 502,
+                        body: "upstream JSON exceeds complexity limit".into(),
+                        retry_after: None,
+                    }));
+                }
                 Err(feedback) if attempt == 0 && plan.can_repair(&result) => {
                     rendered = plan.repair(&feedback).map_err(DispatchFailure::Local)?;
                     rendered["stream"] = serde_json::json!(false);
@@ -863,6 +874,17 @@ impl ShimClient {
                     crate::cost::stamp(&target.provider, &target.model, &mut result);
                     return Ok(Box::pin(futures::stream::iter(crate::shim::chunks(result))));
                 }
+                Err(feedback)
+                    if feedback
+                        .iter()
+                        .any(|error| error == crate::shim::JSON_COMPLEXITY_ERROR) =>
+                {
+                    return Err(DispatchFailure::Local(ShimError::ProviderError {
+                        status: 502,
+                        body: "upstream JSON exceeds complexity limit".into(),
+                        retry_after: None,
+                    }));
+                }
                 Err(feedback) if attempt == 0 && plan.can_repair(&result) => {
                     rendered = plan.repair(&feedback).map_err(DispatchFailure::Local)?
                 }
@@ -948,6 +970,16 @@ impl ShimClient {
             let mut usage = serde_json::json!({});
             crate::shim::add_usage(&mut usage, &result);
             if let Err(feedback) = plan.finish(&mut result, &target) {
+                if feedback
+                    .iter()
+                    .any(|error| error == crate::shim::JSON_COMPLEXITY_ERROR)
+                {
+                    return Err(ShimError::ProviderError {
+                        status: 502,
+                        body: "upstream JSON exceeds complexity limit".into(),
+                        retry_after: None,
+                    });
+                }
                 if !plan.can_repair(&result) {
                     return Err(crate::shim::failed());
                 }

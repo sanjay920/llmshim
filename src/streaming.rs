@@ -287,4 +287,33 @@ mod retention_tests {
         assert!(stream.active_choices.is_empty());
         assert!(stream.seen_choices.is_empty());
     }
+
+    #[test]
+    fn atomic_tool_arguments_are_bounded_before_completeness_parse() {
+        let arguments = format!(
+            "[{}]",
+            std::iter::repeat_n("0", 20_000)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut stream = StreamNormalizer::new(ReplayTarget::new(
+            "openrouter",
+            "vendor/model",
+            WireFormat::OpenAiChat,
+        ));
+        let error = stream
+            .push(
+                &serde_json::json!({
+                    "choices":[{"index":0,"delta":{"tool_calls":[{
+                        "id":"call-1",
+                        "type":"function",
+                        "function":{"name":"read","arguments":arguments}
+                    }]}}]
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("complexity limit"));
+        assert_eq!(stream.budget.retained(), Default::default());
+    }
 }

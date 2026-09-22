@@ -25,7 +25,7 @@ impl Gemini {
 // -- Request transformation helpers --
 
 /// Convert OpenAI messages to Gemini contents + optional systemInstruction.
-fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
+fn transform_messages(messages: &[Value]) -> Result<(Option<Value>, Vec<Value>)> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
     // Track tool_call_id → function name from assistant messages.
@@ -76,8 +76,22 @@ fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
                     .unwrap_or_else(|| "function".to_string());
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 // Gemini requires response to be an object, never an array or primitive.
-                let parsed: Value =
-                    serde_json::from_str(content).unwrap_or_else(|_| json!({"result": content}));
+                let parsed: Value = match crate::json_bounds::parse_str(
+                    content,
+                    crate::json_bounds::Limits::INBOUND,
+                ) {
+                    Ok(value) => value,
+                    Err(crate::json_bounds::ParseError::Malformed(_)) => {
+                        json!({"result": content})
+                    }
+                    Err(crate::json_bounds::ParseError::Complexity) => {
+                        return Err(ShimError::ProviderError {
+                            status: 400,
+                            body: "tool result exceeds JSON complexity limit".into(),
+                            retry_after: None,
+                        })
+                    }
+                };
                 let response = if parsed.is_object() {
                     parsed
                 } else {
@@ -111,7 +125,7 @@ fn transform_messages(messages: &[Value]) -> (Option<Value>, Vec<Value>) {
     // Post-process: enforce Gemini's strict turn ordering requirements.
     let contents = merge_same_role(contents);
 
-    (system_instruction, contents)
+    Ok((system_instruction, contents))
 }
 
 /// Gemini's own repair, not a shared one. This is the only wire in the crate
@@ -440,7 +454,7 @@ impl Provider for Gemini {
                 )))
             })?;
 
-        let (system_instruction, contents) = transform_messages(messages);
+        let (system_instruction, contents) = transform_messages(messages)?;
 
         let mut body = json!({"contents": contents});
         let body_obj = body.as_object_mut().unwrap();
