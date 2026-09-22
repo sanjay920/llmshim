@@ -79,9 +79,13 @@ concurrency backpressure still applies. Token permits are estimates based on
 the final provider-native body and authoritative prepared target. They include
 the serialized native prompt and schema material, recognized native reasoning
 budgets, and the effective native output limit.
-For native Chat Completions bodies, `n` and `best_of` are treated as generated
-candidate counts; Gemini `generationConfig.candidateCount` is treated the same
-way. The output allowance is multiplied by the final wire candidate count.
+For native Chat Completions bodies, OpenAI's `n` is treated as a generated
+candidate count; Gemini `generationConfig.candidateCount` is treated the same
+way. The output allowance is multiplied by the final wire candidate count. The
+estimator also defensively recognizes `best_of`, `bestOf`, and
+`candidate_count`, including a `generation_config` container that llmshim can
+preserve from `x-gemini`, when a final body contains them; that compatibility
+handling does not imply universal provider support.
 Anthropic's omitted output limit uses
 the adapter's 8,192-token default; other known models use the catalog output
 ceiling when the provider leaves the limit unspecified. Unknown hosted models
