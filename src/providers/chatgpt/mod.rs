@@ -192,6 +192,15 @@ impl Provider for ChatGpt {
         "chatgpt"
     }
 
+    fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
+        crate::provider::RequestAdmissionPolicy::namespaced(
+            "x-chatgpt",
+            &["input"],
+            &["instructions", "text", "tools", "tool_choice", "reasoning"],
+            &[],
+        )
+    }
+
     fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
         crate::reasoning::ReplayTarget::new(
             "chatgpt",
