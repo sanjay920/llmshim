@@ -225,6 +225,17 @@ async fn completion_with_fallback_inner(
                     }
                     return Err(error);
                 }
+                Err(crate::client::DispatchFailure::LogicalTimeout(error)) => {
+                    if let Some(logger) = logger {
+                        logger.log(&LogEntry::from_error(
+                            provider.name(),
+                            model_str,
+                            &error.to_string(),
+                            timer.elapsed(),
+                        ));
+                    }
+                    return Err(error);
+                }
                 Err(crate::client::DispatchFailure::PolicyRefusal(refusal))
                     if refusal.kind() == crate::policy::AttemptPolicyRefusalKind::ProviderLimit =>
                 {
@@ -562,5 +573,64 @@ mod deadline_tests {
                 second_send.assert_async().await;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn logical_timeout_stops_explicit_504_fallback_before_every_send() {
+        let mut first_server = mockito::Server::new_async().await;
+        let first_send = first_server
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let mut second_server = mockito::Server::new_async().await;
+        let second_send = second_server
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let router = Router::new()
+            .register(
+                "first",
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    "first",
+                    first_server.url(),
+                    None,
+                )),
+            )
+            .register(
+                "second",
+                Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                    "second",
+                    second_server.url(),
+                    None,
+                )),
+            );
+        let policy = DispatchPolicyContext::new(Arc::new(PendingPolicy(PendingCallback::Headers)))
+            .with_logical_deadline(tokio::time::Instant::now());
+        let mut config = FallbackConfig::new(vec!["first/test".into(), "second/test".into()])
+            .max_retries(2)
+            .initial_backoff(Duration::ZERO);
+        config.retryable_statuses.push(504);
+        let error = completion_with_fallback_inner(
+            &router,
+            &serde_json::json!({"model": "first/test", "messages": []}),
+            &config,
+            None,
+            Some(&policy),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ShimError::ProviderError {
+                status: 504,
+                ref body,
+                ..
+            } if body == "proxy logical request timed out"
+        ));
+        first_send.assert_async().await;
+        second_send.assert_async().await;
     }
 }
