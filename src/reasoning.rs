@@ -565,6 +565,7 @@ fn strip_untracked_native(value: &mut Value) {
 pub(crate) fn enforce_stateless(body: &mut Value) -> crate::error::Result<()> {
     body["store"] = json!(false);
     body.as_object_mut().unwrap().remove("previous_response_id");
+    body.as_object_mut().unwrap().remove("conversation");
     if body.get("include").is_none() {
         body["include"] = json!([]);
     }

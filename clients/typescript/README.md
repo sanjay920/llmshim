@@ -202,7 +202,11 @@ Omit `baseUrl` to auto-spawn the bundled binary instead (see below). `createClie
 
 `npm install llmshim` also installs one of five tiny `optionalDependencies` — `llmshim-darwin-arm64`, `llmshim-darwin-x64`, `llmshim-linux-x64`, `llmshim-linux-arm64`, or `@sanjay920/llmshim-win32-x64` (the Windows one is scoped to sidestep npm's spam filter on unscoped `*-win32-*` names) — npm resolves the one matching your platform automatically via each package's `os`/`cpu` fields, so only ~8MB for your actual platform ever downloads. Each contains nothing but the prebuilt `llmshim` binary.
 
-On the first `chat`/`stream`/`models`/`health` call on a `Client` constructed without `baseUrl`, the client finds that bundled binary (falling back to `PATH`, e.g. a `cargo install llmshim`), starts `llmshim proxy` on a free local port, waits for it to accept connections, and reuses that same process for every subsequent call in the same Node process — mirroring the Python client's `_server.py`. It's stopped automatically on process exit.
+On the first `chat`/`stream`/`models`/`health` call on a `Client` constructed without `baseUrl`, the client finds that bundled binary (falling back to `PATH`, e.g. a `cargo install llmshim`) and starts it on a child-selected loopback port. The child publishes a one-time TLS certificate and authentication token over its private startup pipe. The client pins that certificate and authenticates every managed request, so another local listener cannot impersonate a child that exits.
+
+`ensureServer()` still returns a usable URL. It points to a process-owned loopback relay with a random capability in its path; the relay keeps its listener for the lifetime of the Node process and forwards each request once to the current authenticated child. Treat that URL as a secret. Passing it to another process explicitly shares access to this managed proxy. A failed request is never replayed automatically; a later request starts a fresh child when needed.
+
+The child watches a private parent-liveness pipe, so it shuts down when the Node process exits, terminates from a signal, or crashes. A host that handles a signal and keeps running retains its relay and child. Returning early from a `stream()` iterator cancels that request through the relay and closes the provider stream; it does not stop the managed child or replay the request.
 
 If no bundled binary is found and nothing is on `PATH`, the first request throws a clear error explaining how to install one or pass an explicit `baseUrl`.
 

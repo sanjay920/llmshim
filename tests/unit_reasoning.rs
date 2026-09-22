@@ -126,16 +126,33 @@ fn responses_preserve_encrypted_items_and_refuse_other_accounts() {
 
 #[test]
 fn native_overrides_cannot_enable_provider_storage() {
-    let r=OpenAi::new("key".into()).transform_request("gpt-6-astra",&json!({"messages":[],"store":true,"x-openai":{"store":true,"previous_response_id":"stored","include":["message.output_text.logprobs"]}})).unwrap();
-    assert_eq!(r.body["store"], false);
-    assert!(r.body.get("previous_response_id").is_none());
-    assert_eq!(
-        r.body["include"],
-        json!([
-            "message.output_text.logprobs",
-            "reasoning.encrypted_content"
-        ])
-    );
+    for conversation in [json!("conv_other"), json!({"id": "conv_other"})] {
+        let request = json!({
+            "messages": [{"role": "user", "content": "explicit history"}],
+            "store": true,
+            "x-openai": {
+                "store": true,
+                "previous_response_id": "stored",
+                "conversation": conversation,
+                "include": ["message.output_text.logprobs"]
+            }
+        });
+        let stored_request = request.clone();
+        let outgoing = OpenAi::new("key".into())
+            .transform_request("gpt-6-astra", &request)
+            .unwrap();
+        assert_eq!(outgoing.body["store"], false);
+        assert!(outgoing.body.get("previous_response_id").is_none());
+        assert!(outgoing.body.get("conversation").is_none());
+        assert_eq!(
+            outgoing.body["include"],
+            json!([
+                "message.output_text.logprobs",
+                "reasoning.encrypted_content"
+            ])
+        );
+        assert_eq!(request, stored_request);
+    }
 }
 
 #[test]

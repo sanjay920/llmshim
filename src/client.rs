@@ -1011,20 +1011,36 @@ fn parse_go_duration(s: &str) -> Option<Duration> {
             i += 1;
         }
         let unit = &s[unit_start..i];
-        let secs = match unit {
-            "h" => value * 3600.0,
-            "m" => value * 60.0,
-            "s" => value,
-            "ms" => value / 1_000.0,
-            "us" | "µs" | "μs" => value / 1_000_000.0,
-            "ns" => value / 1_000_000_000.0,
-            _ => return None,
-        };
-        total += Duration::from_secs_f64(secs);
+        let parsed_duration_component = parse_go_duration_component(value, unit)?;
+        total = total.saturating_add(parsed_duration_component);
         saw_unit = true;
     }
 
     saw_unit.then_some(total)
+}
+
+fn parse_go_duration_component(value: f64, unit: &str) -> Option<Duration> {
+    if !value.is_finite() || value.is_sign_negative() {
+        return None;
+    }
+
+    let seconds_per_unit = match unit {
+        "h" => 3600.0,
+        "m" => 60.0,
+        "s" => 1.0,
+        "ms" => 1.0 / 1_000.0,
+        "us" | "µs" | "μs" => 1.0 / 1_000_000.0,
+        "ns" => 1.0 / 1_000_000_000.0,
+        _ => return None,
+    };
+
+    let maximum_duration_seconds = Duration::MAX.as_secs_f64();
+    if value > maximum_duration_seconds / seconds_per_unit {
+        return Some(Duration::MAX);
+    }
+
+    let seconds = value * seconds_per_unit;
+    Some(Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX))
 }
 
 /// Positive duration from `now` until `when`; `None`/zero if `when` is in the past.
@@ -1357,6 +1373,35 @@ mod tests {
         assert_eq!(parse_go_duration("5x"), None); // unknown unit
     }
 
+    #[test]
+    fn go_duration_oversized_finite_values_saturate_before_capping() {
+        assert_eq!(
+            parse_go_duration("99999999999999999999s"),
+            Some(Duration::MAX)
+        );
+        assert_eq!(
+            parse_go_duration("9999999999999999999h"),
+            Some(Duration::MAX)
+        );
+        assert_eq!(
+            parse_go_duration("9999999999999999999s9999999999999999999s"),
+            Some(Duration::MAX)
+        );
+
+        let headers = headers(&[("x-ratelimit-reset-tokens", "99999999999999999999s")]);
+        let wait = retry_after_wait(&headers, Duration::from_secs(60)).unwrap();
+        assert!(wait >= Duration::from_secs(60));
+        assert!(wait < Duration::from_secs(60) + Duration::from_millis(251));
+    }
+
+    #[test]
+    fn go_duration_nonfinite_and_negative_values_are_ignored() {
+        for invalid_duration in ["NaNs", "infinitys", "-1s"] {
+            assert_eq!(parse_go_duration(invalid_duration), None);
+        }
+        assert_eq!(parse_go_duration(&format!("{}s", "9".repeat(400))), None);
+    }
+
     // --- Backoff / jitter ---------------------------------------------------
 
     #[test]
@@ -1479,6 +1524,53 @@ mod tests {
                     matches!(result, Err(ShimError::ProviderError { status: actual, .. }) if actual == status as u16)
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn extreme_provider_reset_headers_retry_without_panicking() {
+        for reset_header in [
+            "99999999999999999999s".to_owned(),
+            "9999999999999999999s9999999999999999999s".to_owned(),
+            format!("{}s", "9".repeat(400)),
+        ] {
+            let mut upstream_server = mockito::Server::new_async().await;
+            let rate_limited_response = upstream_server
+                .mock("POST", "/v1/chat")
+                .with_status(429)
+                .with_header("x-ratelimit-reset-tokens", &reset_header)
+                .with_body("rate limited")
+                .expect(1)
+                .create_async()
+                .await;
+            let successful_response = upstream_server
+                .mock("POST", "/v1/chat")
+                .with_status(200)
+                .with_body("ok")
+                .expect(1)
+                .create_async()
+                .await;
+            let client = ShimClient {
+                retry: RetryConfig {
+                    max_retries: 1,
+                    base: Duration::ZERO,
+                    cap: Duration::from_millis(10),
+                },
+                ..ShimClient::new()
+            };
+            let request = ProviderRequest {
+                url: format!("{}/v1/chat", upstream_server.url()),
+                headers: vec![],
+                body: serde_json::json!({"messages": []}),
+            };
+            let response = tokio::time::timeout(Duration::from_secs(5), client.send(&request))
+                .await
+                .expect("reset hint must remain bounded by the retry cap")
+                .expect("bounded retry must succeed");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.text().await.unwrap(), "ok");
+            rate_limited_response.assert_async().await;
+            successful_response.assert_async().await;
         }
     }
 
