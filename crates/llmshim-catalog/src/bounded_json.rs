@@ -12,6 +12,12 @@ pub struct Limits {
     pub max_owned_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub nodes: usize,
+    pub owned_bytes: usize,
+}
+
 impl Limits {
     pub const UNARY: Self = Self {
         max_depth: 128,
@@ -47,11 +53,19 @@ pub enum ParseError {
 }
 
 pub fn parse_slice(input: &[u8], limits: Limits) -> Result<Value, ParseError> {
+    parse_slice_with_usage(input, limits).map(|(value, _)| value)
+}
+
+pub fn parse_slice_with_usage(input: &[u8], limits: Limits) -> Result<(Value, Usage), ParseError> {
     let mut deserializer = serde_json::Deserializer::from_slice(input);
     parse(&mut deserializer, limits)
 }
 
 pub fn parse_str(input: &str, limits: Limits) -> Result<Value, ParseError> {
+    parse_str_with_usage(input, limits).map(|(value, _)| value)
+}
+
+pub fn parse_str_with_usage(input: &str, limits: Limits) -> Result<(Value, Usage), ParseError> {
     let mut deserializer = serde_json::Deserializer::from_str(input);
     parse(&mut deserializer, limits)
 }
@@ -59,7 +73,7 @@ pub fn parse_str(input: &str, limits: Limits) -> Result<Value, ParseError> {
 fn parse<'de, R>(
     deserializer: &mut serde_json::Deserializer<R>,
     limits: Limits,
-) -> Result<Value, ParseError>
+) -> Result<(Value, Usage), ParseError>
 where
     R: serde_json::de::Read<'de>,
 {
@@ -77,13 +91,85 @@ where
         deserializer.end()?;
         Ok(value)
     });
-    result.map_err(|error| {
-        if error.to_string().contains(COMPLEXITY_MARKER) {
-            ParseError::Complexity
-        } else {
-            ParseError::Malformed(error)
+    result
+        .map(|value| {
+            (
+                value,
+                Usage {
+                    nodes: budget.nodes,
+                    owned_bytes: budget.owned_bytes,
+                },
+            )
+        })
+        .map_err(|error| {
+            if error.to_string().contains(COMPLEXITY_MARKER) {
+                ParseError::Complexity
+            } else {
+                ParseError::Malformed(error)
+            }
+        })
+}
+
+pub fn measure_value(value: &Value, limits: Limits) -> Result<Usage, ParseError> {
+    let mut usage = Usage::default();
+    let mut pending = vec![(value, 1_usize)];
+    while let Some((current, depth)) = pending.pop() {
+        if depth > limits.max_depth {
+            return Err(ParseError::Complexity);
         }
-    })
+        usage.nodes = usage.nodes.checked_add(1).ok_or(ParseError::Complexity)?;
+        usage.owned_bytes = usage
+            .owned_bytes
+            .checked_add(size_of::<Value>())
+            .ok_or(ParseError::Complexity)?;
+        match current {
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+            Value::String(text) => {
+                usage.owned_bytes = usage
+                    .owned_bytes
+                    .checked_add(text.capacity())
+                    .ok_or(ParseError::Complexity)?;
+            }
+            Value::Array(values) => {
+                usage.owned_bytes = usage
+                    .owned_bytes
+                    .checked_add(
+                        values
+                            .capacity()
+                            .checked_mul(size_of::<Value>())
+                            .ok_or(ParseError::Complexity)?,
+                    )
+                    .ok_or(ParseError::Complexity)?;
+                if values.len() > limits.max_nodes.saturating_sub(pending.len()) {
+                    return Err(ParseError::Complexity);
+                }
+                let child_depth = depth.checked_add(1).ok_or(ParseError::Complexity)?;
+                pending.extend(values.iter().map(|child| (child, child_depth)));
+            }
+            Value::Object(values) => {
+                if values.len() > limits.max_nodes.saturating_sub(pending.len()) {
+                    return Err(ParseError::Complexity);
+                }
+                let child_depth = depth.checked_add(1).ok_or(ParseError::Complexity)?;
+                for (key, child) in values {
+                    usage.owned_bytes = usage
+                        .owned_bytes
+                        .checked_add(key.capacity())
+                        .and_then(|bytes| {
+                            bytes.checked_add(
+                                size_of::<String>() + size_of::<Value>() + 3 * size_of::<usize>(),
+                            )
+                        })
+                        .ok_or(ParseError::Complexity)?;
+                    pending.push((child, child_depth));
+                }
+            }
+        }
+        if usage.nodes > limits.max_nodes || usage.owned_bytes > limits.max_owned_bytes {
+            return Err(ParseError::Complexity);
+        }
+    }
+    Ok(usage)
 }
 
 struct Budget {
@@ -272,6 +358,25 @@ mod tests {
         assert!(parse_str("\"abcd\"", string_limits).is_ok());
         assert!(matches!(
             parse_str("\"abcde\"", string_limits),
+            Err(ParseError::Complexity)
+        ));
+    }
+
+    #[test]
+    fn parse_usage_matches_the_owned_value_measurement() {
+        let input = br#"{"items":["one",{"nested":true}],"count":2}"#;
+        let (value, parsed_usage) = parse_slice_with_usage(input, Limits::INBOUND).unwrap();
+        let measured_usage = measure_value(&value, Limits::INBOUND).unwrap();
+        assert_eq!(parsed_usage, measured_usage);
+        assert!(matches!(
+            measure_value(
+                &value,
+                Limits {
+                    max_depth: Limits::INBOUND.max_depth,
+                    max_nodes: measured_usage.nodes - 1,
+                    max_owned_bytes: Limits::INBOUND.max_owned_bytes,
+                },
+            ),
             Err(ParseError::Complexity)
         ));
     }
