@@ -12,6 +12,8 @@ pub enum ApiError {
     RateLimited(Duration),
     /// Instance concurrency queue timed out → HTTP 503 + `Retry-After`.
     Overloaded(Duration),
+    /// Whole proxy logical request lifetime expired → HTTP 504.
+    RequestTimeout,
     /// Missing or invalid API key → HTTP 401. Constructed by the gateway.
     #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
     Unauthorized,
@@ -48,6 +50,15 @@ impl IntoResponse for ApiError {
                     "Proxy is at capacity; retry after the suggested delay",
                     retry_after,
                 );
+            }
+            ApiError::RequestTimeout => {
+                let body = ErrorResponse {
+                    error: ErrorDetail {
+                        code: "request_timeout".to_string(),
+                        message: "Request exceeded the configured logical lifetime".to_string(),
+                    },
+                };
+                return (StatusCode::GATEWAY_TIMEOUT, axum::Json(body)).into_response();
             }
             ApiError::Unauthorized => {
                 let body = ErrorResponse {

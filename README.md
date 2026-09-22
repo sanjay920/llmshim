@@ -312,6 +312,8 @@ All configuration is via env vars — everything optional with safe defaults. Wi
 | --- | --- | --- |
 | `LLMSHIM_MAX_CONCURRENCY` | `256` | Max in-flight upstream requests per instance. |
 | `LLMSHIM_QUEUE_TIMEOUT_MS` | `5000` | Max wait for a concurrency slot before returning 503. |
+| `LLMSHIM_PROXY_UNARY_TIMEOUT_MS` | `7200000` | Absolute unary request and final-body lifetime. |
+| `LLMSHIM_PROXY_STREAM_TIMEOUT_MS` | `21600000` | Absolute streaming request and final-body lifetime. |
 | `LLMSHIM_RATE_LIMIT_RPM` | unset | Global requests-per-minute limit (per provider). |
 | `LLMSHIM_RATE_LIMIT_TPM` | unset | Global tokens-per-minute limit. |
 | `LLMSHIM_OPENAI_RPM`, `LLMSHIM_ANTHROPIC_TPM`, … | unset | Per-provider overrides (`LLMSHIM_<PROVIDER>_RPM`/`_TPM`). |
