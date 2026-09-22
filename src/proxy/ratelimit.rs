@@ -656,52 +656,66 @@ impl Backpressure {
 // ===========================================================================
 
 /// Rough token footprint of a request, for the TPM bucket. Not exact — a
-/// conservative-ish `chars / 4` over message content plus the requested (or
-/// default) output budget. Errs toward over-counting so we protect the limit.
+/// conservative-ish `chars / 4` over all prompt-bearing proxy fields plus the
+/// largest requested output budget. Provider namespaces and tool schemas are
+/// included because adapters can copy them into the native prompt.
 pub fn estimate_request_tokens(req: &ChatRequest) -> u32 {
-    let mut input_chars = 0usize;
-    for m in &req.messages {
-        input_chars += m.role.len();
-        input_chars += content_len(&m.content);
-        if let Some(tc) = &m.tool_calls {
-            input_chars += tc.to_string().len();
-        }
+    let mut input_chars = serde_json::to_string(&req.messages)
+        .map(|messages| messages.len())
+        .unwrap_or(0);
+    for prompt_bearing_value in [req.provider_config.as_ref(), req.response_format.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        input_chars = input_chars.saturating_add(prompt_bearing_value.to_string().len());
     }
-    let input_tokens = (input_chars / 4) as u64;
-    let output_tokens = req
+    let input_tokens = u64::try_from(input_chars / 4).unwrap_or(u64::MAX);
+    let configured_output_tokens = req.config.as_ref().and_then(|config| config.max_tokens);
+    let provider_output_tokens = req
         .provider_config
         .as_ref()
-        .and_then(|config| {
-            config
-                .get("max_tokens")
-                .or_else(|| config.get("max_completion_tokens"))
-        })
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| req.config.as_ref().and_then(|c| c.max_tokens))
+        .and_then(largest_provider_output_budget);
+    let output_tokens = configured_output_tokens
+        .into_iter()
+        .chain(provider_output_tokens)
+        .max()
         .unwrap_or(DEFAULT_MAX_TOKENS_ESTIMATE);
     input_tokens
         .saturating_add(output_tokens)
         .clamp(1, u32::MAX as u64) as u32
 }
 
-/// Character length of a message `content` field, which may be a plain string
-/// or an array of content blocks.
-fn content_len(content: &serde_json::Value) -> usize {
-    match content {
-        serde_json::Value::String(s) => s.len(),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .map(|it| {
-                it.get("text")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.len())
-                    // Non-text blocks (images, etc.): count serialized size.
-                    .unwrap_or_else(|| it.to_string().len())
-            })
-            .sum(),
-        serde_json::Value::Null => 0,
-        other => other.to_string().len(),
+fn direct_output_budget(config: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    [
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "maxOutputTokens",
+    ]
+    .into_iter()
+    .filter_map(|field| config.get(field).and_then(serde_json::Value::as_u64))
+    .max()
+}
+
+fn largest_provider_output_budget(provider_config: &serde_json::Value) -> Option<u64> {
+    let provider_config = provider_config.as_object()?;
+    let mut largest_budget = direct_output_budget(provider_config);
+    for (field, native_config) in provider_config {
+        if !field.starts_with("x-") {
+            continue;
+        }
+        let Some(native_config) = native_config.as_object() else {
+            continue;
+        };
+        largest_budget = largest_budget.max(direct_output_budget(native_config));
+        if let Some(generation_config) = native_config
+            .get("generationConfig")
+            .and_then(serde_json::Value::as_object)
+        {
+            largest_budget = largest_budget.max(direct_output_budget(generation_config));
+        }
     }
+    largest_budget
 }
 
 /// Build the configured limiter from the environment.
@@ -1068,6 +1082,41 @@ mod tests {
         .unwrap();
         // Should not panic and should include output budget.
         assert!(estimate_request_tokens(&req) >= 10);
+    }
+
+    #[test]
+    fn estimate_counts_tool_schemas_and_namespaced_output_limits() {
+        let large_description = "x".repeat(8_000);
+        let req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+            "config": {"max_tokens": 10},
+            "provider_config": {
+                "tools": [{"type": "function", "function": {
+                    "name": "lookup",
+                    "description": large_description,
+                    "parameters": {"type": "object", "properties": {}}
+                }}],
+                "x-openai": {"max_output_tokens": 4_000}
+            }
+        }))
+        .unwrap();
+        assert!(
+            estimate_request_tokens(&req) >= 6_000,
+            "the native output limit and serialized tool schema must both consume permits"
+        );
+    }
+
+    #[test]
+    fn estimate_counts_namespaced_native_prompt_content() {
+        let native_input = "x".repeat(8_000);
+        let req: ChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+            "provider_config": {"x-openai": {"input": native_input}}
+        }))
+        .unwrap();
+        assert!(estimate_request_tokens(&req) >= 3_000);
     }
 
     // --- Trait object dispatch ----------------------------------------------

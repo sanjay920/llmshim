@@ -26,7 +26,11 @@ struct Admission {
 /// Proactive admission control, run before every upstream dispatch:
 ///   1. Acquire an instance concurrency permit (bounded wait → 503 on timeout).
 ///   2. Acquire a rate-limit token for the provider (→ 429 with Retry-After).
-async fn admit(state: &Arc<AppState>, req: &ChatRequest) -> Result<Admission, ApiError> {
+async fn admit(
+    state: &Arc<AppState>,
+    req: &ChatRequest,
+    prepared_request: &serde_json::Value,
+) -> Result<Admission, ApiError> {
     // (1) Backpressure: bounded queue for a concurrency slot.
     let permit = state
         .backpressure
@@ -38,7 +42,11 @@ async fn admit(state: &Arc<AppState>, req: &ChatRequest) -> Result<Admission, Ap
     // dispatch path surface the proper "unknown provider" error).
     let key = state
         .router
-        .resolve(&req.model)
+        .resolve(
+            prepared_request["model"]
+                .as_str()
+                .ok_or(ShimError::MissingModel)?,
+        )
         .ok()
         .map(|(p, _)| RateKey::provider(p.name()));
 
@@ -68,7 +76,7 @@ pub async fn chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
-    convert::validate_request(&req)?;
+    let value = convert::prepare_request(&req)?;
     if req.stream {
         // Delegate to streaming (which runs its own admission control).
         return Ok(chat_stream_inner(state, req).await);
@@ -76,10 +84,9 @@ pub async fn chat(
 
     // Admission control: concurrency permit + rate-limit token. The permit is
     // held until `admission` drops at the end of this function.
-    let admission = admit(&state, &req).await?;
+    let admission = admit(&state, &req, &value).await?;
 
     let timer = RequestTimer::start();
-    let value = convert::request_to_value(&req);
 
     let result = if let Some(fallback_models) = &req.fallback {
         // Build fallback chain: primary model + fallback models
@@ -126,17 +133,17 @@ pub async fn chat_stream(
 }
 
 async fn chat_stream_inner(state: Arc<AppState>, req: ChatRequest) -> Response {
-    if let Err(error) = convert::validate_request(&req) {
-        return ApiError::from(error).into_response();
-    }
+    let value = match convert::prepare_request(&req) {
+        Ok(value) => value,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
     // Admission control up front: reject with 429/503 (+ Retry-After) before we
     // commit to a stream, rather than emitting a rejection as an SSE event.
-    let admission = match admit(&state, &req).await {
+    let admission = match admit(&state, &req, &value).await {
         Ok(a) => a,
         Err(e) => return e.into_response(),
     };
 
-    let value = convert::request_to_value(&req);
     let stream_result = crate::stream(&state.router, &value).await;
 
     if let Err(e) = &stream_result {
@@ -512,5 +519,45 @@ mod tests {
             "https://trusted.example"
         );
         upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_provider_config_admission_overrides_before_dispatch() {
+        let state = Arc::new(AppState {
+            router: Router::new(),
+            logger: None,
+            limiter: Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default())),
+            backpressure: Backpressure::new(256, Duration::from_millis(50)),
+        });
+        for (path, provider_config) in [
+            (
+                "/v1/chat",
+                serde_json::json!({"model": "anthropic/claude-opus-5"}),
+            ),
+            (
+                "/v1/chat/stream",
+                serde_json::json!({"x-openai": {"input": "replacement"}}),
+            ),
+        ] {
+            let response = app_with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "model": "openai/gpt-5.6-luna",
+                                "messages": [{"role": "user", "content": "canonical"}],
+                                "provider_config": provider_config,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 }

@@ -51,17 +51,120 @@ pub fn request_to_value(req: &ChatRequest) -> Value {
     if let Some(format) = &req.response_format {
         v["response_format"] = format.clone();
     }
+    // Routing and canonical history always come from the typed proxy envelope.
+    // Validation rejects conflicting passthrough fields, and these assignments
+    // keep the conversion safe if a future internal caller skips validation.
+    v["model"] = json!(req.model);
+    v["messages"] = json!(req.messages);
     v
 }
 
-/// Validate canonical history before HTTP/SSE admission. Providers additionally
-/// validate their native projection after applying native overrides.
-pub(crate) fn validate_request(req: &ChatRequest) -> crate::error::Result<()> {
+fn invalid_provider_config(field: &str) -> crate::error::ShimError {
+    crate::error::ShimError::ProviderError {
+        status: 400,
+        body: format!(
+            "provider_config.{field} cannot replace a field admitted from the proxy request"
+        ),
+        retry_after: None,
+    }
+}
+
+fn validate_provider_config(req: &ChatRequest) -> crate::error::Result<()> {
+    let Some(provider_config) = req.provider_config.as_ref() else {
+        return Ok(());
+    };
+    let Some(provider_config) = provider_config.as_object() else {
+        return Err(crate::error::ShimError::ProviderError {
+            status: 400,
+            body: "provider_config must be an object".into(),
+            retry_after: None,
+        });
+    };
+
+    for protected_field in ["model", "messages"] {
+        if provider_config.contains_key(protected_field) {
+            return Err(invalid_provider_config(protected_field));
+        }
+    }
+
+    for (namespace, native_config) in provider_config {
+        if !namespace.starts_with("x-") {
+            continue;
+        }
+        let Some(native_config) = native_config.as_object() else {
+            continue;
+        };
+        for protected_field in ["model", "messages", "input", "contents"] {
+            if native_config.contains_key(protected_field) {
+                return Err(invalid_provider_config(&format!(
+                    "{namespace}.{protected_field}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the exact engine request used for admission and dispatch.
+pub(crate) fn prepare_request(req: &ChatRequest) -> crate::error::Result<Value> {
+    validate_provider_config(req)?;
     let request = request_to_value(req);
     if let Some(messages) = request["messages"].as_array() {
         crate::toolcall::validate_history(messages)?;
     }
-    Ok(())
+    Ok(request)
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn request_with_provider_config(provider_config: Value) -> ChatRequest {
+        serde_json::from_value(json!({
+            "model": "openai/gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "canonical"}],
+            "provider_config": provider_config,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn canonical_model_and_messages_cannot_be_replaced_at_the_merge_root() {
+        for provider_config in [
+            json!({"model": "anthropic/claude-opus-5"}),
+            json!({"messages": [{"role": "user", "content": "replacement"}]}),
+        ] {
+            let request = request_with_provider_config(provider_config);
+            assert!(prepare_request(&request).is_err());
+            let converted = request_to_value(&request);
+            assert_eq!(converted["model"], "openai/gpt-5.6-luna");
+            assert_eq!(converted["messages"][0]["content"], "canonical");
+        }
+    }
+
+    #[test]
+    fn native_namespaces_cannot_replace_the_admitted_model_or_prompt() {
+        for protected_field in ["model", "messages", "input", "contents"] {
+            let request = request_with_provider_config(json!({
+                "x-openai": {(protected_field): "replacement"}
+            }));
+            let error = prepare_request(&request).unwrap_err().to_string();
+            assert!(error.contains(&format!("x-openai.{protected_field}")));
+        }
+    }
+
+    #[test]
+    fn provider_specific_tools_and_options_remain_available() {
+        let request = request_with_provider_config(json!({
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+            "x-openai": {"reasoning": {"effort": "high"}, "max_output_tokens": 2048},
+            "x-openrouter": {"provider": {"sort": "throughput"}},
+        }));
+        let prepared = prepare_request(&request).unwrap();
+        assert_eq!(prepared["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(prepared["x-openai"]["reasoning"]["effort"], "high");
+        assert_eq!(prepared["x-openrouter"]["provider"]["sort"], "throughput");
+    }
 }
 
 /// Release date as a Unix timestamp. The OpenAI list shape types `created` as

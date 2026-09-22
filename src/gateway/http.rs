@@ -38,7 +38,7 @@ use crate::gateway::{
     StreamChunk,
 };
 use crate::log::{Logger, RequestTimer};
-use crate::proxy::convert::{chunk_to_events, request_to_value, value_to_response};
+use crate::proxy::convert::{chunk_to_events, value_to_response};
 use crate::proxy::error::ApiError;
 use crate::proxy::ratelimit::{build_limiter, estimate_request_tokens, penalty_duration};
 use crate::proxy::types::{ChatRequest, HealthResponse, ModelsResponse, StreamEvent};
@@ -408,6 +408,7 @@ fn build_request(
 ) -> Result<
     (
         String,
+        String,
         GatewayRequest,
         crate::gateway::auth::IdentifiedCaller,
     ),
@@ -420,18 +421,18 @@ fn build_request(
         );
         ApiError::Unauthorized
     })?;
-    crate::proxy::convert::validate_request(req)?;
-    let provider_name = {
-        let (provider, _model) = state.router.resolve(&req.model)?;
-        provider.name().to_string()
-    };
+    let payload = crate::proxy::convert::prepare_request(req)?;
+    let admitted_model = payload["model"].as_str().ok_or(ShimError::MissingModel)?;
+    let (provider, resolved_model) = state.router.resolve(admitted_model)?;
+    let provider_name = provider.name().to_string();
+    let budget_model = resolved_model.to_string();
     let gw = GatewayRequest {
         provider: provider_name.clone(),
         tier: identified_caller.identity.tier,
         permits: estimate_request_tokens(req),
-        payload: request_to_value(req),
+        payload,
     };
-    Ok((provider_name, gw, identified_caller))
+    Ok((provider_name, budget_model, gw, identified_caller))
 }
 
 fn idempotency_conflict() -> ApiError {
@@ -484,10 +485,10 @@ async fn chat(
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let (provider_name, gw, identified_caller) = build_request(&state, &headers, &req)?;
+    let (provider_name, budget_model, gw, identified_caller) =
+        build_request(&state, &headers, &req)?;
     let identity = &identified_caller.identity;
     state.enforce_quota(identity, &provider_name, gw.permits)?;
-    let (_, budget_model) = state.router.resolve(&req.model)?;
     state
         .enforce_budget(identity, &provider_name, &budget_model)
         .await?;
@@ -550,18 +551,15 @@ async fn chat_stream_inner(
     headers: HeaderMap,
     req: ChatRequest,
 ) -> Response {
-    let (provider_name, gw, identified_caller) = match build_request(&state, &headers, &req) {
-        Ok(t) => t,
-        Err(e) => return e.into_response(),
-    };
+    let (provider_name, budget_model, gw, identified_caller) =
+        match build_request(&state, &headers, &req) {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
     let identity = identified_caller.identity;
     if let Err(e) = state.enforce_quota(&identity, &provider_name, gw.permits) {
         return e.into_response();
     }
-    let budget_model = match state.router.resolve(&req.model) {
-        Ok((_, m)) => m,
-        Err(e) => return ApiError::from(e).into_response(),
-    };
     if let Err(e) = state
         .enforce_budget(&identity, &provider_name, &budget_model)
         .await
@@ -1346,5 +1344,42 @@ mod native_tests {
                 .unwrap(),
             "true"
         );
+    }
+
+    #[tokio::test]
+    async fn gateway_rejects_provider_config_admission_overrides_before_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+        let state = configured_state(&server.url());
+        for (path, provider_config) in [
+            ("/v1/chat", json!({"model": "local/unpriced"})),
+            ("/v1/chat/stream", json!({"x-local": {"messages": []}})),
+        ] {
+            let response = app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-key")
+                        .body(Body::from(
+                            json!({
+                                "model": "local/test",
+                                "messages": [{"role": "user", "content": "canonical"}],
+                                "provider_config": provider_config,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        upstream.assert_async().await;
     }
 }

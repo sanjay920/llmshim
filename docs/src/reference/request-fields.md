@@ -78,7 +78,7 @@ never replayed. See [reasoning replay](../guides/reasoning.md#preserve-reasoning
 | `messages` | array | Portable | top-level `messages` |
 | `stream` | boolean | Transport | selects SSE only on `/v1/chat` |
 | `config` | object | Portable | recognized children become top-level engine controls |
-| `provider_config` | object | Passthrough container | each child is merged into the engine request |
+| `provider_config` | object | Passthrough container | each non-reserved child is merged into the engine request |
 | `fallback` | array of strings | Proxy orchestration | ordered non-streaming backup routes; not sent to a provider |
 | `x-cache` | object | Caller stability annotations | native breakpoints or `prompt_cache_key`; never forwarded verbatim |
 
@@ -110,6 +110,13 @@ becomes engine fields named `reasoning_effort`, `tools`, and `x-anthropic`.
 Because `provider_config` is merged after `config`, a same-named child there
 overrides the portable value. Prefer the `x-*` namespace for an intentional
 native override; it makes that loss of portability visible.
+
+`model` and `messages` are reserved at the `provider_config` root. Native
+namespaces may not replace their wire equivalents (`model`, `messages`,
+`input`, or `contents`). The proxy rejects those conflicts so routing, spend
+checks, prompt validation, and dispatch all refer to the same request. Tool
+definitions, schemas, output limits, and other documented native controls
+remain valid passthrough fields.
 
 ## Output contracts
 
