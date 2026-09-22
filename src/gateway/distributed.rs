@@ -51,6 +51,8 @@ use tokio::task::JoinHandle;
 use super::{Dispatch, GatewayConfig, GatewayError, GatewayRequest, StreamChunk};
 use crate::proxy::ratelimit::{RateKey, RateLimiter, RetryAfter};
 
+mod admission;
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -357,22 +359,24 @@ impl DistributedGateway {
 
     /// Enqueue a descriptor onto its provider's priority queue, first shedding
     /// with `Overloaded` if the waiting queue is at capacity.
-    async fn enqueue(&self, prepared: &PreparedSubmission) -> Result<(), GatewayError> {
-        let key = queue_key(&prepared.descriptor.provider);
-        let mut conn = self.conn.clone();
-        let depth: u64 = conn.zcard(&key).await.map_err(|e| redis_err(&e))?;
-        if depth as usize >= self.config.max_queue_depth {
+    async fn enqueue(&self, prepared_submission: &PreparedSubmission) -> Result<(), GatewayError> {
+        let descriptor = &prepared_submission.descriptor;
+        let provider_queue_key = queue_key(&descriptor.provider);
+        let mut connection = self.conn.clone();
+        let priority_score =
+            deadline_score(descriptor.tier, descriptor.enqueue_ms, self.aging_step_ms());
+        let admitted = admission::enqueue(
+            &mut connection,
+            &provider_queue_key,
+            self.config.max_queue_depth,
+            priority_score,
+            &prepared_submission.member,
+        )
+        .await
+        .map_err(|error| redis_err(&error))?;
+        if !admitted {
             return Err(GatewayError::Overloaded(self.config.overloaded_retry_after));
         }
-        let score = deadline_score(
-            prepared.descriptor.tier,
-            prepared.descriptor.enqueue_ms,
-            self.aging_step_ms(),
-        );
-        let _: () = conn
-            .zadd(&key, &prepared.member, score)
-            .await
-            .map_err(|e| redis_err(&e))?;
         Ok(())
     }
 
@@ -1080,6 +1084,123 @@ mod tests {
         )
         .await
         .ok()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_concurrent_origins_share_one_remaining_queue_slot() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider_name = format!("queue-admission-{}", uuid::Uuid::new_v4());
+        let mut gateways = Vec::new();
+        for _ in 0..3 {
+            gateways.push(
+                DistributedGateway::connect(
+                    &redis_url,
+                    Arc::new(EchoDispatch),
+                    unlimited(),
+                    GatewayConfig {
+                        max_queue_depth: 2,
+                        ..GatewayConfig::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let prepare_submission = |request_id: &str, tier: u8| {
+            PreparedSubmission::new(JobDescriptor {
+                id: request_id.to_owned(),
+                provider: provider_name.clone(),
+                tier,
+                permits: 1,
+                payload: serde_json::json!({"request": request_id}),
+                policy_scope: None,
+                stream: false,
+                enqueue_ms: 1_700_000_000_000,
+            })
+            .unwrap()
+        };
+        let existing_submission = prepare_submission("existing", 0);
+        gateways[0].enqueue(&existing_submission).await.unwrap();
+        let prepared_submissions = [
+            prepare_submission("origin-a", 1),
+            prepare_submission("origin-b", 2),
+            prepare_submission("origin-c", 3),
+        ];
+        let results = futures::future::join_all(
+            gateways
+                .iter()
+                .zip(prepared_submissions.iter())
+                .map(|(gateway, prepared)| gateway.enqueue(prepared)),
+        )
+        .await;
+        let mut connection = gateways[0].conn.clone();
+        let queued_members: Vec<String> = connection
+            .zrange(queue_key(&provider_name), 0, -1)
+            .await
+            .unwrap();
+        let _: i64 = connection.del(queue_key(&provider_name)).await.unwrap();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(queued_members.len(), 2);
+        for (result, prepared) in results.iter().zip(prepared_submissions.iter()) {
+            if result.is_ok() {
+                assert_eq!(queued_members[0], prepared.member);
+            } else {
+                assert!(matches!(result, Err(GatewayError::Overloaded(_))));
+                assert!(!queued_members.contains(&prepared.member));
+            }
+        }
+        assert_eq!(queued_members[1], existing_submission.member);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_queue_admission_zero_capacity_and_storage_errors_fail_closed() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider_name = format!("queue-failure-{}", uuid::Uuid::new_v4());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            GatewayConfig {
+                max_queue_depth: 0,
+                overloaded_retry_after: Duration::from_secs(7),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let prepared_submission = PreparedSubmission::new(JobDescriptor {
+            id: "refused".into(),
+            provider: provider_name.clone(),
+            tier: 0,
+            permits: 1,
+            payload: serde_json::json!({"request": "synthetic payload"}),
+            policy_scope: None,
+            stream: false,
+            enqueue_ms: 1_700_000_000_000,
+        })
+        .unwrap();
+        assert!(matches!(
+            gateway.enqueue(&prepared_submission).await,
+            Err(GatewayError::Overloaded(delay)) if delay == Duration::from_secs(7)
+        ));
+        let provider_queue_key = queue_key(&provider_name);
+        let mut connection = gateway.conn.clone();
+        let queue_exists: bool = connection.exists(&provider_queue_key).await.unwrap();
+        assert!(!queue_exists);
+
+        let _: () = connection
+            .set(&provider_queue_key, "existing value")
+            .await
+            .unwrap();
+        assert!(matches!(
+            gateway.enqueue(&prepared_submission).await,
+            Err(GatewayError::Upstream(_))
+        ));
+        let stored_value: String = connection.get(&provider_queue_key).await.unwrap();
+        assert_eq!(stored_value, "existing value");
+        let _: i64 = connection.del(provider_queue_key).await.unwrap();
     }
 
     #[tokio::test]
