@@ -118,14 +118,11 @@ impl CollectorState {
             .get(&output_index)
             .map(|retained| retained.footprint)
             .unwrap_or_default();
-        let mut replacement = crate::stream_retention::estimate_value(&item)?;
-        if previous.entries == 0 {
-            replacement = replacement
-                .checked_add(crate::stream_retention::RetainedFootprint::record(
-                    size_of::<u64>(),
-                ))
-                .ok_or_else(crate::stream_retention::retention_error)?;
-        }
+        let replacement = crate::stream_retention::estimate_value(&item)?
+            .checked_add(crate::stream_retention::RetainedFootprint::record(
+                size_of::<u64>(),
+            ))
+            .ok_or_else(crate::stream_retention::retention_error)?;
         self.replace(previous, replacement)?;
         self.items.insert(
             output_index,
@@ -148,14 +145,11 @@ impl CollectorState {
             .and_then(|retained| retained.parts.get(&content_index))
             .map(|retained| retained.footprint)
             .unwrap_or_default();
-        let mut replacement = crate::stream_retention::estimate_value(&output_text)?;
-        if previous.entries == 0 {
-            replacement = replacement
-                .checked_add(crate::stream_retention::RetainedFootprint::record(
-                    size_of::<u64>(),
-                ))
-                .ok_or_else(crate::stream_retention::retention_error)?;
-        }
+        let replacement = crate::stream_retention::estimate_value(&output_text)?
+            .checked_add(crate::stream_retention::RetainedFootprint::record(
+                size_of::<u64>(),
+            ))
+            .ok_or_else(crate::stream_retention::retention_error)?;
 
         let newly_seen_output = !self.texts.contains_key(&output_index);
         let map_footprint = crate::stream_retention::RetainedFootprint::record(
@@ -564,6 +558,45 @@ mod deadline_tests {
         .await;
         assert!(collected.result.is_err());
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn item_replacement_preserves_the_live_node_at_the_exact_entry_boundary() {
+        let collected = collect(
+            vec![
+                json!({"type":"response.output_item.done", "output_index":0, "item":{}}),
+                json!({"type":"response.output_item.done", "output_index":0, "item":{}}),
+                json!({"type":"response.output_item.done", "output_index":1, "item":{}}),
+                json!({"type":"response.output_item.done", "output_index":2, "item":{}}),
+            ],
+            retention_limits(8 * 1024, 5),
+        )
+        .await;
+        assert!(matches!(
+            collected.result,
+            Err(ShimError::Stream(ref message))
+                if message == crate::stream_retention::RETENTION_ERROR
+        ));
+        assert!(collected.native_usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn nested_text_replacement_preserves_the_live_node_at_the_exact_entry_boundary() {
+        let collected = collect(
+            vec![
+                json!({"type":"response.output_text.done", "output_index":0, "content_index":0, "text":""}),
+                json!({"type":"response.output_text.done", "output_index":0, "content_index":0, "text":""}),
+                json!({"type":"response.output_text.done", "output_index":0, "content_index":1, "text":""}),
+            ],
+            retention_limits(8 * 1024, 8),
+        )
+        .await;
+        assert!(matches!(
+            collected.result,
+            Err(ShimError::Stream(ref message))
+                if message == crate::stream_retention::RETENTION_ERROR
+        ));
+        assert!(collected.native_usage.is_none());
     }
 
     #[tokio::test]
