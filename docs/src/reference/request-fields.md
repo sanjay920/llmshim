@@ -113,14 +113,18 @@ native override; it makes that loss of portability visible.
 
 `model` and `messages` are reserved at the `provider_config` root. After named
 route defaults and aliases are resolved, the proxy validates only the selected
-provider's active namespace and wire. It rejects fields that would replace the
-admitted model or prompt: `x-openai.model/input`, `x-chatgpt.input`,
-`x-anthropic.model/messages`, `x-gemini.contents/systemInstruction`,
+provider's active namespace and wire. Every resolvable explicit fallback is
+validated the same way before the primary request runs. The proxy rejects
+fields that would replace the admitted model or main history/input container:
+`x-openai.model/input`, `x-chatgpt.input`,
+`x-anthropic.model/messages`, `x-gemini.contents`,
 `x-openrouter.model/messages`, and the corresponding model plus
-`messages`/`input` fields for the configured vLLM or SGLang wire. Other
-provider namespaces are inactive data and do not affect admission. Tool
-definitions, schemas, output limits, OpenRouter routing preferences, and other
-documented native controls remain valid passthrough fields.
+`messages`/`input` fields for any `OpenAiCompatible` provider's configured
+namespace and wire. A namespace is inactive only when neither the primary nor
+an explicit fallback or route can select its provider. Native `system` and
+`instructions`, tool definitions, schemas, output limits, OpenRouter routing
+preferences, and other documented controls remain valid and are included in
+the estimate when active.
 
 ## Output contracts
 

@@ -1359,6 +1359,61 @@ mod native_tests {
         assert!(gateway_request.permits >= 32_000);
     }
 
+    #[test]
+    fn gateway_uses_dynamic_openai_compatible_namespace_and_wire_policy() {
+        for (wire, prompt_field, output_field) in [
+            (
+                crate::reasoning::WireFormat::OpenAiChat,
+                "messages",
+                "max_tokens",
+            ),
+            (
+                crate::reasoning::WireFormat::OpenAiResponses,
+                "input",
+                "max_output_tokens",
+            ),
+        ] {
+            let router = Router::new().register(
+                "local",
+                Box::new(
+                    crate::providers::openai_compat::OpenAiCompatible::new(
+                        "local",
+                        "http://127.0.0.1:9",
+                        None,
+                    )
+                    .with_wire(wire),
+                ),
+            );
+            let state = configured_state_with_router(router);
+            let headers = HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer test-key"),
+            )]);
+
+            for protected_field in ["model", prompt_field] {
+                let request: ChatRequest = serde_json::from_value(json!({
+                    "model":"local/declared",
+                    "messages":[{"role":"user","content":"canonical"}],
+                    "provider_config":{"x-local":{(protected_field):"replacement"}}
+                }))
+                .unwrap();
+                assert!(build_request(&state, &headers, &request).is_err());
+            }
+
+            let request: ChatRequest = serde_json::from_value(json!({
+                "model":"local/declared",
+                "messages":[{"role":"user","content":"canonical"}],
+                "provider_config":{"x-local":{(output_field):7_000}}
+            }))
+            .unwrap();
+            let (_, _, gateway_request, _) = match build_request(&state, &headers, &request) {
+                Ok(prepared) => prepared,
+                Err(_) => panic!("native output limit should remain supported"),
+            };
+            assert!(gateway_request.permits >= 7_000);
+        }
+    }
+
     #[tokio::test]
     async fn browser_origin_policy_covers_gateway_and_native_routes() {
         let server = mockito::Server::new_async().await;
@@ -1426,10 +1481,10 @@ mod native_tests {
             .expect(0)
             .create_async()
             .await;
-        let state = configured_state_for_provider(&server.url(), "vllm");
+        let state = configured_state_for_provider(&server.url(), "local");
         for (path, provider_config) in [
-            ("/v1/chat", json!({"model": "vllm/unpriced"})),
-            ("/v1/chat/stream", json!({"x-vllm": {"messages": []}})),
+            ("/v1/chat", json!({"model": "local/unpriced"})),
+            ("/v1/chat/stream", json!({"x-local": {"messages": []}})),
         ] {
             let response = app(state.clone())
                 .oneshot(
@@ -1440,7 +1495,7 @@ mod native_tests {
                         .header("authorization", "Bearer test-key")
                         .body(Body::from(
                             json!({
-                                "model": "vllm/test",
+                                "model": "local/test",
                                 "messages": [{"role": "user", "content": "canonical"}],
                                 "provider_config": provider_config,
                             })
@@ -1466,9 +1521,9 @@ mod native_tests {
                         .header("authorization", "Bearer test-key")
                         .body(Body::from(
                             json!({
-                                "model": "vllm/test",
+                                "model": "local/test",
                                 "messages": [{"role": "user", "content": "canonical"}],
-                                "x-vllm": {"messages": []},
+                                "x-local": {"messages": []},
                                 "max_tokens": 100
                             })
                             .to_string(),

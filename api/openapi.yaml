@@ -277,8 +277,12 @@ components:
             controls). Also carries `tools`, `response_format`, and
             `reasoning_summary`. Root `model` and `messages` are reserved.
             After named-route and alias resolution, the selected provider's
-            active namespace may not replace its native model or prompt
-            container. Inactive provider namespaces remain inert data.
+            active namespace may not replace its native model or main
+            messages/input/contents container. Every resolvable explicit
+            fallback is checked before the primary request runs. Native system
+            and instruction controls remain supported and are estimated when
+            active; another provider namespace is inert only if no primary,
+            fallback, or route can select it.
           examples:
             - x-anthropic:
                 thinking:

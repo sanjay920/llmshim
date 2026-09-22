@@ -692,6 +692,12 @@ pub(crate) fn estimate_prepared_request_tokens(prepared: &PreparedRequest) -> u3
             prompt_characters = prompt_characters.saturating_add(value.to_string().len());
         }
     }
+    if prepared.target.provider_name == "anthropic" {
+        if let Some(output_configuration) = prepared.payload.get("output_config") {
+            prompt_characters =
+                prompt_characters.saturating_add(output_configuration.to_string().len());
+        }
+    }
     prompt_characters = prompt_characters.saturating_add(active_native_prompt_characters(prepared));
     let estimated_input_tokens = u64::try_from(prompt_characters / 4).unwrap_or(u64::MAX);
     let estimated_output_tokens = effective_output_budget(prepared);
@@ -711,32 +717,19 @@ fn active_native_prompt_characters(prepared: &PreparedRequest) -> usize {
     else {
         return 0;
     };
-    let prompt_fields: &[&str] = match prepared.target.provider_name.as_str() {
-        "openai" => &["instructions", "prompt", "text", "tools", "tool_choice"],
-        "chatgpt" => &["instructions", "text", "tools", "tool_choice", "reasoning"],
-        "anthropic" => &["system", "tools", "tool_choice", "thinking"],
-        "gemini" => &["systemInstruction", "tools", "toolConfig", "thinkingConfig"],
-        "openrouter" => &["tools", "tool_choice", "response_format", "reasoning"],
-        "vllm" | "sglang" => &[
-            "tools",
-            "tool_choice",
-            "response_format",
-            "guided_json",
-            "guided_regex",
-            "guided_ebnf",
-            "structured_outputs",
-            "chat_template_kwargs",
-        ],
-        _ => &[],
-    };
-    prompt_fields.iter().fold(0usize, |total, field| {
-        total.saturating_add(
-            native_configuration
-                .get(*field)
-                .map(|value| value.to_string().len())
-                .unwrap_or_default(),
-        )
-    })
+    prepared
+        .target
+        .policy
+        .native_prompt_fields()
+        .iter()
+        .fold(0usize, |total, field| {
+            total.saturating_add(
+                native_configuration
+                    .get(*field)
+                    .map(|value| value.to_string().len())
+                    .unwrap_or_default(),
+            )
+        })
 }
 
 fn portable_output_budget(request: &serde_json::Value) -> Option<u64> {
@@ -759,25 +752,12 @@ fn native_direct_output_budget(
     target: &AdmissionTarget,
 ) -> Option<u64> {
     let namespace = active_native_namespace(target)?;
-    match target.provider_name.as_str() {
-        "openai" => native_u64(request, namespace, &["max_output_tokens"]),
-        "anthropic" => native_u64(request, namespace, &["max_tokens"]),
-        "openrouter" => ["max_tokens", "max_completion_tokens"]
-            .into_iter()
-            .filter_map(|field| native_u64(request, namespace, &[field]))
-            .max(),
-        "vllm" | "sglang" => match target.wire {
-            crate::reasoning::WireFormat::OpenAiResponses => {
-                native_u64(request, namespace, &["max_output_tokens"])
-            }
-            crate::reasoning::WireFormat::OpenAiChat => ["max_tokens", "max_completion_tokens"]
-                .into_iter()
-                .filter_map(|field| native_u64(request, namespace, &[field]))
-                .max(),
-            _ => None,
-        },
-        _ => None,
-    }
+    target
+        .policy
+        .native_output_limit_fields()
+        .iter()
+        .filter_map(|field| native_u64(request, namespace, &[*field]))
+        .max()
 }
 
 fn reasoning_output_budget(request: &serde_json::Value, target: &AdmissionTarget) -> Option<u64> {
@@ -1292,12 +1272,67 @@ mod tests {
         wire: crate::reasoning::WireFormat,
         payload: serde_json::Value,
     ) -> PreparedRequest {
+        let policy = match provider_name {
+            "openai" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-openai",
+                &["model", "input"],
+                &["instructions", "prompt", "text", "tools", "tool_choice"],
+                &["max_output_tokens"],
+            ),
+            "chatgpt" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-chatgpt",
+                &["input"],
+                &["instructions", "text", "tools", "tool_choice", "reasoning"],
+                &[],
+            ),
+            "anthropic" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-anthropic",
+                &["model", "messages"],
+                &[
+                    "system",
+                    "tools",
+                    "tool_choice",
+                    "thinking",
+                    "output_config",
+                ],
+                &["max_tokens"],
+            ),
+            "gemini" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-gemini",
+                &["contents"],
+                &["systemInstruction", "tools", "toolConfig", "thinkingConfig"],
+                &[],
+            ),
+            "openrouter" => crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-openrouter",
+                &["model", "messages"],
+                &["tools", "tool_choice", "response_format", "reasoning"],
+                &["max_tokens", "max_completion_tokens"],
+            ),
+            "vllm" | "sglang" => match wire {
+                crate::reasoning::WireFormat::OpenAiResponses => {
+                    crate::provider::RequestAdmissionPolicy::namespaced(
+                        format!("x-{provider_name}"),
+                        &["model", "input"],
+                        &["instructions", "tools", "tool_choice"],
+                        &["max_output_tokens"],
+                    )
+                }
+                _ => crate::provider::RequestAdmissionPolicy::namespaced(
+                    format!("x-{provider_name}"),
+                    &["model", "messages"],
+                    &["tools", "tool_choice", "response_format"],
+                    &["max_tokens", "max_completion_tokens"],
+                ),
+            },
+            _ => crate::provider::RequestAdmissionPolicy::default(),
+        };
         PreparedRequest {
             payload,
             target: AdmissionTarget {
                 provider_name: provider_name.into(),
                 model: model.into(),
-                wire,
+                policy,
             },
         }
     }
@@ -1407,6 +1442,49 @@ mod tests {
     }
 
     #[test]
+    fn prepared_estimate_counts_compact_anthropic_output_schemas() {
+        let baseline = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":100
+            }),
+        );
+        let root_schema = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":100,
+                "output_config":{"format":{"type":"json_schema","schema":{
+                    "type":"object","description":"x".repeat(8_000)
+                }}}
+            }),
+        );
+        let namespaced_schema = prepared_request(
+            "anthropic",
+            "claude-sonnet-5",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model":"anthropic/claude-sonnet-5","messages":[],"max_tokens":100,
+                "x-anthropic":{"output_config":{"format":{"type":"json_schema","schema":{
+                    "type":"object","description":"x".repeat(8_000)
+                }}}}
+            }),
+        );
+        let baseline_permits = estimate_prepared_request_tokens(&baseline);
+        assert!(
+            estimate_prepared_request_tokens(&root_schema)
+                >= baseline_permits.saturating_add(1_900)
+        );
+        assert!(
+            estimate_prepared_request_tokens(&namespaced_schema)
+                >= baseline_permits.saturating_add(1_900)
+        );
+    }
+
+    #[test]
     fn prepared_estimate_tracks_chatgpt_and_self_hosted_wire_semantics() {
         let openai = prepared_request(
             "openai",
@@ -1418,7 +1496,12 @@ mod tests {
         let unknown_openai_target = AdmissionTarget {
             provider_name: "openai".into(),
             model: "gpt-unknown".into(),
-            wire: crate::reasoning::WireFormat::OpenAiResponses,
+            policy: crate::provider::RequestAdmissionPolicy::namespaced(
+                "x-openai",
+                &["model", "input"],
+                &["instructions"],
+                &["max_output_tokens"],
+            ),
         };
         assert_eq!(omitted_output_budget(&unknown_openai_target), 128_000);
 
