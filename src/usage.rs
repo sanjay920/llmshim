@@ -117,6 +117,7 @@ pub fn normalize_cache(native: &Value, normalized: &mut Value) {
     normalized["uncached_input_tokens"] = json!(uncached_input(native));
 }
 
+#[derive(Clone)]
 pub(crate) struct NativeUsageObservation {
     pub(crate) usage: Value,
     pub(crate) terminal: bool,
@@ -248,6 +249,11 @@ fn normalize_native_usage(wire: WireFormat, native_usage: &Value) -> Option<Valu
 pub(crate) struct NativeStreamUsage {
     target: ReplayTarget,
     anthropic_usage: Value,
+    known_chat_choices: std::collections::BTreeSet<u64>,
+    finished_chat_choices: std::collections::BTreeSet<u64>,
+    known_gemini_candidates: std::collections::BTreeSet<u64>,
+    finished_gemini_candidates: std::collections::BTreeSet<u64>,
+    terminal_candidate: Option<NativeUsageObservation>,
 }
 
 impl NativeStreamUsage {
@@ -255,7 +261,19 @@ impl NativeStreamUsage {
         Self {
             target,
             anthropic_usage: json!({}),
+            known_chat_choices: std::collections::BTreeSet::new(),
+            finished_chat_choices: std::collections::BTreeSet::new(),
+            known_gemini_candidates: std::collections::BTreeSet::new(),
+            finished_gemini_candidates: std::collections::BTreeSet::new(),
+            terminal_candidate: None,
         }
+    }
+
+    pub(crate) fn take_terminal_candidate(&mut self) -> Option<NativeUsageObservation> {
+        self.terminal_candidate.take().map(|mut observation| {
+            observation.terminal = true;
+            observation
+        })
     }
 
     pub(crate) fn ingest(&mut self, native_event_text: &str) -> Option<NativeUsageObservation> {
@@ -278,46 +296,88 @@ impl NativeStreamUsage {
                         .pointer("/delta/stop_reason")
                         .is_some_and(Value::is_string);
                 let mut observation =
-                    usage_observation(self.target.wire, &self.anthropic_usage, terminal)?;
+                    usage_observation(self.target.wire, &self.anthropic_usage, false)?;
                 if terminal && !has_counter(incoming_usage, "/output_tokens") {
                     observation.counters_complete = false;
                     observation.explicit_zero = false;
+                }
+                if terminal {
+                    self.terminal_candidate = Some(observation.clone());
                 }
                 Some(observation)
             }
             WireFormat::OpenAiResponses => {
                 let terminal = native_event["type"] == "response.completed";
-                native_event.get("response").and_then(|response| {
+                let observation = native_event.get("response").and_then(|response| {
                     native_usage_object(self.target.wire, response)
-                        .and_then(|usage| usage_observation(self.target.wire, usage, terminal))
-                })
+                        .and_then(|usage| usage_observation(self.target.wire, usage, false))
+                });
+                if terminal {
+                    self.terminal_candidate = observation.clone();
+                }
+                observation
             }
             WireFormat::OpenAiChat => {
-                let terminal = native_event
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .is_some_and(|choices| {
-                        choices.is_empty()
-                            || choices
-                                .iter()
-                                .any(|choice| choice["finish_reason"].is_string())
-                    });
-                native_event
+                let choices = native_event.get("choices").and_then(Value::as_array);
+                if let Some(choices) = choices {
+                    for (position, choice) in choices.iter().enumerate() {
+                        let index = choice["index"].as_u64().unwrap_or(position as u64);
+                        let newly_seen = self.known_chat_choices.insert(index);
+                        let finished = choice["finish_reason"].is_string();
+                        let has_output = choice
+                            .get("delta")
+                            .and_then(Value::as_object)
+                            .is_some_and(|delta| !delta.is_empty());
+                        if newly_seen || !finished || has_output {
+                            self.terminal_candidate = None;
+                        }
+                        if finished {
+                            self.finished_chat_choices.insert(index);
+                        } else {
+                            self.finished_chat_choices.remove(&index);
+                        }
+                    }
+                }
+                let observation = native_event
                     .get("usage")
-                    .and_then(|usage| usage_observation(self.target.wire, usage, terminal))
+                    .and_then(|usage| usage_observation(self.target.wire, usage, false));
+                if let Some(observation) = observation.as_ref() {
+                    let all_known_finished = !self.known_chat_choices.is_empty()
+                        && self.finished_chat_choices == self.known_chat_choices;
+                    self.terminal_candidate = all_known_finished.then(|| observation.clone());
+                }
+                observation
             }
             WireFormat::GoogleGenerateContent => {
-                let terminal = native_event
-                    .get("candidates")
-                    .and_then(Value::as_array)
-                    .is_some_and(|candidates| {
-                        candidates
-                            .iter()
-                            .any(|candidate| candidate["finishReason"].is_string())
-                    });
-                native_event
+                let candidates = native_event.get("candidates").and_then(Value::as_array);
+                if let Some(candidates) = candidates {
+                    for (position, candidate) in candidates.iter().enumerate() {
+                        let index = candidate["index"].as_u64().unwrap_or(position as u64);
+                        let newly_seen = self.known_gemini_candidates.insert(index);
+                        let finished = candidate["finishReason"].is_string();
+                        let has_output = candidate
+                            .pointer("/content/parts")
+                            .and_then(Value::as_array)
+                            .is_some_and(|parts| !parts.is_empty());
+                        if newly_seen || !finished || has_output {
+                            self.terminal_candidate = None;
+                        }
+                        if finished {
+                            self.finished_gemini_candidates.insert(index);
+                        } else {
+                            self.finished_gemini_candidates.remove(&index);
+                        }
+                    }
+                }
+                let observation = native_event
                     .get("usageMetadata")
-                    .and_then(|usage| usage_observation(self.target.wire, usage, terminal))
+                    .and_then(|usage| usage_observation(self.target.wire, usage, false));
+                if let Some(observation) = observation.as_ref() {
+                    let all_known_finished = !self.known_gemini_candidates.is_empty()
+                        && self.finished_gemini_candidates == self.known_gemini_candidates;
+                    self.terminal_candidate = all_known_finished.then(|| observation.clone());
+                }
+                observation
             }
         }
     }
