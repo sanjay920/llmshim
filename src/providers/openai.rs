@@ -574,9 +574,10 @@ impl OpenAi {
         target: &crate::reasoning::ReplayTarget,
         schema_budget: &mut crate::schema::RequestBudget,
     ) -> Result<ProviderRequest> {
+        crate::reasoning::preflight_request(request)?;
         let request = crate::schema::prepare_request(request, schema_budget)?;
         let request = crate::cache::prepare_request(&request, target.wire)?;
-        let request = crate::reasoning::prepare_request(&request, target);
+        let request = crate::reasoning::prepare_request(&request, target)?;
         let request = crate::toolcall::prepare_request(&request, target)?;
         let obj = request.as_object().ok_or(ShimError::MissingModel)?;
 

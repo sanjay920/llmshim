@@ -434,13 +434,14 @@ impl Provider for Gemini {
     }
 
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        crate::reasoning::preflight_request(request)?;
         let mut schema_budget = crate::schema::RequestBudget::new();
         let request = crate::schema::prepare_request(request, &mut schema_budget)?;
         let request = crate::cache::prepare_request(
             &request,
             crate::reasoning::WireFormat::GoogleGenerateContent,
         )?;
-        let request = crate::reasoning::prepare_request(&request, &self.replay_target(model));
+        let request = crate::reasoning::prepare_request(&request, &self.replay_target(model))?;
         let request = crate::toolcall::prepare_request(&request, &self.replay_target(model))?;
         let obj = request.as_object().ok_or(ShimError::MissingModel)?;
 

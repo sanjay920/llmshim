@@ -194,6 +194,7 @@ impl Provider for OpenAiCompatible {
     }
 
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        crate::reasoning::preflight_request(request)?;
         if self.wire == WireFormat::OpenAiResponses {
             return self.transform_request_responses(model, request);
         }
@@ -201,7 +202,7 @@ impl Provider for OpenAiCompatible {
         let request = crate::schema::prepare_request(request, &mut schema_budget)?;
         let request =
             crate::cache::prepare_request(&request, crate::reasoning::WireFormat::OpenAiChat)?;
-        let request = crate::reasoning::prepare_request(&request, &self.replay_target(model));
+        let request = crate::reasoning::prepare_request(&request, &self.replay_target(model))?;
         let request = crate::toolcall::prepare_request(&request, &self.replay_target(model))?;
         let obj = request.as_object().ok_or(ShimError::MissingModel)?;
         let messages = obj

@@ -1,6 +1,7 @@
 //! Typed, lossless reasoning and a single fail-closed replay policy.
 //! Opaque data is never inspected to decide where a block may be sent.
 mod normalize;
+mod request_budget;
 pub(crate) use normalize::capture_response_with_budget;
 #[cfg(test)]
 pub(crate) use normalize::capture_stream_with_budget;
@@ -270,7 +271,7 @@ pub(crate) fn strip_fields(message: &mut Value) {
 
 /// The only replay-policy entry point used by every native adapter. Keeps
 /// matching JSON blocks unchanged; removes unknown/mismatched data and counts it.
-pub fn filter_reasoning_for_target(message: &mut Value, target: &ReplayTarget) {
+fn filter_reasoning_after_preflight(message: &mut Value, target: &ReplayTarget) {
     let blocks = match message["reasoning"].as_array() {
         Some(a) => a.clone(),
         None => legacy_blocks(message),
@@ -348,6 +349,15 @@ pub fn filter_reasoning_for_target(message: &mut Value, target: &ReplayTarget) {
             }
         }
     }
+}
+
+pub fn filter_reasoning_for_target(
+    message: &mut Value,
+    target: &ReplayTarget,
+) -> crate::error::Result<()> {
+    request_budget::preflight_message(message)?;
+    filter_reasoning_after_preflight(message, target);
+    Ok(())
 }
 
 pub(crate) fn blocks(message: &Value) -> impl Iterator<Item = ReasoningBlock> + '_ {
@@ -460,11 +470,19 @@ fn render_chat(message: &mut Value, target: &ReplayTarget) {
     }
 }
 
-pub(crate) fn prepare_request(request: &Value, target: &ReplayTarget) -> Value {
+pub(crate) fn preflight_request(request: &Value) -> crate::error::Result<()> {
+    request_budget::preflight_request(request)
+}
+
+pub(crate) fn prepare_request(
+    request: &Value,
+    target: &ReplayTarget,
+) -> crate::error::Result<Value> {
+    request_budget::preflight_request(request)?;
     let mut request = request.clone();
     if let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
-            filter_reasoning_for_target(message, target);
+            filter_reasoning_after_preflight(message, target);
             // A raw native thinking block has no provenance and must not bypass
             // the policy simply by being put into an assistant content array.
             if let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) {
@@ -501,7 +519,7 @@ pub(crate) fn prepare_request(request: &Value, target: &ReplayTarget) -> Value {
     // Native escape hatches cannot smuggle untracked reasoning past the
     // canonical message policy. Replayable blocks belong in `messages`.
     sanitize_extensions(&mut request);
-    request
+    Ok(request)
 }
 
 pub(crate) fn sanitize_extensions(request: &mut Value) {
