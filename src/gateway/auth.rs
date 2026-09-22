@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use axum::http::HeaderMap;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 fn anonymous() -> String {
     "anonymous".to_string()
@@ -52,6 +53,12 @@ pub struct Identity {
 pub enum AuthError {
     MissingKey,
     InvalidKey,
+}
+
+/// Authenticated identity plus a non-secret owner scope for request-bound state.
+pub(crate) struct IdentifiedCaller {
+    pub identity: Identity,
+    pub credential_scope: String,
 }
 
 /// API-key registry. `Open` = no auth (dev); `Enforced` = Bearer required.
@@ -105,19 +112,36 @@ impl KeyStore {
     /// header; enforced mode requires a valid Bearer key and takes tier + tenant
     /// from it (header ignored, so callers can't self-escalate).
     pub fn identify(&self, headers: &HeaderMap) -> Result<Identity, AuthError> {
+        self.identify_caller(headers).map(|caller| caller.identity)
+    }
+
+    /// Resolve the identity and a stable credential-specific scope. Distinct API
+    /// keys remain separate even when an operator assigns them the same tenant.
+    pub(crate) fn identify_caller(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<IdentifiedCaller, AuthError> {
         match self {
-            KeyStore::Open => Ok(Identity {
-                tenant: anonymous(),
-                tier: header_tier(headers),
-                rpm: None,
-                tpm: None,
-                budget_usd: None,
-                budget_window_secs: None,
-                budget_allow_unpriced: false,
+            KeyStore::Open => Ok(IdentifiedCaller {
+                identity: Identity {
+                    tenant: anonymous(),
+                    tier: header_tier(headers),
+                    rpm: None,
+                    tpm: None,
+                    budget_usd: None,
+                    budget_window_secs: None,
+                    budget_allow_unpriced: false,
+                },
+                credential_scope: "open-development-mode".to_string(),
             }),
             KeyStore::Enforced(map) => {
                 let key = bearer_token(headers).ok_or(AuthError::MissingKey)?;
-                map.get(key).cloned().ok_or(AuthError::InvalidKey)
+                let identity = map.get(key).cloned().ok_or(AuthError::InvalidKey)?;
+                let credential_scope = format!("{:x}", Sha256::digest(key.as_bytes()));
+                Ok(IdentifiedCaller {
+                    identity,
+                    credential_scope,
+                })
             }
         }
     }
@@ -185,6 +209,18 @@ mod tests {
                 budget_allow_unpriced: false,
             },
         );
+        keys.insert(
+            "sk-paid-rotated".to_string(),
+            Identity {
+                tenant: "acme".into(),
+                tier: 5,
+                rpm: Some(100),
+                tpm: None,
+                budget_usd: None,
+                budget_window_secs: None,
+                budget_allow_unpriced: false,
+            },
+        );
         let store = KeyStore::enforced(keys);
 
         // A valid key → its tier, regardless of the (spoofed) header.
@@ -196,6 +232,18 @@ mod tests {
             .unwrap();
         assert_eq!(id.tier, 5, "tier must come from the key, not the header");
         assert_eq!(id.tenant, "acme");
+
+        let first_caller = store
+            .identify_caller(&hdrs(&[("authorization", "Bearer sk-paid")]))
+            .unwrap();
+        let rotated_caller = store
+            .identify_caller(&hdrs(&[("authorization", "Bearer sk-paid-rotated")]))
+            .unwrap();
+        assert_ne!(
+            first_caller.credential_scope, rotated_caller.credential_scope,
+            "keys for the same tenant need separate state ownership"
+        );
+        assert!(!first_caller.credential_scope.contains("sk-paid"));
 
         // Missing / bad key → rejected.
         assert!(matches!(
