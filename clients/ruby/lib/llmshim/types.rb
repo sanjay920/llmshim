@@ -8,7 +8,7 @@ module Llmshim
   # Mirrors the +Usage+ schema in api/openapi.yaml.
   Usage = Struct.new(
     :input_tokens, :output_tokens, :reasoning_tokens, :total_tokens,
-    :cache_read_tokens, :cache_write_tokens, :cost_usd,
+    :cache_read_tokens, :cache_write_tokens, :cost_usd, :cost_source,
     keyword_init: true
   ) do
     def self.from_hash(hash)
@@ -22,7 +22,10 @@ module Llmshim
         cache_read_tokens: hash.fetch("cache_read_tokens", 0),
         cache_write_tokens: hash.fetch("cache_write_tokens", 0),
         # nil means the server could not price the model, never free.
-        cost_usd: hash["cost_usd"]
+        cost_usd: hash["cost_usd"],
+        # "provider" when the number is the bill the provider reported for this
+        # generation, "catalog" when it was computed from catalog prices.
+        cost_source: hash["cost_source"]
       )
     end
   end

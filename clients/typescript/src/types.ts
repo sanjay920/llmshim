@@ -149,6 +149,13 @@ export interface ChatRequest {
   fallback?: string[];
 }
 
+/**
+ * Where a `cost_usd` figure came from. `"provider"` is the bill the provider
+ * reported for the generation; `"catalog"` is computed from catalog prices and
+ * is an upper bound.
+ */
+export type CostSource = 'provider' | 'catalog';
+
 /** Token usage reported by the provider. */
 export interface Usage {
   input_tokens: number;
@@ -164,6 +171,13 @@ export interface Usage {
    * model — it never means free. Absent on servers older than 0.4.
    */
   cost_usd?: number | null;
+  /**
+   * Where `cost_usd` came from: `"provider"` when the provider reported what
+   * it charged for this generation (OpenRouter does), `"catalog"` when it was
+   * computed from catalog prices, which is an upper-bound estimate. Absent on
+   * servers older than 0.9.
+   */
+  cost_source?: CostSource;
 }
 
 /** The assistant message inside a ChatResponse. */
@@ -233,6 +247,8 @@ export interface UsageEvent {
   cache_write_tokens?: number;
   /** `null` when the server could not price the model, never `0`. */
   cost_usd?: number | null;
+  /** Whether `cost_usd` is the provider's reported bill or a catalog estimate. */
+  cost_source?: CostSource;
 }
 
 /** Terminal event signalling the stream is complete. */

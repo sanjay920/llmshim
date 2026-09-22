@@ -73,6 +73,16 @@ for whichever stream chunk carries usage; `log.rs`, `proxy::types::Usage`, both
 native facades and the four bundled clients carry it through as a nullable
 field. `null` means unknown, not free.
 
+**A provider-reported bill outranks the catalog.** Where a response carries
+`usage.cost` — OpenRouter returns it, and the OpenRouter adapter asks for it by
+default — `stamp` uses that number and records `usage.cost_source:
+"provider"`; otherwise it prices from the catalog and records `"catalog"`. The
+catalog product is an estimate of that bill and deliberately an upper bound, so
+it must never overwrite one. `cost_source` rides beside `cost_usd` everywhere
+it goes (`LogEntry`, `proxy::types::Usage`, OpenAPI, the typed clients).
+`shim::add_usage` sums a reported `cost` across a repair's two attempts, because
+two dispatches are two charges.
+
 `ModelInfo.context_cost_tiers` adds context-dependent standard rates without
 changing the public `Cost` struct. `cost_for_input_tokens` includes cached input
 in tier selection; `src/cost.rs` applies the resulting rates to the whole

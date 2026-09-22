@@ -88,6 +88,17 @@ OpenRouter is OpenAI Chat Completions-compatible, so tools, vision, streaming,
 and `reasoning_effort` all pass through; OpenRouter-only controls (provider
 routing, model fallbacks, transforms) go under an `x-openrouter` key.
 
+OpenRouter also reports **what it actually charged**, and llmshim asks for that
+by default (`usage: {include: true}`). The response then carries
+`usage.cost_usd` with `usage.cost_source: "provider"` — the bill, not the
+catalog estimate — alongside `usage.cost_details` and `usage.is_byok`. Send
+your own `usage` object to change or disable it. Because OpenRouter is an
+aggregator, the response's top-level **`provider`** names the upstream that
+actually served the call (`"Together"`, `"Fireworks"`, …) and `id` is the
+OpenRouter generation id; both survive streaming and buffered paths. On a
+stream the accounting rides on the terminal chunk, which OpenRouter only sends
+when you set `stream_options: {include_usage: true}`.
+
 Point at a **self-hosted vLLM or SGLang** server (local or remote) by setting its
 base URL — no key needed unless the server was launched with one:
 
