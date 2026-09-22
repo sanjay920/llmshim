@@ -729,6 +729,7 @@ impl ShimClient {
                 }
             };
             let mut result = match crate::providers::chatgpt::transform_collected_response(
+                &target,
                 model,
                 native_response,
             ) {
@@ -743,8 +744,15 @@ impl ShimClient {
                     return Err(DispatchFailure::Upstream(error));
                 }
             };
-            crate::reasoning::bind_response_context(&mut result, &target);
-            crate::toolcall::bind_response_context(&mut result, &target);
+            if let Err(error) = crate::derived_response::bind_unary_context(&mut result, &target) {
+                finish_invalid_response(
+                    &mut tracker,
+                    self.deadlines.policy_callback,
+                    attempt_deadline,
+                )
+                .await?;
+                return Err(DispatchFailure::Upstream(error));
+            }
             finish_completed_response(
                 &mut tracker,
                 self.deadlines.policy_callback,
@@ -792,8 +800,15 @@ impl ShimClient {
                 return Err(DispatchFailure::Upstream(error));
             }
         };
-        crate::reasoning::bind_response_context(&mut result, &target);
-        crate::toolcall::bind_response_context(&mut result, &target);
+        if let Err(error) = crate::derived_response::bind_unary_context(&mut result, &target) {
+            finish_invalid_response(
+                &mut tracker,
+                self.deadlines.policy_callback,
+                attempt_deadline,
+            )
+            .await?;
+            return Err(DispatchFailure::Upstream(error));
+        }
         finish_completed_response(
             &mut tracker,
             self.deadlines.policy_callback,

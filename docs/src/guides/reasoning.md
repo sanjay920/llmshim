@@ -74,6 +74,15 @@ are read for one migration release, but untracked data is dropped. An explicit
 writers emit only the block array. Models absent from the catalog need a local
 family assertion before their reasoning can be replayed.
 
+Unary reasoning blocks, tool signatures, wire identities, and their provenance
+share a 16 MiB estimated-owned-memory and 4,096-entry derived metadata limit.
+The limit is checked before model, provider, account, payload, or signature
+copies are created. A response that exceeds it fails as an upstream response;
+llmshim never returns a truncated or partially normalized assistant message.
+The public Rust `reasoning::capture_response` helper therefore returns a
+`Result`; callers must discard the response and propagate an error. Successful
+capture preserves every accepted origin string byte-for-byte.
+
 Streaming reasoning uses the same blocks with a part `index` and an optional
 `replace:true` flag for completed item snapshots. `ReasoningAccumulator` assembles
 fragments and removes stream framing before storage:
@@ -89,7 +98,9 @@ assistant["reasoning"] = serde_json::json!(reasoning.blocks());
 `push` returns a `Result` because reasoning text, signatures, encrypted data,
 and block identities share the per-response retained-state budget. Propagate
 that error; an over-budget accumulator never returns an apparently complete
-partial result.
+partial result. Each native stream frame also applies the derived metadata
+limit before eagerly normalizing multiple completed reasoning blocks; the
+retained-state limit remains the separate bound across frames.
 
 Use `reasoning_text(&message_or_delta)` for display without inspecting opaque
 data. A provider may expose only a summary or no readable reasoning at all.

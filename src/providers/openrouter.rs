@@ -271,8 +271,7 @@ impl Provider for OpenRouter {
     fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
         let native = response.clone();
         let mut result = self.transform_response_native(model, response)?;
-        crate::reasoning::capture_response(&self.replay_target(model), &native, &mut result);
-        crate::toolcall::capture_response(&self.replay_target(model), &native, &mut result)?;
+        crate::derived_response::capture_unary(&self.replay_target(model), &native, &mut result)?;
         Ok(result)
     }
 
