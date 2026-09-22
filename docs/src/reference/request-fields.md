@@ -111,12 +111,16 @@ Because `provider_config` is merged after `config`, a same-named child there
 overrides the portable value. Prefer the `x-*` namespace for an intentional
 native override; it makes that loss of portability visible.
 
-`model` and `messages` are reserved at the `provider_config` root. Native
-namespaces may not replace their wire equivalents (`model`, `messages`,
-`input`, or `contents`). The proxy rejects those conflicts so routing, spend
-checks, prompt validation, and dispatch all refer to the same request. Tool
-definitions, schemas, output limits, and other documented native controls
-remain valid passthrough fields.
+`model` and `messages` are reserved at the `provider_config` root. After named
+route defaults and aliases are resolved, the proxy validates only the selected
+provider's active namespace and wire. It rejects fields that would replace the
+admitted model or prompt: `x-openai.model/input`, `x-chatgpt.input`,
+`x-anthropic.model/messages`, `x-gemini.contents/systemInstruction`,
+`x-openrouter.model/messages`, and the corresponding model plus
+`messages`/`input` fields for the configured vLLM or SGLang wire. Other
+provider namespaces are inactive data and do not affect admission. Tool
+definitions, schemas, output limits, OpenRouter routing preferences, and other
+documented native controls remain valid passthrough fields.
 
 ## Output contracts
 

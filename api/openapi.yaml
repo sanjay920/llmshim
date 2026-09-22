@@ -275,7 +275,10 @@ components:
             `x-openai` / `x-chatgpt` / `x-anthropic` / `x-gemini` (native controls) or
             `x-openrouter` / `x-vllm` / `x-sglang` (aggregator / self-hosted
             controls). Also carries `tools`, `response_format`, and
-            `reasoning_summary`.
+            `reasoning_summary`. Root `model` and `messages` are reserved.
+            After named-route and alias resolution, the selected provider's
+            active namespace may not replace its native model or prompt
+            container. Inactive provider namespaces remain inert data.
           examples:
             - x-anthropic:
                 thinking:
