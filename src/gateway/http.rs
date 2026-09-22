@@ -1551,6 +1551,117 @@ mod native_tests {
         }
     }
 
+    async fn assert_chat_stream_budget_finality(
+        events: Vec<Value>,
+        expected_second_status: StatusCode,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let mut stream_body = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        stream_body.push_str("data: [DONE]\n\n");
+        let expected_calls = usize::from(expected_second_status == StatusCode::OK) + 1;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_header("content-type", "text/event-stream")
+            .with_body(stream_body)
+            .expect(expected_calls)
+            .create_async()
+            .await;
+        let router = Router::new().register(
+            "openrouter",
+            Box::new(
+                crate::providers::openrouter::OpenRouter::new("test-key".into())
+                    .with_base_url(server.url()),
+            ),
+        );
+        let application = app(configured_state_with_router_and_identity(
+            router,
+            budgeted_identity(10.0, false),
+        ));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/stream")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "openrouter/x-ai/grok-4.7",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let first = application.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = to_bytes(first.into_body(), 100_000).await.unwrap();
+        let second = application.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), expected_second_status);
+        if second.status() == StatusCode::OK {
+            let _ = to_bytes(second.into_body(), 100_000).await.unwrap();
+        }
+        upstream.assert_async().await;
+    }
+
+    async fn assert_gemini_stream_budget_finality(
+        events: Vec<Value>,
+        expected_second_status: StatusCode,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let stream_body = events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let expected_calls = usize::from(expected_second_status == StatusCode::OK) + 1;
+        let upstream = server
+            .mock("POST", Matcher::Regex("/models/.*".into()))
+            .with_header("content-type", "text/event-stream")
+            .with_body(stream_body)
+            .expect(expected_calls)
+            .create_async()
+            .await;
+        let router = Router::new().register(
+            "gemini",
+            Box::new(
+                crate::providers::gemini::Gemini::new("test-key".into())
+                    .with_base_url(server.url()),
+            ),
+        );
+        let application = app(configured_state_with_router_and_identity(
+            router,
+            budgeted_identity(10.0, true),
+        ));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/stream")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(
+                    json!({
+                        "model": "gemini/gemini-3.8-flash",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let first = application.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = to_bytes(first.into_body(), 100_000).await.unwrap();
+        let second = application.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), expected_second_status);
+        if second.status() == StatusCode::OK {
+            let _ = to_bytes(second.into_body(), 100_000).await.unwrap();
+        }
+        upstream.assert_async().await;
+    }
+
     #[tokio::test]
     async fn budget_rejects_unknown_and_surcharged_requests_before_send() {
         let mut unknown_server = mockito::Server::new_async().await;
@@ -2131,6 +2242,75 @@ mod native_tests {
             StatusCode::TOO_MANY_REQUESTS
         );
         stream_upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn later_chat_and_gemini_activity_revokes_early_terminal_usage_authority() {
+        let chat_unsafe = vec![
+            vec![
+                json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                json!({"choices":[{"index":0,"delta":{"content":"later"},"finish_reason":null}]}),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+            ],
+            vec![
+                json!({"choices":[
+                    {"index":0,"delta":{},"finish_reason":"stop"},
+                    {"index":1,"delta":{},"finish_reason":null}
+                ],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                json!({"choices":[{"index":1,"delta":{"content":"later"},"finish_reason":null}]}),
+                json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+            ],
+            vec![
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                json!({"choices":[{"index":1,"delta":{"content":"new"},"finish_reason":null}]}),
+                json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+            ],
+        ];
+        for sequence in chat_unsafe {
+            assert_chat_stream_budget_finality(sequence, StatusCode::TOO_MANY_REQUESTS).await;
+        }
+        assert_chat_stream_budget_finality(
+            vec![
+                json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}),
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            ],
+            StatusCode::OK,
+        )
+        .await;
+
+        let gemini_unsafe = vec![
+            vec![
+                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
+                json!({"candidates":[{"index":0,"content":{"parts":[{"text":"later"}]}}]}),
+                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}]}),
+            ],
+            vec![
+                json!({"candidates":[
+                    {"index":0,"finishReason":"STOP","content":{"parts":[]}},
+                    {"index":1,"content":{"parts":[]}}
+                ],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
+                json!({"candidates":[{"index":1,"content":{"parts":[{"text":"later"}]}}]}),
+                json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+            ],
+            vec![
+                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
+                json!({"candidates":[{"index":1,"content":{"parts":[{"text":"new"}]}}]}),
+                json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+            ],
+        ];
+        for sequence in gemini_unsafe {
+            assert_gemini_stream_budget_finality(sequence, StatusCode::TOO_MANY_REQUESTS).await;
+        }
+        assert_gemini_stream_budget_finality(
+            vec![
+                json!({"candidates":[{"index":0,"content":{"parts":[{"text":"ok"}]}}]}),
+                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}]}),
+                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
+            ],
+            StatusCode::OK,
+        )
+        .await;
     }
 
     #[tokio::test]

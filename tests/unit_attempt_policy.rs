@@ -392,6 +392,76 @@ fn successful_stream(content: &str) -> String {
     )
 }
 
+async fn record_chat_stream(events: Vec<Value>) -> Vec<RecordedEvent> {
+    let mut server = mockito::Server::new_async().await;
+    let mut body = events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+    body.push_str("data: [DONE]\n\n");
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = OpenRouter::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+    let chunks: Vec<_> = ShimClient::new()
+        .stream_with_policy(
+            &provider,
+            "x-ai/grok-4.7",
+            &request("openrouter/x-ai/grok-4.7"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+    upstream.assert_async().await;
+    policy.events()
+}
+
+async fn record_gemini_stream(events: Vec<Value>) -> Vec<RecordedEvent> {
+    let mut server = mockito::Server::new_async().await;
+    let body = events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+    let upstream = server
+        .mock("POST", mockito::Matcher::Regex("/models/.*".into()))
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let provider = Gemini::new("test-key".into()).with_base_url(server.url());
+    let policy = Arc::new(RecordingPolicy::default());
+    let chunks: Vec<_> = ShimClient::new()
+        .stream_with_policy(
+            &provider,
+            "gemini-3.8-flash",
+            &request("gemini/gemini-3.8-flash"),
+            &context(policy.clone()),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+    upstream.assert_async().await;
+    policy.events()
+}
+
+fn terminal_usage_count(events: &[RecordedEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, RecordedEvent::Usage { terminal: true, .. }))
+        .count()
+}
+
 #[tokio::test]
 async fn a_refused_retry_never_reaches_the_network() {
     let mut server = mockito::Server::new_async().await;
@@ -1283,6 +1353,87 @@ async fn chat_stream_partial_usage_followed_by_clean_finish_is_not_terminal_acco
 }
 
 #[tokio::test]
+async fn chat_terminal_authority_survives_only_without_later_choice_activity() {
+    let complete_usage = json!({"prompt_tokens": 7, "completion_tokens": 3});
+    let unsafe_sequences = vec![
+        vec![
+            json!({"id":"r","choices":[],"usage":complete_usage}),
+            json!({"id":"r","choices":[{"index":0,"delta":{"content":"later"},"finish_reason":null}]}),
+            json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        ],
+        vec![
+            json!({"id":"r","choices":[
+                {"index":0,"delta":{},"finish_reason":"stop"},
+                {"index":1,"delta":{},"finish_reason":null}
+            ],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            json!({"id":"r","choices":[{"index":1,"delta":{"content":"later"},"finish_reason":null}]}),
+            json!({"id":"r","choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+        ],
+        vec![
+            json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            json!({"id":"r","choices":[{"index":1,"delta":{"content":"new"},"finish_reason":null}]}),
+            json!({"id":"r","choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+        ],
+    ];
+    for sequence in unsafe_sequences {
+        let events = record_chat_stream(sequence).await;
+        assert_eq!(terminal_usage_count(&events), 0, "{events:?}");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RecordedEvent::Usage {
+                terminal: false,
+                counters_complete: true,
+                ..
+            }
+        )));
+    }
+
+    let valid = record_chat_stream(vec![
+        json!({"id":"r","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}),
+        json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        json!({"id":"r","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+    ])
+    .await;
+    assert_eq!(terminal_usage_count(&valid), 1, "{valid:?}");
+}
+
+#[tokio::test]
+async fn gemini_terminal_authority_survives_only_without_later_candidate_activity() {
+    let unsafe_sequences = vec![
+        vec![
+            json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+            json!({"candidates":[{"index":0,"content":{"parts":[{"text":"later"}]}}]}),
+            json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}]}),
+        ],
+        vec![
+            json!({"candidates":[
+                {"index":0,"finishReason":"STOP","content":{"parts":[]}},
+                {"index":1,"content":{"parts":[]}}
+            ],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+            json!({"candidates":[{"index":1,"content":{"parts":[{"text":"later"}]}}]}),
+            json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+        ],
+        vec![
+            json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+            json!({"candidates":[{"index":1,"content":{"parts":[{"text":"new"}]}}]}),
+            json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+        ],
+    ];
+    for sequence in unsafe_sequences {
+        let events = record_gemini_stream(sequence).await;
+        assert_eq!(terminal_usage_count(&events), 0, "{events:?}");
+    }
+
+    let valid = record_gemini_stream(vec![
+        json!({"candidates":[{"index":0,"content":{"parts":[{"text":"ok"}]}}]}),
+        json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}]}),
+        json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+    ])
+    .await;
+    assert_eq!(terminal_usage_count(&valid), 1, "{valid:?}");
+}
+
+#[tokio::test]
 async fn anthropic_terminal_empty_usage_cannot_bless_earlier_partial_counters() {
     let mut server = mockito::Server::new_async().await;
     let stream_body = format!(
@@ -2054,12 +2205,22 @@ async fn cumulative_and_duplicate_stream_usage_share_one_attempt_identity() {
             _ => None,
         })
         .collect();
-    assert_eq!(usage_events.len(), 3);
+    assert_eq!(usage_events.len(), 4);
     assert_eq!(usage_events[0].1, Some(8));
     assert_eq!(usage_events[1].1, Some(8));
     assert_eq!(usage_events[2].1, Some(10));
+    assert_eq!(usage_events[3].1, Some(10));
     assert_eq!(usage_events[0].0, usage_events[1].0);
     assert_eq!(usage_events[1].0, usage_events[2].0);
+    assert_eq!(usage_events[2].0, usage_events[3].0);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RecordedEvent::Usage {
+            terminal: true,
+            usage,
+            ..
+        } if usage["total_tokens"] == 10
+    )));
     let finished_id = events.iter().find_map(|event| match event {
         RecordedEvent::Finished {
             id,

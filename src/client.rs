@@ -1164,6 +1164,9 @@ impl Stream for SseStream {
                 }
             }
             if self.normalizer.is_finished() {
+                if let Some(observation) = self.native_usage.take_terminal_candidate() {
+                    return Poll::Ready(Some(Ok(SseOutput::Usage(observation))));
+                }
                 return Poll::Ready(None);
             }
             let data = match self.inner.as_mut().poll_next(cx) {
@@ -1175,7 +1178,11 @@ impl Stream for SseStream {
                 Poll::Ready(None) => {
                     return Poll::Ready(match self.normalizer.finish() {
                         Ok(Some(chunk)) => Some(Ok(SseOutput::Chunk(chunk))),
-                        Ok(None) => None,
+                        Ok(None) => self
+                            .native_usage
+                            .take_terminal_candidate()
+                            .map(SseOutput::Usage)
+                            .map(Ok),
                         Err(error) => Some(Err(error)),
                     })
                 }
