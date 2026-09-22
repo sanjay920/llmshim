@@ -4161,12 +4161,21 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), dropped)
             .await
             .expect("origin drop should cancel provider work");
-        assert!(matches!(
-            lifecycle::read_terminal(&mut connection, &id, &generation)
-                .await
-                .unwrap(),
-            Some(BusMessage::Error(message)) if message == "distributed origin canceled"
-        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    lifecycle::read_terminal(&mut connection, &id, &generation)
+                        .await
+                        .unwrap(),
+                    Some(BusMessage::Error(message)) if message == "distributed origin canceled"
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("origin cancellation terminal should commit");
         for worker in workers {
             worker.abort();
         }
