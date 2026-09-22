@@ -65,6 +65,14 @@ impl DispatchPolicyContext {
         self.policy.observe(identity, event).await
     }
 
+    async fn observe_usage(
+        &self,
+        identity: &AttemptIdentity,
+        observation: AttemptUsageObservation<'_>,
+    ) -> Result<(), AttemptPolicyError> {
+        self.policy.observe_usage(identity, observation).await
+    }
+
     #[cfg(feature = "gateway")]
     pub(crate) fn take_last_refusal(&self) -> Option<AttemptPolicyRefusal> {
         self.last_refusal.lock().unwrap().take()
@@ -94,6 +102,19 @@ pub trait AttemptPolicy: Send + Sync {
         event: AttemptEvent<'a>,
     ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>>;
 
+    fn observe_usage<'a>(
+        &'a self,
+        attempt: &'a AttemptIdentity,
+        observation: AttemptUsageObservation<'a>,
+    ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>> {
+        self.observe(
+            attempt,
+            AttemptEvent::Usage {
+                usage: observation.usage(),
+            },
+        )
+    }
+
     /// The acquire-time liability remains authoritative when this best-effort
     /// drop notification fails.
     fn observe_abandoned(
@@ -101,6 +122,46 @@ pub trait AttemptPolicy: Send + Sync {
         attempt: &AttemptIdentity,
         outcome: AttemptOutcome,
     ) -> Result<(), AttemptPolicyError>;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AttemptUsageObservation<'a> {
+    usage: &'a Value,
+    terminal: bool,
+    counters_complete: bool,
+    explicit_zero: bool,
+}
+
+impl<'a> AttemptUsageObservation<'a> {
+    pub fn new(
+        usage: &'a Value,
+        terminal: bool,
+        counters_complete: bool,
+        explicit_zero: bool,
+    ) -> Self {
+        Self {
+            usage,
+            terminal,
+            counters_complete,
+            explicit_zero,
+        }
+    }
+
+    pub fn usage(self) -> &'a Value {
+        self.usage
+    }
+
+    pub fn terminal(self) -> bool {
+        self.terminal
+    }
+
+    pub fn counters_complete(self) -> bool {
+        self.counters_complete
+    }
+
+    pub fn explicit_zero(self) -> bool {
+        self.explicit_zero
+    }
 }
 
 pub struct PreparedAttempt<'a> {
@@ -370,9 +431,18 @@ impl AttemptTracker {
             .await
     }
 
-    pub(crate) async fn usage(&mut self, usage: &Value) -> Result<(), AttemptPolicyError> {
+    pub(crate) async fn usage(
+        &mut self,
+        usage: &Value,
+        terminal: bool,
+        counters_complete: bool,
+        explicit_zero: bool,
+    ) -> Result<(), AttemptPolicyError> {
         self.context
-            .observe(&self.identity, AttemptEvent::Usage { usage })
+            .observe_usage(
+                &self.identity,
+                AttemptUsageObservation::new(usage, terminal, counters_complete, explicit_zero),
+            )
             .await?;
         self.usage_observed = true;
         Ok(())

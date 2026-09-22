@@ -87,6 +87,40 @@ pub(crate) fn observed_cost_nanos(usage: &Value) -> Option<u64> {
     Some(scaled.ceil() as u64)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpendAuthority {
+    Catalog,
+    Provider,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpendObservation {
+    pub(crate) amount_nanos: Option<u64>,
+    pub(crate) authority: SpendAuthority,
+    pub(crate) terminal_authoritative: bool,
+}
+
+pub(crate) fn spend_observation(
+    observation: crate::policy::AttemptUsageObservation<'_>,
+) -> SpendObservation {
+    let authority =
+        if crate::cost::stamped_source(observation.usage()) == Some(crate::cost::SOURCE_PROVIDER) {
+            SpendAuthority::Provider
+        } else {
+            SpendAuthority::Catalog
+        };
+    let amount_nanos = observed_cost_nanos(observation.usage())
+        .or_else(|| (observation.counters_complete() && observation.explicit_zero()).then_some(0));
+    let terminal_authoritative = observation.terminal()
+        && amount_nanos.is_some()
+        && (authority == SpendAuthority::Provider || observation.counters_complete());
+    SpendObservation {
+        amount_nanos,
+        authority,
+        terminal_authoritative,
+    }
+}
+
 pub(crate) fn may_finalize(outcome: AttemptOutcome) -> bool {
     matches!(
         outcome,

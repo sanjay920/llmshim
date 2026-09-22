@@ -117,17 +117,74 @@ pub fn normalize_cache(native: &Value, normalized: &mut Value) {
     normalized["uncached_input_tokens"] = json!(uncached_input(native));
 }
 
-pub(crate) fn normalize_native_response_usage(
+pub(crate) struct NativeUsageObservation {
+    pub(crate) usage: Value,
+    pub(crate) terminal: bool,
+    pub(crate) counters_complete: bool,
+    pub(crate) explicit_zero: bool,
+}
+
+pub(crate) fn normalize_native_response_usage_observation(
     target: &ReplayTarget,
     native_response: &Value,
-) -> Option<Value> {
-    let native_usage = match target.wire {
+) -> Option<NativeUsageObservation> {
+    let native_usage = native_usage_object(target.wire, native_response)?;
+    usage_observation(target.wire, native_usage, true)
+}
+
+fn native_usage_object(wire: WireFormat, native_response: &Value) -> Option<&Value> {
+    match wire {
         WireFormat::AnthropicMessages | WireFormat::OpenAiChat | WireFormat::OpenAiResponses => {
             native_response.get("usage")?
         }
         WireFormat::GoogleGenerateContent => native_response.get("usageMetadata")?,
+    }
+    .into()
+}
+
+fn usage_observation(
+    wire: WireFormat,
+    native_usage: &Value,
+    terminal: bool,
+) -> Option<NativeUsageObservation> {
+    let counters_complete = match wire {
+        WireFormat::OpenAiChat => {
+            has_counter(native_usage, "/prompt_tokens")
+                && has_counter(native_usage, "/completion_tokens")
+        }
+        WireFormat::OpenAiResponses => {
+            has_counter(native_usage, "/input_tokens")
+                && has_counter(native_usage, "/output_tokens")
+        }
+        WireFormat::AnthropicMessages => {
+            has_counter(native_usage, "/input_tokens")
+                && has_counter(native_usage, "/output_tokens")
+        }
+        WireFormat::GoogleGenerateContent => {
+            has_counter(native_usage, "/promptTokenCount")
+                && has_counter(native_usage, "/candidatesTokenCount")
+        }
     };
-    normalize_native_usage(target.wire, native_usage)
+    let usage = normalize_native_usage(wire, native_usage)?;
+    let explicit_zero = counters_complete
+        && [
+            "prompt_tokens",
+            "completion_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+        ]
+        .into_iter()
+        .all(|field| usage.get(field).and_then(Value::as_u64) == Some(0));
+    Some(NativeUsageObservation {
+        usage,
+        terminal,
+        counters_complete,
+        explicit_zero,
+    })
+}
+
+fn has_counter(value: &Value, pointer: &str) -> bool {
+    value.pointer(pointer).and_then(Value::as_u64).is_some()
 }
 
 fn normalize_native_usage(wire: WireFormat, native_usage: &Value) -> Option<Value> {
@@ -201,7 +258,7 @@ impl NativeStreamUsage {
         }
     }
 
-    pub(crate) fn ingest(&mut self, native_event_text: &str) -> Option<Value> {
+    pub(crate) fn ingest(&mut self, native_event_text: &str) -> Option<NativeUsageObservation> {
         let native_event: Value = serde_json::from_str(native_event_text).ok()?;
         match self.target.wire {
             WireFormat::AnthropicMessages => {
@@ -215,17 +272,46 @@ impl NativeStreamUsage {
                 for (key, value) in incoming {
                     self.anthropic_usage[key] = value.clone();
                 }
-                normalize_native_usage(self.target.wire, &self.anthropic_usage)
+                let terminal = native_event["type"] == "message_delta"
+                    && native_event
+                        .pointer("/delta/stop_reason")
+                        .is_some_and(Value::is_string);
+                usage_observation(self.target.wire, &self.anthropic_usage, terminal)
             }
-            WireFormat::OpenAiResponses => native_event
-                .get("response")
-                .and_then(|response| normalize_native_response_usage(&self.target, response)),
-            WireFormat::OpenAiChat => native_event
-                .get("usage")
-                .and_then(|usage| normalize_native_usage(self.target.wire, usage)),
-            WireFormat::GoogleGenerateContent => native_event
-                .get("usageMetadata")
-                .and_then(|usage| normalize_native_usage(self.target.wire, usage)),
+            WireFormat::OpenAiResponses => {
+                let terminal = native_event["type"] == "response.completed";
+                native_event.get("response").and_then(|response| {
+                    native_usage_object(self.target.wire, response)
+                        .and_then(|usage| usage_observation(self.target.wire, usage, terminal))
+                })
+            }
+            WireFormat::OpenAiChat => {
+                let terminal = native_event
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .is_some_and(|choices| {
+                        choices.is_empty()
+                            || choices
+                                .iter()
+                                .any(|choice| choice["finish_reason"].is_string())
+                    });
+                native_event
+                    .get("usage")
+                    .and_then(|usage| usage_observation(self.target.wire, usage, terminal))
+            }
+            WireFormat::GoogleGenerateContent => {
+                let terminal = native_event
+                    .get("candidates")
+                    .and_then(Value::as_array)
+                    .is_some_and(|candidates| {
+                        candidates
+                            .iter()
+                            .any(|candidate| candidate["finishReason"].is_string())
+                    });
+                native_event
+                    .get("usageMetadata")
+                    .and_then(|usage| usage_observation(self.target.wire, usage, terminal))
+            }
         }
     }
 }
