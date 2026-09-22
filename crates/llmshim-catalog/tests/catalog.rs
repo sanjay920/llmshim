@@ -340,3 +340,86 @@ fn vendored_artifact_has_broad_coverage_without_changing_discovery() {
     assert_eq!(c.resolve("gpt-6-astra").unwrap().provider, "openai");
     assert!(llmshim_catalog::builtin::all().all(|m| m.family.is_some()));
 }
+
+// ============================================================
+// lookup_id: OpenRouter variant-suffix normalization (MOH-240)
+// ============================================================
+//
+// OpenRouter accepts a routing-hint suffix on a model slug (`:nitro`,
+// `:floor`, `:free`, `:exacto`, `:online`). It is not a distinct model, so a
+// suffixed id has no catalog row of its own unless one was hand-added —
+// `resolve` therefore misses it. `lookup_id` is the metadata-only fallback:
+// family, context window, price and capabilities should come from the base
+// id even when the caller (and the wire) uses a suffixed one.
+
+#[test]
+fn lookup_id_normalizes_a_suffixed_openrouter_id_to_its_base_metadata() {
+    let c = Catalog::vendored();
+    let base = c
+        .resolve("openrouter/deepseek/deepseek-v4.1-flash")
+        .expect("base id is in the vendored snapshot");
+
+    for suffix in [":nitro", ":floor", ":free", ":exacto", ":online"] {
+        let id = format!("openrouter/deepseek/deepseek-v4.1-flash{suffix}");
+        // `resolve` must not be fooled — only `lookup_id` normalizes.
+        assert!(c.resolve(&id).is_none(), "resolve should miss {id}");
+        let looked_up = c
+            .lookup_id(&id)
+            .unwrap_or_else(|| panic!("lookup_id should find {id}"));
+        assert_eq!(looked_up.family, base.family);
+        assert_eq!(looked_up.context_window_tokens, base.context_window_tokens);
+        assert_eq!(looked_up.cost, base.cost);
+        assert_eq!(looked_up.capabilities, base.capabilities);
+    }
+}
+
+#[test]
+fn lookup_id_chains_multiple_openrouter_suffixes() {
+    let c = Catalog::vendored();
+    let base = c
+        .resolve("openrouter/deepseek/deepseek-v4.1-flash")
+        .unwrap();
+    let chained = c
+        .lookup_id("openrouter/deepseek/deepseek-v4.1-flash:free:nitro")
+        .unwrap();
+    assert_eq!(chained.family, base.family);
+}
+
+#[test]
+fn lookup_id_leaves_an_unknown_suffix_unresolved() {
+    let c = Catalog::vendored();
+    // ":beta" is not an OpenRouter routing hint, so this must not silently
+    // fall back to the base model's metadata.
+    assert!(c
+        .lookup_id("openrouter/deepseek/deepseek-v4.1-flash:beta")
+        .is_none());
+}
+
+#[test]
+fn lookup_id_leaves_a_non_openrouter_colon_tag_unresolved() {
+    let c = Catalog::vendored();
+    // An Ollama-style tag: the colon is part of the model's own identity, not
+    // an OpenRouter routing hint, so it must not be stripped.
+    assert!(c.lookup_id("ollama/llama3:8b").is_none());
+    assert_eq!(
+        llmshim_catalog::strip_variant_suffix("llama3:8b"),
+        "llama3:8b"
+    );
+}
+
+#[test]
+fn deepseek_v4_1_flash_openrouter_price_matches_the_corrected_rate() {
+    // Regression for MOH-228: the vendored models.dev snapshot priced this
+    // row at half what OpenRouter actually billed. `data/verified.json`
+    // corrects it (sourced from https://openrouter.ai/api/v1/models,
+    // 2026-09-22); this pins the corrected numbers so a future snapshot
+    // refresh can't silently drop the override.
+    let c = Catalog::vendored();
+    let m = c
+        .resolve("openrouter/deepseek/deepseek-v4.1-flash")
+        .unwrap();
+    let cost = m.cost.unwrap();
+    assert_eq!(cost.input, Some(0.3));
+    assert_eq!(cost.output, Some(1.2));
+    assert_eq!(cost.cache_read, Some(0.006));
+}

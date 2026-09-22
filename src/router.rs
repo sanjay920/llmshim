@@ -306,6 +306,13 @@ impl Router {
             retry_after: None,
         })?;
         let requested = self.aliases.get(model).map(String::as_str).unwrap_or(model);
+        // Deliberately `resolve`, never `lookup_id`: a hit here replaces the
+        // returned model name with the catalog's spelling (`m.name`), and
+        // that name goes straight onto the wire. `lookup_id` would match a
+        // suffixed OpenRouter id (`deepseek/deepseek-v4.1-flash:nitro`)
+        // against its base catalog row and silently drop the `:nitro` from
+        // the outbound request. A suffixed id already falls through to
+        // `parse_model` below, which preserves it — exactly what we want.
         let metadata = crate::catalog::resolve(requested).filter(|m| {
             requested.split_once('/').is_none_or(|(prefix, _)| {
                 prefix == m.provider

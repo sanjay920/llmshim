@@ -98,8 +98,11 @@ pub struct ReplayTarget {
 
 impl ReplayTarget {
     pub fn new(provider: &str, model: &str, wire: WireFormat) -> Self {
-        let family = catalog::resolve(&format!("{provider}/{model}"))
-            .or_else(|| catalog::resolve(model))
+        // `lookup_id` normalizes a known OpenRouter variant suffix (`:nitro`,
+        // `:floor`, …) for this lookup only; `model` itself is stored below
+        // unchanged, since it still has to go out on the wire as given.
+        let family = catalog::lookup_id(&format!("{provider}/{model}"))
+            .or_else(|| catalog::lookup_id(model))
             .and_then(|m| m.family);
         Self {
             provider: provider.into(),

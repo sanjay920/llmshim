@@ -67,7 +67,7 @@ pub(crate) fn validate_request(req: &ChatRequest) -> crate::error::Result<()> {
 /// Release date as a Unix timestamp. The OpenAI list shape types `created` as
 /// an integer, so an undated model reports `0` rather than a null.
 fn released_at(id: &str) -> i64 {
-    crate::catalog::resolve(id)
+    crate::catalog::lookup_id(id)
         .and_then(|info| info.release_date)
         .and_then(|date| date.and_hms_opt(0, 0, 0))
         .map(|at| at.and_utc().timestamp())
