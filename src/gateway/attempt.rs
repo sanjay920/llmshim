@@ -36,6 +36,14 @@ pub(crate) struct TrustedPolicyScope {
     tpm: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     budget: Option<crate::gateway::budget::BudgetPolicySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_spend_floor: Option<LegacySpendFloor>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct LegacySpendFloor {
+    window_index: u64,
+    amount_nanos: u64,
 }
 
 impl TrustedPolicyScope {
@@ -46,7 +54,23 @@ impl TrustedPolicyScope {
             rpm: identity.rpm,
             tpm: identity.tpm,
             budget: crate::gateway::budget::BudgetPolicySnapshot::from_identity(identity),
+            legacy_spend_floor: None,
         }
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn set_legacy_spend_floor(&mut self, window_index: u64, amount_nanos: u64) {
+        if self.budget.is_some() {
+            self.legacy_spend_floor = Some(LegacySpendFloor {
+                window_index,
+                amount_nanos,
+            });
+        }
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn is_current(&self) -> bool {
+        self.version == 1
     }
 }
 
@@ -59,6 +83,7 @@ impl std::fmt::Debug for TrustedPolicyScope {
             .field("rpm", &self.rpm)
             .field("tpm", &self.tpm)
             .field("budget", &self.budget)
+            .field("legacy_spend_floor", &self.legacy_spend_floor)
             .finish()
     }
 }
@@ -997,6 +1022,9 @@ mod redis_rates {
         local reservation = 0
         local budget_total_key = KEYS[5]
         local budget_freeze_key = KEYS[5] .. 'frozen'
+        local legacy_floor_key = KEYS[5] .. 'legacy-floor'
+        local legacy_floor_incoming = -1
+        local legacy_floor_stored = -1
         local budget_ttl = 1
         if budget_enabled then
             local bounded = tonumber(ARGV[20]) == 1
@@ -1010,6 +1038,7 @@ mod redis_rates {
             local window_index = math.floor(epoch_secs / window_secs)
             budget_total_key = KEYS[5] .. window_index
             budget_freeze_key = budget_total_key .. ':frozen'
+            legacy_floor_key = budget_total_key .. ':legacy-floor'
             budget_ttl = math.max(1,
                 ((window_index + 1) * window_secs + retention_secs) * 1000 - now)
             local expired_attempts = redis.call('ZRANGEBYSCORE', KEYS[7], '-inf', now,
@@ -1018,6 +1047,17 @@ mod redis_rates {
                 redis.call('ZREM', KEYS[7], unpack(expired_attempts))
             end
             local current = tonumber(redis.call('GET', budget_total_key)) or 0
+            legacy_floor_stored = tonumber(redis.call('GET', legacy_floor_key)) or 0
+            local legacy_floor_window = tonumber(ARGV[27])
+            legacy_floor_incoming = tonumber(ARGV[28])
+            if legacy_floor_window ~= window_index then
+                legacy_floor_incoming = -1
+            end
+            local legacy_delta = 0
+            if legacy_floor_window == window_index and
+                    legacy_floor_incoming > legacy_floor_stored then
+                legacy_delta = legacy_floor_incoming - legacy_floor_stored
+            end
             if redis.call('EXISTS', KEYS[6]) == 1 then
                 admitted = 0
                 refusal = 4
@@ -1032,7 +1072,12 @@ mod redis_rates {
                 admitted = 0
                 refusal = 3
                 wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
+            elseif legacy_delta > budget_limit or current > budget_limit - legacy_delta then
+                admitted = 0
+                refusal = 3
+                wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
             elseif bounded then
+                current = current + legacy_delta
                 if reservation > budget_limit or current > budget_limit - reservation then
                     admitted = 0
                     refusal = 3
@@ -1040,11 +1085,12 @@ mod redis_rates {
                 else
                     budget_next = current + reservation
                 end
-            elseif current >= budget_limit then
+            elseif current >= budget_limit - legacy_delta then
                 admitted = 0
                 refusal = 3
                 wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
             else
+                current = current + legacy_delta
                 reservation = budget_limit - current
                 budget_next = budget_limit
             end
@@ -1059,6 +1105,9 @@ mod redis_rates {
             end
             if budget_enabled then
                 redis.call('SET', budget_total_key, budget_next, 'PX', budget_ttl)
+                if legacy_floor_incoming > legacy_floor_stored then
+                    redis.call('SET', legacy_floor_key, legacy_floor_incoming, 'PX', budget_ttl)
+                end
                 redis.call('HSET', KEYS[6],
                     'liability', reservation,
                     'bounded', ARGV[20],
@@ -1242,7 +1291,7 @@ mod redis_rates {
             )
         }
 
-        fn budget_total_prefix(scope: &TrustedPolicyScope) -> String {
+        pub(super) fn budget_total_prefix(scope: &TrustedPolicyScope) -> String {
             format!(
                 "llmshim:gw:budget:v1:{}:{}:",
                 scope.tenant_key,
@@ -1365,7 +1414,17 @@ mod redis_rates {
                         .arg(policy.window_secs)
                         .arg(self.retention_secs)
                         .arg(self.max_retained_attempts)
-                        .arg(ACCOUNTING_EXPIRY_CLEANUP_BATCH);
+                        .arg(ACCOUNTING_EXPIRY_CLEANUP_BATCH)
+                        .arg(
+                            scope
+                                .legacy_spend_floor
+                                .map_or(-1_i64, |floor| floor.window_index as i64),
+                        )
+                        .arg(
+                            scope
+                                .legacy_spend_floor
+                                .map_or(0_u64, |floor| floor.amount_nanos),
+                        );
                 }
                 (None, None) => {
                     invocation
@@ -1376,6 +1435,8 @@ mod redis_rates {
                         .arg(1)
                         .arg(1)
                         .arg(0)
+                        .arg(0)
+                        .arg(-1)
                         .arg(0);
                 }
                 _ => return Err(RateRefusal::Unavailable),
@@ -1471,6 +1532,7 @@ mod tests {
             rpm,
             tpm,
             budget: None,
+            legacy_spend_floor: None,
         }
     }
 
@@ -1486,6 +1548,7 @@ mod tests {
                 allow_unpriced: false,
                 valid: true,
             }),
+            legacy_spend_floor: None,
         }
     }
 
@@ -2724,6 +2787,127 @@ mod tests {
             .observe_usage(&tenant, first_attempt, terminal_catalog(1))
             .await
             .is_err());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_legacy_spend_floors_import_deltas_without_forgetting_new_charges() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let provider = format!("attempt-legacy-floor-{namespace}");
+        let index_key = format!("llmshim:test:attempt-index:{namespace}");
+        let first = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            10,
+            60,
+            index_key.clone(),
+        )
+        .unwrap();
+        let second = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            10,
+            60,
+            index_key,
+        )
+        .unwrap();
+        let mut connection = first.connection().await.unwrap();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_secs = 3_600;
+        let window_index = redis_time.0 / window_secs;
+        let mut tenant = budget_scope(&format!("redis-legacy-floor-{namespace}"), 1_000);
+        tenant.budget.as_mut().unwrap().window_secs = window_secs;
+        tenant.set_legacy_spend_floor(window_index, 50);
+
+        let first_attempt = uuid::Uuid::new_v4();
+        first
+            .acquire(&provider, &tenant, 1, first_attempt, Some(quote(20)))
+            .await
+            .unwrap();
+        first
+            .observe_usage(&tenant, first_attempt, terminal_provider(10))
+            .await
+            .unwrap();
+        first
+            .finish(
+                &tenant,
+                first_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+
+        tenant.set_legacy_spend_floor(window_index, 60);
+        let second_attempt = uuid::Uuid::new_v4();
+        second
+            .acquire(&provider, &tenant, 1, second_attempt, Some(quote(20)))
+            .await
+            .unwrap();
+        second
+            .observe_usage(&tenant, second_attempt, terminal_provider(5))
+            .await
+            .unwrap();
+        second
+            .finish(
+                &tenant,
+                second_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+
+        let attempt_key = RedisAttemptRates::budget_attempt_key(&tenant, second_attempt);
+        let total_key: String = connection.hget(&attempt_key, "total_key").await.unwrap();
+        let total: u64 = connection.get(&total_key).await.unwrap();
+        let imported: u64 = connection
+            .get(format!("{total_key}:legacy-floor"))
+            .await
+            .unwrap();
+        assert_eq!(imported, 60);
+        assert_eq!(total, 75);
+
+        let duplicate_attempt = uuid::Uuid::new_v4();
+        second
+            .acquire(&provider, &tenant, 1, duplicate_attempt, Some(quote(1)))
+            .await
+            .unwrap();
+        let total_after_duplicate_floor: u64 = connection.get(&total_key).await.unwrap();
+        assert_eq!(total_after_duplicate_floor, 76);
+
+        let mut refused = budget_scope(&format!("redis-legacy-refused-{namespace}"), 100);
+        refused.budget.as_mut().unwrap().window_secs = window_secs;
+        refused.set_legacy_spend_floor(window_index, 101);
+        assert!(matches!(
+            first
+                .acquire(&provider, &refused, 1, uuid::Uuid::new_v4(), Some(quote(0)),)
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        let refused_total_key = format!(
+            "{}{window_index}",
+            RedisAttemptRates::budget_total_prefix(&refused)
+        );
+        assert!(!connection
+            .exists::<_, bool>(&refused_total_key)
+            .await
+            .unwrap());
+        assert!(!connection
+            .exists::<_, bool>(format!("{refused_total_key}:legacy-floor"))
+            .await
+            .unwrap());
     }
 
     #[cfg(feature = "redis-coordination")]

@@ -285,12 +285,30 @@ claim the same remaining slot. `LLMSHIM_GATEWAY_QUEUE_DEPTH` defaults to 10,000
 waiting jobs per provider; a full queue refuses new work with `503` and
 `Retry-After`.
 
-Drain distributed gateway queues before a rolling upgrade that changes the
-trusted policy envelope. Workers reject older unversioned descriptors rather
-than dispatching them without their originating tenant budget. Deploy the
-bounded accounting index only after draining older workers; pre-index
-tombstones remain conservatively charged until their existing 24-hour expiry,
-but cannot participate in the new shared retained-count admission check.
+Authenticated jobs use a versioned scoped queue, lease, response, completion,
+dead-letter, and reaper namespace. Released workers only watch the legacy
+namespace and cannot lease a new scoped job or move its expired lease. New
+workers also serve the legacy namespace for deliberately trusted custom Rust
+jobs, with one per-provider concurrency limit shared across both protocols.
+They reject an older scoped descriptor found in the legacy queue instead of
+running it without its budget policy.
+
+During an upgrade from the post-charge spend counter, a new authenticated
+origin reads the active legacy `llmshim:spend` value before it queues work. The
+private descriptor carries only the Redis-time window index and a rounded-up
+nano-USD floor, never the raw tenant or bearer. Atomic admission remembers the
+largest imported floor and adds only a later positive delta, separately from
+new reservations and settlements. This preserves known active-window spend
+without double charging repeated imports or forgetting intervening new spend.
+Keep each identity's `budget_window_secs` unchanged through this transition so
+the old and new counters name the same tumbling window.
+
+An origin running released code can still admit and record its own request after
+a new origin takes that point-in-time snapshot. Queue isolation prevents old
+workers from weakening new-origin jobs, but cannot retrofit atomic accounting
+into old ingress. Stop old ingress before claiming one fleet-wide hard cap for
+the rest of the transition window. After old ingress is stopped, queued legacy
+scoped jobs fail closed on new workers; custom unscoped jobs remain compatible.
 
 Do not infer capacity from llmshim's implementation details alone. The
 [README benchmarks](https://github.com/sanjay920/llmshim#benchmarks) are the
