@@ -187,20 +187,28 @@ async fn openrouter_reports_its_own_cost() {
     };
     report("non-stream", &resp);
 
-    // A stream only carries usage when the caller asks for the terminal usage
-    // chunk; llmshim deliberately does not default that. The cost rides on it.
+    // No `stream_options`: measured 2026-09-22, OpenRouter puts usage on the
+    // terminal chunk regardless. The cost rides on it.
     use futures::StreamExt;
-    let mut stream = llmshim::stream(
+    let opened = llmshim::stream(
         &router,
         &json!({
             "model": ACCOUNTING_MODEL,
             "messages": [{"role": "user", "content": "Reply with one short sentence: what is 3+3?"}],
             "max_tokens": 2000,
-            "stream_options": {"include_usage": true},
         }),
     )
-    .await
-    .expect("stream should open");
+    .await;
+    let mut stream = match opened {
+        Ok(s) => s,
+        // Same skip the rest of this file applies: an account without credits
+        // must not fail the suite.
+        Err(e) if e.to_string().contains("402") => {
+            eprintln!("SKIP stream: OpenRouter account lacks credits ({e})");
+            return;
+        }
+        Err(e) => panic!("stream failed to open: {e}"),
+    };
 
     let mut terminal = None;
     while let Some(chunk) = stream.next().await {

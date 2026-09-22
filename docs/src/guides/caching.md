@@ -63,8 +63,9 @@ disagreement at the transport boundary so one counter means one thing.
 
 - `cost_source: "provider"` — the provider reported what it charged for this
   generation and `cost_usd` is that figure, not an estimate. OpenRouter does
-  this (as `usage.cost`); llmshim asks it to by default. It needs no catalog
-  entry, so it answers for aggregator slugs the catalog has never heard of.
+  this (as `usage.cost`), unconditionally and on streams too. It needs no
+  catalog entry, so it answers for aggregator slugs the catalog has never
+  heard of.
 - `cost_source: "catalog"` — computed here from catalog prices, as below.
 
 A reported bill always wins. The catalog product is an estimate *of* that bill,
