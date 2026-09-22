@@ -902,12 +902,7 @@ pub async fn collect(
                 }
                 let delta = &item["delta"];
                 if let Some(text) = delta["content"].as_str() {
-                    if !choice.message["content"].is_string() {
-                        choice.message["content"] = json!("");
-                    }
-                    let mut text_out = choice.message["content"].as_str().unwrap().to_owned();
-                    text_out.push_str(text);
-                    choice.message["content"] = json!(text_out);
+                    crate::streaming::append_string_fragment(&mut choice.message["content"], text);
                 }
                 choice.reasoning.push(delta);
                 if let Some(calls) = delta["tool_calls"].as_array() {
@@ -920,9 +915,10 @@ pub async fn collect(
                         .extend(calls.iter().cloned());
                 }
                 if let Some(refusal) = delta.get("refusal").filter(|v| !v.is_null()) {
-                    let old = choice.message["refusal"].as_str().unwrap_or("");
-                    choice.message["refusal"] =
-                        json!(format!("{old}{}", refusal.as_str().unwrap_or("")));
+                    crate::streaming::append_string_fragment(
+                        &mut choice.message["refusal"],
+                        refusal.as_str().unwrap_or(""),
+                    );
                 }
                 if item["finish_reason"].is_string() {
                     choice.finish = item["finish_reason"].clone();

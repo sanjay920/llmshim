@@ -9,6 +9,13 @@ use crate::{
 };
 use serde_json::Value;
 
+pub(crate) fn append_string_fragment(destination: &mut Value, fragment: &str) {
+    match destination {
+        Value::String(assembled) => assembled.push_str(fragment),
+        destination => *destination = Value::String(fragment.to_owned()),
+    }
+}
+
 pub struct StreamNormalizer {
     target: ReplayTarget,
     tools: ToolStream,
