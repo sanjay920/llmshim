@@ -50,10 +50,14 @@ impl DispatchPolicyContext {
             return Err(refusal);
         }
         Ok(AttemptTracker {
-            context: self.clone(),
-            identity,
-            usage_observed: false,
-            finished: false,
+            shared: Arc::new(AttemptTrackerShared {
+                context: self.clone(),
+                identity,
+                state: std::sync::Mutex::new(AttemptTrackerState {
+                    usage_observed: false,
+                    finished: false,
+                }),
+            }),
         })
     }
 
@@ -418,16 +422,32 @@ impl std::fmt::Display for AttemptPolicyError {
 impl std::error::Error for AttemptPolicyError {}
 
 pub(crate) struct AttemptTracker {
+    shared: Arc<AttemptTrackerShared>,
+}
+
+struct AttemptTrackerShared {
     context: DispatchPolicyContext,
     identity: AttemptIdentity,
+    state: std::sync::Mutex<AttemptTrackerState>,
+}
+
+struct AttemptTrackerState {
     usage_observed: bool,
     finished: bool,
 }
 
+pub(crate) struct AttemptCancellationGuard {
+    shared: Arc<AttemptTrackerShared>,
+}
+
 impl AttemptTracker {
     pub(crate) async fn response_headers(&self, status: u16) -> Result<(), AttemptPolicyError> {
-        self.context
-            .observe(&self.identity, AttemptEvent::ResponseHeaders { status })
+        self.shared
+            .context
+            .observe(
+                &self.shared.identity,
+                AttemptEvent::ResponseHeaders { status },
+            )
             .await
     }
 
@@ -438,18 +458,19 @@ impl AttemptTracker {
         counters_complete: bool,
         explicit_zero: bool,
     ) -> Result<(), AttemptPolicyError> {
-        self.context
+        self.shared
+            .context
             .observe_usage(
-                &self.identity,
+                &self.shared.identity,
                 AttemptUsageObservation::new(usage, terminal, counters_complete, explicit_zero),
             )
             .await?;
-        self.usage_observed = true;
+        self.shared.state.lock().unwrap().usage_observed = true;
         Ok(())
     }
 
     pub(crate) fn accounting(&self, completed: bool) -> AttemptAccounting {
-        if self.usage_observed {
+        if self.shared.state.lock().unwrap().usage_observed {
             AttemptAccounting::UsageObserved
         } else if completed {
             AttemptAccounting::NoUsageReported
@@ -462,32 +483,56 @@ impl AttemptTracker {
         &mut self,
         outcome: AttemptOutcome,
     ) -> Result<(), AttemptPolicyError> {
-        if self.finished {
+        if self.shared.state.lock().unwrap().finished {
             return Ok(());
         }
-        self.context
-            .observe(&self.identity, AttemptEvent::Finished(outcome))
+        self.shared
+            .context
+            .observe(&self.shared.identity, AttemptEvent::Finished(outcome))
             .await?;
-        self.finished = true;
+        self.shared.state.lock().unwrap().finished = true;
         Ok(())
+    }
+
+    pub(crate) fn cancellation_guard(&self) -> AttemptCancellationGuard {
+        AttemptCancellationGuard {
+            shared: self.shared.clone(),
+        }
     }
 }
 
 impl Drop for AttemptTracker {
     fn drop(&mut self) {
-        if self.finished {
+        abandon_attempt(&self.shared);
+    }
+}
+
+impl Drop for AttemptCancellationGuard {
+    fn drop(&mut self) {
+        abandon_attempt(&self.shared);
+    }
+}
+
+fn abandon_attempt(shared: &AttemptTrackerShared) {
+    let outcome = {
+        let mut state = shared.state.lock().unwrap();
+        if state.finished {
             return;
         }
-        let accounting = self.accounting(false);
-        let _ = self.context.policy.observe_abandoned(
-            &self.identity,
-            AttemptOutcome::Abandoned {
-                kind: self.identity.kind,
-                accounting,
+        state.finished = true;
+        AttemptOutcome::Abandoned {
+            kind: shared.identity.kind,
+            accounting: if state.usage_observed {
+                AttemptAccounting::UsageObserved
+            } else {
+                AttemptAccounting::Unknown
             },
-        );
-        self.finished = true;
-    }
+        }
+    };
+    let _ = shared
+        .context
+        .policy
+        .observe_abandoned(&shared.identity, outcome);
 }
 
 fn sanitized_endpoint(endpoint: &str) -> String {
