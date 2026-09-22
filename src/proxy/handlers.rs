@@ -1,7 +1,8 @@
 use super::convert;
 use super::error::ApiError;
+use super::lifetime::{timeout_response, LogicalRequestLifetime};
 use super::types::*;
-use super::{AppState, LogicalPreparationPermit};
+use super::AppState;
 use crate::log::RequestTimer;
 use axum::extract::{Extension, State};
 use axum::response::sse::{Event, Sse};
@@ -23,6 +24,9 @@ fn dispatch_error(error: crate::error::ShimError, overload_wait: std::time::Dura
         } if body == "attempt policy coordinator unavailable" => {
             ApiError::Overloaded(overload_wait)
         }
+        crate::error::ShimError::ProviderError {
+            status: 504, body, ..
+        } if body == "proxy logical request timed out" => ApiError::RequestTimeout,
         _ => ApiError::from(error),
     }
 }
@@ -43,19 +47,35 @@ fn is_attempt_policy_error(error: &crate::error::ShimError) -> bool {
     )
 }
 
+fn is_logical_timeout_error(error: &crate::error::ShimError) -> bool {
+    matches!(
+        error,
+        crate::error::ShimError::ProviderError {
+            status: 504,
+            body,
+            ..
+        } if body == "proxy logical request timed out"
+    )
+}
+
 /// POST /v1/chat — non-streaming completion (or streaming if stream=true)
 pub async fn chat(
     State(state): State<Arc<AppState>>,
-    installed_preparation_permit: Option<Extension<LogicalPreparationPermit>>,
+    logical_lifetime: Option<Extension<LogicalRequestLifetime>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
-    let preparation_permit =
-        preparation_permit(state.as_ref(), installed_preparation_permit).await?;
-    if req.stream {
-        // Delegate to streaming (which runs its own admission control).
-        return Ok(chat_stream_inner(state, req, preparation_permit).await);
+    if logical_lifetime
+        .as_ref()
+        .is_some_and(|Extension(lifetime)| lifetime.select_streaming(req.stream).is_err())
+    {
+        return Ok(timeout_response("/v1/chat"));
     }
-    let _preparation_permit = preparation_permit;
+    let logical_deadline = logical_lifetime
+        .as_ref()
+        .map(|Extension(lifetime)| lifetime.deadline());
+    if req.stream {
+        return Ok(chat_stream_inner(state, req, logical_lifetime).await);
+    }
     let prepared_request = convert::prepare_request(&state.router, &req)?;
     if let Some(fallback_models) = &req.fallback {
         convert::validate_resolvable_fallbacks(
@@ -67,7 +87,11 @@ pub async fn chat(
 
     let timer = RequestTimer::start();
     let value = prepared_request.payload;
-    let policy_context = super::attempt::context(state.limiter.clone(), state.backpressure.clone());
+    let policy_context = super::attempt::context(
+        state.limiter.clone(),
+        state.backpressure.clone(),
+        logical_deadline,
+    );
 
     let result = if let Some(fallback_models) = &req.fallback {
         // Build fallback chain: primary model + fallback models
@@ -118,43 +142,38 @@ pub async fn chat(
 /// POST /v1/chat/stream — always streaming SSE
 pub async fn chat_stream(
     State(state): State<Arc<AppState>>,
-    installed_preparation_permit: Option<Extension<LogicalPreparationPermit>>,
+    logical_lifetime: Option<Extension<LogicalRequestLifetime>>,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    let preparation_permit =
-        match preparation_permit(state.as_ref(), installed_preparation_permit).await {
-            Ok(permit) => permit,
-            Err(error) => return error.into_response(),
-        };
-    chat_stream_inner(state, req, preparation_permit).await
-}
-
-async fn preparation_permit(
-    state: &AppState,
-    installed_permit: Option<Extension<LogicalPreparationPermit>>,
-) -> Result<LogicalPreparationPermit, ApiError> {
-    match installed_permit {
-        Some(Extension(permit)) => Ok(permit),
-        None => LogicalPreparationPermit::acquire(&state.backpressure)
-            .await
-            .map_err(|_| ApiError::Overloaded(state.backpressure.queue_timeout())),
+    if logical_lifetime
+        .as_ref()
+        .is_some_and(|Extension(lifetime)| lifetime.select_streaming(true).is_err())
+    {
+        return timeout_response("/v1/chat/stream");
     }
+    chat_stream_inner(state, req, logical_lifetime).await
 }
 
 async fn chat_stream_inner(
     state: Arc<AppState>,
     req: ChatRequest,
-    preparation_permit: LogicalPreparationPermit,
+    logical_lifetime: Option<Extension<LogicalRequestLifetime>>,
 ) -> Response {
     let prepared_request = match convert::prepare_request(&state.router, &req) {
         Ok(prepared_request) => prepared_request,
         Err(error) => return ApiError::from(error).into_response(),
     };
     let value = prepared_request.payload;
-    let policy_context = super::attempt::context(state.limiter.clone(), state.backpressure.clone());
+    let policy_context = super::attempt::context(
+        state.limiter.clone(),
+        state.backpressure.clone(),
+        logical_lifetime
+            .as_ref()
+            .map(|Extension(lifetime)| lifetime.deadline()),
+    );
     let stream_result = crate::stream_with_policy(&state.router, &value, &policy_context).await;
     if let Err(error) = &stream_result {
-        if is_attempt_policy_error(error) {
+        if is_attempt_policy_error(error) || is_logical_timeout_error(error) {
             return dispatch_error(
                 stream_result.err().expect("matched error"),
                 state.backpressure.queue_timeout(),
@@ -164,7 +183,6 @@ async fn chat_stream_inner(
     }
 
     let event_stream = async_stream::stream! {
-        let _preparation_permit = preparation_permit;
         match stream_result {
             Ok(mut upstream_stream) => {
                 while let Some(chunk) = upstream_stream.next().await {

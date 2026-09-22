@@ -17,12 +17,17 @@ struct ProxyAttemptPolicy {
 pub(crate) fn context(
     limiter: Arc<dyn RateLimiter>,
     backpressure: Backpressure,
+    logical_deadline: Option<tokio::time::Instant>,
 ) -> DispatchPolicyContext {
-    DispatchPolicyContext::new(Arc::new(ProxyAttemptPolicy {
+    let context = DispatchPolicyContext::new(Arc::new(ProxyAttemptPolicy {
         limiter,
         backpressure,
         active_permits: Mutex::new(HashMap::new()),
-    }))
+    }));
+    match logical_deadline {
+        Some(deadline) => context.with_logical_deadline(deadline),
+        None => context,
+    }
 }
 
 impl AttemptPolicy for ProxyAttemptPolicy {
