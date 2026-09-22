@@ -5,7 +5,6 @@ use crate::policy::{
     DispatchPolicyContext, PreparedAttempt,
 };
 use crate::proxy::ratelimit::{penalty_duration, RateLimitConfig};
-use crate::reasoning::WireFormat;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -340,7 +339,7 @@ impl AttemptCoordinator {
                     Some(self.concurrency_wait),
                 )
             })?;
-        let permits = estimate_prepared_attempt_tokens(attempt);
+        let permits = crate::proxy::ratelimit::estimate_attempt_tokens(attempt);
         match self.rates.acquire(provider, scope, permits).await {
             Ok(()) => {
                 self.active_permits
@@ -414,60 +413,6 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
         self.coordinator.release(attempt.id());
         Ok(())
     }
-}
-
-fn estimate_prepared_attempt_tokens(attempt: &PreparedAttempt<'_>) -> u32 {
-    let native_body = attempt.native_body();
-    let prompt_tokens = serde_json::to_string(native_body)
-        .map(|serialized| serialized.len() as u64 / 4)
-        .unwrap_or(u64::MAX);
-    let explicit_output = match attempt.identity().wire() {
-        WireFormat::AnthropicMessages => native_body.get("max_tokens").and_then(|v| v.as_u64()),
-        WireFormat::OpenAiResponses => native_body
-            .get("max_output_tokens")
-            .and_then(|v| v.as_u64()),
-        WireFormat::OpenAiChat => native_body
-            .get("max_completion_tokens")
-            .or_else(|| native_body.get("max_tokens"))
-            .and_then(|v| v.as_u64()),
-        WireFormat::GoogleGenerateContent => native_body
-            .pointer("/generationConfig/maxOutputTokens")
-            .and_then(|v| v.as_u64()),
-    };
-    let reasoning_output = match attempt.identity().wire() {
-        WireFormat::AnthropicMessages => native_body
-            .pointer("/thinking/budget_tokens")
-            .and_then(|v| v.as_u64()),
-        WireFormat::GoogleGenerateContent => native_body
-            .pointer("/generationConfig/thinkingConfig/thinkingBudget")
-            .and_then(|v| v.as_u64()),
-        WireFormat::OpenAiResponses | WireFormat::OpenAiChat => native_body
-            .pointer("/reasoning/max_tokens")
-            .and_then(|v| v.as_u64()),
-    }
-    .unwrap_or_default();
-    let default_output = crate::catalog::resolve(&format!(
-        "{}/{}",
-        attempt.identity().provider_name(),
-        attempt.identity().native_model()
-    ))
-    .or_else(|| crate::catalog::resolve(attempt.identity().native_model()))
-    .and_then(|model| model.max_output_tokens)
-    .map(u64::from)
-    .unwrap_or_else(|| match attempt.identity().provider_name() {
-        "anthropic" => 8_192,
-        "gemini" => 65_536,
-        "openai" | "chatgpt" | "xai" => 128_000,
-        "openrouter" => 1_048_576,
-        _ => 1_024,
-    });
-    prompt_tokens
-        .saturating_add(
-            explicit_output
-                .unwrap_or(default_output)
-                .max(reasoning_output),
-        )
-        .clamp(1, u32::MAX as u64) as u32
 }
 
 #[cfg(feature = "redis-coordination")]
@@ -802,5 +747,26 @@ mod tests {
             .acquire(&RateKey::provider(provider), 1)
             .await
             .is_err());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_redelivery_acquisition_debits_a_new_attempt() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-redelivery-{}", uuid::Uuid::new_v4().simple());
+        let rates =
+            RedisAttemptRates::new(&redis_url, RateLimitConfig::with_global(Some(100), None))
+                .unwrap();
+        let tenant = scope("redelivered-job", Some(2), None);
+
+        assert!(rates.acquire(&provider, &tenant, 1).await.is_ok());
+        assert!(rates.acquire(&provider, &tenant, 1).await.is_ok());
+        assert!(matches!(
+            rates.acquire(&provider, &tenant, 1).await,
+            Err(RateRefusal::Tenant(_))
+        ));
     }
 }

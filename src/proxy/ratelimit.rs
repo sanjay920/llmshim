@@ -802,6 +802,76 @@ pub(crate) fn estimate_prepared_request_tokens(prepared: &PreparedRequest) -> u3
         .clamp(1, u32::MAX as u64) as u32
 }
 
+/// Estimate the final immutable provider-native body seen by the per-attempt
+/// policy hook. This is deliberately separate from logical-request admission:
+/// retries reuse the same prepared body, while repairs and fallback targets
+/// arrive here with their own authoritative wire body and target.
+pub(crate) fn estimate_attempt_tokens(attempt: &crate::policy::PreparedAttempt<'_>) -> u32 {
+    estimate_native_attempt_tokens(
+        attempt.identity().provider_name(),
+        attempt.identity().native_model(),
+        attempt.identity().wire(),
+        attempt.native_body(),
+    )
+}
+
+fn estimate_native_attempt_tokens(
+    provider: &str,
+    model: &str,
+    wire: crate::reasoning::WireFormat,
+    native_body: &serde_json::Value,
+) -> u32 {
+    let prompt_tokens = serde_json::to_string(native_body)
+        .map(|serialized| serialized.len() as u64 / 4)
+        .unwrap_or(u64::MAX);
+    let explicit_output = match wire {
+        crate::reasoning::WireFormat::AnthropicMessages => native_body
+            .get("max_tokens")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::OpenAiResponses => native_body
+            .get("max_output_tokens")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::OpenAiChat => native_body
+            .get("max_completion_tokens")
+            .or_else(|| native_body.get("max_tokens"))
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::GoogleGenerateContent => native_body
+            .pointer("/generationConfig/maxOutputTokens")
+            .and_then(|value| value.as_u64()),
+    };
+    let reasoning_output = match wire {
+        crate::reasoning::WireFormat::AnthropicMessages => native_body
+            .pointer("/thinking/budget_tokens")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::GoogleGenerateContent => native_body
+            .pointer("/generationConfig/thinkingConfig/thinkingBudget")
+            .and_then(|value| value.as_u64()),
+        crate::reasoning::WireFormat::OpenAiResponses
+        | crate::reasoning::WireFormat::OpenAiChat => native_body
+            .pointer("/reasoning/max_tokens")
+            .and_then(|value| value.as_u64()),
+    }
+    .unwrap_or_default();
+    let default_output = crate::catalog::resolve(&format!("{provider}/{model}"))
+        .or_else(|| crate::catalog::resolve(model))
+        .and_then(|model| model.max_output_tokens)
+        .map(u64::from)
+        .unwrap_or_else(|| match provider {
+            "anthropic" => 8_192,
+            "gemini" => 65_536,
+            "openai" | "chatgpt" | "xai" => 128_000,
+            "openrouter" => 1_048_576,
+            _ => 1_024,
+        });
+    prompt_tokens
+        .saturating_add(
+            explicit_output
+                .unwrap_or(default_output)
+                .max(reasoning_output),
+        )
+        .clamp(1, u32::MAX as u64) as u32
+}
+
 fn active_native_prompt_characters(prepared: &PreparedRequest) -> usize {
     let Some(active_namespace) = active_native_namespace(&prepared.target) else {
         return 0;
@@ -1743,6 +1813,48 @@ mod tests {
             }),
         );
         assert_eq!(effective_output_budget(&sglang_responses), 8_000);
+    }
+
+    #[test]
+    fn native_attempt_estimate_uses_authoritative_wire_fields() {
+        let openai = estimate_native_attempt_tokens(
+            "openai",
+            "unknown-test-model",
+            crate::reasoning::WireFormat::OpenAiResponses,
+            &serde_json::json!({
+                "model": "unknown-test-model",
+                "input": "short",
+                "max_output_tokens": 7_000,
+                "max_tokens": 1
+            }),
+        );
+        let anthropic = estimate_native_attempt_tokens(
+            "anthropic",
+            "unknown-test-model",
+            crate::reasoning::WireFormat::AnthropicMessages,
+            &serde_json::json!({
+                "model": "unknown-test-model",
+                "messages": [{"role": "user", "content": "short"}],
+                "max_tokens": 2_000,
+                "thinking": {"budget_tokens": 6_000}
+            }),
+        );
+        let gemini = estimate_native_attempt_tokens(
+            "gemini",
+            "unknown-test-model",
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+            &serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "short"}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 3_000,
+                    "thinkingConfig": {"thinkingBudget": 5_000}
+                }
+            }),
+        );
+
+        assert!(openai >= 7_000);
+        assert!(anthropic >= 6_000);
+        assert!(gemini >= 5_000);
     }
 
     // --- Trait object dispatch ----------------------------------------------
