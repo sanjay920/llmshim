@@ -154,14 +154,20 @@ impl ChatGptAuth {
         let auth_file_override = std::env::var_os("CHATGPT_AUTH_FILE");
         let use_default_path = token_directory_override.is_none() && auth_file_override.is_none();
         let protected_default_root = use_default_path.then(crate::config::config_dir);
-        let dir = token_directory_override
+        let default_token_directory = crate::config::config_dir().join("chatgpt");
+        let token_directory = token_directory_override
             .as_ref()
             .map(PathBuf::from)
-            .unwrap_or_else(|| protected_default_root.as_ref().unwrap().join("chatgpt"));
-        let file = auth_file_override.unwrap_or_else(|| "auth.json".into());
-        let mut auth = Self::new(dir.join(file));
-        auth.protected_default_root = protected_default_root;
-        auth
+            .unwrap_or(default_token_directory);
+        let auth_file = PathBuf::from(auth_file_override.unwrap_or_else(|| "auth.json".into()));
+        let auth_path = if auth_file.is_absolute() {
+            auth_file
+        } else {
+            token_directory.join(auth_file)
+        };
+        let mut chatgpt_auth = Self::new(auth_path);
+        chatgpt_auth.protected_default_root = protected_default_root;
+        chatgpt_auth
     }
 
     pub fn new(path: PathBuf) -> Self {
