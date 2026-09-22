@@ -277,7 +277,8 @@ impl ShimClient {
                     // server's own wait, and a caller with its own backoff
                     // above this client gets to honour it too.
                     let retry_after = parse_retry_after(resp.headers());
-                    let error_body = body::read(resp, self.response_body_limits.error_bytes).await;
+                    let error_body =
+                        body::read_text(resp, self.response_body_limits.error_bytes).await;
                     if let Some(tracker) = attempt_tracker.as_mut() {
                         let accounting = tracker.accounting(false);
                         tracker
@@ -289,9 +290,7 @@ impl ShimClient {
                             .map_err(DispatchFailure::PolicyObservation)?;
                     }
                     let body = match error_body {
-                        Ok(error_body_bytes) => {
-                            String::from_utf8_lossy(&error_body_bytes).into_owned()
-                        }
+                        Ok(error_body_text) => error_body_text,
                         Err(body::BodyReadError::TooLarge) => {
                             return Err(body::BodyReadError::TooLarge.into_dispatch_failure());
                         }

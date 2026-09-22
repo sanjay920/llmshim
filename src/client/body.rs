@@ -78,6 +78,24 @@ pub(super) async fn read_json(
         .map_err(BodyReadError::Http)
 }
 
+pub(super) async fn read_text(
+    response: reqwest::Response,
+    maximum_bytes: usize,
+) -> Result<String, BodyReadError> {
+    let content_type = response.headers().get(http::header::CONTENT_TYPE).cloned();
+    let decoded_body = read(response, maximum_bytes).await?;
+    let mut bounded_response = http::Response::new(decoded_body);
+    if let Some(content_type) = content_type {
+        bounded_response
+            .headers_mut()
+            .insert(http::header::CONTENT_TYPE, content_type);
+    }
+    reqwest::Response::from(bounded_response)
+        .text()
+        .await
+        .map_err(BodyReadError::Http)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +250,33 @@ mod tests {
             .unwrap();
         assert!(matches!(read_json(response, 64).await,
             Err(BodyReadError::Http(error)) if error.is_decode()));
+        response_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_text_preserves_reqwest_character_decoding() {
+        let mut upstream_server = mockito::Server::new_async().await;
+        let response_mock = upstream_server
+            .mock("GET", "/encoded-text")
+            .with_header("content-type", "text/plain; charset=iso-8859-1")
+            .with_body(vec![b'c', b'a', b'f', 0xe9])
+            .expect(2)
+            .create_async()
+            .await;
+        let response_url = format!("{}/encoded-text", upstream_server.url());
+        let http_client = reqwest::Client::new();
+        let original_text = http_client
+            .get(&response_url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let bounded_text = read_text(http_client.get(response_url).send().await.unwrap(), 4)
+            .await
+            .unwrap();
+        assert_eq!(bounded_text, original_text);
         response_mock.assert_async().await;
     }
 
