@@ -81,3 +81,37 @@ fn config_save_replaces_existing_permissive_file_with_private_modes() {
     assert!(config_contents.contains("anthropic = \"test-placeholder\""));
     assert!(config_contents.contains("openai = \"old\""));
 }
+
+#[test]
+fn malformed_config_diagnostic_excludes_source_marker_and_retains_location() {
+    let temporary_home_directory = tempfile::tempdir().unwrap();
+    let config_directory_path = temporary_home_directory.path().join(".llmshim");
+    std::fs::create_dir_all(&config_directory_path).unwrap();
+    let source_marker = "SYNTHETIC_CONFIG_DIAGNOSTIC_MARKER";
+    std::fs::write(
+        config_directory_path.join("config.toml"),
+        format!("[keys]\nopenai = \"{source_marker}\n"),
+    )
+    .unwrap();
+
+    let command_output = Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args(["get", "openai"])
+        .env("HOME", temporary_home_directory.path())
+        .env("LLMSHIM_CATALOG_OFFLINE", "1")
+        .output()
+        .expect("config command should start");
+    let diagnostic = String::from_utf8_lossy(&command_output.stderr);
+    assert!(!diagnostic.contains(source_marker), "{diagnostic}");
+    assert!(!diagnostic.contains("openai ="), "{diagnostic}");
+    assert!(diagnostic.contains(
+        &config_directory_path
+            .join("config.toml")
+            .display()
+            .to_string()
+    ));
+    assert!(
+        diagnostic.contains("TOML configuration error"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("line 2, column "), "{diagnostic}");
+}
