@@ -92,12 +92,29 @@ OpenRouter has its own prices. See the [release notes](https://docs.x.ai/develop
 Grok 4.7 Fast is available in Cursor/Grok Build, not as a public xAI API model.
 
 For OpenRouter, use `openrouter/x-ai/grok-4.7`. You can append `:nitro` and set
-`x-openrouter.provider.zdr = true` together. Nitro prioritizes throughput and
-allows priority endpoints, whose rates can be higher. On `/v1/chat`, put
-`x-openrouter` inside `provider_config`. These routing options do not enforce
-ZDR on an llmshim fallback to a different provider.
-The Nitro route has replay metadata but no fixed catalog price; its
-`cost_usd` remains `null` unless local policy supplies rates.
+`x-openrouter.provider.zdr = true` together. [Nitro](https://openrouter.ai/docs/guides/routing/model-variants/nitro)
+prioritizes throughput and allows priority endpoints, whose rates can be higher.
+[ZDR](https://openrouter.ai/docs/guides/features/zdr) restricts eligible inference
+endpoints to those with a zero-retention policy. On `/v1/chat`, put
+`x-openrouter` inside `provider_config`:
+
+```json
+{
+  "model": "openrouter/x-ai/grok-4.7:nitro",
+  "messages": [{"role": "user", "content": "Reply with only pong."}],
+  "config": {"max_tokens": 1024, "reasoning_effort": "low"},
+  "provider_config": {"x-openrouter": {"provider": {"zdr": true}}}
+}
+```
+
+These routing options do not enforce ZDR on an llmshim fallback to a different
+provider. For throughput sorting without priority endpoints, omit `:nitro` and
+set `x-openrouter.provider.sort` to `"throughput"` alongside `zdr`.
+
+The Nitro route has replay metadata but no fixed catalog price. When OpenRouter
+reports its bill, llmshim uses it for `usage.cost_usd` and sets
+`usage.cost_source` to `"provider"`. Without a reported bill or locally configured
+rates, `cost_usd` remains `null`.
 
 ### ChatGPT subscription
 
