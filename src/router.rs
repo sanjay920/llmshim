@@ -1,5 +1,6 @@
 use crate::breaker::ProviderBreaker;
 use crate::config::Route;
+use crate::credentials::{key_for, EnvironmentOnly, StoredCredentials, CREDENTIALED_PROVIDERS};
 use crate::error::{Result, ShimError};
 use crate::provider::Provider;
 use crate::providers::anthropic::Anthropic;
@@ -221,6 +222,18 @@ impl Router {
     /// no route out should not have to discover `LLMSHIM_CATALOG_OFFLINE` to
     /// stop it. The fetch becomes something the caller asks for.
     pub fn from_env_without_catalog_refresh() -> Self {
+        Self::from_credentials_without_catalog_refresh(&EnvironmentOnly)
+    }
+
+    /// [`Router::from_env_without_catalog_refresh`] with somewhere to fall back to for a
+    /// provider the environment has no key for: an embedder's own saved login
+    /// ([`crate::credentials`]).
+    ///
+    /// The environment still wins, so this only ever registers a provider that would otherwise
+    /// have been absent. `stored` is asked by provider name, never by variable name, so a
+    /// caller holds no provider-specific knowledge — which is the whole reason the seam is here
+    /// rather than in the caller.
+    pub fn from_credentials_without_catalog_refresh(stored: &dyn StoredCredentials) -> Self {
         let mut router = Router::new();
 
         // Named routes are configuration, not discovery: they come from
@@ -232,20 +245,22 @@ impl Router {
             router = router.register("chatgpt", Box::new(ChatGpt::new(chatgpt_auth)));
         }
 
-        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            router = router.register("openai", Box::new(OpenAi::new(key)));
-        }
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            router = router.register("anthropic", Box::new(Anthropic::new(key)));
-        }
-        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
-            router = router.register("gemini", Box::new(Gemini::new(key)));
-        }
-        if let Ok(key) = std::env::var("XAI_API_KEY") {
-            router = router.register("xai", Box::new(Xai::new(key)));
-        }
-        if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
-            router = router.register("openrouter", Box::new(OpenRouter::new(key)));
+        let environment = |name: &str| std::env::var(name).ok();
+        for provider in CREDENTIALED_PROVIDERS {
+            let Some(key) = key_for(provider, &environment, stored) else {
+                continue;
+            };
+            let built: Box<dyn Provider> = match provider {
+                "openai" => Box::new(OpenAi::new(key)),
+                "anthropic" => Box::new(Anthropic::new(key)),
+                "gemini" => Box::new(Gemini::new(key)),
+                "xai" => Box::new(Xai::new(key)),
+                "openrouter" => Box::new(OpenRouter::new(key)),
+                // Unreachable while the list and this match are edited together, and a silent
+                // skip is the right failure: an unbuildable name must not take the router down.
+                _ => continue,
+            };
+            router = router.register(provider, built);
         }
         // Self-hosted OpenAI-compatible servers: the base URL is the config
         // (local vs remote); the API key is optional. Registered only when the
