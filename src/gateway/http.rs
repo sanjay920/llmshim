@@ -870,6 +870,7 @@ pub(crate) fn app_with_origin_policy(
     state: Arc<GatewayState>,
     origin_policy: OriginPolicy,
 ) -> axum::Router {
+    let default_receipt_store = crate::proxy::wire::DefaultReceiptStore::from_env();
     axum::Router::new()
         .route("/v1/chat", post(chat))
         .route("/v1/chat/completions", post(chat))
@@ -883,6 +884,10 @@ pub(crate) fn app_with_origin_policy(
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             native_translate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            default_receipt_store,
+            crate::proxy::wire::install_default_receipt_store,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

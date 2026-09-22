@@ -64,9 +64,34 @@ location or mount a shared durable directory for several server instances. Files
 are written atomically with private permissions; they contain tool-call arguments
 and reasoning/signature metadata, not provider credentials or whole prompts.
 Receipts are scoped to a digest of the inbound credential. Preserve that directory
-and credential when replaying native histories across restarts. There is no
-automatic expiry. Deleting receipts makes their owned tool IDs unavailable; those
-calls fail explicitly. A changed call's arguments cannot reuse an issued receipt.
+and credential when replaying native histories across restarts.
+
+New receipts are retained for 30 days, with limits of 100,000 files and 256 MiB
+of serialized receipt data. The oldest issued receipts are removed first when a
+limit is reached. Configure these trusted-operator limits with
+`LLMSHIM_REPLAY_RECEIPTS_TTL_SECS`, `LLMSHIM_REPLAY_RECEIPTS_MAX_ENTRIES`, and
+`LLMSHIM_REPLAY_RECEIPTS_MAX_BYTES`. Receipt lock acquisition waits at most two
+seconds by default; `LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS` can set a trusted
+operator value from 1 to 30,000 milliseconds. Native HTTP conversion uses two
+bounded blocking slots per application, with at most one used by ingress so a
+completed response always has reserved egress capacity. The ingress and egress
+wait queues are separately capped; excess or timed-out work receives a retryable
+503. Canceled queued work performs no I/O, while a started worker retains its
+capacity until it exits. The journal is capped at 64 MiB; crash recovery can also
+use one fixed receipt staging file of at most 4 MiB and one fixed journal staging
+file of at most 64 MiB.
+
+On first use after an upgrade, llmshim counts existing receipt files once and
+includes them in admission without expiring or deleting them because they have no
+trustworthy issue time. If that bounded pass cannot establish a complete total,
+existing receipts remain readable but new writes fail closed. After raising a
+limit, set `LLMSHIM_REPLAY_RECEIPTS_RESCAN_INCOMPLETE_BASELINE=1` for one explicit
+retry in that process. Managed replacements preserve existing files on disk and
+record that the older value must never resurface after expiry. All processes
+sharing a directory must run a version that participates in the retention lock;
+an older binary can write outside its accounting. Deleting a retained receipt
+makes its owned tool ID unavailable, and the call fails explicitly. A changed
+call's arguments cannot reuse an issued receipt.
 
 Untracked native thinking has no provenance and is dropped. Issued reasoning
 restores its original typed block and still passes through the common family,
