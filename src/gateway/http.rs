@@ -711,6 +711,14 @@ mod native_tests {
     use tower::ServiceExt;
 
     fn configured_state(base_url: &str) -> Arc<GatewayState> {
+        configured_state_with_limits(base_url, None, None)
+    }
+
+    fn configured_state_with_limits(
+        base_url: &str,
+        requests_per_minute: Option<u32>,
+        tokens_per_minute: Option<u32>,
+    ) -> Arc<GatewayState> {
         let router = Arc::new(Router::new().register(
             "local",
             Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
@@ -734,14 +742,14 @@ mod native_tests {
             crate::gateway::auth::Identity {
                 tenant: "test-tenant".into(),
                 tier: 1,
-                rpm: None,
-                tpm: None,
+                rpm: requests_per_minute,
+                tpm: tokens_per_minute,
                 budget_usd: None,
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
             },
         )]);
-        let state = Arc::new(GatewayState {
+        Arc::new(GatewayState {
             router,
             backend: Backend::Local(scheduler),
             keystore: crate::gateway::auth::KeyStore::enforced(keys),
@@ -752,8 +760,48 @@ mod native_tests {
             )),
             idempotency_ttl_secs: 30,
             overloaded_retry_after: config.overloaded_retry_after,
-        });
-        state
+        })
+    }
+
+    #[tokio::test]
+    async fn zero_tenant_quota_rejects_before_upstream_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "unexpected",
+                    "choices": [{"message": {"role": "assistant", "content": "unexpected"}, "finish_reason": "stop"}],
+                    "usage": {}
+                })
+                .to_string(),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        let state = configured_state_with_limits(&server.url(), Some(0), None);
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::from(
+                        json!({
+                            "model": "local/test",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "60");
+        upstream.assert_async().await;
     }
 
     #[tokio::test]

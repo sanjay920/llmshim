@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::Instant;
 
+const ZERO_QUOTA_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 /// A continuously-refilling token bucket (per-minute rate → burst == rate).
 struct Bucket {
     capacity: f64,
@@ -24,17 +26,20 @@ struct Bucket {
 
 impl Bucket {
     fn new(per_minute: u32, now: Instant) -> Self {
-        let cap = (per_minute as f64).max(1.0);
+        let capacity = per_minute as f64;
         Self {
-            capacity: cap,
-            refill_per_sec: (cap / 60.0).max(f64::MIN_POSITIVE),
-            tokens: cap,
+            capacity,
+            refill_per_sec: if capacity > 0.0 { capacity / 60.0 } else { 0.0 },
             last: now,
+            tokens: capacity,
         }
     }
 
     /// Take `want` tokens if available, else report how long until they refill.
     fn take(&mut self, want: f64, now: Instant) -> Result<(), Duration> {
+        if self.capacity == 0.0 {
+            return Err(ZERO_QUOTA_RETRY_AFTER);
+        }
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         self.last = now;
@@ -61,8 +66,9 @@ impl TenantQuota {
         Self::default()
     }
 
-    /// Check a request against the tenant's per-provider quota. A no-op when the
-    /// identity carries no limits (open/dev mode). `Err(retry_after)` when over.
+    /// Check a request against the tenant's per-provider quota. An omitted limit
+    /// is unlimited; an explicit zero denies every request. `Err(retry_after)`
+    /// is returned when a request is denied.
     pub fn check(
         &self,
         tenant: &str,
@@ -73,6 +79,11 @@ impl TenantQuota {
     ) -> Result<(), Duration> {
         if rpm.is_none() && tpm.is_none() {
             return Ok(());
+        }
+        // Check before creating or charging either bucket. A zero tenant limit
+        // is a permanent policy decision, and must not consume another bucket.
+        if rpm == Some(0) || tpm == Some(0) {
+            return Err(ZERO_QUOTA_RETRY_AFTER);
         }
         let now = Instant::now();
         let key = format!("{tenant}:{provider}");
@@ -496,5 +507,16 @@ mod tests {
         );
         // A different tenant has its own bucket.
         assert!(q.check("b", "openai", Some(1), None, 1).is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_limits_deny_without_consuming_other_bucket() {
+        let q = TenantQuota::new();
+
+        assert!(q.check("rpm-zero", "openai", Some(0), Some(1), 1).is_err());
+        assert!(q.check("rpm-zero", "openai", None, Some(1), 1).is_ok());
+
+        assert!(q.check("tpm-zero", "openai", Some(1), Some(0), 1).is_err());
+        assert!(q.check("tpm-zero", "openai", Some(1), None, 1).is_ok());
     }
 }
