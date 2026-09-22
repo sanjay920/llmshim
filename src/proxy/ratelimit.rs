@@ -846,8 +846,12 @@ fn estimate_native_attempt_tokens(
             .and_then(|value| value.as_u64()),
         crate::reasoning::WireFormat::OpenAiChat => native_body
             .get("max_completion_tokens")
-            .or_else(|| native_body.get("max_tokens"))
-            .and_then(|value| value.as_u64()),
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                native_body
+                    .get("max_tokens")
+                    .and_then(serde_json::Value::as_u64)
+            }),
         crate::reasoning::WireFormat::GoogleGenerateContent => {
             native_u64_at_paths(native_body, GEMINI_OUTPUT_TOKEN_PATHS)
         }
@@ -1012,8 +1016,12 @@ fn active_native_prompt_characters(prepared: &PreparedRequest) -> usize {
 fn portable_output_budget(request: &serde_json::Value) -> Option<u64> {
     request
         .get("max_tokens")
-        .or_else(|| request.get("max_completion_tokens"))
         .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            request
+                .get("max_completion_tokens")
+                .and_then(serde_json::Value::as_u64)
+        })
 }
 
 #[cfg(any(feature = "gateway", test))]
@@ -2056,6 +2064,45 @@ mod tests {
                 &gemini_prepared_request.body,
             ),
             gemini_alias_prompt_tokens.saturating_add(21) as u32,
+        );
+    }
+
+    #[test]
+    fn native_chat_output_aliases_skip_null_and_preserve_numeric_precedence() {
+        for (output_controls, expected_output_tokens) in [
+            (
+                serde_json::json!({"max_completion_tokens": null, "max_tokens": 5000}),
+                5000,
+            ),
+            (
+                serde_json::json!({"max_completion_tokens": 5000, "max_tokens": null}),
+                5000,
+            ),
+            (
+                serde_json::json!({"max_completion_tokens": 7, "max_tokens": 5000}),
+                7,
+            ),
+            (
+                serde_json::json!({"max_completion_tokens": 5000, "max_tokens": 7}),
+                5000,
+            ),
+        ] {
+            let serialized_prompt_tokens = output_controls.to_string().len() as u32 / 4;
+            assert_eq!(
+                estimate_native_attempt_tokens(
+                    "local",
+                    "test",
+                    crate::reasoning::WireFormat::OpenAiChat,
+                    &output_controls,
+                ),
+                serialized_prompt_tokens + expected_output_tokens,
+            );
+        }
+        assert_eq!(
+            portable_output_budget(
+                &serde_json::json!({"max_tokens": null, "max_completion_tokens": 5000})
+            ),
+            Some(5000),
         );
     }
 
