@@ -400,9 +400,9 @@ pub struct GatewayConfig {
     /// in-memory path uses `max_wait` for queue residence instead.
     pub request_timeout: Duration,
     /// Distributed mode only: how long a worker may hold a leased job before the
-    /// reaper assumes it crashed and redelivers the job (at-least-once). Streams
-    /// refresh the lease as they run, so set this above your slowest *unary*
-    /// call, not your longest stream.
+    /// reaper assumes it crashed and redelivers the job (at-least-once). A
+    /// fenced heartbeat refreshes the lease throughout preparation, unary work,
+    /// quiet streams, and terminal publication.
     pub lease_timeout: Duration,
     /// Distributed mode only: max delivery attempts before a job is sent to the
     /// dead-letter queue instead of being redelivered (stops a "poison" request
