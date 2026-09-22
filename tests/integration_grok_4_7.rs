@@ -119,7 +119,7 @@ async fn completion_streaming_tools_and_encrypted_replay() {
             while let Some(chunk) = stream.next().await {
                 let chunk: Value = serde_json::from_str(&chunk.unwrap()).unwrap();
                 let delta = &chunk["choices"][0]["delta"];
-                reasoning.push(delta);
+                reasoning.push(delta).unwrap();
                 if let Some(text) = delta["content"].as_str() {
                     content.push_str(text);
                 }
