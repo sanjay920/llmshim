@@ -1959,4 +1959,119 @@ mod native_tests {
         }
         upstream.assert_async().await;
     }
+
+    #[tokio::test]
+    async fn gateway_keeps_responses_history_stateless_after_native_overrides() {
+        let captured_requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let captured_upstream_requests = captured_requests.clone();
+        let mut upstream_server = mockito::Server::new_async().await;
+        let upstream = upstream_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer upstream-test-key")
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let native_request: Value =
+                    serde_json::from_slice(request.body().unwrap()).unwrap();
+                captured_upstream_requests
+                    .lock()
+                    .unwrap()
+                    .push(native_request.clone());
+                let native_response = json!({
+                    "id": "resp_test",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "explicit history only"}]
+                    }],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                });
+                if native_request["stream"] == true {
+                    format!(
+                        "data: {}\n\ndata: {}\n\n",
+                        json!({
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "content_index": 0,
+                            "item_id": "msg_test",
+                            "delta": "explicit history only"
+                        }),
+                        json!({"type": "response.completed", "response": native_response})
+                    )
+                    .into_bytes()
+                } else {
+                    native_response.to_string().into_bytes()
+                }
+            })
+            .expect(12)
+            .create_async()
+            .await;
+        let router = Router::new().register(
+            "openai",
+            Box::new(
+                crate::providers::openai::OpenAi::new("upstream-test-key".into())
+                    .with_base_url(upstream_server.url()),
+            ),
+        );
+        let state = configured_state_with_router(router);
+        let receipt_directory = tempfile::tempdir().unwrap();
+        let receipts = Arc::new(crate::proxy::wire::Receipts::new(
+            receipt_directory.path().to_owned(),
+        ));
+        for (path, streaming) in [
+            ("/v1/chat", false),
+            ("/v1/chat/stream", true),
+            ("/v1/chat/completions", false),
+            ("/v1/chat/completions", true),
+            ("/v1/messages", false),
+            ("/v1/messages", true),
+        ] {
+            for conversation in [json!("conv_other"), json!({"id": "conv_other"})] {
+                let overrides = json!({
+                    "conversation": conversation,
+                    "previous_response_id": "resp_other",
+                    "store": true
+                });
+                let mut request = json!({
+                    "model": "openai/gpt-6-astra",
+                    "messages": [{"role": "user", "content": "explicit history"}],
+                    "stream": streaming
+                });
+                if path == "/v1/chat" || path == "/v1/chat/stream" {
+                    request["config"] = json!({"max_tokens": 32});
+                    request["provider_config"] = json!({"x-openai": overrides});
+                } else {
+                    request["max_tokens"] = json!(32);
+                    request["x-openai"] = overrides;
+                }
+                let response = app(state.clone())
+                    .layer(Extension(receipts.clone()))
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header("content-type", "application/json")
+                            .header("authorization", "Bearer test-key")
+                            .body(Body::from(request.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let response_body = to_bytes(response.into_body(), 16_384).await.unwrap();
+                let response_body = String::from_utf8(response_body.to_vec()).unwrap();
+                assert!(response_body.contains("explicit history only"));
+                assert!(!response_body.contains("event: error"));
+            }
+        }
+        upstream.assert_async().await;
+        let captured_requests = captured_requests.lock().unwrap();
+        assert_eq!(captured_requests.len(), 12);
+        for request in captured_requests.iter() {
+            assert_eq!(request["store"], false);
+            assert!(request.get("previous_response_id").is_none());
+            assert!(request.get("conversation").is_none());
+            assert!(request["input"].to_string().contains("explicit history"));
+        }
+    }
 }
