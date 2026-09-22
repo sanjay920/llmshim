@@ -39,7 +39,8 @@ The shared client retries transport failures and HTTP `429`, `500`, `502`,
 `503`, `504`, and `529`. The default is three retries after the initial
 request—up to four attempts total—with exponential backoff and jitter.
 `Retry-After` and recognized OpenAI or Anthropic reset headers take precedence
-over computed backoff.
+over computed backoff. Invalid reset durations are ignored; oversized finite
+durations saturate safely before the configured cap and jitter are applied.
 
 | Variable | Default | Meaning |
 |---|---:|---|
