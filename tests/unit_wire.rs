@@ -110,6 +110,31 @@ fn encrypted_reasoning_can_cross_inbound_wire_without_losing_original_metadata()
     );
 }
 
+#[test]
+fn native_unary_and_stream_usage_preserve_provider_floor_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Receipts::new(dir.path().to_owned());
+    let mut canonical = canonical();
+    canonical["usage"]["cost_usd"] = json!(1.0);
+    canonical["usage"]["cost_source"] = json!("provider_floor");
+    for wire in [Wire::Messages, Wire::Chat] {
+        let native = response_from_chat(&canonical, wire, &store, "a").unwrap();
+        assert_eq!(native["usage"]["cost_usd"], 1.0);
+        assert_eq!(native["usage"]["cost_source"], "provider_floor");
+        let frames = llmshim::proxy::wire::stream_frames(&native, wire);
+        assert!(frames.iter().any(|(_, data)| {
+            serde_json::from_str::<Value>(data)
+                .ok()
+                .is_some_and(|event| {
+                    event["usage"]["cost_source"] == "provider_floor"
+                        || event
+                            .pointer("/message/usage/cost_source")
+                            .is_some_and(|source| source == "provider_floor")
+                })
+        }));
+    }
+}
+
 async fn post(app: axum::Router, path: &str, body: Value) -> (axum::http::StatusCode, Value) {
     let response = app
         .oneshot(

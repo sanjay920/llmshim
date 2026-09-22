@@ -481,7 +481,7 @@ pub fn response_from_chat(
             exported["reasoning_content"] = json!(crate::reasoning::reasoning_text(message));
             receipts.put(scope, "reasoning", &message_key(&exported), reasoning)?;
         }
-        json!({"id":response["id"],"object":"chat.completion","created":response.get("created").cloned().unwrap_or(json!(chrono::Utc::now().timestamp())),"model":response["model"],"choices":[{"index":0,"message":exported,"finish_reason":finish}],"usage":{"prompt_tokens":usage["input_tokens"],"completion_tokens":usage["output_tokens"],"total_tokens":usage["total_tokens"],"cache_read_tokens":usage["cache_read_tokens"],"cache_write_tokens":usage["cache_write_tokens"],"cost_usd":usage["cost_usd"],"prompt_tokens_details":{"cached_tokens":usage["cache_read_tokens"]}}})
+        json!({"id":response["id"],"object":"chat.completion","created":response.get("created").cloned().unwrap_or(json!(chrono::Utc::now().timestamp())),"model":response["model"],"choices":[{"index":0,"message":exported,"finish_reason":finish}],"usage":{"prompt_tokens":usage["input_tokens"],"completion_tokens":usage["output_tokens"],"total_tokens":usage["total_tokens"],"cache_read_tokens":usage["cache_read_tokens"],"cache_write_tokens":usage["cache_write_tokens"],"cost_usd":usage["cost_usd"],"cost_source":usage["cost_source"],"prompt_tokens_details":{"cached_tokens":usage["cache_read_tokens"]}}})
     } else {
         let mut content = Vec::new();
         for block in message["reasoning"].as_array().into_iter().flatten() {
@@ -507,7 +507,7 @@ pub fn response_from_chat(
             let parsed = call_content(&call)?;
             content.push(json!({"type":"tool_use","id":parsed["id"],"name":parsed["name"],"input":parsed["arguments"]}));
         }
-        json!({"id":response["id"],"type":"message","role":"assistant","model":response["model"],"content":content,"stop_reason":match finish{"tool_calls"=>"tool_use","length"=>"max_tokens","content_filter"=>"refusal",_=>"end_turn"},"stop_sequence":null,"usage":{"input_tokens":usage["input_tokens"],"output_tokens":usage["output_tokens"],"cache_read_input_tokens":usage["cache_read_tokens"],"cache_creation_input_tokens":usage["cache_write_tokens"],"cost_usd":usage["cost_usd"]}})
+        json!({"id":response["id"],"type":"message","role":"assistant","model":response["model"],"content":content,"stop_reason":match finish{"tool_calls"=>"tool_use","length"=>"max_tokens","content_filter"=>"refusal",_=>"end_turn"},"stop_sequence":null,"usage":{"input_tokens":usage["input_tokens"],"output_tokens":usage["output_tokens"],"cache_read_input_tokens":usage["cache_read_tokens"],"cache_creation_input_tokens":usage["cache_write_tokens"],"cost_usd":usage["cost_usd"],"cost_source":usage["cost_source"]}})
     };
     if let Some(served) = response.get("x-llmshim-served-model") {
         out["x-llmshim-served-model"] = served.clone();

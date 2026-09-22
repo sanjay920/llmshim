@@ -15,6 +15,17 @@ use tokio::time::Instant;
 
 const ZERO_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
 const LATE_SETTLEMENT_RETENTION_SECS: u64 = 86_400;
+const DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS: usize = 100_000;
+const ACCOUNTING_EXPIRY_CLEANUP_BATCH: usize = 128;
+#[cfg(feature = "redis-coordination")]
+const REDIS_ACCOUNTING_INDEX_KEY: &str = "llmshim:gw:budget:v1:attempt-index";
+
+fn retained_accounting_attempt_limit() -> usize {
+    std::env::var("LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS)
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct TrustedPolicyScope {
@@ -158,6 +169,8 @@ struct LocalRateState {
     budget_totals: HashMap<BudgetWindowKey, u64>,
     budget_frozen: std::collections::HashSet<BudgetWindowKey>,
     budget_attempts: HashMap<uuid::Uuid, AttemptLiability>,
+    budget_expirations: std::collections::BinaryHeap<std::cmp::Reverse<(u64, uuid::Uuid)>>,
+    budget_window_references: HashMap<BudgetWindowKey, usize>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -181,19 +194,37 @@ struct AttemptLiability {
 
 struct LocalAttemptRates {
     config: RateLimitConfig,
+    max_retained_attempts: usize,
+    retention_secs: u64,
     state: tokio::sync::Mutex<LocalRateState>,
 }
 
 impl LocalAttemptRates {
     fn new(config: RateLimitConfig) -> Self {
+        Self::with_accounting_limits(
+            config,
+            retained_accounting_attempt_limit(),
+            LATE_SETTLEMENT_RETENTION_SECS,
+        )
+    }
+
+    fn with_accounting_limits(
+        config: RateLimitConfig,
+        max_retained_attempts: usize,
+        retention_secs: u64,
+    ) -> Self {
         Self {
             config,
+            max_retained_attempts,
+            retention_secs,
             state: tokio::sync::Mutex::new(LocalRateState {
                 global: Dimensions::default(),
                 tenant: Dimensions::default(),
                 budget_totals: HashMap::new(),
                 budget_frozen: std::collections::HashSet::new(),
                 budget_attempts: HashMap::new(),
+                budget_expirations: std::collections::BinaryHeap::new(),
+                budget_window_references: HashMap::new(),
             }),
         }
     }
@@ -213,6 +244,13 @@ impl LocalAttemptRates {
         let now = Instant::now();
         let now_epoch_secs = test_epoch_secs.unwrap_or_else(epoch_secs);
         purge_expired_budget_state(&mut state, now_epoch_secs);
+        if scope.budget.is_some()
+            && quote.is_some()
+            && (state.budget_attempts.contains_key(&attempt_id)
+                || state.budget_attempts.len() >= self.max_retained_attempts)
+        {
+            return Err(RateRefusal::Unavailable);
+        }
         let mut provider_wait = None;
         let mut tenant_wait = None;
         for wait in [
@@ -256,9 +294,6 @@ impl LocalAttemptRates {
         let budget_commit = match (&scope.budget, quote) {
             (None, None) => None,
             (Some(policy), Some(mut quote)) => {
-                if state.budget_attempts.contains_key(&attempt_id) {
-                    return Err(RateRefusal::Unavailable);
-                }
                 let window_index = now_epoch_secs / policy.window_secs;
                 let window_key = BudgetWindowKey {
                     tenant_key: scope.tenant_key.clone(),
@@ -290,7 +325,7 @@ impl LocalAttemptRates {
                 Some((
                     window_key,
                     quote,
-                    next_window.saturating_add(LATE_SETTLEMENT_RETENTION_SECS),
+                    next_window.saturating_add(self.retention_secs),
                 ))
             }
             _ => return Err(RateRefusal::Unavailable),
@@ -315,6 +350,13 @@ impl LocalAttemptRates {
             *total = total
                 .checked_add(quote.amount_nanos)
                 .ok_or(RateRefusal::Unavailable)?;
+            state
+                .budget_expirations
+                .push(std::cmp::Reverse((expires_at_epoch_secs, attempt_id)));
+            *state
+                .budget_window_references
+                .entry(window_key.clone())
+                .or_insert(0) += 1;
             state.budget_attempts.insert(
                 attempt_id,
                 AttemptLiability {
@@ -346,20 +388,43 @@ fn budget_wait(window_secs: u64, now_epoch_secs: u64) -> Duration {
 }
 
 fn purge_expired_budget_state(state: &mut LocalRateState, now_epoch_secs: u64) {
-    state
-        .budget_attempts
-        .retain(|_, attempt| attempt.expires_at_epoch_secs > now_epoch_secs);
-    let active_windows: std::collections::HashSet<_> = state
-        .budget_attempts
-        .values()
-        .map(|attempt| attempt.window_key.clone())
-        .collect();
-    state
-        .budget_totals
-        .retain(|window, _| active_windows.contains(window));
-    state
-        .budget_frozen
-        .retain(|window| active_windows.contains(window));
+    let mut removed_expirations = 0;
+    while removed_expirations < ACCOUNTING_EXPIRY_CLEANUP_BATCH
+        && state
+            .budget_expirations
+            .peek()
+            .is_some_and(|entry| entry.0 .0 <= now_epoch_secs)
+    {
+        removed_expirations += 1;
+        let std::cmp::Reverse((expires_at, attempt_id)) = state
+            .budget_expirations
+            .pop()
+            .expect("peeked expiry exists");
+        let should_remove = state
+            .budget_attempts
+            .get(&attempt_id)
+            .is_some_and(|attempt| attempt.expires_at_epoch_secs == expires_at);
+        if !should_remove {
+            continue;
+        }
+        let attempt = state
+            .budget_attempts
+            .remove(&attempt_id)
+            .expect("matched attempt exists");
+        let remove_window = match state.budget_window_references.get_mut(&attempt.window_key) {
+            Some(references) if *references > 1 => {
+                *references -= 1;
+                false
+            }
+            Some(_) => true,
+            None => true,
+        };
+        if remove_window {
+            state.budget_window_references.remove(&attempt.window_key);
+            state.budget_totals.remove(&attempt.window_key);
+            state.budget_frozen.remove(&attempt.window_key);
+        }
+    }
 }
 
 fn check_dimension(
@@ -939,14 +1004,24 @@ mod redis_rates {
             reservation = tonumber(ARGV[22])
             local window_secs = tonumber(ARGV[23])
             local retention_secs = tonumber(ARGV[24])
+            local max_retained_attempts = tonumber(ARGV[25])
+            local cleanup_batch = tonumber(ARGV[26])
             local epoch_secs = math.floor(now / 1000)
             local window_index = math.floor(epoch_secs / window_secs)
             budget_total_key = KEYS[5] .. window_index
             budget_freeze_key = budget_total_key .. ':frozen'
             budget_ttl = math.max(1,
                 ((window_index + 1) * window_secs + retention_secs) * 1000 - now)
+            local expired_attempts = redis.call('ZRANGEBYSCORE', KEYS[7], '-inf', now,
+                'LIMIT', 0, cleanup_batch)
+            if #expired_attempts > 0 then
+                redis.call('ZREM', KEYS[7], unpack(expired_attempts))
+            end
             local current = tonumber(redis.call('GET', budget_total_key)) or 0
             if redis.call('EXISTS', KEYS[6]) == 1 then
+                admitted = 0
+                refusal = 4
+            elseif redis.call('ZCARD', KEYS[7]) >= max_retained_attempts then
                 admitted = 0
                 refusal = 4
             elseif redis.call('EXISTS', budget_freeze_key) == 1 then
@@ -995,6 +1070,7 @@ mod redis_rates {
                     'terminal_catalog', -1,
                     'terminal_provider', -1)
                 redis.call('PEXPIRE', KEYS[6], budget_ttl)
+                redis.call('ZADD', KEYS[7], 'NX', now + budget_ttl, KEYS[6])
             end
         end
 
@@ -1109,6 +1185,9 @@ mod redis_rates {
         client: redis::Client,
         connection: OnceCell<ConnectionManager>,
         config: RateLimitConfig,
+        max_retained_attempts: usize,
+        retention_secs: u64,
+        accounting_index_key: String,
         combined_script: redis::Script,
         penalty_script: redis::Script,
         settle_budget_script: redis::Script,
@@ -1116,10 +1195,29 @@ mod redis_rates {
 
     impl RedisAttemptRates {
         pub(super) fn new(url: &str, config: RateLimitConfig) -> redis::RedisResult<Self> {
+            Self::with_accounting_limits(
+                url,
+                config,
+                retained_accounting_attempt_limit(),
+                LATE_SETTLEMENT_RETENTION_SECS,
+                REDIS_ACCOUNTING_INDEX_KEY.to_owned(),
+            )
+        }
+
+        pub(super) fn with_accounting_limits(
+            url: &str,
+            config: RateLimitConfig,
+            max_retained_attempts: usize,
+            retention_secs: u64,
+            accounting_index_key: String,
+        ) -> redis::RedisResult<Self> {
             Ok(Self {
                 client: redis::Client::open(url)?,
                 connection: OnceCell::new(),
                 config,
+                max_retained_attempts,
+                retention_secs,
+                accounting_index_key,
                 combined_script: redis::Script::new(COMBINED_RATE_LUA),
                 penalty_script: redis::Script::new(PENALTY_LUA),
                 settle_budget_script: redis::Script::new(SETTLE_BUDGET_LUA),
@@ -1241,12 +1339,14 @@ mod redis_rates {
                 (Some(_), Some(_)) => {
                     invocation
                         .key(Self::budget_total_prefix(scope))
-                        .key(Self::budget_attempt_key(scope, attempt_id));
+                        .key(Self::budget_attempt_key(scope, attempt_id))
+                        .key(&self.accounting_index_key);
                 }
                 (None, None) => {
                     invocation
                         .key("llmshim:gw:budget:v1:none")
-                        .key(format!("llmshim:gw:budget:v1:none:{attempt_id}"));
+                        .key(format!("llmshim:gw:budget:v1:none:{attempt_id}"))
+                        .key("llmshim:gw:budget:v1:none:index");
                 }
                 _ => return Err(RateRefusal::Unavailable),
             }
@@ -1263,10 +1363,20 @@ mod redis_rates {
                         .arg(policy.limit_nanos)
                         .arg(quote.amount_nanos)
                         .arg(policy.window_secs)
-                        .arg(LATE_SETTLEMENT_RETENTION_SECS);
+                        .arg(self.retention_secs)
+                        .arg(self.max_retained_attempts)
+                        .arg(ACCOUNTING_EXPIRY_CLEANUP_BATCH);
                 }
                 (None, None) => {
-                    invocation.arg(0).arg(0).arg(0).arg(0).arg(1).arg(1);
+                    invocation
+                        .arg(0)
+                        .arg(0)
+                        .arg(0)
+                        .arg(0)
+                        .arg(1)
+                        .arg(1)
+                        .arg(0)
+                        .arg(0);
                 }
                 _ => return Err(RateRefusal::Unavailable),
             }
@@ -1879,6 +1989,12 @@ mod tests {
             .observe_usage(&tenant, correction_attempt, terminal_provider(15))
             .await
             .unwrap();
+        for _ in 0..2 {
+            rates
+                .observe_usage(&tenant, correction_attempt, terminal_catalog(80))
+                .await
+                .unwrap();
+        }
         rates
             .finish(
                 &tenant,
@@ -2094,6 +2210,186 @@ mod tests {
             .budget_attempts
             .get(&old_attempt)
             .is_some_and(|attempt| attempt.finalized));
+    }
+
+    #[tokio::test]
+    async fn local_accounting_capacity_is_bounded_and_refusal_does_not_debit_rates() {
+        let rates = LocalAttemptRates::with_accounting_limits(
+            RateLimitConfig::with_global(Some(3), None),
+            2,
+            1,
+        );
+        let mut tenant = budget_scope("bounded-accounting", 100);
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let first_attempt = uuid::Uuid::new_v4();
+        let second_attempt = uuid::Uuid::new_v4();
+        for attempt_id in [first_attempt, second_attempt] {
+            rates
+                .acquire_at_epoch("provider", &tenant, 1, attempt_id, Some(quote(0)), Some(10))
+                .await
+                .unwrap();
+            rates
+                .observe_usage(&tenant, attempt_id, terminal_catalog(0))
+                .await
+                .unwrap();
+            rates
+                .finish(
+                    &tenant,
+                    attempt_id,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    first_attempt,
+                    Some(quote(0)),
+                    Some(10),
+                )
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(0)),
+                    Some(10),
+                )
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(state.budget_attempts.len(), 2);
+            assert_eq!(state.budget_expirations.len(), 2);
+        }
+
+        let unbudgeted = scope("capacity-rate-proof", None, None);
+        assert!(rates
+            .acquire("provider", &unbudgeted, 1, uuid::Uuid::new_v4(), None,)
+            .await
+            .is_ok());
+        assert!(matches!(
+            rates
+                .acquire("provider", &unbudgeted, 1, uuid::Uuid::new_v4(), None,)
+                .await,
+            Err(RateRefusal::Provider(_))
+        ));
+
+        let replacement = uuid::Uuid::new_v4();
+        assert!(rates
+            .acquire_at_epoch(
+                "replacement-provider",
+                &tenant,
+                1,
+                replacement,
+                Some(quote(0)),
+                Some(12),
+            )
+            .await
+            .is_ok());
+        assert!(rates
+            .observe_usage(&tenant, first_attempt, terminal_catalog(1))
+            .await
+            .is_err());
+        let state = rates.state.lock().await;
+        assert_eq!(state.budget_attempts.len(), 1);
+        assert!(state.budget_attempts.contains_key(&replacement));
+    }
+
+    #[tokio::test]
+    async fn local_expiry_removes_frozen_window_without_accepting_late_callbacks() {
+        let rates = LocalAttemptRates::with_accounting_limits(RateLimitConfig::default(), 2, 1);
+        let mut tenant = budget_scope(
+            "bounded-frozen-accounting",
+            crate::gateway::budget::MAX_EXACT_REDIS_NANOS,
+        );
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let overflowing_attempt = uuid::Uuid::new_v4();
+        let releasing_attempt = uuid::Uuid::new_v4();
+        for attempt_id in [overflowing_attempt, releasing_attempt] {
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    attempt_id,
+                    Some(quote(10)),
+                    Some(20),
+                )
+                .await
+                .unwrap();
+        }
+        rates
+            .observe_usage(
+                &tenant,
+                overflowing_attempt,
+                terminal_provider(crate::gateway::budget::MAX_EXACT_REDIS_NANOS),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, releasing_attempt, terminal_provider(0))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                releasing_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(0)),
+                    Some(20),
+                )
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        let replacement = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                replacement,
+                Some(quote(0)),
+                Some(22),
+            )
+            .await
+            .unwrap();
+        assert!(rates
+            .observe_usage(&tenant, overflowing_attempt, terminal_provider(1))
+            .await
+            .is_err());
+        let state = rates.state.lock().await;
+        assert!(!state
+            .budget_frozen
+            .iter()
+            .any(|window| window.window_index == 20));
+        assert!(state.budget_attempts.contains_key(&replacement));
     }
 
     #[tokio::test]
@@ -2332,6 +2628,194 @@ mod tests {
     #[cfg(feature = "redis-coordination")]
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_accounting_capacity_is_shared_bounded_and_atomic_with_rate_debits() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let provider = format!("attempt-capacity-{namespace}");
+        let index_key = format!("llmshim:test:attempt-index:{namespace}");
+        let config = RateLimitConfig::with_global(Some(3), None);
+        let first = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            config.clone(),
+            2,
+            1,
+            index_key.clone(),
+        )
+        .unwrap();
+        let second =
+            RedisAttemptRates::with_accounting_limits(&redis_url, config, 2, 1, index_key.clone())
+                .unwrap();
+        let mut tenant = budget_scope(&format!("redis-capacity-{namespace}"), 100);
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let first_attempt = uuid::Uuid::new_v4();
+        let second_attempt = uuid::Uuid::new_v4();
+        first
+            .acquire(&provider, &tenant, 1, first_attempt, Some(quote(0)))
+            .await
+            .unwrap();
+        second
+            .acquire(&provider, &tenant, 1, second_attempt, Some(quote(0)))
+            .await
+            .unwrap();
+        for (rates, attempt_id) in [(&first, first_attempt), (&second, second_attempt)] {
+            rates
+                .observe_usage(&tenant, attempt_id, terminal_catalog(0))
+                .await
+                .unwrap();
+            rates
+                .finish(
+                    &tenant,
+                    attempt_id,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            second
+                .acquire(&provider, &tenant, 1, first_attempt, Some(quote(0)))
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        assert!(matches!(
+            first
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(0)),)
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        let mut connection = first.connection().await.unwrap();
+        let retained: usize = connection.zcard(&index_key).await.unwrap();
+        assert_eq!(retained, 2);
+
+        let unbudgeted = scope(&format!("redis-capacity-rate-{namespace}"), None, None);
+        assert!(second
+            .acquire(&provider, &unbudgeted, 1, uuid::Uuid::new_v4(), None,)
+            .await
+            .is_ok());
+        assert!(matches!(
+            first
+                .acquire(&provider, &unbudgeted, 1, uuid::Uuid::new_v4(), None,)
+                .await,
+            Err(RateRefusal::Provider(_))
+        ));
+
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        let replacement = uuid::Uuid::new_v4();
+        second
+            .acquire(
+                &format!("{provider}-replacement"),
+                &tenant,
+                1,
+                replacement,
+                Some(quote(0)),
+            )
+            .await
+            .unwrap();
+        let retained: usize = connection.zcard(&index_key).await.unwrap();
+        assert_eq!(retained, 1);
+        assert!(first
+            .observe_usage(&tenant, first_attempt, terminal_catalog(1))
+            .await
+            .is_err());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_expiry_releases_frozen_capacity_without_accepting_late_callbacks() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let provider = format!("attempt-frozen-capacity-{namespace}");
+        let index_key = format!("llmshim:test:attempt-index:{namespace}");
+        let first = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            2,
+            1,
+            index_key.clone(),
+        )
+        .unwrap();
+        let second = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            2,
+            1,
+            index_key.clone(),
+        )
+        .unwrap();
+        let mut tenant = budget_scope(
+            &format!("redis-frozen-capacity-{namespace}"),
+            crate::gateway::budget::MAX_EXACT_REDIS_NANOS,
+        );
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let overflowing_attempt = uuid::Uuid::new_v4();
+        let releasing_attempt = uuid::Uuid::new_v4();
+        first
+            .acquire(&provider, &tenant, 1, overflowing_attempt, Some(quote(10)))
+            .await
+            .unwrap();
+        second
+            .acquire(&provider, &tenant, 1, releasing_attempt, Some(quote(10)))
+            .await
+            .unwrap();
+        first
+            .observe_usage(
+                &tenant,
+                overflowing_attempt,
+                terminal_provider(crate::gateway::budget::MAX_EXACT_REDIS_NANOS),
+            )
+            .await
+            .unwrap();
+        second
+            .observe_usage(&tenant, releasing_attempt, terminal_provider(0))
+            .await
+            .unwrap();
+        second
+            .finish(
+                &tenant,
+                releasing_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            second
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(0)),)
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        let replacement = uuid::Uuid::new_v4();
+        second
+            .acquire(&provider, &tenant, 1, replacement, Some(quote(0)))
+            .await
+            .unwrap();
+        assert!(first
+            .observe_usage(&tenant, overflowing_attempt, terminal_provider(1))
+            .await
+            .is_err());
+        let mut connection = second.connection().await.unwrap();
+        let retained: usize = connection.zcard(index_key).await.unwrap();
+        assert_eq!(retained, 1);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn redis_failed_settlement_keeps_the_acquired_liability() {
         use redis::AsyncCommands;
 
@@ -2518,6 +3002,12 @@ mod tests {
             .observe_usage(&tenant, attempt_id, terminal_provider(15))
             .await
             .unwrap();
+        for _ in 0..2 {
+            rates
+                .observe_usage(&tenant, attempt_id, terminal_catalog(80))
+                .await
+                .unwrap();
+        }
         rates
             .finish(
                 &tenant,

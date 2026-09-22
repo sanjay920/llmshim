@@ -17,15 +17,21 @@ from __future__ import annotations
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import get_args
 
 import pytest
 
 import llmshim
 from llmshim import _client
+from llmshim.types import CostSource
 
 # Captures the most recent request the mock server received, so tests can
 # assert on exactly what the client serialized and sent.
 CAPTURED: dict = {}
+
+
+def test_cost_source_contract_includes_provider_floor():
+    assert set(get_args(CostSource)) == {"provider", "provider_floor", "catalog"}
 
 
 class _MockHandler(BaseHTTPRequestHandler):
@@ -104,6 +110,8 @@ class _MockHandler(BaseHTTPRequestHandler):
                         "output_tokens": 5,
                         "reasoning_tokens": 3,
                         "total_tokens": 18,
+                        "cost_usd": 1.0,
+                        "cost_source": "provider_floor",
                     },
                     "latency_ms": 42,
                 },
@@ -249,6 +257,8 @@ def test_chat_parses_response():
     assert resp["message"]["content"] == "pong"
     assert resp["reasoning"] == "let me think"
     assert resp["usage"]["total_tokens"] == 18
+    assert resp["usage"]["cost_usd"] == 1.0
+    assert resp["usage"]["cost_source"] == "provider_floor"
     assert resp["latency_ms"] == 42
 
 

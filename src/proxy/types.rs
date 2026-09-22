@@ -119,8 +119,8 @@ pub struct Usage {
     pub total_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
-    /// USD charged for this response. `null` means the catalog carries no price
-    /// for the model at all — it never means free.
+    /// USD accounting for this response. A provider floor is a known lower
+    /// bound; `null` means the cost could not be known and never means free.
     ///
     /// Where a model prices some token classes and not others, the unpriced ones
     /// are charged at its highest published rate, so this is an **upper bound**
