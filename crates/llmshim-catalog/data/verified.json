@@ -1,0 +1,32 @@
+{
+  "xai/grok-4.7": {
+    "name": "Grok 4.7",
+    "family": "grok",
+    "limit": {"context": 500000},
+    "release_date": "2026-09-21",
+    "modalities": {"input": ["text", "image"], "output": ["text"]},
+    "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh"]}],
+    "streaming": true,
+    "forced_tool_choice": true,
+    "cost": {"input": 2, "cache_read": 0.5, "output": 6},
+    "context_cost_tiers": [{"above_input_tokens": 200000, "cost": {"input": 4, "cache_read": 1, "output": 12}}]
+  },
+  "xai/grok-4.6": {
+    "cost": {"input": 2, "cache_read": 0.5, "output": 6},
+    "context_cost_tiers": [{"above_input_tokens": 200000, "cost": {"input": 4, "cache_read": 1, "output": 12}}]
+  },
+  "openrouter/x-ai/grok-4.7": {
+    "name": "Grok 4.7",
+    "family": "grok",
+    "limit": {"context": 500000, "output": 450000},
+    "release_date": "2026-09-21",
+    "modalities": {"input": ["text", "image", "file"], "output": ["text"]},
+    "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh"]}],
+    "reasoning": true,
+    "tool_call": true,
+    "structured_output": true,
+    "forced_tool_choice": true,
+    "cost": {"input": 1.6, "cache_read": 0.4, "output": 4.8},
+    "context_cost_tiers": [{"above_input_tokens": 200000, "cost": {"input": 3.2, "cache_read": 0.8, "output": 9.6}}]
+  }
+}

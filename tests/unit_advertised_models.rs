@@ -11,7 +11,7 @@ const EXPECTED: &[&str] = &[
     "anthropic/claude-haiku-4-5-20251001",
     "gemini/gemini-3.8-flash",
     "gemini/gemini-3.5-flash-lite",
-    "xai/grok-4.6",
+    "xai/grok-4.7",
     "chatgpt/gpt-6-astra",
     "chatgpt/gpt-5.6-sol",
     "chatgpt/gpt-5.6-terra",

@@ -9,6 +9,107 @@ fn feed(value: serde_json::Value) -> String {
 }
 
 #[test]
+fn grok_4_7_is_available_offline_and_4_6_remains_explicit() {
+    let c = Catalog::vendored();
+    for id in ["xai/grok-4.7", "openrouter/x-ai/grok-4.7"] {
+        let m = c.resolve(id).unwrap();
+        assert_eq!(m.family, Some(ModelFamily::Grok));
+        assert_eq!(m.context_window_tokens, Some(500_000));
+        assert_eq!(m.reasoning_options.len(), 1);
+        assert_eq!(m.field_sources["family"], CatalogSource::Builtin);
+        assert!(
+            m.cost_for_input_tokens(200_001).unwrap().input.unwrap()
+                > m.cost.unwrap().input.unwrap()
+        );
+    }
+    assert_eq!(c.resolve("grok-4.7").unwrap().id, "xai/grok-4.7");
+    assert!(llmshim_catalog::builtin::spec("grok-4.6").is_some());
+    assert!(!llmshim_catalog::builtin::MODELS
+        .iter()
+        .any(|m| m.id == "xai/grok-4.6"));
+    assert_eq!(
+        llmshim_catalog::builtin::spec("grok-4.7")
+            .unwrap()
+            .max_output_tokens,
+        None
+    );
+}
+
+#[test]
+fn context_price_tiers_select_by_full_input_and_inherit_missing_rates() {
+    let mut c = Catalog::empty();
+    c.merge_models_dev(
+        &feed(
+            json!({"cost":{"input":2,"output":6,"cache_read":0.5,"tiers":[
+                {"tier":{"type":"context","size":400000},"output":18},
+                {"tier":{"type":"context","size":200000},"input":4,"output":12,"cache_read":1}
+            ]}}),
+        ),
+        None,
+    )
+    .unwrap();
+    let m = c.resolve("test/m").unwrap();
+    assert_eq!(m.cost_for_input_tokens(200_000), m.cost);
+    let long = m.cost_for_input_tokens(200_001).unwrap();
+    assert_eq!(
+        (long.input, long.output, long.cache_read),
+        (Some(4.0), Some(12.0), Some(1.0))
+    );
+    let longer = m.cost_for_input_tokens(400_001).unwrap();
+    assert_eq!((longer.input, longer.output), (Some(4.0), Some(18.0)));
+    let restored: ModelInfo = serde_json::from_value(serde_json::to_value(m).unwrap()).unwrap();
+    assert_eq!(restored.cost_for_input_tokens(400_001), Some(longer));
+}
+
+#[test]
+fn tier_policy_preserves_local_prices_and_ignores_provider_billing() {
+    let mut c = Catalog::vendored();
+    c.merge_local_toml("[models.\"xai/grok-4.7\".cost]\ninput=0.25")
+        .unwrap();
+    c.merge_provider_models(
+        "xai",
+        &json!({"data":[{"id":"grok-4.7","cost":{"input":999},"context_cost_tiers":[]}]}),
+        Utc::now(),
+    )
+    .unwrap();
+    let m = c.resolve("xai/grok-4.7").unwrap();
+    let long = m.cost_for_input_tokens(300_000).unwrap();
+    assert_eq!(long.input, Some(0.25));
+    assert_eq!(long.output, Some(12.0));
+    c.merge_local_toml("[models.\"xai/grok-4.7\"]\ncontext_cost_tiers=[]")
+        .unwrap();
+    c.merge_builtins();
+    assert_eq!(
+        c.resolve("xai/grok-4.7")
+            .unwrap()
+            .cost_for_input_tokens(300_000)
+            .unwrap()
+            .output,
+        Some(6.0)
+    );
+    assert!(c
+        .merge_local_toml("[models.\"xai/grok-4.7\"]\ncontext_cost_tiers=\"bad\"")
+        .is_err());
+}
+
+#[test]
+fn launch_metadata_wins_over_stale_community_data_in_either_order() {
+    for builtins_first in [true, false] {
+        let mut c = Catalog::empty();
+        if builtins_first {
+            c.merge_builtins();
+        }
+        c.merge_models_dev(&json!({"xai":{"models":{"grok-4.7":{"family":"gpt","cost":{"input":99},"context_cost_tiers":[]}}}}).to_string(),None).unwrap();
+        if !builtins_first {
+            c.merge_builtins();
+        }
+        let m = c.resolve("xai/grok-4.7").unwrap();
+        assert_eq!(m.family, Some(ModelFamily::Grok));
+        assert_eq!(m.cost_for_input_tokens(300_000).unwrap().input, Some(4.0));
+    }
+}
+
+#[test]
 fn absent_fields_are_unknown_and_zero_is_a_real_price() {
     let mut catalog = Catalog::empty();
     catalog

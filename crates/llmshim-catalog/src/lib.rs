@@ -165,6 +165,20 @@ impl Catalog {
             model.source = CatalogSource::Builtin;
             self.merge_model(model);
         }
+        // Verified launch-day metadata is separate from the unmodified
+        // models.dev snapshot and does not expand curated discovery.
+        let entries: Value = serde_json::from_str(include_str!("../data/verified.json"))
+            .expect("validated builtin metadata");
+        for (id, value) in entries.as_object().expect("builtin metadata object") {
+            let (provider, name) = id.split_once('/').expect("qualified builtin id");
+            self.merge_model(parse::model_from_value(
+                provider,
+                name,
+                value,
+                CatalogSource::Builtin,
+                None,
+            ));
+        }
     }
 
     pub fn merge_models_dev(
@@ -235,6 +249,9 @@ impl Catalog {
                     ))?;
                 let mut model =
                     parse::model_from_value(provider, name, v, CatalogSource::Local, None);
+                if v.get("context_cost_tiers").is_some() && model.context_cost_tiers.is_none() {
+                    return Err(CatalogError::Invalid("invalid context_cost_tiers"));
+                }
                 if let Some(label) = v["label"].as_str() {
                     model.label = label.into();
                 }

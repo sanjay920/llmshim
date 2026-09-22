@@ -16,7 +16,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 - **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-5.6-sol`, `chatgpt/gpt-5.6-terra`, and `chatgpt/gpt-5.6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
 - **Anthropic:** `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`
 - **Gemini:** `gemini-3.8-flash`, `gemini-3.5-flash-lite`
-- **xAI:** `grok-4.6`
+- **xAI:** `grok-4.7`
 - **OpenRouter:** not enumerated (huge/dynamic catalog) — any `openrouter/<vendor>/<model>` slug routes through, e.g. `openrouter/anthropic/claude-sonnet-5`.
 - **vLLM / SGLang:** not enumerated (self-hosted) — any `vllm/<served-model>` or `sglang/<served-model>` routes through to the configured server, e.g. `sglang/Qwen/Qwen3.6-35B-A3B-FP8`.
 
@@ -72,6 +72,17 @@ boundary (the last place that knows the dispatch target) for completions and
 for whichever stream chunk carries usage; `log.rs`, `proxy::types::Usage`, both
 native facades and the four bundled clients carry it through as a nullable
 field. `null` means unknown, not free.
+
+`ModelInfo.context_cost_tiers` adds context-dependent standard rates without
+changing the public `Cost` struct. `cost_for_input_tokens` includes cached input
+in tier selection; `src/cost.rs` applies the resulting rates to the whole
+response. Local per-field prices outrank lower-source tier rates. Builtin
+launch metadata lives in `crates/llmshim-catalog/data/verified.json`, separate
+from the unmodified models.dev snapshot. Grok 4.7 live regression tests are in
+`tests/integration_grok_4_7.rs`; they use an ephemeral proxy port, configured
+keys, and billed API calls. `none` clamps to `low`; named tool choice must be
+flat on the Responses wire. Preserve encrypted reasoning on both normal and
+streaming tool round trips.
 
 `src/gateway/quota.rs` adds a per-identity dollar cap beside the RPM/TPM
 buckets: `budget_usd` + `budget_window_secs` on an `Identity`, checked before
@@ -321,15 +332,15 @@ accounts exercise enforcement too. The provider handles incompatible
 thinking on a switch to older models; do not infer signatures from text.
 
 `tests/unit_fable.rs` pins these rules. Live checks for Fable 5, Fable 5.1,
-Opus 5, Gemini 3.8 Flash, and Grok 4.6:
+Opus 5, Gemini 3.8 Flash, and Grok 4.7:
 
 ```bash
 cargo test --features proxy --test integration_current_models -- --ignored --nocapture
 ```
 
 The live tests consume API usage and are ignored during offline preflight.
-Gemini 3.8 Flash and Opus 5 already had catalog/adapter support; Grok 4.6 is
-the verified xAI model ID. Keep the ChatGPT four-model allowlist independent.
+Gemini 3.8 Flash and Opus 5 already had catalog/adapter support; Grok 4.7 is
+the current xAI model ID (verified live 2026-09-21); retain Grok 4.6 for explicit routing. Keep the ChatGPT four-model allowlist independent.
 
 Two knobs work across every provider: `reasoning_effort` (`none|low|medium|high|xhigh|max`) and `reasoning_mode` (`standard|pro`). A third, `reasoning_summary` (`auto|none`), controls reasoning-text visibility → Anthropic `thinking.display` (`auto`→`summarized`, the default when `reasoning_effort` is present so newer models like Sonnet 5 / Opus 4.7-4.8 return reasoning text instead of the API-default `omitted`; `none`→`omitted` for lower latency). Applies to both the adaptive and pre-4.6 enabled thinking builders; a caller-supplied `thinking` block bypasses it. Each provider transform maps them to its native dialect, **clamping to the nearest tier the target model accepts** (all boundaries verified live — e.g. `max` is native on OpenAI gpt-5.6 and GPT-6 Astra; Anthropic 4.6 rejects `xhigh` but has `max`; Gemini's enum tops out at `high`; xAI grok-4.20 models reject any reasoning param). `mode: "pro"` is native on OpenAI gpt-5.6/-pro models (`reasoning.mode`), emulated as a one-tier effort bump elsewhere; explicit `none` always wins. Native passthrough (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) bypasses the mapping entirely and always takes precedence. **Full per-provider mapping tables: `docs/src/guides/reasoning.md`** — update it and the pinning tests in `tests/unit_*.rs` together whenever a mapping changes.
 

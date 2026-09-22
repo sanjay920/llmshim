@@ -473,7 +473,7 @@ Standard library only. Full docs: [`clients/ruby/README.md`](clients/ruby/README
 | **OpenAI** | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | Yes (summaries) |
 | **Anthropic** | `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001` | Yes (thinking summaries) |
 | **Google Gemini** | `gemini-3.8-flash`, `gemini-3.5-flash-lite` | Yes (thought summaries) |
-| **xAI** | `grok-4.6` | No (hidden) |
+| **xAI** | `grok-4.7` | No (hidden) |
 
 The CLI and server advertise these current tiers. ChatGPT subscription access
 uses the same four OpenAI models under `chatgpt/`. OpenRouter and self-hosted

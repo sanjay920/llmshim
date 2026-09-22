@@ -104,7 +104,21 @@ pub fn for_target(provider: &str, model: &str) -> Option<Cost> {
 
 /// USD cost of one response's usage, or `None` when it cannot be known.
 pub fn cost_usd(provider: &str, model: &str, usage: &Value) -> Option<f64> {
-    price(usage, &for_target(provider, model)?)
+    let info = crate::catalog::resolve(&format!("{provider}/{model}"))
+        .filter(|m| m.cost.is_some())
+        .or_else(|| crate::catalog::resolve(model))?;
+    // Normalized uncached input excludes reads/writes for every provider.
+    // Tier selection includes them; subtracting cache hits would undercharge
+    // long cached conversations. Legacy usage falls back to its prompt total.
+    let input_tokens = usage
+        .get("uncached_input_tokens")
+        .and_then(Value::as_u64)
+        .map(|n| {
+            n.saturating_add(count(usage, "cache_read_tokens"))
+                .saturating_add(count(usage, "cache_write_tokens"))
+        })
+        .unwrap_or_else(|| count(usage, "prompt_tokens"));
+    price(usage, &info.cost_for_input_tokens(input_tokens)?)
 }
 
 /// Whether this target can be priced at all, asked *before* the request runs.
@@ -158,6 +172,16 @@ pub fn stamp_chunk(provider: &str, model: &str, chunk: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_context_threshold_counts_cached_input_and_reprices_the_whole_response() {
+        for model in ["grok-4.6", "grok-4.7"] {
+            let mut usage = serde_json::json!({"uncached_input_tokens":50_000,"cache_read_tokens":150_000,"completion_tokens":1000});
+            close(cost_usd("xai", model, &usage), 0.1 + 0.075 + 0.006);
+            usage["cache_read_tokens"] = serde_json::json!(150_001);
+            close(cost_usd("xai", model, &usage), 0.2 + 0.150001 + 0.012);
+        }
+    }
     use serde_json::json;
 
     const TOLERANCE: f64 = 1e-12;

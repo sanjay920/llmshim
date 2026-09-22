@@ -18,9 +18,31 @@ input/output modalities, knowledge/release dates, and field-level sources.
 Missing data remains unknown. A date given only as a month is not turned into
 an invented day. Unknown family keys remain absent and must not authorize replay.
 
+`ModelInfo::cost_for_input_tokens(total)` selects context-dependent rates from
+`context_cost_tiers`; `cost` remains the base rates. The total includes cached
+input. A tier applies to the entire request strictly above its threshold, with
+missing rates inherited from the preceding tier. Models.dev `cost.tiers` entries
+whose type is `context` are imported. Local policy can set
+`context_cost_tiers = []` to disable inherited tiers, or use:
+
+```toml
+[[models."xai/grok-4.7".context_cost_tiers]]
+above_input_tokens = 200000
+[models."xai/grok-4.7".context_cost_tiers.cost]
+input = 4.0
+cache_read = 1.0
+output = 12.0
+```
+
+The strongest source replaces the tier list as a whole. Higher-priority base
+price overrides still win per field over lower-priority tier rates. Provider
+discovery cannot supply either base prices or tiers.
+
 The compiled `builtin` module retains the small verified discovery table,
 historical metadata, and the separate ChatGPT subscription allowlist. Catalog
 coverage does not authorize or configure an API route or a subscription model.
+`data/verified.json` supplies sourced launch metadata independently of the
+models.dev snapshot. It does not add models to the curated discovery list.
 
 ## Layers and policy
 

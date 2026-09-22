@@ -261,11 +261,11 @@ pub const MODELS: &[BuiltinModelInfo] = &[
         capabilities: CAPS_STD,
     },
     BuiltinModelInfo {
-        id: "xai/grok-4.6",
+        id: "xai/grok-4.7",
         provider: "xai",
         family: Some(ModelFamily::Grok),
-        name: "grok-4.6",
-        label: "Grok 4.6",
+        name: "grok-4.7",
+        label: "Grok 4.7",
         context_window_tokens: Some(500_000),
         max_output_tokens: None,
         capabilities: CAPS_XAI,
@@ -279,6 +279,16 @@ pub const MODELS: &[BuiltinModelInfo] = &[
 /// Historical metadata remains available to explicit `spec()` lookups without
 /// appearing in discovery or model pickers. Routing is provider-owned.
 const LEGACY_MODELS: &[BuiltinModelInfo] = &[
+    BuiltinModelInfo {
+        id: "xai/grok-4.6",
+        provider: "xai",
+        family: Some(ModelFamily::Grok),
+        name: "grok-4.6",
+        label: "Grok 4.6",
+        context_window_tokens: Some(500_000),
+        max_output_tokens: None,
+        capabilities: CAPS_XAI,
+    },
     BuiltinModelInfo {
         id: "openai/gpt-5.5",
         provider: "openai",
