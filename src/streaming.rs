@@ -9,6 +9,8 @@ use crate::{
 };
 use serde_json::Value;
 
+pub use crate::stream_retention::StreamRetentionLimits;
+
 pub(crate) fn append_string_fragment(destination: &mut Value, fragment: &str) {
     match destination {
         Value::String(assembled) => assembled.push_str(fragment),
@@ -25,33 +27,58 @@ pub struct StreamNormalizer {
     reasoning: crate::reasoning::ReasoningAccumulator,
     observed_integrity: bool,
     active_choices: std::collections::BTreeSet<u64>,
+    seen_choices: std::collections::BTreeSet<u64>,
+    budget: crate::stream_retention::RetainedBudget,
     finished: bool,
 }
+
 impl StreamNormalizer {
     pub fn new(target: ReplayTarget) -> Self {
-        Self {
-            tools: ToolStream::new(target.clone()),
+        Self::with_retention_limits(target, StreamRetentionLimits::default())
+            .expect("valid default stream retention limits")
+    }
+
+    pub fn with_retention_limits(
+        target: ReplayTarget,
+        limits: StreamRetentionLimits,
+    ) -> Result<Self> {
+        let limits = StreamRetentionLimits::new(
+            limits.normalizer_bytes,
+            limits.normalizer_entries,
+            limits.native_usage_bytes,
+            limits.native_usage_entries,
+        )?;
+        let budget = crate::stream_retention::RetainedBudget::new(
+            limits.normalizer_bytes,
+            limits.normalizer_entries,
+        );
+        Ok(Self {
+            tools: ToolStream::with_budget(target.clone(), budget.clone()),
             target,
-            usage: StreamUsage::default(),
+            usage: StreamUsage::with_budget(budget.clone()),
             seen_terminal: false,
             seen_refusal: false,
-            reasoning: crate::reasoning::ReasoningAccumulator::default(),
+            reasoning: crate::reasoning::ReasoningAccumulator::with_budget(budget.clone()),
             observed_integrity: false,
             active_choices: std::collections::BTreeSet::new(),
+            seen_choices: std::collections::BTreeSet::new(),
+            budget,
             finished: false,
-        }
+        })
     }
     pub fn is_finished(&self) -> bool {
         self.finished
     }
     pub(crate) fn abort(&mut self) {
         self.finished = true;
+        self.clear_retained();
     }
 
     pub fn push(&mut self, data: &str) -> Result<Option<String>> {
         let result = self.push_inner(data);
         if result.is_err() {
             self.finished = true;
+            self.clear_retained();
         }
         result
     }
@@ -74,7 +101,7 @@ impl StreamNormalizer {
             return Err(ShimError::Stream("upstream stream failed".into()));
         }
         if self.target.wire == WireFormat::AnthropicMessages {
-            self.usage.ingest("anthropic", &mut native);
+            self.usage.ingest("anthropic", &mut native)?;
         }
         let data = native.to_string();
         let parsed = if self.target.provider == "chatgpt"
@@ -150,19 +177,29 @@ impl StreamNormalizer {
             .enumerate()
         {
             let index = choice["index"].as_u64().unwrap_or(i as u64);
+            if self.seen_choices.insert(index) {
+                self.budget
+                    .reserve(crate::stream_retention::RetainedFootprint::record(0))?;
+            }
             if choice["finish_reason"].is_string() {
                 self.seen_terminal = true;
-                self.active_choices.remove(&index);
-            } else if choice["delta"].as_object().is_some_and(|d| !d.is_empty()) {
-                self.active_choices.insert(index);
+                if self.active_choices.remove(&index) {
+                    self.budget
+                        .release(crate::stream_retention::RetainedFootprint::record(0));
+                }
+            } else if choice["delta"].as_object().is_some_and(|d| !d.is_empty())
+                && self.active_choices.insert(index)
+            {
+                self.budget
+                    .reserve(crate::stream_retention::RetainedFootprint::record(0))?;
             }
         }
         crate::reasoning::bind_response_context(&mut value, &self.target);
         if self.target.wire == WireFormat::AnthropicMessages {
-            self.reasoning.push(&value["choices"][0]["delta"]);
+            self.reasoning.push(&value["choices"][0]["delta"])?;
             if self.seen_terminal && !self.observed_integrity {
                 self.observed_integrity = true;
-                let mut observation = serde_json::json!({"choices":[{"message":{"reasoning":self.reasoning.blocks()}}]});
+                let mut observation = serde_json::json!({"choices":[{"message":{"reasoning":self.reasoning.take_blocks()}}]});
                 crate::providers::anthropic_signature::observe(
                     &mut observation,
                     &self.target.model,
@@ -186,12 +223,59 @@ impl StreamNormalizer {
             return Ok(None);
         }
         self.finished = true;
-        self.tools.finish()?;
+        if let Err(error) = self.tools.finish() {
+            self.clear_retained();
+            return Err(error);
+        }
         if !self.seen_terminal || !self.active_choices.is_empty() {
+            self.clear_retained();
             return Err(ShimError::Stream(
                 "stream ended before a terminal response".into(),
             ));
         }
-        Ok(self.usage.take_terminal())
+        let terminal = self.usage.take_terminal();
+        self.clear_retained();
+        Ok(terminal)
+    }
+
+    fn clear_retained(&mut self) {
+        self.tools.clear();
+        self.usage.clear();
+        self.reasoning.clear();
+        self.active_choices.clear();
+        self.seen_choices.clear();
+        self.budget.reset();
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn retained_state_is_released_immediately_after_budget_failure() {
+        let limits = StreamRetentionLimits::new(768, 64, 4 * 1024, 64).unwrap();
+        let mut stream = StreamNormalizer::with_retention_limits(
+            ReplayTarget::new("openai", "gpt-5.4", WireFormat::OpenAiResponses),
+            limits,
+        )
+        .unwrap();
+        stream
+            .push(&serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"synthetic","name":"read","arguments":""}}).to_string())
+            .unwrap();
+        let error = (0..16)
+            .find_map(|_| {
+                stream
+                    .push(&serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}).to_string())
+                    .err()
+            })
+            .expect("the tiny budget must fail");
+        assert_eq!(
+            error.to_string(),
+            format!("stream error: {}", crate::stream_retention::RETENTION_ERROR)
+        );
+        assert_eq!(stream.budget.retained(), Default::default());
+        assert!(stream.active_choices.is_empty());
+        assert!(stream.seen_choices.is_empty());
     }
 }

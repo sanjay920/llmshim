@@ -361,13 +361,69 @@ pub fn reasoning_text(message: &Value) -> String {
 
 /// Assemble normalized reasoning fragments once. Repeated completed snapshots
 /// replace their part, and signatures/data are never concatenated across parts.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct ReasoningAccumulator {
-    parts: BTreeMap<String, Value>,
+    parts: BTreeMap<String, ReasoningPart>,
     order: Vec<String>,
+    budget: crate::stream_retention::RetainedBudget,
+    retained: crate::stream_retention::RetainedFootprint,
 }
+
+#[derive(Debug)]
+struct ReasoningPart {
+    value: Value,
+    footprint: crate::stream_retention::RetainedFootprint,
+}
+
+impl Default for ReasoningAccumulator {
+    fn default() -> Self {
+        let limits = crate::stream_retention::StreamRetentionLimits::default();
+        Self::with_budget(crate::stream_retention::RetainedBudget::new(
+            limits.normalizer_bytes,
+            limits.normalizer_entries,
+        ))
+    }
+}
+
 impl ReasoningAccumulator {
-    pub fn push(&mut self, message: &Value) {
+    pub(crate) fn with_budget(budget: crate::stream_retention::RetainedBudget) -> Self {
+        Self {
+            parts: BTreeMap::new(),
+            order: Vec::new(),
+            budget,
+            retained: Default::default(),
+        }
+    }
+
+    pub fn with_retention_limits(
+        limits: crate::streaming::StreamRetentionLimits,
+    ) -> crate::error::Result<Self> {
+        let limits = crate::stream_retention::StreamRetentionLimits::new(
+            limits.normalizer_bytes,
+            limits.normalizer_entries,
+            limits.native_usage_bytes,
+            limits.native_usage_entries,
+        )?;
+        Ok(Self::with_budget(
+            crate::stream_retention::RetainedBudget::new(
+                limits.normalizer_bytes,
+                limits.normalizer_entries,
+            ),
+        ))
+    }
+
+    /// Add normalized reasoning fragments, returning a fixed stream error if
+    /// their retained text, opaque data, identities, or metadata exceed the
+    /// per-response state budget.
+    pub fn push(&mut self, message: &Value) -> crate::error::Result<()> {
+        let result = self.push_inner(message);
+        if result.is_err() {
+            self.clear();
+        }
+        result
+    }
+
+    fn push_inner(&mut self, message: &Value) -> crate::error::Result<()> {
         for (position, fragment) in message["reasoning"]
             .as_array()
             .into_iter()
@@ -383,19 +439,50 @@ impl ReasoningAccumulator {
                 (None, Some(index)) => format!("index:{index}"),
                 (None, None) => format!("index:{position}"),
             };
-            if !self.parts.contains_key(&key) {
-                self.order.push(key.clone());
-            }
             if fragment["replace"] == true || !self.parts.contains_key(&key) {
                 let mut snapshot = fragment.clone();
                 if let Some(previous) = self.parts.get(&key) {
-                    snapshot["origin"] = previous["origin"].clone();
+                    snapshot["origin"] = previous.value["origin"].clone();
                 }
-                self.parts.insert(key, snapshot);
-            } else if let Some(block) = self.parts.get_mut(&key) {
-                for field in ["text", "signature", "data"] {
-                    if let Some(text) = fragment[field].as_str() {
-                        crate::streaming::append_string_fragment(&mut block[field], text);
+                let value_footprint = crate::stream_retention::estimate_value(&snapshot)?;
+                if let Some(previous) = self.parts.get(&key) {
+                    self.budget.replace(previous.footprint, value_footprint)?;
+                    replace_footprint(&mut self.retained, previous.footprint, value_footprint);
+                } else {
+                    let key_footprint = crate::stream_retention::RetainedFootprint::record(
+                        key.capacity().saturating_mul(2),
+                    );
+                    let added = key_footprint
+                        .checked_add(value_footprint)
+                        .ok_or_else(crate::stream_retention::retention_error)?;
+                    self.budget.reserve(added)?;
+                    self.retained = self
+                        .retained
+                        .checked_add(added)
+                        .ok_or_else(crate::stream_retention::retention_error)?;
+                    self.order.push(key.clone());
+                }
+                self.parts.insert(
+                    key,
+                    ReasoningPart {
+                        value: snapshot,
+                        footprint: value_footprint,
+                    },
+                );
+            } else if let Some(part) = self.parts.get_mut(&key) {
+                let block = &mut part.value;
+                if let Some(block_object) = block.as_object_mut() {
+                    for field in ["text", "signature", "data"] {
+                        if let Some(text) = fragment[field].as_str() {
+                            append_retained_object_string(
+                                &self.budget,
+                                &mut self.retained,
+                                &mut part.footprint,
+                                block_object,
+                                field,
+                                text,
+                            )?;
+                        }
                     }
                 }
                 if let Some(payload) = fragment.get("payload") {
@@ -409,26 +496,49 @@ impl ReasoningAccumulator {
                                 "text" | "signature" | "data" | "summary" | "thinking"
                             ) && value.is_string()
                             {
-                                crate::streaming::append_string_fragment(
-                                    previous.entry(field.clone()).or_insert(Value::Null),
+                                append_retained_object_string(
+                                    &self.budget,
+                                    &mut self.retained,
+                                    &mut part.footprint,
+                                    previous,
+                                    field,
                                     value.as_str().unwrap(),
-                                );
+                                )?;
                             } else {
-                                previous.insert(field.clone(), value.clone());
+                                replace_retained_value(
+                                    &self.budget,
+                                    &mut self.retained,
+                                    &mut part.footprint,
+                                    previous,
+                                    field,
+                                    value,
+                                )?;
                             }
                         }
                     } else {
-                        block["payload"] = payload.clone();
+                        let block_object = block
+                            .as_object_mut()
+                            .ok_or_else(crate::stream_retention::retention_error)?;
+                        replace_retained_value(
+                            &self.budget,
+                            &mut self.retained,
+                            &mut part.footprint,
+                            block_object,
+                            "payload",
+                            payload,
+                        )?;
                     }
                 }
             }
         }
+        Ok(())
     }
+
     pub fn blocks(&self) -> Vec<Value> {
         self.order
             .iter()
             .filter_map(|key| self.parts.get(key))
-            .cloned()
+            .map(|part| part.value.clone())
             .map(|mut b| {
                 if let Some(obj) = b.as_object_mut() {
                     obj.remove("index");
@@ -443,4 +553,120 @@ impl ReasoningAccumulator {
             })
             .collect()
     }
+
+    pub(crate) fn take_blocks(&mut self) -> Vec<Value> {
+        let blocks = self.blocks();
+        self.clear();
+        blocks
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.parts.clear();
+        self.order.clear();
+        self.budget.release(self.retained);
+        self.retained = Default::default();
+    }
+}
+
+fn append_retained_string(
+    budget: &crate::stream_retention::RetainedBudget,
+    retained: &mut crate::stream_retention::RetainedFootprint,
+    part_footprint: &mut crate::stream_retention::RetainedFootprint,
+    destination: &mut Value,
+    fragment: &str,
+) -> crate::error::Result<()> {
+    let previous = crate::stream_retention::estimate_value(destination)?;
+    match destination {
+        Value::String(assembled) => {
+            assembled
+                .try_reserve(fragment.len())
+                .map_err(|_| crate::stream_retention::retention_error())?;
+            assembled.push_str(fragment);
+        }
+        _ => *destination = Value::String(fragment.to_owned()),
+    }
+    let replacement = crate::stream_retention::estimate_value(destination)?;
+    budget.replace(previous, replacement)?;
+    replace_footprint(retained, previous, replacement);
+    part_footprint.bytes = part_footprint
+        .bytes
+        .saturating_sub(previous.bytes)
+        .saturating_add(replacement.bytes);
+    part_footprint.entries = part_footprint
+        .entries
+        .saturating_sub(previous.entries)
+        .saturating_add(replacement.entries);
+    Ok(())
+}
+
+fn append_retained_object_string(
+    budget: &crate::stream_retention::RetainedBudget,
+    retained: &mut crate::stream_retention::RetainedFootprint,
+    part_footprint: &mut crate::stream_retention::RetainedFootprint,
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    fragment: &str,
+) -> crate::error::Result<()> {
+    if let Some(destination) = object.get_mut(field) {
+        append_retained_string(budget, retained, part_footprint, destination, fragment)
+    } else {
+        replace_retained_value(
+            budget,
+            retained,
+            part_footprint,
+            object,
+            field,
+            &Value::String(fragment.to_owned()),
+        )
+    }
+}
+
+fn replace_retained_value(
+    budget: &crate::stream_retention::RetainedBudget,
+    retained: &mut crate::stream_retention::RetainedFootprint,
+    part_footprint: &mut crate::stream_retention::RetainedFootprint,
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    value: &Value,
+) -> crate::error::Result<()> {
+    let previous = object
+        .get(field)
+        .map(crate::stream_retention::estimate_value)
+        .transpose()?
+        .unwrap_or_default();
+    let mut replacement = crate::stream_retention::estimate_value(value)?;
+    if !object.contains_key(field) {
+        replacement = replacement
+            .checked_add(crate::stream_retention::RetainedFootprint::record(
+                field.len(),
+            ))
+            .ok_or_else(crate::stream_retention::retention_error)?;
+    }
+    budget.replace(previous, replacement)?;
+    replace_footprint(retained, previous, replacement);
+    part_footprint.bytes = part_footprint
+        .bytes
+        .saturating_sub(previous.bytes)
+        .saturating_add(replacement.bytes);
+    part_footprint.entries = part_footprint
+        .entries
+        .saturating_sub(previous.entries)
+        .saturating_add(replacement.entries);
+    object.insert(field.to_owned(), value.clone());
+    Ok(())
+}
+
+fn replace_footprint(
+    retained: &mut crate::stream_retention::RetainedFootprint,
+    previous: crate::stream_retention::RetainedFootprint,
+    replacement: crate::stream_retention::RetainedFootprint,
+) {
+    retained.bytes = retained
+        .bytes
+        .saturating_sub(previous.bytes)
+        .saturating_add(replacement.bytes);
+    retained.entries = retained
+        .entries
+        .saturating_sub(previous.entries)
+        .saturating_add(replacement.entries);
 }
