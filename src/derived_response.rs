@@ -117,7 +117,10 @@ pub(crate) fn origin_footprint(target: &ReplayTarget) -> Option<DerivedFootprint
         .len()
         .checked_add(target.model.len())?
         .checked_add(target.account.as_deref().map(str::len).unwrap_or(0))?;
-    DerivedFootprint::record(size_of::<ReasoningOrigin>())?
+    let container_bytes = 6_usize
+        .checked_mul(64_usize.checked_add(size_of::<Value>())?)?
+        .checked_add("providermodelfamilywirereceived_ataccount".len())?;
+    DerivedFootprint::record(size_of::<ReasoningOrigin>().checked_add(container_bytes)?)?
         .checked_add(DerivedFootprint::strings(string_bytes))
 }
 
