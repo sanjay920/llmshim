@@ -277,14 +277,13 @@ impl GatewayState {
         #[cfg(feature = "redis-coordination")]
         if identity.budget_usd.is_some() {
             if let Backend::Distributed(gateway) = &self.backend {
-                let window_secs = identity
-                    .budget_window_secs
-                    .unwrap_or(crate::gateway::quota::DEFAULT_BUDGET_WINDOW_SECS)
-                    .max(1);
-                let (window_index, amount_nanos) = gateway
-                    .legacy_spend_floor(&identity.tenant, window_secs)
-                    .await?;
-                policy_scope.set_legacy_spend_floor(window_index, amount_nanos);
+                let _ = gateway;
+                self.attempt_coordinator
+                    .retain_legacy_spend_floor(&identity.tenant, &mut policy_scope)
+                    .await
+                    .map_err(|_| {
+                        GatewayError::Upstream("llmshim-coordinator-unavailable".into())
+                    })?;
             }
         }
         Ok(policy_scope)
@@ -1513,7 +1512,181 @@ mod native_tests {
         let value: Value = serde_json::from_str(&serialized).unwrap();
         assert_eq!(value["legacy_spend_floor"]["window_index"], window_index);
         assert_eq!(value["legacy_spend_floor"]["amount_nanos"], 50);
-        let _: i64 = connection.del(legacy_key).await.unwrap();
+        let tenant_key = value["tenant_key"].as_str().unwrap();
+        let known_floor_key = format!(
+            "llmshim:gw:budget:v1:{tenant_key}:{window_secs}:{window_index}:legacy-known-floor"
+        );
+        assert_eq!(
+            connection.get::<_, u64>(&known_floor_key).await.unwrap(),
+            50
+        );
+        let _: i64 = connection
+            .zrem(
+                crate::gateway::attempt::REDIS_ACCOUNTING_INDEX_KEY,
+                &known_floor_key,
+            )
+            .await
+            .unwrap();
+        let _: i64 = connection.del((legacy_key, known_floor_key)).await.unwrap();
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn authenticated_replay_retains_fresh_legacy_floor_without_new_attempt() {
+        use redis::AsyncCommands;
+        use sha2::Digest;
+
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let namespace = uuid::Uuid::new_v4();
+        let tenant = format!("origin-replay-{namespace}");
+        let provider_name = format!("origin-replay-{namespace}");
+        let router = Arc::new(Router::new().register(
+            &provider_name,
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                provider_name.clone(),
+                "http://127.0.0.1:1",
+                None,
+            )),
+        ));
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let config = GatewayConfig::default();
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::redis(
+            &redis_url,
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        )
+        .unwrap();
+        let gateway = crate::gateway::distributed::DistributedGateway::connect_with_coordinator(
+            &redis_url,
+            Arc::new(CountingDispatch {
+                calls: call_count.clone(),
+            }),
+            Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
+                crate::proxy::ratelimit::RateLimitConfig::default(),
+            )),
+            config.clone(),
+            attempt_coordinator.clone(),
+        )
+        .await
+        .unwrap();
+        gateway.spawn_workers(vec![provider_name.clone()]);
+        let identity = crate::gateway::auth::Identity {
+            tenant: tenant.clone(),
+            tier: 1,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(1.0),
+            budget_window_secs: Some(3_600),
+            budget_allow_unpriced: true,
+        };
+        let state = Arc::new(GatewayState {
+            router,
+            backend: Backend::Distributed(gateway.clone()),
+            keystore: crate::gateway::auth::KeyStore::enforced(std::collections::HashMap::from([
+                ("origin-key".into(), identity),
+            ])),
+            attempt_coordinator,
+            idempotency: crate::gateway::idempotency::IdempotencyCache::new(Duration::from_secs(
+                30,
+            )),
+            idempotency_ttl_secs: 30,
+            prequeue_backpressure: Backpressure::new(
+                config.max_concurrency_per_provider,
+                config.max_wait,
+            ),
+            overloaded_retry_after: config.overloaded_retry_after,
+        });
+        let application = app(state);
+        let mut connection = gateway.connection_for_test();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_index = redis_time.0 / 3_600;
+        let legacy_key = format!("llmshim:spend:{tenant}:{window_index}");
+        let model = format!("{provider_name}/test");
+        let idempotency_key = format!("origin-replay-{namespace}");
+
+        let _: () = connection.set(&legacy_key, "0.00000005").await.unwrap();
+        let first_response = application
+            .clone()
+            .oneshot(canonical_request_for_model(
+                "origin-key",
+                &idempotency_key,
+                "same-request",
+                &model,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let tenant_key = format!("{:x}", sha2::Sha256::digest(tenant.as_bytes()));
+        let scoped_members_before_replay: Vec<String> = connection
+            .zrange(crate::gateway::attempt::REDIS_ACCOUNTING_INDEX_KEY, 0, -1)
+            .await
+            .unwrap();
+        let scoped_members_before_replay: Vec<String> = scoped_members_before_replay
+            .into_iter()
+            .filter(|member| member.contains(&tenant_key))
+            .collect();
+        assert_eq!(scoped_members_before_replay.len(), 1);
+
+        let _: () = connection.set(&legacy_key, "0.00000009").await.unwrap();
+        let replay_response = application
+            .oneshot(canonical_request_for_model(
+                "origin-key",
+                &idempotency_key,
+                "same-request",
+                &model,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        assert_eq!(replay_response.headers()["idempotency-replayed"], "true");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let total_key = format!("llmshim:gw:budget:v1:{tenant_key}:3600:{window_index}");
+        assert_eq!(
+            connection
+                .get::<_, u64>(format!("{total_key}:legacy-known-floor"))
+                .await
+                .unwrap(),
+            90
+        );
+        assert!(!connection.exists::<_, bool>(&total_key).await.unwrap());
+        assert!(!connection
+            .exists::<_, bool>(format!("{total_key}:legacy-floor"))
+            .await
+            .unwrap());
+        let scoped_members_after_replay: Vec<String> = connection
+            .zrange(crate::gateway::attempt::REDIS_ACCOUNTING_INDEX_KEY, 0, -1)
+            .await
+            .unwrap();
+        let scoped_members_after_replay: Vec<String> = scoped_members_after_replay
+            .into_iter()
+            .filter(|member| member.contains(&tenant_key))
+            .collect();
+        assert_eq!(scoped_members_after_replay, scoped_members_before_replay);
+
+        for member in scoped_members_after_replay {
+            let _: usize = connection
+                .zrem(crate::gateway::attempt::REDIS_ACCOUNTING_INDEX_KEY, &member)
+                .await
+                .unwrap();
+            let _: i64 = connection.del(member).await.unwrap();
+        }
+        let _: i64 = connection
+            .del((
+                legacy_key,
+                total_key.clone(),
+                format!("{total_key}:legacy-floor"),
+                format!("{total_key}:legacy-known-floor"),
+            ))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

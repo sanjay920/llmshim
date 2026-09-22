@@ -296,18 +296,23 @@ jobs, with one per-provider concurrency limit shared across both protocols.
 They reject an older scoped descriptor found in the legacy queue instead of
 running it without its budget policy.
 
-During an upgrade from the post-charge spend counter, a new authenticated
-origin reads the active legacy `llmshim:spend` value before it queues work. The
-private descriptor carries only the Redis-time window index and a rounded-up
-nano-USD floor, never the raw tenant or bearer. Atomic admission remembers the
-largest known imported floor even when its request is refused. Admission tracks
-the separately applied floor and adds only a later positive delta, alongside
-new reservations and settlements. This preserves known active-window spend
+During an upgrade from the post-charge spend counter, each new authenticated
+origin uses one Redis-time Lua transaction to read the active legacy
+`llmshim:spend` value and retain the largest rounded-up nano-USD floor before
+idempotency lookup, queueing, or any worker refusal. A replay, conflict,
+overloaded or cancelled submission, unpriceable request, semaphore timeout, and
+zero-rate policy therefore cannot forget spend that the origin already saw.
+The private descriptor carries only the Redis-time window index and retained
+nano-USD floor, never the raw tenant or bearer. Worker admission tracks the
+separately applied floor and adds only a later positive delta, alongside new
+reservations and settlements. Origin retention creates no attempt, rate debit,
+aggregate charge, or applied delta. This preserves known active-window spend
 without double charging repeated imports or forgetting intervening new spend.
 Known-floor records share the finite retained-accounting index. If that index
-cannot retain newly learned spend, one fleet freeze marker blocks budgeted work
-until the longest affected window retention expires; stale descriptors cannot
-become admissible merely because the original request was refused.
+cannot retain newly learned spend, the same origin transaction sets one fleet
+freeze marker through the longest affected retention horizon. It remains in
+force if a slot later frees, so a stale descriptor cannot exploit discarded
+knowledge.
 Keep each identity's `budget_window_secs` unchanged through this transition so
 the old and new counters name the same tumbling window.
 

@@ -18,7 +18,7 @@ const LATE_SETTLEMENT_RETENTION_SECS: u64 = 86_400;
 const DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS: usize = 100_000;
 const ACCOUNTING_EXPIRY_CLEANUP_BATCH: usize = 128;
 #[cfg(feature = "redis-coordination")]
-const REDIS_ACCOUNTING_INDEX_KEY: &str = "llmshim:gw:budget:v1:attempt-index";
+pub(crate) const REDIS_ACCOUNTING_INDEX_KEY: &str = "llmshim:gw:budget:v1:attempt-index";
 
 fn retained_accounting_attempt_limit() -> usize {
     std::env::var("LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS")
@@ -98,6 +98,15 @@ enum RateRefusal {
 
 #[async_trait::async_trait]
 trait AttemptRates: Send + Sync {
+    #[cfg(feature = "redis-coordination")]
+    async fn retain_legacy_spend_floor(
+        &self,
+        _tenant: &str,
+        _scope: &TrustedPolicyScope,
+    ) -> Result<LegacySpendFloor, ()> {
+        Err(())
+    }
+
     async fn acquire(
         &self,
         provider: &str,
@@ -726,6 +735,20 @@ impl AttemptCoordinator {
         }))
     }
 
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) async fn retain_legacy_spend_floor(
+        &self,
+        tenant: &str,
+        scope: &mut TrustedPolicyScope,
+    ) -> Result<(), ()> {
+        if scope.budget.is_none() {
+            return Ok(());
+        }
+        let retained_floor = self.rates.retain_legacy_spend_floor(tenant, scope).await?;
+        scope.set_legacy_spend_floor(retained_floor.window_index, retained_floor.amount_nanos);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn unavailable_for_test(
         concurrency_limit: usize,
@@ -973,6 +996,64 @@ mod redis_rates {
     use tokio::sync::OnceCell;
 
     const KEY_TTL_MS: u64 = 3_600_000;
+    const RETAIN_LEGACY_SPEND_FLOOR_LUA: &str = r#"
+        local redis_time = redis.call('TIME')
+        local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+        local window_secs = tonumber(ARGV[1])
+        local retention_secs = tonumber(ARGV[2])
+        local max_retained_attempts = tonumber(ARGV[3])
+        local cleanup_batch = tonumber(ARGV[4])
+        local max_exact = tonumber(ARGV[5])
+        local window_index = math.floor(math.floor(now / 1000) / window_secs)
+        local budget_ttl = math.max(1,
+            ((window_index + 1) * window_secs + retention_secs) * 1000 - now)
+        local legacy_raw = redis.call('GET', KEYS[1] .. window_index)
+        local legacy_usd = 0
+        if legacy_raw ~= false then
+            legacy_usd = tonumber(legacy_raw)
+            if legacy_usd == nil or legacy_usd ~= legacy_usd or legacy_usd < 0 then
+                return {-1, window_index, 0}
+            end
+        end
+        local incoming_floor = max_exact
+        if legacy_usd < max_exact / 1000000000 then
+            incoming_floor = math.ceil(legacy_usd * 1000000000)
+        end
+
+        local expired_members = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now,
+            'LIMIT', 0, cleanup_batch)
+        if #expired_members > 0 then
+            redis.call('ZREM', KEYS[3], unpack(expired_members))
+        end
+
+        local known_floor_key = KEYS[2] .. window_index .. ':legacy-known-floor'
+        local applied_floor_key = KEYS[2] .. window_index .. ':legacy-floor'
+        local applied_floor = tonumber(redis.call('GET', applied_floor_key)) or 0
+        local known_floor = tonumber(redis.call('GET', known_floor_key)) or applied_floor
+        if incoming_floor > known_floor then
+            known_floor = incoming_floor
+        end
+        local floor_is_indexed = redis.call('ZSCORE', KEYS[3], known_floor_key) ~= false
+        if known_floor > 0 and not floor_is_indexed then
+            if redis.call('ZCARD', KEYS[3]) < max_retained_attempts then
+                redis.call('ZADD', KEYS[3], 'NX', now + budget_ttl, known_floor_key)
+                floor_is_indexed = true
+            else
+                local existing_freeze_ttl = redis.call('PTTL', KEYS[4])
+                if existing_freeze_ttl < budget_ttl then
+                    redis.call('SET', KEYS[4], 1, 'PX', budget_ttl)
+                end
+                return {0, window_index, known_floor}
+            end
+        end
+        if known_floor > 0 and floor_is_indexed then
+            redis.call('SET', known_floor_key, known_floor, 'PX', budget_ttl)
+        end
+        if redis.call('EXISTS', KEYS[4]) == 1 then
+            return {0, window_index, known_floor}
+        end
+        return {1, window_index, known_floor}
+    "#;
     const COMBINED_RATE_LUA: &str = r#"
         local redis_time = redis.call('TIME')
         local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
@@ -1268,6 +1349,7 @@ mod redis_rates {
         max_retained_attempts: usize,
         retention_secs: u64,
         accounting_index_key: String,
+        retain_legacy_spend_floor_script: redis::Script,
         combined_script: redis::Script,
         penalty_script: redis::Script,
         settle_budget_script: redis::Script,
@@ -1298,6 +1380,7 @@ mod redis_rates {
                 max_retained_attempts,
                 retention_secs,
                 accounting_index_key,
+                retain_legacy_spend_floor_script: redis::Script::new(RETAIN_LEGACY_SPEND_FLOOR_LUA),
                 combined_script: redis::Script::new(COMBINED_RATE_LUA),
                 penalty_script: redis::Script::new(PENALTY_LUA),
                 settle_budget_script: redis::Script::new(SETTLE_BUDGET_LUA),
@@ -1390,6 +1473,35 @@ mod redis_rates {
 
     #[async_trait::async_trait]
     impl AttemptRates for RedisAttemptRates {
+        async fn retain_legacy_spend_floor(
+            &self,
+            tenant: &str,
+            scope: &TrustedPolicyScope,
+        ) -> Result<LegacySpendFloor, ()> {
+            let policy = scope.budget.as_ref().ok_or(())?;
+            let mut connection = self.connection().await.map_err(|_| ())?;
+            let result: (i64, u64, u64) = self
+                .retain_legacy_spend_floor_script
+                .key(format!("llmshim:spend:{tenant}:"))
+                .key(Self::budget_total_prefix(scope))
+                .key(&self.accounting_index_key)
+                .key(format!("{}:frozen", self.accounting_index_key))
+                .arg(policy.window_secs)
+                .arg(self.retention_secs)
+                .arg(self.max_retained_attempts)
+                .arg(ACCOUNTING_EXPIRY_CLEANUP_BATCH)
+                .arg(crate::gateway::budget::MAX_EXACT_REDIS_NANOS)
+                .invoke_async(&mut connection)
+                .await
+                .map_err(|_| ())?;
+            (result.0 == 1)
+                .then_some(LegacySpendFloor {
+                    window_index: result.1,
+                    amount_nanos: result.2,
+                })
+                .ok_or(())
+        }
+
         async fn acquire(
             &self,
             provider: &str,
@@ -3162,6 +3274,319 @@ mod tests {
             .exists::<_, bool>(format!("{rollover_total_key}:legacy-known-floor"))
             .await
             .unwrap());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_origin_retains_floor_before_worker_refusal_or_abandonment() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let tenant = format!("origin-floor-{namespace}");
+        let provider = format!("origin-floor-{namespace}");
+        let index_key = format!("llmshim:test:origin-floor-index:{namespace}");
+        let rates = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            10,
+            60,
+            index_key.clone(),
+        )
+        .unwrap();
+        let identity = Identity {
+            tenant: tenant.clone(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(0.000_000_1),
+            budget_window_secs: Some(3_600),
+            budget_allow_unpriced: false,
+        };
+        let mut connection = rates.connection().await.unwrap();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_index = redis_time.0 / 3_600;
+        let legacy_key = format!("llmshim:spend:{tenant}:{window_index}");
+
+        let _: () = connection.set(&legacy_key, "0.00000005").await.unwrap();
+        let mut stale_scope = TrustedPolicyScope::from_identity(&identity);
+        let stale_floor = rates
+            .retain_legacy_spend_floor(&tenant, &stale_scope)
+            .await
+            .unwrap();
+        stale_scope.set_legacy_spend_floor(stale_floor.window_index, stale_floor.amount_nanos);
+
+        let _: () = connection.set(&legacy_key, "0.00000009").await.unwrap();
+        let fresh_scope = TrustedPolicyScope::from_identity(&identity);
+        let fresh_floor = rates
+            .retain_legacy_spend_floor(&tenant, &fresh_scope)
+            .await
+            .unwrap();
+        assert_eq!(fresh_floor.amount_nanos, 90);
+        drop(fresh_scope);
+
+        let total_prefix = RedisAttemptRates::budget_total_prefix(&stale_scope);
+        let known_floor_key = format!("{total_prefix}{window_index}:legacy-known-floor");
+        let total_key = format!("{total_prefix}{window_index}");
+        assert_eq!(
+            connection.get::<_, u64>(&known_floor_key).await.unwrap(),
+            90
+        );
+        assert!(!connection.exists::<_, bool>(&total_key).await.unwrap());
+        assert!(!connection
+            .exists::<_, bool>(format!("{total_key}:legacy-floor"))
+            .await
+            .unwrap());
+        assert!(matches!(
+            rates
+                .acquire(
+                    &provider,
+                    &stale_scope,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(20)),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert!(!connection.exists::<_, bool>(&total_key).await.unwrap());
+        assert!(!connection
+            .exists::<_, bool>(format!("{total_key}:legacy-floor"))
+            .await
+            .unwrap());
+
+        let _: () = connection.set(&legacy_key, "0.000000095").await.unwrap();
+        let mut zero_rate_identity = identity.clone();
+        zero_rate_identity.rpm = Some(0);
+        let zero_rate_scope = TrustedPolicyScope::from_identity(&zero_rate_identity);
+        let zero_rate_floor = rates
+            .retain_legacy_spend_floor(&tenant, &zero_rate_scope)
+            .await
+            .unwrap();
+        assert_eq!(zero_rate_floor.amount_nanos, 95);
+        assert!(matches!(
+            rates
+                .acquire(
+                    &provider,
+                    &zero_rate_scope,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(0)),
+                )
+                .await,
+            Err(RateRefusal::Tenant(_))
+        ));
+        assert!(matches!(
+            rates
+                .acquire(
+                    &format!("{provider}-stale"),
+                    &stale_scope,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(10)),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+
+        let _: () = connection.set(&legacy_key, "not-a-number").await.unwrap();
+        assert!(rates
+            .retain_legacy_spend_floor(&tenant, &TrustedPolicyScope::from_identity(&identity))
+            .await
+            .is_err());
+        assert_eq!(
+            connection.get::<_, u64>(&known_floor_key).await.unwrap(),
+            95
+        );
+
+        let _: i64 = connection
+            .del((legacy_key, known_floor_key, index_key))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_origin_rollover_does_not_carry_an_old_window_floor_forward() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let tenant = format!("origin-rollover-{namespace}");
+        let index_key = format!("llmshim:test:origin-rollover-index:{namespace}");
+        let rates = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            10,
+            1,
+            index_key.clone(),
+        )
+        .unwrap();
+        let identity = Identity {
+            tenant: tenant.clone(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(0.000_000_1),
+            budget_window_secs: Some(1),
+            budget_allow_unpriced: false,
+        };
+        let scope = TrustedPolicyScope::from_identity(&identity);
+        let mut connection = rates.connection().await.unwrap();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let old_window = redis_time.0;
+        let old_legacy_key = format!("llmshim:spend:{tenant}:{old_window}");
+        let _: () = connection.set(&old_legacy_key, "0.00000009").await.unwrap();
+        let old_floor = rates
+            .retain_legacy_spend_floor(&tenant, &scope)
+            .await
+            .unwrap();
+        assert_eq!(old_floor.amount_nanos, 90);
+
+        let new_window = loop {
+            let redis_time: (u64, u64) = redis::cmd("TIME")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            if redis_time.0 > old_window {
+                break redis_time.0;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let new_floor = rates
+            .retain_legacy_spend_floor(&tenant, &scope)
+            .await
+            .unwrap();
+        assert_eq!(new_floor.window_index, new_window);
+        assert_eq!(new_floor.amount_nanos, 0);
+        let old_known_key = format!(
+            "{}{old_window}:legacy-known-floor",
+            RedisAttemptRates::budget_total_prefix(&scope)
+        );
+        let new_known_key = format!(
+            "{}{new_window}:legacy-known-floor",
+            RedisAttemptRates::budget_total_prefix(&scope)
+        );
+        assert_eq!(connection.get::<_, u64>(&old_known_key).await.unwrap(), 90);
+        assert!(!connection.exists::<_, bool>(&new_known_key).await.unwrap());
+
+        let _: i64 = connection
+            .del((old_legacy_key, old_known_key, new_known_key, index_key))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_origin_capacity_failure_freezes_after_the_slot_is_freed() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let index_key = format!("llmshim:test:origin-capacity-index:{namespace}");
+        let freeze_key = format!("{index_key}:frozen");
+        let rates = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            1,
+            60,
+            index_key.clone(),
+        )
+        .unwrap();
+        let mut connection = rates.connection().await.unwrap();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_index = redis_time.0 / 3_600;
+        let identity_for = |tenant: String| Identity {
+            tenant,
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(0.000_000_1),
+            budget_window_secs: Some(3_600),
+            budget_allow_unpriced: false,
+        };
+        let blocked_identity = identity_for(format!("origin-blocked-{namespace}"));
+        let blocked_legacy_key =
+            format!("llmshim:spend:{}:{window_index}", blocked_identity.tenant);
+        let _: () = connection.set(&blocked_legacy_key, "0.0").await.unwrap();
+        let mut stale_scope = TrustedPolicyScope::from_identity(&blocked_identity);
+        let stale_floor = rates
+            .retain_legacy_spend_floor(&blocked_identity.tenant, &stale_scope)
+            .await
+            .unwrap();
+        stale_scope.set_legacy_spend_floor(stale_floor.window_index, stale_floor.amount_nanos);
+
+        let filler_identity = identity_for(format!("origin-filler-{namespace}"));
+        let filler_legacy_key = format!("llmshim:spend:{}:{window_index}", filler_identity.tenant);
+        let _: () = connection
+            .set(&filler_legacy_key, "0.000000001")
+            .await
+            .unwrap();
+        let filler_scope = TrustedPolicyScope::from_identity(&filler_identity);
+        rates
+            .retain_legacy_spend_floor(&filler_identity.tenant, &filler_scope)
+            .await
+            .unwrap();
+        let filler_known_key = format!(
+            "{}{window_index}:legacy-known-floor",
+            RedisAttemptRates::budget_total_prefix(&filler_scope)
+        );
+
+        let _: () = connection
+            .set(&blocked_legacy_key, "0.00000009")
+            .await
+            .unwrap();
+        let fresh_scope = TrustedPolicyScope::from_identity(&blocked_identity);
+        assert!(rates
+            .retain_legacy_spend_floor(&blocked_identity.tenant, &fresh_scope)
+            .await
+            .is_err());
+        assert!(connection.exists::<_, bool>(&freeze_key).await.unwrap());
+        let _: usize = connection
+            .zrem(&index_key, &filler_known_key)
+            .await
+            .unwrap();
+        assert!(matches!(
+            rates
+                .acquire(
+                    &format!("origin-capacity-{namespace}"),
+                    &stale_scope,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(20)),
+                )
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+
+        let _: i64 = connection
+            .del((
+                blocked_legacy_key,
+                filler_legacy_key,
+                filler_known_key,
+                index_key,
+                freeze_key,
+            ))
+            .await
+            .unwrap();
     }
 
     #[cfg(feature = "redis-coordination")]
