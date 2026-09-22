@@ -609,6 +609,77 @@ mod deadline_tests {
     }
 
     #[tokio::test]
+    async fn nested_text_replacement_shrink_reclaims_retained_bytes() {
+        let large_output_text = json!({"type":"output_text", "text":"x".repeat(4_096)});
+        let expected_response = json!({
+            "status":"completed",
+            "output":[{
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text", "text":"ok"}]
+            }]
+        });
+        let retained_large = crate::stream_retention::estimate_value(&large_output_text)
+            .unwrap()
+            .checked_add(crate::stream_retention::RetainedFootprint::record(
+                size_of::<u64>(),
+            ))
+            .unwrap()
+            .checked_add(crate::stream_retention::RetainedFootprint::record(
+                size_of::<u64>() + size_of::<BTreeMap<u64, RetainedValue>>(),
+            ))
+            .unwrap();
+        let retained_terminal =
+            crate::stream_retention::estimate_value(&expected_response).unwrap();
+        let byte_limit = retained_large.bytes.max(retained_terminal.bytes) + 512;
+        assert!(retained_large.bytes + retained_terminal.bytes > byte_limit);
+
+        let collected = collect(
+            vec![
+                json!({"type":"response.output_text.done", "output_index":0, "content_index":0, "text":"x".repeat(4_096)}),
+                json!({"type":"response.output_text.done", "output_index":0, "content_index":0, "text":"ok"}),
+                completed(json!({"status":"completed", "output":[]})),
+            ],
+            retention_limits(byte_limit, 128),
+        )
+        .await;
+        assert_eq!(collected.result.unwrap(), expected_response);
+    }
+
+    #[tokio::test]
+    async fn terminal_output_replaces_discarded_fallback_state() {
+        let fallback_item = json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text", "text":"discarded".repeat(512)}]
+        });
+        let terminal_response = json!({
+            "status":"completed",
+            "output":[{"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"terminal"}]}]
+        });
+        let retained_fallback = crate::stream_retention::estimate_value(&fallback_item)
+            .unwrap()
+            .checked_add(crate::stream_retention::RetainedFootprint::record(
+                size_of::<u64>(),
+            ))
+            .unwrap();
+        let retained_terminal =
+            crate::stream_retention::estimate_value(&terminal_response).unwrap();
+        let byte_limit = retained_fallback.bytes.max(retained_terminal.bytes) + 512;
+        assert!(retained_fallback.bytes + retained_terminal.bytes > byte_limit);
+
+        let collected = collect(
+            vec![
+                json!({"type":"response.output_item.done", "output_index":0, "item":fallback_item}),
+                completed(terminal_response.clone()),
+            ],
+            retention_limits(byte_limit, 128),
+        )
+        .await;
+        assert_eq!(collected.result.unwrap(), terminal_response);
+    }
+
+    #[tokio::test]
     async fn completed_items_replace_text_fallback_without_changing_precedence() {
         let collected = collect(
             vec![
@@ -626,7 +697,7 @@ mod deadline_tests {
         assert_eq!(response["output"][0]["content"][0]["text"], "first");
         assert_eq!(response["output"][0]["content"][1]["text"], "second");
         assert_eq!(response["output"][1]["type"], "function_call");
-        assert_eq!(response.to_string().contains("discarded"), false);
+        assert!(!response.to_string().contains("discarded"));
     }
 
     #[tokio::test]
