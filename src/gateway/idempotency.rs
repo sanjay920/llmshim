@@ -1,6 +1,6 @@
 //! Request-bound idempotency for completed unary gateway responses.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::mem::size_of;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -16,7 +16,8 @@ const DEFAULT_MAX_ENTRY_RETAINED_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_ENTRY_RETAINED_NODES: usize = 16_384;
 const DEFAULT_MAX_RETAINED_NODES: usize = 1_000_000;
-const JSON_OBJECT_MEMBER_OVERHEAD_BYTES: usize = 32;
+const JSON_OBJECT_MEMBER_OVERHEAD_BYTES: usize = 64;
+const EXPIRY_INDEX_MEMBER_OVERHEAD_BYTES: usize = 64;
 
 /// Credential, route, client key, and canonical request binding for one replay.
 pub(crate) struct IdempotencyContext {
@@ -231,43 +232,44 @@ struct CacheEntry<T> {
     expires_at: Instant,
     footprint: RetainedFootprint,
 }
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum CacheNamespace {
+    Scoped,
+    Generic,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct ExpiryRecord {
+    expires_at: Instant,
+    namespace: CacheNamespace,
+    storage_key: String,
+}
+
 #[derive(Default)]
 struct IdempotencyCacheState {
     scoped_entries: HashMap<String, CacheEntry<CachedResponse>>,
     generic_entries: HashMap<String, CacheEntry<Value>>,
+    expiry_index: BTreeSet<ExpiryRecord>,
     retained_footprint: RetainedFootprint,
 }
 
 impl IdempotencyCacheState {
     fn purge_expired(&mut self, now: Instant) {
-        let mut expired = RetainedFootprint::default();
-        self.scoped_entries.retain(|_, entry| {
-            if entry.expires_at > now {
-                true
-            } else {
-                expired = expired
-                    .checked_add(entry.footprint)
-                    .unwrap_or(RetainedFootprint {
-                        bytes: usize::MAX,
-                        nodes: usize::MAX,
-                    });
-                false
+        while self
+            .expiry_index
+            .first()
+            .is_some_and(|record| record.expires_at <= now)
+        {
+            let record = self
+                .expiry_index
+                .pop_first()
+                .expect("the expiry index was checked under the cache lock");
+            match record.namespace {
+                CacheNamespace::Scoped => self.remove_scoped(&record.storage_key),
+                CacheNamespace::Generic => self.remove_generic(&record.storage_key),
             }
-        });
-        self.generic_entries.retain(|_, entry| {
-            if entry.expires_at > now {
-                true
-            } else {
-                expired = expired
-                    .checked_add(entry.footprint)
-                    .unwrap_or(RetainedFootprint {
-                        bytes: usize::MAX,
-                        nodes: usize::MAX,
-                    });
-                false
-            }
-        });
-        self.retained_footprint = self.retained_footprint.without(expired);
+        }
     }
     fn entry_count(&self) -> usize {
         self.scoped_entries.len() + self.generic_entries.len()
@@ -284,12 +286,22 @@ impl IdempotencyCacheState {
             .is_some_and(|total| total.fits_within(limits))
     }
     fn remove_scoped(&mut self, key: &str) {
-        if let Some(entry) = self.scoped_entries.remove(key) {
+        if let Some((storage_key, entry)) = self.scoped_entries.remove_entry(key) {
+            self.expiry_index.remove(&ExpiryRecord {
+                expires_at: entry.expires_at,
+                namespace: CacheNamespace::Scoped,
+                storage_key,
+            });
             self.retained_footprint = self.retained_footprint.without(entry.footprint);
         }
     }
     fn remove_generic(&mut self, key: &str) {
-        if let Some(entry) = self.generic_entries.remove(key) {
+        if let Some((storage_key, entry)) = self.generic_entries.remove_entry(key) {
+            self.expiry_index.remove(&ExpiryRecord {
+                expires_at: entry.expires_at,
+                namespace: CacheNamespace::Generic,
+                storage_key,
+            });
             self.retained_footprint = self.retained_footprint.without(entry.footprint);
         }
     }
@@ -306,7 +318,11 @@ fn scoped_entry_footprint(
         limits.max_entry_retained_nodes,
     )?;
     for bytes in [
-        size_of::<CachedResponse>(),
+        size_of::<CacheEntry<CachedResponse>>(),
+        size_of::<String>(),
+        size_of::<ExpiryRecord>(),
+        EXPIRY_INDEX_MEMBER_OVERHEAD_BYTES,
+        context.storage_key.capacity(),
         context.storage_key.capacity(),
         context.request_fingerprint.capacity(),
     ] {
@@ -327,9 +343,19 @@ fn generic_entry_footprint(
         limits.max_entry_retained_bytes,
         limits.max_entry_retained_nodes,
     )?;
-    footprint
-        .add_bytes(key.capacity(), limits.max_entry_retained_bytes)
-        .then_some(footprint)
+    for retained_bytes in [
+        size_of::<CacheEntry<Value>>(),
+        size_of::<String>(),
+        size_of::<ExpiryRecord>(),
+        EXPIRY_INDEX_MEMBER_OVERHEAD_BYTES,
+        key.capacity(),
+        key.capacity(),
+    ] {
+        if !footprint.add_bytes(retained_bytes, limits.max_entry_retained_bytes) {
+            return None;
+        }
+    }
+    Some(footprint)
 }
 
 /// A process-local, bounded, best-effort cache of completed request-bound responses.
@@ -383,11 +409,18 @@ impl IdempotencyCache {
             .retained_footprint
             .checked_add(footprint)
             .expect("idempotency cache footprint was checked before insertion");
+        let storage_key = context.storage_key().to_string();
+        let expires_at = now + self.ttl;
+        state.expiry_index.insert(ExpiryRecord {
+            expires_at,
+            namespace: CacheNamespace::Scoped,
+            storage_key: storage_key.clone(),
+        });
         state.scoped_entries.insert(
-            context.storage_key().to_string(),
+            storage_key,
             CacheEntry {
                 value: CachedResponse::new(context, response),
-                expires_at: now + self.ttl,
+                expires_at,
                 footprint,
             },
         );
@@ -431,11 +464,17 @@ impl IdempotencyCache {
             .retained_footprint
             .checked_add(footprint)
             .expect("idempotency cache footprint was checked before insertion");
+        let expires_at = now + self.ttl;
+        state.expiry_index.insert(ExpiryRecord {
+            expires_at,
+            namespace: CacheNamespace::Generic,
+            storage_key: storage_key.clone(),
+        });
         state.generic_entries.insert(
             storage_key,
             CacheEntry {
                 value,
-                expires_at: now + self.ttl,
+                expires_at,
                 footprint,
             },
         );
@@ -461,6 +500,7 @@ mod tests {
     }
     fn stats(cache: &IdempotencyCache) -> (usize, usize, RetainedFootprint) {
         let state = cache.state.lock().unwrap();
+        assert_eq!(state.expiry_index.len(), state.entry_count());
         (
             state.scoped_entries.len(),
             state.generic_entries.len(),
@@ -602,6 +642,46 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     #[allow(deprecated)]
+    async fn expiry_index_keeps_one_record_per_current_entry() {
+        let cache = IdempotencyCache::with_limits(Duration::from_secs(5), small_limits(2));
+        let scoped_context = context(
+            "tenant-a",
+            "credential-a",
+            "/v1/chat",
+            json!({"prompt": "one"}),
+        );
+        cache.put("refreshed", json!(0));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        cache.store(&scoped_context, json!(2));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for response_value in 0..8 {
+            cache.put("refreshed", json!(response_value));
+            assert_eq!(stats(&cache).0 + stats(&cache).1, 2);
+        }
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        cache.put("full-cache", json!(3));
+        assert_eq!(cache.get("full-cache"), None);
+        assert_eq!(cache.get("refreshed"), Some(json!(7)));
+        assert_eq!(
+            cache.lookup(&scoped_context),
+            IdempotencyLookup::Replay(json!(2))
+        );
+        assert_eq!(stats(&cache).0 + stats(&cache).1, 2);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(cache.lookup(&scoped_context), IdempotencyLookup::Miss);
+        assert_eq!(stats(&cache).0 + stats(&cache).1, 1);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        cache.put("after-expiry", json!(4));
+        assert_eq!(cache.get("refreshed"), None);
+        assert_eq!(cache.get("after-expiry"), Some(json!(4)));
+        assert_eq!(stats(&cache).0 + stats(&cache).1, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[allow(deprecated)]
     async fn expiry_frees_shared_capacity_and_footprint() {
         let cache = IdempotencyCache::with_limits(Duration::from_secs(5), small_limits(1));
         cache.put("generic", json!({"response": 1}));
@@ -624,21 +704,30 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn entry_and_aggregate_payload_limits_skip_retention() {
-        let mut limits = small_limits(4);
-        limits.max_entry_retained_bytes = 180;
-        limits.max_retained_bytes = 350;
-        let cache = IdempotencyCache::with_limits(Duration::from_secs(60), limits);
+        let short_response = json!({"text": "short"});
+        let short_response_footprint = generic_entry_footprint(
+            &generic_storage_key("first"),
+            &short_response,
+            small_limits(4),
+        )
+        .unwrap();
+        let cache_limits = CacheLimits {
+            max_entry_retained_bytes: short_response_footprint.bytes + 1,
+            max_retained_bytes: short_response_footprint.bytes * 2,
+            ..small_limits(4)
+        };
+        let cache = IdempotencyCache::with_limits(Duration::from_secs(60), cache_limits);
         cache.put(
             "too-large",
             json!({"text": "this entry is intentionally over the tiny test limit"}),
         );
         assert_eq!(cache.get("too-large"), None);
-        cache.put("first", json!({"text": "short"}));
-        cache.put("second", json!({"text": "short"}));
-        cache.put("third", json!({"text": "short"}));
+        cache.put("first", short_response.clone());
+        cache.put("second", short_response.clone());
+        cache.put("third", short_response);
         assert_eq!(stats(&cache).1, 2);
-        assert!(stats(&cache).2.bytes <= limits.max_retained_bytes);
-        assert!(stats(&cache).2.nodes <= limits.max_retained_nodes);
+        assert!(stats(&cache).2.bytes <= cache_limits.max_retained_bytes);
+        assert!(stats(&cache).2.nodes <= cache_limits.max_retained_nodes);
     }
 
     #[test]
