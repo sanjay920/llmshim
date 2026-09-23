@@ -175,6 +175,42 @@ pub trait AttemptPolicy: Send + Sync {
         attempt: &AttemptIdentity,
         outcome: AttemptOutcome,
     ) -> Result<(), AttemptPolicyError>;
+
+    /// Each frame of the attempt's response as the provider sent it, before
+    /// llmshim normalizes it: every server-sent event's `data` payload of a
+    /// stream, in arrival order, or the body of a non-streaming response.
+    ///
+    /// For an observer that records the wire, such as a debug capture. It is
+    /// synchronous and cannot fail, so an observer can neither stall nor refuse
+    /// the attempt it watches, and it is called inline on the response path:
+    /// return promptly. Headers are never passed, by construction. The default
+    /// ignores every frame, so implementing it is optional.
+    fn observe_native(&self, _attempt: &AttemptIdentity, _frame: NativeFrame<'_>) {}
+}
+
+/// One provider-native frame of an attempt's response, handed to
+/// [`AttemptPolicy::observe_native`]. Non-exhaustive so it can grow: match it
+/// with a wildcard arm.
+#[non_exhaustive]
+#[derive(Clone, Copy)]
+pub enum NativeFrame<'a> {
+    /// One server-sent event's `data` payload, exactly as it arrived.
+    StreamData { data: &'a str },
+    /// A non-streaming response's body, parsed and otherwise untouched.
+    ResponseBody { body: &'a Value },
+}
+
+impl std::fmt::Debug for NativeFrame<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::StreamData { .. } => "StreamData",
+            Self::ResponseBody { .. } => "ResponseBody",
+        };
+        formatter
+            .debug_struct(kind)
+            .field("content", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -541,6 +577,14 @@ impl AttemptTracker {
             .await?;
         self.shared.state.lock().unwrap().finished = true;
         Ok(())
+    }
+
+    /// Hand one native response frame to the policy's observer.
+    pub(crate) fn native(&self, frame: NativeFrame<'_>) {
+        self.shared
+            .context
+            .policy
+            .observe_native(&self.shared.identity, frame);
     }
 
     pub(crate) fn cancellation_guard(&self) -> AttemptCancellationGuard {
