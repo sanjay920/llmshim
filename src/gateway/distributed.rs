@@ -526,7 +526,7 @@ struct OriginDropGuard {
 }
 
 enum StreamDataSend {
-    Sent,
+    Sent { terminal_committed: bool },
     ReceiverClosed,
     Deadline,
     HeartbeatFailed(i64),
@@ -1432,6 +1432,7 @@ impl DistributedGateway {
             let mut heartbeat = tokio::time::interval(heartbeat_interval);
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             heartbeat.tick().await;
+            let mut terminal_committed = false;
             loop {
                 tokio::select! {
                     biased;
@@ -1449,13 +1450,23 @@ impl DistributedGateway {
                         let _ = chunk_tx.try_send(Err(GatewayError::Timeout));
                         return;
                     }
-                    _ = heartbeat.tick() => {
+                    _ = heartbeat.tick(), if !terminal_committed => {
                         let status = heartbeat_origin_with_connections(
                             &connections,
                             redis_operation_timeout,
                             accepted.origin_guard.command.as_ref().unwrap(),
                             origin_lease,
                         ).await;
+                        if status == 0 {
+                            if let Ok(Some(BusMessage::End | BusMessage::Error(_))) = read_terminal_with_connections(
+                                &connections,
+                                redis_operation_timeout,
+                                accepted.origin_guard.command.as_ref().unwrap(),
+                            ).await {
+                                terminal_committed = true;
+                                continue;
+                            }
+                        }
                         if status != 1 {
                             if status == -1 {
                                 accepted.origin_guard.disarm();
@@ -1497,7 +1508,9 @@ impl DistributedGateway {
                                     accepted.origin_guard.command.as_ref().unwrap(),
                                     origin_lease,
                                 ).await {
-                                    StreamDataSend::Sent => {}
+                                    StreamDataSend::Sent { terminal_committed: committed } => {
+                                        terminal_committed |= committed;
+                                    }
                                     StreamDataSend::ReceiverClosed => {
                                         if cancel_origin_with_connections(
                                             &connections,
@@ -2446,6 +2459,19 @@ async fn heartbeat_origin_with_connections(
     .unwrap_or_default()
 }
 
+async fn read_terminal_with_connections(
+    connections: &crate::redis_operation::RedisConnectionManagerCache,
+    timeout: Duration,
+    command: &OriginCancelCommand,
+) -> redis::RedisResult<Option<BusMessage>> {
+    let id = command.id.clone();
+    let generation = command.generation.clone();
+    run_redis_operation(connections, timeout, |mut connection| async move {
+        lifecycle::read_terminal(&mut connection, &id, &generation).await
+    })
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_stream_data(
     sender: &mpsc::Sender<StreamChunk>,
@@ -2457,18 +2483,32 @@ async fn send_stream_data(
     origin_command: &OriginCancelCommand,
     origin_lease: Duration,
 ) -> StreamDataSend {
+    let mut terminal_committed = false;
     loop {
         tokio::select! {
             biased;
             _ = sender.closed() => return StreamDataSend::ReceiverClosed,
             _ = tokio::time::sleep_until(deadline) => return StreamDataSend::Deadline,
-            _ = heartbeat.tick() => {
+            _ = heartbeat.tick(), if !terminal_committed => {
                 let status = heartbeat_origin_with_connections(
                     connections,
                     redis_operation_timeout,
                     origin_command,
                     origin_lease,
                 ).await;
+                if status == 0 {
+                    match read_terminal_with_connections(
+                        connections,
+                        redis_operation_timeout,
+                        origin_command,
+                    ).await {
+                        Ok(Some(BusMessage::End | BusMessage::Error(_))) => {
+                            terminal_committed = true;
+                            continue;
+                        }
+                        _ => return StreamDataSend::HeartbeatFailed(status),
+                    }
+                }
                 if status != 1 {
                     return StreamDataSend::HeartbeatFailed(status);
                 }
@@ -2478,7 +2518,7 @@ async fn send_stream_data(
                     return StreamDataSend::ReceiverClosed;
                 };
                 permits.next().expect("two reserved stream slots").send(Ok(chunk));
-                return StreamDataSend::Sent;
+                return StreamDataSend::Sent { terminal_committed };
             }
         }
     }
@@ -2752,6 +2792,10 @@ mod tests {
         dropped: Arc<tokio::sync::Notify>,
     }
 
+    struct FiniteBurstStreamDispatch {
+        fail_after_chunks: bool,
+    }
+
     struct DispatchDropGuard {
         dispatch_drops: Arc<std::sync::atomic::AtomicUsize>,
         dispatch_dropped: Arc<tokio::sync::Notify>,
@@ -2849,6 +2893,29 @@ mod tests {
                     yield Ok(format!("chunk-{index}"));
                 }
                 std::future::pending::<()>().await;
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Dispatch for FiniteBurstStreamDispatch {
+        async fn dispatch(&self, _provider: &str, _payload: Value) -> Result<Value, DispatchError> {
+            unreachable!("finite burst fixture only dispatches streams")
+        }
+
+        async fn dispatch_stream(
+            &self,
+            _provider: &str,
+            _payload: Value,
+        ) -> Result<super::super::ChunkStream, DispatchError> {
+            let fail_after_chunks = self.fail_after_chunks;
+            Ok(Box::pin(async_stream::stream! {
+                for index in 0..17 {
+                    yield Ok(format!("chunk-{index}"));
+                }
+                if fail_after_chunks {
+                    yield Err(GatewayError::Upstream("provider-terminal".into()));
+                }
             }))
         }
     }
@@ -4693,6 +4760,112 @@ mod tests {
         for worker in workers {
             worker.abort();
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_terminal_commit_during_backpressure_preserves_chunk_order() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        for fail_after_chunks in [false, true] {
+            let provider = format!(
+                "origin-terminal-buffer-{}-{}",
+                u8::from(fail_after_chunks),
+                uuid::Uuid::new_v4().simple()
+            );
+            let mut gateway = DistributedGateway::connect(
+                &redis_url,
+                Arc::new(FiniteBurstStreamDispatch { fail_after_chunks }),
+                unlimited(),
+                GatewayConfig {
+                    lease_timeout: Duration::from_millis(300),
+                    request_timeout: Duration::from_secs(2),
+                    ..GatewayConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            Arc::get_mut(&mut gateway).unwrap().origin_lease_timeout = Duration::from_millis(90);
+            let workers = gateway.spawn_workers(vec![provider.clone()]);
+            let mut receiver = gateway
+                .submit_stream(GatewayRequest {
+                    provider,
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"terminal-buffer"}),
+                })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            let mut chunks = Vec::new();
+            let mut terminal_error = None;
+            while let Some(item) = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("finite stream should finish")
+            {
+                match item {
+                    Ok(chunk) => chunks.push(chunk),
+                    Err(error) => {
+                        terminal_error = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            assert_eq!(chunks.len(), 17);
+            for (index, chunk) in chunks.iter().enumerate() {
+                assert_eq!(chunk, &format!("chunk-{index}"));
+            }
+            if fail_after_chunks {
+                assert_eq!(
+                    terminal_error.as_deref(),
+                    Some("upstream error: upstream error: provider-terminal")
+                );
+            } else {
+                assert!(terminal_error.is_none());
+            }
+            for worker in workers {
+                worker.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_stream_heartbeat_zero_without_terminal_still_fails() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-missing-terminal-{}", uuid::Uuid::new_v4().simple());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            GatewayConfig::default(),
+        )
+        .await
+        .unwrap();
+        let command = OriginCancelCommand {
+            protocol: QueueProtocol::LegacyUnscoped,
+            provider,
+            id: format!("missing-{}", uuid::Uuid::new_v4().simple()),
+            generation: "999999".into(),
+            member: format!("missing-{}:999999", uuid::Uuid::new_v4().simple()),
+            origin_token: "missing-token".into(),
+        };
+        let (sender, _receiver) = mpsc::channel(2);
+        sender.try_send(Ok("occupied".into())).unwrap();
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(1));
+        assert!(matches!(
+            send_stream_data(
+                &sender,
+                "must-not-send".into(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                &mut heartbeat,
+                &gateway.connections,
+                gateway.redis_operation_timeout,
+                &command,
+                Duration::from_secs(1),
+            )
+            .await,
+            StreamDataSend::HeartbeatFailed(0)
+        ));
     }
 
     #[tokio::test]
