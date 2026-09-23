@@ -350,13 +350,13 @@ impl GatewayState {
             PreparedGatewaySubmission::Distributed(prepared) => match &self.backend {
                 Backend::Distributed(gateway) => {
                     drop(prequeue_permit);
-                    let _ = logical_deadline;
-                    gateway.submit_prepared_with_reference(prepared).await.map(
-                        |(value, lifecycle_reference)| SubmittedValue {
+                    gateway
+                        .submit_prepared_with_reference(prepared, logical_deadline)
+                        .await
+                        .map(|(value, lifecycle_reference)| SubmittedValue {
                             value,
                             lifecycle_reference: Some(lifecycle_reference),
-                        },
-                    )
+                        })
                 }
                 Backend::Local(_) => unreachable!("prepared backend changed"),
             },
@@ -400,7 +400,7 @@ impl GatewayState {
             #[cfg(feature = "redis-coordination")]
             PreparedGatewaySubmission::Distributed(prepared) => match &self.backend {
                 Backend::Distributed(gateway) => {
-                    let accepted = gateway.accept_prepared(prepared).await?;
+                    let accepted = gateway.accept_prepared(prepared, logical_deadline).await?;
                     drop(prequeue_permit);
                     Ok(gateway.stream_accepted(accepted))
                 }
@@ -1304,6 +1304,57 @@ mod native_tests {
     }
 
     #[tokio::test]
+    async fn excessive_typed_reasoning_is_rejected_before_gateway_queue_or_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let details: Vec<Value> = (0..64)
+            .map(|index| json!({"type":"reasoning.text","text":"x","index":index}))
+            .collect();
+        let body = json!({
+            "model":"local/gpt-5.6-luna",
+            "messages":[{
+                "role":"assistant",
+                "content":"answer",
+                "reasoning_origin":{
+                    "provider":"source",
+                    "model":"m".repeat(64 * 1024),
+                    "family":"claude",
+                    "wire":"openai-chat",
+                    "received_at":"2026-09-22T00:00:00Z"
+                },
+                "reasoning_details":details
+            }]
+        });
+        assert!(body.to_string().len() < 80 * 1024);
+        for stream in [false, true] {
+            let mut request_body = body.clone();
+            request_body["stream"] = json!(stream);
+            let response = app(configured_state(&server.url()))
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-key")
+                        .body(Body::from(request_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let response_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert!(String::from_utf8(response_body.to_vec())
+                .unwrap()
+                .contains("request reasoning metadata exceeds derived size limit"));
+        }
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn ingress_preparation_gate_precedes_native_conversion_and_prequeue_work() {
         let mut server = mockito::Server::new_async().await;
         let upstream = server
@@ -1396,6 +1447,22 @@ mod native_tests {
     }
 
     #[cfg(feature = "redis-coordination")]
+    struct QuietBodyDropDispatch {
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<tokio::sync::Notify>,
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    struct QuietBodyDropGuard(Arc<tokio::sync::Notify>);
+
+    #[cfg(feature = "redis-coordination")]
+    impl Drop for QuietBodyDropGuard {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    #[cfg(feature = "redis-coordination")]
     #[async_trait::async_trait]
     impl Dispatch for CountingDispatch {
         async fn dispatch(&self, _provider: &str, payload: Value) -> Result<Value, DispatchError> {
@@ -1408,6 +1475,29 @@ mod native_tests {
                     "finish_reason": "stop"
                 }],
                 "usage": {}
+            }))
+        }
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[async_trait::async_trait]
+    impl Dispatch for QuietBodyDropDispatch {
+        async fn dispatch(&self, _provider: &str, _payload: Value) -> Result<Value, DispatchError> {
+            unreachable!("quiet body-drop fixture only streams")
+        }
+
+        async fn dispatch_stream(
+            &self,
+            _provider: &str,
+            _payload: Value,
+        ) -> Result<crate::gateway::ChunkStream, DispatchError> {
+            let started = self.started.clone();
+            let dropped = self.dropped.clone();
+            Ok(Box::pin(async_stream::stream! {
+                let _guard = QuietBodyDropGuard(dropped);
+                started.notify_one();
+                std::future::pending::<()>().await;
+                yield Ok(String::new());
             }))
         }
     }
@@ -1446,6 +1536,100 @@ mod native_tests {
             ),
             overloaded_retry_after: config.overloaded_retry_after,
         })
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_quiet_final_http_body_drop_cancels_distributed_dispatch() {
+        use redis::AsyncCommands;
+
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let namespace = uuid::Uuid::new_v4();
+        let provider = format!("body-drop-{namespace}");
+        let router = Arc::new(Router::new().register(
+            &provider,
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                provider.clone(),
+                "http://127.0.0.1:1",
+                None,
+            )),
+        ));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let config = GatewayConfig {
+            lease_timeout: Duration::from_millis(90),
+            request_timeout: Duration::from_secs(2),
+            ..GatewayConfig::default()
+        };
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::redis(
+            &redis_url,
+            crate::proxy::ratelimit::RateLimitConfig::default(),
+            config.max_concurrency_per_provider,
+            config.max_wait,
+        )
+        .unwrap();
+        let gateway = crate::gateway::distributed::DistributedGateway::connect_with_coordinator(
+            &redis_url,
+            Arc::new(QuietBodyDropDispatch {
+                started: started.clone(),
+                dropped: dropped.clone(),
+            }),
+            Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
+                crate::proxy::ratelimit::RateLimitConfig::default(),
+            )),
+            config.clone(),
+            attempt_coordinator.clone(),
+        )
+        .await
+        .unwrap();
+        gateway.spawn_workers(vec![provider.clone()]);
+        let application = app(distributed_state_for_tenant(
+            router,
+            gateway.clone(),
+            &config,
+            attempt_coordinator,
+            "body-drop-tenant",
+        ));
+        let started_notification = started.notified();
+        let response = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer reassigned-key")
+                    .body(Body::from(
+                        json!({
+                            "model": format!("{provider}/test"),
+                            "messages": [{"role":"user","content":"quiet"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(1), started_notification)
+            .await
+            .expect("distributed stream should start");
+        let mut observer = gateway.connection_for_test().await.unwrap();
+        let processing_key = format!("llmshim:gw:lifecycle:v2:proc:scoped:{provider}");
+        assert_eq!(observer.zcard::<_, u64>(&processing_key).await.unwrap(), 1);
+        let dropped_notification = dropped.notified();
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), dropped_notification)
+            .await
+            .expect("dropping final body should cancel the quiet provider stream");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observer.zcard::<_, u64>(&processing_key).await.unwrap() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canceled delivery should leave processing");
     }
 
     #[cfg(feature = "redis-coordination")]
