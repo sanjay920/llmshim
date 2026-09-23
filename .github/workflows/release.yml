@@ -24,8 +24,11 @@ jobs:
           LLMSHIM_CATALOG_OFFLINE: '1'
         run: cargo test --workspace --features proxy --tests
 
+  windows-check:
+    uses: ./.github/workflows/windows-check.yml
+
   release-inputs:
-    needs: test
+    needs: [test, windows-check]
     runs-on: ubuntu-latest
     permissions:
       contents: read
