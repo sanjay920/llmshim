@@ -269,6 +269,8 @@ type Result<T> = std::result::Result<T, String>;
 struct BoundedCanonicalWriter {
     bytes: Vec<u8>,
     maximum_bytes: usize,
+    #[cfg(test)]
+    growth_steps: usize,
 }
 
 impl Write for BoundedCanonicalWriter {
@@ -288,12 +290,46 @@ impl Write for BoundedCanonicalWriter {
                 receipts::REQUEST_LIMIT_ERROR_MESSAGE,
             ));
         }
-        self.bytes.try_reserve_exact(buffer.len()).map_err(|_| {
+        let required_capacity = self.bytes.len().checked_add(buffer.len()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 receipts::REQUEST_LIMIT_ERROR_MESSAGE,
             )
         })?;
+        if required_capacity > self.bytes.capacity() {
+            let mut next_capacity = self.bytes.capacity().max(64).min(self.maximum_bytes);
+            while next_capacity < required_capacity {
+                next_capacity = next_capacity
+                    .checked_mul(2)
+                    .unwrap_or(self.maximum_bytes)
+                    .min(self.maximum_bytes);
+                if next_capacity < required_capacity && next_capacity == self.maximum_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        receipts::REQUEST_LIMIT_ERROR_MESSAGE,
+                    ));
+                }
+            }
+            let additional_capacity =
+                next_capacity.checked_sub(self.bytes.len()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        receipts::REQUEST_LIMIT_ERROR_MESSAGE,
+                    )
+                })?;
+            self.bytes
+                .try_reserve_exact(additional_capacity)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        receipts::REQUEST_LIMIT_ERROR_MESSAGE,
+                    )
+                })?;
+            #[cfg(test)]
+            {
+                self.growth_steps += 1;
+            }
+        }
         self.bytes.extend_from_slice(buffer);
         Ok(buffer.len())
     }
@@ -307,6 +343,8 @@ fn serialize_canonical_request(value: &Value, maximum_bytes: usize) -> Result<Ve
     let mut writer = BoundedCanonicalWriter {
         bytes: Vec::new(),
         maximum_bytes,
+        #[cfg(test)]
+        growth_steps: 0,
     };
     serde_json::to_writer(&mut writer, value)
         .map_err(|_| receipts::REQUEST_LIMIT_ERROR_MESSAGE.to_owned())?;
@@ -1273,7 +1311,8 @@ mod async_receipt_tests {
 
     #[tokio::test]
     async fn canonical_serialization_limit_refuses_before_handler() {
-        let receipts = Arc::new(Receipts::new(tempfile::tempdir().unwrap().keep()));
+        let receipt_directory = tempfile::tempdir().unwrap();
+        let receipts = Arc::new(Receipts::new(receipt_directory.path().to_owned()));
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let counted = handler_calls.clone();
         let application = Router::new()
@@ -1316,6 +1355,25 @@ mod async_receipt_tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn canonical_writer_grows_geometrically_and_enforces_exact_limit() {
+        let expected = (0_u8..100).collect::<Vec<_>>();
+        let mut writer = BoundedCanonicalWriter {
+            bytes: Vec::new(),
+            maximum_bytes: 128,
+            growth_steps: 0,
+        };
+        for byte in &expected {
+            writer.write_all(&[*byte]).unwrap();
+        }
+        assert_eq!(writer.bytes, expected);
+        assert!(writer.growth_steps <= 3);
+        assert!(writer.write_all(&[7_u8; 28]).is_ok());
+        let before_refusal = writer.bytes.clone();
+        assert!(writer.write_all(&[8_u8]).is_err());
+        assert_eq!(writer.bytes, before_refusal);
     }
 
     #[test]
@@ -1364,7 +1422,8 @@ mod async_receipt_tests {
 
     #[test]
     fn canonical_node_limit_is_checked_before_serialization() {
-        let receipts = Receipts::new(tempfile::tempdir().unwrap().keep());
+        let receipt_directory = tempfile::tempdir().unwrap();
+        let receipts = Receipts::new(receipt_directory.path().to_owned());
         let native = json!({
             "model":"local/test",
             "messages":[{"role":"user","content":"ordinary"}]
