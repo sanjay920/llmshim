@@ -81,6 +81,17 @@ capacity until it exits. The journal is capped at 64 MiB; crash recovery can als
 use one fixed receipt staging file of at most 4 MiB and one fixed journal staging
 file of at most 64 MiB.
 
+One native request may restore at most 4,096 receipt occurrences, including
+repeated uses of the same valid handle. Those occurrences share limits of 2 MiB
+of encoded receipt data, 32,768 decoded JSON nodes, and 8 MiB of estimated owned
+JSON memory. Each occurrence is admitted before its record is read and parsed;
+repeating a key consumes the limits again because the canonical history repeats
+the value. The reconstructed canonical request is also limited to 32,768 nodes,
+8 MiB estimated owned JSON, and 2 MiB when serialized for the shared handler.
+Excess restoration fails as a native 413 without truncating history or starting
+provider inference. These conservative estimates bound conversion allocations;
+they are not process RSS measurements.
+
 On first use after an upgrade, llmshim counts existing receipt files once and
 includes them in admission without expiring or deleting them because they have no
 trustworthy issue time. If that bounded pass cannot establish a complete total,
@@ -102,7 +113,8 @@ clients that discard it also discard replayable reasoning. Keep full native
 assistant messages and tool IDs when saving a conversation. Receipt metadata is
 separate from the caller-owned conversation history.
 
-Requests are limited to 2 MiB and buffered metadata/response conversion to 32 MiB.
+Requests and reconstructed canonical handler bodies are limited to 2 MiB, and
+buffered response conversion is limited to 32 MiB.
 `x-cache` segment indices on native requests refer to their input `messages`
 array; the facade remaps boundaries when system/tool-result conversion expands
 that array. `x-shim` applies through the shared client. A signature mismatch's
