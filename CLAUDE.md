@@ -120,7 +120,7 @@ cargo clippy --workspace --features proxy -- -D warnings
 cargo package -p llmshim-catalog --allow-dirty
 ```
 
-The root and language clients use version 0.13.0. The 0.13 minor bump also reflects the narrower ChatGPT model allowlist. The 0.12 minor bump was required because the public
+The root and language clients use version 0.14.0; the 0.14 minor adds `AttemptPolicy::observe_native` (a defaulted method, so no implementor breaks). The 0.13 minor bump also reflects the narrower ChatGPT model allowlist. The 0.12 minor bump was required because the public
 `CostSource` unions gain `provider_floor`; exhaustive consumers must handle it.
 The version metadata does not itself publish a release. Release workflows must
 publish the catalog dependency before llmshim. Public code, fixtures,
