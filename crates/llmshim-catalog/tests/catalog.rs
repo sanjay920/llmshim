@@ -342,7 +342,7 @@ fn vendored_artifact_has_broad_coverage_without_changing_discovery() {
 }
 
 // ============================================================
-// lookup_id: OpenRouter variant-suffix normalization (MOH-240)
+// lookup_id: OpenRouter variant-suffix normalization
 // ============================================================
 //
 // OpenRouter accepts a routing-hint suffix on a model slug (`:nitro`,
@@ -409,7 +409,7 @@ fn lookup_id_leaves_a_non_openrouter_colon_tag_unresolved() {
 
 #[test]
 fn deepseek_v4_1_flash_openrouter_price_matches_the_corrected_rate() {
-    // Regression for MOH-228: the vendored models.dev snapshot priced this
+    // The vendored models.dev snapshot priced this
     // row at half what OpenRouter actually billed. `data/verified.json`
     // corrects it (sourced from https://openrouter.ai/api/v1/models,
     // 2026-09-22); this pins the corrected numbers so a future snapshot
