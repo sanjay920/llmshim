@@ -22,6 +22,16 @@ fn recognized_structured_block(payload: &Value) -> bool {
     ) || payload["thought"] == true
 }
 
+pub(super) fn legacy_structured_block_emits(payload: &Value) -> bool {
+    if !recognized_structured_block(payload) {
+        return false;
+    }
+    !matches!(
+        payload["type"].as_str(),
+        Some("redacted_thinking" | "reasoning.encrypted")
+    ) || payload["data"].is_string()
+}
+
 fn summary_text_length(payload: &Value) -> Option<usize> {
     let joined_length = |field: &str, kind: Option<&str>| {
         let mut total = 0_usize;
@@ -306,7 +316,7 @@ pub(super) fn legacy_chat_blocks(message: &Value, origin: &ReasoningOrigin) -> V
     for field in ["reasoning_details", "thinking_blocks"] {
         let mut blocks = Vec::new();
         for payload in message[field].as_array().into_iter().flatten() {
-            if !recognized_structured_block(payload) {
+            if !legacy_structured_block_emits(payload) {
                 continue;
             }
             let mut block = ReasoningBlock::text("", origin.clone());
@@ -322,9 +332,9 @@ pub(super) fn legacy_chat_blocks(message: &Value, origin: &ReasoningOrigin) -> V
                     }
                 }
                 "redacted_thinking" | "reasoning.encrypted" => {
-                    let Some(data) = payload["data"].as_str() else {
-                        continue;
-                    };
+                    let data = payload["data"]
+                        .as_str()
+                        .expect("legacy eligibility requires string data");
                     block.kind = if payload["type"] == "redacted_thinking" {
                         ReasoningKind::Redacted
                     } else {

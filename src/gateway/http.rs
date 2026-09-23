@@ -1304,6 +1304,57 @@ mod native_tests {
     }
 
     #[tokio::test]
+    async fn excessive_typed_reasoning_is_rejected_before_gateway_queue_or_dispatch() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream = server
+            .mock("POST", Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let details: Vec<Value> = (0..64)
+            .map(|index| json!({"type":"reasoning.text","text":"x","index":index}))
+            .collect();
+        let body = json!({
+            "model":"local/gpt-5.6-luna",
+            "messages":[{
+                "role":"assistant",
+                "content":"answer",
+                "reasoning_origin":{
+                    "provider":"source",
+                    "model":"m".repeat(64 * 1024),
+                    "family":"claude",
+                    "wire":"openai-chat",
+                    "received_at":"2026-09-22T00:00:00Z"
+                },
+                "reasoning_details":details
+            }]
+        });
+        assert!(body.to_string().len() < 80 * 1024);
+        for stream in [false, true] {
+            let mut request_body = body.clone();
+            request_body["stream"] = json!(stream);
+            let response = app(configured_state(&server.url()))
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-key")
+                        .body(Body::from(request_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let response_body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert!(String::from_utf8(response_body.to_vec())
+                .unwrap()
+                .contains("request reasoning metadata exceeds derived size limit"));
+        }
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn ingress_preparation_gate_precedes_native_conversion_and_prequeue_work() {
         let mut server = mockito::Server::new_async().await;
         let upstream = server
