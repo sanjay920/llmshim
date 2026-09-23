@@ -26,7 +26,7 @@ translator. ChatGPT forces `store: false` and `stream: true` and strips token
 limits, metadata, and sampling fields even from native overrides, following
 [LiteLLM's backend contract](https://docs.litellm.ai/docs/providers/chatgpt).
 It uses a short default instruction when no instructions are supplied.
-Only `chatgpt/gpt-6-astra` and `chatgpt/gpt-5.6-{sol,terra,luna}` are accepted;
+Only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and `chatgpt/gpt-6-luna` are accepted;
 older and unlisted models fail locally before authentication or network calls.
 Access to those models and limits depend on the signed-in account.
 ChatGPT responses preserve the full `chatgpt/<model>` ID, including streaming
@@ -43,7 +43,7 @@ call includes its ID, name, and full JSON arguments, including in the proxy's
 | OpenAI | System/developer text becomes Responses `instructions`; Chat Completions tool definitions are flattened for Responses | `store` defaults to `false`; unified reasoning becomes the native `reasoning` object; `x-openai.reasoning` overrides that mapping |
 | Anthropic | Messages become Anthropic content blocks; tools use `input_schema`, `tool_use`, and `tool_result` | `max_tokens` defaults to 8192 when absent; supported models receive the 1M-context beta by default; `x-anthropic.extra_betas` appends beta headers and `disable_1m_context` suppresses that automatic header |
 | Gemini | Messages become `contents`; tools use `functionDeclarations`, `functionCall`, and `functionResponse` | Base64 images become `inline_data`, but a remote image URL becomes a text placeholder because Gemini cannot consume it directly; `x-gemini.thinkingConfig` replaces mapped thinking configuration |
-| xAI | System/developer text becomes Responses `instructions`; tools are flattened like OpenAI Responses | Unified reasoning becomes `reasoning: {effort}` where the model accepts it; Grok 4.6 clamps `none` to `low` and `max` to `xhigh`; there is no `x-xai` namespace |
+| xAI | System/developer text becomes Responses `instructions`; tools are flattened like OpenAI Responses | Unified reasoning becomes `reasoning: {effort}` where the model accepts it; Grok 4.7 clamps `none` to `low` and `max` to `xhigh`; there is no `x-xai` namespace |
 | OpenRouter | Passthrough — messages, tools, `image_url` vision, and `response_format` are already Chat Completions and forwarded unchanged | `reasoning_effort` maps 1:1 to OpenRouter's `reasoning:{effort}` (superset vocabulary, no clamping); reasoning is normalized to provenance-bearing blocks; the `middle-out` transform is disabled by default; `x-openrouter` carries `provider`/`models`/`transforms`/`route`/native `reasoning` (and `http_referer`/`x_title` headers) |
 | vLLM / SGLang | Passthrough to a self-hosted server — configured by base URL (local or remote), auth optional | reasoning normalized to provenance-bearing blocks; `reasoning_effort` forwarded (honored per-model); server-specific params (`chat_template_kwargs`, `guided_json`, `top_k`, `separate_reasoning`, …) go under `x-vllm`/`x-sglang`. Reasoning/tool parsing depend on the server's launch flags (`--reasoning-parser`, `--tool-call-parser`) |
 
@@ -59,14 +59,14 @@ forwarded blindly.
 Fable 5.1 uses always-on adaptive thinking, with `low`, `medium`,
 `high`, `xhigh`, and `max` effort. Unified `none` maps to `low`; explicit
 native disabled/manual thinking and assistant prefill return local errors.
-Sampling parameters are omitted for Fable 5.1 and Opus 5 because
-those models reject them.
+Sampling parameters are omitted for Fable 5.1, Opus 5, and Opus 5.5
+because those models reject them.
 
-Fable 5.1 accepts only `auto` and `none`:
+Fable 5.1 and Opus 5.5 accept only `auto` and `none`:
 `required` or a named forced tool returns a local 400 rather than changing the
 request's meaning. Describe the desired tool in the prompt, or use structured
 output when the requirement is a JSON schema. Native `stop_reason: "refusal"`
-maps to `finish_reason: "content_filter"` for Fable and Opus 5.
+maps to `finish_reason: "content_filter"` for Fable and Opus 5/5.5.
 
 Fable 5.1 binds thinking blocks to the preceding system prompt, tools, and
 conversation. Keep that prefix unchanged when replaying signed reasoning.
@@ -75,6 +75,13 @@ instructions as system turns for Fable 5.1. If your application edits or
 compacts prior history, remove stale thinking or use Anthropic's explicit
 binding controls under `x-anthropic`. A binding failure remains an error.
 See [Anthropic's migration and history rules](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide).
+
+Opus 5.5 also requires adaptive thinking, rejects assistant prefill,
+and binds thinking to the conversation prefix. It accepts thinking from older
+Opus, Sonnet, and Haiku models, but not Fable or Mythos. Its thinking blocks
+replay only to Opus 5.5, Fable 5.1, or Mythos 5.1. See the
+[Opus 5.5 migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
+
 
 The raw Rust response exposes normalized thinking signatures for replay.
 The compact proxy response does not expose every native thinking field;

@@ -31,7 +31,7 @@ console.log(res.message.content);
 
 // Streaming — an async iterator of typed events
 for await (const ev of client.stream({
-  model: "gpt-5.6-sol",
+  model: "gpt-6-sol",
   messages: [{ role: "user", content: "Write a haiku about the ocean." }],
 })) {
   if (ev.type === "reasoning") process.stdout.write(`\x1b[2m${ev.text}\x1b[0m`);
@@ -52,7 +52,7 @@ reads its own credentials from the environment (or `llmshim configure`):
 
 | Provider   | Model string                                       | Env vars                                          |
 | ---------- | -------------------------------------------------- | ------------------------------------------------- |
-| OpenAI     | `openai/gpt-5.6-sol`                               | `OPENAI_API_KEY`                                  |
+| OpenAI     | `openai/gpt-6-sol`                               | `OPENAI_API_KEY`                                  |
 | Anthropic  | `anthropic/claude-sonnet-5`                        | `ANTHROPIC_API_KEY`                               |
 | Gemini     | `gemini/gemini-3.8-flash`                          | `GEMINI_API_KEY`                                  |
 | xAI        | `xai/grok-4.6`                                     | `XAI_API_KEY`                                     |
@@ -74,7 +74,7 @@ doesn't support a value):
 
 ```ts
 const res = await client.chat({
-  model: "openai/gpt-5.6-sol",
+  model: "openai/gpt-6-sol",
   messages: [{ role: "user", content: "Explain quicksort." }],
   config: {
     reasoning_effort: "high", // none | low | medium | high | xhigh | max
@@ -96,7 +96,7 @@ An ordered list tried in turn on retryable upstream failures (429/5xx):
 await client.chat({
   model: "anthropic/claude-sonnet-5",
   messages: [{ role: "user", content: "Hi" }],
-  fallback: ["openai/gpt-5.6-sol", "gemini/gemini-3.8-flash"],
+  fallback: ["openai/gpt-6-sol", "gemini/gemini-3.8-flash"],
 });
 ```
 
@@ -152,7 +152,7 @@ const tools = [
 
 // Non-streaming
 const res = await client.chat({
-  model: "openai/gpt-5.6-sol",
+  model: "openai/gpt-6-sol",
   messages: [{ role: "user", content: "What's the weather in Paris?" }],
   provider_config: { tools },
 });
@@ -162,7 +162,7 @@ for (const call of res.message.tool_calls ?? []) {
 
 // Streaming
 for await (const ev of client.stream({
-  model: "openai/gpt-5.6-sol",
+  model: "openai/gpt-6-sol",
   messages: [{ role: "user", content: "What's the weather in Paris?" }],
   provider_config: { tools },
 })) {

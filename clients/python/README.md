@@ -56,7 +56,7 @@ With options (all map to the API's provider-agnostic `config`):
 
 ```python
 resp = llmshim.chat(
-    "openai/gpt-5.6-sol",
+    "openai/gpt-6-sol",
     "Explain quicksort",
     max_tokens=500,
     temperature=0.7,
@@ -101,7 +101,7 @@ print(f"Claude: {r1['message']['content']}")
 messages.append({"role": "assistant", "content": r1["message"]["content"]})
 messages.append({"role": "user", "content": "Now explain differently."})
 
-r2 = llmshim.chat("gpt-5.6-sol", messages, max_tokens=500)
+r2 = llmshim.chat("gpt-6-sol", messages, max_tokens=500)
 print(f"GPT: {r2['message']['content']}")
 ```
 
@@ -192,7 +192,7 @@ resp = llmshim.chat(
     "anthropic/claude-sonnet-5",
     "Hello",
     max_tokens=100,
-    fallback=["openai/gpt-5.6-sol", "gemini/gemini-3.8-flash"],
+    fallback=["openai/gpt-6-sol", "gemini/gemini-3.8-flash"],
 )
 ```
 
@@ -265,8 +265,8 @@ billed provider calls; run it only when you deliberately want to hit real APIs.
 
 | Provider | Models |
 |----------|--------|
-| OpenAI | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
-| Anthropic | `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001` |
+| OpenAI | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` |
+| Anthropic | `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001` |
 | Gemini | `gemini-3.8-flash`, `gemini-3.5-flash-lite` |
 | xAI | `grok-4.6` |
 

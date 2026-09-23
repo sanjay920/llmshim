@@ -178,8 +178,8 @@ Tools, images, and reasoning use the existing Responses translation;
 requests). The backend requires `store: false` and `stream: true` and rejects
 token limits, sampling fields, and metadata, so these constraints also apply
 to native overrides. Bare `gpt-*` names still route to API-key OpenAI.
-The ChatGPT route supports only `chatgpt/gpt-6-astra`, `chatgpt/gpt-5.6-sol`,
-`chatgpt/gpt-5.6-terra`, and `chatgpt/gpt-5.6-luna`. Older and unlisted model
+The ChatGPT route supports only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`,
+and `chatgpt/gpt-6-luna`. Older and unlisted model
 IDs return a local error before authentication or an upstream request.
 Access to these models and usage limits depend on the ChatGPT account.
 
@@ -237,7 +237,7 @@ use serde_json::json;
 
 let router = llmshim::router::Router::from_env();
 let request = json!({
-    "model": "gpt-5.6-sol",
+    "model": "gpt-6-sol",
     "messages": [{"role": "user", "content": "Write a haiku about Rust."}],
     "max_tokens": 128,
 });
@@ -378,7 +378,7 @@ print(f"Claude: {r1['message']['content']}")
 messages.append({"role": "assistant", "content": r1["message"]["content"]})
 messages.append({"role": "user", "content": "Now explain it differently."})
 
-r2 = llmshim.chat("gpt-5.6-sol", messages, max_tokens=500)
+r2 = llmshim.chat("gpt-6-sol", messages, max_tokens=500)
 print(f"GPT: {r2['message']['content']}")
 ```
 
@@ -426,7 +426,7 @@ resp = llmshim.chat(
     "anthropic/claude-sonnet-5",
     "Hello",
     max_tokens=100,
-    fallback=["openai/gpt-5.6-sol", "gemini/gemini-3.8-flash"],
+    fallback=["openai/gpt-6-sol", "gemini/gemini-3.8-flash"],
 )
 ```
 
@@ -490,13 +490,13 @@ Standard library only. Full docs: [`clients/ruby/README.md`](clients/ruby/README
 
 | Provider | Models | Reasoning visible |
 |----------|--------|-------------------|
-| **OpenAI** | `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | Yes (summaries) |
-| **Anthropic** | `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001` | Yes (thinking summaries) |
+| **OpenAI** | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | Yes (summaries) |
+| **Anthropic** | `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001` | Yes (thinking summaries) |
 | **Google Gemini** | `gemini-3.8-flash`, `gemini-3.5-flash-lite` | Yes (thought summaries) |
 | **xAI** | `grok-4.7` | No (hidden) |
 
 The CLI and server advertise these current tiers. ChatGPT subscription access
-uses the same four OpenAI models under `chatgpt/`. OpenRouter and self-hosted
+uses the same three GPT-6 models under `chatgpt/`. OpenRouter and self-hosted
 providers accept caller-selected IDs without a fixed advertised list.
 
 Use a bare model name (auto-detected by prefix) or an explicit `provider/model`

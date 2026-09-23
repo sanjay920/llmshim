@@ -104,11 +104,11 @@ pub const CHATGPT_MODELS: &[BuiltinModelInfo] = &[
         },
     },
     BuiltinModelInfo {
-        id: "chatgpt/gpt-5.6-sol",
+        id: "chatgpt/gpt-6-sol",
         provider: "chatgpt",
         family: Some(ModelFamily::Gpt),
-        name: "gpt-5.6-sol",
-        label: "GPT-5.6 Sol (ChatGPT)",
+        name: "gpt-6-sol",
+        label: "GPT-6 Sol (ChatGPT)",
         // Subscription entitlements and limits are account-dependent.
         context_window_tokens: None,
         max_output_tokens: None,
@@ -121,28 +121,11 @@ pub const CHATGPT_MODELS: &[BuiltinModelInfo] = &[
         },
     },
     BuiltinModelInfo {
-        id: "chatgpt/gpt-5.6-terra",
+        id: "chatgpt/gpt-6-luna",
         provider: "chatgpt",
         family: Some(ModelFamily::Gpt),
-        name: "gpt-5.6-terra",
-        label: "GPT-5.6 Terra (ChatGPT)",
-        // Subscription entitlements and limits are account-dependent.
-        context_window_tokens: None,
-        max_output_tokens: None,
-        capabilities: ModelCapabilities {
-            tools: Support::Supported,
-            streaming: Support::Supported,
-            images: Support::Supported,
-            reasoning: Support::Supported,
-            ..ModelCapabilities::unknown()
-        },
-    },
-    BuiltinModelInfo {
-        id: "chatgpt/gpt-5.6-luna",
-        provider: "chatgpt",
-        family: Some(ModelFamily::Gpt),
-        name: "gpt-5.6-luna",
-        label: "GPT-5.6 Luna (ChatGPT)",
+        name: "gpt-6-luna",
+        label: "GPT-6 Luna (ChatGPT)",
         // Subscription entitlements and limits are account-dependent.
         context_window_tokens: None,
         max_output_tokens: None,
@@ -170,31 +153,21 @@ pub const MODELS: &[BuiltinModelInfo] = &[
         capabilities: CAPS_STD,
     },
     BuiltinModelInfo {
-        id: "openai/gpt-5.6-sol",
+        id: "openai/gpt-6-sol",
         provider: "openai",
         family: Some(ModelFamily::Gpt),
-        name: "gpt-5.6-sol",
-        label: "GPT-5.6 Sol",
+        name: "gpt-6-sol",
+        label: "GPT-6 Sol",
         context_window_tokens: Some(1_050_000),
         max_output_tokens: Some(128_000),
         capabilities: CAPS_STD,
     },
     BuiltinModelInfo {
-        id: "openai/gpt-5.6-terra",
+        id: "openai/gpt-6-luna",
         provider: "openai",
         family: Some(ModelFamily::Gpt),
-        name: "gpt-5.6-terra",
-        label: "GPT-5.6 Terra",
-        context_window_tokens: Some(1_050_000),
-        max_output_tokens: Some(128_000),
-        capabilities: CAPS_STD,
-    },
-    BuiltinModelInfo {
-        id: "openai/gpt-5.6-luna",
-        provider: "openai",
-        family: Some(ModelFamily::Gpt),
-        name: "gpt-5.6-luna",
-        label: "GPT-5.6 Luna",
+        name: "gpt-6-luna",
+        label: "GPT-6 Luna",
         context_window_tokens: Some(1_050_000),
         max_output_tokens: Some(128_000),
         capabilities: CAPS_STD,
@@ -211,14 +184,14 @@ pub const MODELS: &[BuiltinModelInfo] = &[
         capabilities: CAPS_FULL.with_forced_tool_choice(Support::Unsupported),
     },
     BuiltinModelInfo {
-        id: "anthropic/claude-opus-5",
+        id: "anthropic/claude-opus-5-5",
         provider: "anthropic",
         family: Some(ModelFamily::Claude),
-        name: "claude-opus-5",
-        label: "Claude Opus 5",
+        name: "claude-opus-5-5",
+        label: "Claude Opus 5.5",
         context_window_tokens: Some(1_000_000),
         max_output_tokens: Some(128_000),
-        capabilities: CAPS_FULL,
+        capabilities: CAPS_FULL.with_forced_tool_choice(Support::Unsupported),
     },
     BuiltinModelInfo {
         id: "anthropic/claude-sonnet-5",
@@ -273,12 +246,102 @@ pub const MODELS: &[BuiltinModelInfo] = &[
     CHATGPT_MODELS[0],
     CHATGPT_MODELS[1],
     CHATGPT_MODELS[2],
-    CHATGPT_MODELS[3],
 ];
 
 /// Historical metadata remains available to explicit `spec()` lookups without
 /// appearing in discovery or model pickers. Routing is provider-owned.
 const LEGACY_MODELS: &[BuiltinModelInfo] = &[
+    BuiltinModelInfo {
+        id: "openai/gpt-5.6-sol",
+        provider: "openai",
+        family: Some(ModelFamily::Gpt),
+        name: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol",
+        context_window_tokens: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_STD,
+    },
+    BuiltinModelInfo {
+        id: "openai/gpt-5.6-terra",
+        provider: "openai",
+        family: Some(ModelFamily::Gpt),
+        name: "gpt-5.6-terra",
+        label: "GPT-5.6 Terra",
+        context_window_tokens: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_STD,
+    },
+    BuiltinModelInfo {
+        id: "openai/gpt-5.6-luna",
+        provider: "openai",
+        family: Some(ModelFamily::Gpt),
+        name: "gpt-5.6-luna",
+        label: "GPT-5.6 Luna",
+        context_window_tokens: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_STD,
+    },
+    BuiltinModelInfo {
+        id: "anthropic/claude-opus-5",
+        provider: "anthropic",
+        family: Some(ModelFamily::Claude),
+        name: "claude-opus-5",
+        label: "Claude Opus 5",
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_FULL,
+    },
+    BuiltinModelInfo {
+        id: "chatgpt/gpt-5.6-sol",
+        provider: "chatgpt",
+        family: Some(ModelFamily::Gpt),
+        name: "gpt-5.6-sol",
+        label: "GPT-5.6 Sol (ChatGPT)",
+        // Subscription entitlements and limits are account-dependent.
+        context_window_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            tools: Support::Supported,
+            streaming: Support::Supported,
+            images: Support::Supported,
+            reasoning: Support::Supported,
+            ..ModelCapabilities::unknown()
+        },
+    },
+    BuiltinModelInfo {
+        id: "chatgpt/gpt-5.6-terra",
+        provider: "chatgpt",
+        family: Some(ModelFamily::Gpt),
+        name: "gpt-5.6-terra",
+        label: "GPT-5.6 Terra (ChatGPT)",
+        // Subscription entitlements and limits are account-dependent.
+        context_window_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            tools: Support::Supported,
+            streaming: Support::Supported,
+            images: Support::Supported,
+            reasoning: Support::Supported,
+            ..ModelCapabilities::unknown()
+        },
+    },
+    BuiltinModelInfo {
+        id: "chatgpt/gpt-5.6-luna",
+        provider: "chatgpt",
+        family: Some(ModelFamily::Gpt),
+        name: "gpt-5.6-luna",
+        label: "GPT-5.6 Luna (ChatGPT)",
+        // Subscription entitlements and limits are account-dependent.
+        context_window_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            tools: Support::Supported,
+            streaming: Support::Supported,
+            images: Support::Supported,
+            reasoning: Support::Supported,
+            ..ModelCapabilities::unknown()
+        },
+    },
     BuiltinModelInfo {
         id: "xai/grok-4.6",
         provider: "xai",
@@ -538,8 +601,8 @@ pub fn anthropic_reasoning_options(model: &str) -> Vec<crate::ReasoningOption> {
         "claude-opus-4-6" | "claude-sonnet-4-6" => vec![Effort {
             values: vec![Low, Medium, High, Max],
         }],
-        "claude-opus-4-7" | "claude-opus-4-8" | "claude-opus-5" | "claude-sonnet-5"
-        | "claude-fable-5" | "claude-fable-5-1" => vec![Effort {
+        "claude-opus-4-7" | "claude-opus-4-8" | "claude-opus-5" | "claude-opus-5-5"
+        | "claude-sonnet-5" | "claude-fable-5" | "claude-fable-5-1" => vec![Effort {
             values: vec![Low, Medium, High, Xhigh, Max],
         }],
         "claude-3-7-sonnet" | "claude-sonnet-4" | "claude-opus-4" | "claude-haiku-4"

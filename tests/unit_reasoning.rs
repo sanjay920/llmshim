@@ -43,6 +43,50 @@ fn multiple_anthropic_blocks_keep_order_text_and_opaque_bytes() {
 }
 
 #[test]
+fn opus_5_5_thinking_replays_only_to_documented_compatible_models() {
+    let provider = Anthropic::new("key".into());
+    let response = provider
+        .transform_response("claude-opus-5-5", anthropic_native())
+        .unwrap();
+    let assistant_message = response["choices"][0]["message"].clone();
+    assert_eq!(
+        assistant_message["reasoning"][0]["origin"]["model"],
+        "claude-opus-5-5"
+    );
+
+    let fable_request = provider
+        .transform_request("claude-fable-5-1", &request(assistant_message.clone()))
+        .unwrap();
+    assert_eq!(
+        fable_request.body["messages"][1]["content"],
+        anthropic_native()["content"]
+    );
+
+    let older_request = provider
+        .transform_request("claude-opus-5", &request(assistant_message.clone()))
+        .unwrap();
+    assert_eq!(
+        older_request.body["messages"][1]["content"],
+        json!("answer")
+    );
+    assert_eq!(
+        assistant_message["reasoning"][0]["origin"]["model"],
+        "claude-opus-5-5"
+    );
+
+    let fable_response = provider
+        .transform_response("claude-fable-5-1", anthropic_native())
+        .unwrap();
+    let opus_request = provider
+        .transform_request(
+            "claude-opus-5-5",
+            &request(fable_response["choices"][0]["message"].clone()),
+        )
+        .unwrap();
+    assert_eq!(opus_request.body["messages"][1]["content"], json!("answer"));
+}
+
+#[test]
 fn missing_origin_legacy_and_raw_native_thinking_are_dropped() {
     let p = Anthropic::new("key".into());
     let message = json!({"role":"assistant","content":[{"type":"thinking","thinking":"raw","signature":"untracked"},{"type":"text","text":"ok"}],

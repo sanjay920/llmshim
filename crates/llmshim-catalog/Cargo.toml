@@ -1,6 +1,6 @@
 [package]
 name = "llmshim-catalog"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 description = "Offline-first model metadata with verified defaults, models.dev, and local overrides"
 license = "MIT OR Apache-2.0"

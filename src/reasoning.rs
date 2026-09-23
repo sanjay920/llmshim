@@ -214,6 +214,21 @@ pub fn should_replay(
     if origin.wire != target.wire {
         return Err(DropReason::WireMismatch);
     }
+    if origin.provider == "anthropic" && target.provider == "anthropic" {
+        let source_model = origin.model.as_str();
+        let target_model = target.model.as_str();
+        let opus_55_source_supported = source_model != "claude-opus-5-5"
+            || matches!(
+                target_model,
+                "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1"
+            );
+        let opus_55_target_supported = target_model != "claude-opus-5-5"
+            || !(source_model.starts_with("claude-fable")
+                || source_model.starts_with("claude-mythos"));
+        if !opus_55_source_supported || !opus_55_target_supported {
+            return Err(DropReason::FamilyMismatch);
+        }
+    }
     if kind == ReasoningKind::Encrypted
         && (origin.provider != target.provider
             || origin.account.is_none()

@@ -8,7 +8,7 @@ model requests. It has no dependency on the llmshim translation crate.
 use llmshim_catalog::{Catalog, ModelFamily};
 
 let catalog = Catalog::vendored(); // no files or network needed
-let model = catalog.resolve("anthropic/claude-opus-5").unwrap();
+let model = catalog.resolve("anthropic/claude-opus-5-5").unwrap();
 assert_eq!(model.family, Some(ModelFamily::Claude));
 ```
 

@@ -12,9 +12,9 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 
 ## Advertised models
 
-- **OpenAI:** `gpt-6-astra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`
-- **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-5.6-sol`, `chatgpt/gpt-5.6-terra`, and `chatgpt/gpt-5.6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
-- **Anthropic:** `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`
+- **OpenAI:** `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`
+- **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and `chatgpt/gpt-6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
+- **Anthropic:** `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`
 - **Gemini:** `gemini-3.8-flash`, `gemini-3.5-flash-lite`
 - **xAI:** `grok-4.7`
 - **OpenRouter:** not enumerated (huge/dynamic catalog) — any `openrouter/<vendor>/<model>` slug routes through, e.g. `openrouter/anthropic/claude-sonnet-5`.
@@ -42,7 +42,7 @@ API keys: `~/.llmshim/config.toml` (via `llmshim configure`) or env vars `OPENAI
 `llmshim-catalog` is a standalone workspace member. Its `builtin` module owns
 the curated/historical constants; `src/models.rs` reexports the legacy borrowed
 API. Owned metadata and snapshots live in `llmshim::catalog`. Keep the curated
-15-route discovery and four-entry ChatGPT allowlist distinct from catalog
+13-route discovery and three-entry ChatGPT allowlist distinct from catalog
 coverage. Local policy > provider capabilities > verified builtin assertions >
 models.dev, per field; unknowns never erase assertions. Provider APIs never
 contribute pricing. See `crates/llmshim-catalog/README.md` for cache and override
@@ -120,7 +120,7 @@ cargo clippy --workspace --features proxy -- -D warnings
 cargo package -p llmshim-catalog --allow-dirty
 ```
 
-The root and language clients use version 0.12.1. The 0.12 minor bump was required because the public
+The root and language clients use version 0.13.0. The 0.13 minor bump also reflects the narrower ChatGPT model allowlist. The 0.12 minor bump was required because the public
 `CostSource` unions gain `provider_floor`; exhaustive consumers must handle it.
 The version metadata does not itself publish a release. Release workflows must
 publish the catalog dependency before llmshim. Public code, fixtures,
@@ -154,13 +154,13 @@ repair remain a separate concern. See `docs/src/guides/schemas.md`.
 
 `src/models.rs::MODELS` is the single advertised list, imported directly by
 `src/main.rs` and used by `available_models()` for proxy discovery. Keep the
-current model in each retained tier: four OpenAI, four Anthropic, two stable
-Gemini, one xAI, and four ChatGPT routes. Do not add previews or bring back
+current model in each retained tier: three OpenAI, four Anthropic, two stable
+Gemini, one xAI, and three ChatGPT routes. Do not add previews or bring back
 superseded generations without an explicit catalog decision.
 
 Historical metadata lives in private `LEGACY_MODELS` and remains queryable via
 `spec()`. Pruning discovery does not delete legacy transforms, tests, or
-explicit-ID routing. ChatGPT keeps its separately authorized four-ID request
+explicit-ID routing. ChatGPT keeps its separately authorized three-ID request
 allowlist. Keep reader-facing model tables and examples current; retain the
 actual model IDs in historical benchmark results and regression fixtures.
 
@@ -198,7 +198,7 @@ its own loopback CLI process and stops it on completion/failure:
 cargo test --features proxy --test integration_chatgpt_proxy -- --ignored --nocapture
 ```
 
-It checks all four models through `/v1/chat` and `/v1/chat/stream`, provider
+It checks all three models through `/v1/chat` and `/v1/chat/stream`, provider
 identity with API-key OpenAI also registered, model discovery, old-model
 rejection, Astra tool calls (normal and streaming), a tool-result round trip,
 and image input. It uses the saved ChatGPT login and consumes
@@ -348,6 +348,15 @@ trip; errors must not become success. Test with the
 accounts exercise enforcement too. The provider handles incompatible
 thinking on a switch to older models; do not infer signatures from text.
 
+Claude Opus 5.5 also requires adaptive thinking, rejects forced tools and
+assistant prefill, and binds thinking to the conversation prefix. It reads
+older Opus/Sonnet/Haiku thinking but not Fable/Mythos thinking; only Fable 5.1
+and Mythos 5.1 can read its thinking on a model switch. GPT-6 Sol/Luna accept
+`none` and `max` reasoning effort and native `pro` mode. Their current routes
+replace GPT-5.6 discovery entries, while historical OpenAI and Anthropic IDs
+remain explicitly routable. ChatGPT accepts only the three GPT-6 IDs; removal
+of its older 5.6 request IDs is a public behavior change in v0.13.0.
+
 `tests/unit_fable.rs` pins these rules. Live checks for Fable 5, Fable 5.1,
 Opus 5, Gemini 3.8 Flash, and Grok 4.7:
 
@@ -357,9 +366,9 @@ cargo test --features proxy --test integration_current_models -- --ignored --noc
 
 The live tests consume API usage and are ignored during offline preflight.
 Gemini 3.8 Flash and Opus 5 already had catalog/adapter support; Grok 4.7 is
-the current xAI model ID (verified live 2026-09-21); retain Grok 4.6 for explicit routing. Keep the ChatGPT four-model allowlist independent.
+the current xAI model ID (verified live 2026-09-21); retain Grok 4.6 for explicit routing. Keep the ChatGPT three-model allowlist independent.
 
-Two knobs work across every provider: `reasoning_effort` (`none|low|medium|high|xhigh|max`) and `reasoning_mode` (`standard|pro`). A third, `reasoning_summary` (`auto|none`), controls reasoning-text visibility → Anthropic `thinking.display` (`auto`→`summarized`, the default when `reasoning_effort` is present so newer models like Sonnet 5 / Opus 4.7-4.8 return reasoning text instead of the API-default `omitted`; `none`→`omitted` for lower latency). Applies to both the adaptive and pre-4.6 enabled thinking builders; a caller-supplied `thinking` block bypasses it. Each provider transform maps them to its native dialect, **clamping to the nearest tier the target model accepts** (all boundaries verified live — e.g. `max` is native on OpenAI gpt-5.6 and GPT-6 Astra; Anthropic 4.6 rejects `xhigh` but has `max`; Gemini's enum tops out at `high`; xAI grok-4.20 models reject any reasoning param). `mode: "pro"` is native on OpenAI gpt-5.6/-pro models (`reasoning.mode`), emulated as a one-tier effort bump elsewhere; explicit `none` always wins. Native passthrough (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) bypasses the mapping entirely and always takes precedence. **Full per-provider mapping tables: `docs/src/guides/reasoning.md`** — update it and the pinning tests in `tests/unit_*.rs` together whenever a mapping changes.
+Two knobs work across every provider: `reasoning_effort` (`none|low|medium|high|xhigh|max`) and `reasoning_mode` (`standard|pro`). A third, `reasoning_summary` (`auto|none`), controls reasoning-text visibility → Anthropic `thinking.display` (`auto`→`summarized`, the default when `reasoning_effort` is present so newer models like Sonnet 5 / Opus 4.7-4.8 return reasoning text instead of the API-default `omitted`; `none`→`omitted` for lower latency). Applies to both the adaptive and pre-4.6 enabled thinking builders; a caller-supplied `thinking` block bypasses it. Each provider transform maps them to its native dialect, **clamping to the nearest tier the target model accepts** (boundaries grounded in provider docs and live tests — e.g. `max` is native on OpenAI gpt-5.6 and all GPT-6 models; Anthropic 4.6 rejects `xhigh` but has `max`; Gemini's enum tops out at `high`; xAI grok-4.20 models reject any reasoning param). `mode: "pro"` is native on OpenAI gpt-5.6, GPT-6, and -pro models (`reasoning.mode`), emulated as a one-tier effort bump elsewhere; explicit `none` always wins. Native passthrough (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) bypasses the mapping entirely and always takes precedence. **Full per-provider mapping tables: `docs/src/guides/reasoning.md`** — update it and the pinning tests in `tests/unit_*.rs` together whenever a mapping changes.
 
 ### Owned tool identities and stream state
 
