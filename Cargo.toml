@@ -1,6 +1,6 @@
 [package]
 name = "llmshim"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2021"
 description = "Blazing fast LLM API translation layer in pure Rust"
 license = "MIT OR Apache-2.0"
@@ -44,9 +44,6 @@ base64 = "0.22"
 tempfile = "3"
 fs2 = "0.4"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 # Proxy dependencies (feature-gated)
 axum = { version = "0.8", features = ["json"], optional = true }
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
@@ -61,6 +58,9 @@ async-trait = { version = "0.1", optional = true }
 
 # Distributed rate-limit coordination (feature: redis-coordination, opt-in)
 redis = { version = "1", default-features = false, features = ["tokio-rustls-comp", "connection-manager", "script"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 eventsource-stream = "0.2"
