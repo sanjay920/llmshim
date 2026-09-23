@@ -120,7 +120,7 @@ cargo clippy --workspace --features proxy -- -D warnings
 cargo package -p llmshim-catalog --allow-dirty
 ```
 
-The root and language clients prepare version 0.12.0 because the public
+The root and language clients use version 0.12.1. The 0.12 minor bump was required because the public
 `CostSource` unions gain `provider_floor`; exhaustive consumers must handle it.
 The version metadata does not itself publish a release. Release workflows must
 publish the catalog dependency before llmshim. Public code, fixtures,
