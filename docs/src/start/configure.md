@@ -59,8 +59,8 @@ llmshim login chatgpt
 ```
 
 Open the printed URL, sign in, and enter the device code. Select
-`chatgpt/gpt-6-astra` or one of `chatgpt/gpt-5.6-sol`, `chatgpt/gpt-5.6-terra`,
-and `chatgpt/gpt-5.6-luna`. Only those four models are supported. ChatGPT tokens are
+`chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, or `chatgpt/gpt-6-luna`.
+Only those three models are supported. ChatGPT tokens are
 stored separately from API keys and refreshed automatically. Device login may
 need enabling in ChatGPT security settings or workspace permissions.
 

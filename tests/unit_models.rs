@@ -11,13 +11,20 @@ fn models_registry_has_all_providers() {
 
 #[test]
 fn models_registry_has_expected_count() {
-    assert_eq!(MODELS.len(), 15);
+    assert_eq!(MODELS.len(), 13);
 }
 
 #[test]
 fn legacy_specs_remain_queryable_without_advertising_old_models() {
     for id in [
         "openai/gpt-5.5",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-terra",
+        "openai/gpt-5.6-luna",
+        "anthropic/claude-opus-5",
+        "chatgpt/gpt-5.6-sol",
+        "chatgpt/gpt-5.6-terra",
+        "chatgpt/gpt-5.6-luna",
         "anthropic/claude-fable-5",
         "gemini/gemini-3.7-flash",
         "xai/grok-4.5",

@@ -9,10 +9,10 @@ send upstream.
 The most explicit form is `provider/model`:
 
 ```text
-openai/gpt-5.6-sol
-anthropic/claude-opus-5
+openai/gpt-6-sol
+anthropic/claude-opus-5-5
 gemini/gemini-3.8-flash
-xai/grok-4.6
+xai/grok-4.7
 ```
 
 The part before the first slash is the Router registration key. The remainder
@@ -46,8 +46,8 @@ select subscription access. Bare GPT names continue to use OpenAI API keys.
 The static model registry powers `llmshim models` and `GET /v1/models`. Those
 commands are discovery aids, filtered to configured providers. The registry is
 not generally an allowlist: most providers accept models absent from that list.
-ChatGPT accepts only `chatgpt/gpt-6-astra` and the three
-`chatgpt/gpt-5.6-{sol,terra,luna}` models. The provider rejects other IDs
+ChatGPT accepts only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and
+`chatgpt/gpt-6-luna`. The provider rejects other IDs
 before authentication or network calls, including through aliases.
 
 For that reason, this documentation does not maintain another static model
@@ -59,7 +59,7 @@ Rust applications can attach a one-level alias while building a Router:
 
 ```rust
 let router = llmshim::router::Router::from_env()
-    .alias("smart", "anthropic/claude-opus-5");
+    .alias("smart", "anthropic/claude-opus-5-5");
 ```
 
 The Router checks an alias before parsing the provider address. An alias target

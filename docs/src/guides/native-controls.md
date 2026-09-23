@@ -27,7 +27,7 @@ access to the full native reasoning object, including `effort`, `mode`,
 
 ```json
 {
-  "model": "openai/gpt-5.6-sol",
+  "model": "openai/gpt-6-sol",
   "messages": [{"role": "user", "content": "Analyze this carefully."}],
   "x-openai": {
     "reasoning": {
@@ -114,7 +114,7 @@ request. Wrap the same namespace inside it:
 
 ```json
 {
-  "model": "openai/gpt-5.6-sol",
+  "model": "openai/gpt-6-sol",
   "messages": [{"role": "user", "content": "Analyze this carefully."}],
   "provider_config": {
     "x-openai": {

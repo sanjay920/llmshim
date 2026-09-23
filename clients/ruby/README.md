@@ -44,7 +44,7 @@ environment variables. The Ruby client never sees your keys — the proxy holds 
 
 | Provider   | Model string form                       | Env vars                              |
 | ---------- | --------------------------------------- | ------------------------------------- |
-| OpenAI     | `openai/gpt-5.6-sol`                    | `OPENAI_API_KEY`                      |
+| OpenAI     | `openai/gpt-6-sol`                    | `OPENAI_API_KEY`                      |
 | Anthropic  | `anthropic/claude-sonnet-5`            | `ANTHROPIC_API_KEY`                   |
 | Gemini     | `gemini/gemini-3.8-flash`              | `GEMINI_API_KEY`                      |
 | xAI        | `xai/grok-4.6`                         | `XAI_API_KEY`                         |
@@ -75,7 +75,7 @@ of message hashes:
 
 ```ruby
 resp = client.chat(
-  model: "openai/gpt-5.6-sol",
+  model: "openai/gpt-6-sol",
   messages: [
     { role: "system", content: "You are a pirate." },
     { role: "user",   content: "Hello!" }
@@ -99,7 +99,7 @@ A shared default client (base URL from `LLMSHIM_BASE_URL`, else `http://localhos
 ```ruby
 require "llmshim"
 
-resp = Llmshim.chat(model: "gpt-5.6-sol", messages: "Explain quicksort")
+resp = Llmshim.chat(model: "gpt-6-sol", messages: "Explain quicksort")
 puts resp.content
 ```
 
@@ -127,7 +127,7 @@ Predicate helpers are available too: `event.content?`, `event.reasoning?`,
 Called without a block, `stream` returns the collected array of events:
 
 ```ruby
-events = client.stream(model: "gpt-5.6-sol", messages: "Hi")
+events = client.stream(model: "gpt-6-sol", messages: "Hi")
 text = events.select(&:content?).map(&:text).join
 ```
 
@@ -147,7 +147,7 @@ resp = client.chat(
   # Provider-specific controls, namespaced under x-<provider> (see below):
   provider_config: { "x-anthropic" => { thinking: { type: "adaptive" }, output_config: { effort: "high" } } },
   # Try these models if the primary fails with a retryable error:
-  fallback: ["openai/gpt-5.6-sol", "gemini/gemini-3.8-flash"]
+  fallback: ["openai/gpt-6-sol", "gemini/gemini-3.8-flash"]
 )
 
 resp.message.tool_calls.each do |tc|
@@ -208,7 +208,7 @@ Two provider-agnostic knobs live in `config` (pass them as top-level kwargs):
 
 ```ruby
 resp = client.chat(
-  model: "openai/gpt-5.6-sol",
+  model: "openai/gpt-6-sol",
   messages: "Prove that sqrt(2) is irrational.",
   reasoning_effort: "high",
   reasoning_mode: "pro"

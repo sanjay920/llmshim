@@ -138,28 +138,29 @@ See [Native provider controls](native-controls.md) for passthrough examples.
 
 ## Effort mapping tables
 
-These mappings were verified against the live provider APIs. A bold value is a
-clamp rather than a direct name-for-name mapping.
+These mappings follow provider documentation and live checks. A bold value
+is a clamp rather than a direct name-for-name mapping.
 
 ### OpenAI Responses API
 
-| unified | GPT-6 Astra | GPT-5.6 Sol / Terra / Luna |
-|---|---|---|
-| `none` | **`low`** | `none` |
-| `low` | `low` | `low` |
-| `medium` | `medium` | `medium` |
-| `high` | `high` | `high` |
-| `xhigh` | `xhigh` | `xhigh` |
-| `max` | `max` | `max` |
+| unified | GPT-6 Astra | GPT-6 Sol / Luna | GPT-5.6 Sol / Terra / Luna (explicit legacy) |
+|---|---|---|---|
+| `none` | **`low`** | `none` | `none` |
+| `low` | `low` | `low` | `low` |
+| `medium` | `medium` | `medium` | `medium` |
+| `high` | `high` | `high` | `high` |
+| `xhigh` | `xhigh` | `xhigh` | `xhigh` |
+| `max` | `max` | `max` | `max` |
 
 OpenAI receives `reasoning.effort`. Legacy `minimal` input clamps to `low`
-on all four advertised models.
+on the three advertised GPT-6 models. See the
+[OpenAI model catalog](https://developers.openai.com/api/docs/models).
 
 ### Anthropic Messages API
 
 Adaptive models use `thinking: {type}` plus `output_config: {effort}`:
 
-| unified | Fable 5.1 | Opus 5 / Sonnet 5 |
+| unified | Fable 5.1 / Opus 5.5 | Opus 5 / Sonnet 5 |
 |---|---|---|
 | `none` | `adaptive` + **`low`** | `thinking: {type: "disabled"}` |
 | `low` | `adaptive` + `low` | `adaptive` + `low` |
@@ -169,10 +170,12 @@ Adaptive models use `thinking: {type}` plus `output_config: {effort}`:
 | `max` | `adaptive` + `max` | `adaptive` + `max` |
 
 On models that can disable thinking, `reasoning_effort: "none"` maps to disabled
-thinking. Fable 5.1 always uses adaptive thinking, so `none` maps to `low`.
-Explicit native `thinking.type: "disabled"` or `"enabled"` is rejected locally
-for Fable. Fable and Opus 5 omit `temperature`, `top_p`, and `top_k` regardless
-of whether a thinking object was explicitly provided.
+thinking. Fable 5.1 and Opus 5.5 always use adaptive thinking, so `none` maps
+to `low`. Explicit native disabled/manual thinking is rejected locally for
+those models, as is forced tool choice. Opus 5.5 thinking blocks replay to
+Fable 5.1, while older Opus models cannot consume them. Opus 5.5 omits
+`temperature`, `top_p`, and `top_k`, as do Fable and Opus 5. See the
+[Opus 5.5 migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
 
 Fable behavior and its five effort levels follow Anthropic's
 [migration guide](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide)
@@ -210,12 +213,12 @@ Native controls remain available through `x-gemini.thinkingConfig`.
 
 ### ChatGPT subscription
 
-GPT-5.6 Sol, Terra, and Luna use the GPT-5.6 mapping above.
 GPT-6 Astra preserves `low`, `medium`, `high`, `xhigh`, and `max`;
 `none` and `minimal` clamp to `low` because Astra cannot disable reasoning.
-The shared Responses translator applies this mapping to Astra through either
-ChatGPT or API-key OpenAI. These effort values follow the
-[official Astra model documentation](https://developers.openai.com/api/docs/models/gpt-6-astra).
+GPT-6 Sol and Luna accept `none` and `max`; `minimal` clamps to `low`.
+The shared Responses translator applies these mappings through both ChatGPT
+subscription and API-key OpenAI. See the
+[official OpenAI model catalog](https://developers.openai.com/api/docs/models).
 Native `x-chatgpt.reasoning` overrides the unified mapping.
 
 ### xAI Responses API
@@ -248,8 +251,7 @@ Chat Completions shape with `function.name`.
 
 | Provider / model | What `pro` does |
 |---|---|
-| OpenAI GPT-5.6 family | Native `reasoning.mode: "pro"` |
-| OpenAI GPT-6 Astra | One-tier effort bump (`low → medium → high → xhigh`); explicit `max` stays `max` |
+| OpenAI GPT-5.6 and GPT-6 families | Native `reasoning.mode: "pro"` |
 | Anthropic | One-tier effort bump (`low → medium → high → xhigh → max`) |
 | Gemini | One-tier bump within its four-rung enum, capped at `high` |
 | xAI Grok 4.7 | One-tier bump, capped at `xhigh` |
@@ -261,6 +263,9 @@ Rules that hold across providers:
   is not bumped back on, except where the model itself cannot disable it.
 - `pro` without an effort lets OpenAI native-mode models select their own
   effort. Other models behave as a default `medium` bumped to `high`.
+
+The native GPT-6 mode follows the
+[OpenAI reasoning guide](https://developers.openai.com/api/docs/guides/reasoning).
 
 ## Precedence
 

@@ -136,13 +136,8 @@ fn translates_chat_tools_images_and_enforces_backend_constraints() {
 }
 
 #[test]
-fn supported_catalog_and_reasoning_match_the_four_current_models() {
-    let expected = [
-        "gpt-6-astra",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-    ];
+fn supported_catalog_and_reasoning_match_the_three_current_models() {
+    let expected = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
     let catalog = llmshim::models::available_models(&["chatgpt"]);
     assert_eq!(catalog.iter().map(|m| m.name).collect::<Vec<_>>(), expected);
     let (_dir, auth) = auth_fixture(token_record(false));
@@ -200,6 +195,9 @@ async fn older_and_unlisted_models_fail_before_authentication_or_dispatch() {
     let auth = ChatGptAuth::new(dir.path().join("auth.json")).with_auth_base(server.url());
     let provider = ChatGpt::new(auth).with_base_url(server.url());
     for model in [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.4",
         "gpt-5.3-codex",
@@ -657,9 +655,8 @@ fn cli_discovers_saved_login_and_lists_subscription_models() {
             "ChatGPT login is ready",
         ),
         (vec!["models"], "chatgpt/gpt-6-astra"),
-        (vec!["models"], "chatgpt/gpt-5.6-sol"),
-        (vec!["models"], "chatgpt/gpt-5.6-terra"),
-        (vec!["models"], "chatgpt/gpt-5.6-luna"),
+        (vec!["models"], "chatgpt/gpt-6-sol"),
+        (vec!["models"], "chatgpt/gpt-6-luna"),
     ] {
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_llmshim"))
             .args(args)
