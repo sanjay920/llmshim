@@ -167,7 +167,7 @@ fn native_overrides_and_mislabelled_payloads_cannot_bypass_replay_policy() {
     let origin = p.replay_target("gpt-6-astra").origin();
     let mut message = json!({"role":"assistant","reasoning":[{"kind":"text","text":"summary","origin":origin,
         "payload":{"type":"reasoning","id":"rs_bad","encrypted_content":"hidden"}}]});
-    filter_reasoning_for_target(&mut message, &p.replay_target("gpt-6-astra"));
+    filter_reasoning_for_target(&mut message, &p.replay_target("gpt-6-astra")).unwrap();
     assert!(message.get("reasoning").is_none());
 }
 
@@ -298,12 +298,13 @@ fn gemini_tool_signatures_have_origin_and_round_trip_only_to_compatible_wire() {
     filter_reasoning_for_target(
         &mut foreign,
         &OpenAi::new("key".into()).replay_target("gpt-6-astra"),
-    );
+    )
+    .unwrap();
     assert!(foreign["tool_calls"][0].get("thought_signature").is_none());
     let mut other_provider = message.clone();
     let mut same_family_target = p.replay_target("gemini-3.8-flash");
     same_family_target.provider = "another-google-gateway".into();
-    filter_reasoning_for_target(&mut other_provider, &same_family_target);
+    filter_reasoning_for_target(&mut other_provider, &same_family_target).unwrap();
     assert!(other_provider["tool_calls"][0]
         .get("thought_signature")
         .is_none());

@@ -74,6 +74,15 @@ are read for one migration release, but untracked data is dropped. An explicit
 writers emit only the block array. Models absent from the catalog need a local
 family assertion before their reasoning can be replayed.
 
+Inbound reasoning history has a separate whole-request limit of 16 MiB of
+estimated derived metadata and 16,384 reasoning records. A record is one
+reasoning block or tool signature, rather than every JSON descendant. The limit
+is checked across all messages before legacy origins or payloads are repeated;
+an excessive request fails with a fixed 400 and no provider call. Accepted
+legacy and normalized blocks remain byte-for-byte intact. The public Rust
+`filter_reasoning_for_target` helper returns a `Result` for the same reason:
+propagate a budget error instead of treating it as an ordinary policy drop.
+
 Unary reasoning blocks, tool signatures, wire identities, and their provenance
 share a 16 MiB estimated-owned-memory and 4,096-entry derived metadata limit.
 The limit is checked before model, provider, account, payload, or signature
