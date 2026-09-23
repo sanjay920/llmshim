@@ -729,6 +729,11 @@ impl ShimClient {
                     );
                 }
             };
+            if let Some(tracker) = &tracker {
+                tracker.native(crate::policy::NativeFrame::ResponseBody {
+                    body: &native_response,
+                });
+            }
             let mut result = match crate::providers::chatgpt::transform_collected_response(
                 &target,
                 model,
@@ -781,6 +786,9 @@ impl ShimClient {
                 return Err(error.into_dispatch_failure());
             }
         };
+        if let Some(tracker) = &tracker {
+            tracker.native(crate::policy::NativeFrame::ResponseBody { body: &body });
+        }
         observe_native_response_usage(
             &target,
             &body,
@@ -1419,6 +1427,9 @@ async fn run_eager_stream_producer(
                 return;
             }
         };
+        if let Some(tracker) = &tracker {
+            tracker.native(crate::policy::NativeFrame::StreamData { data: &data });
+        }
         if data.trim().is_empty() {
             continue;
         }
