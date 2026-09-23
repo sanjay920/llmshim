@@ -250,6 +250,7 @@ impl Provider for ChatGpt {
 
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
         validate_model(model)?;
+        crate::reasoning::preflight_request(request)?;
         self.request(model, request, self.auth.cached_credentials()?)
     }
 
@@ -260,6 +261,7 @@ impl Provider for ChatGpt {
     ) -> Pin<Box<dyn Future<Output = Result<ProviderRequest>> + Send + 'a>> {
         Box::pin(async move {
             validate_model(model)?;
+            crate::reasoning::preflight_request(request)?;
             self.request(model, request, self.auth.credentials().await?)
         })
     }

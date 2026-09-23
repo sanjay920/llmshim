@@ -92,7 +92,7 @@ fn protocol_key(protocol: QueueProtocol, kind: &str, identifier: &str) -> String
         "dlq" => lifecycle::dlq_key(protocol, identifier),
         "resp" => lifecycle::response_channel(protocol, identifier),
         _ => format!(
-            "llmshim:gw:lifecycle:v1:{}:{kind}:{identifier}",
+            "llmshim:gw:lifecycle:v2:{}:{kind}:{identifier}",
             protocol.scope_name()
         ),
     }
@@ -112,6 +112,13 @@ fn released_protocol_key(protocol: QueueProtocol, kind: &str, identifier: &str) 
         QueueProtocol::LegacyUnscoped => format!("llmshim:gw:{kind}:{identifier}"),
         QueueProtocol::ScopedV1 => format!("llmshim:gw:scoped:v1:{kind}:{identifier}"),
     }
+}
+
+fn prior_lifecycle_key(protocol: QueueProtocol, kind: &str, identifier: &str) -> String {
+    format!(
+        "llmshim:gw:lifecycle:v1:{}:{kind}:{identifier}",
+        protocol.scope_name()
+    )
 }
 
 fn protocol_queue_key(protocol: QueueProtocol, provider: &str) -> String {
@@ -188,6 +195,13 @@ const LEASE_LUA: &str = r#"
         redis.call('ZREM', KEYS[1], m)
         return false
     end
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    local origin_expiry = tonumber(redis.call('HGET', meta, 'origin_expires_at_ms') or '0')
+    local origin_max = tonumber(redis.call('HGET', meta, 'origin_max_expires_at_ms') or '0')
+    if origin_expiry <= now_ms or origin_max <= now_ms then
+        redis.call('HSET', meta, 'cancel_requested', '1')
+    end
     if redis.call('HGET', meta, 'cancel_requested') == '1' then return false end
     local terminal_charge = tonumber(ARGV[4])
     if redis.call('HGET', meta, 'stream') == '1' then terminal_charge = tonumber(ARGV[5]) end
@@ -197,8 +211,6 @@ const LEASE_LUA: &str = r#"
     elseif terminal_bytes + terminal_charge > tonumber(ARGV[3]) then return false end
     local payload = redis.call('GET', payload_key)
     if not payload then return false end
-    local redis_time = redis.call('TIME')
-    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
     redis.call('ZREM', KEYS[1], m)
     redis.call('ZADD', KEYS[2], now_ms + ARGV[1], m)
     redis.call('HSET', KEYS[3], m, s)
@@ -232,6 +244,13 @@ const ACK_LUA: &str = r#"
 const RELEASE_LUA: &str = r#"
     if redis.call('HGET', KEYS[4], ARGV[1]) ~= ARGV[3] then return 0 end
     if redis.call('HGET', KEYS[6], 'generation') ~= ARGV[4] then return 0 end
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    local origin_expiry = tonumber(redis.call('HGET', KEYS[6], 'origin_expires_at_ms') or '0')
+    local origin_max = tonumber(redis.call('HGET', KEYS[6], 'origin_max_expires_at_ms') or '0')
+    if origin_expiry <= now_ms or origin_max <= now_ms then
+        redis.call('HSET', KEYS[6], 'cancel_requested', '1')
+    end
     if redis.call('HGET', KEYS[6], 'cancel_requested') == '1' then return -1 end
     local terminal_charge = tonumber(redis.call('HGET', KEYS[6], 'terminal_charge') or '0')
     if terminal_charge > 0 then
@@ -260,6 +279,13 @@ const REAP_LUA: &str = r#"
         local id, generation = string.match(m, '^(.*):([^:]*)$')
         local meta = id and (ARGV[2] .. id .. ':meta') or nil
         local s = redis.call('HGET', KEYS[3], m)
+        local origin_expired = false
+        if meta then
+            local origin_expiry = tonumber(redis.call('HGET', meta, 'origin_expires_at_ms') or '0')
+            local origin_max = tonumber(redis.call('HGET', meta, 'origin_max_expires_at_ms') or '0')
+            origin_expired = origin_expiry <= now_ms or origin_max <= now_ms
+            if origin_expired then redis.call('HSET', meta, 'cancel_requested', '1') end
+        end
         if meta and redis.call('HGET', meta, 'generation') == generation
             and redis.call('HGET', meta, 'cancel_requested') == '1' then
             local terminal_charge = tonumber(redis.call('HGET', meta, 'terminal_charge') or '0')
@@ -271,6 +297,7 @@ const REAP_LUA: &str = r#"
             redis.call('HSET', KEYS[7], m, string.len(ARGV[4]))
             redis.call('HSET', KEYS[8], m, 'terminal')
             redis.call('ZADD', KEYS[6], now_ms + tonumber(ARGV[3]), m)
+            redis.call('ZREM', KEYS[9], m)
             local hard_ttl = tonumber(ARGV[3]) + tonumber(ARGV[5])
             redis.call('PEXPIRE', meta, hard_ttl)
             redis.call('PEXPIRE', ARGV[2] .. id .. ':payload', hard_ttl)
@@ -294,9 +321,14 @@ const REFRESH_LUA: &str = r#"
     if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return 0 end
     if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
     if redis.call('HGET', KEYS[3], 'generation') ~= ARGV[4] then return 0 end
-    if redis.call('HGET', KEYS[3], 'cancel_requested') == '1' then return -1 end
     local redis_time = redis.call('TIME')
     local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    local origin_expiry = tonumber(redis.call('HGET', KEYS[3], 'origin_expires_at_ms') or '0')
+    local origin_max = tonumber(redis.call('HGET', KEYS[3], 'origin_max_expires_at_ms') or '0')
+    if origin_expiry <= now_ms or origin_max <= now_ms then
+        redis.call('HSET', KEYS[3], 'cancel_requested', '1')
+    end
+    if redis.call('HGET', KEYS[3], 'cancel_requested') == '1' then return -1 end
     redis.call('ZADD', KEYS[1], 'XX', now_ms + ARGV[3], ARGV[1])
     return 1
 "#;
@@ -308,6 +340,13 @@ const PUBLISH_LUA: &str = r#"
     if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return -1 end
     if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return -1 end
     if redis.call('HGET', KEYS[3], 'generation') ~= ARGV[5] then return -1 end
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    local origin_expiry = tonumber(redis.call('HGET', KEYS[3], 'origin_expires_at_ms') or '0')
+    local origin_max = tonumber(redis.call('HGET', KEYS[3], 'origin_max_expires_at_ms') or '0')
+    if origin_expiry <= now_ms or origin_max <= now_ms then
+        redis.call('HSET', KEYS[3], 'cancel_requested', '1')
+    end
     if redis.call('HGET', KEYS[3], 'cancel_requested') == '1' then return -2 end
     return redis.call('PUBLISH', ARGV[3], ARGV[4])
 "#;
@@ -336,13 +375,18 @@ const TERMINAL_PUBLISH_COMPLETE_LUA: &str = r#"
     if redis.call('HGET', KEYS[6], 'generation') ~= ARGV[6] then return 0 end
     local reserved = tonumber(redis.call('HGET', KEYS[6], 'terminal_charge') or '0')
     local terminal_payload = ARGV[5]
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    local origin_expiry = tonumber(redis.call('HGET', KEYS[6], 'origin_expires_at_ms') or '0')
+    local origin_max = tonumber(redis.call('HGET', KEYS[6], 'origin_max_expires_at_ms') or '0')
+    if origin_expiry <= now_ms or origin_max <= now_ms then
+        redis.call('HSET', KEYS[6], 'cancel_requested', '1')
+    end
     if redis.call('HGET', KEYS[6], 'cancel_requested') == '1' then
         terminal_payload = ARGV[8]
     end
     local actual = string.len(terminal_payload)
     if actual > reserved then return -2 end
-    local redis_time = redis.call('TIME')
-    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
     redis.call('SET', KEYS[7], terminal_payload)
     redis.call('HSET', KEYS[6], 'state', 'terminal', 'terminal_charge', actual)
     redis.call('HSET', KEYS[10], ARGV[1], actual)
@@ -357,6 +401,7 @@ const TERMINAL_PUBLISH_COMPLETE_LUA: &str = r#"
     redis.call('ZREM', KEYS[1], ARGV[1])
     redis.call('HDEL', KEYS[2], ARGV[1])
     redis.call('HDEL', KEYS[3], ARGV[1])
+    redis.call('ZREM', KEYS[12], ARGV[1])
     return 1
 "#;
 
@@ -370,7 +415,13 @@ const DEAD_LETTER_LUA: &str = r#"
     if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
     if redis.call('HGET', KEYS[6], 'generation') ~= ARGV[3] then return 0 end
     local base_charge = tonumber(redis.call('HGET', KEYS[6], 'base_charge') or '0')
+    local redis_time = redis.call('TIME')
+    local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
+    local origin_expiry = tonumber(redis.call('HGET', KEYS[6], 'origin_expires_at_ms') or '0')
+    local origin_max = tonumber(redis.call('HGET', KEYS[6], 'origin_max_expires_at_ms') or '0')
     local canceled = redis.call('HGET', KEYS[6], 'cancel_requested') == '1'
+        or origin_expiry <= now_ms or origin_max <= now_ms
+    if canceled then redis.call('HSET', KEYS[6], 'cancel_requested', '1') end
     local dlq_bytes = tonumber(redis.call('HGET', KEYS[5], 'dlq_bytes') or '0')
     local overflow = redis.call('ZCARD', KEYS[4]) >= tonumber(ARGV[5])
         or dlq_bytes + base_charge > tonumber(ARGV[6])
@@ -385,8 +436,6 @@ const DEAD_LETTER_LUA: &str = r#"
         redis.call('HSET', KEYS[6], 'state', 'terminal', 'terminal_charge', '0')
         redis.call('HSET', KEYS[12], ARGV[1], 0)
         redis.call('HSET', KEYS[13], ARGV[1], 'terminal')
-        local redis_time = redis.call('TIME')
-        local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
         redis.call('ZADD', KEYS[7], now_ms + tonumber(ARGV[7]), ARGV[1])
         redis.call('ZREM', KEYS[4], ARGV[1])
     elseif overflow then
@@ -394,12 +443,8 @@ const DEAD_LETTER_LUA: &str = r#"
         redis.call('HSET', KEYS[6], 'state', 'terminal', 'terminal_charge', '0')
         redis.call('HSET', KEYS[12], ARGV[1], 0)
         redis.call('HSET', KEYS[13], ARGV[1], 'terminal')
-        local redis_time = redis.call('TIME')
-        local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
         redis.call('ZADD', KEYS[7], now_ms + tonumber(ARGV[7]), ARGV[1])
     else
-        local redis_time = redis.call('TIME')
-        local now_ms = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
         redis.call('ZADD', KEYS[4], now_ms, ARGV[1])
         redis.call('ZADD', KEYS[7], now_ms + tonumber(ARGV[4]), ARGV[1])
         redis.call('HINCRBY', KEYS[5], 'dlq_bytes', base_charge)
@@ -416,6 +461,7 @@ const DEAD_LETTER_LUA: &str = r#"
     redis.call('ZREM', KEYS[1], ARGV[1])
     redis.call('HDEL', KEYS[2], ARGV[1])
     redis.call('HDEL', KEYS[3], ARGV[1])
+    redis.call('ZREM', KEYS[14], ARGV[1])
     return 1
 "#;
 
@@ -454,11 +500,50 @@ pub(crate) struct PreparedSubmission {
     protocol: QueueProtocol,
     serialized_payload: String,
     reservation_nonce: String,
+    origin_token: String,
 }
 
 pub(crate) struct AcceptedSubmission {
     prepared: PreparedSubmission,
     pubsub: redis::aio::PubSub,
+    origin_deadline: tokio::time::Instant,
+    origin_guard: OriginDropGuard,
+}
+
+#[derive(Clone)]
+struct OriginCancelCommand {
+    protocol: QueueProtocol,
+    provider: String,
+    id: String,
+    generation: String,
+    member: String,
+    origin_token: String,
+}
+
+struct OriginDropGuard {
+    sender: mpsc::Sender<OriginCancelCommand>,
+    command: Option<OriginCancelCommand>,
+}
+
+enum StreamDataSend {
+    Sent { terminal_committed: bool },
+    ReceiverClosed,
+    Deadline,
+    HeartbeatFailed(i64),
+}
+
+impl OriginDropGuard {
+    fn disarm(&mut self) {
+        self.command.take();
+    }
+}
+
+impl Drop for OriginDropGuard {
+    fn drop(&mut self) {
+        if let Some(command) = self.command.take() {
+            let _ = self.sender.try_send(command);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -497,6 +582,7 @@ impl PreparedSubmission {
             protocol,
             serialized_payload,
             reservation_nonce: uuid::Uuid::new_v4().simple().to_string(),
+            origin_token: uuid::Uuid::new_v4().simple().to_string(),
         })
     }
 }
@@ -576,8 +662,14 @@ pub struct DistributedGateway {
     redis_operation_timeout: Duration,
     worker_job_timeout: Duration,
     lifecycle_limits: lifecycle::Limits,
+    origin_lease_timeout: Duration,
+    origin_cancel_sender: mpsc::Sender<OriginCancelCommand>,
     #[cfg(test)]
     terminal_operation_delay: Duration,
+    #[cfg(test)]
+    activation_operation_delay: Duration,
+    #[cfg(test)]
+    origin_heartbeat_barrier: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl DistributedGateway {
@@ -628,6 +720,17 @@ impl DistributedGateway {
             "LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS",
             Duration::from_secs(6 * 60 * 60),
         );
+        let origin_lease_timeout = positive_duration_from_env(
+            "LLMSHIM_GATEWAY_ORIGIN_LEASE_MS",
+            config.lease_timeout.min(Duration::from_secs(60)),
+        )
+        .min(Duration::from_secs(5 * 60));
+        let lifecycle_limits = lifecycle::Limits::from_env();
+        let cancellation_capacity = usize::try_from(lifecycle_limits.max_jobs)
+            .unwrap_or(usize::MAX)
+            .min(config.max_queue_depth.max(1))
+            .clamp(1, 10_000);
+        let (origin_cancel_sender, origin_cancel_receiver) = mpsc::channel(cancellation_capacity);
         let connections = Arc::new(crate::redis_operation::RedisConnectionManagerCache::new(
             client.clone(),
         ));
@@ -641,7 +744,7 @@ impl DistributedGateway {
             },
         )
         .await?;
-        Ok(Arc::new(Self {
+        let gateway = Arc::new(Self {
             client,
             connections,
             dispatch,
@@ -663,10 +766,22 @@ impl DistributedGateway {
             bump_attempts_script: redis::Script::new(BUMP_ATTEMPTS_LUA),
             redis_operation_timeout,
             worker_job_timeout,
-            lifecycle_limits: lifecycle::Limits::from_env(),
+            lifecycle_limits,
+            origin_lease_timeout,
+            origin_cancel_sender,
             #[cfg(test)]
             terminal_operation_delay: Duration::ZERO,
-        }))
+            #[cfg(test)]
+            activation_operation_delay: Duration::ZERO,
+            #[cfg(test)]
+            origin_heartbeat_barrier: None,
+        });
+        tokio::spawn(origin_cancellation_pump(
+            gateway.connections.clone(),
+            gateway.redis_operation_timeout,
+            origin_cancel_receiver,
+        ));
+        Ok(gateway)
     }
 
     async fn redis_operation<T, F, Fut>(&self, operation: F) -> redis::RedisResult<T>
@@ -824,14 +939,19 @@ impl DistributedGateway {
                 .zcard(released_queue_key(QueueProtocol::ScopedV1, p))
                 .zcard(l1_protocol_key(QueueProtocol::LegacyUnscoped, "q", p))
                 .zcard(l1_protocol_key(QueueProtocol::ScopedV1, "q", p));
-            let (legacy, scoped, released_unscoped, released_scoped, l1_unscoped, l1_scoped): (
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-                u64,
-            ) = self
+            pipeline
+                .zcard(prior_lifecycle_key(QueueProtocol::LegacyUnscoped, "q", p))
+                .zcard(prior_lifecycle_key(QueueProtocol::ScopedV1, "q", p));
+            let (
+                legacy,
+                scoped,
+                released_unscoped,
+                released_scoped,
+                l1_unscoped,
+                l1_scoped,
+                prior_unscoped,
+                prior_scoped,
+            ): (u64, u64, u64, u64, u64, u64, u64, u64) = self
                 .redis_operation(|mut connection| async move {
                     pipeline.query_async(&mut connection).await
                 })
@@ -845,7 +965,9 @@ impl DistributedGateway {
                     .saturating_add(released_unscoped)
                     .saturating_add(released_scoped)
                     .saturating_add(l1_unscoped)
-                    .saturating_add(l1_scoped) as usize,
+                    .saturating_add(l1_scoped)
+                    .saturating_add(prior_unscoped)
+                    .saturating_add(prior_scoped) as usize,
             ));
         }
         out
@@ -865,7 +987,8 @@ impl DistributedGateway {
     async fn enqueue_prepared(
         &self,
         prepared_submission: &mut PreparedSubmission,
-    ) -> Result<(), GatewayError> {
+        origin_deadline: tokio::time::Instant,
+    ) -> Result<OriginDropGuard, GatewayError> {
         let descriptor = &prepared_submission.descriptor;
         let protocol = prepared_submission.protocol;
         let id = descriptor.id.clone();
@@ -884,8 +1007,19 @@ impl DistributedGateway {
             l1_protocol_key(QueueProtocol::LegacyUnscoped, "proc", &provider),
             l1_protocol_key(QueueProtocol::ScopedV1, "q", &provider),
             l1_protocol_key(QueueProtocol::ScopedV1, "proc", &provider),
+            prior_lifecycle_key(QueueProtocol::LegacyUnscoped, "q", &provider),
+            prior_lifecycle_key(QueueProtocol::LegacyUnscoped, "proc", &provider),
+            prior_lifecycle_key(QueueProtocol::ScopedV1, "q", &provider),
+            prior_lifecycle_key(QueueProtocol::ScopedV1, "proc", &provider),
         ];
         let limits = self.lifecycle_limits;
+        let origin_total_lifetime =
+            origin_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if origin_total_lifetime.is_zero() {
+            return Err(GatewayError::Timeout);
+        }
+        let origin_lease = self.origin_lease_timeout.min(origin_total_lifetime);
+        let origin_token = prepared_submission.origin_token.clone();
         let reserved = self
             .redis_operation(|mut connection| async move {
                 match lifecycle::reserve(
@@ -899,6 +1033,9 @@ impl DistributedGateway {
                     priority_score,
                     limits,
                     old_keys.each_ref().map(|key| key.as_str()),
+                    origin_lease,
+                    origin_total_lifetime,
+                    &origin_token,
                 )
                 .await
                 {
@@ -926,6 +1063,21 @@ impl DistributedGateway {
                 }
             })?;
         prepared_submission.member = reserved.member.clone();
+        let mut origin_guard = OriginDropGuard {
+            sender: self.origin_cancel_sender.clone(),
+            command: Some(OriginCancelCommand {
+                protocol,
+                provider: descriptor.provider.clone(),
+                id: descriptor.id.clone(),
+                generation: reserved.generation.clone(),
+                member: reserved.member.clone(),
+                origin_token: prepared_submission.origin_token.clone(),
+            }),
+        };
+        #[cfg(test)]
+        if !self.activation_operation_delay.is_zero() {
+            tokio::time::sleep(self.activation_operation_delay).await;
+        }
         let provider = descriptor.provider.clone();
         let id = descriptor.id.clone();
         let request_timeout = self.config.request_timeout;
@@ -942,6 +1094,8 @@ impl DistributedGateway {
                     released_queue_key(QueueProtocol::ScopedV1, &provider),
                     l1_protocol_key(QueueProtocol::LegacyUnscoped, "q", &provider),
                     l1_protocol_key(QueueProtocol::ScopedV1, "q", &provider),
+                    prior_lifecycle_key(QueueProtocol::LegacyUnscoped, "q", &provider),
+                    prior_lifecycle_key(QueueProtocol::ScopedV1, "q", &provider),
                 ];
                 lifecycle::activate(
                     &mut connection,
@@ -958,13 +1112,25 @@ impl DistributedGateway {
             })
             .await;
         match activation {
-            Ok(true) => Ok(()),
+            Ok(true) => Ok(origin_guard),
             Ok(false) => {
-                self.cancel_prepared(prepared_submission).await;
+                if self
+                    .cancel_origin(origin_guard.command.as_ref().unwrap().clone())
+                    .await
+                    > 0
+                {
+                    origin_guard.disarm();
+                }
                 Err(GatewayError::Overloaded(self.config.overloaded_retry_after))
             }
             Err(error) => {
-                self.cancel_prepared(prepared_submission).await;
+                if self
+                    .cancel_origin(origin_guard.command.as_ref().unwrap().clone())
+                    .await
+                    > 0
+                {
+                    origin_guard.disarm();
+                }
                 Err(redis_err(&error))
             }
         }
@@ -973,7 +1139,14 @@ impl DistributedGateway {
     #[cfg(test)]
     async fn enqueue(&self, prepared_submission: &PreparedSubmission) -> Result<(), GatewayError> {
         let mut cloned_submission = prepared_submission.clone();
-        self.enqueue_prepared(&mut cloned_submission).await
+        let mut guard = self
+            .enqueue_prepared(
+                &mut cloned_submission,
+                tokio::time::Instant::now() + self.config.request_timeout,
+            )
+            .await?;
+        guard.disarm();
+        Ok(())
     }
 
     /// Origin side (unary): enqueue by priority and await the result over the bus.
@@ -995,22 +1168,34 @@ impl DistributedGateway {
         &self,
         prepared: PreparedSubmission,
     ) -> Result<Value, GatewayError> {
-        let accepted = self.accept_prepared(prepared).await?;
+        let accepted = self.accept_prepared(prepared, None).await?;
         self.await_accepted(accepted).await
     }
 
     pub(crate) async fn submit_prepared_with_reference(
         &self,
         prepared: PreparedSubmission,
+        logical_deadline: Option<tokio::time::Instant>,
     ) -> Result<(Value, LifecycleReference), GatewayError> {
-        let accepted = self.accept_prepared(prepared).await?;
+        let accepted = self.accept_prepared(prepared, logical_deadline).await?;
         self.await_accepted_with_reference(accepted).await
     }
 
     pub(crate) async fn accept_prepared(
         &self,
         mut prepared: PreparedSubmission,
+        logical_deadline: Option<tokio::time::Instant>,
     ) -> Result<AcceptedSubmission, GatewayError> {
+        let now = tokio::time::Instant::now();
+        let configured_deadline = now
+            .checked_add(self.config.request_timeout)
+            .unwrap_or(now + Duration::from_secs(6 * 60 * 60));
+        let origin_deadline = logical_deadline
+            .map(|deadline| deadline.min(configured_deadline))
+            .unwrap_or(configured_deadline);
+        if origin_deadline <= now {
+            return Err(GatewayError::Timeout);
+        }
         let channel = protocol_response_channel(prepared.protocol, &prepared.descriptor.id);
 
         // Subscribe BEFORE enqueue so we can't miss the (fire-and-forget) publish.
@@ -1025,8 +1210,15 @@ impl DistributedGateway {
             .await
             .map_err(|_| GatewayError::Upstream("distributed response subscribe timed out".into()))?
             .map_err(|e| redis_err(&e))?;
-        self.enqueue_prepared(&mut prepared).await?;
-        Ok(AcceptedSubmission { prepared, pubsub })
+        let origin_guard = self
+            .enqueue_prepared(&mut prepared, origin_deadline)
+            .await?;
+        Ok(AcceptedSubmission {
+            prepared,
+            pubsub,
+            origin_deadline,
+            origin_guard,
+        })
     }
 
     pub(crate) async fn await_accepted(
@@ -1051,20 +1243,14 @@ impl DistributedGateway {
             generation: generation.into(),
         };
         let mut messages = accepted.pubsub.on_message();
-        match tokio::time::timeout(self.config.request_timeout, messages.next()).await {
-            Ok(Some(msg)) => {
-                let payload: String = msg.get_payload().map_err(|e| redis_err(&e))?;
-                match serde_json::from_str::<BusMessage>(&payload) {
-                    Ok(BusMessage::Unary(v)) => Ok((v, lifecycle_reference)),
-                    Ok(BusMessage::Error(e)) => Err(GatewayError::Upstream(e)),
-                    Ok(_) => Err(GatewayError::Upstream("unexpected stream message".into())),
-                    Err(e) => Err(GatewayError::Upstream(format!(
-                        "bad response envelope: {e}"
-                    ))),
-                }
-            }
-            Ok(None) => Err(GatewayError::Shutdown),
-            Err(_) => {
+        let heartbeat_interval = (self.origin_lease_timeout / 3).max(Duration::from_millis(1));
+        let mut heartbeat = tokio::time::interval(heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(accepted.origin_deadline) => {
                 let job_id = accepted.prepared.descriptor.id.clone();
                 let generation = lifecycle_reference.generation.clone();
                 if let Ok(Some(terminal)) = self
@@ -1073,6 +1259,86 @@ impl DistributedGateway {
                     })
                     .await
                 {
+                    accepted.origin_guard.disarm();
+                    return match terminal {
+                        BusMessage::Unary(value) => Ok((value, lifecycle_reference)),
+                        BusMessage::Error(error) => Err(GatewayError::Upstream(error)),
+                        _ => Err(GatewayError::Upstream("unexpected durable terminal message".into())),
+                    };
+                }
+                let cancel_status = self.cancel_origin(accepted.origin_guard.command.as_ref().unwrap().clone()).await;
+                if cancel_status > 0 {
+                    accepted.origin_guard.disarm();
+                }
+                if cancel_status == 3 {
+                    let job_id = accepted.prepared.descriptor.id.clone();
+                    let generation = lifecycle_reference.generation.clone();
+                    if let Ok(Some(terminal)) = self.redis_operation(|mut connection| async move {
+                        lifecycle::read_terminal(&mut connection, &job_id, &generation).await
+                    }).await {
+                        return match terminal {
+                            BusMessage::Unary(value) => Ok((value, lifecycle_reference)),
+                            BusMessage::Error(error) => Err(GatewayError::Upstream(error)),
+                            _ => Err(GatewayError::Timeout),
+                        };
+                    }
+                }
+                return Err(GatewayError::Timeout);
+            }
+            _ = heartbeat.tick() => {
+                match self.heartbeat_origin(&accepted.prepared).await {
+                    1 => {}
+                    -1 => {
+                        accepted.origin_guard.disarm();
+                        return Err(GatewayError::Upstream("distributed origin canceled".into()));
+                    }
+                    _ => {
+                        let job_id = accepted.prepared.descriptor.id.clone();
+                        let generation = lifecycle_reference.generation.clone();
+                        if let Ok(Some(terminal)) = self.redis_operation(|mut connection| async move {
+                            lifecycle::read_terminal(&mut connection, &job_id, &generation).await
+                        }).await {
+                            accepted.origin_guard.disarm();
+                            return match terminal {
+                                BusMessage::Unary(value) => Ok((value, lifecycle_reference)),
+                                BusMessage::Error(error) => Err(GatewayError::Upstream(error)),
+                                _ => Err(GatewayError::Upstream("unexpected durable terminal message".into())),
+                            };
+                        }
+                        return Err(GatewayError::Upstream("distributed origin heartbeat unavailable".into()));
+                    },
+                }
+            }
+            message = messages.next() => match message {
+            Some(msg) => {
+                let payload: String = msg.get_payload().map_err(|e| redis_err(&e))?;
+                match serde_json::from_str::<BusMessage>(&payload) {
+                    Ok(BusMessage::Unary(value)) => {
+                        accepted.origin_guard.disarm();
+                        return Ok((value, lifecycle_reference.clone()));
+                    }
+                    Ok(BusMessage::Error(error)) => {
+                        accepted.origin_guard.disarm();
+                        return Err(GatewayError::Upstream(error));
+                    }
+                    Ok(_) | Err(_) => {
+                        if self.cancel_origin(accepted.origin_guard.command.as_ref().unwrap().clone()).await > 0 {
+                            accepted.origin_guard.disarm();
+                        }
+                        return Err(GatewayError::Upstream("invalid distributed response envelope".into()));
+                    }
+                }
+            }
+            None => {
+                let job_id = accepted.prepared.descriptor.id.clone();
+                let generation = lifecycle_reference.generation.clone();
+                if let Ok(Some(terminal)) = self
+                    .redis_operation(|mut connection| async move {
+                        lifecycle::read_terminal(&mut connection, &job_id, &generation).await
+                    })
+                    .await
+                {
+                    accepted.origin_guard.disarm();
                     return match terminal {
                         BusMessage::Unary(value) => Ok((value, lifecycle_reference)),
                         BusMessage::Error(error) => Err(GatewayError::Upstream(error)),
@@ -1081,10 +1347,53 @@ impl DistributedGateway {
                         )),
                     };
                 }
-                self.cancel_prepared(&accepted.prepared).await;
-                Err(GatewayError::Timeout)
+                let cancel_status = self.cancel_origin(accepted.origin_guard.command.as_ref().unwrap().clone()).await;
+                if cancel_status > 0 {
+                    accepted.origin_guard.disarm();
+                }
+                if cancel_status == 3 {
+                    let job_id = accepted.prepared.descriptor.id.clone();
+                    let generation = lifecycle_reference.generation.clone();
+                    if let Ok(Some(terminal)) = self.redis_operation(|mut connection| async move {
+                        lifecycle::read_terminal(&mut connection, &job_id, &generation).await
+                    }).await {
+                        return match terminal {
+                            BusMessage::Unary(value) => Ok((value, lifecycle_reference)),
+                            BusMessage::Error(error) => Err(GatewayError::Upstream(error)),
+                            _ => Err(GatewayError::Shutdown),
+                        };
+                    }
+                }
+                return Err(GatewayError::Shutdown);
+            }
+            }
             }
         }
+    }
+
+    async fn heartbeat_origin(&self, prepared: &PreparedSubmission) -> i64 {
+        let Some((_, generation)) = prepared.member.rsplit_once(':') else {
+            return 0;
+        };
+        #[cfg(test)]
+        if let Some((started, release)) = &self.origin_heartbeat_barrier {
+            started.notify_one();
+            release.notified().await;
+        }
+        heartbeat_origin_with_connections(
+            &self.connections,
+            self.redis_operation_timeout,
+            &OriginCancelCommand {
+                protocol: prepared.protocol,
+                provider: prepared.descriptor.provider.clone(),
+                id: prepared.descriptor.id.clone(),
+                generation: generation.to_string(),
+                member: prepared.member.clone(),
+                origin_token: prepared.origin_token.clone(),
+            },
+            self.origin_lease_timeout,
+        )
+        .await
     }
 
     /// Origin side (streaming): enqueue by priority and return a channel of raw
@@ -1101,7 +1410,7 @@ impl DistributedGateway {
         &self,
         prepared: PreparedSubmission,
     ) -> Result<mpsc::Receiver<StreamChunk>, GatewayError> {
-        let accepted = self.accept_prepared(prepared).await?;
+        let accepted = self.accept_prepared(prepared, None).await?;
         Ok(self.stream_accepted(accepted))
     }
 
@@ -1109,118 +1418,143 @@ impl DistributedGateway {
         &self,
         mut accepted: AcceptedSubmission,
     ) -> mpsc::Receiver<StreamChunk> {
-        let (chunk_tx, chunk_rx) = mpsc::channel(16);
-        let request_timeout = self.config.request_timeout;
-        let member = accepted.prepared.member;
-        let request_id = accepted.prepared.descriptor.id;
-        let request_provider = accepted.prepared.descriptor.provider;
-        let request_protocol = accepted.prepared.protocol;
-        let request_generation = member
-            .rsplit_once(':')
-            .map(|(_, generation)| generation.to_string())
-            .unwrap_or_default();
+        const DATA_CAPACITY: usize = 16;
+        let (chunk_tx, chunk_rx) = mpsc::channel(DATA_CAPACITY + 1);
+        let origin_deadline = accepted.origin_deadline;
+        let heartbeat_interval = (self.origin_lease_timeout / 3).max(Duration::from_millis(1));
         let connections = self.connections.clone();
         let redis_operation_timeout = self.redis_operation_timeout;
+        let origin_lease = self.origin_lease_timeout;
 
         tokio::spawn(async move {
             use futures::StreamExt;
             let mut messages = accepted.pubsub.on_message();
+            let mut heartbeat = tokio::time::interval(heartbeat_interval);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+            let mut terminal_committed = false;
             loop {
-                match tokio::time::timeout(request_timeout, messages.next()).await {
-                    Ok(Some(msg)) => {
-                        let payload: String = match msg.get_payload() {
-                            Ok(p) => p,
-                            Err(_) => break,
-                        };
-                        match serde_json::from_str::<BusMessage>(&payload) {
-                            Ok(BusMessage::Chunk(s)) => {
-                                if chunk_tx.send(Ok(s)).await.is_err() {
-                                    if let Some((_, generation)) = member.rsplit_once(':') {
-                                        let generation = generation.to_string();
-                                        let member = member.clone();
-                                        let request_provider = request_provider.clone();
-                                        let request_id = request_id.clone();
-                                        let _ = run_redis_operation(
-                                            &connections,
-                                            redis_operation_timeout,
-                                            |mut connection| async move {
-                                                lifecycle::cancel(
-                                                    &mut connection,
-                                                    request_protocol,
-                                                    &request_provider,
-                                                    &request_id,
-                                                    &generation,
-                                                    &member,
-                                                    Duration::from_secs(10 * 60),
-                                                )
-                                                .await
-                                            },
-                                        )
-                                        .await;
-                                    }
-                                    break; // client disconnected
-                                }
-                            }
-                            Ok(BusMessage::End) => break,
-                            Ok(BusMessage::Error(e)) => {
-                                let _ = chunk_tx.send(Err(GatewayError::Upstream(e))).await;
-                                break;
-                            }
-                            Ok(BusMessage::Unary(_)) | Err(_) => break,
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => {
-                        let terminal_id = request_id.clone();
-                        let terminal_generation = request_generation.clone();
-                        if let Ok(Some(terminal)) = run_redis_operation(
+                tokio::select! {
+                    biased;
+                    _ = chunk_tx.closed() => {
+                        if cancel_origin_with_connections(
                             &connections,
                             redis_operation_timeout,
-                            |mut connection| async move {
-                                lifecycle::read_terminal(
-                                    &mut connection,
-                                    &terminal_id,
-                                    &terminal_generation,
-                                )
-                                .await
-                            },
-                        )
-                        .await
-                        {
-                            match terminal {
-                                BusMessage::End => break,
-                                BusMessage::Error(error) => {
-                                    let _ = chunk_tx.send(Err(GatewayError::Upstream(error))).await;
-                                    break;
-                                }
-                                _ => {}
-                            }
+                            accepted.origin_guard.command.as_ref().unwrap().clone(),
+                        ).await {
+                            accepted.origin_guard.disarm();
                         }
-                        if let Some((_, generation)) = member.rsplit_once(':') {
-                            let generation = generation.to_string();
-                            let cancel_member = member.clone();
-                            let cancel_provider = request_provider.clone();
-                            let cancel_id = request_id.clone();
-                            let _ = run_redis_operation(
+                        return;
+                    }
+                    _ = tokio::time::sleep_until(origin_deadline) => {
+                        let _ = chunk_tx.try_send(Err(GatewayError::Timeout));
+                        return;
+                    }
+                    _ = heartbeat.tick(), if !terminal_committed => {
+                        let status = heartbeat_origin_with_connections(
+                            &connections,
+                            redis_operation_timeout,
+                            accepted.origin_guard.command.as_ref().unwrap(),
+                            origin_lease,
+                        ).await;
+                        if status == 0 {
+                            if let Ok(Some(BusMessage::End | BusMessage::Error(_))) = read_terminal_with_connections(
                                 &connections,
                                 redis_operation_timeout,
-                                |mut connection| async move {
-                                    lifecycle::cancel(
-                                        &mut connection,
-                                        request_protocol,
-                                        &cancel_provider,
-                                        &cancel_id,
-                                        &generation,
-                                        &cancel_member,
-                                        Duration::from_secs(10 * 60),
-                                    )
-                                    .await
-                                },
-                            )
-                            .await;
+                                accepted.origin_guard.command.as_ref().unwrap(),
+                            ).await {
+                                terminal_committed = true;
+                                continue;
+                            }
                         }
-                        let _ = chunk_tx.send(Err(GatewayError::Timeout)).await;
-                        break;
+                        if status != 1 {
+                            if status == -1 {
+                                accepted.origin_guard.disarm();
+                            }
+                            let message = if status == -1 {
+                                "distributed origin canceled"
+                            } else {
+                                "distributed origin heartbeat unavailable"
+                            };
+                            let _ = chunk_tx.try_send(Err(GatewayError::Upstream(message.into())));
+                            return;
+                        }
+                    }
+                    message = messages.next() => {
+                        let Some(message) = message else {
+                            let _ = chunk_tx.try_send(Err(GatewayError::Upstream(
+                                "distributed response channel lost".into(),
+                            )));
+                            return;
+                        };
+                        let payload: String = match message.get_payload() {
+                            Ok(payload) => payload,
+                            Err(_) => {
+                                let _ = chunk_tx.try_send(Err(GatewayError::Upstream(
+                                    "distributed response channel lost".into(),
+                                )));
+                                return;
+                            }
+                        };
+                        match serde_json::from_str::<BusMessage>(&payload) {
+                            Ok(BusMessage::Chunk(chunk)) => {
+                                match send_stream_data(
+                                    &chunk_tx,
+                                    chunk,
+                                    origin_deadline,
+                                    &mut heartbeat,
+                                    &connections,
+                                    redis_operation_timeout,
+                                    accepted.origin_guard.command.as_ref().unwrap(),
+                                    origin_lease,
+                                ).await {
+                                    StreamDataSend::Sent { terminal_committed: committed } => {
+                                        terminal_committed |= committed;
+                                    }
+                                    StreamDataSend::ReceiverClosed => {
+                                        if cancel_origin_with_connections(
+                                            &connections,
+                                            redis_operation_timeout,
+                                            accepted.origin_guard.command.as_ref().unwrap().clone(),
+                                        ).await {
+                                            accepted.origin_guard.disarm();
+                                        }
+                                        return;
+                                    }
+                                    StreamDataSend::Deadline => {
+                                        let _ = chunk_tx.try_send(Err(GatewayError::Timeout));
+                                        return;
+                                    }
+                                    StreamDataSend::HeartbeatFailed(status) => {
+                                        if status == -1 {
+                                            accepted.origin_guard.disarm();
+                                        }
+                                        let message = if status == -1 {
+                                            "distributed origin canceled"
+                                        } else {
+                                            "distributed origin heartbeat unavailable"
+                                        };
+                                        let _ = chunk_tx.try_send(Err(GatewayError::Upstream(message.into())));
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(BusMessage::End) => {
+                                accepted.origin_guard.disarm();
+                                return;
+                            }
+                            Ok(BusMessage::Error(error)) => {
+                                accepted.origin_guard.disarm();
+                                let _ = chunk_tx.try_send(Err(GatewayError::Upstream(error)));
+                                return;
+                            }
+                            Ok(BusMessage::Unary(_)) | Err(_) => {
+                                let _ = chunk_tx.try_send(Err(GatewayError::Upstream(
+                                    "distributed response channel lost".into(),
+                                )));
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -1296,29 +1630,22 @@ impl DistributedGateway {
             .saturating_add(released_scoped) as usize
     }
 
-    async fn cancel_prepared(&self, prepared: &PreparedSubmission) {
-        let Some((_, generation)) = prepared.member.rsplit_once(':') else {
-            return;
-        };
-        let protocol = prepared.protocol;
-        let provider = prepared.descriptor.provider.clone();
-        let id = prepared.descriptor.id.clone();
-        let generation = generation.to_string();
-        let member = prepared.member.clone();
-        let _ = self
-            .redis_operation(|mut connection| async move {
-                lifecycle::cancel(
-                    &mut connection,
-                    protocol,
-                    &provider,
-                    &id,
-                    &generation,
-                    &member,
-                    Duration::from_secs(10 * 60),
-                )
-                .await
-            })
-            .await;
+    async fn cancel_origin(&self, command: OriginCancelCommand) -> i64 {
+        self.redis_operation(|mut connection| async move {
+            lifecycle::cancel(
+                &mut connection,
+                command.protocol,
+                &command.provider,
+                &command.id,
+                &command.generation,
+                &command.member,
+                Duration::from_secs(10 * 60),
+                &command.origin_token,
+            )
+            .await
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Spawn one worker loop per provider plus a reaper for redelivery.
@@ -1565,6 +1892,22 @@ impl DistributedGateway {
             return;
         }
 
+        match self.refresh_owned(ownership).await {
+            1 => {}
+            -1 => {
+                let _ = self
+                    .terminal_owned(
+                        ownership,
+                        &descriptor.id,
+                        descriptor.stream,
+                        &BusMessage::Error("distributed origin canceled".into()),
+                    )
+                    .await;
+                return;
+            }
+            _ => return,
+        }
+
         self.run_and_publish(ownership, descriptor).await;
     }
 
@@ -1620,6 +1963,16 @@ impl DistributedGateway {
                                     .publish_owned(ownership, &channel, &BusMessage::Chunk(chunk))
                                     .await
                                 {
+                                    let _ = self
+                                        .terminal_owned(
+                                            ownership,
+                                            &desc.id,
+                                            true,
+                                            &BusMessage::Error(
+                                                "distributed response publication failed".into(),
+                                            ),
+                                        )
+                                        .await;
                                     return;
                                 }
                             }
@@ -1750,6 +2103,7 @@ impl DistributedGateway {
             .key(lifecycle::payload_key(id))
             .key(lifecycle::terminal_reservations())
             .key(lifecycle::reservation_states())
+            .key(lifecycle::origin_expiry())
             .arg(&ownership.member)
             .arg(&ownership.owner_token)
             .arg(10 * 60_u64)
@@ -1919,6 +2273,7 @@ impl DistributedGateway {
             .key(lifecycle::terminal_reservations())
             .key(lifecycle::dlq_reservations())
             .key(lifecycle::reservation_states())
+            .key(lifecycle::origin_expiry())
             .arg(&ownership.member)
             .arg(&ownership.owner_token)
             .arg(generation)
@@ -1958,9 +2313,17 @@ impl DistributedGateway {
     /// Run the reaper loop: periodically requeue leases whose visibility deadline
     /// has passed (a crashed or stuck worker).
     async fn reaper(self: Arc<Self>, providers: Vec<String>) {
-        let interval = (self.config.lease_timeout / 3).max(Duration::from_millis(1));
+        let interval = (self.config.lease_timeout / 3)
+            .min(self.origin_lease_timeout / 3)
+            .max(Duration::from_millis(1));
         loop {
             tokio::time::sleep(interval).await;
+            let _ = self
+                .redis_operation(|mut connection| async move {
+                    lifecycle::expire_origins(&mut connection, 128, Duration::from_secs(10 * 60))
+                        .await
+                })
+                .await;
             let _ = self
                 .redis_operation(|mut connection| async move {
                     lifecycle::cleanup_expired(&mut connection, 128).await
@@ -2007,6 +2370,7 @@ impl DistributedGateway {
             .key(lifecycle::expiry())
             .key(lifecycle::terminal_reservations())
             .key(lifecycle::reservation_states())
+            .key(lifecycle::origin_expiry())
             .arg(256)
             .arg(lifecycle::job_prefix())
             .arg(10 * 60 * 1000_u64)
@@ -2037,6 +2401,127 @@ fn positive_duration_from_env(name: &str, fallback: Duration) -> Duration {
         .filter(|milliseconds| *milliseconds > 0)
         .map(Duration::from_millis)
         .unwrap_or(fallback)
+}
+
+async fn origin_cancellation_pump(
+    connections: Arc<crate::redis_operation::RedisConnectionManagerCache>,
+    timeout: Duration,
+    mut receiver: mpsc::Receiver<OriginCancelCommand>,
+) {
+    while let Some(command) = receiver.recv().await {
+        let _ = cancel_origin_with_connections(&connections, timeout, command).await;
+    }
+}
+
+async fn cancel_origin_with_connections(
+    connections: &crate::redis_operation::RedisConnectionManagerCache,
+    timeout: Duration,
+    command: OriginCancelCommand,
+) -> bool {
+    matches!(
+        run_redis_operation(connections, timeout, |mut connection| async move {
+            lifecycle::cancel(
+                &mut connection,
+                command.protocol,
+                &command.provider,
+                &command.id,
+                &command.generation,
+                &command.member,
+                Duration::from_secs(10 * 60),
+                &command.origin_token,
+            )
+            .await
+        })
+        .await,
+        Ok(status) if status > 0
+    )
+}
+
+async fn heartbeat_origin_with_connections(
+    connections: &crate::redis_operation::RedisConnectionManagerCache,
+    timeout: Duration,
+    command: &OriginCancelCommand,
+    origin_lease: Duration,
+) -> i64 {
+    let command = command.clone();
+    run_redis_operation(connections, timeout, |mut connection| async move {
+        lifecycle::heartbeat_origin(
+            &mut connection,
+            &command.id,
+            &command.generation,
+            &command.member,
+            &command.origin_token,
+            origin_lease,
+        )
+        .await
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn read_terminal_with_connections(
+    connections: &crate::redis_operation::RedisConnectionManagerCache,
+    timeout: Duration,
+    command: &OriginCancelCommand,
+) -> redis::RedisResult<Option<BusMessage>> {
+    let id = command.id.clone();
+    let generation = command.generation.clone();
+    run_redis_operation(connections, timeout, |mut connection| async move {
+        lifecycle::read_terminal(&mut connection, &id, &generation).await
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_stream_data(
+    sender: &mpsc::Sender<StreamChunk>,
+    chunk: String,
+    deadline: tokio::time::Instant,
+    heartbeat: &mut tokio::time::Interval,
+    connections: &crate::redis_operation::RedisConnectionManagerCache,
+    redis_operation_timeout: Duration,
+    origin_command: &OriginCancelCommand,
+    origin_lease: Duration,
+) -> StreamDataSend {
+    let mut terminal_committed = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = sender.closed() => return StreamDataSend::ReceiverClosed,
+            _ = tokio::time::sleep_until(deadline) => return StreamDataSend::Deadline,
+            _ = heartbeat.tick(), if !terminal_committed => {
+                let status = heartbeat_origin_with_connections(
+                    connections,
+                    redis_operation_timeout,
+                    origin_command,
+                    origin_lease,
+                ).await;
+                if status == 0 {
+                    match read_terminal_with_connections(
+                        connections,
+                        redis_operation_timeout,
+                        origin_command,
+                    ).await {
+                        Ok(Some(BusMessage::End | BusMessage::Error(_))) => {
+                            terminal_committed = true;
+                            continue;
+                        }
+                        _ => return StreamDataSend::HeartbeatFailed(status),
+                    }
+                }
+                if status != 1 {
+                    return StreamDataSend::HeartbeatFailed(status);
+                }
+            }
+            permits = sender.reserve_many(2) => {
+                let Ok(mut permits) = permits else {
+                    return StreamDataSend::ReceiverClosed;
+                };
+                permits.next().expect("two reserved stream slots").send(Ok(chunk));
+                return StreamDataSend::Sent { terminal_committed };
+            }
+        }
+    }
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -2299,6 +2784,18 @@ mod tests {
         dispatch_dropped: Arc<tokio::sync::Notify>,
     }
 
+    struct ProgressStreamDispatch;
+
+    struct BurstThenQuietStreamDispatch {
+        started: Arc<tokio::sync::Notify>,
+        drops: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<tokio::sync::Notify>,
+    }
+
+    struct FiniteBurstStreamDispatch {
+        fail_after_chunks: bool,
+    }
+
     struct DispatchDropGuard {
         dispatch_drops: Arc<std::sync::atomic::AtomicUsize>,
         dispatch_dropped: Arc<tokio::sync::Notify>,
@@ -2352,6 +2849,77 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Dispatch for ProgressStreamDispatch {
+        async fn dispatch(&self, _provider: &str, _payload: Value) -> Result<Value, DispatchError> {
+            unreachable!("progress stream fixture only dispatches streams")
+        }
+
+        async fn dispatch_stream(
+            &self,
+            _provider: &str,
+            _payload: Value,
+        ) -> Result<super::super::ChunkStream, DispatchError> {
+            Ok(Box::pin(async_stream::stream! {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    yield Ok("progress".into());
+                }
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Dispatch for BurstThenQuietStreamDispatch {
+        async fn dispatch(&self, _provider: &str, _payload: Value) -> Result<Value, DispatchError> {
+            unreachable!("burst stream fixture only dispatches streams")
+        }
+
+        async fn dispatch_stream(
+            &self,
+            _provider: &str,
+            _payload: Value,
+        ) -> Result<super::super::ChunkStream, DispatchError> {
+            let started = self.started.clone();
+            let drops = self.drops.clone();
+            let dropped = self.dropped.clone();
+            Ok(Box::pin(async_stream::stream! {
+                let _guard = DispatchDropGuard {
+                    dispatch_drops: drops,
+                    dispatch_dropped: dropped,
+                };
+                started.notify_one();
+                for index in 0..17 {
+                    yield Ok(format!("chunk-{index}"));
+                }
+                std::future::pending::<()>().await;
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Dispatch for FiniteBurstStreamDispatch {
+        async fn dispatch(&self, _provider: &str, _payload: Value) -> Result<Value, DispatchError> {
+            unreachable!("finite burst fixture only dispatches streams")
+        }
+
+        async fn dispatch_stream(
+            &self,
+            _provider: &str,
+            _payload: Value,
+        ) -> Result<super::super::ChunkStream, DispatchError> {
+            let fail_after_chunks = self.fail_after_chunks;
+            Ok(Box::pin(async_stream::stream! {
+                for index in 0..17 {
+                    yield Ok(format!("chunk-{index}"));
+                }
+                if fail_after_chunks {
+                    yield Err(GatewayError::Upstream("provider-terminal".into()));
+                }
+            }))
+        }
+    }
+
     fn unlimited() -> Arc<dyn RateLimiter> {
         Arc::new(InMemoryRateLimiter::new(RateLimitConfig::default()))
     }
@@ -2387,6 +2955,13 @@ mod tests {
         .ok()
     }
 
+    async fn job_origin_token(connection: &mut ConnectionManager, id: &str) -> String {
+        connection
+            .hget(lifecycle::meta_key(id), "origin_token")
+            .await
+            .unwrap()
+    }
+
     async fn lease_test_job(
         gateway: &Arc<DistributedGateway>,
         provider: &str,
@@ -2406,7 +2981,14 @@ mod tests {
             )
             .unwrap();
         let id = prepared.descriptor.id.clone();
-        gateway.enqueue_prepared(&mut prepared).await.unwrap();
+        let mut origin_guard = gateway
+            .enqueue_prepared(
+                &mut prepared,
+                tokio::time::Instant::now() + gateway.config.request_timeout,
+            )
+            .await
+            .unwrap();
+        origin_guard.disarm();
         let protocol = QueueProtocol::LegacyUnscoped;
         let mut connection = gateway.connection_for_test().await.unwrap();
         let leased: Option<(String, String, String)> = gateway
@@ -2745,6 +3327,124 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_origin_lease_protocol_waits_for_lifecycle_v1_drain() {
+        let provider = format!("origin-drain-{}", uuid::Uuid::new_v4().simple());
+        let Some(gateway) = test_gateway(&provider).await else {
+            return;
+        };
+        let old_queue = prior_lifecycle_key(QueueProtocol::LegacyUnscoped, "q", &provider);
+        let old_member = format!("old-accepted-{}", uuid::Uuid::new_v4().simple());
+        let mut connection = gateway.connection_for_test().await.unwrap();
+        let _: () = connection.zadd(&old_queue, &old_member, 0).await.unwrap();
+        let prepared = gateway
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"new-protocol"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            gateway.enqueue(&prepared).await,
+            Err(GatewayError::Upstream(message)) if message.contains("migration")
+        ));
+        assert_eq!(
+            connection
+                .zscore::<_, _, f64>(&old_queue, &old_member)
+                .await
+                .unwrap(),
+            0.0
+        );
+        let _: i64 = connection.zrem(&old_queue, &old_member).await.unwrap();
+        gateway.enqueue(&prepared).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_activation_abort_uses_guard_before_job_is_dispatchable() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("activation-abort-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(LatchBlockedDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: Arc::new(tokio::sync::Notify::new()),
+                release_dispatches: Arc::new(Semaphore::new(0)),
+            }),
+            unlimited(),
+            GatewayConfig::default(),
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut gateway)
+            .unwrap()
+            .activation_operation_delay = Duration::from_millis(200);
+        let prepared = gateway
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"activation-abort"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let id = prepared.descriptor.id.clone();
+        let submit_gateway = gateway.clone();
+        let activation =
+            tokio::spawn(async move { submit_gateway.accept_prepared(prepared, None).await });
+        let mut observer = gateway.connection_for_test().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !observer
+                .exists::<_, bool>(lifecycle::meta_key(&id))
+                .await
+                .unwrap()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reserve should finish before delayed activation");
+        activation.abort();
+        let _ = activation.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let state: Option<String> = observer
+                    .hget(lifecycle::meta_key(&id), "state")
+                    .await
+                    .unwrap();
+                if state.as_deref() == Some("terminal") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("armed guard should durably cancel pending activation");
+        let workers = gateway.spawn_workers(vec![provider.clone()]);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            observer
+                .zcard::<_, u64>(protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider,))
+                .await
+                .unwrap(),
+            0
+        );
+        for worker in workers {
+            worker.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn redis_scoped_protocol_is_invisible_to_released_workers_and_reapers() {
         #[derive(Deserialize)]
         #[allow(dead_code)]
@@ -2960,13 +3660,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn redis_unary_round_trip() {
-        let Some(gw) = test_gateway("itest-unary").await else {
+        let provider = format!("itest-unary-{}", uuid::Uuid::new_v4().simple());
+        let Some(gw) = test_gateway(&provider).await else {
             return;
         };
-        gw.spawn_workers(vec!["itest-unary".into()]);
+        gw.spawn_workers(vec![provider.clone()]);
         let resp = gw
             .submit(GatewayRequest {
-                provider: "itest-unary".into(),
+                provider,
                 tier: 0,
                 permits: 1,
                 payload: serde_json::json!({ "hello": "world" }),
@@ -2979,13 +3680,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn redis_stream_round_trip() {
-        let Some(gw) = test_gateway("itest-stream").await else {
+        let provider = format!("itest-stream-{}", uuid::Uuid::new_v4().simple());
+        let Some(gw) = test_gateway(&provider).await else {
             return;
         };
-        gw.spawn_workers(vec!["itest-stream".into()]);
+        gw.spawn_workers(vec![provider.clone()]);
         let mut rx = gw
             .submit_stream(GatewayRequest {
-                provider: "itest-stream".into(),
+                provider,
                 tier: 0,
                 permits: 1,
                 payload: serde_json::json!({}),
@@ -3170,6 +3872,7 @@ mod tests {
         let members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
         assert_eq!(members.len(), 1);
         let (id, generation) = members[0].rsplit_once(':').unwrap();
+        let origin_token = job_origin_token(&mut connection, id).await;
         assert_eq!(
             lifecycle::cancel(
                 &mut connection,
@@ -3179,6 +3882,7 @@ mod tests {
                 generation,
                 &members[0],
                 Duration::from_secs(60),
+                &origin_token,
             )
             .await
             .unwrap(),
@@ -3234,6 +3938,7 @@ mod tests {
             let (ownership, id) = lease_test_job(&gateway, &provider, false, suffix).await;
             let (_, generation) = ownership.id_and_generation().unwrap();
             let mut connection = gateway.connection_for_test().await.unwrap();
+            let origin_token = job_origin_token(&mut connection, &id).await;
             assert_eq!(
                 lifecycle::cancel(
                     &mut connection,
@@ -3243,6 +3948,7 @@ mod tests {
                     generation,
                     &ownership.member,
                     Duration::from_secs(60),
+                    &origin_token,
                 )
                 .await
                 .unwrap(),
@@ -3266,6 +3972,7 @@ mod tests {
             lease_test_job(&gateway, &stream_provider, true, "stream-owner").await;
         let (_, stream_generation) = stream_ownership.id_and_generation().unwrap();
         let mut connection = gateway.connection_for_test().await.unwrap();
+        let stream_origin_token = job_origin_token(&mut connection, &stream_id).await;
         assert_eq!(
             lifecycle::cancel(
                 &mut connection,
@@ -3275,6 +3982,7 @@ mod tests {
                 stream_generation,
                 &stream_ownership.member,
                 Duration::from_secs(60),
+                &stream_origin_token,
             )
             .await
             .unwrap(),
@@ -3305,6 +4013,7 @@ mod tests {
         let (release_ownership, release_id) =
             lease_test_job(&gateway, &release_provider, false, "release-owner").await;
         let (_, release_generation) = release_ownership.id_and_generation().unwrap();
+        let release_origin_token = job_origin_token(&mut connection, &release_id).await;
         assert_eq!(
             lifecycle::cancel(
                 &mut connection,
@@ -3314,6 +4023,7 @@ mod tests {
                 release_generation,
                 &release_ownership.member,
                 Duration::from_secs(60),
+                &release_origin_token,
             )
             .await
             .unwrap(),
@@ -3345,6 +4055,7 @@ mod tests {
         let (dlq_ownership, dlq_id) =
             lease_test_job(&gateway, &dlq_provider, false, "dlq-owner").await;
         let (_, dlq_generation) = dlq_ownership.id_and_generation().unwrap();
+        let dlq_origin_token = job_origin_token(&mut connection, &dlq_id).await;
         assert_eq!(
             lifecycle::cancel(
                 &mut connection,
@@ -3354,6 +4065,7 @@ mod tests {
                 dlq_generation,
                 &dlq_ownership.member,
                 Duration::from_secs(60),
+                &dlq_origin_token,
             )
             .await
             .unwrap(),
@@ -3372,6 +4084,7 @@ mod tests {
         let (reap_ownership, reap_id) =
             lease_test_job(&gateway, &reap_provider, false, "reap-owner").await;
         let (_, reap_generation) = reap_ownership.id_and_generation().unwrap();
+        let reap_origin_token = job_origin_token(&mut connection, &reap_id).await;
         assert_eq!(
             lifecycle::cancel(
                 &mut connection,
@@ -3381,6 +4094,7 @@ mod tests {
                 reap_generation,
                 &reap_ownership.member,
                 Duration::from_secs(60),
+                &reap_origin_token,
             )
             .await
             .unwrap(),
@@ -3418,6 +4132,7 @@ mod tests {
         let (first_ownership, first_id) =
             lease_test_job(&gateway, &first_provider, false, "terminal-first-owner").await;
         let (_, first_generation) = first_ownership.id_and_generation().unwrap();
+        let first_origin_token = job_origin_token(&mut connection, &first_id).await;
         assert!(
             gateway
                 .terminal_owned(
@@ -3437,6 +4152,7 @@ mod tests {
                 first_generation,
                 &first_ownership.member,
                 Duration::from_secs(60),
+                &first_origin_token,
             )
             .await
             .unwrap(),
@@ -3448,6 +4164,771 @@ mod tests {
                 .unwrap(),
             Some(BusMessage::Unary(value)) if value == serde_json::json!({"winner":"terminal"})
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_origin_crash_expiry_cancels_waiting_job_after_restart() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-crash-{}", uuid::Uuid::new_v4().simple());
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            GatewayConfig {
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut gateway).unwrap().origin_lease_timeout = Duration::from_millis(40);
+        let prepared = gateway
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"crash"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let id = prepared.descriptor.id.clone();
+        let mut accepted = gateway.accept_prepared(prepared, None).await.unwrap();
+        let member = accepted.prepared.member.clone();
+        let generation = member.rsplit_once(':').unwrap().1.to_string();
+        let mut connection = gateway.connection_for_test().await.unwrap();
+        assert_eq!(
+            lifecycle::heartbeat_origin(
+                &mut connection,
+                &id,
+                &generation,
+                &member,
+                "stale-origin-token",
+                Duration::from_millis(40),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        accepted.origin_guard.disarm();
+        drop(accepted);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            gateway
+                .redis_operation(|mut connection| async move {
+                    lifecycle::expire_origins(&mut connection, 16, Duration::from_secs(60)).await
+                })
+                .await
+                .unwrap()
+                >= 1
+        );
+        assert_eq!(
+            connection
+                .zcard::<_, u64>(protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider,))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            lifecycle::read_terminal(&mut connection, &id, &generation)
+                .await
+                .unwrap(),
+            Some(BusMessage::Error(message)) if message == "distributed origin canceled"
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_cancel_queue_overflow_falls_back_to_origin_expiry() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-overflow-{}", uuid::Uuid::new_v4().simple());
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            GatewayConfig {
+                max_queue_depth: 4,
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut gateway).unwrap().origin_lease_timeout = Duration::from_millis(40);
+        let (overflow_sender, mut overflow_receiver) = mpsc::channel(1);
+        let mut references = Vec::new();
+        for ordinal in 0..2 {
+            let prepared = gateway
+                .prepare_submission(
+                    GatewayRequest {
+                        provider: provider.clone(),
+                        tier: 0,
+                        permits: 1,
+                        payload: serde_json::json!({"request":ordinal}),
+                    },
+                    false,
+                    None,
+                )
+                .unwrap();
+            let mut accepted = gateway.accept_prepared(prepared, None).await.unwrap();
+            let (id, generation) = accepted.prepared.member.rsplit_once(':').unwrap();
+            references.push((id.to_string(), generation.to_string()));
+            accepted.origin_guard.sender = overflow_sender.clone();
+            drop(accepted);
+        }
+        assert_eq!(overflow_receiver.len(), 1);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let _ = gateway
+            .redis_operation(|mut connection| async move {
+                lifecycle::expire_origins(&mut connection, 16, Duration::from_secs(60)).await
+            })
+            .await
+            .unwrap();
+        let mut connection = gateway.connection_for_test().await.unwrap();
+        for (id, generation) in references {
+            assert!(matches!(
+                lifecycle::read_terminal(&mut connection, &id, &generation)
+                    .await
+                    .unwrap(),
+                Some(BusMessage::Error(message)) if message == "distributed origin canceled"
+            ));
+        }
+        drop(overflow_receiver.recv().await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_origin_crash_expiry_drops_processing_dispatch() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-processing-crash-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let dispatch_dropped = Arc::new(tokio::sync::Notify::new());
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(PendingDispatch {
+                dispatch_starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dispatch_started: dispatch_started.clone(),
+                dispatch_drops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dispatch_dropped: dispatch_dropped.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(300),
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut gateway).unwrap().origin_lease_timeout = Duration::from_millis(40);
+        let mut prepared = gateway
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"processing-crash"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let id = prepared.descriptor.id.clone();
+        let mut origin_guard = gateway
+            .enqueue_prepared(
+                &mut prepared,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        origin_guard.disarm();
+        let generation = prepared.member.rsplit_once(':').unwrap().1.to_string();
+        let worker = tokio::spawn(gateway.clone().worker(
+            provider,
+            QueueProtocol::LegacyUnscoped,
+            Arc::new(Semaphore::new(1)),
+        ));
+        let started = dispatch_started.notified();
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .expect("processing dispatch should start");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            gateway
+                .redis_operation(|mut connection| async move {
+                    lifecycle::expire_origins(&mut connection, 16, Duration::from_secs(60)).await
+                })
+                .await
+                .unwrap()
+                >= 1
+        );
+        tokio::time::timeout(Duration::from_secs(1), dispatch_dropped.notified())
+            .await
+            .expect("origin expiry should drop active provider work");
+        let mut connection = gateway.connection_for_test().await.unwrap();
+        assert!(matches!(
+            lifecycle::read_terminal(&mut connection, &id, &generation)
+                .await
+                .unwrap(),
+            Some(BusMessage::Error(message)) if message == "distributed origin canceled"
+        ));
+        worker.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_quiet_stream_receiver_drop_cancels_active_delivery() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-body-drop-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(QuietStreamDispatch {
+                dispatch_starts: dispatch_starts.clone(),
+                dispatch_started: dispatch_started.clone(),
+                release_streams: Arc::new(Semaphore::new(0)),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(90),
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut gateway).unwrap().origin_lease_timeout = Duration::from_secs(1);
+        let workers = gateway.spawn_workers(vec![provider.clone()]);
+        let first_dispatch = dispatch_started.notified();
+        let receiver = gateway
+            .submit_stream(GatewayRequest {
+                provider: provider.clone(),
+                tier: 0,
+                permits: 1,
+                payload: serde_json::json!({"request":"quiet"}),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), first_dispatch)
+            .await
+            .expect("quiet dispatch should start");
+        let mut connection = gateway.connection_for_test().await.unwrap();
+        let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
+        let members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
+        assert_eq!(members.len(), 1);
+        let (id, generation) = members[0].rsplit_once(':').unwrap();
+        let id = id.to_string();
+        let generation = generation.to_string();
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if connection.zcard::<_, u64>(&processing).await.unwrap() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("receiver drop should terminate the active delivery");
+        assert!(matches!(
+            lifecycle::read_terminal(&mut connection, &id, &generation)
+                .await
+                .unwrap(),
+            Some(BusMessage::Error(message)) if message == "distributed origin canceled"
+        ));
+        assert_eq!(dispatch_starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for worker in workers {
+            worker.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_unary_submit_future_drop_uses_bounded_cancel_pump() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-unary-drop-{}", uuid::Uuid::new_v4().simple());
+        let dispatch_started = Arc::new(tokio::sync::Notify::new());
+        let dispatch_dropped = Arc::new(tokio::sync::Notify::new());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(PendingDispatch {
+                dispatch_starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dispatch_started: dispatch_started.clone(),
+                dispatch_drops: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dispatch_dropped: dispatch_dropped.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(90),
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let workers = gateway.spawn_workers(vec![provider.clone()]);
+        let started = dispatch_started.notified();
+        let submit_gateway = gateway.clone();
+        let submit_provider = provider.clone();
+        let submission = tokio::spawn(async move {
+            submit_gateway
+                .submit(GatewayRequest {
+                    provider: submit_provider,
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"drop"}),
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .expect("unary dispatch should start");
+        let mut connection = gateway.connection_for_test().await.unwrap();
+        let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
+        let members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
+        let (id, generation) = members[0].rsplit_once(':').unwrap();
+        let id = id.to_string();
+        let generation = generation.to_string();
+        let dropped = dispatch_dropped.notified();
+        submission.abort();
+        let _ = submission.await;
+        tokio::time::timeout(Duration::from_secs(1), dropped)
+            .await
+            .expect("origin drop should cancel provider work");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    lifecycle::read_terminal(&mut connection, &id, &generation)
+                        .await
+                        .unwrap(),
+                    Some(BusMessage::Error(message)) if message == "distributed origin canceled"
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("origin cancellation terminal should commit");
+        for worker in workers {
+            worker.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_unary_heartbeat_reads_terminal_that_committed_first() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-terminal-race-{}", uuid::Uuid::new_v4().simple());
+        let heartbeat_started = Arc::new(tokio::sync::Notify::new());
+        let heartbeat_release = Arc::new(tokio::sync::Notify::new());
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(300),
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mutable_gateway = Arc::get_mut(&mut gateway).unwrap();
+        mutable_gateway.origin_lease_timeout = Duration::from_millis(90);
+        mutable_gateway.origin_heartbeat_barrier =
+            Some((heartbeat_started.clone(), heartbeat_release.clone()));
+        let prepared = gateway
+            .prepare_submission(
+                GatewayRequest {
+                    provider: provider.clone(),
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"terminal-race"}),
+                },
+                false,
+                None,
+            )
+            .unwrap();
+        let accepted = gateway.accept_prepared(prepared, None).await.unwrap();
+        let id = accepted.prepared.descriptor.id.clone();
+        let serialized_payload = accepted.prepared.serialized_payload.clone();
+        let mut connection = gateway.connection_for_test().await.unwrap();
+        let owner_token = "terminal-race-owner";
+        let leased: Option<(String, String, String)> = gateway
+            .lease
+            .key(protocol_queue_key(QueueProtocol::LegacyUnscoped, &provider))
+            .key(protocol_processing_key(
+                QueueProtocol::LegacyUnscoped,
+                &provider,
+            ))
+            .key(protocol_leased_key(
+                QueueProtocol::LegacyUnscoped,
+                &provider,
+            ))
+            .key(protocol_owners_key(
+                QueueProtocol::LegacyUnscoped,
+                &provider,
+            ))
+            .key(lifecycle::counters())
+            .key(lifecycle::terminal_reservations())
+            .key(lifecycle::reservation_states())
+            .key(lifecycle::expiry())
+            .arg(300_u64)
+            .arg(owner_token)
+            .arg(gateway.lifecycle_limits.max_terminal_bytes)
+            .arg(gateway.lifecycle_limits.unary_terminal_bytes)
+            .arg(gateway.lifecycle_limits.stream_terminal_bytes)
+            .arg(lifecycle::job_prefix())
+            .arg(7 * 60 * 60 * 1_000_u64)
+            .arg(6 * 60 * 60 * 1_000_u64)
+            .invoke_async(&mut connection)
+            .await
+            .unwrap();
+        let (member, original_score, _) = leased.expect("job should lease");
+        let ownership = LeaseOwnership {
+            protocol: QueueProtocol::LegacyUnscoped,
+            provider,
+            member,
+            original_score,
+            owner_token: owner_token.into(),
+            serialized_payload,
+        };
+        let await_gateway = gateway.clone();
+        let awaiting =
+            tokio::spawn(
+                async move { await_gateway.await_accepted_with_reference(accepted).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), heartbeat_started.notified())
+            .await
+            .expect("heartbeat branch should be selected");
+        assert!(
+            gateway
+                .terminal_owned(
+                    &ownership,
+                    &id,
+                    false,
+                    &BusMessage::Unary(serde_json::json!({"winner":"terminal"})),
+                )
+                .await
+        );
+        heartbeat_release.notify_one();
+        let (value, _) = tokio::time::timeout(Duration::from_secs(1), awaiting)
+            .await
+            .expect("unary wait should finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value, serde_json::json!({"winner":"terminal"}));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_stream_progress_cannot_extend_total_request_timeout() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-total-deadline-{}", uuid::Uuid::new_v4().simple());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(ProgressStreamDispatch),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(90),
+                request_timeout: Duration::from_millis(120),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let workers = gateway.spawn_workers(vec![provider.clone()]);
+        let started = tokio::time::Instant::now();
+        let mut receiver = gateway
+            .submit_stream(GatewayRequest {
+                provider,
+                tier: 0,
+                permits: 1,
+                payload: serde_json::json!({"request":"progress"}),
+            })
+            .await
+            .unwrap();
+        let mut progress_chunks = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+            {
+                Some(Ok(chunk)) => {
+                    assert_eq!(chunk, "progress");
+                    progress_chunks += 1;
+                }
+                Some(Err(GatewayError::Timeout)) => break,
+                other => panic!("unexpected stream result: {other:?}"),
+            }
+        }
+        assert!(progress_chunks >= 3);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        for worker in workers {
+            worker.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_full_stream_buffer_keeps_heartbeat_and_reserves_terminal_slot() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-full-buffer-{}", uuid::Uuid::new_v4().simple());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let mut gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(BurstThenQuietStreamDispatch {
+                started: started.clone(),
+                drops: drops.clone(),
+                dropped: dropped.clone(),
+            }),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(90),
+                request_timeout: Duration::from_millis(400),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        Arc::get_mut(&mut gateway).unwrap().origin_lease_timeout = Duration::from_millis(90);
+        let workers = gateway.spawn_workers(vec![provider.clone()]);
+        let started_notification = started.notified();
+        let mut receiver = gateway
+            .submit_stream(GatewayRequest {
+                provider: provider.clone(),
+                tier: 0,
+                permits: 1,
+                payload: serde_json::json!({"request":"full-buffer"}),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started_notification)
+            .await
+            .expect("burst stream should start");
+        let mut observer = gateway.connection_for_test().await.unwrap();
+        let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
+        let members: Vec<String> = observer.zrange(&processing, 0, -1).await.unwrap();
+        assert_eq!(members.len(), 1);
+        let id = members[0].rsplit_once(':').unwrap().0;
+        let response_channel = protocol_response_channel(QueueProtocol::LegacyUnscoped, id);
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("provider should drop at the absolute deadline");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let channels: Vec<String> = redis::cmd("PUBSUB")
+                    .arg("CHANNELS")
+                    .arg(&response_channel)
+                    .query_async(&mut observer)
+                    .await
+                    .unwrap();
+                if channels.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relay should release PubSub without receiver polling");
+        let mut data_chunks = 0;
+        let mut saw_timeout = false;
+        while let Some(item) = receiver.recv().await {
+            match item {
+                Ok(_) => data_chunks += 1,
+                Err(GatewayError::Timeout) => {
+                    saw_timeout = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected terminal error: {other}"),
+            }
+        }
+        assert_eq!(data_chunks, 16);
+        assert!(
+            saw_timeout,
+            "reserved slot must retain the terminal timeout"
+        );
+        for worker in workers {
+            worker.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_terminal_commit_during_backpressure_preserves_chunk_order() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        for fail_after_chunks in [false, true] {
+            let provider = format!(
+                "origin-terminal-buffer-{}-{}",
+                u8::from(fail_after_chunks),
+                uuid::Uuid::new_v4().simple()
+            );
+            let mut gateway = DistributedGateway::connect(
+                &redis_url,
+                Arc::new(FiniteBurstStreamDispatch { fail_after_chunks }),
+                unlimited(),
+                GatewayConfig {
+                    lease_timeout: Duration::from_millis(300),
+                    request_timeout: Duration::from_secs(2),
+                    ..GatewayConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            Arc::get_mut(&mut gateway).unwrap().origin_lease_timeout = Duration::from_millis(90);
+            let workers = gateway.spawn_workers(vec![provider.clone()]);
+            let mut receiver = gateway
+                .submit_stream(GatewayRequest {
+                    provider,
+                    tier: 0,
+                    permits: 1,
+                    payload: serde_json::json!({"request":"terminal-buffer"}),
+                })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            let mut chunks = Vec::new();
+            let mut terminal_error = None;
+            while let Some(item) = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("finite stream should finish")
+            {
+                match item {
+                    Ok(chunk) => chunks.push(chunk),
+                    Err(error) => {
+                        terminal_error = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            assert_eq!(chunks.len(), 17);
+            for (index, chunk) in chunks.iter().enumerate() {
+                assert_eq!(chunk, &format!("chunk-{index}"));
+            }
+            if fail_after_chunks {
+                assert_eq!(
+                    terminal_error.as_deref(),
+                    Some("upstream error: upstream error: provider-terminal")
+                );
+            } else {
+                assert!(terminal_error.is_none());
+            }
+            for worker in workers {
+                worker.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_stream_heartbeat_zero_without_terminal_still_fails() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-missing-terminal-{}", uuid::Uuid::new_v4().simple());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(EchoDispatch),
+            unlimited(),
+            GatewayConfig::default(),
+        )
+        .await
+        .unwrap();
+        let command = OriginCancelCommand {
+            protocol: QueueProtocol::LegacyUnscoped,
+            provider,
+            id: format!("missing-{}", uuid::Uuid::new_v4().simple()),
+            generation: "999999".into(),
+            member: format!("missing-{}:999999", uuid::Uuid::new_v4().simple()),
+            origin_token: "missing-token".into(),
+        };
+        let (sender, _receiver) = mpsc::channel(2);
+        sender.try_send(Ok("occupied".into())).unwrap();
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(1));
+        assert!(matches!(
+            send_stream_data(
+                &sender,
+                "must-not-send".into(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                &mut heartbeat,
+                &gateway.connections,
+                gateway.redis_operation_timeout,
+                &command,
+                Duration::from_secs(1),
+            )
+            .await,
+            StreamDataSend::HeartbeatFailed(0)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_stream_bus_loss_after_chunk_is_not_clean_eof() {
+        let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
+        let provider = format!("origin-bus-loss-{}", uuid::Uuid::new_v4().simple());
+        let gateway = DistributedGateway::connect(
+            &redis_url,
+            Arc::new(ProgressStreamDispatch),
+            unlimited(),
+            GatewayConfig {
+                lease_timeout: Duration::from_millis(90),
+                request_timeout: Duration::from_secs(2),
+                ..GatewayConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let workers = gateway.spawn_workers(vec![provider.clone()]);
+        let mut receiver = gateway
+            .submit_stream(GatewayRequest {
+                provider,
+                tier: 0,
+                permits: 1,
+                payload: serde_json::json!({"request":"bus-loss"}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "progress"
+        );
+        let mut observer = gateway.connection_for_test().await.unwrap();
+        let killed: u64 = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("TYPE")
+            .arg("pubsub")
+            .query_async(&mut observer)
+            .await
+            .unwrap();
+        assert!(killed >= 1);
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match receiver.recv().await {
+                    Some(Ok(_)) => continue,
+                    terminal => return terminal,
+                }
+            }
+        })
+        .await
+        .expect("bus loss should terminate the relay");
+        assert!(matches!(
+            terminal,
+            Some(Err(GatewayError::Upstream(message))) if message == "distributed response channel lost"
+        ));
+        for worker in workers {
+            worker.abort();
+        }
     }
 
     #[tokio::test]
@@ -3545,6 +5026,7 @@ mod tests {
         let mutable_gateway = Arc::get_mut(&mut gateway).unwrap();
         mutable_gateway.worker_job_timeout = Duration::from_millis(290);
         mutable_gateway.terminal_operation_delay = Duration::from_millis(70);
+        mutable_gateway.origin_lease_timeout = Duration::from_secs(2);
         let preparation_capacity = Arc::new(Semaphore::new(1));
         let worker = tokio::spawn(gateway.clone().worker(
             provider.clone(),
@@ -3573,14 +5055,25 @@ mod tests {
         let processing = protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider);
         let processing_members: Vec<String> = connection.zrange(&processing, 0, -1).await.unwrap();
         assert_eq!(processing_members.len(), 1);
+        let processing_id = processing_members[0].rsplit_once(':').unwrap().0;
+        let origin_expiry: u64 = connection
+            .hget(lifecycle::meta_key(processing_id), "origin_expires_at_ms")
+            .await
+            .unwrap();
+        assert!(
+            origin_expiry
+                > redis_server_time_ms(&mut connection)
+                    .await
+                    .saturating_add(1_000)
+        );
         let near_expiry = redis_server_time_ms(&mut connection)
             .await
-            .saturating_add(40);
+            .saturating_add(120);
         let _: () = connection
             .zadd(&processing, &processing_members[0], near_expiry)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        tokio::time::sleep(Duration::from_millis(160)).await;
         assert_eq!(
             gateway
                 .reap_once_protocol(QueueProtocol::LegacyUnscoped, &provider)
@@ -4181,7 +5674,7 @@ mod tests {
     async fn redis_stale_owner_cannot_mutate_or_publish_for_replacement_delivery() {
         let redis_url = std::env::var("LLMSHIM_REDIS_URL").expect("owned Redis fixture required");
         let provider = format!("lease-fence-{}", uuid::Uuid::new_v4().simple());
-        let gateway = DistributedGateway::connect(
+        let mut gateway = DistributedGateway::connect(
             &redis_url,
             Arc::new(EchoDispatch),
             unlimited(),
@@ -4192,6 +5685,7 @@ mod tests {
         )
         .await
         .unwrap();
+        Arc::get_mut(&mut gateway).unwrap().origin_lease_timeout = Duration::from_secs(2);
         let prepared = gateway
             .prepare_submission(
                 GatewayRequest {
@@ -4328,20 +5822,20 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn redis_dedup_and_dead_letter_markers() {
-        let provider = "itest-dedup";
-        let Some(gw) = test_gateway(provider).await else {
+        let provider = format!("itest-dedup-{}", uuid::Uuid::new_v4().simple());
+        let Some(gw) = test_gateway(&provider).await else {
             return;
         };
         let mut conn = gw.connection_for_test().await.unwrap();
         for k in [
             protocol_done_key(QueueProtocol::LegacyUnscoped, "job-x"),
             protocol_attempts_key(QueueProtocol::LegacyUnscoped, "job-y"),
-            protocol_dlq_key(QueueProtocol::LegacyUnscoped, provider),
-            released_dlq_key(QueueProtocol::LegacyUnscoped, provider),
-            released_dlq_key(QueueProtocol::ScopedV1, provider),
-            protocol_processing_key(QueueProtocol::LegacyUnscoped, provider),
-            protocol_leased_key(QueueProtocol::LegacyUnscoped, provider),
-            protocol_owners_key(QueueProtocol::LegacyUnscoped, provider),
+            protocol_dlq_key(QueueProtocol::LegacyUnscoped, &provider),
+            released_dlq_key(QueueProtocol::LegacyUnscoped, &provider),
+            released_dlq_key(QueueProtocol::ScopedV1, &provider),
+            protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider),
+            protocol_leased_key(QueueProtocol::LegacyUnscoped, &provider),
+            protocol_owners_key(QueueProtocol::LegacyUnscoped, &provider),
         ] {
             let _: Result<i64, _> = conn.del(k).await;
         }
@@ -4354,7 +5848,7 @@ mod tests {
         let completed_member = "completed-member";
         let completed_ownership = LeaseOwnership {
             protocol: QueueProtocol::LegacyUnscoped,
-            provider: provider.into(),
+            provider: provider.clone(),
             member: completed_member.into(),
             original_score: "0".into(),
             owner_token: "completed-owner".into(),
@@ -4362,7 +5856,7 @@ mod tests {
         };
         let _: () = conn
             .zadd(
-                protocol_processing_key(QueueProtocol::LegacyUnscoped, provider),
+                protocol_processing_key(QueueProtocol::LegacyUnscoped, &provider),
                 completed_member,
                 now_ms().saturating_add(1_000),
             )
@@ -4370,7 +5864,7 @@ mod tests {
             .unwrap();
         let _: () = conn
             .hset(
-                protocol_leased_key(QueueProtocol::LegacyUnscoped, provider),
+                protocol_leased_key(QueueProtocol::LegacyUnscoped, &provider),
                 completed_member,
                 0,
             )
@@ -4378,7 +5872,7 @@ mod tests {
             .unwrap();
         let _: () = conn
             .hset(
-                protocol_owners_key(QueueProtocol::LegacyUnscoped, provider),
+                protocol_owners_key(QueueProtocol::LegacyUnscoped, &provider),
                 completed_member,
                 "completed-owner",
             )
@@ -4403,7 +5897,7 @@ mod tests {
         );
 
         // Dead-letter transition records authoritative cleanup ownership.
-        assert_eq!(gw.dead_letter_len(provider).await, 0);
+        assert_eq!(gw.dead_letter_len(&provider).await, 0);
         let baseline_jobs = conn
             .hget::<_, _, i64>(lifecycle::counters(), "jobs")
             .await
@@ -4413,9 +5907,9 @@ mod tests {
             .await
             .unwrap_or_default();
         let (poison_ownership, poison_id) =
-            lease_test_job(&gw, provider, false, "poison-owner").await;
+            lease_test_job(&gw, &provider, false, "poison-owner").await;
         assert!(gw.dead_letter_owned(&poison_ownership).await);
-        assert_eq!(gw.dead_letter_len(provider).await, 1);
+        assert_eq!(gw.dead_letter_len(&provider).await, 1);
         assert_eq!(
             conn.hget::<_, _, String>(lifecycle::reservation_states(), &poison_ownership.member,)
                 .await
@@ -4445,7 +5939,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lifecycle::cleanup_expired(&mut conn, 1).await.unwrap(), 1);
-        assert_eq!(gw.dead_letter_len(provider).await, 0);
+        assert_eq!(gw.dead_letter_len(&provider).await, 0);
         assert_eq!(
             conn.hget::<_, _, i64>(lifecycle::counters(), "jobs")
                 .await

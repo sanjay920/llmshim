@@ -346,12 +346,25 @@ redelivery can still make another external call; lease fencing prevents stale
 local publication and cleanup but cannot make an external provider exactly
 once.
 
-New distributed submissions use lifecycle-v1 storage. Queue and processing
+New distributed submissions use lifecycle-v2 storage. Queue and processing
 indexes contain only an opaque job ID plus a Redis-owned generation; the exact
 serialized request is stored once and Lua never decodes or rewrites it. Reserve
 and activate are separate state transitions, so an uncertain reserve is not
 dispatchable until its matching generation activates. Delayed operations from
 an older generation cannot resurrect or mutate a replacement job.
+
+Lifecycle-v2 adds a generation- and token-fenced origin lease. Origins renew it
+while awaiting unary results or relaying streams, but never beyond the immutable
+total deadline. `LLMSHIM_GATEWAY_REQUEST_TIMEOUT_MS` remains the distributed
+queue-plus-upstream total limit; the HTTP logical deadline may shorten it and
+cannot extend it. `LLMSHIM_GATEWAY_ORIGIN_LEASE_MS` optionally tunes crash
+detection and is capped at five minutes. Redis server time decides expiry.
+Dropped unary futures and quiet streaming bodies request cancellation through
+one bounded gateway pump; a fixed-batch Redis expiry index covers process loss
+and pump saturation without detached per-drop tasks.
+Unary terminals remain readable after response-bus loss. Stream chunks remain
+transient, so a lost stream bus is reported as an error rather than treating a
+durable End marker as proof that every chunk reached the origin.
 
 Lifecycle storage defaults to 10,000 retained jobs, 512 MiB of request/metadata
 bytes, and a separate 512 MiB terminal pool. Environment overrides are
@@ -388,8 +401,8 @@ metadata allowance; processing cancellation and provider response terminals
 use pre-reserved terminal capacity. New DLQ retention is limited to 1,000
 entries, 64 MiB and 24 hours.
 
-Lifecycle-v1 ingress remains disabled while any known older waiting or
-processing namespace is nonempty. Stop old ingress and let matching old workers
+Lifecycle-v2 ingress remains disabled while any known lifecycle-v1 or older
+waiting or processing namespace is nonempty. Stop old ingress and let matching old workers
 drain those fixed keys; lifecycle startup does not scan, migrate, or delete old
 members. Historical DLQ lists and deprecated generic-cache keys are not covered
 by the new bound until an operator explicitly inventories and removes them.
