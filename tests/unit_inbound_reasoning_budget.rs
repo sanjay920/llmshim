@@ -73,7 +73,7 @@ fn every_synchronous_provider_route_refuses_before_transforming() {
             Box::new(ChatGpt::new(ChatGptAuth::new(
                 token_directory.path().join("missing.json"),
             ))),
-            "gpt-5.6-luna",
+            "gpt-6-luna",
         ),
     ];
     for (provider, model) in providers {
@@ -93,7 +93,7 @@ async fn chatgpt_async_preparation_refuses_before_reading_credentials() {
         token_directory.path().join("missing.json"),
     ));
     let request = legacy_request(64 * 1024, 64);
-    let error = match provider.prepare_request("gpt-5.6-luna", &request).await {
+    let error = match provider.prepare_request("gpt-6-luna", &request).await {
         Ok(_) => panic!("ChatGPT accepted excessive reasoning metadata"),
         Err(error) => error,
     };

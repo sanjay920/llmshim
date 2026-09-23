@@ -33,7 +33,7 @@ Both chat endpoints accept the same body:
     "reasoning_effort": "medium"
   },
   "provider_config": {},
-  "fallback": ["openai/gpt-5.6-terra"]
+  "fallback": ["openai/gpt-6-luna"]
 }
 ```
 
@@ -190,10 +190,10 @@ shapes from one body:
 {
   "object": "list",
   "data": [
-    {"id": "openai/gpt-5.6-terra", "object": "model", "created": 0, "owned_by": "openai"}
+    {"id": "openai/gpt-6-luna", "object": "model", "created": 1790035200, "owned_by": "openai"}
   ],
   "models": [
-    {"id": "openai/gpt-5.6-terra", "provider": "openai", "name": "gpt-5.6-terra"}
+    {"id": "openai/gpt-6-luna", "provider": "openai", "name": "gpt-6-luna"}
   ]
 }
 ```

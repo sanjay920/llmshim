@@ -87,7 +87,7 @@ for ev := range ch {
 maxTokens := 1024
 temp := 0.7
 resp, err := client.Chat(ctx, llmshim.ChatRequest{
-	Model:    "openai/gpt-5.6-sol",
+	Model:    "openai/gpt-6-sol",
 	Messages: []llmshim.Message{{Role: "user", Content: "Hi"}},
 	Config: &llmshim.Config{
 		MaxTokens:   &maxTokens,
@@ -159,7 +159,7 @@ tools := []map[string]any{{
 messages := []llmshim.Message{{Role: "user", Content: "What's the weather in Paris?"}}
 
 resp, err := client.Chat(ctx, llmshim.ChatRequest{
-	Model:          "openai/gpt-5.6-sol",
+	Model:          "openai/gpt-6-sol",
 	Messages:       messages,
 	ProviderConfig: map[string]any{"tools": tools},
 })
@@ -184,7 +184,7 @@ messages = append(messages,
 )
 
 final, err := client.Chat(ctx, llmshim.ChatRequest{
-	Model:          "openai/gpt-5.6-sol",
+	Model:          "openai/gpt-6-sol",
 	Messages:       messages,
 	ProviderConfig: map[string]any{"tools": tools},
 })
@@ -214,7 +214,7 @@ from environment variables, and provider-native controls go under its
 
 | Provider | Model string | Environment | Namespace |
 | --- | --- | --- | --- |
-| OpenAI | `openai/gpt-5.6-sol` | `OPENAI_API_KEY` | `x-openai` |
+| OpenAI | `openai/gpt-6-sol` | `OPENAI_API_KEY` | `x-openai` |
 | Anthropic | `anthropic/claude-sonnet-5` | `ANTHROPIC_API_KEY` | `x-anthropic` |
 | Gemini | `gemini/gemini-3.8-flash` | `GEMINI_API_KEY` | `x-gemini` |
 | xAI | `xai/grok-4.6` | `XAI_API_KEY` | none (unified reasoning controls) |

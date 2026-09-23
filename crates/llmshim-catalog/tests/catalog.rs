@@ -9,6 +9,48 @@ fn feed(value: serde_json::Value) -> String {
 }
 
 #[test]
+fn new_frontier_models_have_verified_pricing_and_legacy_specs() {
+    let catalog = Catalog::vendored();
+    for (identifier, short_input, short_output, long_input, long_output) in [
+        ("openai/gpt-6-sol", 2.0, 10.0, 4.0, 15.0),
+        ("openai/gpt-6-luna", 0.1, 0.5, 0.2, 0.75),
+    ] {
+        let model = catalog.resolve(identifier).unwrap();
+        assert_eq!(model.family, Some(ModelFamily::Gpt));
+        assert_eq!(model.context_window_tokens, Some(1_050_000));
+        assert_eq!(model.max_output_tokens, Some(128_000));
+        assert_eq!(
+            model.cost_for_input_tokens(272_000).unwrap().input,
+            Some(short_input)
+        );
+        assert_eq!(
+            model.cost_for_input_tokens(272_000).unwrap().output,
+            Some(short_output)
+        );
+        assert_eq!(
+            model.cost_for_input_tokens(272_001).unwrap().input,
+            Some(long_input)
+        );
+        assert_eq!(
+            model.cost_for_input_tokens(272_001).unwrap().output,
+            Some(long_output)
+        );
+        assert_eq!(model.field_sources["cost.input"], CatalogSource::Builtin);
+    }
+    let opus = catalog.resolve("anthropic/claude-opus-5-5").unwrap();
+    assert_eq!(opus.family, Some(ModelFamily::Claude));
+    assert_eq!(opus.cost.unwrap().input, Some(4.0));
+    assert_eq!(opus.cost.unwrap().output, Some(20.0));
+    assert_eq!(opus.cost.unwrap().cache_read, Some(0.2));
+    assert_eq!(opus.cost.unwrap().cache_write, Some(8.0));
+    assert_eq!(opus.capabilities.forced_tool_choice, Support::Unsupported);
+    assert!(llmshim_catalog::builtin::spec("claude-opus-5").is_some());
+    assert!(!llmshim_catalog::builtin::MODELS
+        .iter()
+        .any(|model| model.id == "anthropic/claude-opus-5"));
+}
+
+#[test]
 fn grok_4_7_is_available_offline_and_4_6_remains_explicit() {
     let c = Catalog::vendored();
     for id in ["xai/grok-4.7", "openrouter/x-ai/grok-4.7"] {
@@ -335,8 +377,8 @@ fn vendored_artifact_has_broad_coverage_without_changing_discovery() {
     let providers: std::collections::BTreeSet<_> = c.models().map(|m| &m.provider).collect();
     assert!(providers.len() >= 200);
     assert!(c.models().count() >= 7000);
-    assert_eq!(llmshim_catalog::builtin::MODELS.len(), 15);
-    assert_eq!(llmshim_catalog::builtin::CHATGPT_MODELS.len(), 4);
+    assert_eq!(llmshim_catalog::builtin::MODELS.len(), 13);
+    assert_eq!(llmshim_catalog::builtin::CHATGPT_MODELS.len(), 3);
     assert_eq!(c.resolve("gpt-6-astra").unwrap().provider, "openai");
     assert!(llmshim_catalog::builtin::all().all(|m| m.family.is_some()));
 }

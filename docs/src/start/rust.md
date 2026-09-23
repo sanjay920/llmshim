@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The public request contract is a serde_json::Value.
     let request = json!({
-        "model": "openai/gpt-5.6-sol",
+        "model": "openai/gpt-6-sol",
         "messages": [
             {"role": "user", "content": "What is Rust in one sentence?"}
         ],

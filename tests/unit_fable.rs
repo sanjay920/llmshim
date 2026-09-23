@@ -38,7 +38,12 @@ fn fable_uses_always_on_adaptive_thinking_and_all_effort_levels() {
 
 #[test]
 fn fable_and_opus5_strip_sampling_even_without_explicit_thinking() {
-    for model in ["claude-fable-5", "claude-fable-5-1", "claude-opus-5"] {
+    for model in [
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-opus-5",
+        "claude-opus-5-5",
+    ] {
         for extra in [
             json!({}),
             json!({"reasoning_effort": "none"}),
@@ -80,6 +85,44 @@ fn fable_rejects_explicit_disabled_or_manual_thinking() {
                 assert!(error.to_string().contains("adaptive thinking"));
             }
         }
+    }
+}
+
+#[test]
+fn opus_5_5_enforces_bound_adaptive_thinking_before_dispatch() {
+    let provider = provider();
+    for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let request = json!({
+            "messages": [{"role": "user", "content": "Say pong"}],
+            "reasoning_effort": effort,
+            "max_tokens": 128,
+        });
+        let native = provider
+            .transform_request("claude-opus-5-5", &request)
+            .unwrap();
+        assert_eq!(native.body["thinking"]["type"], "adaptive");
+        assert_eq!(
+            native.body["output_config"]["effort"],
+            if matches!(effort, "none" | "minimal") {
+                "low"
+            } else {
+                effort
+            }
+        );
+    }
+    for invalid_request in [
+        json!({"messages": [{"role": "user", "content": "Say pong"}],
+            "x-anthropic": {"thinking": {"type": "disabled"}}}),
+        json!({"messages": [{"role": "user", "content": "Say pong"}],
+            "tool_choice": "required"}),
+        json!({"messages": [{"role": "user", "content": "Say pong"}],
+            "tool_choice": {"type": "tool", "name": "lookup"}}),
+        json!({"messages": [{"role": "assistant", "content": "unfinished"}]}),
+    ] {
+        assert!(matches!(
+            provider.transform_request("claude-opus-5-5", &invalid_request),
+            Err(ShimError::ProviderError { status: 400, .. })
+        ));
     }
 }
 
@@ -181,7 +224,12 @@ fn fable51_keeps_appended_system_turns_out_of_the_bound_initial_prompt() {
 
 #[test]
 fn refusal_has_a_content_filter_finish_reason_instead_of_success_or_502() {
-    for model in ["claude-fable-5", "claude-fable-5-1", "claude-opus-5"] {
+    for model in [
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-opus-5",
+        "claude-opus-5-5",
+    ] {
         let result = provider()
             .transform_response(
                 model,
