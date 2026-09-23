@@ -122,6 +122,9 @@ pub fn measure_value(value: &Value, limits: Limits) -> Result<Usage, ParseError>
             .owned_bytes
             .checked_add(size_of::<Value>())
             .ok_or(ParseError::Complexity)?;
+        if usage.nodes > limits.max_nodes || usage.owned_bytes > limits.max_owned_bytes {
+            return Err(ParseError::Complexity);
+        }
         match current {
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
             Value::String(text) => {
@@ -140,14 +143,27 @@ pub fn measure_value(value: &Value, limits: Limits) -> Result<Usage, ParseError>
                             .ok_or(ParseError::Complexity)?,
                     )
                     .ok_or(ParseError::Complexity)?;
-                if values.len() > limits.max_nodes.saturating_sub(pending.len()) {
+                if usage.owned_bytes > limits.max_owned_bytes {
+                    return Err(ParseError::Complexity);
+                }
+                let remaining_nodes = limits
+                    .max_nodes
+                    .checked_sub(usage.nodes)
+                    .and_then(|remaining| remaining.checked_sub(pending.len()))
+                    .ok_or(ParseError::Complexity)?;
+                if values.len() > remaining_nodes {
                     return Err(ParseError::Complexity);
                 }
                 let child_depth = depth.checked_add(1).ok_or(ParseError::Complexity)?;
                 pending.extend(values.iter().map(|child| (child, child_depth)));
             }
             Value::Object(values) => {
-                if values.len() > limits.max_nodes.saturating_sub(pending.len()) {
+                let remaining_nodes = limits
+                    .max_nodes
+                    .checked_sub(usage.nodes)
+                    .and_then(|remaining| remaining.checked_sub(pending.len()))
+                    .ok_or(ParseError::Complexity)?;
+                if values.len() > remaining_nodes {
                     return Err(ParseError::Complexity);
                 }
                 let child_depth = depth.checked_add(1).ok_or(ParseError::Complexity)?;
@@ -161,6 +177,9 @@ pub fn measure_value(value: &Value, limits: Limits) -> Result<Usage, ParseError>
                             )
                         })
                         .ok_or(ParseError::Complexity)?;
+                    if usage.owned_bytes > limits.max_owned_bytes {
+                        return Err(ParseError::Complexity);
+                    }
                     pending.push((child, child_depth));
                 }
             }
