@@ -1,3 +1,5 @@
+#[cfg(feature = "proxy")]
+pub(crate) use llmshim_catalog::bounded_json::{measure_value, parse_slice_with_usage, Usage};
 pub(crate) use llmshim_catalog::bounded_json::{parse_slice, parse_str, Limits, ParseError};
 
 pub(crate) fn enforce_sse_complexity(input: &str) -> crate::error::Result<()> {

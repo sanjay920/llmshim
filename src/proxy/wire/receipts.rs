@@ -35,6 +35,95 @@ const JOURNAL_FILE: &str = ".receipt-retention-v1.jsonl";
 const JOURNAL_PENDING_FILE: &str = ".receipt-retention-v1.pending";
 const DATA_PENDING_FILE: &str = ".receipt-write-v1.pending";
 pub(super) const BUSY_ERROR_MESSAGE: &str = "native replay metadata is busy";
+pub(super) const REQUEST_LIMIT_ERROR_MESSAGE: &str = "native replay metadata exceeds request limit";
+pub(super) const REQUEST_MAX_SERIALIZED_BYTES: usize = 2 * 1024 * 1024;
+pub(super) const REQUEST_MAX_OWNED_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const REQUEST_MAX_NODES: usize = 32_768;
+pub(super) const REQUEST_MAX_OCCURRENCES: usize = 4_096;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RestorationLimits {
+    pub(super) max_serialized_bytes: usize,
+    pub(super) max_owned_bytes: usize,
+    pub(super) max_nodes: usize,
+    pub(super) max_occurrences: usize,
+}
+
+impl Default for RestorationLimits {
+    fn default() -> Self {
+        Self {
+            max_serialized_bytes: REQUEST_MAX_SERIALIZED_BYTES,
+            max_owned_bytes: REQUEST_MAX_OWNED_BYTES,
+            max_nodes: REQUEST_MAX_NODES,
+            max_occurrences: REQUEST_MAX_OCCURRENCES,
+        }
+    }
+}
+
+pub(super) struct RestorationBudget {
+    limits: RestorationLimits,
+    serialized_bytes: usize,
+    owned_bytes: usize,
+    nodes: usize,
+    occurrences: usize,
+}
+
+impl RestorationBudget {
+    pub(super) fn new(limits: RestorationLimits) -> Self {
+        Self {
+            limits,
+            serialized_bytes: 0,
+            owned_bytes: 0,
+            nodes: 0,
+            occurrences: 0,
+        }
+    }
+
+    fn reserve_read(
+        &mut self,
+        serialized_bytes: usize,
+    ) -> Result<crate::json_bounds::Limits, String> {
+        let remaining_nodes = self.limits.max_nodes.saturating_sub(self.nodes);
+        let remaining_owned_bytes = self.limits.max_owned_bytes.saturating_sub(self.owned_bytes);
+        let next_occurrences = self
+            .occurrences
+            .checked_add(1)
+            .ok_or_else(request_limit_error)?;
+        let next_serialized_bytes = self
+            .serialized_bytes
+            .checked_add(serialized_bytes)
+            .ok_or_else(request_limit_error)?;
+        if next_occurrences > self.limits.max_occurrences
+            || next_serialized_bytes > self.limits.max_serialized_bytes
+            || remaining_nodes == 0
+            || serialized_bytes > remaining_owned_bytes
+        {
+            return Err(request_limit_error());
+        }
+        self.occurrences = next_occurrences;
+        self.serialized_bytes = next_serialized_bytes;
+        Ok(crate::json_bounds::Limits {
+            max_depth: crate::json_bounds::Limits::INBOUND.max_depth,
+            max_nodes: remaining_nodes,
+            max_owned_bytes: remaining_owned_bytes,
+        })
+    }
+
+    fn commit_usage(&mut self, usage: crate::json_bounds::Usage) -> Result<(), String> {
+        self.nodes = self
+            .nodes
+            .checked_add(usage.nodes)
+            .ok_or_else(request_limit_error)?;
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_add(usage.owned_bytes)
+            .ok_or_else(request_limit_error)?;
+        if self.nodes > self.limits.max_nodes || self.owned_bytes > self.limits.max_owned_bytes {
+            return Err(request_limit_error());
+        }
+        Ok(())
+    }
+}
 
 thread_local! {
     static HTTP_LOCK_TIMEOUT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
@@ -325,6 +414,26 @@ impl Receipts {
     }
 
     pub fn get(&self, scope: &str, kind: &str, key: &Value) -> Result<Option<Value>, String> {
+        self.get_inner(scope, kind, key, None)
+    }
+
+    pub(super) fn get_bounded(
+        &self,
+        scope: &str,
+        kind: &str,
+        key: &Value,
+        budget: &mut RestorationBudget,
+    ) -> Result<Option<Value>, String> {
+        self.get_inner(scope, kind, key, Some(budget))
+    }
+
+    fn get_inner(
+        &self,
+        scope: &str,
+        kind: &str,
+        key: &Value,
+        mut budget: Option<&mut RestorationBudget>,
+    ) -> Result<Option<Value>, String> {
         self.prepare_directories()?;
         let lock_file = self.lock_file()?;
         self.acquire_lock(&lock_file)?;
@@ -340,12 +449,18 @@ impl Receipts {
                 self.compact_if_needed(&mut index)?;
                 return Ok(None);
             }
-            return parse_receipt(&self.managed_path(&receipt_key));
+            return match budget.as_deref_mut() {
+                Some(budget) => parse_receipt_bounded(&self.managed_path(&receipt_key), budget),
+                None => parse_receipt(&self.managed_path(&receipt_key)),
+            };
         }
         if index.shadows.contains(&receipt_key) {
             return Ok(None);
         }
-        parse_receipt(&self.legacy_path(&receipt_key))
+        match budget {
+            Some(budget) => parse_receipt_bounded(&self.legacy_path(&receipt_key), budget),
+            None => parse_receipt(&self.legacy_path(&receipt_key)),
+        }
     }
 
     fn prepare_directories(&self) -> Result<(), String> {
@@ -961,6 +1076,46 @@ fn parse_receipt(path: &Path) -> Result<Option<Value>, String> {
     }
 }
 
+fn parse_receipt_bounded(
+    path: &Path,
+    budget: &mut RestorationBudget,
+) -> Result<Option<Value>, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(io_error) if io_error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(error()),
+    };
+    let serialized_bytes = usize::try_from(file.metadata().map_err(|_| error())?.len())
+        .map_err(|_| request_limit_error())?;
+    if serialized_bytes > MAX_RECEIPT_BYTES as usize {
+        return Err(error());
+    }
+    let remaining_limits = budget.reserve_read(serialized_bytes)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(serialized_bytes)
+        .map_err(|_| request_limit_error())?;
+    file.take(
+        u64::try_from(serialized_bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_add(1))
+            .ok_or_else(request_limit_error)?,
+    )
+    .read_to_end(&mut bytes)
+    .map_err(|_| error())?;
+    if bytes.len() != serialized_bytes {
+        return Err(error());
+    }
+    let (value, usage) = match crate::json_bounds::parse_slice_with_usage(&bytes, remaining_limits)
+    {
+        Ok(parsed) => parsed,
+        Err(crate::json_bounds::ParseError::Complexity) => return Err(request_limit_error()),
+        Err(crate::json_bounds::ParseError::Malformed(_)) => return Err(error()),
+    };
+    budget.commit_usage(usage)?;
+    Ok(Some(value))
+}
+
 fn unix_time_secs() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -980,6 +1135,10 @@ fn error() -> String {
     "native replay metadata is unavailable".into()
 }
 
+fn request_limit_error() -> String {
+    REQUEST_LIMIT_ERROR_MESSAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,6 +1151,77 @@ mod tests {
             max_total_bytes,
             ttl_secs,
         }
+    }
+
+    #[test]
+    fn request_budget_charges_every_repeated_receipt_occurrence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Receipts::new(directory.path().to_owned());
+        let value = json!({"id":"call","signature":"ordinary"});
+        store.put("scope", "call", &json!("call"), &value).unwrap();
+        let receipt_key = store.key("scope", "call", &json!("call"));
+        let serialized_bytes = usize::try_from(
+            std::fs::metadata(store.managed_path(&receipt_key))
+                .unwrap()
+                .len(),
+        )
+        .unwrap();
+        let mut budget = RestorationBudget::new(RestorationLimits {
+            max_serialized_bytes: serialized_bytes * 2,
+            max_owned_bytes: 64 * 1024,
+            max_nodes: 128,
+            max_occurrences: 2,
+        });
+
+        assert_eq!(
+            store
+                .get_bounded("scope", "call", &json!("call"), &mut budget)
+                .unwrap(),
+            Some(value.clone())
+        );
+        assert_eq!(
+            store
+                .get_bounded("scope", "call", &json!("call"), &mut budget)
+                .unwrap(),
+            Some(value.clone())
+        );
+        assert_eq!(
+            store
+                .get_bounded("scope", "call", &json!("call"), &mut budget)
+                .unwrap_err(),
+            REQUEST_LIMIT_ERROR_MESSAGE
+        );
+        assert_eq!(
+            store.get("scope", "call", &json!("call")).unwrap(),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn request_budget_applies_remaining_node_limit_during_receipt_parse() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Receipts::new(directory.path().to_owned());
+        let value = json!({"items":[1,2,3]});
+        store
+            .put("scope", "block", &json!("block"), &value)
+            .unwrap();
+        let mut budget = RestorationBudget::new(RestorationLimits {
+            max_serialized_bytes: 1024,
+            max_owned_bytes: 64 * 1024,
+            max_nodes: 3,
+            max_occurrences: 4,
+        });
+
+        assert_eq!(
+            store
+                .get_bounded("scope", "block", &json!("block"), &mut budget)
+                .unwrap_err(),
+            REQUEST_LIMIT_ERROR_MESSAGE
+        );
+        assert_eq!(
+            store.get("scope", "block", &json!("block")).unwrap(),
+            Some(value)
+        );
     }
 
     fn managed_file_count(root: &Path) -> usize {
