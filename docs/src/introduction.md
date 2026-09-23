@@ -4,7 +4,7 @@ Write a conversation once:
 
 ```json
 {
-  "model": "openai/gpt-5.6-sol",
+  "model": "openai/gpt-6-sol",
   "messages": [
     { "role": "user", "content": "Explain ownership in one sentence." }
   ]
@@ -14,8 +14,8 @@ Write a conversation once:
 To send the same conversation to another provider, change one line:
 
 ```diff
-- "model": "openai/gpt-5.6-sol"
-+ "model": "anthropic/claude-opus-5"
+- "model": "openai/gpt-6-sol"
++ "model": "anthropic/claude-opus-5-5"
 ```
 
 llmshim selects the provider, translates the request into that provider's native

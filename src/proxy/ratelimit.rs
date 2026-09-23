@@ -1933,10 +1933,10 @@ mod tests {
 
         let chatgpt = prepared_request(
             "chatgpt",
-            "gpt-5.6-luna",
+            "gpt-6-luna",
             crate::reasoning::WireFormat::OpenAiResponses,
             serde_json::json!({
-                "model":"chatgpt/gpt-5.6-luna","messages":[],
+                "model":"chatgpt/gpt-6-luna","messages":[],
                 "max_tokens":1,"x-chatgpt":{"max_output_tokens":2}
             }),
         );

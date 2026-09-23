@@ -135,6 +135,32 @@ fn request_passes_prompt_cache_controls() {
 // ============================================================
 
 #[test]
+fn gpt_6_sol_and_luna_accept_none_and_max_without_a_pro_downgrade() {
+    let provider = provider();
+    for model in ["gpt-6-sol", "gpt-6-luna"] {
+        for (requested_effort, expected_effort) in
+            [("none", "none"), ("minimal", "low"), ("max", "max")]
+        {
+            let request = json!({
+                "messages": [{"role": "user", "content": "Say pong"}],
+                "reasoning_effort": requested_effort,
+            });
+            let native = provider.transform_request(model, &request).unwrap();
+            assert_eq!(native.body["model"], model);
+            assert_eq!(native.body["reasoning"]["effort"], expected_effort);
+        }
+        let request = json!({
+            "messages": [{"role": "user", "content": "Say pong"}],
+            "reasoning_effort": "max",
+            "reasoning_mode": "pro",
+        });
+        let native = provider.transform_request(model, &request).unwrap();
+        assert_eq!(native.body["reasoning"]["effort"], "max");
+        assert_eq!(native.body["reasoning"]["mode"], "pro");
+    }
+}
+
+#[test]
 fn request_no_reasoning_by_default() {
     let p = provider();
     let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
@@ -853,7 +879,7 @@ fn gpt_5_4_family_clamps_minimal_to_low() {
 }
 
 #[test]
-fn mode_pro_native_on_5_6_and_pro_models() {
+fn mode_pro_native_on_gpt_6_and_supported_older_models() {
     let p = provider();
     let req = json!({
         "model": "x",
@@ -861,7 +887,13 @@ fn mode_pro_native_on_5_6_and_pro_models() {
         "reasoning_effort": "high",
         "reasoning_mode": "pro",
     });
-    for model in ["gpt-5.6-terra", "gpt-5.5-pro"] {
+    for model in [
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.5-pro",
+    ] {
         let r = p.transform_request(model, &req).unwrap();
         assert_eq!(r.body["reasoning"]["mode"], "pro", "{model}");
         assert_eq!(r.body["reasoning"]["effort"], "high", "{model}");

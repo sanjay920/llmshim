@@ -267,6 +267,10 @@ fn is_gpt_5_6(model: &str) -> bool {
     model.to_lowercase().starts_with("gpt-5.6")
 }
 
+fn is_gpt_6_model(model: &str) -> bool {
+    matches!(model, "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna")
+}
+
 /// GPT-5.4 family (`gpt-5.4`, `-mini`, `-nano`) rejects "minimal": its
 /// API-reported enum is none/low/medium/high/xhigh (verified live). The
 /// `-pro` variant is caught by `is_pro_model` first, which is stricter.
@@ -292,8 +296,8 @@ fn clamp_reasoning_effort<'a>(model: &str, effort: &'a str) -> &'a str {
             "max" => "xhigh",
             other => other,
         }
-    } else if is_gpt_5_6(model) {
-        // 5.6: full range incl. "max"; rejects only "minimal"
+    } else if is_gpt_5_6(model) || is_gpt_6_model(model) {
+        // GPT-5.6 and GPT-6 Sol/Luna accept max and none, but reject minimal.
         match effort {
             "minimal" => "low",
             other => other,
@@ -612,18 +616,15 @@ impl OpenAi {
                     .and_then(|e| e.as_str())
             });
 
-        // Unified reasoning mode: "pro" is NATIVE on gpt-5.6 and -pro models
-        // (`reasoning.mode`, verified live); every other model 400s on the
-        // field, so emulate it there with a one-tier effort bump — the same
-        // policy the non-OpenAI providers use.
+        // Native reasoning mode is available on GPT-5.6, GPT-6, and -pro models.
+        // Other models get an effort bump instead.
         let pro_mode = matches!(
             obj.get("reasoning_mode").and_then(|m| m.as_str()),
             Some("pro")
         );
-        let mode_is_native = is_gpt_5_6(model) || is_pro_model(model);
+        let mode_is_native = is_gpt_5_6(model) || is_gpt_6_model(model) || is_pro_model(model);
 
         let effort = match (effort, pro_mode, mode_is_native) {
-            (Some("max"), true, false) if model == "gpt-6-astra" => Some("max"),
             (Some(e), true, false) => Some(bump_effort(e)),
             (None, true, false) => Some("high"), // pro alone ≈ medium, bumped
             (e, _, _) => e,

@@ -44,7 +44,10 @@ fn validate_model(model: &str) -> Result<()> {
     {
         Ok(())
     } else {
-        Err(auth_error(400, "unsupported model; use chatgpt/gpt-6-astra, chatgpt/gpt-5.6-sol, chatgpt/gpt-5.6-terra, or chatgpt/gpt-5.6-luna"))
+        Err(auth_error(
+            400,
+            "unsupported model; use chatgpt/gpt-6-astra, chatgpt/gpt-6-sol, or chatgpt/gpt-6-luna",
+        ))
     }
 }
 

@@ -41,7 +41,7 @@ pricing. Catalog entries do not imply credentials or account entitlement.
 ## Advertised catalog
 
 The CLI picker, `llmshim models`, and `/v1/models` share this curated set of
-15 routes. It keeps the current model in each retained tier. Google entries
+13 routes. It keeps the current model in each retained tier. Google entries
 are stable releases only. Credentials determine which providers are listed.
 
 ### OpenAI
@@ -49,16 +49,15 @@ are stable releases only. Credentials determine which providers are listed.
 | ID | Display name |
 |---|---|
 | `openai/gpt-6-astra` | GPT-6 Astra |
-| `openai/gpt-5.6-sol` | GPT-5.6 Sol |
-| `openai/gpt-5.6-terra` | GPT-5.6 Terra |
-| `openai/gpt-5.6-luna` | GPT-5.6 Luna |
+| `openai/gpt-6-sol` | GPT-6 Sol |
+| `openai/gpt-6-luna` | GPT-6 Luna |
 
 ### Anthropic
 
 | ID | Display name |
 |---|---|
 | `anthropic/claude-fable-5-1` | Claude Fable 5.1 |
-| `anthropic/claude-opus-5` | Claude Opus 5 |
+| `anthropic/claude-opus-5-5` | Claude Opus 5.5 |
 | `anthropic/claude-sonnet-5` | Claude Sonnet 5 |
 | `anthropic/claude-haiku-4-5-20251001` | Claude Haiku 4.5 |
 
@@ -120,20 +119,35 @@ A partial stream bill that is not confirmed as the terminal provider bill uses
 `cost_source: "provider_floor"`; it is a known lower bound rather than an exact
 invoice.
 
+The [OpenAI model catalog](https://developers.openai.com/api/docs/models) lists
+GPT-6 Sol and Luna at $2/$10 and $0.10/$0.50 per million input/output tokens
+on the Standard tier. Prompts above 272,000 input tokens use higher rates
+for the whole request; the built-in catalog records those tiers.
+
+Anthropic positions Claude Opus 5.5 at Fable 5.1 level on most work, and
+estimates around 40% less cost per typical task than Opus 5. Its $4/$20
+input/output token prices are 20% below Opus 5. Cache reads cost $0.20 per
+million tokens. Five-minute cache writes cost $5 per million;
+one-hour writes cost $8. Because the catalog has one aggregate cache-write
+rate, its $8 estimate is the conservative one-hour ceiling. See the
+[Anthropic model pricing](https://platform.claude.com/docs/en/models/opus-5-5/overview).
+
 ### ChatGPT subscription
 
 | ID | Display name |
 |---|---|
 | `chatgpt/gpt-6-astra` | GPT-6 Astra (ChatGPT) |
-| `chatgpt/gpt-5.6-sol` | GPT-5.6 Sol (ChatGPT) |
-| `chatgpt/gpt-5.6-terra` | GPT-5.6 Terra (ChatGPT) |
-| `chatgpt/gpt-5.6-luna` | GPT-5.6 Luna (ChatGPT) |
+| `chatgpt/gpt-6-sol` | GPT-6 Sol (ChatGPT) |
+| `chatgpt/gpt-6-luna` | GPT-6 Luna (ChatGPT) |
 
-The ChatGPT provider accepts only these four model IDs. Older and unlisted
+The ChatGPT provider accepts only these three model IDs. Older and unlisted
 IDs are rejected locally before authentication or network calls, including
 when selected through a Router alias. The list is not an account entitlement
-check. Context and output limits remain unspecified because they depend on
-the account/backend. Bare GPT names still route to API-key OpenAI.
+check. The new models are rolling out, so availability also depends on
+workspace settings and account entitlement; see the
+[ChatGPT and Codex changelog](https://learn.chatgpt.com/docs/changelog).
+Context and output limits remain unspecified because they depend on the
+account/backend. Bare GPT names still route to API-key OpenAI.
 
 ## Spec metadata
 
@@ -173,21 +187,22 @@ in the [reasoning guide](../guides/reasoning.md) and the provider transforms.
 Look up one model's full spec from the Rust crate:
 
 ```rust
-if let Some(m) = llmshim::models::spec("openai/gpt-5.6-sol") {
+if let Some(m) = llmshim::models::spec("openai/gpt-6-sol") {
     println!("{}: reasoning = {:?}", m.label, m.capabilities.reasoning);
 }
 ```
 
-`spec()` accepts a full id (`"openai/gpt-5.6-sol"`) or a bare name
-(`"gpt-5.6-sol"`). It also retains historical metadata for explicit lookups;
+`spec()` accepts a full id (`"openai/gpt-6-sol"`) or a bare name
+(`"gpt-6-sol"`). It also retains historical metadata for explicit lookups;
 those models are absent from the advertised list. `None` means no metadata
 is recorded. Specs remain a point-in-time snapshot pinned by the crate version.
 
 ## Routing beyond the catalog
 
 Pruning the advertised list does not remove provider adapters or their
-compatibility behavior. Older explicit IDs still reach their provider, subject
-to upstream availability. Known historical IDs also remain selectable by
+compatibility behavior. Older explicit OpenAI and Anthropic IDs still reach their provider, subject
+to upstream availability. The ChatGPT subscription route accepts only the
+three current GPT-6 models. Known historical IDs also remain selectable by
 exact ID in the CLI, and `spec()` keeps their metadata.
 
 The Router does not check explicit model names against this registry. If a

@@ -127,12 +127,11 @@ async fn chatgpt_server_mode() {
         .collect();
     let expected = [
         "chatgpt/gpt-6-astra",
-        "chatgpt/gpt-5.6-sol",
-        "chatgpt/gpt-5.6-terra",
-        "chatgpt/gpt-5.6-luna",
+        "chatgpt/gpt-6-sol",
+        "chatgpt/gpt-6-luna",
     ];
     assert_eq!(actual, expected);
-    println!("PASS /health and /v1/models (exactly four ChatGPT models)");
+    println!("PASS /health and /v1/models (exactly three ChatGPT models)");
 
     for model in expected {
         let request = json!({"model": model, "messages": [{"role": "user", "content": "Reply with only pong."}],
@@ -172,7 +171,7 @@ async fn chatgpt_server_mode() {
 
     let invalid = client
         .post(format!("{base}/v1/chat"))
-        .json(&json!({"model": "chatgpt/gpt-5.4", "messages": []}))
+        .json(&json!({"model": "chatgpt/gpt-5.6-sol", "messages": []}))
         .send()
         .await
         .unwrap();

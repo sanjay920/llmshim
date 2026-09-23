@@ -30,7 +30,7 @@ pip install llmshim
 ```python
 import llmshim
 
-response = llmshim.chat("gpt-5.6-sol", "What is Rust?")
+response = llmshim.chat("gpt-6-sol", "What is Rust?")
 print(response["message"]["content"])
 ```
 
@@ -50,7 +50,7 @@ import { Client } from "llmshim";
 
 const client = new Client();
 const response = await client.chat({
-  model: "openai/gpt-5.6-sol",
+  model: "openai/gpt-6-sol",
   messages: [{ role: "user", content: "What is Rust?" }],
 });
 
@@ -83,7 +83,7 @@ import (
 func main() {
 	client := llmshim.New()
 	response, err := client.Chat(context.Background(), llmshim.ChatRequest{
-		Model: "openai/gpt-5.6-sol",
+		Model: "openai/gpt-6-sol",
 		Messages: []llmshim.Message{
 			{Role: "user", Content: "What is Rust?"},
 		},
@@ -111,7 +111,7 @@ gem install llmshim
 require "llmshim"
 
 response = Llmshim.chat(
-  model: "openai/gpt-5.6-sol",
+  model: "openai/gpt-6-sol",
   messages: "What is Rust?"
 )
 

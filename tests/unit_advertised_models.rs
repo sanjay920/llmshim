@@ -2,20 +2,18 @@ use llmshim::models::{available_models, spec, MODELS};
 
 const EXPECTED: &[&str] = &[
     "openai/gpt-6-astra",
-    "openai/gpt-5.6-sol",
-    "openai/gpt-5.6-terra",
-    "openai/gpt-5.6-luna",
+    "openai/gpt-6-sol",
+    "openai/gpt-6-luna",
     "anthropic/claude-fable-5-1",
-    "anthropic/claude-opus-5",
+    "anthropic/claude-opus-5-5",
     "anthropic/claude-sonnet-5",
     "anthropic/claude-haiku-4-5-20251001",
     "gemini/gemini-3.8-flash",
     "gemini/gemini-3.5-flash-lite",
     "xai/grok-4.7",
     "chatgpt/gpt-6-astra",
-    "chatgpt/gpt-5.6-sol",
-    "chatgpt/gpt-5.6-terra",
-    "chatgpt/gpt-5.6-luna",
+    "chatgpt/gpt-6-sol",
+    "chatgpt/gpt-6-luna",
 ];
 
 #[test]
@@ -81,6 +79,14 @@ async fn proxy_discovery_excludes_legacy_and_preview_models() {
         .register("chatgpt", Box::new(ChatGpt::default()));
     // Pruning discovery must not block explicit legacy requests.
     assert_eq!(router.resolve("openai/gpt-5.4").unwrap().1, "gpt-5.4");
+    assert_eq!(
+        router.resolve("openai/gpt-5.6-sol").unwrap().1,
+        "gpt-5.6-sol"
+    );
+    assert_eq!(
+        router.resolve("anthropic/claude-opus-5").unwrap().1,
+        "claude-opus-5"
+    );
     assert_eq!(
         router.resolve("anthropic/claude-fable-5").unwrap().1,
         "claude-fable-5"

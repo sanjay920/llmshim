@@ -158,8 +158,14 @@ async fn current_models_proxy_routes() {
             .unwrap()
             .iter()
             .any(|entry| entry["id"] == model);
-        // Fable 5 remains callable by explicit ID but is superseded in discovery.
-        assert_eq!(advertised, model != "anthropic/claude-fable-5");
+        // Older Fable and Opus IDs remain callable by explicit address.
+        assert_eq!(
+            advertised,
+            !matches!(
+                model,
+                "anthropic/claude-fable-5" | "anthropic/claude-opus-5"
+            )
+        );
         let response = client.post(format!("{base}/v1/chat")).json(&json!({"model": model,
             "messages": [{"role": "user", "content": "Reply with only pong."}],
             "config": {"reasoning_effort": "none", "max_tokens": 512, "temperature": 0.5, "top_p": 0.8, "top_k": 10}}))
