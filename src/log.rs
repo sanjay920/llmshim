@@ -1,10 +1,11 @@
 use chrono::Utc;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use serde::Serialize;
 use serde_json::Value;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 /// A single log entry for an LLM request.
@@ -174,12 +175,12 @@ impl Logger {
         provider: &str,
         model: &str,
         started: RequestTimer,
-        mut upstream: Pin<
+        upstream: Pin<
             Box<dyn Stream<Item = std::result::Result<String, crate::error::ShimError>> + Send>,
         >,
     ) -> Pin<Box<dyn Stream<Item = std::result::Result<String, crate::error::ShimError>> + Send>>
     {
-        let mut entry = StreamEntry {
+        let entry = StreamEntry {
             logger: self,
             provider: provider.to_string(),
             model: model.to_string(),
@@ -187,33 +188,36 @@ impl Logger {
             usage: None,
             written: false,
         };
-        Box::pin(async_stream::stream! {
-            while let Some(item) = upstream.next().await {
-                match item {
-                    Ok(chunk) => {
-                        // Read from the parsed chunk, never its text: a usage
-                        // object is the chunk's own `usage` field.
-                        if let Ok(parsed) = serde_json::from_str::<Value>(&chunk) {
-                            if parsed.get("usage").is_some_and(Value::is_object) {
-                                entry.usage = Some(parsed);
-                            }
-                        }
-                        yield Ok(chunk);
-                    }
-                    Err(error) => {
-                        entry.failed(&error.to_string());
-                        yield Err(error);
-                        return;
-                    }
-                }
-            }
-        })
+        Box::pin(Metered { upstream, entry })
     }
 }
 
-/// The one log entry a wrapped stream owes, written when the stream is dropped:
-/// a reader that stops at the final event never polls the stream to its end, so
-/// the end of the loop is not a place every stream reaches.
+/// A chunk stream that owes one log entry: written when the upstream ends, or
+/// when the stream is dropped first — a reader that stops at the final event
+/// never polls it to its end.
+struct Metered {
+    upstream:
+        Pin<Box<dyn Stream<Item = std::result::Result<String, crate::error::ShimError>> + Send>>,
+    entry: StreamEntry,
+}
+
+impl Stream for Metered {
+    type Item = std::result::Result<String, crate::error::ShimError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let polled = this.upstream.as_mut().poll_next(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(chunk))) => this.entry.saw(chunk),
+            Poll::Ready(Some(Err(error))) => this.entry.failed(&error.to_string()),
+            Poll::Ready(None) => this.entry.finish(),
+            Poll::Pending => {}
+        }
+        polled
+    }
+}
+
+/// The one log entry a wrapped stream owes, and whether it has been written.
 struct StreamEntry {
     logger: Logger,
     provider: String,
@@ -224,7 +228,21 @@ struct StreamEntry {
 }
 
 impl StreamEntry {
+    /// Remember `chunk` when it carries a usage object — read from the parsed
+    /// chunk, never its text.
+    fn saw(&mut self, chunk: &str) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(chunk) {
+            if parsed.get("usage").is_some_and(Value::is_object) {
+                self.usage = Some(parsed);
+            }
+        }
+    }
+
+    /// One error line for the stream, however many errors it yields.
     fn failed(&mut self, error: &str) {
+        if self.written {
+            return;
+        }
         self.written = true;
         self.logger.log(&LogEntry::from_error(
             &self.provider,
@@ -233,11 +251,10 @@ impl StreamEntry {
             self.started.elapsed(),
         ));
     }
-}
 
-impl Drop for StreamEntry {
-    fn drop(&mut self) {
-        if self.written {
+    /// The success line for the last usage seen, once; nothing if none was seen.
+    fn finish(&mut self) {
+        if std::mem::replace(&mut self.written, true) {
             return;
         }
         if let Some(usage) = &self.usage {
@@ -248,6 +265,12 @@ impl Drop for StreamEntry {
                 self.started.elapsed(),
             ));
         }
+    }
+}
+
+impl Drop for StreamEntry {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -271,7 +294,7 @@ impl RequestTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::stream;
+    use futures::{stream, StreamExt};
 
     fn lines(path: &std::path::Path) -> Vec<Value> {
         std::fs::read_to_string(path)
