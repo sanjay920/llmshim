@@ -171,7 +171,13 @@ async fn chat_stream_inner(
             .as_ref()
             .map(|Extension(lifetime)| lifetime.deadline()),
     );
-    let stream_result = crate::stream_with_policy(&state.router, &value, &policy_context).await;
+    let stream_result = crate::stream_with_logger_and_policy(
+        &state.router,
+        &value,
+        state.logger.as_ref(),
+        &policy_context,
+    )
+    .await;
     if let Err(error) = &stream_result {
         if is_attempt_policy_error(error) || is_logical_timeout_error(error) {
             return dispatch_error(

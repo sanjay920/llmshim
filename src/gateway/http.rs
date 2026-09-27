@@ -122,9 +122,10 @@ impl Dispatch for RealDispatch {
         _provider: &str,
         payload: Value,
     ) -> Result<ChunkStream, DispatchError> {
-        let upstream = crate::stream(self.router.as_ref(), &payload)
-            .await
-            .map_err(|error| Self::map_err(error, None))?;
+        let upstream =
+            crate::stream_with_logger(self.router.as_ref(), &payload, self.logger.as_ref())
+                .await
+                .map_err(|error| Self::map_err(error, None))?;
         // Map raw ShimError chunks → GatewayError so the channel type is stable.
         let mapped = upstream.map(|item| item.map_err(|e| GatewayError::Upstream(e.to_string())));
         Ok(Box::pin(mapped))
@@ -136,8 +137,13 @@ impl Dispatch for RealDispatch {
         payload: Value,
         policy_context: crate::policy::DispatchPolicyContext,
     ) -> Result<ChunkStream, DispatchError> {
-        let opened =
-            crate::stream_with_policy(self.router.as_ref(), &payload, &policy_context).await;
+        let opened = crate::stream_with_logger_and_policy(
+            self.router.as_ref(),
+            &payload,
+            self.logger.as_ref(),
+            &policy_context,
+        )
+        .await;
         let refusal = policy_context.take_last_refusal();
         let upstream = opened.map_err(|error| Self::map_err(error, refusal))?;
         let mapped = upstream.map(|item| item.map_err(|e| GatewayError::Upstream(e.to_string())));

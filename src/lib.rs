@@ -172,11 +172,62 @@ pub async fn stream_with_policy(
     stream_inner(router, request, Some(policy_context)).await
 }
 
+/// Streaming with usage logging. Exactly one `LogEntry` is written per stream:
+/// a success entry when the upstream terminal chunk carries a usage object, or
+/// one error entry if the stream fails first. A stream that ends without a
+/// usage object logs nothing.
+pub async fn stream_with_logger(
+    router: &Router,
+    request: &Value,
+    logger: Option<&Logger>,
+) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    stream_with_logger_inner(router, request, logger, None).await
+}
+
+pub async fn stream_with_logger_and_policy(
+    router: &Router,
+    request: &Value,
+    logger: Option<&Logger>,
+    policy_context: &DispatchPolicyContext,
+) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    stream_with_logger_inner(router, request, logger, Some(policy_context)).await
+}
+
+async fn stream_with_logger_inner(
+    router: &Router,
+    request: &Value,
+    logger: Option<&Logger>,
+    policy_context: Option<&DispatchPolicyContext>,
+) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    let timer = RequestTimer::start();
+    let (provider, model, upstream) = stream_resolved(router, request, policy_context).await?;
+    let Some(logger) = logger.cloned() else {
+        return Ok(upstream);
+    };
+    Ok(logger.wrap_stream(&provider, &model, timer, upstream))
+}
+
 async fn stream_inner(
     router: &Router,
     request: &Value,
     policy_context: Option<&DispatchPolicyContext>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    let (_, _, stream) = stream_resolved(router, request, policy_context).await?;
+    Ok(stream)
+}
+
+/// Resolve the dispatch target and open the upstream stream. Returns the
+/// provider name and requested model string alongside the stream so a logger
+/// can attribute it without resolving twice.
+async fn stream_resolved(
+    router: &Router,
+    request: &Value,
+    policy_context: Option<&DispatchPolicyContext>,
+) -> Result<(
+    String,
+    String,
+    Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
+)> {
     let request = router.expand_route(request)?;
     let request = request.as_ref();
     let model_str = request
@@ -185,9 +236,10 @@ async fn stream_inner(
         .ok_or(error::ShimError::MissingModel)?;
 
     let (provider, model) = router.resolve_owned(model_str)?;
+    let provider_name = provider.name().to_string();
     // The breaker observes a single target without refusing it. An explicit
     // dispatch policy still gates every actual stream-open attempt below.
-    match policy_context {
+    let stream = match policy_context {
         Some(context) => {
             bound_client(router)
                 .stream_owned_with_policy(provider, &model, request, context)
@@ -198,7 +250,8 @@ async fn stream_inner(
                 .stream_owned(provider, &model, request)
                 .await
         }
-    }
+    }?;
+    Ok((provider_name, model_str.to_string(), stream))
 }
 
 /// The shared HTTP client, reporting to this router's breaker. The pool is

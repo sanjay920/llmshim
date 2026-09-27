@@ -111,6 +111,44 @@ fn encrypted_reasoning_can_cross_inbound_wire_without_losing_original_metadata()
 }
 
 #[test]
+fn chat_wire_exports_reasoning_details_and_never_a_reasoning_array() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Receipts::new(dir.path().to_owned());
+    let canonical = canonical();
+    let chat = response_from_chat(&canonical, Wire::Chat, &store, "a").unwrap();
+    let message = &chat["choices"][0]["message"];
+    assert!(message.get("reasoning").is_none());
+    assert_eq!(
+        message["reasoning_details"],
+        canonical["message"]["reasoning"]
+    );
+    assert!(message["reasoning_content"].is_string());
+    // The Messages wire keeps the canonical array under its own field.
+    let messages = response_from_chat(&canonical, Wire::Messages, &store, "a").unwrap();
+    assert!(messages["content"][0]["type"] == "thinking");
+}
+
+#[test]
+fn legacy_reasoning_array_round_trips_through_the_chat_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Receipts::new(dir.path().to_owned());
+    let canonical = canonical();
+    let chat = response_from_chat(&canonical, Wire::Chat, &store, "a").unwrap();
+    let mut message = chat["choices"][0]["message"].clone();
+    // A client that saved the message before `reasoning_details` existed still
+    // carries the same array under `reasoning`.
+    message["reasoning"] = message["reasoning_details"].clone();
+    message.as_object_mut().unwrap().remove("reasoning_details");
+    assert!(message.get("reasoning_details").is_none());
+    let request = json!({"model":"anthropic/claude-sonnet-4-6","messages":[{"role":"user","content":"read"},message]});
+    let imported = request_to_chat(&request, Wire::Chat, &store, "a").unwrap();
+    assert_eq!(
+        imported["messages"][1]["reasoning"],
+        canonical["message"]["reasoning"]
+    );
+}
+
+#[test]
 fn native_unary_and_stream_usage_preserve_provider_floor_source() {
     let dir = tempfile::tempdir().unwrap();
     let store = Receipts::new(dir.path().to_owned());
@@ -223,6 +261,62 @@ async fn native_sse_has_complete_frames_and_no_internal_event_types() {
         }
     }
     upstream.assert_async().await;
+}
+
+#[tokio::test]
+async fn native_stream_with_logger_writes_one_usage_line() {
+    let mut server = mockito::Server::new_async().await;
+    let data = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"id":"r","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}),
+        json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}})
+    );
+    let upstream = server
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(data)
+        .expect(1)
+        .create_async()
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("usage.jsonl");
+    let logger = llmshim::log::Logger::to_file(log_path.to_str().unwrap()).unwrap();
+    let router = Router::new().register(
+        "local",
+        Box::new(OpenAiCompatible::new("local", server.url(), None)),
+    );
+    let app =
+        app(router, Some(logger)).layer(Extension(Arc::new(Receipts::new(dir.path().to_owned()))));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"model":"local/test","messages":[{"role":"user","content":"hi"}],"stream":true})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("hello"), "{text}");
+    upstream.assert_async().await;
+    let logged = std::fs::read_to_string(&log_path).unwrap();
+    let lines: Vec<Value> = logged
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one usage line: {logged}");
+    assert_eq!(lines[0]["input_tokens"], 4);
+    assert_eq!(lines[0]["output_tokens"], 2);
+    assert_eq!(lines[0]["total_tokens"], 6);
+    assert_eq!(lines[0]["provider"], "local");
+    assert_eq!(lines[0]["request_id"], "r");
 }
 
 #[tokio::test]
