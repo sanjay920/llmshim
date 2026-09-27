@@ -486,10 +486,20 @@ fn request_to_chat_with_limits(
                 canonical.as_object_mut().unwrap().remove(field);
             }
             if role == "assistant" {
+                // A message exported before `reasoning_details` existed carries
+                // the same array under `reasoning`. Alias it so the receipt key
+                // matches, then read the receipt through the canonical field.
+                let mut key_source = message.clone();
+                if key_source.get("reasoning_details").is_none()
+                    && key_source.get("reasoning").is_some_and(Value::is_array)
+                {
+                    key_source["reasoning_details"] = key_source["reasoning"].clone();
+                    key_source.as_object_mut().unwrap().remove("reasoning");
+                }
                 if let Some(reasoning) = receipts.get_bounded(
                     scope,
                     "reasoning",
-                    &message_key(message),
+                    &message_key(&key_source),
                     &mut restoration_budget,
                 )? {
                     canonical["reasoning"] = reasoning;
@@ -690,7 +700,7 @@ pub fn response_from_chat(
             exported["tool_calls"] = json!(calls.iter().map(native_call).collect::<Vec<_>>());
         }
         if let Some(reasoning) = message.get("reasoning").filter(|r| r.is_array()) {
-            exported["reasoning"] = reasoning.clone();
+            exported["reasoning_details"] = reasoning.clone();
             exported["reasoning_content"] = json!(crate::reasoning::reasoning_text(message));
             receipts.put(scope, "reasoning", &message_key(&exported), reasoning)?;
         }
