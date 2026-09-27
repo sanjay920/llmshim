@@ -108,8 +108,9 @@ Untracked native thinking has no provenance and is dropped. Issued reasoning
 restores its original typed block and still passes through the common family,
 wire and account replay filter. Cross-wire opaque reasoning uses a receipt handle
 in native Messages fields so the original block can be restored without pretending
-it originated on that wire. Chat Completions includes a `reasoning` extension;
-clients that discard it also discard replayable reasoning. Keep full native
+it originated on that wire. Chat Completions includes a `reasoning_details`
+extension (and readable `reasoning_content`); clients that discard them also
+discard replayable reasoning. Keep full native
 assistant messages and tool IDs when saving a conversation. Receipt metadata is
 separate from the caller-owned conversation history.
 

@@ -1,7 +1,9 @@
 use chrono::Utc;
+use futures::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
 use std::io::Write;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -118,6 +120,7 @@ impl LogEntry {
 }
 
 /// Logger that writes JSONL to a writer (file or stdout).
+#[derive(Clone)]
 pub struct Logger {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
@@ -157,6 +160,95 @@ impl Logger {
             }
         }
     }
+
+    /// Wrap a provider chunk stream so at most one entry is written for it.
+    ///
+    /// A chunk whose parsed JSON carries an object `usage` is remembered, and the
+    /// last one seen is logged as a success once the stream is finished with —
+    /// whether it ran to its end or its reader stopped early, as the native
+    /// facade does at the `done` event. An error chunk logs one error entry
+    /// instead. A stream that saw no usage object logs nothing, so an
+    /// unaccounted stream never fabricates a zero-token line.
+    pub fn wrap_stream(
+        self,
+        provider: &str,
+        model: &str,
+        started: RequestTimer,
+        mut upstream: Pin<
+            Box<dyn Stream<Item = std::result::Result<String, crate::error::ShimError>> + Send>,
+        >,
+    ) -> Pin<Box<dyn Stream<Item = std::result::Result<String, crate::error::ShimError>> + Send>>
+    {
+        let mut entry = StreamEntry {
+            logger: self,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            started,
+            usage: None,
+            written: false,
+        };
+        Box::pin(async_stream::stream! {
+            while let Some(item) = upstream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        // Read from the parsed chunk, never its text: a usage
+                        // object is the chunk's own `usage` field.
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&chunk) {
+                            if parsed.get("usage").is_some_and(Value::is_object) {
+                                entry.usage = Some(parsed);
+                            }
+                        }
+                        yield Ok(chunk);
+                    }
+                    Err(error) => {
+                        entry.failed(&error.to_string());
+                        yield Err(error);
+                        return;
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// The one log entry a wrapped stream owes, written when the stream is dropped:
+/// a reader that stops at the final event never polls the stream to its end, so
+/// the end of the loop is not a place every stream reaches.
+struct StreamEntry {
+    logger: Logger,
+    provider: String,
+    model: String,
+    started: RequestTimer,
+    usage: Option<Value>,
+    written: bool,
+}
+
+impl StreamEntry {
+    fn failed(&mut self, error: &str) {
+        self.written = true;
+        self.logger.log(&LogEntry::from_error(
+            &self.provider,
+            &self.model,
+            error,
+            self.started.elapsed(),
+        ));
+    }
+}
+
+impl Drop for StreamEntry {
+    fn drop(&mut self) {
+        if self.written {
+            return;
+        }
+        if let Some(usage) = &self.usage {
+            self.logger.log(&LogEntry::from_response(
+                &self.provider,
+                &self.model,
+                usage,
+                self.started.elapsed(),
+            ));
+        }
+    }
 }
 
 /// Timer helper — start before request, finish after.
@@ -173,5 +265,126 @@ impl RequestTimer {
 
     pub fn elapsed(&self) -> std::time::Duration {
         self.start.elapsed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    fn lines(path: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn error() -> crate::error::ShimError {
+        crate::error::ShimError::Stream("upstream failed".into())
+    }
+
+    #[tokio::test]
+    async fn wrap_stream_logs_one_entry_from_the_terminal_usage_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.jsonl");
+        let logger = Logger::to_file(path.to_str().unwrap()).unwrap();
+        let chunks = vec![
+            Ok("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}".to_string()),
+            Ok(
+                "{\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6},\"id\":\"r1\"}"
+                    .to_string(),
+            ),
+        ];
+        let mut wrapped = logger.wrap_stream(
+            "openai",
+            "gpt-5.4",
+            RequestTimer::start(),
+            Box::pin(stream::iter(chunks)),
+        );
+        let mut seen = 0;
+        while wrapped.next().await.is_some() {
+            seen += 1;
+        }
+        assert_eq!(seen, 2, "the wrapper must forward every chunk unchanged");
+        let lines = lines(&path);
+        assert_eq!(lines.len(), 1, "exactly one log line");
+        assert_eq!(lines[0]["input_tokens"], 4);
+        assert_eq!(lines[0]["output_tokens"], 2);
+        assert_eq!(lines[0]["total_tokens"], 6);
+        assert_eq!(lines[0]["request_id"], "r1");
+        assert_eq!(lines[0]["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn wrap_stream_logs_nothing_without_a_usage_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.jsonl");
+        let logger = Logger::to_file(path.to_str().unwrap()).unwrap();
+        let chunks = vec![
+            Ok("{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}".to_string()),
+            Ok("{\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}".to_string()),
+        ];
+        let mut wrapped = logger.wrap_stream(
+            "openai",
+            "gpt-5.4",
+            RequestTimer::start(),
+            Box::pin(stream::iter(chunks)),
+        );
+        while wrapped.next().await.is_some() {}
+        assert!(lines(&path).is_empty(), "no usage object means no log line");
+    }
+
+    #[tokio::test]
+    async fn wrap_stream_logs_one_error_entry_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.jsonl");
+        let logger = Logger::to_file(path.to_str().unwrap()).unwrap();
+        let chunks: Vec<std::result::Result<String, crate::error::ShimError>> = vec![
+            Ok("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}".to_string()),
+            Err(error()),
+        ];
+        let mut wrapped = logger.wrap_stream(
+            "openai",
+            "gpt-5.4",
+            RequestTimer::start(),
+            Box::pin(stream::iter(chunks)),
+        );
+        let mut errors = 0;
+        while let Some(item) = wrapped.next().await {
+            if item.is_err() {
+                errors += 1;
+            }
+        }
+        assert_eq!(errors, 1);
+        let lines = lines(&path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["status"], "error");
+        assert!(lines[0]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("upstream failed")));
+    }
+
+    #[tokio::test]
+    async fn wrap_stream_logs_the_last_usage_object_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.jsonl");
+        let logger = Logger::to_file(path.to_str().unwrap()).unwrap();
+        let chunks = vec![
+            Ok("{\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}".to_string()),
+            Ok("{\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,\"total_tokens\":12},\"id\":\"final\"}".to_string()),
+        ];
+        let mut wrapped = logger.wrap_stream(
+            "openai",
+            "gpt-5.4",
+            RequestTimer::start(),
+            Box::pin(stream::iter(chunks)),
+        );
+        while wrapped.next().await.is_some() {}
+        let lines = lines(&path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["total_tokens"], 12);
+        assert_eq!(lines[0]["request_id"], "final");
     }
 }
