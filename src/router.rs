@@ -1,6 +1,9 @@
 use crate::breaker::ProviderBreaker;
 use crate::config::Route;
-use crate::credentials::{key_for, EnvironmentOnly, StoredCredentials, CREDENTIALED_PROVIDERS};
+use crate::credentials::{
+    key_source, stored_base_url, EnvironmentOnly, KeySource, StoredCredentials,
+    CREDENTIALED_PROVIDERS,
+};
 use crate::error::{Result, ShimError};
 use crate::provider::Provider;
 use crate::providers::anthropic::Anthropic;
@@ -79,6 +82,33 @@ fn self_hosted_from_env(name: &str) -> Option<OpenAiCompatible> {
         _ => crate::reasoning::WireFormat::OpenAiChat,
     };
     Some(OpenAiCompatible::new(name, base, key).with_wire(wire))
+}
+
+/// Build one hosted provider on the key it was registered with, on the provider's own address
+/// unless a stored `base_url` says otherwise. `None` for a name no arm knows, which the caller
+/// treats as "register nothing".
+fn hosted_provider(
+    provider: &str,
+    key: String,
+    base_url: Option<String>,
+) -> Option<Box<dyn Provider>> {
+    macro_rules! on_base {
+        ($provider:expr) => {{
+            let provider = $provider;
+            match base_url {
+                Some(url) => Box::new(provider.with_base_url(url)) as Box<dyn Provider>,
+                None => Box::new(provider) as Box<dyn Provider>,
+            }
+        }};
+    }
+    Some(match provider {
+        "openai" => on_base!(OpenAi::new(key)),
+        "anthropic" => on_base!(Anthropic::new(key)),
+        "gemini" => on_base!(Gemini::new(key)),
+        "xai" => on_base!(Xai::new(key)),
+        "openrouter" => on_base!(OpenRouter::new(key)),
+        _ => return None,
+    })
 }
 
 impl Router {
@@ -234,6 +264,17 @@ impl Router {
     /// caller holds no provider-specific knowledge — which is the whole reason the seam is here
     /// rather than in the caller.
     pub fn from_credentials_without_catalog_refresh(stored: &dyn StoredCredentials) -> Self {
+        Self::from_credentials_with_env(stored, &|name| std::env::var(name).ok())
+    }
+
+    /// [`Router::from_credentials_without_catalog_refresh`] with the environment lookup
+    /// injected, so a caller can decide what counts as exported without mutating the process
+    /// environment. The credential precedence is already tested this way at the `key_for`
+    /// seam; this exposes the same seam one level up, where a stored address is read.
+    pub fn from_credentials_with_env(
+        stored: &dyn StoredCredentials,
+        environment: &dyn Fn(&str) -> Option<String>,
+    ) -> Self {
         let mut router = Router::new();
 
         // Named routes are configuration, not discovery: they come from
@@ -245,22 +286,26 @@ impl Router {
             router = router.register("chatgpt", Box::new(ChatGpt::new(chatgpt_auth)));
         }
 
-        let environment = |name: &str| std::env::var(name).ok();
         for provider in CREDENTIALED_PROVIDERS {
-            let Some(key) = key_for(provider, &environment, stored) else {
+            let Some(source) = key_source(provider, environment, stored) else {
                 continue;
             };
-            let built: Box<dyn Provider> = match provider {
-                "openai" => Box::new(OpenAi::new(key)),
-                "anthropic" => Box::new(Anthropic::new(key)),
-                "gemini" => Box::new(Gemini::new(key)),
-                "xai" => Box::new(Xai::new(key)),
-                "openrouter" => Box::new(OpenRouter::new(key)),
-                // Unreachable while the list and this match are edited together, and a silent
-                // skip is the right failure: an unbuildable name must not take the router down.
-                _ => continue,
+            // A stored address belongs only to the stored key: an exported key is never sent
+            // to it, and an invalid stored address registers nothing rather than fall back to
+            // the provider's own host, which the key was never meant for.
+            let base_url = match &source {
+                KeySource::Environment(_) => None,
+                KeySource::Stored(_) => match stored.base_url_for(provider) {
+                    None => None,
+                    Some(raw) => match stored_base_url(&raw) {
+                        Some(url) => Some(url),
+                        None => continue,
+                    },
+                },
             };
-            router = router.register(provider, built);
+            if let Some(built) = hosted_provider(provider, source.into_key(), base_url) {
+                router = router.register(provider, built);
+            }
         }
         // Self-hosted OpenAI-compatible servers: the base URL is the config
         // (local vs remote); the API key is optional. Registered only when the
