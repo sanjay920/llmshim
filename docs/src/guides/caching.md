@@ -5,7 +5,7 @@ llmshim translates the declaration into the provider's caching mechanism.
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-5",
+  "model": "anthropic/claude-sonnet-5-5",
   "messages": [
     {"role":"system","content":"Stable instructions"},
     {"role":"user","content":"Session context"},

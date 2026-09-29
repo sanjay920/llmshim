@@ -1,6 +1,7 @@
 use chrono::Utc;
 use llmshim_catalog::{
-    Catalog, CatalogSource, ModelCapabilities, ModelFamily, ModelInfo, ReasoningOption, Support,
+    Catalog, CatalogSource, EffortLevel, ModelCapabilities, ModelFamily, ModelInfo,
+    ReasoningOption, Support,
 };
 use serde_json::json;
 
@@ -48,6 +49,34 @@ fn new_frontier_models_have_verified_pricing_and_legacy_specs() {
     assert!(!llmshim_catalog::builtin::MODELS
         .iter()
         .any(|model| model.id == "anthropic/claude-opus-5"));
+
+    let sonnet = catalog.resolve("anthropic/claude-sonnet-5-5").unwrap();
+    assert_eq!(sonnet.family, Some(ModelFamily::Claude));
+    assert_eq!(sonnet.context_window_tokens, Some(1_000_000));
+    assert_eq!(sonnet.max_output_tokens, Some(128_000));
+    assert_eq!(sonnet.cost.unwrap().input, Some(2.0));
+    assert_eq!(sonnet.cost.unwrap().output, Some(10.0));
+    assert_eq!(sonnet.cost.unwrap().cache_read, Some(0.2));
+    assert_eq!(sonnet.cost.unwrap().cache_write, Some(4.0));
+    assert_eq!(sonnet.capabilities.forced_tool_choice, Support::Unsupported);
+    assert_eq!(sonnet.release_date.unwrap().to_string(), "2026-09-28");
+    assert_eq!(sonnet.field_sources["cost.input"], CatalogSource::Builtin);
+    assert_eq!(
+        sonnet.reasoning_options,
+        vec![ReasoningOption::Effort {
+            values: vec![
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::High,
+                EffortLevel::Xhigh,
+                EffortLevel::Max,
+            ],
+        }]
+    );
+    assert!(llmshim_catalog::builtin::spec("claude-sonnet-5").is_some());
+    assert!(!llmshim_catalog::builtin::MODELS
+        .iter()
+        .any(|model| model.id == "anthropic/claude-sonnet-5"));
 }
 
 #[test]

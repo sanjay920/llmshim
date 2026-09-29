@@ -16,7 +16,7 @@ In a Rust request, both are top-level fields:
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-5",
+  "model": "anthropic/claude-sonnet-5-5",
   "messages": [{"role": "user", "content": "Solve this carefully."}],
   "reasoning_effort": "high",
   "reasoning_mode": "pro"
@@ -27,7 +27,7 @@ In the proxy contract, put them under `config`:
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-5",
+  "model": "anthropic/claude-sonnet-5-5",
   "messages": [{"role": "user", "content": "Solve this carefully."}],
   "config": {
     "reasoning_effort": "high",
@@ -160,7 +160,7 @@ on the three advertised GPT-6 models. See the
 
 Adaptive models use `thinking: {type}` plus `output_config: {effort}`:
 
-| unified | Fable 5.1 / Opus 5.5 | Opus 5 / Sonnet 5 |
+| unified | Fable 5.1 / Opus 5.5 / Sonnet 5.5 | Opus 5 / Sonnet 5 |
 |---|---|---|
 | `none` | `adaptive` + **`low`** | `thinking: {type: "disabled"}` |
 | `low` | `adaptive` + `low` | `adaptive` + `low` |
@@ -170,12 +170,17 @@ Adaptive models use `thinking: {type}` plus `output_config: {effort}`:
 | `max` | `adaptive` + `max` | `adaptive` + `max` |
 
 On models that can disable thinking, `reasoning_effort: "none"` maps to disabled
-thinking. Fable 5.1 and Opus 5.5 always use adaptive thinking, so `none` maps
-to `low`. Explicit native disabled/manual thinking is rejected locally for
-those models, as is forced tool choice. Opus 5.5 thinking blocks replay to
-Fable 5.1, while older Opus models cannot consume them. Opus 5.5 omits
-`temperature`, `top_p`, and `top_k`, as do Fable and Opus 5. See the
-[Opus 5.5 migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
+thinking. Fable 5.1, Opus 5.5, and Sonnet 5.5 always use adaptive thinking, so
+`none` maps to `low`. Explicit native disabled/manual thinking is rejected
+locally for those models, as is forced tool choice. Opus 5.5 thinking blocks
+replay to Fable 5.1, while older Opus models cannot consume them. Sonnet 5.5
+blocks replay only to Sonnet 5.5, and Sonnet 5.5 reads thinking from Sonnet 5,
+Opus 4.8, Haiku 4.5, and earlier, but not from Opus 5, Opus 5.5, or a
+Fable/Mythos model. Opus 5.5 and Sonnet 5.5 omit `temperature`, `top_p`, and
+`top_k`, as do Fable and Opus 5. See the
+[Opus 5.5 migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide)
+and the
+[Sonnet 5.5 model page](https://platform.claude.com/docs/en/models/sonnet-5-5/overview).
 
 Fable behavior and its five effort levels follow Anthropic's
 [migration guide](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide)

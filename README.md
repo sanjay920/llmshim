@@ -216,7 +216,7 @@ async fn main() {
     let router = llmshim::router::Router::from_env();
 
     let request = json!({
-        "model": "claude-sonnet-5",
+        "model": "claude-sonnet-5-5",
         "messages": [{"role": "user", "content": "What is Rust?"}],
         "max_tokens": 500,
     });
@@ -287,7 +287,7 @@ llmshim proxy
 ```bash
 curl http://localhost:3000/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"model":"claude-sonnet-5","messages":[{"role":"user","content":"Hi"}],"config":{"max_tokens":100}}'
+  -d '{"model":"claude-sonnet-5-5","messages":[{"role":"user","content":"Hi"}],"config":{"max_tokens":100}}'
 ```
 
 | Method | Path | Description |
@@ -353,14 +353,14 @@ import llmshim
 # Keys can also come from env vars or `llmshim configure`.
 llmshim.configure(anthropic="sk-ant-...", openai="sk-...")
 
-resp = llmshim.chat("claude-sonnet-5", "Hello!", max_tokens=500)
+resp = llmshim.chat("claude-sonnet-5-5", "Hello!", max_tokens=500)
 print(resp["message"]["content"])
 ```
 
 **Streaming:**
 
 ```python
-for event in llmshim.stream("claude-sonnet-5", "Write a poem"):
+for event in llmshim.stream("claude-sonnet-5-5", "Write a poem"):
     if event["type"] == "content":
         print(event["text"], end="", flush=True)
     elif event["type"] == "usage":
@@ -372,7 +372,7 @@ for event in llmshim.stream("claude-sonnet-5", "Write a poem"):
 ```python
 messages = [{"role": "user", "content": "What is a closure?"}]
 
-r1 = llmshim.chat("claude-sonnet-5", messages, max_tokens=500)
+r1 = llmshim.chat("claude-sonnet-5-5", messages, max_tokens=500)
 print(f"Claude: {r1['message']['content']}")
 
 messages.append({"role": "assistant", "content": r1["message"]["content"]})
@@ -398,7 +398,7 @@ tools = [{
     },
 }]
 
-resp = llmshim.chat("claude-sonnet-5", "Weather in Tokyo?", max_tokens=500, tools=tools)
+resp = llmshim.chat("claude-sonnet-5-5", "Weather in Tokyo?", max_tokens=500, tools=tools)
 for tc in resp["message"].get("tool_calls", []):
     print(f"{tc['function']['name']}({tc['function']['arguments']})")
 ```
@@ -407,7 +407,7 @@ for tc in resp["message"].get("tool_calls", []):
 
 ```python
 resp = llmshim.chat(
-    "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "Solve: x^2 - 5x + 6 = 0",
     max_tokens=4000,
     reasoning_effort="high",   # none | low | medium | high | xhigh | max
@@ -423,7 +423,7 @@ llmshim maps these to each provider's native control (OpenAI `reasoning.effort`/
 
 ```python
 resp = llmshim.chat(
-    "anthropic/claude-sonnet-5",
+    "anthropic/claude-sonnet-5-5",
     "Hello",
     max_tokens=100,
     fallback=["openai/gpt-6-sol", "gemini/gemini-3.8-flash"],
@@ -445,7 +445,7 @@ import { Client } from "llmshim";
 
 const client = new Client(); // no baseUrl -> auto-starts the bundled proxy
 const res = await client.chat({
-  model: "anthropic/claude-sonnet-5",
+  model: "anthropic/claude-sonnet-5-5",
   messages: [{ role: "user", content: "Hello!" }],
 });
 console.log(res.message.content);
@@ -462,7 +462,7 @@ go get github.com/sanjay920/llmshim/clients/go
 ```go
 client := llmshim.New() // defaults to http://localhost:3000
 resp, err := client.Chat(ctx, llmshim.ChatRequest{
-    Model:    "anthropic/claude-sonnet-5",
+    Model:    "anthropic/claude-sonnet-5-5",
     Messages: []llmshim.Message{{Role: "user", Content: "Hello!"}},
 })
 ```
@@ -478,7 +478,7 @@ gem install llmshim
 ```ruby
 require "llmshim"
 
-resp = Llmshim.chat(model: "anthropic/claude-sonnet-5", messages: [{role: "user", content: "Hello!"}])
+resp = Llmshim.chat(model: "anthropic/claude-sonnet-5-5", messages: [{role: "user", content: "Hello!"}])
 puts resp.message.content
 ```
 
@@ -491,7 +491,7 @@ Standard library only. Full docs: [`clients/ruby/README.md`](clients/ruby/README
 | Provider | Models | Reasoning visible |
 |----------|--------|-------------------|
 | **OpenAI** | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | Yes (summaries) |
-| **Anthropic** | `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001` | Yes (thinking summaries) |
+| **Anthropic** | `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5-20251001` | Yes (thinking summaries) |
 | **Google Gemini** | `gemini-3.8-flash`, `gemini-3.5-flash-lite` | Yes (thought summaries) |
 | **xAI** | `grok-4.7` | No (hidden) |
 
@@ -519,7 +519,7 @@ No canonical struct. Requests flow as `serde_json::Value` — each provider maps
 
 ```
 llmshim::completion(router, request)
-  → router.resolve("anthropic/claude-sonnet-5")
+  → router.resolve("anthropic/claude-sonnet-5-5")
   → provider.transform_request(model, &value)
   → HTTP
   → provider.transform_response(model, body)
