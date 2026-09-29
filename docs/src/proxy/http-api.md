@@ -24,7 +24,7 @@ Both chat endpoints accept the same body:
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-5",
+  "model": "anthropic/claude-sonnet-5-5",
   "messages": [{"role": "user", "content": "Explain ownership briefly."}],
   "stream": false,
   "config": {
@@ -94,7 +94,7 @@ through the listed routes. It is ignored by both streaming paths. See
 ```json
 {
   "id": "msg_123",
-  "model": "claude-sonnet-5",
+  "model": "claude-sonnet-5-5",
   "provider": "anthropic",
   "message": {
     "role": "assistant",

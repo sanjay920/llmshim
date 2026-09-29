@@ -48,7 +48,7 @@ Then address them via the model string — `vllm/<served-model>` or
 ```python
 import llmshim
 
-resp = llmshim.chat("claude-sonnet-5", "What is Rust?")
+resp = llmshim.chat("claude-sonnet-5-5", "What is Rust?")
 print(resp["message"]["content"])
 ```
 
@@ -70,7 +70,7 @@ resp = llmshim.chat(
 With message history:
 
 ```python
-resp = llmshim.chat("claude-sonnet-5", [
+resp = llmshim.chat("claude-sonnet-5-5", [
     {"role": "system", "content": "You are a pirate."},
     {"role": "user", "content": "Hello!"},
 ], max_tokens=500)
@@ -79,7 +79,7 @@ resp = llmshim.chat("claude-sonnet-5", [
 ## Streaming
 
 ```python
-for event in llmshim.stream("claude-sonnet-5", "Write a poem"):
+for event in llmshim.stream("claude-sonnet-5-5", "Write a poem"):
     if event["type"] == "content":
         print(event["text"], end="", flush=True)
     elif event["type"] == "reasoning":
@@ -95,7 +95,7 @@ Switch models mid-conversation. History carries over.
 ```python
 messages = [{"role": "user", "content": "What is a closure?"}]
 
-r1 = llmshim.chat("claude-sonnet-5", messages, max_tokens=500)
+r1 = llmshim.chat("claude-sonnet-5-5", messages, max_tokens=500)
 print(f"Claude: {r1['message']['content']}")
 
 messages.append({"role": "assistant", "content": r1["message"]["content"]})
@@ -117,7 +117,7 @@ nearest tier the target model supports:
 
 ```python
 resp = llmshim.chat(
-    "claude-sonnet-5",
+    "claude-sonnet-5-5",
     "Solve: x^2 - 5x + 6 = 0",
     max_tokens=4000,
     reasoning_effort="high",
@@ -141,7 +141,7 @@ per provider (`x-anthropic`, `x-openai`, `x-gemini`, `x-openrouter`, `x-vllm`,
 
 ```python
 resp = llmshim.chat(
-    "anthropic/claude-sonnet-5",
+    "anthropic/claude-sonnet-5-5",
     "Solve this step by step: 17 * 23",
     max_tokens=4000,
     provider_config={
@@ -178,7 +178,7 @@ tools = [{
     },
 }]
 
-resp = llmshim.chat("claude-sonnet-5", "Weather in Tokyo?", max_tokens=500, tools=tools)
+resp = llmshim.chat("claude-sonnet-5-5", "Weather in Tokyo?", max_tokens=500, tools=tools)
 for tc in resp["message"].get("tool_calls", []):
     print(f"{tc['function']['name']}({tc['function']['arguments']})")
 ```
@@ -189,7 +189,7 @@ Tools are accepted in OpenAI Chat Completions format and auto-translated to each
 
 ```python
 resp = llmshim.chat(
-    "anthropic/claude-sonnet-5",
+    "anthropic/claude-sonnet-5-5",
     "Hello",
     max_tokens=100,
     fallback=["openai/gpt-6-sol", "gemini/gemini-3.8-flash"],
@@ -222,7 +222,7 @@ common ones are re-exported at the top level) for static type-checking:
 ```python
 from llmshim.types import ChatResponse, StreamEvent, Message, Config
 
-resp: ChatResponse = llmshim.chat("claude-sonnet-5", "hi")
+resp: ChatResponse = llmshim.chat("claude-sonnet-5-5", "hi")
 ```
 
 Available: `ChatRequest`, `ChatResponse`, `Config`, `Message`, `ToolCall`,
@@ -266,7 +266,7 @@ billed provider calls; run it only when you deliberately want to hit real APIs.
 | Provider | Models |
 |----------|--------|
 | OpenAI | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` |
-| Anthropic | `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001` |
+| Anthropic | `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5-20251001` |
 | Gemini | `gemini-3.8-flash`, `gemini-3.5-flash-lite` |
 | xAI | `grok-4.6` |
 

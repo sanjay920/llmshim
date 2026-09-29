@@ -45,7 +45,7 @@ environment variables. The Ruby client never sees your keys — the proxy holds 
 | Provider   | Model string form                       | Env vars                              |
 | ---------- | --------------------------------------- | ------------------------------------- |
 | OpenAI     | `openai/gpt-6-sol`                    | `OPENAI_API_KEY`                      |
-| Anthropic  | `anthropic/claude-sonnet-5`            | `ANTHROPIC_API_KEY`                   |
+| Anthropic  | `anthropic/claude-sonnet-5-5`            | `ANTHROPIC_API_KEY`                   |
 | Gemini     | `gemini/gemini-3.8-flash`              | `GEMINI_API_KEY`                      |
 | xAI        | `xai/grok-4.6`                         | `XAI_API_KEY`                         |
 | OpenRouter | `openrouter/anthropic/claude-sonnet-5` | `OPENROUTER_API_KEY`                |
@@ -62,7 +62,7 @@ require "llmshim"
 
 client = Llmshim::Client.new(base_url: "http://localhost:3000")
 
-resp = client.chat(model: "anthropic/claude-sonnet-5", messages: "What is Rust?")
+resp = client.chat(model: "anthropic/claude-sonnet-5-5", messages: "What is Rust?")
 puts resp.content                 # => "Rust is a systems programming language..."
 puts resp.provider                # => "anthropic"
 puts resp.latency_ms              # => 1234 (round-trip latency in ms)
@@ -110,7 +110,7 @@ puts resp.content
 `done`, `error`.
 
 ```ruby
-client.stream(model: "anthropic/claude-sonnet-5", messages: "Write a haiku") do |event|
+client.stream(model: "anthropic/claude-sonnet-5-5", messages: "Write a haiku") do |event|
   case event.type
   when "reasoning" then print event.text   # thinking tokens
   when "content"   then print event.text   # answer tokens
@@ -135,7 +135,7 @@ text = events.select(&:content?).map(&:text).join
 
 ```ruby
 resp = client.chat(
-  model: "anthropic/claude-sonnet-5",
+  model: "anthropic/claude-sonnet-5-5",
   messages: "What's the weather in SF?",
   tools: [
     { type: "function",

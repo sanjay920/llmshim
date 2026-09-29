@@ -65,7 +65,7 @@ keys control headers instead:
 
 ```json
 {
-  "model": "anthropic/claude-sonnet-5",
+  "model": "anthropic/claude-sonnet-5-5",
   "messages": [{"role": "user", "content": "Analyze this carefully."}],
   "x-anthropic": {
     "thinking": {"type": "adaptive"},

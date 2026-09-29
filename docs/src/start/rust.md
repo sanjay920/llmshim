@@ -75,7 +75,7 @@ use std::io::{self, Write};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = llmshim::router::Router::from_env();
     let request = json!({
-        "model": "anthropic/claude-sonnet-5",
+        "model": "anthropic/claude-sonnet-5-5",
         "messages": [
             {"role": "user", "content": "Write a haiku about Rust."}
         ],

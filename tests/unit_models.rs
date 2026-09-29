@@ -22,6 +22,7 @@ fn legacy_specs_remain_queryable_without_advertising_old_models() {
         "openai/gpt-5.6-terra",
         "openai/gpt-5.6-luna",
         "anthropic/claude-opus-5",
+        "anthropic/claude-sonnet-5",
         "chatgpt/gpt-5.6-sol",
         "chatgpt/gpt-5.6-terra",
         "chatgpt/gpt-5.6-luna",

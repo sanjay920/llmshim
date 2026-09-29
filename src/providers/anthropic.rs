@@ -26,11 +26,27 @@ impl Anthropic {
     }
 
     fn requires_adaptive_thinking(model: &str) -> bool {
+        Self::is_fable(model) || matches!(model, "claude-opus-5-5" | "claude-sonnet-5-5")
+    }
+
+    /// Models whose thinking blocks are bound to the conversation prefix, and
+    /// which accept only `auto` / `none` tool choice.
+    fn preserves_bound_system_turns(model: &str) -> bool {
+        matches!(
+            model,
+            "claude-fable-5-1" | "claude-opus-5-5" | "claude-sonnet-5-5"
+        )
+    }
+
+    /// Models that reject an assistant-prefill turn before dispatch.
+    fn rejects_assistant_prefill(model: &str) -> bool {
         Self::is_fable(model) || model == "claude-opus-5-5"
     }
 
-    fn preserves_bound_system_turns(model: &str) -> bool {
-        matches!(model, "claude-fable-5-1" | "claude-opus-5-5")
+    /// Models whose native `refusal` stop reason is a content filter rather
+    /// than an unsupported terminal status.
+    fn refusal_is_content_filter(model: &str) -> bool {
+        Self::is_fable(model) || matches!(model, "claude-opus-5" | "claude-opus-5-5")
     }
 
     /// Models that support the 1M context window beta.
@@ -383,11 +399,7 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
         Some("end_turn" | "stop_sequence") => "stop",
         Some("max_tokens") => "length",
         Some("tool_use") => "tool_calls",
-        Some("refusal")
-            if Anthropic::requires_adaptive_thinking(model) || model == "claude-opus-5" =>
-        {
-            "content_filter"
-        }
+        Some("refusal") if Anthropic::refusal_is_content_filter(model) => "content_filter",
         _ => {
             return Err(ShimError::ProviderError {
                 status: 502,
@@ -674,15 +686,16 @@ impl Provider for Anthropic {
                         "This Claude model requires adaptive thinking; use reasoning_effort to control depth".into(), retry_after: None });
                 }
             }
-            if body_obj
+        }
+        if Self::rejects_assistant_prefill(model)
+            && body_obj
                 .get("messages")
                 .and_then(Value::as_array)
                 .and_then(|messages| messages.last())
                 .is_some_and(|message| message["role"] == "assistant")
-            {
-                return Err(ShimError::ProviderError { status: 400, body:
-                    "This Claude model does not support assistant prefill; end the request with a user turn".into(), retry_after: None });
-            }
+        {
+            return Err(ShimError::ProviderError { status: 400, body:
+                "This Claude model does not support assistant prefill; end the request with a user turn".into(), retry_after: None });
         }
         if Self::preserves_bound_system_turns(model)
             && body_obj
@@ -867,12 +880,7 @@ impl Anthropic {
                         "end_turn" => "stop",
                         "max_tokens" => "length",
                         "tool_use" => "tool_calls",
-                        "refusal"
-                            if Self::requires_adaptive_thinking(model)
-                                || model == "claude-opus-5" =>
-                        {
-                            "content_filter"
-                        }
+                        "refusal" if Self::refusal_is_content_filter(model) => "content_filter",
                         other => other,
                     });
 

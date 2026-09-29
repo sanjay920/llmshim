@@ -32,6 +32,7 @@ async fn new_frontier_models_complete_and_stream() {
         "openai/gpt-6-sol",
         "openai/gpt-6-luna",
         "anthropic/claude-opus-5-5",
+        "anthropic/claude-sonnet-5-5",
     ] {
         tokio::time::timeout(Duration::from_secs(120), async {
             let request = frontier_request(model);
@@ -146,6 +147,7 @@ async fn current_frontier_models_work_on_real_proxy_routes() {
         "openai/gpt-6-sol",
         "openai/gpt-6-luna",
         "anthropic/claude-opus-5-5",
+        "anthropic/claude-sonnet-5-5",
         "chatgpt/gpt-6-sol",
         "chatgpt/gpt-6-luna",
     ] {
@@ -156,6 +158,7 @@ async fn current_frontier_models_work_on_real_proxy_routes() {
         "openai/gpt-5.6-terra",
         "openai/gpt-5.6-luna",
         "anthropic/claude-opus-5",
+        "anthropic/claude-sonnet-5",
         "chatgpt/gpt-5.6-sol",
     ] {
         assert!(
@@ -167,6 +170,7 @@ async fn current_frontier_models_work_on_real_proxy_routes() {
         "openai/gpt-6-sol",
         "openai/gpt-6-luna",
         "anthropic/claude-opus-5-5",
+        "anthropic/claude-sonnet-5-5",
     ] {
         let response = client
             .post(format!("{base_url}/v1/chat"))
