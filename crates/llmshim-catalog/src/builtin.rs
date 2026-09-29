@@ -194,14 +194,14 @@ pub const MODELS: &[BuiltinModelInfo] = &[
         capabilities: CAPS_FULL.with_forced_tool_choice(Support::Unsupported),
     },
     BuiltinModelInfo {
-        id: "anthropic/claude-sonnet-5",
+        id: "anthropic/claude-sonnet-5-5",
         provider: "anthropic",
         family: Some(ModelFamily::Claude),
-        name: "claude-sonnet-5",
-        label: "Claude Sonnet 5",
+        name: "claude-sonnet-5-5",
+        label: "Claude Sonnet 5.5",
         context_window_tokens: Some(1_000_000),
         max_output_tokens: Some(128_000),
-        capabilities: CAPS_FULL,
+        capabilities: CAPS_FULL.with_forced_tool_choice(Support::Unsupported),
     },
     BuiltinModelInfo {
         id: "anthropic/claude-haiku-4-5-20251001",
@@ -287,6 +287,16 @@ const LEGACY_MODELS: &[BuiltinModelInfo] = &[
         family: Some(ModelFamily::Claude),
         name: "claude-opus-5",
         label: "Claude Opus 5",
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_FULL,
+    },
+    BuiltinModelInfo {
+        id: "anthropic/claude-sonnet-5",
+        provider: "anthropic",
+        family: Some(ModelFamily::Claude),
+        name: "claude-sonnet-5",
+        label: "Claude Sonnet 5",
         context_window_tokens: Some(1_000_000),
         max_output_tokens: Some(128_000),
         capabilities: CAPS_FULL,
@@ -602,9 +612,11 @@ pub fn anthropic_reasoning_options(model: &str) -> Vec<crate::ReasoningOption> {
             values: vec![Low, Medium, High, Max],
         }],
         "claude-opus-4-7" | "claude-opus-4-8" | "claude-opus-5" | "claude-opus-5-5"
-        | "claude-sonnet-5" | "claude-fable-5" | "claude-fable-5-1" => vec![Effort {
-            values: vec![Low, Medium, High, Xhigh, Max],
-        }],
+        | "claude-sonnet-5" | "claude-sonnet-5-5" | "claude-fable-5" | "claude-fable-5-1" => {
+            vec![Effort {
+                values: vec![Low, Medium, High, Xhigh, Max],
+            }]
+        }
         "claude-3-7-sonnet" | "claude-sonnet-4" | "claude-opus-4" | "claude-haiku-4"
         | "claude-opus-4-1" | "claude-sonnet-4-5" | "claude-opus-4-5" | "claude-haiku-4-5" => {
             vec![BudgetTokens {
