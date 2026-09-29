@@ -24,7 +24,7 @@ const client = new Client(); // no baseUrl -> auto-starts the bundled proxy on f
 
 // Non-streaming
 const res = await client.chat({
-  model: "anthropic/claude-sonnet-5",
+  model: "anthropic/claude-sonnet-5-5",
   messages: [{ role: "user", content: "What is Rust in one sentence?" }],
 });
 console.log(res.message.content);
@@ -53,7 +53,7 @@ reads its own credentials from the environment (or `llmshim configure`):
 | Provider   | Model string                                       | Env vars                                          |
 | ---------- | -------------------------------------------------- | ------------------------------------------------- |
 | OpenAI     | `openai/gpt-6-sol`                               | `OPENAI_API_KEY`                                  |
-| Anthropic  | `anthropic/claude-sonnet-5`                        | `ANTHROPIC_API_KEY`                               |
+| Anthropic  | `anthropic/claude-sonnet-5-5`                        | `ANTHROPIC_API_KEY`                               |
 | Gemini     | `gemini/gemini-3.8-flash`                          | `GEMINI_API_KEY`                                  |
 | xAI        | `xai/grok-4.6`                                     | `XAI_API_KEY`                                     |
 | OpenRouter | `openrouter/anthropic/claude-sonnet-5`          | `OPENROUTER_API_KEY`                              |
@@ -94,7 +94,7 @@ An ordered list tried in turn on retryable upstream failures (429/5xx):
 
 ```ts
 await client.chat({
-  model: "anthropic/claude-sonnet-5",
+  model: "anthropic/claude-sonnet-5-5",
   messages: [{ role: "user", content: "Hi" }],
   fallback: ["openai/gpt-6-sol", "gemini/gemini-3.8-flash"],
 });
@@ -110,7 +110,7 @@ cover:
 
 ```ts
 await client.chat({
-  model: "anthropic/claude-sonnet-5",
+  model: "anthropic/claude-sonnet-5-5",
   messages: [{ role: "user", content: "Think hard about this." }],
   provider_config: {
     "x-anthropic": { thinking: { type: "adaptive" }, output_config: { effort: "high" } },

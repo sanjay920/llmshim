@@ -43,6 +43,7 @@ fn fable_and_opus5_strip_sampling_even_without_explicit_thinking() {
         "claude-fable-5-1",
         "claude-opus-5",
         "claude-opus-5-5",
+        "claude-sonnet-5-5",
     ] {
         for extra in [
             json!({}),
@@ -124,6 +125,55 @@ fn opus_5_5_enforces_bound_adaptive_thinking_before_dispatch() {
             Err(ShimError::ProviderError { status: 400, .. })
         ));
     }
+}
+
+#[test]
+fn sonnet_5_5_enforces_bound_adaptive_thinking_before_dispatch() {
+    let provider = provider();
+    for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let request = json!({
+            "messages": [{"role": "user", "content": "Say pong"}],
+            "reasoning_effort": effort,
+            "max_tokens": 128,
+        });
+        let native = provider
+            .transform_request("claude-sonnet-5-5", &request)
+            .unwrap();
+        assert_eq!(native.body["thinking"]["type"], "adaptive");
+        assert_eq!(
+            native.body["output_config"]["effort"],
+            if matches!(effort, "none" | "minimal") {
+                "low"
+            } else {
+                effort
+            }
+        );
+    }
+    for invalid_request in [
+        json!({"messages": [{"role": "user", "content": "Say pong"}],
+            "x-anthropic": {"thinking": {"type": "disabled"}}}),
+        json!({"messages": [{"role": "user", "content": "Say pong"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+        json!({"messages": [{"role": "user", "content": "Say pong"}],
+            "tool_choice": "required"}),
+        json!({"messages": [{"role": "user", "content": "Say pong"}],
+            "tool_choice": {"type": "tool", "name": "lookup"}}),
+    ] {
+        assert!(matches!(
+            provider.transform_request("claude-sonnet-5-5", &invalid_request),
+            Err(ShimError::ProviderError { status: 400, .. })
+        ));
+    }
+    // Assistant prefill is not documented as rejected for Sonnet 5.5, so it
+    // stays allowed.
+    let prefill = provider
+        .transform_request(
+            "claude-sonnet-5-5",
+            &json!({"messages": [{"role": "user", "content": "Say pong"},
+                {"role": "assistant", "content": "unfinished"}]}),
+        )
+        .unwrap();
+    assert_eq!(prefill.body["messages"][1]["role"], "assistant");
 }
 
 #[test]

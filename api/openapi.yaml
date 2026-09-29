@@ -249,10 +249,10 @@ components:
         model:
           type: string
           description: |
-            Model identifier. Use "provider/model" format (e.g., "anthropic/claude-sonnet-5")
-            or just the model name for auto-detection (e.g., "claude-sonnet-5").
+            Model identifier. Use "provider/model" format (e.g., "anthropic/claude-sonnet-5-5")
+            or just the model name for auto-detection (e.g., "claude-sonnet-5-5").
           examples:
-            - anthropic/claude-sonnet-5
+            - anthropic/claude-sonnet-5-5
             - gpt-6-sol
             - gemini-3.8-flash
         messages:

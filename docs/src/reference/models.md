@@ -58,7 +58,7 @@ are stable releases only. Credentials determine which providers are listed.
 |---|---|
 | `anthropic/claude-fable-5-1` | Claude Fable 5.1 |
 | `anthropic/claude-opus-5-5` | Claude Opus 5.5 |
-| `anthropic/claude-sonnet-5` | Claude Sonnet 5 |
+| `anthropic/claude-sonnet-5-5` | Claude Sonnet 5.5 |
 | `anthropic/claude-haiku-4-5-20251001` | Claude Haiku 4.5 |
 
 ### Google Gemini
@@ -131,6 +131,14 @@ million tokens. Five-minute cache writes cost $5 per million;
 one-hour writes cost $8. Because the catalog has one aggregate cache-write
 rate, its $8 estimate is the conservative one-hour ceiling. See the
 [Anthropic model pricing](https://platform.claude.com/docs/en/models/opus-5-5/overview).
+
+Anthropic positions Claude Sonnet 5.5 as "the best combination of speed and
+intelligence". Its $2/$10 input/output token prices match Sonnet 5. Cache reads
+cost $0.20 per million tokens. Five-minute cache writes cost $2.50 per million;
+one-hour writes cost $4. Because the catalog has one aggregate cache-write rate,
+its $4 estimate is the conservative one-hour ceiling. Sonnet 5.5 thinks
+adaptively by default at `high` effort. See the
+[Anthropic model pricing](https://platform.claude.com/docs/en/models/sonnet-5-5/overview).
 
 ### ChatGPT subscription
 

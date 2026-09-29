@@ -6,7 +6,7 @@ const EXPECTED: &[&str] = &[
     "openai/gpt-6-luna",
     "anthropic/claude-fable-5-1",
     "anthropic/claude-opus-5-5",
-    "anthropic/claude-sonnet-5",
+    "anthropic/claude-sonnet-5-5",
     "anthropic/claude-haiku-4-5-20251001",
     "gemini/gemini-3.8-flash",
     "gemini/gemini-3.5-flash-lite",
@@ -86,6 +86,10 @@ async fn proxy_discovery_excludes_legacy_and_preview_models() {
     assert_eq!(
         router.resolve("anthropic/claude-opus-5").unwrap().1,
         "claude-opus-5"
+    );
+    assert_eq!(
+        router.resolve("anthropic/claude-sonnet-5").unwrap().1,
+        "claude-sonnet-5"
     );
     assert_eq!(
         router.resolve("anthropic/claude-fable-5").unwrap().1,

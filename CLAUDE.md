@@ -14,7 +14,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 
 - **OpenAI:** `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`
 - **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and `chatgpt/gpt-6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
-- **Anthropic:** `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5`, `claude-haiku-4-5-20251001`
+- **Anthropic:** `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5-20251001`
 - **Gemini:** `gemini-3.8-flash`, `gemini-3.5-flash-lite`
 - **xAI:** `grok-4.7`
 - **OpenRouter:** not enumerated (huge/dynamic catalog) — any `openrouter/<vendor>/<model>` slug routes through, e.g. `openrouter/anthropic/claude-sonnet-5`.
@@ -213,7 +213,7 @@ directory writable for container use so refresh locks and atomic saves work.
 
 ```
 llmshim::completion(router, request)
-  → router.resolve("anthropic/claude-sonnet-5")   // parse "provider/model"
+  → router.resolve("anthropic/claude-sonnet-5-5")   // parse "provider/model"
   → provider.prepare_request(model, &value).await    // refresh OAuth if needed, then transform
   → client.send(provider_request)                    // HTTP
   → provider.transform_response(model, body)         // provider-native → OpenAI JSON
@@ -232,7 +232,7 @@ Streaming status handling is separate and is not changed by this policy.
 
 ### Router (`src/router.rs`)
 
-Parses `"provider/model"` strings by splitting on the **first** `/` only, so an OpenRouter slug's internal slash survives (`openrouter/anthropic/claude-sonnet-5` → provider `openrouter`, model `anthropic/claude-sonnet-5`). Auto-infers provider from prefix (`gpt*`/`o*` → openai, `claude*` → anthropic, `gemini*` → gemini, `grok*` → xai); **OpenRouter, vLLM, and SGLang have no prefix inference** — their slugs collide with everyone's, so address them explicitly (`openrouter/…`, `vllm/…`, `sglang/…`); the first-slash split also preserves HF-style served-model slugs (`vllm/meta-llama/Llama-3.1-8B-Instruct`). Supports aliases. `Router::from_env()` reads API-key env vars, plus `VLLM_BASE_URL` / `SGLANG_BASE_URL` (+ optional `*_API_KEY`) for the self-hosted providers.
+Parses `"provider/model"` strings by splitting on the **first** `/` only, so an OpenRouter slug's internal slash survives (`openrouter/anthropic/claude-sonnet-5` → provider `openrouter`, model `anthropic/claude-sonnet-5-5`). Auto-infers provider from prefix (`gpt*`/`o*` → openai, `claude*` → anthropic, `gemini*` → gemini, `grok*` → xai); **OpenRouter, vLLM, and SGLang have no prefix inference** — their slugs collide with everyone's, so address them explicitly (`openrouter/…`, `vllm/…`, `sglang/…`); the first-slash split also preserves HF-style served-model slugs (`vllm/meta-llama/Llama-3.1-8B-Instruct`). Supports aliases. `Router::from_env()` reads API-key env vars, plus `VLLM_BASE_URL` / `SGLANG_BASE_URL` (+ optional `*_API_KEY`) for the self-hosted providers.
 
 ### HTTP Client (`src/client.rs`)
 
@@ -351,7 +351,13 @@ thinking on a switch to older models; do not infer signatures from text.
 Claude Opus 5.5 also requires adaptive thinking, rejects forced tools and
 assistant prefill, and binds thinking to the conversation prefix. It reads
 older Opus/Sonnet/Haiku thinking but not Fable/Mythos thinking; only Fable 5.1
-and Mythos 5.1 can read its thinking on a model switch. GPT-6 Sol/Luna accept
+and Mythos 5.1 can read its thinking on a model switch. Claude Sonnet 5.5
+supersedes Sonnet 5 in the advertised list; it also requires adaptive thinking,
+rejects forced tools, and binds thinking to the conversation prefix, but
+assistant prefill is not documented as rejected for it, so it stays allowed.
+Sonnet 5.5 reads Sonnet 5 / Opus 4.8 / Haiku 4.5 and earlier thinking — not
+Opus 5, Opus 5.5, or Fable/Mythos — and only Sonnet 5.5 can read its own
+thinking. GPT-6 Sol/Luna accept
 `none` and `max` reasoning effort and native `pro` mode. Their current routes
 replace GPT-5.6 discovery entries, while historical OpenAI and Anthropic IDs
 remain explicitly routable. ChatGPT accepts only the three GPT-6 IDs; removal

@@ -38,7 +38,7 @@ func main() {
 	client := llmshim.New() // defaults to http://localhost:3000
 
 	resp, err := client.Chat(ctx, llmshim.ChatRequest{
-		Model:    "anthropic/claude-sonnet-5",
+		Model:    "anthropic/claude-sonnet-5-5",
 		Messages: []llmshim.Message{{Role: "user", Content: "What is Rust?"}},
 	})
 	if err != nil {
@@ -56,7 +56,7 @@ event with `Err` set.
 
 ```go
 ch, err := client.Stream(ctx, llmshim.ChatRequest{
-	Model:    "anthropic/claude-sonnet-5",
+	Model:    "anthropic/claude-sonnet-5-5",
 	Messages: []llmshim.Message{{Role: "user", Content: "Write a haiku"}},
 })
 if err != nil {
@@ -120,7 +120,7 @@ namespace and drops the namespace before the request goes upstream. Use
 
 ```go
 resp, err := client.Chat(ctx, llmshim.ChatRequest{
-	Model:    "anthropic/claude-sonnet-5",
+	Model:    "anthropic/claude-sonnet-5-5",
 	Messages: []llmshim.Message{{Role: "user", Content: "Prove there are infinitely many primes."}},
 	// Namespaced under x-anthropic so Anthropic's transform picks it up.
 	ProviderConfig: map[string]any{
@@ -215,7 +215,7 @@ from environment variables, and provider-native controls go under its
 | Provider | Model string | Environment | Namespace |
 | --- | --- | --- | --- |
 | OpenAI | `openai/gpt-6-sol` | `OPENAI_API_KEY` | `x-openai` |
-| Anthropic | `anthropic/claude-sonnet-5` | `ANTHROPIC_API_KEY` | `x-anthropic` |
+| Anthropic | `anthropic/claude-sonnet-5-5` | `ANTHROPIC_API_KEY` | `x-anthropic` |
 | Gemini | `gemini/gemini-3.8-flash` | `GEMINI_API_KEY` | `x-gemini` |
 | xAI | `xai/grok-4.6` | `XAI_API_KEY` | none (unified reasoning controls) |
 | OpenRouter | `openrouter/<vendor>/<model>` | `OPENROUTER_API_KEY` | `x-openrouter` |

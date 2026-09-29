@@ -14,7 +14,7 @@ different native API and translates only the fields that API understands.
 | vLLM | Chat Completions (self-hosted, `VLLM_BASE_URL`); Responses API with `VLLM_WIRE=responses` | none — address as `vllm/<served-model>` | `x-vllm` |
 | SGLang | Chat Completions (self-hosted, `SGLANG_BASE_URL`); Responses API with `SGLANG_WIRE=responses` | none — address as `sglang/<served-model>` | `x-sglang` |
 
-An explicit address such as `anthropic/claude-sonnet-5` avoids inference.
+An explicit address such as `anthropic/claude-sonnet-5-5` avoids inference.
 The named provider must be registered in the Router—that normally means its
 API key is configured.
 
@@ -81,6 +81,13 @@ and binds thinking to the conversation prefix. It accepts thinking from older
 Opus, Sonnet, and Haiku models, but not Fable or Mythos. Its thinking blocks
 replay only to Opus 5.5, Fable 5.1, or Mythos 5.1. See the
 [Opus 5.5 migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
+
+Sonnet 5.5 requires adaptive thinking and binds thinking to the conversation
+prefix, and it rejects forced tool choice. Assistant prefill is not documented
+as rejected, so it stays allowed. Sonnet 5.5 accepts thinking from Sonnet 5,
+Opus 4.8, Haiku 4.5, and earlier — but not from Opus 5, Opus 5.5, or a
+Fable/Mythos model — and its own thinking blocks replay only to Sonnet 5.5. See
+the [Sonnet 5.5 model page](https://platform.claude.com/docs/en/models/sonnet-5-5/overview).
 
 
 The raw Rust response exposes normalized thinking signatures for replay.
