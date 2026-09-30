@@ -290,6 +290,27 @@ impl Provider for OpenAiCompatible {
         Ok(result)
     }
 
+    fn transform_embedding_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        let texts = crate::embeddings::texts(request)?;
+        // `/v1/embeddings` is the OpenAI Chat Completions surface, whichever
+        // wire this server speaks for chat: the Responses API has no embeddings
+        // route, so a server configured with `_WIRE=responses` still gets this
+        // one. Nothing server-specific is added — a passthrough stays faithful.
+        Ok(ProviderRequest {
+            url: format!("{}/embeddings", self.base_url.trim_end_matches('/')),
+            headers: self.headers(),
+            body: crate::embeddings::openai_body(
+                model,
+                &texts,
+                crate::embeddings::dimensions(request),
+            ),
+        })
+    }
+
+    fn transform_embedding_response(&self, model: &str, response: Value) -> Result<Value> {
+        self.transform_response_native(model, response)
+    }
+
     fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
         crate::json_bounds::enforce_sse_complexity(chunk)?;
         let result = match self.wire {

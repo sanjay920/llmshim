@@ -606,6 +606,104 @@ impl ShimClient {
         result.map_err(DispatchFailure::into_public)
     }
 
+    /// Embeddings dispatch: one vector per input text, with the tokens the
+    /// provider billed. One transport, one retry ladder, one breaker
+    /// observation, the same error classification a completion has — only the
+    /// body shape differs.
+    pub async fn embeddings(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let result = self.embeddings_dispatch(provider, model, request).await;
+        if let Some(outcome) = Self::breaker_outcome(&result) {
+            self.observe(provider, outcome).await;
+        }
+        result.map_err(DispatchFailure::into_public)
+    }
+
+    pub(crate) async fn embeddings_dispatch(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &serde_json::Value,
+    ) -> DispatchResult<serde_json::Value> {
+        // The batch is checked before anything is rendered or sent: a batch a
+        // server could never accept is a local mistake, not a request.
+        crate::embeddings::admit_batch(provider, request).map_err(DispatchFailure::Local)?;
+        let provider_req = provider
+            .transform_embedding_request(model, request)
+            .map_err(DispatchFailure::Local)?;
+        // A provider with no embeddings wire refuses here, in the transform
+        // above, before the catalog is asked about the model.
+        crate::embeddings::admit_model(provider, model, request).map_err(DispatchFailure::Local)?;
+        let target = provider.request_replay_target(model, &provider_req);
+        let AttemptResponse {
+            response,
+            mut tracker,
+            attempt_deadline,
+        } = self
+            .send_prepared(
+                None,
+                AttemptKind::Completion,
+                model,
+                Some(&target),
+                &provider_req,
+            )
+            .await?;
+        let body = match body::read_json(
+            response,
+            self.response_body_limits.success_bytes,
+            self.deadlines.unary_body_idle,
+            attempt_deadline,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                finish_invalid_response(
+                    &mut tracker,
+                    self.deadlines.policy_callback,
+                    attempt_deadline,
+                )
+                .await?;
+                return Err(error.into_dispatch_failure());
+            }
+        };
+        if let Some(tracker) = &tracker {
+            tracker.native(crate::policy::NativeFrame::ResponseBody { body: &body });
+        }
+        observe_native_response_usage(
+            &target,
+            &body,
+            &mut tracker,
+            self.deadlines.policy_callback,
+            attempt_deadline,
+        )
+        .await?;
+        let mut result = match provider.transform_embedding_response(model, body) {
+            Ok(result) => result,
+            Err(error) => {
+                finish_invalid_response(
+                    &mut tracker,
+                    self.deadlines.policy_callback,
+                    attempt_deadline,
+                )
+                .await?;
+                return Err(DispatchFailure::Upstream(error));
+            }
+        };
+        crate::cost::stamp(provider.name(), model, &mut result);
+        finish_completed_response(
+            &mut tracker,
+            self.deadlines.policy_callback,
+            attempt_deadline,
+        )
+        .await?;
+        Ok(result)
+    }
+
     pub(crate) async fn completion_dispatch(
         &self,
         provider: &dyn Provider,

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: llmshim API
-  version: 0.16.0
+  version: 0.17.0
   description: |
     Multi-provider LLM API proxy. Send requests in a single format,
     llmshim translates to the native API of whichever provider you choose.
@@ -78,6 +78,54 @@ paths:
               schema: {type: string}
         default:
           description: Native error with preserved HTTP status and Retry-After when applicable
+  /v1beta/models/{model}:generateContent:
+    post:
+      operationId: nativeGeminiGenerateContent
+      summary: Google Gemini generateContent compatibility endpoint
+      description: Accepts custom function tools; candidateCount must be 1. Served by the gateway too, where x-goog-api-key authentication is accepted. The routing id lives in the path, so it may contain a slash (`gemini/gemini-3.8-flash`). `?key=` and `?alt=` are not read. Any other action under this prefix answers Google's 404 error object.
+      parameters:
+        - name: model
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NativeGeminiRequest'
+      responses:
+        '200':
+          description: Gemini GenerateContentResponse JSON
+          content:
+            application/json:
+              schema: {type: object}
+        default:
+          description: Gemini error object with preserved HTTP status and Retry-After when applicable
+  /v1beta/models/{model}:streamGenerateContent:
+    post:
+      operationId: nativeGeminiStreamGenerateContent
+      summary: Google Gemini streaming compatibility endpoint
+      description: The same request and error contract as generateContent; the response is Gemini SSE, which ends with a finish reason rather than a terminator.
+      parameters:
+        - name: model
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NativeGeminiRequest'
+      responses:
+        '200':
+          description: Gemini GenerateContentResponse chunks over SSE
+          content:
+            text/event-stream:
+              schema: {type: string}
+        default:
+          description: Gemini error object with preserved HTTP status and Retry-After when applicable
   /v1/chat:
     post:
       operationId: chat
@@ -227,6 +275,31 @@ components:
           items: {type: object}
         stream: {type: boolean, default: false}
         n: {type: integer, enum: [1]}
+    NativeGeminiRequest:
+      type: object
+      required: [contents]
+      additionalProperties: false
+      description: |
+        Gemini's own GenerateContentRequest. The model is the path, not a body
+        field. safetySettings and cachedContent pass through to Google
+        verbatim; every other field this server cannot express is refused by
+        name rather than forwarded.
+      properties:
+        contents:
+          type: array
+          items: {type: object}
+        systemInstruction: {type: object}
+        tools:
+          type: array
+          items: {type: object}
+        toolConfig: {type: object}
+        generationConfig: {type: object}
+        safetySettings: {type: array, items: {type: object}}
+        cachedContent: {type: string}
+        fallback:
+          type: array
+          items: {type: string}
+          description: Ordered routing ids tried when the primary model fails, exactly as on the other native facades.
     NativeMessagesRequest:
       type: object
       required: [model, messages]

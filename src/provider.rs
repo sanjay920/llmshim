@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Result, ShimError};
 use serde_json::Value;
 use std::{future::Future, pin::Pin};
 
@@ -101,6 +101,41 @@ pub trait Provider: Send + Sync {
         request: &'a Value,
     ) -> Pin<Box<dyn Future<Output = Result<ProviderRequest>> + Send + 'a>> {
         Box::pin(async move { self.transform_request(model, request) })
+    }
+
+    /// Batch limits for this provider's embeddings wire. The default is
+    /// llmshim's own ceiling, and a provider whose API publishes a cap states
+    /// it here so the caller is refused locally instead of by the server.
+    fn embedding_bounds(&self) -> crate::embeddings::EmbeddingBounds {
+        crate::embeddings::EmbeddingBounds::default()
+    }
+
+    /// Transform an OpenAI-shaped embedding request (`input`, `dimensions`)
+    /// into the provider's native form.
+    ///
+    /// The default refuses by name. A provider with no embeddings API must say
+    /// so here rather than be answered by another vendor's model: a vector from
+    /// a model the caller did not name is the wrong answer, silently.
+    fn transform_embedding_request(
+        &self,
+        _model: &str,
+        _request: &Value,
+    ) -> Result<ProviderRequest> {
+        Err(crate::embeddings::absent(self.name()))
+    }
+
+    /// Normalize a native embeddings response to one vector per input text, in
+    /// input order. Only a provider that implements
+    /// [`Provider::transform_embedding_request`] reaches this.
+    fn transform_embedding_response(&self, _model: &str, _response: Value) -> Result<Value> {
+        Err(ShimError::ProviderError {
+            status: 502,
+            body: format!(
+                "{} returned an embeddings response but has no embeddings wire",
+                self.name()
+            ),
+            retry_after: None,
+        })
     }
 
     /// Transform the provider's native response back into OpenAI format.

@@ -47,7 +47,11 @@ coverage. Local policy > provider capabilities > verified builtin assertions >
 models.dev, per field; unknowns never erase assertions. Provider APIs never
 contribute pricing. See `crates/llmshim-catalog/README.md` for cache and override
 paths, offline behavior, aliases, and publication order. Never await catalog
-refresh in a completion; hold a snapshot for decisions that must agree.
+refresh in a completion; hold a snapshot for decisions that must agree. A
+`CatalogHandle` folds on the first read — construction reads local policy only —
+so nothing builds the 4.6 MB vendored floor before a model is looked up;
+`tests/refresh.rs` pins the deferral, and `cargo run --release --example
+catalog_startup` measures construction against the first read.
 
 `usage.cache_read_tokens` and `usage.cache_write_tokens` are always present on
 normalized responses and usage chunks, logs, and proxy usage. Native token
@@ -120,7 +124,7 @@ cargo clippy --workspace --features proxy -- -D warnings
 cargo package -p llmshim-catalog --allow-dirty
 ```
 
-The root and language clients use version 0.16.0; the 0.16 minor advertises Claude Sonnet 5.5 (and splits the prefill and refusal predicates out of adaptive-only thinking), with the catalog crate at 0.2.1. The 0.15 minor adds `StoredCredentials::base_url_for` (a defaulted method: a stored address goes only with the stored key, never an exported one) and `Router::from_credentials_with_env`, and ships the chat facade's `reasoning_details` and metered streams. The 0.14 minor adds `AttemptPolicy::observe_native` (a defaulted method, so no implementor breaks). The 0.13 minor bump also reflects the narrower ChatGPT model allowlist. The 0.12 minor bump was required because the public
+The root and language clients use version 0.17.0; the 0.17 minor adds the proxy's native Gemini `generateContent` wire, embeddings through OpenAI, Gemini and OpenAI-compatible servers, native Anthropic system blocks, tools and stop sequences, and a catalog folded on its first read rather than at startup, with the catalog crate at 0.3.0 (its model rows gained public embedding fields, so a struct literal of one breaks). The 0.16 minor advertises Claude Sonnet 5.5 (and splits the prefill and refusal predicates out of adaptive-only thinking), with the catalog crate at 0.2.1. The 0.15 minor adds `StoredCredentials::base_url_for` (a defaulted method: a stored address goes only with the stored key, never an exported one) and `Router::from_credentials_with_env`, and ships the chat facade's `reasoning_details` and metered streams. The 0.14 minor adds `AttemptPolicy::observe_native` (a defaulted method, so no implementor breaks). The 0.13 minor bump also reflects the narrower ChatGPT model allowlist. The 0.12 minor bump was required because the public
 `CostSource` unions gain `provider_floor`; exhaustive consumers must handle it.
 The version metadata does not itself publish a release. Release workflows must
 publish the catalog dependency before llmshim. Public code, fixtures,
@@ -300,6 +304,31 @@ Routes do not chain.
 ### Vision (`src/vision.rs`)
 
 Image content blocks are translated between providers automatically. Users can send images in any format (OpenAI `image_url`, Anthropic `image`, Gemini `inline_data`) and the correct provider sees its native format. Base64 data URIs and plain URLs are both handled. Gemini falls back to a text placeholder for URL images (only supports `inline_data`).
+
+### Embeddings (`src/embeddings.rs`)
+
+`llmshim::embeddings` returns one vector per input text, in input order, with
+the model identity and the billed tokens. The typed request renders to an
+OpenAI-shaped payload that each adapter translates: OpenAI's `/v1/embeddings`
+(with `dimensions`, `encoding_format: "float"`), Gemini's `batchEmbedContents`
+(one request object per text), and an OpenAI-compatible server's `/v1/embeddings`
+(the same passthrough used for chat). Anthropic, xAI, OpenRouter and the ChatGPT
+subscription backend have no embeddings route: their adapters refuse by name
+through the defaulted `Provider::transform_embedding_request`, never by
+forwarding to another vendor's model.
+
+Three refusals happen before a request is sent, and the order matters: the batch
+is checked against `Provider::embedding_bounds` first (a server could never
+accept it, so it must not be rendered), the provider's own transform runs
+second — its "no embeddings API" is the fact that decides whether any model id
+could work — and the catalog is asked last. `ModelInfo.embeds` is tri-state and
+kept on `ModelInfo` rather than `ModelCapabilities` because that struct is not
+`#[non_exhaustive]`: a model the catalog carries without a positive assertion is
+refused with the local-override path in the message, while a model the catalog
+has never heard of (self-hosted, OpenRouter) is sent. No chunking and no
+substitution — either would be work the caller did not ask for. The client's
+`embeddings` dispatch reuses `send_prepared`, so retries, timeouts, the breaker
+and `cost::stamp` behave exactly as they do for a completion.
 
 ### Multi-model conversations
 
