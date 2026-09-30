@@ -138,6 +138,26 @@ pub trait Provider: Send + Sync {
         })
     }
 
+    /// Prepare a non-streaming image-generation request. Unsupported providers
+    /// fail locally rather than sending a prompt to a text endpoint.
+    fn image_request(&self, _model: &str, _request: &Value) -> Result<ProviderRequest> {
+        Err(crate::images::error(
+            400,
+            "provider does not support image generation",
+        ))
+    }
+
+    fn image_response(
+        &self,
+        _model: &str,
+        _response: Value,
+    ) -> Result<crate::images::ImageResponse> {
+        Err(crate::images::error(
+            400,
+            "provider does not support image generation",
+        ))
+    }
+
     /// Transform the provider's native response back into OpenAI format.
     fn transform_response(&self, model: &str, response: Value) -> Result<Value>;
 
