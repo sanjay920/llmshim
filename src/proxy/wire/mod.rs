@@ -1,4 +1,5 @@
 //! Native inbound API facades over the existing proxy/gateway handlers.
+mod gemini;
 mod receipts;
 use axum::{
     body::{to_bytes, Body},
@@ -79,15 +80,13 @@ pub(crate) async fn install_default_receipt_store(
 }
 
 pub(crate) async fn bound_inference_request_json(request: Request, next: Next) -> Response {
+    let path = request.uri().path();
     if request.method() != axum::http::Method::POST
-        || !matches!(
-            request.uri().path(),
-            "/v1/chat" | "/v1/chat/stream" | "/v1/chat/completions" | "/v1/messages"
-        )
+        || (path != "/v1/chat" && path != "/v1/chat/stream" && native_route(path).is_none())
     {
         return next.run(request).await;
     }
-    let path = request.uri().path().to_owned();
+    let path = path.to_owned();
     let (parts, body) = request.into_parts();
     let bytes = match to_bytes(body, 2 * 1024 * 1024).await {
         Ok(bytes) => bytes,
@@ -116,10 +115,9 @@ pub(crate) async fn bound_inference_request_json(request: Request, next: Next) -
 }
 
 fn inbound_json_failure(path: &str, status: StatusCode, message: &str) -> Response {
-    match path {
-        "/v1/chat/completions" => fail(Wire::Chat, status, message),
-        "/v1/messages" => fail(Wire::Messages, status, message),
-        _ => (
+    match native_route(path) {
+        Some(route) => fail(route.wire, status, message),
+        None => (
             status,
             Json(json!({"error":{"code": if status == StatusCode::PAYLOAD_TOO_LARGE {"request_too_large"} else {"invalid_request"},"message":message}})),
         )
@@ -263,6 +261,40 @@ impl ReceiptExecutor {
 pub enum Wire {
     Chat,
     Messages,
+    Gemini,
+}
+
+/// A native inbound request's wire, plus what its path names that the body
+/// cannot: Gemini puts both the model and the streaming action in the URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRoute {
+    pub wire: Wire,
+    /// The model the path names. `None` when the body carries it.
+    pub model: Option<String>,
+    /// Whether the path's action streams. `false` when the body carries the
+    /// `stream` flag instead.
+    pub streams: bool,
+}
+
+/// The native inbound route a path serves, or `None` for every other path.
+///
+/// One function decides this so the proxy, the gateway and the request lifetime
+/// cannot disagree about which paths are native — a disagreement that would
+/// leave a wire outside admission control.
+pub fn native_route(path: &str) -> Option<NativeRoute> {
+    let (wire, model, streams) = match path {
+        "/v1/chat/completions" => (Wire::Chat, None, false),
+        "/v1/messages" => (Wire::Messages, None, false),
+        path => {
+            let (model, streams) = gemini::path_route(path)?;
+            (Wire::Gemini, Some(model.to_owned()), streams)
+        }
+    };
+    Some(NativeRoute {
+        wire,
+        model,
+        streams,
+    })
 }
 type Result<T> = std::result::Result<T, String>;
 
@@ -434,6 +466,10 @@ fn request_to_chat_with_limits(
     restoration_limits: receipts::RestorationLimits,
 ) -> Result<Value> {
     let mut restoration_budget = receipts::RestorationBudget::new(restoration_limits);
+    if wire == Wire::Gemini {
+        let canonical = gemini::request(native, receipts, scope, &mut restoration_budget)?;
+        return enforce_canonical_bounds(canonical, restoration_limits);
+    }
     let obj = native.as_object().ok_or("request must be an object")?;
     let model = native["model"]
         .as_str()
@@ -457,6 +493,9 @@ fn request_to_chat_with_limits(
             let supported = match wire {
                 Wire::Chat => tool["type"] == "function",
                 Wire::Messages => tool.get("type").is_none() || tool["type"] == "custom",
+                // Unreachable: the Gemini reader above validated its own
+                // declarations, whose entries carry no `type`.
+                Wire::Gemini => tool.get("type").is_none(),
             };
             if !supported {
                 return Err("this endpoint supports custom function tools".into());
@@ -643,12 +682,21 @@ fn request_to_chat_with_limits(
     });
     canonical["messages"] = Value::Array(messages);
     canonical["provider_config"] = Value::Object(config);
+    enforce_canonical_bounds(canonical, restoration_limits)
+}
+
+/// The restored canonical request may not exceed the restoration budgets it was
+/// read under, whichever wire produced it.
+fn enforce_canonical_bounds(
+    canonical: Value,
+    limits: receipts::RestorationLimits,
+) -> Result<Value> {
     crate::json_bounds::measure_value(
         &canonical,
         crate::json_bounds::Limits {
             max_depth: crate::json_bounds::Limits::INBOUND.max_depth,
-            max_nodes: restoration_limits.max_nodes,
-            max_owned_bytes: restoration_limits.max_owned_bytes,
+            max_nodes: limits.max_nodes,
+            max_owned_bytes: limits.max_owned_bytes,
         },
     )
     .map_err(|_| receipts::REQUEST_LIMIT_ERROR_MESSAGE.to_owned())?;
@@ -691,7 +739,9 @@ pub fn response_from_chat(
         } else {
             "stop"
         });
-    let mut out = if wire == Wire::Chat {
+    let mut out = if wire == Wire::Gemini {
+        gemini::response(response, &usage, finish, receipts, scope)?
+    } else if wire == Wire::Chat {
         let mut exported = json!({"role":"assistant","content":message["content"]});
         if let Some(refusal) = message.get("refusal") {
             exported["refusal"] = refusal.clone();
@@ -739,21 +789,22 @@ pub fn response_from_chat(
 }
 
 fn error_body(wire: Wire, message: &str) -> Value {
-    native_error_body(wire, message, "invalid_request_error")
+    render_error(
+        wire,
+        &crate::error::normalize_error(message),
+        StatusCode::BAD_REQUEST,
+    )
 }
 
-fn native_error_body(wire: Wire, message: &str, fallback_type: &str) -> Value {
-    render_error(wire, &crate::error::normalize_error(message), fallback_type)
-}
-
-fn render_error(wire: Wire, error: &crate::error::NormalizedError, fallback_type: &str) -> Value {
-    let kind = match wire {
-        Wire::Messages => error.code_type().or(error.kind.as_deref()),
-        Wire::Chat => error.kind.as_deref().or(error.code_type()),
-    }
-    .unwrap_or(fallback_type);
+fn render_error(wire: Wire, error: &crate::error::NormalizedError, status: StatusCode) -> Value {
+    let fallback_type = fallback_error_type(wire, status);
     match wire {
+        Wire::Gemini => gemini::error(status, &error.message),
         Wire::Messages => {
+            let kind = error
+                .code_type()
+                .or(error.kind.as_deref())
+                .unwrap_or(fallback_type);
             let kind = if kind == "server_error" {
                 "api_error"
             } else {
@@ -762,9 +813,26 @@ fn render_error(wire: Wire, error: &crate::error::NormalizedError, fallback_type
             json!({"type":"error","error":{"type":kind,"message":error.message}})
         }
         Wire::Chat => {
+            let kind = error
+                .kind
+                .as_deref()
+                .or(error.code_type())
+                .unwrap_or(fallback_type);
             json!({"error":{"type":kind,"message":error.message,"param":error.param,"code":error.code}})
         }
     }
+}
+
+/// A failure frame. Gemini's SSE carries no event names, so its failures are
+/// bare `data:` frames holding Google's error object - the same shape the
+/// request lifetime already emits for a timed-out stream.
+fn error_frame(wire: Wire, body: Value) -> Event {
+    let event = if wire == Wire::Gemini {
+        Event::default()
+    } else {
+        Event::default().event("error")
+    };
+    event.data(body.to_string())
 }
 
 fn error_from_event(wire: Wire, event: &Value) -> Value {
@@ -803,8 +871,8 @@ fn receipt_work_failure(
         }
     }
 }
-fn error_for_status(wire: Wire, status: StatusCode, message: &str) -> Value {
-    native_error_body(wire, message, fallback_error_type(wire, status))
+pub(crate) fn error_for_status(wire: Wire, status: StatusCode, message: &str) -> Value {
+    render_error(wire, &crate::error::normalize_error(message), status)
 }
 fn fallback_error_type(wire: Wire, status: StatusCode) -> &'static str {
     match status.as_u16() {
@@ -823,11 +891,22 @@ pub async fn translate(request: Request, next: Next) -> Response {
     if request.method() != axum::http::Method::POST {
         return next.run(request).await;
     }
-    let wire = match request.uri().path() {
-        "/v1/chat/completions" => Wire::Chat,
-        "/v1/messages" => Wire::Messages,
-        _ => return next.run(request).await,
+    let Some(route) = native_route(request.uri().path()) else {
+        // A `/v1beta/models/` path is a Gemini client asking for a method this
+        // server does not serve (`:countTokens`, a misspelled action). Answering
+        // in Google's shape keeps it out of the chat handler, where the same
+        // body is either an axum deserialization rejection or - worse - a
+        // completion the caller never asked for.
+        if request.uri().path().starts_with("/v1beta/models/") {
+            return fail(
+                Wire::Gemini,
+                StatusCode::NOT_FOUND,
+                "this endpoint serves the generateContent and streamGenerateContent actions only",
+            );
+        }
+        return next.run(request).await;
     };
+    let wire = route.wire;
     let default_store = request
         .extensions()
         .get::<DefaultReceiptStore>()
@@ -876,7 +955,7 @@ pub async fn translate(request: Request, next: Next) -> Response {
             )
         }
     };
-    let native: Value =
+    let mut native: Value =
         match crate::json_bounds::parse_slice(&bytes, crate::json_bounds::Limits::INBOUND) {
             Ok(value) => value,
             Err(crate::json_bounds::ParseError::Malformed(_)) => {
@@ -890,6 +969,12 @@ pub async fn translate(request: Request, next: Next) -> Response {
                 )
             }
         };
+    if let Some(model) = &route.model {
+        // Gemini names the model and the action in the URL; the body carries
+        // neither, and nothing there may disagree with the path.
+        native["model"] = json!(model);
+        native["stream"] = json!(route.streams);
+    }
     let response_model = native["model"].clone();
     let request_receipts = receipts.clone();
     let request_scope = scope.clone();
@@ -947,16 +1032,21 @@ pub async fn translate(request: Request, next: Next) -> Response {
             let start=if wire==Wire::Chat {
                 json!({"id":response["id"],"model":model,"object":"chat.completion.chunk","created":response["created"],"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]})
             } else {json!({"type":"message_start","message":{"id":response["id"],"type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}})};
-            let mut start_event = Event::default();
-            if wire == Wire::Messages {
-                start_event = start_event.event("message_start");
+            // Gemini's own chunks each carry the role, so that wire opens with
+            // its first rendered frame rather than a synthetic role chunk whose
+            // model would only be the one the caller asked for.
+            if wire!=Wire::Gemini {
+                let mut start_event = Event::default();
+                if wire == Wire::Messages {
+                    start_event = start_event.event("message_start");
+                }
+                yield Ok::<Event, Infallible>(start_event.data(start.to_string()));
             }
-            yield Ok::<Event, Infallible>(start_event.data(start.to_string()));
             let mut reasoning=crate::reasoning::ReasoningAccumulator::default();let mut size=0usize;let mut done=false;
             while let Some(event)=stream.next().await {
-                let event=match event{Ok(event)=>event,Err(_)=>{yield Ok::<Event,Infallible>(Event::default().event("error").data(error_body(wire,"upstream stream failed").to_string()));return;}};
+                let event=match event{Ok(event)=>event,Err(_)=>{yield Ok::<Event,Infallible>(error_frame(wire,error_body(wire,"upstream stream failed")));return;}};
                 size=size.saturating_add(event.len());
-                if size>32*1024*1024 {yield Ok(Event::default().event("error").data(error_body(wire,"response exceeds size limit").to_string()));return;}
+                if size>32*1024*1024 {yield Ok(error_frame(wire,error_body(wire,"response exceeds size limit")));return;}
                 let data:Value=match serde_json::from_str(&event){Ok(data)=>data,Err(_)=>continue};
                 match data["type"].as_str() {
                     Some("content")=>{
@@ -966,35 +1056,43 @@ pub async fn translate(request: Request, next: Next) -> Response {
                         );
                         if wire==Wire::Chat {
                             yield Ok(Event::default().data(json!({"id":response["id"],"model":model,"object":"chat.completion.chunk","created":response["created"],"choices":[{"index":0,"delta":{"content":data["text"]},"finish_reason":null}]}).to_string()));
+                        } else if wire==Wire::Gemini {
+                            yield Ok(Event::default().data(json!({"candidates":[{"content":{"role":"model","parts":[{"text":data["text"]}]},"index":0}]}).to_string()));
                         } else {
                             if !text_started {yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));text_started=true;}
                             yield Ok(Event::default().event("content_block_delta").data(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":data["text"]}}).to_string()));
                         }
                     },
-                    Some("reasoning")=>if reasoning.push(&json!({"reasoning":data["blocks"]})).is_err(){yield Ok(Event::default().event("error").data(error_body(wire,crate::stream_retention::RETENTION_ERROR).to_string()));return;},
+                    Some("reasoning")=>if reasoning.push(&json!({"reasoning":data["blocks"]})).is_err(){yield Ok(error_frame(wire,error_body(wire,crate::stream_retention::RETENTION_ERROR)));return;},
                     Some("tool_call")=>{if !response["message"]["tool_calls"].is_array(){response["message"]["tool_calls"]=json!([]);}
                         let mut call=json!({"id":data["id"],"type":"function","function":{"name":data["name"],"arguments":data["arguments"]},"wire_ids":data["wire_ids"]});if let Some(sig)=data.get("thought_signature"){call["thought_signature"]=sig.clone();}
                         response["message"]["tool_calls"].as_array_mut().unwrap().push(call);response["finish_reason"]=json!("tool_calls");},
                     Some("usage")=>response["usage"]=data.clone(),
                     Some("done")=>{done=true;if let Some(finish)=data.get("finish_reason"){response["finish_reason"]=finish.clone();}
                         if let Some(served)=data.get("x-llmshim-served-model"){response["x-llmshim-served-model"]=served.clone();}break;},
-                    Some("error")=>{yield Ok(Event::default().event("error").data(error_from_event(wire,&data).to_string()));return;},
+                    Some("error")=>{yield Ok(error_frame(wire,error_from_event(wire,&data)));return;},
                     _=>{},
                 }
             }
-            if !done {yield Ok(Event::default().event("error").data(error_body(wire,"stream ended before completion").to_string()));return;}
+            if !done {yield Ok(error_frame(wire,error_body(wire,"stream ended before completion")));return;}
             let blocks=reasoning.blocks();if !blocks.is_empty(){response["message"]["reasoning"]=json!(blocks);}
             let response_receipts=receipts.clone();
             let response_scope=scope.clone();
             let native=match receipt_executor.run(ReceiptWorkKind::Egress, move || response_from_chat(&response,wire,&response_receipts,&response_scope)).await {
                 Ok(value)=>value,
-                Err(ReceiptWorkError::Failed(error))=>{yield Ok(Event::default().event("error").data(error_body(wire,&error).to_string()));return;},
-                Err(ReceiptWorkError::Busy)=>{yield Ok(Event::default().event("error").data(error_body(wire,"native replay metadata is busy; retry the request").to_string()));return;},
+                Err(ReceiptWorkError::Failed(error))=>{yield Ok(error_frame(wire,error_body(wire,&error)));return;},
+                Err(ReceiptWorkError::Busy)=>{yield Ok(error_frame(wire,error_body(wire,"native replay metadata is busy; retry the request")));return;},
             };
             let mut native=native;
             if wire==Wire::Chat {
                 // Text was already streamed. Emit completed reasoning/calls once.
                 native["choices"][0]["message"].as_object_mut().unwrap().remove("content");
+            } else if wire==Wire::Gemini {
+                // Only the answer text was streamed already. A thought part
+                // carries `text` too, and reasoning has no other container on
+                // this wire, so dropping it here would lose the block and its
+                // signature from every streamed answer.
+                native["candidates"][0]["content"]["parts"].as_array_mut().unwrap().retain(|part|part.get("thought").is_some()||part.get("text").is_none());
             } else {
                 if text_started {yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":0}).to_string()));}
                 native["content"].as_array_mut().unwrap().retain(|block|block["type"]!="text");
@@ -1049,7 +1147,7 @@ pub async fn translate(request: Request, next: Next) -> Response {
         }
     } else {
         if let Some(error) = parts.extensions.get::<crate::error::NormalizedError>() {
-            render_error(wire, error, fallback_error_type(wire, parts.status))
+            render_error(wire, error, parts.status)
         } else {
             error_for_status(
                 wire,
@@ -1074,6 +1172,9 @@ pub async fn translate(request: Request, next: Next) -> Response {
 
 pub fn stream_frames(response: &Value, wire: Wire) -> Vec<(Option<String>, String)> {
     let mut frames = Vec::new();
+    if wire == Wire::Gemini {
+        return gemini::frames(response);
+    }
     if wire == Wire::Chat {
         let mut chunk = response.clone();
         chunk["object"] = json!("chat.completion.chunk");
@@ -1154,10 +1255,15 @@ pub fn stream_frames(response: &Value, wire: Wire) -> Vec<(Option<String>, Strin
     frames
 }
 
-/// Anthropic clients send x-api-key; an explicit Authorization header wins.
+/// Anthropic clients send x-api-key and Gemini clients send x-goog-api-key; an
+/// explicit Authorization header wins over either.
 pub(crate) fn normalize_auth(headers: &mut axum::http::HeaderMap) {
     if !headers.contains_key(header::AUTHORIZATION) {
-        if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        let key = headers
+            .get("x-api-key")
+            .or_else(|| headers.get("x-goog-api-key"))
+            .and_then(|v| v.to_str().ok());
+        if let Some(key) = key {
             if let Ok(value) = format!("Bearer {key}").parse() {
                 headers.insert(header::AUTHORIZATION, value);
             }
