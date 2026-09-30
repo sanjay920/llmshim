@@ -2,7 +2,9 @@
 //! All loading is local. Network refresh is explicit or detached from requests.
 pub mod aliases;
 pub mod builtin;
+mod cache;
 mod capabilities;
+mod handle;
 mod import_budget;
 mod merge;
 mod parse;
@@ -10,9 +12,11 @@ mod refresh;
 mod types;
 mod variant;
 
+pub use cache::CatalogOptions;
 pub use capabilities::{ModelCapabilities, Support};
 use chrono::{DateTime, Utc};
-pub use refresh::{CatalogHandle, CatalogOptions, RefreshOutcome};
+pub use handle::CatalogHandle;
+pub use refresh::RefreshOutcome;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
@@ -25,7 +29,9 @@ pub const CATALOG_URL: &str = "https://models.dev/api.json";
 static GLOBAL: LazyLock<Result<CatalogHandle, CatalogError>> =
     LazyLock::new(|| CatalogHandle::load(CatalogOptions::default()));
 
-/// Shared resident catalog. Initialization reads only local files; callers may
+/// Shared resident catalog. Initialization reads local policy only and folds no
+/// snapshot: the vendored floor and the disk cache wait for the first read, so
+/// a process that never looks up a model never pays for the catalog. Callers may
 /// schedule `refresh_in_background` after startup. Invalid local policy stays
 /// visible as an error instead of silently reverting to community defaults.
 pub fn global() -> Result<&'static CatalogHandle, &'static CatalogError> {
@@ -154,6 +160,19 @@ impl Catalog {
         });
         merge::merge(target, &model);
         self.index_model(&model);
+    }
+
+    /// Fold another catalog's rows and aliases into this one. Precedence comes
+    /// from each row's own [`CatalogSource`], never from the call order, so a
+    /// layer kept aside and applied later lands exactly where it would have if
+    /// it had been applied in sequence.
+    pub(crate) fn merge_layer(&mut self, layer: &Catalog) {
+        for model in layer.models.values() {
+            self.merge_model(model.clone());
+        }
+        for (alias, target) in &layer.aliases {
+            self.alias(alias.clone(), target.clone());
+        }
     }
 
     fn index_model(&mut self, model: &ModelInfo) {
