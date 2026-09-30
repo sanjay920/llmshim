@@ -373,6 +373,50 @@ impl Provider for OpenAi {
         };
         crate::reasoning::capture_stream(&self.replay_target(model), &native, result)
     }
+
+    fn embedding_bounds(&self) -> crate::embeddings::EmbeddingBounds {
+        // OpenAI refuses an input array over 2048 texts, and a whole request
+        // over 300,000 tokens. A megabyte of text is about 262k tokens at the
+        // four-bytes-per-token estimate the rate limiter uses, so the byte
+        // ceiling refuses locally before a request that cannot be served.
+        crate::embeddings::EmbeddingBounds::new(2048, 1 << 20)
+    }
+
+    fn transform_embedding_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        let texts = crate::embeddings::texts(request)?;
+        let mut body =
+            crate::embeddings::openai_body(model, &texts, crate::embeddings::dimensions(request));
+        // The response is parsed as JSON numbers, so ask for the float format
+        // explicitly rather than inherit a default that could become base64.
+        body["encoding_format"] = json!("float");
+        Ok(ProviderRequest {
+            url: format!("{}/embeddings", self.base_url.trim_end_matches('/')),
+            headers: vec![
+                ("Authorization".into(), format!("Bearer {}", self.api_key)),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            body,
+        })
+    }
+
+    fn transform_embedding_response(&self, _model: &str, mut response: Value) -> Result<Value> {
+        if !response.is_object() {
+            return Err(ShimError::ProviderError {
+                status: 502,
+                body: "invalid upstream response shape".into(),
+                retry_after: None,
+            });
+        }
+        if response.get("data").is_none_or(|data| !data.is_array()) {
+            return Err(ShimError::ProviderError {
+                status: 502,
+                body: "embeddings response has no data array".into(),
+                retry_after: None,
+            });
+        }
+        crate::usage::normalize_response(&mut response);
+        Ok(response)
+    }
 }
 
 impl OpenAi {

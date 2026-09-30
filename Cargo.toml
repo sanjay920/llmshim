@@ -1,6 +1,6 @@
 [package]
 name = "llmshim"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 description = "Blazing fast LLM API translation layer in pure Rust"
 license = "MIT OR Apache-2.0"
@@ -23,7 +23,7 @@ gateway-redis = ["gateway", "redis-coordination"]
 redis-coordination = ["proxy", "dep:redis"]
 
 [dependencies]
-llmshim-catalog = { version = "0.2.1", path = "crates/llmshim-catalog" }
+llmshim-catalog = { version = "0.3.0", path = "crates/llmshim-catalog" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "gzip", "brotli", "zstd", "deflate"] }
 serde = { version = "1", features = ["derive"] }
@@ -84,6 +84,10 @@ path = "examples/stream.rs"
 [[example]]
 name = "bench"
 path = "benchmarks/bench.rs"
+
+[[example]]
+name = "catalog_startup"
+path = "benchmarks/catalog_startup.rs"
 
 [[example]]
 name = "loadtest"

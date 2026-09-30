@@ -322,8 +322,9 @@ impl Router {
     }
 
     /// Refresh the shared model catalog from the network, detached from every
-    /// request: only startup's local snapshot is synchronous, and no catalog
-    /// HTTP fetch is ever awaited by a model request.
+    /// request: only local policy is read synchronously at startup, no snapshot
+    /// is built before a model is looked up, and no catalog HTTP fetch is ever
+    /// awaited by a model request.
     ///
     /// The refresh rides the caller's Tokio runtime and never creates one, so
     /// `None` means nothing was scheduled: there is no runtime on this thread,

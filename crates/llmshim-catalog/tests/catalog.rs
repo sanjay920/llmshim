@@ -494,3 +494,56 @@ fn deepseek_v4_1_flash_openrouter_price_matches_the_corrected_rate() {
     assert_eq!(cost.output, Some(1.2));
     assert_eq!(cost.cache_read, Some(0.006));
 }
+
+#[test]
+fn embedding_assertions_land_on_the_models_that_embed_and_nothing_else() {
+    let catalog = Catalog::vendored();
+    for (identifier, dimensions) in [
+        ("openai/text-embedding-3-small", 1536),
+        ("openai/text-embedding-3-large", 3072),
+        ("openai/text-embedding-ada-002", 1536),
+        ("gemini/gemini-embedding-001", 3072),
+    ] {
+        let model = catalog.resolve(identifier).unwrap();
+        assert_eq!(model.embeds, Support::Supported, "{identifier}");
+        assert_eq!(model.embedding_dimensions, Some(dimensions), "{identifier}");
+        assert_eq!(model.field_sources["embeds"], CatalogSource::Builtin);
+    }
+    // The vendored snapshot lists embedding rows without an embedding flag, and
+    // its `limit.output` is the vector width for OpenAI's models but `1` for
+    // Gemini's. A chat model row therefore stays unasserted, which the
+    // embeddings entry point refuses rather than guesses at.
+    assert_eq!(
+        catalog.resolve("openai/gpt-6-astra").unwrap().embeds,
+        Support::Unknown
+    );
+}
+
+#[test]
+fn a_local_override_can_assert_embedding_for_a_model_no_catalog_lists() {
+    let mut catalog = Catalog::vendored();
+    catalog
+        .merge_local_toml("[models.\"vllm/bge-m3\"]\nembedding = true\ndimensions = 1024")
+        .unwrap();
+    let model = catalog.resolve("vllm/bge-m3").unwrap();
+    assert_eq!(model.embeds, Support::Supported);
+    assert_eq!(model.embedding_dimensions, Some(1024));
+    assert_eq!(model.field_sources["embeds"], CatalogSource::Local);
+}
+
+#[test]
+fn a_models_dev_refresh_cannot_erase_a_builtin_embedding_assertion() {
+    let mut catalog = Catalog::empty();
+    catalog.merge_builtins();
+    catalog
+        .merge_models_dev(
+            &json!({"openai": {"models": {"text-embedding-3-small": {"id": "text-embedding-3-small"}}}})
+                .to_string(),
+            None,
+        )
+        .unwrap();
+    let model = catalog.resolve("openai/text-embedding-3-small").unwrap();
+    assert_eq!(model.embeds, Support::Supported);
+    assert_eq!(model.embedding_dimensions, Some(1536));
+    assert_eq!(model.field_sources["embeds"], CatalogSource::Builtin);
+}

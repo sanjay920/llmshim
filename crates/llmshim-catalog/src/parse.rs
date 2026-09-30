@@ -78,6 +78,12 @@ pub(crate) fn model_from_value(
         };
     }
     m.cost = cost(&v["cost"]);
+    // The vendored snapshot carries no embedding flag — it spells the embedding
+    // models it lists like any other row, and its `limit.output` is the vector
+    // width for OpenAI's models but `1` for Gemini's. So the positive assertion
+    // is a builtin/local one (`embedding = true`), and this reads it back.
+    m.embeds = support(&v["embedding"]);
+    m.embedding_dimensions = count(&v["dimensions"]);
     m.context_cost_tiers = if let Some(tiers) = v.get("context_cost_tiers") {
         serde_json::from_value(tiers.clone()).ok()
     } else {
