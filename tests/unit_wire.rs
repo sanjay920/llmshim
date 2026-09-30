@@ -17,6 +17,10 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+#[path = "support/native_post.rs"]
+mod native_post;
+use native_post::post;
+
 fn canonical() -> Value {
     let p = Anthropic::new("test".into());
     let normalized=p.transform_response("claude-sonnet-4-6",json!({"id":"r","stop_reason":"tool_use","content":[{"type":"thinking","thinking":"brief","signature":"opaque"},{"type":"tool_use","id":"native-id","name":"read","input":{"path":"a"}}],"usage":{"input_tokens":4,"output_tokens":2,"cache_read_input_tokens":3}})).unwrap();
@@ -155,39 +159,30 @@ fn native_unary_and_stream_usage_preserve_provider_floor_source() {
     let mut canonical = canonical();
     canonical["usage"]["cost_usd"] = json!(1.0);
     canonical["usage"]["cost_source"] = json!("provider_floor");
-    for wire in [Wire::Messages, Wire::Chat] {
+    // The cost travels beside the usage in whichever field the wire names,
+    // `null` meaning unknown rather than free.
+    for (wire, usage, cost_source) in [
+        (Wire::Messages, "/usage", "/usage/cost_source"),
+        (Wire::Chat, "/usage", "/usage/cost_source"),
+        (Wire::Gemini, "/usageMetadata", "/usageMetadata/cost_source"),
+    ] {
         let native = response_from_chat(&canonical, wire, &store, "a").unwrap();
-        assert_eq!(native["usage"]["cost_usd"], 1.0);
-        assert_eq!(native["usage"]["cost_source"], "provider_floor");
+        assert_eq!(native.pointer(usage).unwrap()["cost_usd"], 1.0);
+        assert_eq!(
+            native.pointer(usage).unwrap()["cost_source"],
+            "provider_floor"
+        );
         let frames = llmshim::proxy::wire::stream_frames(&native, wire);
         assert!(frames.iter().any(|(_, data)| {
             serde_json::from_str::<Value>(data)
                 .ok()
                 .is_some_and(|event| {
-                    event["usage"]["cost_source"] == "provider_floor"
-                        || event
-                            .pointer("/message/usage/cost_source")
-                            .is_some_and(|source| source == "provider_floor")
+                    event
+                        .pointer(cost_source)
+                        .is_some_and(|source| source == "provider_floor")
                 })
         }));
     }
-}
-
-async fn post(app: axum::Router, path: &str, body: Value) -> (axum::http::StatusCode, Value) {
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(path)
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
 }
 
 #[tokio::test]
@@ -526,11 +521,31 @@ async fn native_stream_errors_unwrap_gateway_display_prefixes() {
     };
     let application = axum::Router::new()
         .route("/v1/messages", axum::routing::post(handler.clone()))
-        .route("/v1/chat/completions", axum::routing::post(handler))
+        .route("/v1/chat/completions", axum::routing::post(handler.clone()))
+        .route("/v1beta/models/{*rest}", axum::routing::post(handler))
         .layer(axum::middleware::from_fn(llmshim::proxy::wire::translate));
-    for (path, kind) in [
-        ("/v1/messages", "api_error"),
-        ("/v1/chat/completions", "server_error"),
+    for (path, body, expected, names_event) in [
+        (
+            "/v1/messages",
+            json!({"model":"local/test","messages":[],"stream":true}),
+            json!({"type":"api_error","message":"Try again later."}),
+            true,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"local/test","messages":[],"stream":true}),
+            json!({"type":"server_error","message":"Try again later.","param":null,
+                   "code":"backend_busy"}),
+            true,
+        ),
+        // Gemini's SSE carries no event names, so its failure is a bare frame
+        // in Google's own error shape.
+        (
+            "/v1beta/models/local/test:streamGenerateContent",
+            json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]}),
+            json!({"code":400,"message":"Try again later.","status":"INVALID_ARGUMENT"}),
+            false,
+        ),
     ] {
         let response = application
             .clone()
@@ -539,9 +554,7 @@ async fn native_stream_errors_unwrap_gateway_display_prefixes() {
                     .method("POST")
                     .uri(path)
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"model":"local/test","messages":[],"stream":true}).to_string(),
-                    ))
+                    .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
@@ -555,11 +568,8 @@ async fn native_stream_errors_unwrap_gateway_display_prefixes() {
             .filter_map(|data| serde_json::from_str::<Value>(data).ok())
             .find(|event| event.get("error").is_some())
             .expect("native error event");
-        assert_eq!(error["error"]["message"], "Try again later.");
-        assert_eq!(error["error"]["type"], kind);
-        if path == "/v1/chat/completions" {
-            assert_eq!(error["error"]["code"], "backend_busy");
-        }
+        assert_eq!(error["error"], expected, "{path}");
+        assert_eq!(text.contains("event: error"), names_event, "{path}");
         assert!(!text.contains("data: [DONE]"));
         assert!(!text.contains("event: message_stop"));
     }
@@ -667,10 +677,13 @@ async fn malformed_tool_calls_are_rejected_before_http_or_sse_dispatch() {
             if path != "/v1/chat/completions" {
                 assert_eq!(body["error"]["code"], "invalid_request");
             }
-            assert!(body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("tool_calls must be an array"));
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("tool_calls must be an array"),
+                "{path} {body}"
+            );
         }
     }
     upstream.assert_async().await;

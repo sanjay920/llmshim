@@ -21,18 +21,13 @@ pub(crate) fn preparation_overload_response(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let mut response = match path {
-        "/v1/chat/completions" => wire::fail(
-            wire::Wire::Chat,
+    let mut response = match wire::native_route(path) {
+        Some(route) => wire::fail(
+            route.wire,
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "Proxy is at capacity; retry after the suggested delay",
         ),
-        "/v1/messages" => wire::fail(
-            wire::Wire::Messages,
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "Proxy is at capacity; retry after the suggested delay",
-        ),
-        _ => error::ApiError::Overloaded(queue_timeout).into_response(),
+        None => error::ApiError::Overloaded(queue_timeout).into_response(),
     };
     let retry_after_seconds =
         queue_timeout.as_secs() + u64::from(queue_timeout.subsec_millis() > 0);
@@ -106,6 +101,9 @@ fn app_with_origin_policy_and_deadlines(
         .route("/v1/chat", post(handlers::chat))
         .route("/v1/chat/completions", post(handlers::chat))
         .route("/v1/messages", post(handlers::chat))
+        // Gemini's native REST shape, `/v1beta/models/<model>:<action>`. The
+        // wildcard keeps a routing id's slashes (`gemini/gemini-3.8-flash`).
+        .route("/v1beta/models/{*rest}", post(handlers::chat))
         .route("/v1/chat/stream", post(handlers::chat_stream))
         .route("/v1/models", get(handlers::list_models))
         .route("/health", get(handlers::health))
