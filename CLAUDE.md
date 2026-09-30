@@ -305,6 +305,31 @@ Routes do not chain.
 
 Image content blocks are translated between providers automatically. Users can send images in any format (OpenAI `image_url`, Anthropic `image`, Gemini `inline_data`) and the correct provider sees its native format. Base64 data URIs and plain URLs are both handled. Gemini falls back to a text placeholder for URL images (only supports `inline_data`).
 
+### Embeddings (`src/embeddings.rs`)
+
+`llmshim::embeddings` returns one vector per input text, in input order, with
+the model identity and the billed tokens. The typed request renders to an
+OpenAI-shaped payload that each adapter translates: OpenAI's `/v1/embeddings`
+(with `dimensions`, `encoding_format: "float"`), Gemini's `batchEmbedContents`
+(one request object per text), and an OpenAI-compatible server's `/v1/embeddings`
+(the same passthrough used for chat). Anthropic, xAI, OpenRouter and the ChatGPT
+subscription backend have no embeddings route: their adapters refuse by name
+through the defaulted `Provider::transform_embedding_request`, never by
+forwarding to another vendor's model.
+
+Three refusals happen before a request is sent, and the order matters: the batch
+is checked against `Provider::embedding_bounds` first (a server could never
+accept it, so it must not be rendered), the provider's own transform runs
+second — its "no embeddings API" is the fact that decides whether any model id
+could work — and the catalog is asked last. `ModelInfo.embeds` is tri-state and
+kept on `ModelInfo` rather than `ModelCapabilities` because that struct is not
+`#[non_exhaustive]`: a model the catalog carries without a positive assertion is
+refused with the local-override path in the message, while a model the catalog
+has never heard of (self-hosted, OpenRouter) is sent. No chunking and no
+substitution — either would be work the caller did not ask for. The client's
+`embeddings` dispatch reuses `send_prepared`, so retries, timeouts, the breaker
+and `cost::stamp` behave exactly as they do for a completion.
+
 ### Multi-model conversations
 
 `src/reasoning.rs` owns the single replay policy, typed blocks, signature origins,
