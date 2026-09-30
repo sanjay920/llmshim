@@ -6,15 +6,45 @@ Both `llmshim proxy` and `llmshim gateway` serve:
 |---|---|
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/messages` | Anthropic Messages |
+| `POST /v1beta/models/{model}:generateContent` | Google Gemini Generate Content |
+| `POST /v1beta/models/{model}:streamGenerateContent` | Google Gemini Generate Content, SSE |
 
 Point a native SDK at the server base URL and use a configured model route, such
-as `anthropic/claude-sonnet-4-6` or `openai/gpt-6-astra`. Provider credentials stay
-in the server. On an authenticated gateway, the client key is a gateway key:
-`Authorization: Bearer …` and Anthropic's `x-api-key` are accepted. An explicit
+as `anthropic/claude-sonnet-4-6`, `openai/gpt-6-astra` or
+`gemini/gemini-3.8-flash`. Provider credentials stay in the server. On an
+authenticated gateway, the client key is a gateway key: `Authorization: Bearer …`,
+Anthropic's `x-api-key` and Gemini's `x-goog-api-key` are accepted. An explicit
 Authorization header takes precedence. Native requests use the existing gateway
 queue, authenticated tier, quotas and request IDs, or the proxy's concurrency
 and rate-limit admission. Rejections preserve HTTP status and Retry-After.
 Native idempotency keys are scoped to credential and wire format.
+
+Gemini names its model and its action in the path, so a routing id's slash
+survives (`/v1beta/models/gemini/gemini-3.8-flash:generateContent`) and the body
+carries neither `model` nor `stream`. Its turns are `contents[].parts`: text
+becomes a message, `inlineData` becomes an image block, `functionCall` and
+`functionResponse` become a tool call and its result, and a `thought` part is
+restored from its receipt like any other opaque reasoning. `systemInstruction`,
+`functionDeclarations`, `toolConfig`, `generationConfig` (including
+`thinkingLevel`) and `responseSchema` translate through the shared engine.
+`safetySettings` and `cachedContent` ride the `x-gemini` namespace to Google
+verbatim; a field this server cannot express — `candidateCount` other than 1,
+`thinkingBudget`, `allowedFunctionNames`, `includeThoughts: false`, a hosted
+tool, an unknown part, or `x-cache`, whose explicit markers the engine applies on
+the Anthropic wire only — is refused by name, because forwarding it would fail
+upstream or silently disappear. Errors are Google's error object;
+`generateContent` returns a `GenerateContentResponse` whose `modelVersion` is
+the model that answered, and `streamGenerateContent` returns Gemini SSE chunks
+with no event names and no terminator — the finish reason ends the stream. That
+SSE form is the only one served: the query string is not read, so `alt=sse` is
+accepted and ignored while a client asking for Google's JSON-array form would
+have to parse frames it did not ask for. The credential is the
+`x-goog-api-key` header (or an explicit `Authorization`, which wins); `?key=`
+is not read. Any other action under `/v1beta/models/` — `:countTokens`,
+`:embedContent`, a misspelled or missing action — is refused with Google's 404
+error object instead of reaching the chat handler, because the path is routed by
+a wildcard.
+`:countTokens`, `:embedContent` and the cached-content endpoints are not served.
 
 ```json
 {
@@ -45,7 +75,8 @@ refusal is a properly shaped OpenAI error naming the parameter:
            "code": "unsupported_parameter"}}
 ```
  Provider-specific endpoints such as
-batches, token counting, uploads and Responses are not served by these aliases.
+batches, token counting, uploads and Responses are not served by these aliases;
+Gemini's `:generateContent` family is, and nothing else under `/v1beta` is.
 
 With `stream:true`, text arrives incrementally. Chat Completions emits
 `chat.completion.chunk` records followed by `[DONE]`. Messages emits
