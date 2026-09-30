@@ -47,7 +47,11 @@ coverage. Local policy > provider capabilities > verified builtin assertions >
 models.dev, per field; unknowns never erase assertions. Provider APIs never
 contribute pricing. See `crates/llmshim-catalog/README.md` for cache and override
 paths, offline behavior, aliases, and publication order. Never await catalog
-refresh in a completion; hold a snapshot for decisions that must agree.
+refresh in a completion; hold a snapshot for decisions that must agree. A
+`CatalogHandle` folds on the first read — construction reads local policy only —
+so nothing builds the 4.6 MB vendored floor before a model is looked up;
+`tests/refresh.rs` pins the deferral, and `cargo run --release --example
+catalog_startup` measures construction against the first read.
 
 `usage.cache_read_tokens` and `usage.cache_write_tokens` are always present on
 normalized responses and usage chunks, logs, and proxy usage. Native token

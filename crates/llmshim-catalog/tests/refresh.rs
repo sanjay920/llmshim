@@ -2,6 +2,7 @@ use llmshim_catalog::{
     Catalog, CatalogError, CatalogHandle, CatalogOptions, RefreshOutcome, Support,
 };
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn options(dir: &tempfile::TempDir, url: String) -> CatalogOptions {
@@ -292,6 +293,56 @@ fn project_override_wins_over_global_and_invalid_local_is_an_error() {
     );
     std::fs::write(&project, "invalid [").unwrap();
     assert!(Catalog::load(&opts).is_err());
+}
+
+#[test]
+fn a_handle_reads_the_disk_only_when_it_is_first_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(&dir, "http://127.0.0.1:1".into());
+    let local = dir.path().join("models.toml");
+    std::fs::write(&local, "[models.\"local/configured\"]\nfamily=\"llama\"").unwrap();
+    opts.global_overrides = Some(local);
+    let handle = CatalogHandle::load(opts.clone()).unwrap();
+    // Discovery lands on disk after the handle exists. A handle that had
+    // already folded the disk at construction could never see it; one that
+    // folds on the first read does, and the local layer it did read is there.
+    std::fs::write(opts.cache_file.as_ref().unwrap(), fixture()).unwrap();
+    let snapshot = handle.snapshot();
+    assert!(Arc::ptr_eq(&snapshot, &handle.snapshot()));
+    assert!(snapshot.resolve("local/configured").is_some());
+    assert!(snapshot.resolve("fixture/fresh-model").is_some());
+}
+
+#[test]
+fn malformed_local_policy_fails_at_construction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = options(&dir, "http://127.0.0.1:1".into());
+    let local = dir.path().join("models.toml");
+    std::fs::write(&local, "invalid [").unwrap();
+    opts.project_overrides = Some(local);
+    assert!(CatalogHandle::load(opts).is_err());
+}
+
+#[tokio::test]
+async fn a_staged_refresh_supersedes_the_cache_file_it_was_written_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut server = mockito::Server::new_async().await;
+    let opts = options(&dir, format!("{}/catalog", server.url()));
+    let response = server
+        .mock("GET", "/catalog")
+        .with_body(fixture())
+        .expect(1)
+        .create_async()
+        .await;
+    let handle = CatalogHandle::load(opts.clone()).unwrap();
+    assert_eq!(
+        handle.refresh(true).await,
+        RefreshOutcome::Updated { models: 1 }
+    );
+    // The refreshed rows live in the handle, not only in the file just written.
+    std::fs::remove_file(opts.cache_file.as_ref().unwrap()).unwrap();
+    assert!(handle.snapshot().resolve("fixture/fresh-model").is_some());
+    response.assert_async().await;
 }
 
 #[tokio::test]

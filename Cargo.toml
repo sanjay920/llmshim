@@ -86,6 +86,10 @@ name = "bench"
 path = "benchmarks/bench.rs"
 
 [[example]]
+name = "catalog_startup"
+path = "benchmarks/catalog_startup.rs"
+
+[[example]]
 name = "loadtest"
 path = "benchmarks/loadtest.rs"
 required-features = ["proxy"]
