@@ -94,14 +94,29 @@ prevents all catalog and provider discovery HTTP, even an explicit refresh.
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 use llmshim_catalog::{CatalogHandle, CatalogOptions};
 
-let catalog = CatalogHandle::load(CatalogOptions::default())?; // disk only
+let catalog = CatalogHandle::load(CatalogOptions::default())?; // local policy only
 let refresh = catalog.refresh_in_background(); // detached, existing Tokio runtime
-let snapshot = catalog.snapshot();             // does not wait for HTTP
+let snapshot = catalog.snapshot();             // folds the vendored floor + cache; never fetches
 let model = snapshot.resolve("openai/gpt-6-astra");
 // Force a refresh from an operator action, independently of model requests:
 let outcome = catalog.refresh(true).await;
 # Ok(()) }
 ```
+
+Building a handle is not building a catalog. The vendored snapshot and the disk
+cache are read by the first `snapshot()`, so a process that starts and never
+looks up a model never pays the fold; the measured cost is `0.019 ms` to
+construct against `116 ms` for the first read
+(`cargo run --release --example catalog_startup`). `refresh` and
+`discover_provider` are the only readers of the network and neither runs on its
+own, so `snapshot()` never fetches — it composes what the disk and whatever
+refreshes already staged in the handle hold. Local policy is the one exception
+to the deferral: a malformed override is a configuration error, so the override
+files are read and validated when the handle is built. A refresh and a provider
+discovery stage their rows in the handle and drop the built snapshot rather than
+merging into it, so neither one builds a catalog no request asked for; the first
+read after a successful refresh sees the new layer, and a failed one leaves the
+snapshot pointer untouched.
 
 The TTL is 24 hours; errors serve the last snapshot indefinitely. An ETag is
 sent only when its sidecar hash matches a validated cache body. Cache files are
