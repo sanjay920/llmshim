@@ -61,6 +61,11 @@ pub(crate) fn merge(target: &mut ModelInfo, incoming: &ModelInfo) {
     capability!(parallel_tool_calls);
     capability!(reasoning);
     capability!(forced_tool_choice);
+    field!(embeds, incoming.embeds != Support::Unknown);
+    field!(
+        embedding_dimensions,
+        incoming.embedding_dimensions.is_some()
+    );
     for (key, values) in [
         ("modalities.input", &incoming.modalities.input),
         ("modalities.output", &incoming.modalities.output),

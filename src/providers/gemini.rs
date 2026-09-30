@@ -294,6 +294,23 @@ fn normalized_gemini_usage(usage: &Value) -> Value {
     result
 }
 
+/// A native `error` object, as the provider error it stands for. Google reports
+/// the status inside the body (`error.code`), so an HTTP 200 can still carry a
+/// refusal — and the two places that unwrap it must agree on how.
+fn native_error(response: &Value) -> Option<ShimError> {
+    let error = response.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("unknown error");
+    let code = error.get("code").and_then(|c| c.as_u64()).unwrap_or(400) as u16;
+    Some(ShimError::ProviderError {
+        status: code,
+        body: message.to_string(),
+        retry_after: None,
+    })
+}
+
 fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
     let candidate = resp
         .get("candidates")
@@ -625,21 +642,67 @@ impl Provider for Gemini {
         };
         crate::reasoning::capture_stream(&self.replay_target(model), &native, result)
     }
+
+    fn transform_embedding_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        let texts = crate::embeddings::texts(request)?;
+        let dimensions = crate::embeddings::dimensions(request);
+        // `batchEmbedContents` takes one full request object per text, and
+        // `content.parts[].text` is the text — plain strings are not accepted
+        // the way they are on an OpenAI embeddings array.
+        let requests: Vec<Value> = texts
+            .iter()
+            .map(|text| {
+                let mut embed = json!({
+                    "model": format!("models/{model}"),
+                    "content": {"parts": [{"text": text}]},
+                });
+                if let Some(dimensions) = dimensions {
+                    embed["outputDimensionality"] = json!(dimensions);
+                }
+                embed
+            })
+            .collect();
+        Ok(ProviderRequest {
+            url: format!(
+                "{}/models/{}:batchEmbedContents?key={}",
+                self.base_url, model, self.api_key
+            ),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: json!({ "requests": requests }),
+        })
+    }
+
+    fn transform_embedding_response(&self, _model: &str, response: Value) -> Result<Value> {
+        if let Some(error) = native_error(&response) {
+            return Err(error);
+        }
+        let Some(embeddings) = response["embeddings"].as_array() else {
+            return Err(ShimError::ProviderError {
+                status: 502,
+                body: "embeddings response has no embeddings array".into(),
+                retry_after: None,
+            });
+        };
+        // One `values` list per request object, in the order they were sent.
+        // The response carries no model and no token counts, so both stay
+        // unreported rather than being guessed at.
+        Ok(json!({
+            "data": embeddings
+                .iter()
+                .enumerate()
+                .map(|(index, embedding)| json!({
+                    "index": index,
+                    "embedding": embedding["values"],
+                }))
+                .collect::<Vec<Value>>(),
+        }))
+    }
 }
 
 impl Gemini {
     fn transform_response_native(&self, model: &str, response: Value) -> Result<Value> {
-        if let Some(err) = response.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
-            let code = err.get("code").and_then(|c| c.as_u64()).unwrap_or(400) as u16;
-            return Err(ShimError::ProviderError {
-                status: code,
-                body: msg.to_string(),
-                retry_after: None,
-            });
+        if let Some(error) = native_error(&response) {
+            return Err(error);
         }
         transform_response_to_openai(model, &response)
     }

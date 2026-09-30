@@ -10,6 +10,7 @@ pub mod cost;
 pub mod credentials;
 mod default_secret_file;
 mod derived_response;
+pub mod embeddings;
 pub mod env;
 pub mod error;
 pub mod fallback;
@@ -154,6 +155,24 @@ async fn completion_inner(
             Err(e)
         }
     }
+}
+
+/// Embedding entry point. Resolves the model id, refuses before dispatch when
+/// the provider has no embeddings API or the catalog does not mark the model as
+/// an embedding model, and returns one vector per input text in input order.
+///
+/// Nothing is chunked: a batch over the provider's bounds is refused, because a
+/// second request the caller did not ask for is a second charge and a different
+/// rate-limit footprint.
+pub async fn embeddings(
+    router: &Router,
+    request: &embeddings::EmbeddingRequest,
+) -> Result<embeddings::Embeddings> {
+    let (provider, model) = router.resolve(&request.model)?;
+    let response = bound_client(router)
+        .embeddings(provider, &model, &embeddings::payload(request))
+        .await?;
+    embeddings::parse(provider.name(), &model, request.input.len(), response)
 }
 
 /// Streaming entry point. Returns an SSE stream of OpenAI-format chunks.
