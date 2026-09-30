@@ -178,10 +178,8 @@ pub(crate) async fn admit_preparation(
 ) -> Response {
     let path = request.uri().path().to_owned();
     let requires_preparation = request.method() == axum::http::Method::POST
-        && matches!(
-            path.as_str(),
-            "/v1/chat" | "/v1/chat/stream" | "/v1/chat/completions" | "/v1/messages"
-        );
+        && (matches!(path.as_str(), "/v1/chat" | "/v1/chat/stream")
+            || wire::native_route(&path).is_some());
     if !requires_preparation {
         return next.run(request).await;
     }
@@ -210,18 +208,13 @@ pub(crate) async fn admit_preparation(
 }
 
 pub(crate) fn timeout_response(path: &str) -> Response {
-    match path {
-        "/v1/chat/completions" => wire::fail(
-            Wire::Chat,
+    match wire::native_route(path) {
+        Some(route) => wire::fail(
+            route.wire,
             StatusCode::GATEWAY_TIMEOUT,
             LOGICAL_TIMEOUT_MESSAGE,
         ),
-        "/v1/messages" => wire::fail(
-            Wire::Messages,
-            StatusCode::GATEWAY_TIMEOUT,
-            LOGICAL_TIMEOUT_MESSAGE,
-        ),
-        _ => (
+        None => (
             StatusCode::GATEWAY_TIMEOUT,
             axum::Json(json!({
                 "error": {
@@ -453,6 +446,16 @@ impl SseBoundary {
 }
 
 fn timeout_sse_frame(path: &str) -> Bytes {
+    if wire::native_route(path).is_some_and(|route| route.wire == Wire::Gemini) {
+        return Bytes::from(format!(
+            "data: {}\n\n",
+            wire::error_for_status(
+                Wire::Gemini,
+                StatusCode::GATEWAY_TIMEOUT,
+                LOGICAL_TIMEOUT_MESSAGE
+            )
+        ));
+    }
     let frame = match path {
         "/v1/chat/completions" => format!(
             "data: {}\n\n",

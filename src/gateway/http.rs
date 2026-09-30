@@ -933,6 +933,7 @@ fn app_with_origin_policy_and_deadlines(
         .route("/v1/chat", post(chat))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/messages", post(chat))
+        .route("/v1beta/models/{*rest}", post(chat))
         .route("/v1/chat/stream", post(chat_stream))
         .route("/v1/models", get(list_models))
         .route("/v1/gateway/stats", get(stats))
@@ -998,19 +999,13 @@ async fn admit_ingress_preparation(
     let state = &ingress.gateway;
     let inference_path = request.uri().path().to_owned();
     let requires_preparation = request.method() == axum::http::Method::POST
-        && matches!(
-            inference_path.as_str(),
-            "/v1/chat" | "/v1/chat/stream" | "/v1/chat/completions" | "/v1/messages"
-        );
+        && (matches!(inference_path.as_str(), "/v1/chat" | "/v1/chat/stream")
+            || crate::proxy::wire::native_route(&inference_path).is_some());
     if !requires_preparation {
         return next.run(request).await;
     }
 
-    let native_wire = match inference_path.as_str() {
-        "/v1/chat/completions" => Some(crate::proxy::wire::Wire::Chat),
-        "/v1/messages" => Some(crate::proxy::wire::Wire::Messages),
-        _ => None,
-    };
+    let native_wire = crate::proxy::wire::native_route(&inference_path).map(|route| route.wire);
     if native_wire.is_some() {
         crate::proxy::wire::normalize_auth(request.headers_mut());
     }
@@ -1079,11 +1074,7 @@ async fn native_translate(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let wire = match request.uri().path() {
-        "/v1/messages" => Some(crate::proxy::wire::Wire::Messages),
-        "/v1/chat/completions" => Some(crate::proxy::wire::Wire::Chat),
-        _ => None,
-    };
+    let wire = crate::proxy::wire::native_route(request.uri().path()).map(|route| route.wire);
     if let Some(wire) = wire {
         crate::proxy::wire::normalize_auth(request.headers_mut());
         if state.keystore.identify(request.headers()).is_err() {
@@ -1263,30 +1254,60 @@ mod native_tests {
     }
 
     fn refusal_request(path: &str, stream: bool) -> Request<Body> {
+        // Gemini carries its turns in `contents` and its action in the path, so
+        // the refusal has to reach the wire's own body check to be its refusal.
+        let body = if path.starts_with("/v1beta/") {
+            json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]})
+        } else {
+            json!({
+                "model": "local/test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": stream
+            })
+        };
         Request::builder()
             .method("POST")
             .uri(path)
             .header("content-type", "application/json")
             .header("authorization", "Bearer test-key")
-            .body(Body::from(
-                json!({
-                    "model": "local/test",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": stream
-                })
-                .to_string(),
-            ))
+            .body(Body::from(body.to_string()))
             .unwrap()
     }
 
     async fn assert_gateway_refusal_surfaces(state: Arc<GatewayState>, expects_retry_after: bool) {
-        for (path, stream, expected_native_type) in [
+        for (path, stream, expected_native) in [
             ("/v1/chat", false, None),
             ("/v1/chat/stream", true, None),
-            ("/v1/chat/completions", false, Some("api_error")),
-            ("/v1/chat/completions", true, Some("api_error")),
-            ("/v1/messages", false, Some("overloaded_error")),
-            ("/v1/messages", true, Some("overloaded_error")),
+            (
+                "/v1/chat/completions",
+                false,
+                Some(("/error/type", "api_error")),
+            ),
+            (
+                "/v1/chat/completions",
+                true,
+                Some(("/error/type", "api_error")),
+            ),
+            (
+                "/v1/messages",
+                false,
+                Some(("/error/type", "overloaded_error")),
+            ),
+            (
+                "/v1/messages",
+                true,
+                Some(("/error/type", "overloaded_error")),
+            ),
+            (
+                "/v1beta/models/local/test:generateContent",
+                false,
+                Some(("/error/status", "UNAVAILABLE")),
+            ),
+            (
+                "/v1beta/models/local/test:streamGenerateContent",
+                true,
+                Some(("/error/status", "UNAVAILABLE")),
+            ),
         ] {
             let response = app(state.clone())
                 .oneshot(refusal_request(path, stream))
@@ -1303,8 +1324,12 @@ mod native_tests {
             let body: Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), 100_000).await.unwrap())
                     .unwrap();
-            if let Some(expected_native_type) = expected_native_type {
-                assert_eq!(body["error"]["type"], expected_native_type);
+            if let Some((pointer, expected_native)) = expected_native {
+                assert_eq!(
+                    body.pointer(pointer).and_then(Value::as_str),
+                    Some(expected_native),
+                    "{path}, stream={stream}"
+                );
             }
         }
     }
@@ -3305,6 +3330,53 @@ mod native_tests {
             let body = to_bytes(response.into_body(), 10000).await.unwrap();
             assert!(String::from_utf8_lossy(&body).contains("hello"));
         }
+        upstream.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn gemini_native_route_accepts_googles_key_header() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream=server.mock("POST","/chat/completions").with_body(json!({"id":"r","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{}}).to_string()).expect(1).create_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let application = app(configured_state(&server.url())).layer(Extension(Arc::new(
+            crate::proxy::wire::Receipts::new(dir.path().to_owned()),
+        )));
+        // Gemini SDKs send the key in `x-goog-api-key`, not `Authorization`.
+        let request = |key: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/v1beta/models/local/test:generateContent")
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                builder = builder.header("x-goog-api-key", key);
+            }
+            builder
+                .body(Body::from(
+                    json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]}).to_string(),
+                ))
+                .unwrap()
+        };
+
+        let rejected = application.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        let error: Value =
+            serde_json::from_slice(&to_bytes(rejected.into_body(), 10_000).await.unwrap()).unwrap();
+        assert_eq!(error["error"]["code"], 401);
+        assert_eq!(error["error"]["status"], "UNAUTHENTICATED");
+
+        let accepted = application
+            .oneshot(request(Some("test-key")))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(accepted.into_body(), 100_000).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["candidates"][0]["content"]["parts"][0]["text"],
+            "hello"
+        );
+        assert_eq!(body["candidates"][0]["finishReason"], "STOP");
         upstream.assert_async().await;
     }
 
