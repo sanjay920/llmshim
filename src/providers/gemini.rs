@@ -428,6 +428,82 @@ fn cannot_disable_thinking(model: &str) -> bool {
 }
 
 impl Provider for Gemini {
+    fn image_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        crate::images::validate(request)?;
+        if !matches!(
+            model,
+            "gemini-2.5-flash-image"
+                | "gemini-3.1-flash-lite-image"
+                | "gemini-3.1-flash-image"
+                | "gemini-3-pro-image"
+        ) {
+            return Err(crate::images::error(
+                400,
+                "Gemini image generation requires a supported image-output model",
+            ));
+        }
+        if request.get("n").is_some_and(|n| n.as_u64() != Some(1)) {
+            return Err(crate::images::error(
+                400,
+                "Gemini image generation supports one candidate per request",
+            ));
+        }
+        let mut config = json!({"responseModalities": ["TEXT", "IMAGE"]});
+        if let Some(image_config) = request.get("x-gemini").and_then(|v| v.get("imageConfig")) {
+            config["imageConfig"] = image_config.clone();
+        }
+        Ok(ProviderRequest {
+            url: format!(
+                "{}/models/{}:generateContent",
+                self.base_url.trim_end_matches('/'),
+                model
+            ),
+            headers: vec![("x-goog-api-key".into(), self.api_key.clone())],
+            body: json!({"contents": [{"role": "user", "parts": [{"text": request["prompt"]}]}], "generationConfig": config}),
+        })
+    }
+
+    fn image_response(&self, model: &str, response: Value) -> Result<crate::images::ImageResponse> {
+        let candidates = response["candidates"]
+            .as_array()
+            .ok_or_else(|| crate::images::error(502, "missing generated image candidates"))?;
+        let mut images = Vec::new();
+        for candidate in candidates {
+            if candidate
+                .get("finishReason")
+                .is_some_and(|reason| reason.as_str() != Some("STOP"))
+            {
+                return Err(crate::images::error(
+                    502,
+                    "Gemini image generation did not finish successfully",
+                ));
+            }
+            let parts = candidate
+                .pointer("/content/parts")
+                .and_then(Value::as_array)
+                .ok_or_else(|| crate::images::error(502, "missing generated image parts"))?;
+            for part in parts {
+                // Thinking models can return draft images before their final answer.
+                if part["thought"].as_bool() == Some(true) {
+                    continue;
+                }
+                if let Some(data) = part.get("inlineData") {
+                    images.push(crate::images::decode(
+                        data["data"].as_str(),
+                        data["mimeType"].as_str().unwrap_or(""),
+                        None,
+                    )?);
+                }
+            }
+        }
+        crate::images::response(
+            images,
+            response["usageMetadata"].clone(),
+            self.name(),
+            model,
+        )
+    }
+
     fn name(&self) -> &str {
         "gemini"
     }
