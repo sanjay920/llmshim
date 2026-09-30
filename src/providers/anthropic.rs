@@ -271,6 +271,9 @@ fn transform_tools(tools: &[Value]) -> Vec<Value> {
     tools
         .iter()
         .filter_map(|tool| {
+            if tool.get("input_schema").is_some() && tool.get("name").is_some() {
+                return Some(tool.clone());
+            }
             let func = tool.get("function")?;
             let mut out = json!({
                 "name": func.get("name")?,
@@ -520,9 +523,21 @@ impl Provider for Anthropic {
 
         let body_obj = body.as_object_mut().unwrap();
 
-        // System message
-        if let Some(sys) = system {
-            body_obj.insert("system".to_string(), sys);
+        // A native top-level `system` keeps the caller's own cache boundaries. Given beside
+        // chat-style system messages it is ambiguous which the caller meant, so it is refused
+        // rather than one of them silently dropped.
+        match (system, obj.get("system")) {
+            (Some(_), Some(_)) => {
+                return Err(ShimError::ProviderError { status: 400, body:
+                    "give the system prompt either as a top-level `system` or as system messages, not both".into(), retry_after: None });
+            }
+            (Some(from_messages), None) => {
+                body_obj.insert("system".to_string(), from_messages);
+            }
+            (None, Some(native)) => {
+                body_obj.insert("system".to_string(), native.clone());
+            }
+            (None, None) => {}
         }
 
         // max_tokens — required by Anthropic
@@ -540,6 +555,9 @@ impl Provider for Anthropic {
         }
 
         if let Some(stop) = obj.get("stop") {
+            body_obj.insert("stop_sequences".into(), stop.clone());
+        }
+        if let Some(stop) = obj.get("stop_sequences") {
             body_obj.insert("stop_sequences".into(), stop.clone());
         }
 
