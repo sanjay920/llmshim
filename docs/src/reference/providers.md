@@ -110,6 +110,14 @@ Image input accepts OpenAI `image_url`, Anthropic `image`, and Gemini
 Gemini's remote-URL fallback is literal text such as `[Image: URL]`; llmshim
 does not download the URL.
 
+## Embeddings
+
+Embeddings are a separate operation rather than a chat translation. OpenAI's
+`/v1/embeddings`, Gemini's `batchEmbedContents`, and an OpenAI-compatible
+server's `/v1/embeddings` are reached through `llmshim::embeddings`; Anthropic,
+xAI, OpenRouter, and the ChatGPT subscription backend have no embeddings route
+and refuse by name. See the [embeddings guide](../guides/embeddings.md).
+
 ## Reasoning and native controls
 
 Unified `reasoning_effort` and `reasoning_mode` are mapped by model family, not

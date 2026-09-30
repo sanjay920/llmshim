@@ -129,6 +129,23 @@ pub struct ModelInfo {
     pub context_window_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub capabilities: crate::ModelCapabilities,
+    /// Whether this model produces embeddings, asserted by the layer that knew
+    /// (a builtin launch fact, a caller's local override, a provider listing).
+    /// It is not part of [`crate::ModelCapabilities`] because that struct is
+    /// not `#[non_exhaustive]`, and adding a field to it would break the struct
+    /// literals downstream crates build.
+    ///
+    /// `Unknown` means no layer asserted anything. The embeddings entry point
+    /// reads that as "refuse": a call that cannot succeed costs a round trip
+    /// and an error, where a refusal costs nothing, and a local `embedding =
+    /// true` states the missing fact.
+    #[serde(default)]
+    pub embeds: crate::Support,
+    /// The width this model was trained at, when a layer asserts one. A caller
+    /// may ask for fewer dimensions on models that support truncation, never
+    /// for more.
+    #[serde(default)]
+    pub embedding_dimensions: Option<u32>,
     pub family: Option<ModelFamily>,
     pub cost: Option<Cost>,
     /// None means unspecified; an explicit empty list disables inherited tiers.
@@ -157,6 +174,8 @@ impl ModelInfo {
             context_window_tokens: None,
             max_output_tokens: None,
             capabilities: crate::ModelCapabilities::unknown(),
+            embeds: crate::Support::Unknown,
+            embedding_dimensions: None,
             family: None,
             cost: None,
             context_cost_tiers: None,
