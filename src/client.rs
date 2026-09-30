@@ -17,6 +17,7 @@ use std::time::Duration;
 
 mod body;
 mod deadline;
+mod images;
 pub use deadline::AttemptDeadlines;
 
 /// Retry bounds, resolved once from the environment (with defaults) at
