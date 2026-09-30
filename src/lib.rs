@@ -13,6 +13,7 @@ mod derived_response;
 pub mod env;
 pub mod error;
 pub mod fallback;
+pub mod images;
 mod json_bounds;
 pub mod log;
 pub mod models;
@@ -258,4 +259,17 @@ async fn stream_resolved(
 /// shared by clone; only the breaker handle is per call.
 pub(crate) fn bound_client(router: &Router) -> ShimClient {
     SHARED_CLIENT.clone().with_breaker(router.breaker().clone())
+}
+
+/// Generate images through the router's configured provider and aliases.
+pub async fn images(router: &Router, request: &Value) -> Result<images::ImageResponse> {
+    let request = router.expand_route(request)?;
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(error::ShimError::MissingModel)?;
+    let (provider, model) = router.resolve(model)?;
+    bound_client(router)
+        .images(provider, &model, &request)
+        .await
 }

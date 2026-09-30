@@ -24,3 +24,15 @@ continues to win conflicts for the fields it asserts.
 
 No public `grok-4.7-fast` API route is asserted. Its launch availability is
 limited to Cursor and Grok Build.
+
+OpenAI GPT Image prices were checked on 2026-09-30 against the current
+[pricing page](https://developers.openai.com/api/docs/pricing) and its model
+pricing tables: [GPT Image 1](https://developers.openai.com/api/docs/models/gpt-image-1),
+[1.5](https://developers.openai.com/api/docs/models/gpt-image-1.5), and
+[1 Mini](https://developers.openai.com/api/docs/models/gpt-image-1-mini).
+Their `cost.input` and `cache_read` describe text input; `cost.output` describes
+image output. The schema cannot separately hold image-input prices or 1.5's
+text-output price. Image generation therefore estimates only fully classified,
+uncached text input and image-only output; other usage remains unknown unless
+the provider reports a bill. These are OpenAI's own rates, not another
+provider's copy. Per-entry `last_updated` records the pricing check date.

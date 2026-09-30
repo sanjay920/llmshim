@@ -331,6 +331,76 @@ fn bump_effort(effort: &str) -> &'static str {
 }
 
 impl Provider for OpenAi {
+    fn image_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        crate::images::validate(request)?;
+        if !model.starts_with("gpt-image-") {
+            return Err(crate::images::error(
+                400,
+                "OpenAI image generation requires a gpt-image model",
+            ));
+        }
+        let mut body = json!({"model": model, "prompt": request["prompt"]});
+        for field in [
+            "n",
+            "size",
+            "quality",
+            "background",
+            "output_format",
+            "output_compression",
+            "moderation",
+            "user",
+        ] {
+            if let Some(value) = request.get(field) {
+                body[field] = value.clone();
+            }
+        }
+        if !matches!(
+            body.get("output_format")
+                .map_or(Some("png"), Value::as_str)
+                .unwrap_or(""),
+            "png" | "jpeg" | "webp"
+        ) {
+            return Err(crate::images::error(400, "invalid image output format"));
+        }
+        Ok(ProviderRequest {
+            url: format!("{}/images/generations", self.base_url.trim_end_matches('/')),
+            headers: vec![("Authorization".into(), format!("Bearer {}", self.api_key))],
+            body,
+        })
+    }
+
+    fn image_response(&self, model: &str, response: Value) -> Result<crate::images::ImageResponse> {
+        let format = response
+            .get("output_format")
+            .map_or(Some("png"), Value::as_str)
+            .unwrap_or("");
+        let media_type = match format {
+            "png" => "image/png",
+            "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => {
+                return Err(crate::images::error(
+                    502,
+                    "unsupported generated image format",
+                ))
+            }
+        };
+        let data = response["data"]
+            .as_array()
+            .ok_or_else(|| crate::images::error(502, "missing generated images"))?;
+        let images = data
+            .iter()
+            .map(|item| {
+                crate::images::decode(
+                    item["b64_json"].as_str(),
+                    media_type,
+                    item["revised_prompt"].as_str(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        crate::images::response(images, response["usage"].clone(), self.name(), model)
+    }
+
     fn name(&self) -> &str {
         "openai"
     }
