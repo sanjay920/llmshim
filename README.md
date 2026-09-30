@@ -253,6 +253,32 @@ while let Some(Ok(chunk)) = stream.next().await {
 
 See [`examples/chat.rs`](examples/chat.rs) and [`examples/stream.rs`](examples/stream.rs) for runnable programs (`cargo run --example chat`).
 
+**Embeddings:**
+
+```rust
+use llmshim::embeddings::EmbeddingRequest;
+
+let router = llmshim::router::Router::from_env();
+let request = EmbeddingRequest::new(
+    "openai/text-embedding-3-small",
+    vec!["first document".to_string(), "second document".to_string()],
+);
+
+let batch = llmshim::embeddings(&router, &request).await.unwrap();
+// `cost_usd` is an Option: `None` is an unknown price, never a free one.
+println!(
+    "{} vectors, revision {:?}, cost {:?} USD",
+    batch.vectors.len(),
+    batch.revision,
+    batch.usage.cost_usd,
+);
+```
+
+OpenAI (`/v1/embeddings`), Gemini (`batchEmbedContents`) and any OpenAI-compatible
+self-hosted server embed; Anthropic, xAI, OpenRouter and the ChatGPT subscription
+backend refuse by name instead of being answered by another vendor's model. See
+[the embeddings guide](docs/src/guides/embeddings.md).
+
 ---
 
 ## Use it from the CLI

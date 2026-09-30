@@ -37,6 +37,41 @@ fn request_sends_bearer_when_key_set() {
     assert_eq!(auth.unwrap().1, "Bearer secret");
 }
 
+// ============================================================
+// transform_embedding_request
+// ============================================================
+
+#[test]
+fn embeddings_request_uses_the_embeddings_route_with_the_same_optional_auth() {
+    let request = json!({"input": ["a", "b"], "dimensions": 256});
+    let result = vllm()
+        .transform_embedding_request("nomic-embed-text", &request)
+        .unwrap();
+    assert_eq!(result.url, "http://localhost:8000/v1/embeddings");
+    assert_eq!(
+        result.body,
+        json!({"model": "nomic-embed-text", "input": ["a", "b"], "dimensions": 256}),
+        "a passthrough server sees the embeddings body unchanged"
+    );
+    assert!(result.headers.iter().all(|(k, _)| k != "Authorization"));
+
+    let keyed = sglang_with_key()
+        .transform_embedding_request("m", &request)
+        .unwrap();
+    assert_eq!(keyed.url, "http://localhost:30000/v1/embeddings");
+    let auth = keyed.headers.iter().find(|(k, _)| k == "Authorization");
+    assert_eq!(auth.unwrap().1, "Bearer secret");
+}
+
+#[test]
+fn embeddings_request_without_dimensions_names_only_the_model_and_the_texts() {
+    let body = vllm()
+        .transform_embedding_request("m", &json!({"input": ["a"]}))
+        .unwrap()
+        .body;
+    assert_eq!(body, json!({"model": "m", "input": ["a"]}));
+}
+
 #[test]
 fn request_trailing_slash_base_url_is_normalized() {
     let p = OpenAiCompatible::new("vllm", "http://localhost:8000/v1/", None);
