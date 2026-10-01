@@ -25,14 +25,6 @@ async fn unsupported_and_malformed_fields_fail_before_dispatch() {
     let (status, error) = post(app.clone(), "/v1/responses", Value::Null).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["error"]["message"], "request must be an object");
-    let captured: Value =
-        serde_json::from_str(include_str!("fixtures/codex-responses-request.json")).unwrap();
-    let (status, error) = post(app.clone(), "/v1/responses", captured).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        error["error"]["message"],
-        "unsupported Responses request field: client_metadata"
-    );
     for (field, value, name) in [
         (
             "previous_response_id",
@@ -43,7 +35,7 @@ async fn unsupported_and_malformed_fields_fail_before_dispatch() {
         ("store", json!(true), "store"),
         ("stream", json!("false"), "stream"),
         ("store", Value::Null, "store"),
-        ("tools", json!([{"type": "web_search"}]), "web_search"),
+        ("tools", json!([{"type": "unknown_hosted"}]), "parameters"),
         (
             "tools",
             json!([{"type": "function","name": "weather"}]),
@@ -110,7 +102,7 @@ async fn unsupported_and_malformed_fields_fail_before_dispatch() {
             json!({"effort": "impossible"}),
             "reasoning.effort",
         ),
-        ("reasoning", json!({"summary": "auto"}), "summary"),
+        ("reasoning", json!({"summary": "unknown"}), "summary"),
         (
             "text",
             json!({"format": {"type": "json_schema","name": "test"}}),
@@ -155,7 +147,7 @@ async fn unsupported_and_malformed_fields_fail_before_dispatch() {
         ),
         ("reasoning", json!(3), "reasoning"),
         ("text", json!(3), "text"),
-        ("text", json!({"verbosity": "high"}), "text"),
+        ("text", json!({"verbosity": "unknown"}), "text"),
         ("text", json!({"format": {"type": "xml"}}), "text.format"),
         (
             "input",

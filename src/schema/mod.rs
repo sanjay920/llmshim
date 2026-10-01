@@ -2,6 +2,8 @@
 //! fetched; unresolved/cyclic schemas fall back per tool rather than per request.
 mod budget;
 mod memo;
+#[cfg(test)]
+mod responses_tests;
 pub mod validate;
 mod walk;
 use crate::error::Result;
@@ -341,8 +343,25 @@ pub(crate) fn normalize_native_tools(
     body: &mut Value,
     budget: &mut RequestBudget,
 ) -> Result<()> {
+    if target == Target::OpenAiResponses {
+        if let Some(items) = body["input"].as_array_mut() {
+            for item in items {
+                if item["type"] == "tool_search_output" {
+                    let mut declarations = json!({"tools": item["tools"]});
+                    normalize_native_tools(target, &mut declarations, budget)?;
+                    item["tools"] = declarations["tools"].take();
+                }
+            }
+        }
+    }
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
         for tool in tools {
+            if target == Target::OpenAiResponses && tool["type"] == "namespace" {
+                let mut namespace = json!({"tools": tool["tools"]});
+                normalize_native_tools(target, &mut namespace, budget)?;
+                tool["tools"] = namespace["tools"].take();
+                continue;
+            }
             match target {
                 Target::Google => {
                     if let Some(declarations) = tool
@@ -359,7 +378,7 @@ pub(crate) fn normalize_native_tools(
                 _ => {
                     if tool["function"].is_object() {
                         tool_schema(target, &mut tool["function"], "parameters", budget)?;
-                    } else if tool["type"] == "function" {
+                    } else if matches!(tool["type"].as_str(), Some("function" | "tool_search")) {
                         tool_schema(target, tool, "parameters", budget)?;
                     }
                 }

@@ -181,6 +181,7 @@ export interface Usage {
 
 /** The assistant message inside a ChatResponse. */
 export interface ResponseMessage {
+  responses_output?: Record<string, unknown>[];
   refusal?: string;
   role: string;
   /**
@@ -253,6 +254,7 @@ export interface UsageEvent {
 
 /** Terminal event signalling the stream is complete. */
 export interface DoneEvent {
+  responses_output?: Record<string, unknown>[];
   finish_reason?: string;
   "x-llmshim-served-model"?: string;
   type: "done";

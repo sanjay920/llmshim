@@ -41,11 +41,14 @@ paths:
       operationId: nativeResponses
       summary: Stateless OpenAI Responses JSON and SSE
       description: >-
-        Accepts text/image messages and function call/output items through the shared
+        Accepts text/image messages and function/custom call/output items through the shared
         engine. Reasoning items restore credential-scoped replay receipts; dropped items
-        are noted in metadata.reasoning_dropped. Stream true emits numbered Responses
-        SSE events, ending with completed, incomplete or failed. Hosted tools,
-        previous_response_id, conversation and store true are refused by name. Send full history.
+        are noted in metadata.reasoning_dropped. Unsupported verbosity is named in
+        metadata.controls_dropped. Stream true emits numbered Responses
+        SSE events, ending with completed, incomplete or failed. Namespaced and custom tools
+        pass natively to Responses providers or use reversible function transport. Hosted search
+        requires a native Responses provider. Previous_response_id, conversation and store true
+        are refused by name. Send full history.
       requestBody:
         required: true
         content:
@@ -66,34 +69,62 @@ paths:
                   type: array
                   items:
                     type: object
-                    required: [type, name, parameters]
+                    required: [type]
                     properties:
-                      type: {type: string, enum: [function]}
+                      type:
+                        type: string
+                        enum: [function, custom, namespace, web_search, tool_search]
                       name: {type: string, minLength: 1}
                       parameters: {type: object}
                       description: {type: string}
                       strict: {type: boolean}
+                      defer_loading: {type: boolean}
+                      format: {type: object}
+                      tools: {type: array, items: {type: object}}
+                      execution: {type: string, enum: [client, server]}
                 tool_choice:
                   oneOf:
                     - {type: string, enum: [auto, none, required]}
                     - type: object
                       required: [type, name]
                       properties:
-                        type: {type: string, enum: [function]}
+                        type: {type: string, enum: [function, custom]}
                         name: {type: string, minLength: 1}
+                        namespace: {type: string, minLength: 1}
                 max_output_tokens: {type: integer, minimum: 1}
                 temperature: {type: number, minimum: 0, maximum: 2}
                 top_p: {type: number, minimum: 0, maximum: 1}
                 reasoning:
-                  type: object
+                  type: [object, 'null']
                   additionalProperties: false
                   properties:
-                    effort: {type: string, enum: [none, minimal, low, medium, high, xhigh, max]}
+                    effort:
+                      oneOf:
+                        - {type: string, enum: [none, minimal, low, medium, high, xhigh, max]}
+                        - {type: integer, minimum: 0}
+                    summary: {type: string, enum: [auto, concise, detailed, none]}
+                    context: {type: string, enum: [auto, current_turn, all_turns]}
                 text:
-                  type: object
+                  type: [object, 'null']
                   additionalProperties: false
                   properties:
                     format: {type: object}
+                    verbosity: {type: string, enum: [low, medium, high]}
+                client_metadata: {type: object, additionalProperties: {type: string}}
+                prompt_cache_key: {type: string}
+                parallel_tool_calls: {type: boolean}
+                service_tier: {type: string, enum: [auto, default, flex, priority]}
+                stream_options:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    reasoning_summary_delivery: {type: string, enum: [sequential_cutoff]}
+                access_programs:
+                  type: [object, 'null']
+                  additionalProperties: false
+                  required: [cyber]
+                  properties:
+                    cyber: {type: string, enum: [standard, daybreak_blue, daybreak_red]}
                 include:
                   type: array
                   items: {type: string, enum: [reasoning.encrypted_content]}
@@ -644,6 +675,10 @@ components:
       type: object
       required: [role, content]
       properties:
+        responses_output:
+          type: array
+          items: {type: object}
+          description: Native Responses output order retained when hosted search items are present.
         refusal:
           type: string
           description: Provider refusal; no schema repair is attempted.
@@ -907,6 +942,9 @@ components:
             type:
               type: string
               const: done
+            responses_output:
+              type: array
+              items: {type: object}
             finish_reason:
               type: string
             x-llmshim-served-model:

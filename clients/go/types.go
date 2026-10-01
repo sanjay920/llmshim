@@ -147,11 +147,12 @@ type ChatResponse struct {
 // ResponseMessage is the assistant message in a ChatResponse. Content is a
 // string or null.
 type ResponseMessage struct {
-	Refusal   *string          `json:"refusal,omitempty"`
-	Role      string           `json:"role"`
-	Content   any              `json:"content"`
-	ToolCalls []ToolCall       `json:"tool_calls,omitempty"`
-	Reasoning []ReasoningBlock `json:"reasoning,omitempty"`
+	ResponsesOutput []map[string]any `json:"responses_output,omitempty"`
+	Refusal         *string          `json:"refusal,omitempty"`
+	Role            string           `json:"role"`
+	Content         any              `json:"content"`
+	ToolCalls       []ToolCall       `json:"tool_calls,omitempty"`
+	Reasoning       []ReasoningBlock `json:"reasoning,omitempty"`
 }
 
 // ToolCall is a function tool call.
@@ -212,6 +213,7 @@ const (
 // If a transport or parse error occurs while reading the stream, Err is set
 // and the channel is then closed.
 type StreamEvent struct {
+	ResponsesOutput  []map[string]any  `json:"responses_output,omitempty"`
 	FinishReason     *string           `json:"finish_reason,omitempty"`
 	ServedModel      *string           `json:"x-llmshim-served-model,omitempty"`
 	WireIDs          []WireToolID      `json:"wire_ids,omitempty"`

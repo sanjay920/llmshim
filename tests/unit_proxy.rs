@@ -121,6 +121,7 @@ fn chat_response_serializes() {
         model: "claude-sonnet-4-6".into(),
         provider: "anthropic".into(),
         message: ResponseMessage {
+            responses_output: None,
             refusal: None,
             reasoning: None,
             role: "assistant".into(),
@@ -162,6 +163,7 @@ fn chat_response_no_reasoning() {
         model: "gpt-5.4".into(),
         provider: "openai".into(),
         message: ResponseMessage {
+            responses_output: None,
             refusal: None,
             reasoning: None,
             role: "assistant".into(),
@@ -251,6 +253,7 @@ fn stream_event_usage() {
 #[test]
 fn stream_event_done() {
     let event = StreamEvent::Done {
+        responses_output: None,
         finish_reason: None,
         served_model: None,
     };

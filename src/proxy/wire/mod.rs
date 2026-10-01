@@ -502,7 +502,7 @@ fn request_to_chat_with_limits(
             scope,
             restoration_limits,
         )?;
-        responses::restore(&mut chat, receipts, scope, restoration_limits)?;
+        responses::restore(&mut chat, native, receipts, scope, restoration_limits)?;
         return enforce_canonical_bounds(chat, restoration_limits);
     }
     let mut restoration_budget = receipts::RestorationBudget::new(restoration_limits);
@@ -1432,7 +1432,11 @@ pub(crate) async fn translate_with_router(
                 );
             }
         };
-        responses::output_options(&mut response, replay_metadata, include_reasoning);
+        if let Err(message) =
+            responses::output_options(&mut response, replay_metadata, include_reasoning)
+        {
+            return fail(wire, StatusCode::BAD_GATEWAY, &message);
+        }
         native = json!(response);
     }
     if let Some(served) = native["x-llmshim-served-model"].as_str() {

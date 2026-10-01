@@ -130,7 +130,14 @@ impl RequestBudget {
         reserve_schema_locations(self, request)?;
         if let Some(object) = request.as_object() {
             for (key, extension) in object.iter().filter(|(key, _)| key.starts_with("x-")) {
-                let _ = key;
+                if matches!(
+                    key.as_str(),
+                    "x-responses-tools" | "x-responses-loaded-tools"
+                ) {
+                    for tool in extension.as_array().into_iter().flatten() {
+                        reserve_tool_schemas(self, tool)?;
+                    }
+                }
                 reserve_schema_locations(self, extension)?;
             }
         }
@@ -143,6 +150,9 @@ fn reserve_schema_locations(budget: &mut RequestBudget, container: &Value) -> Re
         for tool in tools {
             reserve_tool_schemas(budget, tool)?;
         }
+    }
+    for message in container["messages"].as_array().into_iter().flatten() {
+        reserve_schema_locations(budget, &message["x-responses-item"])?;
     }
     for pointer in [
         "/response_format/json_schema/schema",
@@ -176,6 +186,11 @@ fn reserve_tool_schemas(budget: &mut RequestBudget, tool: &Value) -> Result<()> 
             if let Some(schema) = declaration.get("parameters") {
                 budget.reserve_retained(schema)?;
             }
+        }
+    }
+    if let Some(tools) = tool.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            reserve_tool_schemas(budget, tool)?;
         }
     }
     Ok(())

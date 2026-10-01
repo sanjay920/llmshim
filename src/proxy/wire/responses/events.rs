@@ -80,6 +80,8 @@ impl Events {
                 added.fields.insert("status".into(), json!("in_progress"));
                 if item.kind == "function_call" {
                     added.fields.insert("arguments".into(), json!(""));
+                } else if item.kind == "custom_tool_call" {
+                    added.fields.insert("input".into(), json!(""));
                 }
                 events.push(self.event(
                     "response.output_item.added",
@@ -90,6 +92,21 @@ impl Events {
                 "message" => {
                     for (part_index, part) in item.content.iter().flatten().enumerate() {
                         if part["type"] == "output_text" {
+                            if self.text.is_none() {
+                                events.push(self.event(
+                                    "response.content_part.added",
+                                    json!({"output_index": index, "item_id": item.id,
+                                        "content_index": part_index,
+                                        "part": {"type": "output_text", "text": "",
+                                            "annotations": []}}),
+                                ));
+                                events.push(self.event(
+                                    "response.output_text.delta",
+                                    json!({"output_index": index, "item_id": item.id,
+                                        "content_index": part_index, "delta": part["text"],
+                                        "logprobs": []}),
+                                ));
+                            }
                             events.push(self.event(
                                 "response.output_text.done",
                                 json!({
@@ -128,6 +145,22 @@ impl Events {
                             "item_id": item.id,
                             "arguments": item.fields.get("arguments"),
                             "name": item.fields.get("name"),
+                        }),
+                    ));
+                }
+                "custom_tool_call" => {
+                    events.push(self.event(
+                        "response.custom_tool_call_input.delta",
+                        json!({
+                            "output_index": index, "item_id": item.id,
+                            "delta": item.fields.get("input"),
+                        }),
+                    ));
+                    events.push(self.event(
+                        "response.custom_tool_call_input.done",
+                        json!({
+                            "output_index": index, "item_id": item.id,
+                            "input": item.fields.get("input"),
                         }),
                     ));
                 }

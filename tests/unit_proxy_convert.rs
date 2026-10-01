@@ -80,6 +80,7 @@ fn response_with_tool_calls() {
         model: "gpt-5.4".into(),
         provider: "openai".into(),
         message: ResponseMessage {
+            responses_output: None,
             refusal: None,
             reasoning: None,
             role: "assistant".into(),
@@ -122,6 +123,7 @@ fn response_with_reasoning_tokens() {
         model: "gpt-5.4".into(),
         provider: "openai".into(),
         message: ResponseMessage {
+            responses_output: None,
             refusal: None,
             reasoning: None,
             role: "assistant".into(),
@@ -207,6 +209,7 @@ fn stream_event_usage_has_tokens() {
 #[test]
 fn stream_event_done_is_minimal() {
     let e = StreamEvent::Done {
+        responses_output: None,
         finish_reason: None,
         served_model: None,
     };

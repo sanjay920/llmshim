@@ -1,5 +1,5 @@
 //! Responses generation controls and function tool declarations.
-use super::{array, Result};
+use super::Result;
 use serde_json::{json, Map, Value};
 
 /// Accepts positive output limits, temperature 0..=2, and top_p 0..=1; refuses other values.
@@ -36,20 +36,44 @@ pub(super) fn reasoning(native: &Value, controls: &mut Map<String, Value>) -> Re
     let Some(reasoning) = native.get("reasoning") else {
         return Ok(());
     };
+    if reasoning.is_null() {
+        return Ok(());
+    }
     let reasoning = reasoning.as_object().ok_or("reasoning must be an object")?;
     for key in reasoning.keys() {
-        if key != "effort" {
+        if !matches!(key.as_str(), "effort" | "summary" | "context") {
             return Err(format!("unsupported reasoning field: {key}"));
         }
     }
-    if let Some(effort) = reasoning.get("effort") {
+    if let Some(context) = reasoning.get("context") {
         if !matches!(
-            effort.as_str(),
-            Some("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+            context.as_str(),
+            Some("auto" | "current_turn" | "all_turns")
         ) {
+            return Err("invalid reasoning.context".into());
+        }
+    }
+    if let Some(summary) = reasoning.get("summary") {
+        controls.insert("reasoning_summary".into(), summary.clone());
+        if !matches!(
+            summary.as_str(),
+            Some("auto" | "concise" | "detailed" | "none")
+        ) {
+            return Err("invalid reasoning.summary".into());
+        }
+    }
+    if let Some(effort) = reasoning.get("effort") {
+        if !effort.is_u64()
+            && !matches!(
+                effort.as_str(),
+                Some("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+            )
+        {
             return Err("invalid reasoning.effort".into());
         }
-        controls.insert("reasoning_effort".into(), effort.clone());
+        if effort.is_string() {
+            controls.insert("reasoning_effort".into(), effort.clone());
+        }
     }
     Ok(())
 }
@@ -59,9 +83,20 @@ pub(super) fn text_format(native: &Value, controls: &mut Map<String, Value>) -> 
     let Some(text) = native.get("text") else {
         return Ok(());
     };
+    if text.is_null() {
+        return Ok(());
+    }
     let text = text.as_object().ok_or("text must be an object")?;
-    if text.keys().any(|key| key != "format") {
+    if text
+        .keys()
+        .any(|key| !matches!(key.as_str(), "format" | "verbosity"))
+    {
         return Err("unsupported text field".into());
+    }
+    if let Some(verbosity) = text.get("verbosity") {
+        if !matches!(verbosity.as_str(), Some("low" | "medium" | "high")) {
+            return Err("invalid text.verbosity".into());
+        }
     }
     let Some(format) = text.get("format") else {
         return Ok(());
@@ -89,35 +124,6 @@ pub(super) fn text_format(native: &Value, controls: &mut Map<String, Value>) -> 
     Ok(())
 }
 
-/// Accepts function tools with name/parameters and refuses hosted tools by type.
-pub(super) fn tools(native: &Value, controls: &mut Map<String, Value>) -> Result<()> {
-    let Some(tools) = native.get("tools") else {
-        return Ok(());
-    };
-    let mut translated = Vec::new();
-    for tool in array(tools, "tools")? {
-        if tool["type"] != "function" {
-            return Err(format!("unsupported hosted tool: {}", tool["type"]));
-        }
-        if !tool["name"].as_str().is_some_and(|name| !name.is_empty())
-            || !tool["parameters"].is_object()
-        {
-            return Err("function tool requires name and parameters".into());
-        }
-        let fields = tool
-            .as_object()
-            .ok_or("function tool requires name and parameters")?;
-        let function: Map<String, Value> = fields
-            .iter()
-            .filter(|(key, _)| key.as_str() != "type")
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        translated.push(json!({"type": "function", "function": function}));
-    }
-    controls.insert("tools".into(), json!(translated));
-    Ok(())
-}
-
 /// Accepts auto/none/required or a named function choice and refuses other choices.
 pub(super) fn tool_choice(native: &Value, controls: &mut Map<String, Value>) -> Result<()> {
     let Some(choice) = native.get("tool_choice") else {
@@ -125,10 +131,21 @@ pub(super) fn tool_choice(native: &Value, controls: &mut Map<String, Value>) -> 
     };
     let translated = match choice.as_str() {
         Some("auto" | "none" | "required") => choice.clone(),
-        _ if choice["type"] == "function"
+        _ if matches!(choice["type"].as_str(), Some("function" | "custom"))
             && choice["name"].as_str().is_some_and(|name| !name.is_empty()) =>
         {
-            json!({"type": "function", "function": {"name": choice["name"]}})
+            if choice.get("namespace").is_some_and(|namespace| {
+                !namespace
+                    .as_str()
+                    .is_some_and(|namespace| !namespace.is_empty())
+            }) {
+                return Err("tool_choice namespace must be a nonempty string".into());
+            }
+            let name = crate::responses_tools::name(
+                choice["name"].as_str().ok_or("tool_choice requires name")?,
+                choice["namespace"].as_str(),
+            );
+            json!({"type": "function", "function": {"name": name}})
         }
         _ => return Err("unsupported tool_choice".into()),
     };

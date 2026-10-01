@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 /// Accepts canonical history and issued receipts; refuses malformed shapes or excess restoration.
 pub(in crate::proxy::wire) fn restore(
     chat: &mut Value,
+    native: &Value,
     receipts: &Receipts,
     scope: &str,
     limits: RestorationLimits,
@@ -16,8 +17,34 @@ pub(in crate::proxy::wire) fn restore(
         .get_mut("messages")
         .and_then(Value::as_array_mut)
         .ok_or("malformed canonical messages: expected an array")?;
+    let calls: std::collections::BTreeMap<_, _> = native["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("function_call" | "custom_tool_call")
+            )
+        })
+        .filter_map(|item| item["call_id"].as_str().map(|id| (id, item)))
+        .collect();
     let mut budget = RestorationBudget::new(limits);
     for message in messages.iter_mut() {
+        for call in message
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(item) = call["id"].as_str().and_then(|id| calls.get(id)) {
+                let mut descriptor = json!({"type": item["type"], "name": item["name"]});
+                if let Some(namespace) = item.get("namespace") {
+                    descriptor["namespace"] = namespace.clone();
+                }
+                call["x-responses-call"] = descriptor;
+            }
+        }
         if let Some(item) = message
             .as_object_mut()
             .ok_or("malformed canonical message: expected an object")?
@@ -29,7 +56,6 @@ pub(in crate::proxy::wire) fn restore(
             }
         }
     }
-    merge_assistant_items(messages);
     Ok(())
 }
 
@@ -101,6 +127,13 @@ pub(in crate::proxy::wire) fn retain(
         let mut summary = item.clone();
         summary.fields.remove("encrypted_content");
         receipts.put(scope, "responses-reasoning", &json!(summary), block)?;
+        if item.fields.get("summary") != Some(&json!([])) {
+            let mut omitted = item.clone();
+            omitted.fields.insert("summary".into(), json!([]));
+            receipts.put(scope, "responses-reasoning", &json!(omitted), block)?;
+            omitted.fields.remove("encrypted_content");
+            receipts.put(scope, "responses-reasoning", &json!(omitted), block)?;
+        }
     }
     Ok(())
 }
@@ -110,6 +143,8 @@ pub(in crate::proxy::wire) fn replay_metadata(
     chat: &mut Value,
     target: Option<&crate::reasoning::ReplayTarget>,
 ) -> Result<Value> {
+    let tools = chat["provider_config"]["x-responses-loaded-tools"].clone();
+    let controls = chat["provider_config"]["x-responses-controls"].clone();
     let messages = chat
         .get_mut("messages")
         .and_then(Value::as_array_mut)
@@ -139,26 +174,104 @@ pub(in crate::proxy::wire) fn replay_metadata(
             || message["reasoning"].is_array()
             || message["tool_calls"].is_array()
     });
-    merge_assistant_items(messages);
-    Ok(if dropped.is_empty() {
-        json!({})
-    } else {
-        json!({"reasoning_dropped": dropped})
-    })
+    if target.is_none_or(|target| target.wire != crate::reasoning::WireFormat::OpenAiResponses) {
+        merge_assistant_items(messages);
+    }
+    let mut metadata = json!({});
+    if controls["text"].get("verbosity").is_some()
+        && target.is_some_and(|target| !crate::responses_tools::supports_verbosity(target))
+    {
+        metadata["controls_dropped"] = json!(["text.verbosity"]);
+    }
+    if tools.is_array() {
+        metadata["x-responses-tools"] = tools;
+    }
+    if controls.is_object() {
+        metadata["x-responses-controls"] = controls;
+    }
+    if !dropped.is_empty() {
+        metadata["reasoning_dropped"] = json!(dropped);
+    }
+    Ok(metadata)
 }
 
 /// Accepts issued responses and include selection; omits unrequested encrypted content.
 pub(in crate::proxy::wire) fn output_options(
     response: &mut super::Response,
-    metadata: Value,
+    mut metadata: Value,
     include: bool,
-) {
+) -> Result<()> {
+    let tools = metadata
+        .as_object_mut()
+        .and_then(|metadata| metadata.remove("x-responses-tools"))
+        .unwrap_or(Value::Null);
+    let controls = metadata
+        .as_object_mut()
+        .and_then(|metadata| metadata.remove("x-responses-controls"))
+        .unwrap_or(Value::Null);
+    if controls["parallel_tool_calls"] == false
+        && response
+            .output
+            .iter()
+            .filter(|item| item.kind == "function_call")
+            .count()
+            > 1
+    {
+        return Err("parallel_tool_calls is false but the provider returned multiple calls".into());
+    }
+    if controls["reasoning"]["summary"] == "none" {
+        for item in &mut response.output {
+            if item.kind == "reasoning" {
+                item.fields.insert("summary".into(), json!([]));
+            }
+        }
+    }
+    let mut declarations = crate::responses_tools::declarations(&tools);
+    for item in &response.output {
+        if item.kind == "tool_search_output" {
+            if let Some(tools) = item.fields.get("tools") {
+                declarations.extend(crate::responses_tools::declarations(tools));
+            }
+        }
+    }
+    for item in &mut response.output {
+        if item.kind != "function_call" {
+            continue;
+        }
+        if let Some(tool) = declarations.iter().find(|tool| {
+            crate::responses_tools::name(
+                tool["name"].as_str().unwrap_or(""),
+                tool["namespace"].as_str(),
+            ) == item
+                .fields
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        }) {
+            item.fields.insert("name".into(), tool["name"].clone());
+            if let Some(namespace) = tool.get("namespace") {
+                item.fields.insert("namespace".into(), namespace.clone());
+            }
+            if tool["type"] == "custom" {
+                let arguments = item
+                    .fields
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .ok_or("custom tool arguments must be text")?;
+                let input = crate::responses_tools::custom_input(arguments)?;
+                item.kind = "custom_tool_call".into();
+                item.fields.remove("arguments");
+                item.fields.insert("input".into(), json!(input));
+            }
+        }
+    }
     response.fields.insert("metadata".into(), metadata);
     if !include {
         for item in &mut response.output {
             item.fields.remove("encrypted_content");
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -173,7 +286,14 @@ mod tests {
             uuid::Uuid::new_v4()
         )));
         let mut valid = json!({"messages": []});
-        assert!(restore(&mut valid, &receipts, "scope", RestorationLimits::default()).is_ok());
+        assert!(restore(
+            &mut valid,
+            &json!({}),
+            &receipts,
+            "scope",
+            RestorationLimits::default()
+        )
+        .is_ok());
         assert_eq!(replay_metadata(&mut valid, None).unwrap(), json!({}));
         for (mut chat, message) in [
             (
@@ -192,7 +312,14 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                restore(&mut chat, &receipts, "scope", RestorationLimits::default()).unwrap_err(),
+                restore(
+                    &mut chat,
+                    &json!({}),
+                    &receipts,
+                    "scope",
+                    RestorationLimits::default()
+                )
+                .unwrap_err(),
                 message
             );
             assert_eq!(replay_metadata(&mut chat, None).unwrap_err(), message);
