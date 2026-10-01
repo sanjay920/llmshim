@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod audio;
 mod body;
 mod deadline;
 mod images;
@@ -336,6 +337,26 @@ impl ShimClient {
         prepared_target: Option<&ReplayTarget>,
         req: &ProviderRequest,
     ) -> DispatchResult<AttemptResponse> {
+        self.send_prepared_with_body(
+            policy_context,
+            attempt_kind,
+            resolved_model,
+            prepared_target,
+            req,
+            |builder| Ok(builder.json(&req.body)),
+        )
+        .await
+    }
+
+    async fn send_prepared_with_body(
+        &self,
+        policy_context: Option<&DispatchPolicyContext>,
+        attempt_kind: AttemptKind,
+        resolved_model: &str,
+        prepared_target: Option<&ReplayTarget>,
+        req: &ProviderRequest,
+        build_body: impl Fn(reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder>,
+    ) -> DispatchResult<AttemptResponse> {
         let max_retries = self.retry.max_retries;
 
         for attempt in 0..=max_retries {
@@ -343,8 +364,8 @@ impl ShimClient {
             for (key, value) in &req.headers {
                 builder = builder.header(key, value);
             }
-            let http_request = builder
-                .json(&req.body)
+            let http_request = build_body(builder)
+                .map_err(DispatchFailure::Local)?
                 .build()
                 .map_err(|error| DispatchFailure::Local(error.into()))?;
             let attempt_total = match attempt_kind {

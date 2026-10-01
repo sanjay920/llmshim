@@ -2,7 +2,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
 
-use crate::error::{Result, ShimError};
+use crate::error::{provider_error as error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedImage {
@@ -17,14 +17,6 @@ pub struct ImageResponse {
     /// Provider-native counters, with `cost_usd` and `cost_source` added.
     /// An unknown price is null, never an invented zero.
     pub usage: Value,
-}
-
-pub(crate) fn error(status: u16, body: &str) -> ShimError {
-    ShimError::ProviderError {
-        status,
-        body: body.into(),
-        retry_after: None,
-    }
 }
 
 pub(crate) fn validate(request: &Value) -> Result<()> {

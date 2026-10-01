@@ -28,6 +28,7 @@
 - [Prompt caching](guides/caching.md)
 - [Images and vision](guides/images.md)
 - [Embeddings](guides/embeddings.md)
+- [Audio](guides/audio.md)
 - [Reasoning controls](guides/reasoning.md)
 - [Fallback chains](guides/fallbacks.md)
 - [Native provider controls](guides/native-controls.md)

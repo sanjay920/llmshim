@@ -6,6 +6,7 @@ Both `llmshim proxy` and `llmshim gateway` serve:
 |---|---|
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/messages` | Anthropic Messages |
+| `POST /v1/responses` | Stateless, non-streaming Responses subset |
 | `POST /v1beta/models/{model}:generateContent` | Google Gemini Generate Content |
 | `POST /v1beta/models/{model}:streamGenerateContent` | Google Gemini Generate Content, SSE |
 
@@ -152,3 +153,38 @@ array; the facade remaps boundaries when system/tool-result conversion expands
 that array. `x-shim` applies through the shared client. A signature mismatch's
 `x-llmshim-served-model` observation appears in JSON and the HTTP header for unary
 responses, or in terminal stream metadata. It never changes message provenance.
+
+## Responses follow-up design
+
+The proxy and gateway now serve a non-streaming, stateless
+`POST /v1/responses` subset, described in the [proxy quickstart](../start/proxy.md#stateless-responses-requests).
+The remaining problem is streaming ordered output items and carrying reasoning
+history without treating an opaque item supplied by a client as provider-issued.
+
+Extend the existing wire translator with an incremental Responses event state
+machine. Allocate stable response and output-item IDs at creation, keep an
+output index per item, and increment one sequence counter across every event.
+Emit creation, item/part addition, text and function argument deltas, part/item
+done events, and the completed response with final usage. A provider error or
+premature end must terminate with failure, never completion. Reuse the shared
+stream accumulator and its bounds; do not buffer a whole completion to fabricate
+deltas, because that loses first-token latency and cancellation behavior.
+
+For reasoning replay, use the existing credential-scoped receipts to restore
+provider-issued blocks, then let the existing replay policy decide whether the
+target accepts them. Record dropped blocks in response metadata, including why
+they were dropped. Accept external summary-only items as text only under an
+explicit rule; never attach encrypted payloads to a made-up origin. Returning
+summaries already works, but inbound reasoning items currently receive a 400.
+Trusting a client's claimed provider identity was rejected because it bypasses
+issuer binding. Implementing response storage or implicit continuation was
+rejected because the proxy has no durable conversation contract; all history
+must remain explicit.
+
+Tests must exercise all scripted provider families on streaming and ordinary
+requests, interleaved parallel calls, empty output, refusal, token exhaustion,
+usage before/after finish, split argument fragments, and failure after an item
+opens. Assert exact event order, stable item IDs, contiguous sequence numbers,
+and that the completed response equals the accumulated deltas. Pair receipt
+replay with altered, expired, cross-credential, and cross-provider near misses;
+mutate each acceptance guard to establish that the negative test catches it.

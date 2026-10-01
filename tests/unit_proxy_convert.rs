@@ -73,6 +73,7 @@ fn request_with_fallback() {
 #[test]
 fn response_with_tool_calls() {
     let resp = ChatResponse {
+        created_at: 1,
         finish_reason: None,
         served_model: None,
         id: "r1".into(),
@@ -113,6 +114,7 @@ fn response_with_tool_calls() {
 #[test]
 fn response_with_reasoning_tokens() {
     let resp = ChatResponse {
+        created_at: 1,
         finish_reason: None,
         served_model: None,
         id: "r2".into(),

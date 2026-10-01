@@ -194,6 +194,7 @@ export interface ResponseMessage {
 
 /** Response body from POST /v1/chat (non-streaming). */
 export interface ChatResponse {
+  created_at?: number;
   finish_reason?: string;
   "x-llmshim-served-model"?: string;
   /** Response ID from the provider. */

@@ -104,3 +104,35 @@ gateway that supplies authentication and TLS. The supported topology and
 deployment checklist are covered in
 [Deploy the proxy safely](../proxy/deployment.md).
 
+
+## Stateless Responses requests
+
+`POST /v1/responses` accepts a Responses request with a configured model route:
+
+```bash
+curl http://localhost:3000/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"openai/gpt-6-astra","input":"Hello","store":false}'
+```
+
+This first increment supports non-streaming requests: string input or message
+items with text/image parts, `instructions`, function tools and tool-call/result
+items, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`,
+`reasoning.effort`, and `text.format` (text, JSON object, or JSON Schema).
+Function arguments and tool outputs are strings. Send the full history on every
+request; `call_id` links a function call to its output. Images require
+`image_url`, with optional `detail` (`auto`, `low`, or `high`). File inputs and
+file-backed images are unsupported.
+
+The result has `object: "response"`, message/output-text or refusal items,
+function-call items, provider-supplied reasoning summaries, and input/output,
+cached, and reasoning token details. Token exhaustion returns
+`status: "incomplete"` and `incomplete_details.reason: "max_output_tokens"`.
+The proxy and gateway share their existing admission, logging, error status,
+Retry-After, and credential behavior with this route.
+
+`previous_response_id`, `conversation`, `store: true`, `stream: true`, hosted
+tools, and reasoning input items return a named 400. Omit `store` and `stream`,
+or set them to `false`. Unknown top-level fields are refused. See the
+[native API design](../proxy/native-apis.md#responses-follow-up-design) for the
+remaining streaming and reasoning replay work.

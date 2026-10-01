@@ -4,6 +4,7 @@ pub mod anthropic_signature;
 pub mod chatgpt;
 pub mod gemini;
 pub mod openai;
+mod openai_audio;
 pub mod openai_compat;
 pub mod openrouter;
 pub mod xai;

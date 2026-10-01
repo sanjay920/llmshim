@@ -1,6 +1,7 @@
 //! Model metadata with no dependency on the translation crate.
 //! All loading is local. Network refresh is explicit or detached from requests.
 pub mod aliases;
+pub mod audio;
 pub mod builtin;
 mod cache;
 mod capabilities;

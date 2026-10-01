@@ -334,10 +334,41 @@ fn bump_effort(effort: &str) -> &'static str {
 }
 
 impl Provider for OpenAi {
+    fn transcription_request(
+        &self,
+        model: &str,
+        request: &crate::audio::TranscriptionRequest,
+    ) -> Result<crate::audio::TranscriptionUpload> {
+        super::openai_audio::transcription_request(self, model, request)
+    }
+
+    fn transcription_response(
+        &self,
+        model: &str,
+        request: &crate::audio::TranscriptionRequest,
+        response: Value,
+    ) -> Result<crate::audio::TranscriptionResponse> {
+        super::openai_audio::transcription_response(model, request, response)
+    }
+
+    fn speech_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        super::openai_audio::speech_request(self, model, request)
+    }
+
+    fn speech_response(
+        &self,
+        model: &str,
+        request: &Value,
+        bytes: Vec<u8>,
+        media_type: &str,
+    ) -> Result<crate::audio::SpeechResponse> {
+        super::openai_audio::speech_response(model, request, bytes, media_type)
+    }
+
     fn image_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
         crate::images::validate(request)?;
         if !model.starts_with("gpt-image-") {
-            return Err(crate::images::error(
+            return Err(crate::error::provider_error(
                 400,
                 "OpenAI image generation requires a gpt-image model",
             ));
@@ -363,7 +394,10 @@ impl Provider for OpenAi {
                 .unwrap_or(""),
             "png" | "jpeg" | "webp"
         ) {
-            return Err(crate::images::error(400, "invalid image output format"));
+            return Err(crate::error::provider_error(
+                400,
+                "invalid image output format",
+            ));
         }
         Ok(ProviderRequest {
             url: format!("{}/images/generations", self.base_url.trim_end_matches('/')),
@@ -382,7 +416,7 @@ impl Provider for OpenAi {
             "jpeg" => "image/jpeg",
             "webp" => "image/webp",
             _ => {
-                return Err(crate::images::error(
+                return Err(crate::error::provider_error(
                     502,
                     "unsupported generated image format",
                 ))
@@ -390,7 +424,7 @@ impl Provider for OpenAi {
         };
         let data = response["data"]
             .as_array()
-            .ok_or_else(|| crate::images::error(502, "missing generated images"))?;
+            .ok_or_else(|| crate::error::provider_error(502, "missing generated images"))?;
         let images = data
             .iter()
             .map(|item| {

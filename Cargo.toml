@@ -25,7 +25,7 @@ redis-coordination = ["proxy", "dep:redis"]
 [dependencies]
 llmshim-catalog = { version = "0.3.2", path = "crates/llmshim-catalog" }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "gzip", "brotli", "zstd", "deflate"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "http2", "gzip", "brotli", "zstd", "deflate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

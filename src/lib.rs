@@ -5,6 +5,7 @@ pub mod schema;
 pub mod shim;
 /// Offline-first model catalog, also available as the standalone `llmshim-catalog` crate.
 pub use llmshim_catalog as catalog;
+pub mod audio;
 pub mod config;
 pub mod cost;
 pub mod credentials;
@@ -290,5 +291,29 @@ pub async fn images(router: &Router, request: &Value) -> Result<images::ImageRes
     let (provider, model) = router.resolve(model)?;
     bound_client(router)
         .images(provider, &model, &request)
+        .await
+}
+
+/// Generate speech through the router's configured provider and aliases.
+pub async fn speech(router: &Router, request: &Value) -> Result<audio::SpeechResponse> {
+    let request = router.expand_route(request)?;
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(error::ShimError::MissingModel)?;
+    let (provider, model) = router.resolve(model)?;
+    bound_client(router)
+        .speech(provider, &model, &request)
+        .await
+}
+
+/// Transcribe caller-owned audio through the router's configured provider and aliases.
+pub async fn transcription(
+    router: &Router,
+    request: &audio::TranscriptionRequest,
+) -> Result<audio::TranscriptionResponse> {
+    let (provider, model) = router.resolve(&request.model)?;
+    bound_client(router)
+        .transcription(provider, &model, request)
         .await
 }

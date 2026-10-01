@@ -131,6 +131,7 @@ type Config struct {
 
 // ChatResponse is the response body from POST /v1/chat.
 type ChatResponse struct {
+	CreatedAt    int64           `json:"created_at,omitempty"`
 	FinishReason *string         `json:"finish_reason,omitempty"`
 	ServedModel  *string         `json:"x-llmshim-served-model,omitempty"`
 	ID           string          `json:"id"`
