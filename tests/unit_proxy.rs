@@ -130,6 +130,7 @@ fn chat_response_serializes() {
         reasoning: Some("I thought about it...".into()),
         usage: Usage {
             input_tokens: 10,
+            uncached_input_tokens: 0,
             output_tokens: 5,
             reasoning_tokens: 0,
             cache_read_tokens: 0,
@@ -170,6 +171,7 @@ fn chat_response_no_reasoning() {
         reasoning: None,
         usage: Usage {
             input_tokens: 5,
+            uncached_input_tokens: 0,
             output_tokens: 2,
             reasoning_tokens: 0,
             cache_read_tokens: 0,
@@ -230,6 +232,7 @@ fn stream_event_tool_call() {
 fn stream_event_usage() {
     let event = StreamEvent::Usage(Usage {
         input_tokens: 100,
+        uncached_input_tokens: 0,
         output_tokens: 50,
         reasoning_tokens: 20,
         cache_read_tokens: 0,

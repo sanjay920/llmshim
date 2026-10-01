@@ -96,8 +96,11 @@ fn thought_signature(block: &Value) -> String {
 
 fn usage_metadata(usage: &Value) -> Value {
     json!({
-        "promptTokenCount": usage["input_tokens"],
+        "promptTokenCount": usage["uncached_input_tokens"].as_u64().unwrap_or(0)
+            .saturating_add(usage["cache_read_tokens"].as_u64().unwrap_or(0))
+            .saturating_add(usage["cache_write_tokens"].as_u64().unwrap_or(0)),
         "candidatesTokenCount": usage["output_tokens"],
+        "thoughtsTokenCount": usage["reasoning_tokens"],
         "totalTokenCount": usage["total_tokens"],
         "cachedContentTokenCount": usage["cache_read_tokens"],
         "cost_usd": usage["cost_usd"],

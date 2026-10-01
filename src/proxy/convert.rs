@@ -1,4 +1,5 @@
-use super::types::{ChatRequest, ChatResponse, ResponseMessage, StreamEvent, Usage};
+use super::types::{ChatRequest, ChatResponse, ResponseMessage, StreamEvent};
+use super::usage::extract_usage;
 use crate::provider::{Provider, RequestAdmissionPolicy};
 use crate::router::Router;
 use serde_json::{json, Value};
@@ -670,67 +671,6 @@ pub fn value_to_response(v: &Value, provider: &str, latency_ms: u64) -> ChatResp
         usage,
         latency_ms,
     }
-}
-
-/// Extract usage from an OpenAI-format usage object.
-pub fn extract_usage(usage: &Value) -> Usage {
-    let input = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let reasoning = usage
-        .get("reasoning_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let total = usage
-        .get("total_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(input + output);
-
-    Usage {
-        input_tokens: input,
-        output_tokens: output,
-        reasoning_tokens: reasoning,
-        total_tokens: total,
-        cache_read_tokens: usage["cache_read_tokens"].as_u64().unwrap_or(0),
-        cache_write_tokens: usage["cache_write_tokens"].as_u64().unwrap_or(0),
-        cost_usd: crate::cost::stamped(usage),
-        cost_source: crate::cost::stamped_source(usage).map(str::to_owned),
-    }
-}
-
-#[cfg(test)]
-#[test]
-fn cache_accounting_survives_proxy_projection() {
-    let usage = extract_usage(
-        &json!({"prompt_tokens": 10, "cache_read_tokens": 7, "cache_write_tokens": 3}),
-    );
-    let wire = serde_json::to_value(usage).unwrap();
-    assert_eq!(wire["cache_read_tokens"], 7);
-    assert_eq!(wire["cache_write_tokens"], 3);
-    let empty = serde_json::to_value(extract_usage(&json!({}))).unwrap();
-    assert_eq!(empty["cache_read_tokens"], 0);
-    assert_eq!(empty["cache_write_tokens"], 0);
-    let provider_floor = serde_json::to_value(extract_usage(&json!({
-        "cost_usd": 1.0,
-        "cost_source": "provider_floor"
-    })))
-    .unwrap();
-    assert_eq!(provider_floor["cost_usd"], 1.0);
-    assert_eq!(provider_floor["cost_source"], "provider_floor");
-    let events =
-        chunk_to_events(&json!({"choices":[],"usage":{"cache_read_tokens":9}}).to_string());
-    assert!(matches!(
-        &events[..],
-        [StreamEvent::Usage(Usage {
-            cache_read_tokens: 9,
-            ..
-        })]
-    ));
 }
 
 #[cfg(test)]
