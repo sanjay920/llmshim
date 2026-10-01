@@ -110,6 +110,9 @@ through the listed routes. It is ignored by both streaming paths. See
 }
 ```
 
+`created_at` is the original completion time as a Unix timestamp. If the provider
+omits an ID, the server assigns one; gateway idempotency replay preserves both.
+
 `message.tool_calls` appears when the model requests tools. `reasoning` appears
 when the provider returns reasoning text. `reasoning_tokens` is omitted when
 zero; the other usage fields are always present.

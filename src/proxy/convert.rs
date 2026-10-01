@@ -641,13 +641,18 @@ pub fn value_to_response(v: &Value, provider: &str, latency_ms: u64) -> ChatResp
     let usage = extract_usage(&v["usage"]);
 
     ChatResponse {
+        created_at: v["created_at"]
+            .as_i64()
+            .or_else(|| v["created"].as_i64())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp()),
         finish_reason: choice["finish_reason"].as_str().map(str::to_owned),
         served_model: v["x-llmshim-served-model"].as_str().map(str::to_owned),
         id: v
             .get("id")
             .and_then(|id| id.as_str())
-            .unwrap_or("")
-            .to_string(),
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("chat_{}", uuid::Uuid::new_v4().simple())),
         model: v
             .get("model")
             .and_then(|m| m.as_str())

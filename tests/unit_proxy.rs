@@ -114,6 +114,7 @@ fn chat_request_with_tool_calls() {
 #[test]
 fn chat_response_serializes() {
     let resp = ChatResponse {
+        created_at: 1,
         finish_reason: None,
         served_model: None,
         id: "msg_123".into(),
@@ -153,6 +154,7 @@ fn chat_response_serializes() {
 #[test]
 fn chat_response_no_reasoning() {
     let resp = ChatResponse {
+        created_at: 1,
         finish_reason: None,
         served_model: None,
         id: "r1".into(),

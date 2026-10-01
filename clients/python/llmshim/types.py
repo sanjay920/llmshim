@@ -228,6 +228,7 @@ _Observation = TypedDict("_Observation", {"x-llmshim-served-model": str}, total=
 
 
 class ChatResponse(_ChatResponseBase, _Observation, total=False):
+    created_at: int
     finish_reason: str
     reasoning: Union[str, None]
 

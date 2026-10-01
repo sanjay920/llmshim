@@ -131,10 +131,11 @@ pub fn to_openai(block: &Value) -> Option<Value> {
         // OpenAI Chat Completions format → Responses API format
         "image_url" => {
             let url = block.pointer("/image_url/url").and_then(|u| u.as_str())?;
-            Some(json!({
-                "type": "input_image",
-                "image_url": url
-            }))
+            let mut image = json!({"type": "input_image", "image_url": url});
+            if let Some(detail) = block.pointer("/image_url/detail") {
+                image["detail"] = detail.clone();
+            }
+            Some(image)
         }
 
         // Anthropic format → OpenAI format

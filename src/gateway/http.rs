@@ -55,6 +55,18 @@ pub struct RealDispatch {
 }
 
 impl RealDispatch {
+    fn with_response_identity(mut value: Value) -> Value {
+        // Distributed replay reads the persisted dispatch result, so identity
+        // must be assigned before either backend stores the completion.
+        if !value["created_at"].is_i64() && !value["created"].is_i64() {
+            value["created_at"] = json!(chrono::Utc::now().timestamp());
+        }
+        if !value["id"].as_str().is_some_and(|id| !id.is_empty()) {
+            value["id"] = json!(format!("chat_{}", uuid::Uuid::new_v4().simple()));
+        }
+        value
+    }
+
     fn map_err(
         err: ShimError,
         refusal: Option<crate::policy::AttemptPolicyRefusal>,
@@ -97,6 +109,7 @@ impl Dispatch for RealDispatch {
     async fn dispatch(&self, _provider: &str, payload: Value) -> Result<Value, DispatchError> {
         crate::completion_with_logger(self.router.as_ref(), &payload, self.logger.as_ref())
             .await
+            .map(Self::with_response_identity)
             .map_err(|error| Self::map_err(error, None))
     }
 
@@ -114,7 +127,9 @@ impl Dispatch for RealDispatch {
         )
         .await;
         let refusal = policy_context.take_last_refusal();
-        result.map_err(|error| Self::map_err(error, refusal))
+        result
+            .map(Self::with_response_identity)
+            .map_err(|error| Self::map_err(error, refusal))
     }
 
     async fn dispatch_stream(
@@ -933,6 +948,7 @@ fn app_with_origin_policy_and_deadlines(
         .route("/v1/chat", post(chat))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/messages", post(chat))
+        .route("/v1/responses", post(chat))
         .route("/v1beta/models/{*rest}", post(chat))
         .route("/v1/chat/stream", post(chat_stream))
         .route("/v1/models", get(list_models))
@@ -3858,6 +3874,51 @@ mod native_tests {
             assert!(request.get("previous_response_id").is_none());
             assert!(request.get("conversation").is_none());
             assert!(request["input"].to_string().contains("explicit history"));
+        }
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_assigns_identity_before_gateway_storage() {
+        for supplied_identity in [false, true] {
+            let mut server = mockito::Server::new_async().await;
+            let mut body = json!({"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{}});
+            if supplied_identity {
+                body["id"] = json!("chat_original");
+                body["created"] = json!(123);
+            }
+            let upstream = server
+                .mock("POST", "/chat/completions")
+                .with_body(body.to_string())
+                .expect(1)
+                .create_async()
+                .await;
+            let dispatch = RealDispatch {
+                router: Arc::new(Router::new().register(
+                    "local",
+                    Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                        "local",
+                        server.url(),
+                        None,
+                    )),
+                )),
+                logger: None,
+            };
+            let response = dispatch
+                .dispatch(
+                    "local",
+                    json!({"model":"local/test","messages":[{"role":"user","content":"hi"}]}),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{}", error.message));
+            assert_eq!(response["choices"][0]["message"]["content"], "Hello");
+            if supplied_identity {
+                assert_eq!(response["id"], "chat_original");
+                assert_eq!(response["created"], 123);
+            } else {
+                assert!(response["id"].as_str().unwrap().starts_with("chat_"));
+                assert!(response["created_at"].as_i64().unwrap() > 0);
+            }
+            upstream.assert_async().await;
         }
     }
 }

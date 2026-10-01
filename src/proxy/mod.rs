@@ -101,6 +101,7 @@ fn app_with_origin_policy_and_deadlines(
         .route("/v1/chat", post(handlers::chat))
         .route("/v1/chat/completions", post(handlers::chat))
         .route("/v1/messages", post(handlers::chat))
+        .route("/v1/responses", post(handlers::chat))
         // Gemini's native REST shape, `/v1beta/models/<model>:<action>`. The
         // wildcard keeps a routing id's slashes (`gemini/gemini-3.8-flash`).
         .route("/v1beta/models/{*rest}", post(handlers::chat))

@@ -1,6 +1,7 @@
 //! Native inbound API facades over the existing proxy/gateway handlers.
 mod gemini;
 mod receipts;
+mod responses;
 use axum::{
     body::{to_bytes, Body},
     extract::Request,
@@ -260,6 +261,7 @@ impl ReceiptExecutor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wire {
     Chat,
+    Responses,
     Messages,
     Gemini,
 }
@@ -285,6 +287,7 @@ pub fn native_route(path: &str) -> Option<NativeRoute> {
     let (wire, model, streams) = match path {
         "/v1/chat/completions" => (Wire::Chat, None, false),
         "/v1/messages" => (Wire::Messages, None, false),
+        "/v1/responses" => (Wire::Responses, None, false),
         path => {
             let (model, streams) = gemini::path_route(path)?;
             (Wire::Gemini, Some(model.to_owned()), streams)
@@ -465,6 +468,15 @@ fn request_to_chat_with_limits(
     scope: &str,
     restoration_limits: receipts::RestorationLimits,
 ) -> Result<Value> {
+    if wire == Wire::Responses {
+        return request_to_chat_with_limits(
+            &responses::request(native)?,
+            Wire::Chat,
+            receipts,
+            scope,
+            restoration_limits,
+        );
+    }
     let mut restoration_budget = receipts::RestorationBudget::new(restoration_limits);
     if wire == Wire::Gemini {
         let canonical = gemini::request(native, receipts, scope, &mut restoration_budget)?;
@@ -491,7 +503,7 @@ fn request_to_chat_with_limits(
     if let Some(tools) = native.get("tools") {
         for tool in array(tools, "tools")? {
             let supported = match wire {
-                Wire::Chat => tool["type"] == "function",
+                Wire::Chat | Wire::Responses => tool["type"] == "function",
                 Wire::Messages => tool.get("type").is_none() || tool["type"] == "custom",
                 // Unreachable: the Gemini reader above validated its own
                 // declarations, whose entries carry no `type`.
@@ -739,7 +751,9 @@ pub fn response_from_chat(
         } else {
             "stop"
         });
-    let mut out = if wire == Wire::Gemini {
+    let mut out = if wire == Wire::Responses {
+        responses::response(response, &usage, finish)
+    } else if wire == Wire::Gemini {
         gemini::response(response, &usage, finish, receipts, scope)?
     } else if wire == Wire::Chat {
         let mut exported = json!({"role":"assistant","content":message["content"]});
@@ -812,7 +826,7 @@ fn render_error(wire: Wire, error: &crate::error::NormalizedError, status: Statu
             };
             json!({"type":"error","error":{"type":kind,"message":error.message}})
         }
-        Wire::Chat => {
+        Wire::Chat | Wire::Responses => {
             let kind = error
                 .kind
                 .as_deref()

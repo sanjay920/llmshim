@@ -36,6 +36,72 @@ servers:
     description: Local development
 
 paths:
+  /v1/responses:
+    post:
+      operationId: nativeResponses
+      summary: Stateless non-streaming OpenAI Responses subset
+      description: >-
+        Accepts text/image messages and function call/output items through the shared
+        engine. Hosted tools, reasoning input items, stream true, previous_response_id,
+        conversation and store true are refused with a named 400. Send full history.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [model, input]
+              properties:
+                model: {type: string, minLength: 1}
+                input:
+                  oneOf:
+                    - {type: string}
+                    - type: array
+                      items: {type: object}
+                instructions: {type: string}
+                tools:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, name, parameters]
+                    properties:
+                      type: {type: string, enum: [function]}
+                      name: {type: string, minLength: 1}
+                      parameters: {type: object}
+                      description: {type: string}
+                      strict: {type: boolean}
+                tool_choice:
+                  oneOf:
+                    - {type: string, enum: [auto, none, required]}
+                    - type: object
+                      required: [type, name]
+                      properties:
+                        type: {type: string, enum: [function]}
+                        name: {type: string, minLength: 1}
+                max_output_tokens: {type: integer, minimum: 1}
+                temperature: {type: number, minimum: 0, maximum: 2}
+                top_p: {type: number, minimum: 0, maximum: 1}
+                reasoning:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    effort: {type: string, enum: [none, minimal, low, medium, high, xhigh, max]}
+                text:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    format: {type: object}
+                stream: {type: boolean, enum: [false]}
+                store: {type: boolean, enum: [false]}
+      responses:
+        '200':
+          description: Responses object with output items and usage token details
+          content:
+            application/json:
+              schema: {type: object}
+        default:
+          description: Responses error object with preserved status and Retry-After
   /v1/chat/completions:
     post:
       operationId: nativeChatCompletions
@@ -528,6 +594,7 @@ components:
       type: object
       required: [id, model, provider, message, usage, latency_ms]
       properties:
+        created_at: {type: integer, description: Unix timestamp of the original completion}
         finish_reason: {type: string}
         x-llmshim-served-model:
           type: string

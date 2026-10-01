@@ -81,6 +81,7 @@ pub struct Config {
 
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {
+    pub created_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     #[serde(

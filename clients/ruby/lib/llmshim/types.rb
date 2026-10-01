@@ -71,7 +71,7 @@ module Llmshim
   #
   # +raw+ retains the original parsed Hash for forward compatibility.
   ChatResponse = Struct.new(
-    :id, :model, :provider, :message, :reasoning, :usage, :latency_ms, :raw, :served_model, :finish_reason,
+    :id, :model, :provider, :message, :reasoning, :usage, :latency_ms, :raw, :served_model, :finish_reason, :created_at,
     keyword_init: true
   ) do
     def self.from_hash(hash)
@@ -85,6 +85,7 @@ module Llmshim
         latency_ms: hash["latency_ms"],
         raw: hash,
         served_model: hash["x-llmshim-served-model"],
+        created_at: hash["created_at"],
         finish_reason: hash["finish_reason"]
       )
     end
