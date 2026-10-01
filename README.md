@@ -179,7 +179,7 @@ requests). The backend requires `store: false` and `stream: true` and rejects
 token limits, sampling fields, and metadata, so these constraints also apply
 to native overrides. Bare `gpt-*` names still route to API-key OpenAI.
 The ChatGPT route supports only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`,
-and `chatgpt/gpt-6-luna`. Older and unlisted model
+`chatgpt/gpt-6.1-sol`, and `chatgpt/gpt-6-luna`. Older and unlisted model
 IDs return a local error before authentication or an upstream request.
 Access to these models and usage limits depend on the ChatGPT account.
 
@@ -522,7 +522,7 @@ Standard library only. Full docs: [`clients/ruby/README.md`](clients/ruby/README
 | **xAI** | `grok-4.7` | No (hidden) |
 
 The CLI and server advertise these current tiers. ChatGPT subscription access
-uses the same three GPT-6 models under `chatgpt/`. OpenRouter and self-hosted
+also includes `chatgpt/gpt-6.1-sol`. OpenRouter and self-hosted
 providers accept caller-selected IDs without a fixed advertised list.
 
 Use a bare model name (auto-detected by prefix) or an explicit `provider/model`

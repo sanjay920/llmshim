@@ -146,9 +146,10 @@ adaptively by default at `high` effort. See the
 |---|---|
 | `chatgpt/gpt-6-astra` | GPT-6 Astra (ChatGPT) |
 | `chatgpt/gpt-6-sol` | GPT-6 Sol (ChatGPT) |
+| `chatgpt/gpt-6.1-sol` | GPT-6.1 Sol (ChatGPT) |
 | `chatgpt/gpt-6-luna` | GPT-6 Luna (ChatGPT) |
 
-The ChatGPT provider accepts only these three model IDs. Older and unlisted
+The ChatGPT provider accepts only these four model IDs. Older and unlisted
 IDs are rejected locally before authentication or network calls, including
 when selected through a Router alias. The list is not an account entitlement
 check. The new models are rolling out, so availability also depends on
@@ -210,7 +211,7 @@ is recorded. Specs remain a point-in-time snapshot pinned by the crate version.
 Pruning the advertised list does not remove provider adapters or their
 compatibility behavior. Older explicit OpenAI and Anthropic IDs still reach their provider, subject
 to upstream availability. The ChatGPT subscription route accepts only the
-three current GPT-6 models. Known historical IDs also remain selectable by
+current GPT-6 models. Known historical IDs also remain selectable by
 exact ID in the CLI, and `spec()` keeps their metadata.
 
 The Router does not check explicit model names against this registry. If a

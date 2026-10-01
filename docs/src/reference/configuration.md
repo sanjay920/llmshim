@@ -68,7 +68,11 @@ workspace permissions. See [OpenAI authentication](https://learn.chatgpt.com/doc
 
 Tokens use LiteLLM's flat JSON format (`access_token`, `refresh_token`,
 `id_token`, `expires_at`, `account_id`). The default cache is separate from
-LiteLLM and Codex. Refreshes are serialized across processes sharing that file
+LiteLLM and Codex. Set `CHATGPT_AUTH_FILE` to an absolute Codex CLI `auth.json`
+path to share that login. Nested Codex tokens are read and refreshed in place;
+unknown fields are retained, `last_refresh` is updated as a UTC timestamp, and
+`tokens.expires_at` retains the refreshed expiry for subsequent reads.
+Refreshes are serialized across processes sharing that file
 and saved atomically; new token files have Unix mode `0600`. An expired or
 unreadable session returns an error, never a background interactive login.
 

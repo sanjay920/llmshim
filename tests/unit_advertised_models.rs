@@ -14,6 +14,7 @@ const EXPECTED: &[&str] = &[
     "chatgpt/gpt-6-astra",
     "chatgpt/gpt-6-sol",
     "chatgpt/gpt-6-luna",
+    "chatgpt/gpt-6.1-sol",
 ];
 
 #[test]

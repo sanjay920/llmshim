@@ -268,7 +268,10 @@ fn is_gpt_5_6(model: &str) -> bool {
 }
 
 fn is_gpt_6_model(model: &str) -> bool {
-    matches!(model, "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna")
+    matches!(
+        model,
+        "gpt-6-astra" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna"
+    )
 }
 
 /// GPT-5.4 family (`gpt-5.4`, `-mini`, `-nano`) rejects "minimal": its

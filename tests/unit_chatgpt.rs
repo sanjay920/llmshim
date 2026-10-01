@@ -136,8 +136,8 @@ fn translates_chat_tools_images_and_enforces_backend_constraints() {
 }
 
 #[test]
-fn supported_catalog_and_reasoning_match_the_three_current_models() {
-    let expected = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
+fn supported_catalog_and_reasoning_match_the_current_models() {
+    let expected = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"];
     let catalog = llmshim::models::available_models(&["chatgpt"]);
     assert_eq!(catalog.iter().map(|m| m.name).collect::<Vec<_>>(), expected);
     let (_dir, auth) = auth_fixture(token_record(false));

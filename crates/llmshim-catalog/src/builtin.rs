@@ -137,6 +137,23 @@ pub const CHATGPT_MODELS: &[BuiltinModelInfo] = &[
             ..ModelCapabilities::unknown()
         },
     },
+    BuiltinModelInfo {
+        id: "chatgpt/gpt-6.1-sol",
+        provider: "chatgpt",
+        family: Some(ModelFamily::Gpt),
+        name: "gpt-6.1-sol",
+        label: "GPT-6.1 Sol (ChatGPT)",
+        // Subscription entitlements and limits are account-dependent.
+        context_window_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            tools: Support::Supported,
+            streaming: Support::Supported,
+            images: Support::Supported,
+            reasoning: Support::Supported,
+            ..ModelCapabilities::unknown()
+        },
+    },
 ];
 
 /// Curated models advertised in the CLI, proxy discovery, and documentation.
@@ -246,6 +263,7 @@ pub const MODELS: &[BuiltinModelInfo] = &[
     CHATGPT_MODELS[0],
     CHATGPT_MODELS[1],
     CHATGPT_MODELS[2],
+    CHATGPT_MODELS[3],
 ];
 
 /// Historical metadata remains available to explicit `spec()` lookups without

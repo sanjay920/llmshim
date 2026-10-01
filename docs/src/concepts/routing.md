@@ -46,7 +46,7 @@ select subscription access. Bare GPT names continue to use OpenAI API keys.
 The static model registry powers `llmshim models` and `GET /v1/models`. Those
 commands are discovery aids, filtered to configured providers. The registry is
 not generally an allowlist: most providers accept models absent from that list.
-ChatGPT accepts only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and
+ChatGPT accepts only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, `chatgpt/gpt-6.1-sol`, and
 `chatgpt/gpt-6-luna`. The provider rejects other IDs
 before authentication or network calls, including through aliases.
 

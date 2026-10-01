@@ -406,8 +406,8 @@ fn vendored_artifact_has_broad_coverage_without_changing_discovery() {
     let providers: std::collections::BTreeSet<_> = c.models().map(|m| &m.provider).collect();
     assert!(providers.len() >= 200);
     assert!(c.models().count() >= 7000);
-    assert_eq!(llmshim_catalog::builtin::MODELS.len(), 13);
-    assert_eq!(llmshim_catalog::builtin::CHATGPT_MODELS.len(), 3);
+    assert_eq!(llmshim_catalog::builtin::MODELS.len(), 14);
+    assert_eq!(llmshim_catalog::builtin::CHATGPT_MODELS.len(), 4);
     assert_eq!(c.resolve("gpt-6-astra").unwrap().provider, "openai");
     assert!(llmshim_catalog::builtin::all().all(|m| m.family.is_some()));
 }
