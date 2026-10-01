@@ -1,6 +1,8 @@
 //! ChatGPT subscription provider. Address models explicitly as `chatgpt/<model>`.
 mod auth;
+mod storage;
 mod streaming;
+mod tokens;
 
 pub use auth::{ChatGptAuth, DeviceCode, LoginStatus};
 pub(crate) use streaming::collect_response_with_terminal;
@@ -22,9 +24,10 @@ use crate::{
     provider::{Provider, ProviderRequest},
     providers::openai::OpenAi,
 };
-use auth::{auth_error, Tokens};
+use auth::auth_error;
 use serde_json::{json, Value};
 use std::{future::Future, pin::Pin};
+use tokens::Tokens;
 
 pub struct ChatGpt {
     pub auth: ChatGptAuth,
@@ -46,7 +49,7 @@ fn validate_model(model: &str) -> Result<()> {
     } else {
         Err(auth_error(
             400,
-            "unsupported model; use chatgpt/gpt-6-astra, chatgpt/gpt-6-sol, or chatgpt/gpt-6-luna",
+            "unsupported model; use chatgpt/gpt-6-astra, chatgpt/gpt-6-sol, chatgpt/gpt-6.1-sol, or chatgpt/gpt-6-luna",
         ))
     }
 }

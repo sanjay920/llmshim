@@ -1,15 +1,11 @@
-//! Device-code OAuth and an independent, LiteLLM-compatible token cache.
+//! Device-code OAuth for flat and Codex-format credential files.
 //! Protocol reference: BerriAI/litellm fa09de9e, llms/chatgpt/authenticator.py.
 
+use super::tokens::Tokens;
 use crate::error::{Result, ShimError};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use fs2::FileExt;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    fs::File,
-    io::{Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -24,93 +20,6 @@ pub(super) fn auth_error(status: u16, message: &str) -> ShimError {
         status,
         body: format!("ChatGPT: {message}"),
         retry_after: None,
-    }
-}
-
-fn storage_error(_: impl std::fmt::Display) -> ShimError {
-    auth_error(500, "cannot read or update the OAuth cache")
-}
-
-fn now() -> u64 {
-    chrono::Utc::now().timestamp().max(0) as u64
-}
-
-fn claims(token: &str) -> Option<Value> {
-    // Claims are hints for expiry/account routing, not local proof of identity.
-    // The upstream validates the token. Never print token contents on errors.
-    let payload = token.split('.').nth(1)?.trim_end_matches('=');
-    crate::json_bounds::parse_slice(
-        &URL_SAFE_NO_PAD.decode(payload).ok()?,
-        crate::json_bounds::Limits::OAUTH,
-    )
-    .ok()
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(super) struct Tokens {
-    pub access_token: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    id_token: Option<String>,
-    #[serde(default)]
-    expires_at: Option<u64>,
-    #[serde(default)]
-    pub account_id: Option<String>,
-}
-
-impl Tokens {
-    fn normalize(&mut self) {
-        let access_claims = claims(&self.access_token);
-        if self.expires_at.is_none() {
-            self.expires_at = access_claims.as_ref().and_then(|c| c["exp"].as_u64());
-        }
-        if self.account_id.as_deref().is_none_or(str::is_empty) {
-            let id_claims = self.id_token.as_deref().and_then(claims);
-            self.account_id = id_claims.iter().chain(access_claims.iter()).find_map(|c| {
-                c.get("https://api.openai.com/auth")?
-                    .get("chatgpt_account_id")?
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-            });
-        }
-    }
-
-    fn usable(&self) -> bool {
-        !self.access_token.is_empty()
-            && self
-                .expires_at
-                .is_some_and(|exp| exp > now().saturating_add(60))
-    }
-
-    fn from_response(value: Value, previous: Option<&Tokens>) -> Result<Self> {
-        let mut tokens: Self = serde_json::from_value(value.clone())
-            .map_err(|_| auth_error(502, "invalid OAuth token response"))?;
-        if tokens.access_token.is_empty() {
-            return Err(auth_error(502, "OAuth token response has no access token"));
-        }
-        if let Some(old) = previous {
-            if tokens.refresh_token.as_deref().is_none_or(str::is_empty) {
-                tokens.refresh_token = old.refresh_token.clone();
-            }
-            if tokens.id_token.as_deref().is_none_or(str::is_empty) {
-                tokens.id_token = old.id_token.clone();
-            }
-        }
-        if tokens.expires_at.is_none() {
-            tokens.expires_at = value["expires_in"]
-                .as_u64()
-                .map(|s| now().saturating_add(s));
-        }
-        tokens.normalize();
-        if tokens.account_id.is_none() {
-            tokens.account_id = previous.and_then(|old| old.account_id.clone());
-        }
-        if !tokens.usable() {
-            return Err(auth_error(502, "OAuth response has no usable token expiry"));
-        }
-        Ok(tokens)
     }
 }
 
@@ -132,14 +41,14 @@ pub struct DeviceCode {
     deadline: Instant,
 }
 
-/// OAuth credentials are stored separately from API keys and Codex credentials.
+/// OAuth credentials can use an independent cache or a shared Codex auth file.
 /// Clones and separate processes coordinate refreshes through a cache file lock.
 #[derive(Clone)]
 pub struct ChatGptAuth {
-    path: PathBuf,
-    protected_default_root: Option<PathBuf>,
-    base_url: String,
-    http: Client,
+    pub(super) path: PathBuf,
+    pub(super) protected_default_root: Option<PathBuf>,
+    pub(super) base_url: String,
+    pub(super) http: Client,
 }
 
 impl Default for ChatGptAuth {
@@ -197,32 +106,6 @@ impl ChatGptAuth {
         self.read().ok().flatten().and_then(|t| t.account_id)
     }
 
-    fn read(&self) -> Result<Option<Tokens>> {
-        let mut data = Vec::new();
-        if let Some(protected_default_root) = &self.protected_default_root {
-            let mut file_handle = crate::default_secret_file::open_default_secret_file(
-                protected_default_root,
-                &["chatgpt"],
-                "auth.json",
-            )
-            .map_err(storage_error)?;
-            let Some(file_handle) = file_handle.as_mut() else {
-                return Ok(None);
-            };
-            file_handle.read_to_end(&mut data).map_err(storage_error)?;
-        } else {
-            data = match std::fs::read(&self.path) {
-                Ok(data) => data,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(e) => return Err(storage_error(e)),
-            };
-        };
-        let mut tokens: Tokens = serde_json::from_slice(&data)
-            .map_err(|_| auth_error(401, "invalid OAuth cache; run `llmshim login chatgpt`"))?;
-        tokens.normalize();
-        Ok(Some(tokens))
-    }
-
     pub fn status(&self) -> Result<LoginStatus> {
         Ok(match self.read()? {
             None => LoginStatus::SignedOut,
@@ -232,69 +115,6 @@ impl ChatGptAuth {
             }
             _ => LoginStatus::NeedsLogin,
         })
-    }
-
-    fn parent(&self) -> &Path {
-        self.path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
-    }
-
-    async fn lock(&self) -> Result<File> {
-        let mut dir = std::fs::DirBuilder::new();
-        dir.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            dir.mode(0o700);
-        }
-        dir.create(self.parent()).map_err(storage_error)?;
-        let mut lock_name = self.path.as_os_str().to_os_string();
-        lock_name.push(".lock");
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).read(true).write(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(PathBuf::from(lock_name))
-            .map_err(storage_error)?;
-        let deadline = Instant::now() + Duration::from_secs(35);
-        loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(file),
-                Err(e)
-                    if e.raw_os_error() == fs2::lock_contended_error().raw_os_error()
-                        && Instant::now() < deadline =>
-                {
-                    sleep(Duration::from_millis(50)).await
-                }
-                Err(_) => return Err(auth_error(503, "OAuth cache is busy; retry shortly")),
-            }
-        }
-    }
-
-    fn save(&self, tokens: &Tokens) -> Result<()> {
-        // NamedTempFile is owner-only on Unix. Atomic replacement means readers
-        // see either complete generation, including rotated refresh tokens.
-        let mut file = tempfile::NamedTempFile::new_in(self.parent()).map_err(storage_error)?;
-        file.write_all(&serde_json::to_vec(tokens).map_err(storage_error)?)
-            .map_err(storage_error)?;
-        file.as_file().sync_all().map_err(storage_error)?;
-        file.persist(&self.path).map_err(storage_error)?;
-        Ok(())
-    }
-
-    pub async fn logout(&self) -> Result<()> {
-        let _lock = self.lock().await?;
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(storage_error(e)),
-        }
     }
 
     /// Read a valid cache or refresh it. Never initiates an interactive login.
@@ -331,7 +151,7 @@ impl ChatGptAuth {
         )
         .await?;
         let tokens = Tokens::from_response(value, Some(&old))?;
-        self.save(&tokens)?;
+        self.save(&tokens, self.read_document()?)?;
         Ok(tokens)
     }
 
@@ -429,7 +249,12 @@ impl ChatGptAuth {
             let data = oauth_json(response, "device token exchange failed").await?;
             let tokens = Tokens::from_response(data, None)?;
             let _lock = self.lock().await?;
-            self.save(&tokens)?;
+            let document = match self.read_document() {
+                Ok(document) => document,
+                Err(ShimError::ProviderError { status: 401, .. }) => None,
+                Err(error) => return Err(error),
+            };
+            self.save(&tokens, document)?;
             return Ok(());
         }
     }
@@ -463,118 +288,5 @@ async fn oauth_json(response: reqwest::Response, message: &str) -> Result<Value>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct EnvironmentVariableRestore {
-        name: &'static str,
-        previous_value: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for EnvironmentVariableRestore {
-        fn drop(&mut self) {
-            if let Some(previous_value) = &self.previous_value {
-                std::env::set_var(self.name, previous_value);
-            } else {
-                std::env::remove_var(self.name);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn pending_device_authorization_waits_and_times_out() {
-        let mut server = mockito::Server::new_async().await;
-        let pending = server
-            .mock("POST", "/api/accounts/deviceauth/token")
-            .with_status(403)
-            .expect(1)
-            .create_async()
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let auth = ChatGptAuth::new(dir.path().join("auth.json")).with_auth_base(server.url());
-        let code = DeviceCode {
-            verification_url: String::new(),
-            user_code: "test".into(),
-            device_auth_id: "device".into(),
-            interval: Duration::from_secs(5),
-            deadline: Instant::now() + Duration::from_secs(1),
-        };
-        let err = auth.finish_login(code).await.unwrap_err();
-        assert!(matches!(err, ShimError::ProviderError { status: 408, .. }));
-        pending.assert_async().await;
-        assert!(!auth.auth_path().exists());
-    }
-
-    #[tokio::test]
-    async fn expired_device_code_does_not_start_polling() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth = ChatGptAuth::new(dir.path().join("auth.json"));
-        let code = DeviceCode {
-            verification_url: String::new(),
-            user_code: "test".into(),
-            device_auth_id: "device".into(),
-            interval: Duration::from_secs(5),
-            deadline: Instant::now() - Duration::from_secs(1),
-        };
-        let err = auth.finish_login(code).await.unwrap_err();
-        assert!(matches!(err, ShimError::ProviderError { status: 408, .. }));
-    }
-
-    #[test]
-    fn unknown_or_expired_token_expiry_is_rejected() {
-        for value in [
-            json!({"access_token": "private"}),
-            json!({"access_token": "private", "expires_at": 1}),
-            json!({"access_token": "", "expires_in": 3600}),
-            json!({"refresh_token": "private"}),
-        ] {
-            let err = Tokens::from_response(value, None).err().unwrap();
-            assert!(!err.to_string().contains("private"));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn protected_default_auth_read_keeps_its_construction_home() {
-        let previous_home = EnvironmentVariableRestore {
-            name: "HOME",
-            previous_value: std::env::var_os("HOME"),
-        };
-        let previous_token_directory = EnvironmentVariableRestore {
-            name: "CHATGPT_TOKEN_DIR",
-            previous_value: std::env::var_os("CHATGPT_TOKEN_DIR"),
-        };
-        let previous_auth_file = EnvironmentVariableRestore {
-            name: "CHATGPT_AUTH_FILE",
-            previous_value: std::env::var_os("CHATGPT_AUTH_FILE"),
-        };
-        let construction_home_directory = tempfile::tempdir().unwrap();
-        let changed_home_directory = tempfile::tempdir().unwrap();
-        let construction_auth_directory =
-            construction_home_directory.path().join(".llmshim/chatgpt");
-        std::fs::create_dir_all(&construction_auth_directory).unwrap();
-        std::fs::write(
-            construction_auth_directory.join("auth.json"),
-            format!(
-                r#"{{"access_token":"synthetic","expires_at":{}}}"#,
-                now().saturating_add(3600)
-            ),
-        )
-        .unwrap();
-        std::env::set_var("HOME", construction_home_directory.path());
-        std::env::remove_var("CHATGPT_TOKEN_DIR");
-        std::env::remove_var("CHATGPT_AUTH_FILE");
-        let auth = ChatGptAuth::from_env();
-
-        std::env::set_var("HOME", changed_home_directory.path());
-        assert_eq!(auth.status().unwrap(), LoginStatus::Ready);
-        assert_eq!(
-            auth.auth_path(),
-            construction_auth_directory.join("auth.json")
-        );
-
-        drop(previous_auth_file);
-        drop(previous_token_directory);
-        drop(previous_home);
-    }
-}
+#[path = "auth_tests.rs"]
+mod tests;

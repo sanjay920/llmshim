@@ -26,7 +26,7 @@ translator. ChatGPT forces `store: false` and `stream: true` and strips token
 limits, metadata, and sampling fields even from native overrides, following
 [LiteLLM's backend contract](https://docs.litellm.ai/docs/providers/chatgpt).
 It uses a short default instruction when no instructions are supplied.
-Only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and `chatgpt/gpt-6-luna` are accepted;
+Only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, `chatgpt/gpt-6.1-sol`, and `chatgpt/gpt-6-luna` are accepted;
 older and unlisted models fail locally before authentication or network calls.
 Access to those models and limits depend on the signed-in account.
 ChatGPT responses preserve the full `chatgpt/<model>` ID, including streaming

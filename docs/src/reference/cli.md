@@ -62,8 +62,8 @@ terminal, Ctrl-V pastes an image when the platform clipboard integration can
 read one; otherwise it pastes text.
 
 After `llmshim login chatgpt`, choose a ChatGPT entry in the picker or enter
-one of the three supported IDs: `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`,
-or `chatgpt/gpt-6-luna`. `/model` uses the same list.
+one of the four supported IDs: `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`,
+`chatgpt/gpt-6.1-sol`, or `chatgpt/gpt-6-luna`. `/model` uses the same list.
 
 `--log <path>` appends JSONL request records. If it is absent, chat checks
 `LLMSHIM_LOG`.
