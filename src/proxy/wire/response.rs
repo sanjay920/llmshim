@@ -41,7 +41,9 @@ pub fn response_from_chat(
             "stop"
         });
     let mut out = if wire == Wire::Responses {
-        super::responses::response(response, &usage, finish)
+        let exported = super::responses::response(response, &usage, finish);
+        super::responses::retain(&exported, message, receipts, scope)?;
+        json!(exported)
     } else if wire == Wire::Gemini {
         gemini::response(response, &usage, finish, receipts, scope)?
     } else if wire == Wire::Chat {

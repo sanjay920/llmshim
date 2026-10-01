@@ -679,7 +679,15 @@ async fn chat(
         .as_ref()
         .map(|axum::Extension(lifetime)| lifetime.deadline());
     if req.stream {
-        return Ok(chat_stream_inner(state, headers, req, prequeue_permit, logical_lifetime).await);
+        return Ok(chat_stream_inner(
+            state,
+            headers,
+            req,
+            prequeue_permit,
+            logical_lifetime,
+            uri.path() == "/v1/responses",
+        )
+        .await);
     }
 
     let idem_key = headers
@@ -764,7 +772,15 @@ async fn chat_stream(
     {
         return crate::proxy::lifetime::timeout_response("/v1/chat/stream");
     }
-    chat_stream_inner(state, headers, req, prequeue_permit, logical_lifetime).await
+    chat_stream_inner(
+        state,
+        headers,
+        req,
+        prequeue_permit,
+        logical_lifetime,
+        false,
+    )
+    .await
 }
 
 async fn chat_stream_inner(
@@ -773,6 +789,7 @@ async fn chat_stream_inner(
     req: ChatRequest,
     prequeue_permit: PrequeuePreparationPermit,
     logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
+    responses_identity: bool,
 ) -> Response {
     let (_provider_name, _budget_model, gw, identified_caller) =
         match build_request(&state, &headers, &req) {
@@ -805,9 +822,16 @@ async fn chat_stream_inner(
     };
 
     let event_stream = async_stream::stream! {
+        let mut identity_sent = false;
         while let Some(item) = rx.recv().await {
             match item {
                 Ok(chunk) => {
+                    if responses_identity && !identity_sent {
+                        identity_sent = true;
+                        if let Some(event) = crate::proxy::wire::stream_identity(&chunk) {
+                            yield Ok(event);
+                        }
+                    }
                     for event in chunk_to_events(&chunk) {
                         let event_type = stream_event_type(&event);
                         if let Ok(data) = serde_json::to_string(&event) {
@@ -1101,7 +1125,7 @@ async fn native_translate(
             );
         }
     }
-    crate::proxy::wire::translate(request, next).await
+    crate::proxy::wire::translate_with_router(request, next, Some(&state.router)).await
 }
 
 #[cfg(test)]
@@ -1273,7 +1297,7 @@ mod native_tests {
         // Gemini carries its turns in `contents` and its action in the path, so
         // the refusal has to reach the wire's own body check to be its refusal.
         let body = if path.starts_with("/v1beta/") {
-            json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]})
+            json!({"contents": [{"role": "user","parts": [{"text": "hi"}]}]})
         } else {
             json!({
                 "model": "local/test",
@@ -1359,21 +1383,21 @@ mod native_tests {
             .create_async()
             .await;
         let details: Vec<Value> = (0..64)
-            .map(|index| json!({"type":"reasoning.text","text":"x","index":index}))
+            .map(|index| json!({"type": "reasoning.text","text": "x","index": index}))
             .collect();
         let body = json!({
-            "model":"local/gpt-5.6-luna",
-            "messages":[{
-                "role":"assistant",
-                "content":"answer",
-                "reasoning_origin":{
-                    "provider":"source",
-                    "model":"m".repeat(64 * 1024),
-                    "family":"claude",
-                    "wire":"openai-chat",
-                    "received_at":"2026-09-22T00:00:00Z"
+            "model": "local/gpt-5.6-luna",
+            "messages": [{
+                "role": "assistant",
+                "content": "answer",
+                "reasoning_origin": {
+                    "provider": "source",
+                    "model": "m".repeat(64 * 1024),
+                    "family": "claude",
+                    "wire": "openai-chat",
+                    "received_at": "2026-09-22T00:00:00Z"
                 },
-                "reasoning_details":details
+                "reasoning_details": details
             }]
         });
         assert!(body.to_string().len() < 80 * 1024);
@@ -1649,7 +1673,7 @@ mod native_tests {
                     .body(Body::from(
                         json!({
                             "model": format!("{provider}/test"),
-                            "messages": [{"role":"user","content":"quiet"}],
+                            "messages": [{"role": "user","content": "quiet"}],
                             "stream": true
                         })
                         .to_string(),
@@ -2042,8 +2066,21 @@ mod native_tests {
                 "messages": [{"role": "user", "content": "tenant-a"}]
             })))
             .with_body(
-                json!({"id":"a","choices":[{"message":{"role":"assistant","content":"private-a"},"finish_reason":"stop"}],"usage":{}})
-                    .to_string(),
+                json!({
+                    "id": "a",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "private-a"
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {
+                    }
+                })
+                .to_string(),
             )
             .expect(1)
             .create_async()
@@ -2054,8 +2091,21 @@ mod native_tests {
                 "messages": [{"role": "user", "content": "tenant-b"}]
             })))
             .with_body(
-                json!({"id":"b","choices":[{"message":{"role":"assistant","content":"private-b"},"finish_reason":"stop"}],"usage":{}})
-                    .to_string(),
+                json!({
+                    "id": "b",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "private-b"
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {
+                    }
+                })
+                .to_string(),
             )
             .expect(1)
             .create_async()
@@ -2123,7 +2173,15 @@ mod native_tests {
             .with_body(
                 json!({
                     "id": "unexpected",
-                    "choices": [{"message": {"role": "assistant", "content": "unexpected"}, "finish_reason": "stop"}],
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "unexpected"
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
                     "usage": {}
                 })
                 .to_string(),
@@ -2819,9 +2877,33 @@ mod native_tests {
         let mut stream_server = mockito::Server::new_async().await;
         let partial_stream = format!(
             "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-            json!({"id":"r","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}),
-            json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":7}}),
-            json!({"id":"r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+            json!({
+                "id": "r",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": "ok"
+                        },
+                        "finish_reason": null
+                    }
+                ]
+            }),
+            json!({
+                "id": "r",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                        },
+                        "finish_reason": null
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 7
+                }
+            }),
+            json!({"id": "r","choices": [{"index": 0,"delta": {},"finish_reason": "stop"}]})
         );
         let stream_upstream = stream_server
             .mock("POST", "/chat/completions")
@@ -2865,22 +2947,65 @@ mod native_tests {
     async fn later_chat_and_gemini_activity_revokes_early_terminal_usage_authority() {
         let chat_unsafe = vec![
             vec![
-                json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
-                json!({"choices":[{"index":0,"delta":{"content":"later"},"finish_reason":null}]}),
-                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+                json!({"choices": [],"usage": {"prompt_tokens": 7,"completion_tokens": 3}}),
+                json!({
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "content": "later"
+                            },
+                            "finish_reason": null
+                        }
+                    ]
+                }),
+                json!({"choices": [{"index": 0,"delta": {},"finish_reason": "stop"}]}),
             ],
             vec![
-                json!({"choices":[
-                    {"index":0,"delta":{},"finish_reason":"stop"},
-                    {"index":1,"delta":{},"finish_reason":null}
-                ],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
-                json!({"choices":[{"index":1,"delta":{"content":"later"},"finish_reason":null}]}),
-                json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+                json!({"choices": [
+                    {"index": 0,"delta": {},"finish_reason": "stop"},
+                    {"index": 1,"delta": {},"finish_reason": null}
+                ],"usage": {"prompt_tokens": 7,"completion_tokens": 3}}),
+                json!({
+                    "choices": [
+                        {
+                            "index": 1,
+                            "delta": {
+                                "content": "later"
+                            },
+                            "finish_reason": null
+                        }
+                    ]
+                }),
+                json!({"choices": [{"index": 1,"delta": {},"finish_reason": "stop"}]}),
             ],
             vec![
-                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
-                json!({"choices":[{"index":1,"delta":{"content":"new"},"finish_reason":null}]}),
-                json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
+                json!({
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 7,
+                        "completion_tokens": 3
+                    }
+                }),
+                json!({
+                    "choices": [
+                        {
+                            "index": 1,
+                            "delta": {
+                                "content": "new"
+                            },
+                            "finish_reason": null
+                        }
+                    ]
+                }),
+                json!({"choices": [{"index": 1,"delta": {},"finish_reason": "stop"}]}),
             ],
         ];
         for sequence in chat_unsafe {
@@ -2888,9 +3013,9 @@ mod native_tests {
         }
         assert_chat_stream_budget_finality(
             vec![
-                json!({"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}),
-                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
-                json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                json!({"choices": [{"index": 0,"delta": {"content": "ok"},"finish_reason": null}]}),
+                json!({"choices": [{"index": 0,"delta": {},"finish_reason": "stop"}]}),
+                json!({"choices": [],"usage": {"prompt_tokens": 7,"completion_tokens": 3}}),
             ],
             StatusCode::OK,
         )
@@ -2898,29 +3023,63 @@ mod native_tests {
         assert_chat_stream_budget_finality(
             vec![
                 json!({
-                    "choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}],
-                    "usage":{"cost":1.0}
+                    "choices": [{"index": 0,"delta": {"content": "ok"},"finish_reason": null}],
+                    "usage": {"cost": 1.0}
                 }),
-                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
-                json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                json!({"choices": [{"index": 0,"delta": {},"finish_reason": "stop"}]}),
+                json!({"choices": [],"usage": {"prompt_tokens": 7,"completion_tokens": 3}}),
             ],
             StatusCode::TOO_MANY_REQUESTS,
         )
         .await;
         assert_chat_stream_budget_finality(
             vec![
-                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
-                json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}}),
+                json!({
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {
+                        "cost": 0.25
+                    }
+                }),
+                json!({"choices": [],"usage": {"prompt_tokens": 1_000_000,"completion_tokens": 0}}),
             ],
             StatusCode::OK,
         )
         .await;
         assert_chat_stream_budget_finality(
             vec![
-                json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"cost":0.25}}),
-                json!({"choices":[{"index":1,"delta":{"content":"later"},"finish_reason":null}]}),
-                json!({"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}),
-                json!({"choices":[],"usage":{"prompt_tokens":1_000_000,"completion_tokens":0}}),
+                json!({
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {
+                        "cost": 0.25
+                    }
+                }),
+                json!({
+                    "choices": [
+                        {
+                            "index": 1,
+                            "delta": {
+                                "content": "later"
+                            },
+                            "finish_reason": null
+                        }
+                    ]
+                }),
+                json!({"choices": [{"index": 1,"delta": {},"finish_reason": "stop"}]}),
+                json!({"choices": [],"usage": {"prompt_tokens": 1_000_000,"completion_tokens": 0}}),
             ],
             StatusCode::TOO_MANY_REQUESTS,
         )
@@ -2928,22 +3087,79 @@ mod native_tests {
 
         let gemini_unsafe = vec![
             vec![
-                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
-                json!({"candidates":[{"index":0,"content":{"parts":[{"text":"later"}]}}]}),
-                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}]}),
+                json!({
+                    "candidates": [
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 7,
+                        "candidatesTokenCount": 3,
+                        "cost": 1.0
+                    }
+                }),
+                json!({"candidates": [{"index": 0,"content": {"parts": [{"text": "later"}]}}]}),
+                json!({
+                    "candidates": [
+                        {
+                            "index": 0,
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                ]
+                            }
+                        }
+                    ]
+                }),
             ],
             vec![
-                json!({"candidates":[
-                    {"index":0,"finishReason":"STOP","content":{"parts":[]}},
-                    {"index":1,"content":{"parts":[]}}
-                ],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
-                json!({"candidates":[{"index":1,"content":{"parts":[{"text":"later"}]}}]}),
-                json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+                json!({"candidates": [
+                    {"index": 0,"finishReason": "STOP","content": {"parts": []}},
+                    {"index": 1,"content": {"parts": []}}
+                ],"usageMetadata": {"promptTokenCount": 7,"candidatesTokenCount": 3,"cost": 1.0}}),
+                json!({"candidates": [{"index": 1,"content": {"parts": [{"text": "later"}]}}]}),
+                json!({
+                    "candidates": [
+                        {
+                            "index": 1,
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                ]
+                            }
+                        }
+                    ]
+                }),
             ],
             vec![
-                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
-                json!({"candidates":[{"index":1,"content":{"parts":[{"text":"new"}]}}]}),
-                json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
+                json!({
+                    "candidates": [
+                        {
+                            "index": 0,
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                ]
+                            }
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 7,
+                        "candidatesTokenCount": 3,
+                        "cost": 1.0
+                    }
+                }),
+                json!({"candidates": [{"index": 1,"content": {"parts": [{"text": "new"}]}}]}),
+                json!({
+                    "candidates": [
+                        {
+                            "index": 1,
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                ]
+                            }
+                        }
+                    ]
+                }),
             ],
         ];
         for sequence in gemini_unsafe {
@@ -2951,27 +3167,99 @@ mod native_tests {
         }
         assert_gemini_stream_budget_finality(
             vec![
-                json!({"candidates":[{"index":0,"content":{"parts":[{"text":"ok"}]}}]}),
-                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}]}),
-                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cost":1.0}}),
+                json!({"candidates": [{"index": 0,"content": {"parts": [{"text": "ok"}]}}]}),
+                json!({
+                    "candidates": [
+                        {
+                            "index": 0,
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                ]
+                            }
+                        }
+                    ]
+                }),
+                json!({
+                    "candidates": [
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 7,
+                        "candidatesTokenCount": 3,
+                        "cost": 1.0
+                    }
+                }),
             ],
             StatusCode::OK,
         )
         .await;
         assert_gemini_stream_budget_finality(
             vec![
-                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"cost":0.25}}),
-                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+                json!({
+                    "candidates": [
+                        {
+                            "index": 0,
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                ]
+                            }
+                        }
+                    ],
+                    "usageMetadata": {
+                        "cost": 0.25
+                    }
+                }),
+                json!({
+                    "candidates": [
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 7,
+                        "candidatesTokenCount": 3
+                    }
+                }),
             ],
             StatusCode::OK,
         )
         .await;
         assert_gemini_stream_budget_finality(
             vec![
-                json!({"candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],"usageMetadata":{"cost":0.25}}),
-                json!({"candidates":[{"index":1,"content":{"parts":[{"text":"later"}]}}]}),
-                json!({"candidates":[{"index":1,"finishReason":"STOP","content":{"parts":[]}}]}),
-                json!({"candidates":[],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}),
+                json!({
+                    "candidates": [
+                        {
+                            "index": 0,
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                ]
+                            }
+                        }
+                    ],
+                    "usageMetadata": {
+                        "cost": 0.25
+                    }
+                }),
+                json!({"candidates": [{"index": 1,"content": {"parts": [{"text": "later"}]}}]}),
+                json!({
+                    "candidates": [
+                        {
+                            "index": 1,
+                            "finishReason": "STOP",
+                            "content": {
+                                "parts": [
+                                ]
+                            }
+                        }
+                    ]
+                }),
+                json!({
+                    "candidates": [
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 7,
+                        "candidatesTokenCount": 3
+                    }
+                }),
             ],
             StatusCode::TOO_MANY_REQUESTS,
         )
@@ -3316,7 +3604,28 @@ mod native_tests {
     #[tokio::test]
     async fn native_routes_preserve_auth_queue_and_protocol_scoped_idempotency() {
         let mut server = mockito::Server::new_async().await;
-        let upstream=server.mock("POST","/chat/completions").with_body(json!({"id":"r","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{}}).to_string()).expect(2).create_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "r",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "hello"
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {
+                    }
+                })
+                .to_string(),
+            )
+            .expect(2)
+            .create_async()
+            .await;
         let state = configured_state(&server.url());
         let dir = tempfile::tempdir().unwrap();
         for path in ["/v1/messages", "/v1/chat/completions"] {
@@ -3340,7 +3649,31 @@ mod native_tests {
                 serde_json::from_slice(&to_bytes(rejected.into_body(), 10000).await.unwrap())
                     .unwrap();
             assert_eq!(error["error"]["type"], "authentication_error");
-            let response=app.oneshot(Request::builder().method("POST").uri(path).header("content-type","application/json").header("x-api-key","test-key").header("x-llmshim-priority","255").header("idempotency-key","same-client-key").body(Body::from(json!({"model":"local/test","messages":[{"role":"user","content":"hi"}]}).to_string())).unwrap()).await.unwrap();
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("x-api-key", "test-key")
+                        .header("x-llmshim-priority", "255")
+                        .header("idempotency-key", "same-client-key")
+                        .body(Body::from(
+                            json!({
+                                "model": "local/test",
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": "hi"
+                                    }
+                                ]
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert!(response.headers().contains_key("x-request-id"));
             let body = to_bytes(response.into_body(), 10000).await.unwrap();
@@ -3352,7 +3685,28 @@ mod native_tests {
     #[tokio::test]
     async fn gemini_native_route_accepts_googles_key_header() {
         let mut server = mockito::Server::new_async().await;
-        let upstream=server.mock("POST","/chat/completions").with_body(json!({"id":"r","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{}}).to_string()).expect(1).create_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "r",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "hello"
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {
+                    }
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
         let dir = tempfile::tempdir().unwrap();
         let application = app(configured_state(&server.url())).layer(Extension(Arc::new(
             crate::proxy::wire::Receipts::new(dir.path().to_owned()),
@@ -3368,7 +3722,7 @@ mod native_tests {
             }
             builder
                 .body(Body::from(
-                    json!({"contents":[{"role":"user","parts":[{"text":"hi"}]}]}).to_string(),
+                    json!({"contents": [{"role": "user","parts": [{"text": "hi"}]}]}).to_string(),
                 ))
                 .unwrap()
         };
@@ -3399,7 +3753,28 @@ mod native_tests {
     #[tokio::test]
     async fn native_idempotency_request_mismatch_is_a_native_shaped_conflict() {
         let mut server = mockito::Server::new_async().await;
-        let upstream=server.mock("POST","/chat/completions").with_body(json!({"id":"r","choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{}}).to_string()).expect(1).create_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "r",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "hello"
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {
+                    }
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
         let receipts_directory = tempfile::tempdir().unwrap();
         let application = app(configured_state(&server.url())).layer(Extension(Arc::new(
             crate::proxy::wire::Receipts::new(receipts_directory.path().to_owned()),
@@ -3449,7 +3824,28 @@ mod native_tests {
     #[tokio::test]
     async fn messages_idempotency_mismatch_is_anthropic_shaped_without_cached_content() {
         let mut server = mockito::Server::new_async().await;
-        let upstream=server.mock("POST","/chat/completions").with_body(json!({"id":"r","choices":[{"message":{"role":"assistant","content":"private-cached-content"},"finish_reason":"stop"}],"usage":{}}).to_string()).expect(1).create_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_body(
+                json!({
+                    "id": "r",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "private-cached-content"
+                            },
+                            "finish_reason": "stop"
+                        }
+                    ],
+                    "usage": {
+                    }
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
         let receipts_directory = tempfile::tempdir().unwrap();
         let application = app(configured_state(&server.url())).layer(Extension(Arc::new(
             crate::proxy::wire::Receipts::new(receipts_directory.path().to_owned()),
@@ -3502,9 +3898,23 @@ mod native_tests {
     #[tokio::test]
     async fn all_gateway_surfaces_normalize_upstream_errors_and_reject_bad_history() {
         let mut server = mockito::Server::new_async().await;
-        let upstream = server.mock("POST", "/chat/completions").with_status(401)
-            .with_body(json!({"error":{"type":"invalid_request_error","code":"invalid_api_key","message":"API key is invalid.","param":null}}).to_string())
-            .expect(5).create_async().await;
+        let upstream = server
+            .mock("POST", "/chat/completions")
+            .with_status(401)
+            .with_body(
+                json!({
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "invalid_api_key",
+                        "message": "API key is invalid.",
+                        "param": null
+                    }
+                })
+                .to_string(),
+            )
+            .expect(5)
+            .create_async()
+            .await;
         let state = configured_state(&server.url());
         let application = app(state);
         for (path, stream) in [
@@ -3514,9 +3924,31 @@ mod native_tests {
             ("/v1/messages", false),
             ("/v1/chat/completions", false),
         ] {
-            let response = application.clone().oneshot(Request::builder().method("POST").uri(path)
-                .header("content-type","application/json").header("authorization","Bearer test-key")
-                .body(Body::from(json!({"model":"local/test","messages":[{"role":"user","content":"hi"}],"stream":stream}).to_string())).unwrap()).await.unwrap();
+            let response = application
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-key")
+                        .body(Body::from(
+                            json!({
+                                "model": "local/test",
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": "hi"
+                                    }
+                                ],
+                                "stream": stream
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert!(response.status().is_server_error());
             let data = to_bytes(response.into_body(), 100000).await.unwrap();
             let body: Value = serde_json::from_slice(&data).unwrap();
@@ -3528,9 +3960,32 @@ mod native_tests {
             }
         }
         for path in ["/v1/chat", "/v1/chat/stream", "/v1/chat/completions"] {
-            let response = application.clone().oneshot(Request::builder().method("POST").uri(path)
-                .header("content-type","application/json").header("authorization","Bearer test-key")
-                .body(Body::from(json!({"model":"local/test","messages":[{"role":"assistant","content":"answer","tool_calls":{}}]}).to_string())).unwrap()).await.unwrap();
+            let response = application
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-key")
+                        .body(Body::from(
+                            json!({
+                                "model": "local/test",
+                                "messages": [
+                                    {
+                                        "role": "assistant",
+                                        "content": "answer",
+                                        "tool_calls": {
+                                        }
+                                    }
+                                ]
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
         upstream.assert_async().await;
@@ -3556,7 +4011,17 @@ mod native_tests {
                         ("max_tokens".into(), json!(32_000)),
                         (
                             "tools".into(),
-                            json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]),
+                            json!([
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "lookup",
+                                        "parameters": {
+                                            "type": "object"
+                                        }
+                                    }
+                                }
+                            ]),
                         ),
                     ]),
                 },
@@ -3567,8 +4032,8 @@ mod native_tests {
             HeaderValue::from_static("Bearer test-key"),
         )]);
         let request: ChatRequest = serde_json::from_value(json!({
-            "model":"route/large",
-            "messages":[{"role":"user","content":"hello"}]
+            "model": "route/large",
+            "messages": [{"role": "user","content": "hello"}]
         }))
         .unwrap();
         let (provider_name, budget_model, gateway_request, _) =
@@ -3617,18 +4082,18 @@ mod native_tests {
 
             for protected_field in ["model", prompt_field] {
                 let request: ChatRequest = serde_json::from_value(json!({
-                    "model":"local/declared",
-                    "messages":[{"role":"user","content":"canonical"}],
-                    "provider_config":{"x-local":{(protected_field):"replacement"}}
+                    "model": "local/declared",
+                    "messages": [{"role": "user","content": "canonical"}],
+                    "provider_config": {"x-local": {(protected_field):"replacement"}}
                 }))
                 .unwrap();
                 assert!(build_request(&state, &headers, &request).is_err());
             }
 
             let request: ChatRequest = serde_json::from_value(json!({
-                "model":"local/declared",
-                "messages":[{"role":"user","content":"canonical"}],
-                "provider_config":{"x-local":{(output_field):7_000}}
+                "model": "local/declared",
+                "messages": [{"role": "user","content": "canonical"}],
+                "provider_config": {"x-local": {(output_field):7_000}}
             }))
             .unwrap();
             let (_, _, gateway_request, _) = match build_request(&state, &headers, &request) {
@@ -3881,7 +4346,19 @@ mod native_tests {
     async fn real_dispatch_assigns_identity_before_gateway_storage() {
         for supplied_identity in [false, true] {
             let mut server = mockito::Server::new_async().await;
-            let mut body = json!({"choices":[{"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{}});
+            let mut body = json!({
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "Hello"
+                        },
+                        "finish_reason": "stop"
+                    }
+                ],
+                "usage": {
+                }
+            });
             if supplied_identity {
                 body["id"] = json!("chat_original");
                 body["created"] = json!(123);
@@ -3906,7 +4383,7 @@ mod native_tests {
             let response = dispatch
                 .dispatch(
                     "local",
-                    json!({"model":"local/test","messages":[{"role":"user","content":"hi"}]}),
+                    json!({"model": "local/test","messages": [{"role": "user","content": "hi"}]}),
                 )
                 .await
                 .unwrap_or_else(|error| panic!("{}", error.message));

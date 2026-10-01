@@ -1,14 +1,20 @@
 //! Stateless Responses requests over the shared completion handler.
 mod config;
+mod events;
 mod input;
+mod replay;
 mod response;
+mod stream;
+pub(super) use replay::{output_options, replay_metadata, restore, retain};
+pub(crate) use stream::stream_identity;
+pub(super) use stream::stream_response;
 
 use super::{array, Result};
 use serde_json::{json, Map, Value};
 
-pub(super) use response::response;
+pub(super) use response::{response, OutputItem, Response};
 
-/// Accepts the non-streaming Responses subset and refuses state and unsupported fields.
+/// Accepts the stateless Responses subset and refuses state and unsupported fields.
 pub(super) fn request(native: &Value) -> Result<Value> {
     stateless_fields(native)?;
     let messages = input::messages(native)?;
@@ -21,13 +27,16 @@ pub(super) fn request(native: &Value) -> Result<Value> {
     let mut chat = Map::from_iter([
         ("model".into(), native["model"].clone()),
         ("messages".into(), json!(messages)),
-        ("stream".into(), json!(false)),
+        (
+            "stream".into(),
+            json!(native["stream"].as_bool().unwrap_or(false)),
+        ),
     ]);
     chat.extend(controls);
     Ok(Value::Object(chat))
 }
 
-/// Accepts known stateless fields and refuses stored history, streaming, and unknown fields.
+/// Accepts known stateless fields and refuses stored history and unknown fields.
 fn stateless_fields(native: &Value) -> Result<()> {
     let object = native.as_object().ok_or("request must be an object")?;
     for field in ["previous_response_id", "conversation"] {
@@ -40,8 +49,18 @@ fn stateless_fields(native: &Value) -> Result<()> {
     if object.get("store").is_some_and(|value| value != false) {
         return Err("store must be false: this endpoint is stateless".into());
     }
-    if object.get("stream").is_some_and(|value| value != false) {
-        return Err("stream must be false: Responses streaming is not supported yet".into());
+    if object
+        .get("stream")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err("stream must be a boolean".into());
+    }
+    if let Some(include) = object.get("include") {
+        for item in array(include, "include")? {
+            if item != "reasoning.encrypted_content" {
+                return Err(format!("unsupported include: {item}"));
+            }
+        }
     }
     for field in object.keys() {
         if !matches!(
@@ -58,6 +77,7 @@ fn stateless_fields(native: &Value) -> Result<()> {
                 | "text"
                 | "store"
                 | "stream"
+                | "include"
         ) {
             return Err(format!("unsupported Responses request field: {field}"));
         }

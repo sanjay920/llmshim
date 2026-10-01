@@ -113,7 +113,28 @@ impl StreamNormalizer {
             self.usage.ingest("anthropic", &mut native)?;
         }
         let data = native.to_string();
-        let parsed = if self.target.provider == "chatgpt"
+        let parsed = if self.target.wire == WireFormat::OpenAiResponses
+            && matches!(
+                native["type"].as_str(),
+                Some("response.created" | "response.in_progress")
+            ) {
+            Some(
+                serde_json::json!({
+                    "object": "chat.completion.chunk",
+                    "model": self.target.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant"
+                            },
+                            "finish_reason": null
+                        }
+                    ]
+                })
+                .to_string(),
+            )
+        } else if self.target.provider == "chatgpt"
             && self.target.wire == WireFormat::OpenAiResponses
         {
             crate::providers::chatgpt::parse_stream_chunk(&self.target.model, &data)
@@ -203,12 +224,37 @@ impl StreamNormalizer {
                     .reserve(crate::stream_retention::RetainedFootprint::record(0))?;
             }
         }
+        for source in [&native["response"], &native["message"], &native] {
+            if value["id"].as_str().is_none_or(str::is_empty) {
+                if let Some(id) = source
+                    .get("id")
+                    .or_else(|| source.get("responseId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    value["id"] = serde_json::json!(id);
+                }
+            }
+            if value.get("created").is_none() {
+                if let Some(created) = source.get("created_at").or_else(|| source.get("created")) {
+                    value["created"] = created.clone();
+                }
+            }
+        }
         crate::derived_response::bind_stream_context(&mut value, &self.target)?;
         if self.target.wire == WireFormat::AnthropicMessages {
             self.reasoning.push(&value["choices"][0]["delta"])?;
             if self.seen_terminal && !self.observed_integrity {
                 self.observed_integrity = true;
-                let mut observation = serde_json::json!({"choices":[{"message":{"reasoning":self.reasoning.take_blocks()}}]});
+                let mut observation = serde_json::json!({
+                    "choices": [
+                        {
+                            "message": {
+                                "reasoning": self.reasoning.take_blocks()
+                            }
+                        }
+                    ]
+                });
                 crate::providers::anthropic_signature::observe(
                     &mut observation,
                     &self.target.model,
@@ -269,12 +315,34 @@ mod retention_tests {
         )
         .unwrap();
         stream
-            .push(&serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"synthetic","name":"read","arguments":""}}).to_string())
+            .push(
+                &serde_json::json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "synthetic",
+                        "name": "read",
+                        "arguments": ""
+                    }
+                })
+                .to_string(),
+            )
             .unwrap();
         let error = (0..16)
             .find_map(|_| {
                 stream
-                    .push(&serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}).to_string())
+                    .push(
+                        &serde_json::json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0,
+                            "delta": concat!(
+                                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                                "xxxxxxxxxxxxxxxxxxx",
+                            )
+                        })
+                        .to_string(),
+                    )
                     .err()
             })
             .expect("the tiny budget must fail");
@@ -303,10 +371,10 @@ mod retention_tests {
         let error = stream
             .push(
                 &serde_json::json!({
-                    "choices":[{"index":0,"delta":{"tool_calls":[{
-                        "id":"call-1",
-                        "type":"function",
-                        "function":{"name":"read","arguments":arguments}
+                    "choices": [{"index": 0,"delta": {"tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "read","arguments": arguments}
                     }]}}]
                 })
                 .to_string(),

@@ -62,6 +62,7 @@ fn is_logical_timeout_error(error: &crate::error::ShimError) -> bool {
 pub async fn chat(
     State(state): State<Arc<AppState>>,
     logical_lifetime: Option<Extension<LogicalRequestLifetime>>,
+    uri: axum::http::Uri,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
     if logical_lifetime
@@ -74,7 +75,9 @@ pub async fn chat(
         .as_ref()
         .map(|Extension(lifetime)| lifetime.deadline());
     if req.stream {
-        return Ok(chat_stream_inner(state, req, logical_lifetime).await);
+        return Ok(
+            chat_stream_inner(state, req, logical_lifetime, uri.path() == "/v1/responses").await,
+        );
     }
     let prepared_request = convert::prepare_request(&state.router, &req)?;
     if let Some(fallback_models) = &req.fallback {
@@ -151,13 +154,14 @@ pub async fn chat_stream(
     {
         return timeout_response("/v1/chat/stream");
     }
-    chat_stream_inner(state, req, logical_lifetime).await
+    chat_stream_inner(state, req, logical_lifetime, false).await
 }
 
 async fn chat_stream_inner(
     state: Arc<AppState>,
     req: ChatRequest,
     logical_lifetime: Option<Extension<LogicalRequestLifetime>>,
+    responses_identity: bool,
 ) -> Response {
     let prepared_request = match convert::prepare_request(&state.router, &req) {
         Ok(prepared_request) => prepared_request,
@@ -189,11 +193,18 @@ async fn chat_stream_inner(
     }
 
     let event_stream = async_stream::stream! {
+        let mut identity_sent = false;
         match stream_result {
             Ok(mut upstream_stream) => {
                 while let Some(chunk) = upstream_stream.next().await {
                     match chunk {
                         Ok(chunk_json) => {
+                            if responses_identity && !identity_sent {
+                                identity_sent = true;
+                                if let Some(event) = super::wire::stream_identity(&chunk_json) {
+                                    yield Ok(event);
+                                }
+                            }
                             let events = convert::chunk_to_events(&chunk_json);
                             for event in events {
                                 let event_type = match &event {
@@ -1065,16 +1076,16 @@ mod tests {
         });
         for request_body in [
             serde_json::json!({
-                "model":"openai/gpt-5.6-luna",
-                "messages":[{"role":"user","content":"canonical"}],
-                "fallback":["anthropic/claude-sonnet-5"],
-                "provider_config":{"x-anthropic":{"model":"claude-opus-5","messages":[]}}
+                "model": "openai/gpt-5.6-luna",
+                "messages": [{"role": "user","content": "canonical"}],
+                "fallback": ["anthropic/claude-sonnet-5"],
+                "provider_config": {"x-anthropic": {"model": "claude-opus-5","messages": []}}
             }),
             serde_json::json!({
-                "model":"anthropic/claude-sonnet-5",
-                "messages":[{"role":"user","content":"canonical"}],
-                "fallback":["openai/gpt-5.6-luna"],
-                "provider_config":{"x-openai":{"input":"replacement"}}
+                "model": "anthropic/claude-sonnet-5",
+                "messages": [{"role": "user","content": "canonical"}],
+                "fallback": ["openai/gpt-5.6-luna"],
+                "provider_config": {"x-openai": {"input": "replacement"}}
             }),
         ] {
             let response = app_with_state(state.clone())

@@ -6,7 +6,7 @@ Both `llmshim proxy` and `llmshim gateway` serve:
 |---|---|
 | `POST /v1/chat/completions` | OpenAI Chat Completions |
 | `POST /v1/messages` | Anthropic Messages |
-| `POST /v1/responses` | Stateless, non-streaming Responses subset |
+| `POST /v1/responses` | Stateless Responses JSON or SSE |
 | `POST /v1beta/models/{model}:generateContent` | Google Gemini Generate Content |
 | `POST /v1beta/models/{model}:streamGenerateContent` | Google Gemini Generate Content, SSE |
 
@@ -154,37 +154,32 @@ that array. `x-shim` applies through the shared client. A signature mismatch's
 `x-llmshim-served-model` observation appears in JSON and the HTTP header for unary
 responses, or in terminal stream metadata. It never changes message provenance.
 
-## Responses follow-up design
+## Responses streams and reasoning history
 
-The proxy and gateway now serve a non-streaming, stateless
-`POST /v1/responses` subset, described in the [proxy quickstart](../start/proxy.md#stateless-responses-requests).
-The remaining problem is streaming ordered output items and carrying reasoning
-history without treating an opaque item supplied by a client as provider-issued.
+`POST /v1/responses` accepts `stream: true` through the same engine and
+admission path as ordinary requests. The SSE event name matches the JSON
+`type`, and `sequence_number` increases across creation, progress, item/part
+addition, text or function-argument deltas, item completion, and the terminal
+response. Text arrives incrementally; function arguments arrive once the shared
+engine has assembled and validated the complete call. The terminal event is
+`response.completed` or `response.incomplete` with final output and usage.
+Upstream failure or premature EOF emits `response.failed`. Disconnecting cancels
+the body and drops the upstream stream.
 
-Extend the existing wire translator with an incremental Responses event state
-machine. Allocate stable response and output-item IDs at creation, keep an
-output index per item, and increment one sequence counter across every event.
-Emit creation, item/part addition, text and function argument deltas, part/item
-done events, and the completed response with final usage. A provider error or
-premature end must terminate with failure, never completion. Reuse the shared
-stream accumulator and its bounds; do not buffer a whole completion to fabricate
-deltas, because that loses first-token latency and cancellation behavior.
+Reasoning input items require a `summary` array of `summary_text` parts and may
+carry string `id` and `encrypted_content` fields. Return the issued item unchanged
+in the next request. Credential-scoped receipts restore the original provider
+block, including encrypted content or an Anthropic thinking signature. The
+existing replay policy checks the target wire, model family and issuer binding;
+a client cannot supply its own provenance. Unknown, changed, expired or
+cross-credential items are dropped. Incompatible target reasoning is dropped by
+the engine. `metadata.reasoning_dropped` lists drop reasons rather than refusing
+the full request. Summary-only external items do not establish provenance.
 
-For reasoning replay, use the existing credential-scoped receipts to restore
-provider-issued blocks, then let the existing replay policy decide whether the
-target accepts them. Record dropped blocks in response metadata, including why
-they were dropped. Accept external summary-only items as text only under an
-explicit rule; never attach encrypted payloads to a made-up origin. Returning
-summaries already works, but inbound reasoning items currently receive a 400.
-Trusting a client's claimed provider identity was rejected because it bypasses
-issuer binding. Implementing response storage or implicit continuation was
-rejected because the proxy has no durable conversation contract; all history
-must remain explicit.
+Use `include: ["reasoning.encrypted_content"]` to request encrypted output from
+upstreams that support it. Other providers return replayable receipt-backed
+reasoning items without publishing their private thinking text or signatures.
+Receipt retention and restoration limits apply as on the Messages facade.
 
-Tests must exercise all scripted provider families on streaming and ordinary
-requests, interleaved parallel calls, empty output, refusal, token exhaustion,
-usage before/after finish, split argument fragments, and failure after an item
-opens. Assert exact event order, stable item IDs, contiguous sequence numbers,
-and that the completed response equals the accumulated deltas. Pair receipt
-replay with altered, expired, cross-credential, and cross-provider near misses;
-mutate each acceptance guard to establish that the negative test catches it.
+The endpoint remains stateless: `previous_response_id`, `conversation`,
+`store: true` and hosted tools are refused by name. Send explicit full history.
