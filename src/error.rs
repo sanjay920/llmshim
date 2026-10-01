@@ -70,3 +70,11 @@ impl From<reqwest::Error> for ShimError {
 }
 
 pub type Result<T> = std::result::Result<T, ShimError>;
+
+pub(crate) fn provider_error(status: u16, body: &str) -> ShimError {
+    ShimError::ProviderError {
+        status,
+        body: body.into(),
+        retry_after: None,
+    }
+}

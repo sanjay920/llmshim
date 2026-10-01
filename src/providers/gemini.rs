@@ -437,13 +437,13 @@ impl Provider for Gemini {
                 | "gemini-3.1-flash-image"
                 | "gemini-3-pro-image"
         ) {
-            return Err(crate::images::error(
+            return Err(crate::error::provider_error(
                 400,
                 "Gemini image generation requires a supported image-output model",
             ));
         }
         if request.get("n").is_some_and(|n| n.as_u64() != Some(1)) {
-            return Err(crate::images::error(
+            return Err(crate::error::provider_error(
                 400,
                 "Gemini image generation supports one candidate per request",
             ));
@@ -464,16 +464,16 @@ impl Provider for Gemini {
     }
 
     fn image_response(&self, model: &str, response: Value) -> Result<crate::images::ImageResponse> {
-        let candidates = response["candidates"]
-            .as_array()
-            .ok_or_else(|| crate::images::error(502, "missing generated image candidates"))?;
+        let candidates = response["candidates"].as_array().ok_or_else(|| {
+            crate::error::provider_error(502, "missing generated image candidates")
+        })?;
         let mut images = Vec::new();
         for candidate in candidates {
             if candidate
                 .get("finishReason")
                 .is_some_and(|reason| reason.as_str() != Some("STOP"))
             {
-                return Err(crate::images::error(
+                return Err(crate::error::provider_error(
                     502,
                     "Gemini image generation did not finish successfully",
                 ));
@@ -481,7 +481,9 @@ impl Provider for Gemini {
             let parts = candidate
                 .pointer("/content/parts")
                 .and_then(Value::as_array)
-                .ok_or_else(|| crate::images::error(502, "missing generated image parts"))?;
+                .ok_or_else(|| {
+                    crate::error::provider_error(502, "missing generated image parts")
+                })?;
             for part in parts {
                 // Thinking models can return draft images before their final answer.
                 if part["thought"].as_bool() == Some(true) {

@@ -141,9 +141,56 @@ pub trait Provider: Send + Sync {
     /// Prepare a non-streaming image-generation request. Unsupported providers
     /// fail locally rather than sending a prompt to a text endpoint.
     fn image_request(&self, _model: &str, _request: &Value) -> Result<ProviderRequest> {
-        Err(crate::images::error(
+        Err(crate::error::provider_error(
             400,
             "provider does not support image generation",
+        ))
+    }
+
+    /// Prepare a replayable upload. Providers without transcription refuse locally.
+    fn transcription_request(
+        &self,
+        _model: &str,
+        _request: &crate::audio::TranscriptionRequest,
+    ) -> Result<crate::audio::TranscriptionUpload> {
+        Err(crate::error::provider_error(
+            400,
+            "provider does not support transcription",
+        ))
+    }
+
+    /// Turn the provider answer into transcript text and usage with cost provenance.
+    fn transcription_response(
+        &self,
+        _model: &str,
+        _request: &crate::audio::TranscriptionRequest,
+        _response: Value,
+    ) -> Result<crate::audio::TranscriptionResponse> {
+        Err(crate::error::provider_error(
+            400,
+            "provider does not support transcription",
+        ))
+    }
+
+    /// Prepare speech synthesis. Providers without a speech endpoint refuse locally.
+    fn speech_request(&self, _model: &str, _request: &Value) -> Result<ProviderRequest> {
+        Err(crate::error::provider_error(
+            400,
+            "provider does not support speech synthesis",
+        ))
+    }
+
+    /// Turn the provider answer into audio bytes, their media type, and usage.
+    fn speech_response(
+        &self,
+        _model: &str,
+        _request: &Value,
+        _bytes: Vec<u8>,
+        _media_type: &str,
+    ) -> Result<crate::audio::SpeechResponse> {
+        Err(crate::error::provider_error(
+            400,
+            "provider does not support speech synthesis",
         ))
     }
 
@@ -152,7 +199,7 @@ pub trait Provider: Send + Sync {
         _model: &str,
         _response: Value,
     ) -> Result<crate::images::ImageResponse> {
-        Err(crate::images::error(
+        Err(crate::error::provider_error(
             400,
             "provider does not support image generation",
         ))
