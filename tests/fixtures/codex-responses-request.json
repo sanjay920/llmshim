@@ -13,12 +13,12 @@
           "tools": [
             {
               "type": "custom",
-              "name": "exec",
-              "description": "Recorded custom tool.",
+              "name": "apply_patch",
+              "description": "Apply a patch.",
               "format": {
                 "type": "grammar",
                 "syntax": "lark",
-                "definition": "start: /.+/"
+                "definition": "start: /[\\s\\S]+/"
               }
             }
           ]

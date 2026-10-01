@@ -151,12 +151,11 @@ fn prepare_resolved_request(
     provider: &dyn Provider,
     resolved_model: String,
 ) -> crate::error::Result<PreparedRequest> {
+    let wire = provider.replay_target(&resolved_model).wire;
     let target = admission_target(provider, resolved_model);
     validate_active_native_overrides(&request, &target)?;
     crate::reasoning::preflight_request(&request)?;
-    if let Some(messages) = request["messages"].as_array() {
-        crate::toolcall::validate_history(messages)?;
-    }
+    crate::toolcall::validate_request_history(&request, wire)?;
     Ok(PreparedRequest {
         payload: request,
         #[cfg(any(feature = "gateway", test))]
@@ -666,6 +665,7 @@ pub fn value_to_response(v: &Value, provider: &str, latency_ms: u64) -> ChatResp
             content,
             tool_calls,
             reasoning: msg.get("reasoning").cloned(),
+            responses_output: msg.get("responses_output").cloned(),
         },
         reasoning,
         usage,
@@ -794,6 +794,7 @@ pub fn chunk_to_events(chunk_json: &str) -> Vec<StreamEvent> {
     // Finish reason → done event
     if let Some(finish) = choice.get("finish_reason").and_then(|f| f.as_str()) {
         events.push(StreamEvent::Done {
+            responses_output: choice["delta"].get("responses_output").cloned(),
             finish_reason: Some(finish.into()),
             served_model: parsed["x-llmshim-served-model"].as_str().map(str::to_owned),
         });

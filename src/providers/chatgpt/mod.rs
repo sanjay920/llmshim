@@ -152,6 +152,9 @@ impl ChatGpt {
                     | "reasoning"
                     | "previous_response_id"
                     | "truncation"
+                    | "parallel_tool_calls"
+                    | "service_tier"
+                    | "access_programs"
                     | "prompt_cache_key"
                     | "prompt_cache_retention"
             )

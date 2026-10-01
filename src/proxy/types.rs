@@ -109,6 +109,8 @@ pub struct ResponseMessage {
     pub tool_calls: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responses_output: Option<Value>,
 }
 
 pub use super::usage::Usage;
@@ -142,6 +144,8 @@ pub enum StreamEvent {
 
     #[serde(rename = "done")]
     Done {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        responses_output: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         finish_reason: Option<String>,
         #[serde(

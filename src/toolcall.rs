@@ -219,7 +219,12 @@ pub(crate) fn capture_response_with_budget(
                 .into_iter()
                 .flatten()
                 .enumerate()
-                .filter(|(_, p)| p["type"] == "function_call")
+                .filter(|(_, p)| {
+                    matches!(
+                        p["type"].as_str(),
+                        Some("function_call" | "custom_tool_call")
+                    )
+                })
                 .map(|(i, p)| {
                     budgeted_binding(
                         target,
@@ -426,14 +431,50 @@ pub fn validate_history(messages: &[Value]) -> Result<()> {
     Ok(())
 }
 
+/// Native output items share one assistant turn without changing their replay order.
+pub(crate) fn validate_request_history(request: &Value, wire: WireFormat) -> Result<()> {
+    let Some(messages) = request["messages"].as_array() else {
+        return Ok(());
+    };
+    if wire == WireFormat::OpenAiResponses && request.get("x-responses-controls").is_some() {
+        let mut turns: Vec<Value> = Vec::new();
+        for message in messages.iter() {
+            if message["role"] == "assistant"
+                && (message["tool_calls"].is_null() || message["tool_calls"].is_array())
+                && turns.last().is_some_and(|last| {
+                    last["role"] == "assistant"
+                        && (last["tool_calls"].is_null() || last["tool_calls"].is_array())
+                })
+            {
+                if let Some(turn) = turns.last_mut() {
+                    let mut calls = turn["tool_calls"].as_array().cloned().unwrap_or_default();
+                    calls.extend(
+                        message["tool_calls"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .cloned(),
+                    );
+                    turn["tool_calls"] = json!(calls);
+                }
+            } else {
+                turns.push(message.clone());
+            }
+        }
+        validate_history(&turns)
+    } else {
+        validate_history(messages)
+    }
+}
+
 /// Resolve both sides to their target wire ids. The returned clone contains
 /// only wire-ready identities; the caller's persisted normalized log is untouched.
 pub(crate) fn prepare_request(request: &Value, target: &ReplayTarget) -> Result<Value> {
-    let mut request = request.clone();
+    let mut request = crate::responses_tools::prepare_transport(request, target)?;
+    validate_request_history(&request, target.wire)?;
     let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
         return Ok(request);
     };
-    validate_history(messages)?;
     let current_turn = messages.iter().rposition(|m| m["role"] == "user");
     let mut map = ToolCallMap::default();
     let mut calls_by_logical = BTreeMap::new();
@@ -582,18 +623,30 @@ pub(crate) fn validate_native(body: &Value, target: &ReplayTarget) -> Result<()>
             let mut assistant: Option<Value> = None;
             for item in body["input"].as_array().into_iter().flatten() {
                 if item["role"] == "assistant"
-                    || matches!(item["type"].as_str(), Some("reasoning" | "function_call"))
+                    || matches!(
+                        item["type"].as_str(),
+                        Some("reasoning" | "function_call" | "custom_tool_call")
+                    )
                 {
                     let message = assistant
                         .get_or_insert_with(|| json!({"role":"assistant","tool_calls":[]}));
-                    if item["type"] == "function_call" {
-                        message["tool_calls"].as_array_mut().unwrap().push(json!({"id":item["call_id"],"function":{"name":item["name"],"arguments":item["arguments"]}}));
+                    if matches!(
+                        item["type"].as_str(),
+                        Some("function_call" | "custom_tool_call")
+                    ) {
+                        let calls = message["tool_calls"]
+                            .as_array_mut()
+                            .ok_or_else(|| invalid("native assistant calls must be an array"))?;
+                        calls.push(crate::responses_tools::canonical_call(item)?);
                     }
                 } else {
                     if let Some(message) = assistant.take() {
                         canonical.push(message);
                     }
-                    if item["type"] == "function_call_output" {
+                    if matches!(
+                        item["type"].as_str(),
+                        Some("function_call_output" | "custom_tool_call_output")
+                    ) {
                         canonical.push(json!({"role":"tool","tool_call_id":item["call_id"]}));
                     } else {
                         canonical.push(json!({"role":"user"}));

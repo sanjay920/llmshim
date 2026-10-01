@@ -53,9 +53,13 @@ fn strip_cache_control(value: &mut Value) {
 /// adapter already emits several `function_call_output` items in a row for
 /// parallel tool calls. Two adjacent assistant messages stay two items. The
 /// ChatGPT adapter goes through this same translator and inherits the stance.
-fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
+fn sanitize_messages(messages: &[Value]) -> Result<Vec<Value>> {
     let mut result = Vec::new();
     for msg in messages {
+        if let Some(item) = msg.get("x-responses-item") {
+            result.push(item.clone());
+            continue;
+        }
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
 
         match role {
@@ -112,6 +116,21 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
                             "name": name,
                             "arguments": arguments,
                         });
+                        if let Some(descriptor) = tc.get("x-responses-call") {
+                            item["name"] = descriptor["name"].clone();
+                            if let Some(namespace) = descriptor.get("namespace") {
+                                item["namespace"] = namespace.clone();
+                            }
+                            if descriptor["type"] == "custom_tool_call" {
+                                let input = crate::responses_tools::custom_input(&arguments)
+                                    .map_err(|message| crate::toolcall::invalid(&message))?;
+                                item["type"] = json!("custom_tool_call");
+                                item["input"] = json!(input);
+                                if let Some(object) = item.as_object_mut() {
+                                    object.remove("arguments");
+                                }
+                            }
+                        }
                         if let Some(id) = tc.get("_llmshim_item_id") {
                             item["id"] = id.clone();
                         }
@@ -127,10 +146,9 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
                     .unwrap_or("")
                     .to_string();
                 let output = msg
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                    .get("x-responses-output")
+                    .cloned()
+                    .unwrap_or_else(|| json!(msg["content"].as_str().unwrap_or("")));
                 result.push(json!({
                     "type": "function_call_output",
                     "call_id": call_id,
@@ -157,7 +175,7 @@ fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
             }
         }
     }
-    result
+    Ok(result)
 }
 
 /// Translate Chat Completions tool definitions to Responses API format.
@@ -573,15 +591,8 @@ impl OpenAi {
                         }
                     }
                 }
-                Some("function_call") => {
-                    tool_calls.push(json!({
-                        "id": item.get("call_id").cloned().unwrap_or(json!("")),
-                        "type": "function",
-                        "function": {
-                            "name": item.get("name").cloned().unwrap_or(json!("")),
-                            "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
-                        }
-                    }));
+                Some("function_call" | "custom_tool_call") => {
+                    tool_calls.push(crate::responses_tools::canonical_call(item)?);
                 }
                 _ => {}
             }
@@ -598,6 +609,10 @@ impl OpenAi {
         }
         if !tool_calls.is_empty() {
             message["tool_calls"] = json!(tool_calls);
+        }
+        let auxiliary = crate::responses_tools::auxiliary_output(&response);
+        if !auxiliary.is_empty() {
+            message["responses_output"] = json!(auxiliary);
         }
 
         let finish_reason = match response.get("status").and_then(Value::as_str) {
@@ -741,7 +756,7 @@ impl OpenAi {
             .and_then(|m| m.as_array())
             .ok_or(ShimError::MissingModel)?;
 
-        let clean_messages = sanitize_messages(messages);
+        let clean_messages = sanitize_messages(messages)?;
 
         // Build Responses API request — store defaults to false (OpenAI defaults to true)
         let store = obj.get("store").cloned().unwrap_or(json!(false));
@@ -822,6 +837,8 @@ impl OpenAi {
 
         for key in [
             "include",
+            "parallel_tool_calls",
+            "service_tier",
             "prompt_cache_key",
             "prompt_cache_retention",
             "safety_identifier",
@@ -844,6 +861,12 @@ impl OpenAi {
             Some("system" | "developer") => {
                 if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
                     instructions.push(text.to_string());
+                } else if let Some(parts) = msg["content"].as_array() {
+                    instructions.extend(
+                        parts
+                            .iter()
+                            .filter_map(|part| part["text"].as_str().map(str::to_owned)),
+                    );
                 }
                 false
             }
@@ -866,6 +889,7 @@ impl OpenAi {
 
         // Strip provider-specific params from body
         body_obj.remove("thinking");
+        crate::responses_tools::native_request(&mut body, &request)?;
 
         let url = format!("{}/responses", self.base_url);
 

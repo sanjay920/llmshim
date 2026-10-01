@@ -160,8 +160,9 @@ responses, or in terminal stream metadata. It never changes message provenance.
 admission path as ordinary requests. The SSE event name matches the JSON
 `type`, and `sequence_number` increases across creation, progress, item/part
 addition, text or function-argument deltas, item completion, and the terminal
-response. Text arrives incrementally; function arguments arrive once the shared
-engine has assembled and validated the complete call. The terminal event is
+response. Text arrives incrementally except when hosted search requires buffering
+for native item order; function arguments arrive once the shared engine has
+assembled and validated the complete call. The terminal event is
 `response.completed` or `response.incomplete` with final output and usage.
 Upstream failure or premature EOF emits `response.failed`. Disconnecting cancels
 the body and drops the upstream stream.
@@ -182,4 +183,19 @@ reasoning items without publishing their private thinking text or signatures.
 Receipt retention and restoration limits apply as on the Messages facade.
 
 The endpoint remains stateless: `previous_response_id`, `conversation`,
-`store: true` and hosted tools are refused by name. Send explicit full history.
+and `store: true` are refused by name. Send explicit full history. Custom and
+namespaced tools are supported, including Codex CLI request controls and
+`additional_tools` declarations. Hosted search declarations require a native
+Responses provider. See [Responses requests](../guides/responses.md) for exact
+translation behavior and the accepted controls that may be ignored.
+
+## Agent CLI integration
+
+This endpoint supplies the inference transport for an agent CLI; it does not
+launch that CLI or implement a host's parent-turn provider. That integration
+belongs in the embedding harness. Its turn provider should launch the CLI with
+an isolated home and workspace, direct inference to an authenticated metered
+endpoint, and translate the CLI's completion into the parent turn result.
+Cancellation must stop the child and its requests; failed or incomplete turns
+must remain distinguishable from successful completion. Preserve full request
+history, tool inputs, result items and issued reasoning receipts across turns.

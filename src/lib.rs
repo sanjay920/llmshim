@@ -25,6 +25,7 @@ pub mod providers;
 pub mod reasoning;
 #[cfg(feature = "redis-coordination")]
 mod redis_operation;
+mod responses_tools;
 pub mod router;
 mod sse;
 mod stream_retention;

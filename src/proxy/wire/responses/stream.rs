@@ -72,13 +72,21 @@ pub(in crate::proxy::wire) fn stream_response(
             }
         }
         let mut state = Events::new(super::response(&canonical, &json!({}), "stop"));
-        state
-            .response
-            .fields
-            .insert("metadata".into(), metadata.clone());
+        if let Err(message) = super::output_options(
+            &mut state.response, metadata.clone(), include,
+        ) {
+            yield Ok(state.failed(&message));
+            return;
+        }
         for kind in ["response.created", "response.in_progress"] {
             yield Ok(state.event(kind, json!({"response": state.response.clone()})));
         }
+        // Hosted discovery can precede text, so its terminal order determines event indices.
+        let hosted = metadata["x-responses-tools"].as_array().is_some_and(|tools| {
+            tools.iter().any(|tool| matches!(
+                tool["type"].as_str(), Some("tool_search" | "web_search")
+            ))
+        });
         let mut reasoning = crate::reasoning::ReasoningAccumulator::default();
         let mut calls = Vec::new();
         let mut done = false;
@@ -105,8 +113,10 @@ pub(in crate::proxy::wire) fn stream_response(
                         &mut canonical["message"]["content"],
                         text,
                     );
-                    for event in state.text(text) {
-                        yield Ok(event);
+                    if !hosted {
+                        for event in state.text(text) {
+                            yield Ok(event);
+                        }
                     }
                 }
                 Some("reasoning") => {
@@ -137,6 +147,9 @@ pub(in crate::proxy::wire) fn stream_response(
                 }
                 Some("usage") => canonical["usage"] = data,
                 Some("done") => {
+                    if let Some(output) = data.get("responses_output") {
+                        canonical["message"]["responses_output"] = output.clone();
+                    }
                     done = true;
                     canonical["finish_reason"] =
                         data["finish_reason"].as_str().unwrap_or("stop").into();
@@ -158,7 +171,7 @@ pub(in crate::proxy::wire) fn stream_response(
         if !done {
             canonical["message"]["reasoning"] = json!(reasoning.blocks());
             state.response = super::response(&canonical, &canonical["usage"], "stop");
-            super::output_options(&mut state.response, metadata.clone(), include);
+            let _ = super::output_options(&mut state.response, metadata.clone(), include);
             yield Ok(state.failed(failure.unwrap_or("stream ended before completion")));
             return;
         }
@@ -172,20 +185,22 @@ pub(in crate::proxy::wire) fn stream_response(
         match native {
             Ok(native) => match serde_json::from_value::<super::Response>(native) {
                 Ok(mut native) => {
-                    super::output_options(&mut native, metadata, include);
-                    for event in state.finish(native) {
-                        yield Ok(event);
+                    match super::output_options(&mut native, metadata, include) {
+                        Ok(()) => for event in state.finish(native) {
+                            yield Ok(event);
+                        },
+                        Err(message) => yield Ok(state.failed(&message)),
                     }
                 }
                 Err(_) => {
                     state.response = failure_snapshot;
-                    super::output_options(&mut state.response, metadata, include);
+                    let _ = super::output_options(&mut state.response, metadata, include);
                     yield Ok(state.failed("malformed Responses output"));
                 }
             },
             Err(_) => {
                 state.response = failure_snapshot;
-                super::output_options(&mut state.response, metadata, include);
+                let _ = super::output_options(&mut state.response, metadata, include);
                 yield Ok(state.failed("native replay metadata unavailable"));
             }
         }

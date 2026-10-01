@@ -183,6 +183,10 @@ impl StreamNormalizer {
                 native["type"].as_str(),
                 Some("response.completed" | "response.incomplete")
             ) {
+                let auxiliary = crate::responses_tools::auxiliary_output(&native["response"]);
+                if !auxiliary.is_empty() {
+                    value["choices"][0]["delta"]["responses_output"] = serde_json::json!(auxiliary);
+                }
                 let refusal: String = native["response"]["output"]
                     .as_array()
                     .into_iter()

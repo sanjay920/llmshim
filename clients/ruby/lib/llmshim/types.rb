@@ -56,10 +56,14 @@ module Llmshim
   end
 
   # The assistant message inside a ChatResponse.
-  ResponseMessage = Struct.new(:role, :content, :tool_calls, :reasoning, :refusal, keyword_init: true) do
+  ResponseMessage = Struct.new(
+    :role, :content, :tool_calls, :reasoning, :refusal, :responses_output, keyword_init: true
+  ) do
     def self.from_hash(hash)
       calls = (hash["tool_calls"] || []).map { |c| ToolCall.from_hash(c) }
-      new(role: hash["role"], content: hash["content"], tool_calls: calls, reasoning: hash["reasoning"], refusal: hash["refusal"])
+      new(role: hash["role"], content: hash["content"], tool_calls: calls,
+          reasoning: hash["reasoning"], refusal: hash["refusal"],
+          responses_output: hash["responses_output"])
     end
 
     def to_json(*args)
@@ -148,6 +152,10 @@ module Llmshim
 
     def served_model
       raw["x-llmshim-served-model"]
+    end
+
+    def responses_output
+      raw["responses_output"]
     end
 
     def done?

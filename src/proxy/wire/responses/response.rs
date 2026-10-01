@@ -104,6 +104,45 @@ pub(in crate::proxy::wire) fn response(canonical: &Value, usage: &Value, finish:
             ]),
         });
     }
+    let mut remaining = output;
+    let mut output = Vec::new();
+    for native in message["responses_output"].as_array().into_iter().flatten() {
+        let kind = native["type"].as_str().unwrap_or_default();
+        if matches!(
+            kind,
+            "tool_search_call" | "tool_search_output" | "web_search_call"
+        ) {
+            if let Ok(item) = serde_json::from_value::<OutputItem>(native.clone()) {
+                output.push(item);
+            }
+            continue;
+        }
+        let call_id = message["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|call| {
+                call["wire_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|binding| {
+                        binding["wire"] == "openai-responses" && binding["id"] == native["call_id"]
+                    })
+            })
+            .map(|call| &call["id"]);
+        let index = remaining.iter().position(|item| {
+            if matches!(kind, "function_call" | "custom_tool_call") {
+                item.kind == "function_call" && item.fields.get("call_id") == call_id
+            } else {
+                item.kind == kind
+            }
+        });
+        if let Some(index) = index {
+            output.push(remaining.remove(index));
+        }
+    }
+    output.extend(remaining);
     let incomplete_details = if incomplete {
         json!({"reason": "max_output_tokens"})
     } else {

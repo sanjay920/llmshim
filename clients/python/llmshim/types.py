@@ -210,6 +210,7 @@ class _ResponseMessageBase(TypedDict):
 
 
 class ResponseMessage(_ResponseMessageBase, total=False):
+    responses_output: List[Dict[str, Any]]
     refusal: str
     tool_calls: List[ToolCall]
     reasoning: List[ReasoningBlock]
@@ -309,6 +310,7 @@ class _DoneBase(TypedDict):
 
 
 class DoneEvent(_DoneBase, _Observation, total=False):
+    responses_output: List[Dict[str, Any]]
     finish_reason: str
 
 

@@ -573,6 +573,15 @@ impl Provider for Anthropic {
             }
         }
 
+        if obj.get("parallel_tool_calls") == Some(&json!(false)) {
+            let mut choice = body_obj
+                .get("tool_choice")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "auto"}));
+            choice["disable_parallel_tool_use"] = json!(true);
+            body_obj.insert("tool_choice".into(), choice);
+        }
+
         // Anthropic-specific extensions (x-anthropic namespace)
         if let Some(ext) = obj.get("x-anthropic").and_then(|e| e.as_object()) {
             for (k, v) in ext {

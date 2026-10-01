@@ -1,10 +1,12 @@
 //! Stateless Responses requests over the shared completion handler.
 mod config;
+mod controls;
 mod events;
 mod input;
 mod replay;
 mod response;
 mod stream;
+mod tools;
 pub(super) use replay::{output_options, replay_metadata, restore, retain};
 pub(crate) use stream::stream_identity;
 pub(super) use stream::stream_response;
@@ -19,10 +21,11 @@ pub(super) fn request(native: &Value) -> Result<Value> {
     stateless_fields(native)?;
     let messages = input::messages(native)?;
     let mut controls = Map::new();
+    controls::controls(native, &mut controls)?;
     config::generation_controls(native, &mut controls)?;
     config::reasoning(native, &mut controls)?;
     config::text_format(native, &mut controls)?;
-    config::tools(native, &mut controls)?;
+    tools::tools(native, &mut controls)?;
     config::tool_choice(native, &mut controls)?;
     let mut chat = Map::from_iter([
         ("model".into(), native["model"].clone()),
@@ -78,6 +81,12 @@ fn stateless_fields(native: &Value) -> Result<()> {
                 | "store"
                 | "stream"
                 | "include"
+                | "client_metadata"
+                | "prompt_cache_key"
+                | "parallel_tool_calls"
+                | "service_tier"
+                | "stream_options"
+                | "access_programs"
         ) {
             return Err(format!("unsupported Responses request field: {field}"));
         }

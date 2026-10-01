@@ -323,7 +323,9 @@ impl ToolStream {
                 let part = format!("responses:{index}");
                 match event["type"].as_str() {
                     Some("response.output_item.added" | "response.output_item.done")
-                        if event["item"]["type"] == "function_call" =>
+                        if event["item"]["type"] == "function_call"
+                            || (event["item"]["type"] == "custom_tool_call"
+                                && event["type"] == "response.output_item.done") =>
                     {
                         self.response_item(
                             &part,
@@ -350,7 +352,10 @@ impl ToolStream {
                             .flatten()
                             .enumerate()
                         {
-                            if item["type"] == "function_call" {
+                            if matches!(
+                                item["type"].as_str(),
+                                Some("function_call" | "custom_tool_call")
+                            ) {
                                 self.response_item(
                                     &format!("responses:{i}"),
                                     i as u64,
@@ -675,10 +680,14 @@ impl ToolStream {
         if let Some(id) = item["id"].as_str() {
             self.update(key, 0, index, ToolUpdate::ItemId(id.into()))?;
         }
-        if let Some(name) = item["name"].as_str() {
+        let call = crate::responses_tools::canonical_call(item)?;
+        if let Some(name) = call["function"]["name"].as_str() {
             self.update(key, 0, index, ToolUpdate::Name(name.into()))?;
         }
-        if let Some(args) = item["arguments"].as_str() {
+        if let Some(args) = call["function"]["arguments"]
+            .as_str()
+            .filter(|_| item["arguments"].is_string() || item["type"] == "custom_tool_call")
+        {
             self.update(
                 key,
                 0,
