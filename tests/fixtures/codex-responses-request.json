@@ -1,0 +1,127 @@
+{
+  "model": "openai/gpt-6-astra",
+  "input": [
+    {
+      "type": "additional_tools",
+      "id": "input_0",
+      "role": "developer",
+      "tools": [
+        {
+          "type": "namespace",
+          "name": "functions",
+          "description": "Recorded tool namespace.",
+          "tools": [
+            {
+              "type": "custom",
+              "name": "exec",
+              "description": "Recorded custom tool.",
+              "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: /.+/"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "input_1",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Recorded prompt text."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "input_2",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Recorded prompt text."
+        },
+        {
+          "type": "input_text",
+          "text": "Recorded prompt text."
+        },
+        {
+          "type": "input_text",
+          "text": "Recorded prompt text."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "input_3",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Recorded prompt text."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "input_4",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Recorded prompt text."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "input_5",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Recorded prompt text."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "input_6",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Recorded prompt text."
+        }
+      ]
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": false,
+  "reasoning": {
+    "effort": "low",
+    "context": "all_turns"
+  },
+  "store": false,
+  "stream": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "prompt_cache_key": "recorded-affinity",
+  "text": {
+    "verbosity": "low"
+  },
+  "client_metadata": {
+    "thread_id": "redacted",
+    "turn_id": "redacted",
+    "root_turn_id": "redacted",
+    "x-codex-turn-metadata": "redacted",
+    "x-codex-installation-id": "redacted",
+    "session_id": "redacted",
+    "x-codex-window-id": "redacted"
+  }
+}

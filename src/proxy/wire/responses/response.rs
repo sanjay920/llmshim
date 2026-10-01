@@ -1,9 +1,29 @@
 //! Canonical completions rendered as Responses output items and usage.
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-/// Hashes the canonical ID so Responses response/item IDs remain stable on idempotent replay.
-pub(in crate::proxy::wire) fn response(canonical: &Value, usage: &Value, finish: &str) -> Value {
+#[derive(Clone, Deserialize, Serialize)]
+pub(in crate::proxy::wire) struct Response {
+    pub id: String,
+    pub output: Vec<OutputItem>,
+    #[serde(flatten)]
+    pub fields: Map<String, Value>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(in crate::proxy::wire) struct OutputItem {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<Value>>,
+    #[serde(flatten)]
+    pub fields: Map<String, Value>,
+}
+
+/// Accepts canonical completions and usage; omits empty text and private thinking.
+pub(in crate::proxy::wire) fn response(canonical: &Value, usage: &Value, finish: &str) -> Response {
     let message = &canonical["message"];
     let mut content = Vec::new();
     if let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
@@ -40,56 +60,70 @@ pub(in crate::proxy::wire) fn response(canonical: &Value, usage: &Value, finish:
         Sha256::digest(canonical["id"].to_string().as_bytes())
     );
     let mut output = Vec::new();
+    if !content.is_empty() {
+        output.push(OutputItem {
+            id: format!("msg_{response_id}_{}", output.len()),
+            kind: "message".into(),
+            content: Some(content),
+            fields: Map::from_iter([
+                ("status".into(), json!(status)),
+                ("role".into(), json!("assistant")),
+            ]),
+        });
+    }
     for block in message["reasoning"].as_array().into_iter().flatten() {
-        if let Some(summary) = block["payload"]["summary"]
+        let summary = block["payload"]["summary"]
             .as_array()
-            .filter(|summary| !summary.is_empty())
-        {
-            // A provider's full reasoning text is not a published summary.
-            output.push(json!({
-                "id": format!("rs_{response_id}_{}", output.len()),
-                "type": "reasoning",
-                "summary": summary,
-            }));
+            .cloned()
+            .unwrap_or_default();
+        if !summary.is_empty() || block["data"].is_string() || block["signature"].is_string() {
+            let mut item = OutputItem {
+                id: format!("rs_{response_id}_{}", output.len()),
+                kind: "reasoning".into(),
+                content: None,
+                fields: Map::from_iter([("summary".into(), json!(summary))]),
+            };
+            if block["origin"]["wire"] == "openai-responses" {
+                if let Some(data) = block.get("data") {
+                    item.fields.insert("encrypted_content".into(), data.clone());
+                }
+            }
+            output.push(item);
         }
     }
-    if !content.is_empty() {
-        output.push(json!({
-            "id": format!("msg_{response_id}_{}", output.len()),
-            "type": "message",
-            "status": status,
-            "role": "assistant",
-            "content": content,
-        }));
-    }
     for call in message["tool_calls"].as_array().into_iter().flatten() {
-        output.push(json!({
-            "id": format!("fc_{response_id}_{}", output.len()),
-            "type": "function_call",
-            "status": status,
-            "call_id": call["id"],
-            "name": call["function"]["name"],
-            "arguments": call["function"]["arguments"],
-        }));
+        output.push(OutputItem {
+            id: format!("fc_{response_id}_{}", output.len()),
+            kind: "function_call".into(),
+            content: None,
+            fields: Map::from_iter([
+                ("status".into(), json!(status)),
+                ("call_id".into(), call["id"].clone()),
+                ("name".into(), call["function"]["name"].clone()),
+                ("arguments".into(), call["function"]["arguments"].clone()),
+            ]),
+        });
     }
     let incomplete_details = if incomplete {
         json!({"reason": "max_output_tokens"})
     } else {
         Value::Null
     };
-    json!({
-        "id": format!("resp_{response_id}"),
-        "object": "response",
-        "created_at": canonical["created_at"],
-        "model": canonical["model"],
-        "status": status,
-        "error": null,
-        "incomplete_details": incomplete_details,
-        "output": output,
-        "store": false,
-        "previous_response_id": null,
-        "usage": response_usage(usage),
-    })
+    Response {
+        id: format!("resp_{response_id}"),
+        output,
+        fields: Map::from_iter([
+            ("object".into(), json!("response")),
+            ("created_at".into(), canonical["created_at"].clone()),
+            ("model".into(), canonical["model"].clone()),
+            ("status".into(), json!(status)),
+            ("error".into(), Value::Null),
+            ("incomplete_details".into(), incomplete_details),
+            ("store".into(), json!(false)),
+            ("previous_response_id".into(), Value::Null),
+            ("usage".into(), response_usage(usage)),
+        ]),
+    }
 }
 
 /// Renders normalized counters in the Responses convention: `input_tokens` counts every input

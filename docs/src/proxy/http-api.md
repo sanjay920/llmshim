@@ -12,6 +12,7 @@ and SSE responses.
 |---|---|---|
 | `POST` | `/v1/chat` | A `ChatResponse`, or typed SSE when `stream` is `true` |
 | `POST` | `/v1/chat/stream` | Typed SSE, regardless of the request's `stream` value |
+| `POST` | `/v1/responses` | Stateless Responses JSON or numbered SSE; [contract][responses] |
 | `GET` | `/v1/models` | Models whose providers have configured API keys |
 | `GET` | `/health` | Process health and configured provider names |
 
@@ -43,7 +44,7 @@ Both chat endpoints accept the same body:
 | `messages` | array, required | Full conversation history |
 | `stream` | boolean | On `/v1/chat`, switch the response from JSON to typed SSE; default `false` |
 | `config` | object | Portable generation controls |
-| `provider_config` | object | Non-reserved fields merged into the engine request, including tools and `x-*` namespaces |
+| `provider_config` | object | Non-reserved engine fields, including tools and `x-*` namespaces |
 | `fallback` | string array | Ordered backup models for non-streaming requests only |
 | `response_format` | object | Validated JSON output contract |
 | `x-shim` | object | Capability path selection |
@@ -250,9 +251,16 @@ It does not probe upstream provider availability.
 Before a stream begins, errors use an HTTP status and this JSON envelope:
 
 ```json
-{"error":{"code":"rate_limited","message":"Upstream provider rate limit reached; retry after the suggested delay"}}
+{
+  "error": {
+    "code": "rate_limited",
+    "message": "Upstream provider rate limit reached; retry after the suggested delay"
+  }
+}
 ```
 
 Proactive `429` and `503` responses include `Retry-After` in whole seconds.
 Provider failures normally retain the provider's status. See
 [Errors and retries](../reference/errors.md) for the complete mapping.
+
+[responses]: native-apis.md#responses-streams-and-reasoning-history

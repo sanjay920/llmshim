@@ -2,7 +2,7 @@
 use super::{array, Result};
 use serde_json::{json, Value};
 
-/// Accepts string input or message/call/output items and refuses other item kinds.
+/// Accepts string input or message/call/output/reasoning items and refuses other item kinds.
 pub(super) fn messages(native: &Value) -> Result<Vec<Value>> {
     let mut messages = Vec::new();
     if let Some(instructions) = native.get("instructions") {
@@ -29,6 +29,7 @@ pub(super) fn messages(native: &Value) -> Result<Vec<Value>> {
         messages.push(match kind {
             "message" => message(item)?,
             "function_call_output" => function_call_output(item)?,
+            "reasoning" => reasoning(item)?,
             kind => return Err(format!("unsupported Responses input item: {kind}")),
         });
     }
@@ -120,4 +121,23 @@ fn function_call_output(item: &Value) -> Result<Value> {
         .as_str()
         .ok_or("function_call_output requires output text")?;
     Ok(json!({"role": "tool", "tool_call_id": id, "content": output}))
+}
+
+/// Keep the issued item intact until credential-scoped restoration.
+fn reasoning(item: &Value) -> Result<Value> {
+    for part in array(&item["summary"], "reasoning.summary")? {
+        if part["type"] != "summary_text" || !part["text"].is_string() {
+            return Err("malformed reasoning.summary".into());
+        }
+    }
+    if item
+        .get("encrypted_content")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err("malformed reasoning.encrypted_content".into());
+    }
+    if item.get("id").is_some_and(|value| !value.is_string()) {
+        return Err("malformed reasoning.id".into());
+    }
+    Ok(json!({"role": "assistant","content": null,"x-responses-reasoning": item}))
 }

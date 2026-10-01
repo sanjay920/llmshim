@@ -3,7 +3,8 @@
 The proxy puts a network boundary around the Rust engine. Use it from any
 language that can send JSON over HTTP.
 
-> **Availability:** Rust: engine inside the server · CLI: starts the server · HTTP: compact llmshim API · Clients: connect to this API
+> **Availability:** Rust: engine inside the server · CLI: starts the server · HTTP: compact llmshim
+API · Clients: connect to this API
 
 The proxy has its own compact contract. It is not an OpenAI-compatible proxy.
 
@@ -115,7 +116,7 @@ curl http://localhost:3000/v1/responses \
   -d '{"model":"openai/gpt-6-astra","input":"Hello","store":false}'
 ```
 
-This first increment supports non-streaming requests: string input or message
+This endpoint supports JSON and streaming requests: string input or message
 items with text/image parts, `instructions`, function tools and tool-call/result
 items, `tool_choice`, `max_output_tokens`, `temperature`, `top_p`,
 `reasoning.effort`, and `text.format` (text, JSON object, or JSON Schema).
@@ -131,8 +132,14 @@ cached, and reasoning token details. Token exhaustion returns
 The proxy and gateway share their existing admission, logging, error status,
 Retry-After, and credential behavior with this route.
 
-`previous_response_id`, `conversation`, `store: true`, `stream: true`, hosted
-tools, and reasoning input items return a named 400. Omit `store` and `stream`,
-or set them to `false`. Unknown top-level fields are refused. See the
-[native API design](../proxy/native-apis.md#responses-follow-up-design) for the
-remaining streaming and reasoning replay work.
+Set `stream: true` for Responses SSE events with contiguous sequence numbers and
+a terminal response containing output and usage. Reasoning items returned by an
+earlier request can be included unchanged in `input`; scoped receipts preserve
+provider provenance. Unsupported or unissued reasoning is dropped with reasons
+in `metadata.reasoning_dropped`. Use `include: ["reasoning.encrypted_content"]`
+for encrypted output where supported.
+
+`previous_response_id`, `conversation`, `store: true`, and hosted tools return a
+named 400. Unknown top-level fields are refused. See
+[native APIs](../proxy/native-apis.md#responses-streams-and-reasoning-history)
+for the stream and replay contract.

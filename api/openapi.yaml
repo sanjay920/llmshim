@@ -39,11 +39,13 @@ paths:
   /v1/responses:
     post:
       operationId: nativeResponses
-      summary: Stateless non-streaming OpenAI Responses subset
+      summary: Stateless OpenAI Responses JSON and SSE
       description: >-
         Accepts text/image messages and function call/output items through the shared
-        engine. Hosted tools, reasoning input items, stream true, previous_response_id,
-        conversation and store true are refused with a named 400. Send full history.
+        engine. Reasoning items restore credential-scoped replay receipts; dropped items
+        are noted in metadata.reasoning_dropped. Stream true emits numbered Responses
+        SSE events, ending with completed, incomplete or failed. Hosted tools,
+        previous_response_id, conversation and store true are refused by name. Send full history.
       requestBody:
         required: true
         content:
@@ -92,21 +94,28 @@ paths:
                   additionalProperties: false
                   properties:
                     format: {type: object}
-                stream: {type: boolean, enum: [false]}
+                include:
+                  type: array
+                  items: {type: string, enum: [reasoning.encrypted_content]}
+                stream: {type: boolean}
                 store: {type: boolean, enum: [false]}
       responses:
         '200':
-          description: Responses object with output items and usage token details
+          description: Responses object or numbered SSE sequence with terminal output and usage
           content:
             application/json:
               schema: {type: object}
+            text/event-stream:
+              schema: {type: string}
         default:
           description: Responses error object with preserved status and Retry-After
   /v1/chat/completions:
     post:
       operationId: nativeChatCompletions
       summary: OpenAI Chat Completions compatibility endpoint
-      description: Uses the shared engine and admission path; n must be 1. Stream responses use OpenAI chunks and DONE.
+      description: >-
+        Uses the shared engine and admission path; n must be 1. Stream responses use OpenAI chunks
+        and DONE.
       requestBody:
         required: true
         content:
@@ -127,7 +136,9 @@ paths:
     post:
       operationId: nativeMessages
       summary: Anthropic Messages compatibility endpoint
-      description: Accepts custom function tools. Uses the shared engine and admission path. The gateway accepts x-api-key authentication.
+      description: >-
+        Accepts custom function tools. Uses the shared engine and admission path. The gateway
+        accepts x-api-key authentication.
       requestBody:
         required: true
         content:
@@ -148,7 +159,11 @@ paths:
     post:
       operationId: nativeGeminiGenerateContent
       summary: Google Gemini generateContent compatibility endpoint
-      description: Accepts custom function tools; candidateCount must be 1. Served by the gateway too, where x-goog-api-key authentication is accepted. The routing id lives in the path, so it may contain a slash (`gemini/gemini-3.8-flash`). `?key=` and `?alt=` are not read. Any other action under this prefix answers Google's 404 error object.
+      description: >-
+        Accepts custom function tools; candidateCount must be 1. Served by the gateway too, where
+        x-goog-api-key authentication is accepted. The routing id lives in the path, so it may
+        contain a slash (`gemini/gemini-3.8-flash`). `?key=` and `?alt=` are not read. Any other
+        action under this prefix answers Google's 404 error object.
       parameters:
         - name: model
           in: path
@@ -167,12 +182,15 @@ paths:
             application/json:
               schema: {type: object}
         default:
-          description: Gemini error object with preserved HTTP status and Retry-After when applicable
+          description: >-
+            Gemini error object with preserved HTTP status and Retry-After when applicable
   /v1beta/models/{model}:streamGenerateContent:
     post:
       operationId: nativeGeminiStreamGenerateContent
       summary: Google Gemini streaming compatibility endpoint
-      description: The same request and error contract as generateContent; the response is Gemini SSE, which ends with a finish reason rather than a terminator.
+      description: >-
+        The same request and error contract as generateContent; the response is Gemini SSE, which
+        ends with a finish reason rather than a terminator.
       parameters:
         - name: model
           in: path
@@ -191,7 +209,8 @@ paths:
             text/event-stream:
               schema: {type: string}
         default:
-          description: Gemini error object with preserved HTTP status and Retry-After when applicable
+          description: >-
+            Gemini error object with preserved HTTP status and Retry-After when applicable
   /v1/chat:
     post:
       operationId: chat
@@ -365,7 +384,9 @@ components:
         fallback:
           type: array
           items: {type: string}
-          description: Ordered routing ids tried when the primary model fails, exactly as on the other native facades.
+          description: >-
+            Ordered routing ids tried when the primary model fails, exactly as on the other native
+            facades.
     NativeMessagesRequest:
       type: object
       required: [model, messages]

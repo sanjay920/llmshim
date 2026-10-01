@@ -18,6 +18,7 @@ use axum::{
 };
 use futures::StreamExt;
 pub use receipts::Receipts;
+pub(crate) use responses::stream_identity;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -123,7 +124,16 @@ fn inbound_json_failure(path: &str, status: StatusCode, message: &str) -> Respon
         Some(route) => fail(route.wire, status, message),
         None => (
             status,
-            Json(json!({"error":{"code": if status == StatusCode::PAYLOAD_TOO_LARGE {"request_too_large"} else {"invalid_request"},"message":message}})),
+            Json(json!({
+                "error": {
+                    "code": if status == StatusCode::PAYLOAD_TOO_LARGE {
+                        "request_too_large"
+                    } else {
+                        "invalid_request"
+                    },
+                    "message": message
+                }
+            })),
         )
             .into_response(),
     }
@@ -394,7 +404,14 @@ fn array<'a>(value: &'a Value, name: &str) -> Result<&'a Vec<Value>> {
         .ok_or_else(|| format!("{name} must be an array"))
 }
 fn native_call(call: &Value) -> Value {
-    json!({"id":call["id"],"type":"function","function":{"name":call["function"]["name"],"arguments":call["function"]["arguments"]}})
+    json!({
+        "id": call["id"],
+        "type": "function",
+        "function": {
+            "name": call["function"]["name"],
+            "arguments": call["function"]["arguments"]
+        }
+    })
 }
 fn call_content(call: &Value) -> Result<Value> {
     let args = call["function"]["arguments"]
@@ -410,7 +427,7 @@ fn call_content(call: &Value) -> Result<Value> {
                 return Err("tool arguments exceed JSON complexity limit".into())
             }
         };
-    Ok(json!({"id":call["id"],"name":call["function"]["name"],"arguments":value}))
+    Ok(json!({"id": call["id"],"name": call["function"]["name"],"arguments": value}))
 }
 fn import_call(
     call: &Value,
@@ -436,7 +453,7 @@ fn import_call(
 /// An OpenAI-shaped `unsupported_parameter` refusal, carried through
 /// `normalize_error` so the client sees `param` and `code`, not a bare string.
 fn unsupported_parameter(param: &str, message: &str) -> String {
-    json!({"error":{
+    json!({"error": {
         "message": message,
         "type": "invalid_request_error",
         "param": param,
@@ -446,7 +463,13 @@ fn unsupported_parameter(param: &str, message: &str) -> String {
 }
 
 fn message_key(message: &Value) -> Value {
-    json!({"content":message["content"],"reasoning_content":message["reasoning_content"],"reasoning":message["reasoning"],"reasoning_details":message["reasoning_details"],"thinking_blocks":message["thinking_blocks"]})
+    json!({
+        "content": message["content"],
+        "reasoning_content": message["reasoning_content"],
+        "reasoning": message["reasoning"],
+        "reasoning_details": message["reasoning_details"],
+        "thinking_blocks": message["thinking_blocks"]
+    })
 }
 
 pub fn request_to_chat(
@@ -472,13 +495,15 @@ fn request_to_chat_with_limits(
     restoration_limits: receipts::RestorationLimits,
 ) -> Result<Value> {
     if wire == Wire::Responses {
-        return request_to_chat_with_limits(
+        let mut chat = request_to_chat_with_limits(
             &responses::request(native)?,
             Wire::Chat,
             receipts,
             scope,
             restoration_limits,
-        );
+        )?;
+        responses::restore(&mut chat, receipts, scope, restoration_limits)?;
+        return enforce_canonical_bounds(chat, restoration_limits);
     }
     let mut restoration_budget = receipts::RestorationBudget::new(restoration_limits);
     if wire == Wire::Gemini {
@@ -521,7 +546,7 @@ fn request_to_chat_with_limits(
     let mut boundaries = Vec::new();
     if wire == Wire::Messages {
         if let Some(system) = native.get("system") {
-            messages.push(json!({"role":"system","content":system}));
+            messages.push(json!({"role": "system","content": system}));
         }
     }
     for message in array(&native["messages"], "messages")? {
@@ -585,7 +610,14 @@ fn request_to_chat_with_limits(
         for block in array(&message["content"], "message content")? {
             match block["type"].as_str() {
                 Some("tool_use") if role == "assistant" => {
-                    let call = json!({"id":block["id"],"type":"function","function":{"name":block["name"],"arguments":block["input"].to_string()}});
+                    let call = json!({
+                        "id": block["id"],
+                        "type": "function",
+                        "function": {
+                            "name": block["name"],
+                            "arguments": block["input"].to_string()
+                        }
+                    });
                     let mut call = import_call(&call, receipts, scope, &mut restoration_budget)?;
                     if let Some(cache) = block.get("cache_control") {
                         call["cache_control"] = cache.clone();
@@ -593,7 +625,11 @@ fn request_to_chat_with_limits(
                     calls.push(call);
                 }
                 Some("tool_result") if role == "user" => {
-                    let mut result = json!({"role":"tool","tool_call_id":block["tool_use_id"],"content":block["content"]});
+                    let mut result = json!({
+                        "role": "tool",
+                        "tool_call_id": block["tool_use_id"],
+                        "content": block["content"]
+                    });
                     for field in ["is_error", "cache_control"] {
                         if let Some(value) = block.get(field) {
                             result[field] = value.clone();
@@ -618,7 +654,7 @@ fn request_to_chat_with_limits(
             }
         }
         if !content.is_empty() || !calls.is_empty() || !reasoning.is_empty() {
-            let mut canonical = json!({"role":role,"content":content});
+            let mut canonical = json!({"role": role,"content": content});
             if !calls.is_empty() {
                 canonical["tool_calls"] = Value::Array(calls);
             }
@@ -665,23 +701,42 @@ fn request_to_chat_with_limits(
             if format["type"] == "json_schema" {
                 config.insert(
                     "response_format".into(),
-                    json!({"type":"json_schema","json_schema":{"schema":format["schema"]}}),
+                    json!({"type": "json_schema","json_schema": {"schema": format["schema"]}}),
                 );
             }
         }
         if let Some(tools) = native.get("tools") {
-            config.insert("tools".into(),json!(array(tools,"tools")?.iter().map(|tool|{
-                let mut out=json!({"type":"function","function":{"name":tool["name"],"parameters":tool["input_schema"]}});
-                for field in ["description","strict"] {if let Some(value)=tool.get(field){out["function"][field]=value.clone();}}
-                if let Some(cache)=tool.get("cache_control"){out["cache_control"]=cache.clone();}out
-            }).collect::<Vec<_>>()));
+            config.insert(
+                "tools".into(),
+                json!(array(tools, "tools")?
+                    .iter()
+                    .map(|tool| {
+                        let mut out = json!({
+                            "type": "function",
+                            "function": {
+                                "name": tool["name"],
+                                "parameters": tool["input_schema"]
+                            }
+                        });
+                        for field in ["description", "strict"] {
+                            if let Some(value) = tool.get(field) {
+                                out["function"][field] = value.clone();
+                            }
+                        }
+                        if let Some(cache) = tool.get("cache_control") {
+                            out["cache_control"] = cache.clone();
+                        }
+                        out
+                    })
+                    .collect::<Vec<_>>()),
+            );
         }
         if let Some(choice) = native.get("tool_choice") {
             let choice = match choice["type"].as_str() {
                 Some("any") => json!("required"),
                 Some("auto") => json!("auto"),
                 Some("none") => json!("none"),
-                Some("tool") => json!({"type":"function","function":{"name":choice["name"]}}),
+                Some("tool") => json!({"type": "function","function": {"name": choice["name"]}}),
                 _ => return Err("invalid tool_choice".into()),
             };
             config.insert("tool_choice".into(), choice);
@@ -740,7 +795,7 @@ fn render_error(wire: Wire, error: &crate::error::NormalizedError, status: Statu
             } else {
                 kind
             };
-            json!({"type":"error","error":{"type":kind,"message":error.message}})
+            json!({"type": "error","error": {"type": kind,"message": error.message}})
         }
         Wire::Chat | Wire::Responses => {
             let kind = error
@@ -748,7 +803,14 @@ fn render_error(wire: Wire, error: &crate::error::NormalizedError, status: Statu
                 .as_deref()
                 .or(error.code_type())
                 .unwrap_or(fallback_type);
-            json!({"error":{"type":kind,"message":error.message,"param":error.param,"code":error.code}})
+            json!({
+                "error": {
+                    "type": kind,
+                    "message": error.message,
+                    "param": error.param,
+                    "code": error.code
+                }
+            })
         }
     }
 }
@@ -767,7 +829,7 @@ fn error_frame(wire: Wire, body: Value) -> Event {
 
 fn error_from_event(wire: Wire, event: &Value) -> Value {
     match event.get("error").filter(|error| error.is_object()) {
-        Some(error) => error_body(wire, &json!({"error":error}).to_string()),
+        Some(error) => error_body(wire, &json!({"error": error}).to_string()),
         None => error_body(
             wire,
             event["message"]
@@ -818,6 +880,14 @@ fn fallback_error_type(wire: Wire, status: StatusCode) -> &'static str {
 /// Both aliases call the existing chat handlers after this body translation, so
 /// queueing, quotas, authentication, retry headers and cancellation stay shared.
 pub async fn translate(request: Request, next: Next) -> Response {
+    translate_with_router(request, next, None).await
+}
+
+pub(crate) async fn translate_with_router(
+    request: Request,
+    next: Next,
+    router: Option<&crate::router::Router>,
+) -> Response {
     if request.method() != axum::http::Method::POST {
         return next.run(request).await;
     }
@@ -906,9 +976,14 @@ pub async fn translate(request: Request, next: Next) -> Response {
         native["stream"] = json!(route.streams);
     }
     let response_model = native["model"].clone();
+    let include_reasoning = native["include"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item == "reasoning.encrypted_content")
+    });
     let request_receipts = receipts.clone();
     let request_scope = scope.clone();
-    let chat = match receipt_executor
+    let mut chat = match receipt_executor
         .run(ReceiptWorkKind::Ingress, move || {
             request_to_chat_with_limits(
                 &native,
@@ -932,6 +1007,39 @@ pub async fn translate(request: Request, next: Next) -> Response {
         }
         Err(error) => return receipt_work_failure(wire, error, StatusCode::BAD_REQUEST),
     };
+    let replay_metadata = if wire == Wire::Responses {
+        let destination = router.and_then(|router| {
+            let req =
+                serde_json::from_value::<crate::proxy::types::ChatRequest>(chat.clone()).ok()?;
+            let prepared = crate::proxy::convert::prepare_request(router, &req).ok()?;
+            let (provider, model) = router
+                .resolve_owned(prepared.payload["model"].as_str()?)
+                .ok()?;
+            Some((provider, model, prepared.payload))
+        });
+        let result = receipt_executor
+            .run(ReceiptWorkKind::Ingress, move || {
+                let target = destination.and_then(|(provider, model, payload)| {
+                    let native = provider.transform_request(&model, &payload).ok()?;
+                    Some(provider.request_replay_target(&model, &native))
+                });
+                let metadata = responses::replay_metadata(&mut chat, target.as_ref())?;
+                Ok((
+                    enforce_canonical_bounds(chat, restoration_limits)?,
+                    metadata,
+                ))
+            })
+            .await;
+        match result {
+            Ok((prepared, metadata)) => {
+                chat = prepared;
+                metadata
+            }
+            Err(error) => return receipt_work_failure(wire, error, StatusCode::BAD_REQUEST),
+        }
+    } else {
+        json!({})
+    };
     let serialized_chat = match serialize_canonical_request(&chat, canonical_maximum_bytes) {
         Ok(serialized) => serialized,
         Err(message) => return fail(wire, StatusCode::PAYLOAD_TOO_LARGE, &message),
@@ -953,88 +1061,313 @@ pub async fn translate(request: Request, next: Next) -> Response {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream"))
     {
+        if wire == Wire::Responses {
+            let generated = responses::stream_response(
+                body,
+                response_model,
+                receipts,
+                scope,
+                receipt_executor,
+                replay_metadata,
+                include_reasoning,
+            )
+            .into_response();
+            return Response::from_parts(parts, generated.into_body());
+        }
         let model = response_model;
         let events = async_stream::stream! {
             let mut stream = Box::pin(crate::sse::data(body.into_data_stream()));
-            let mut response=json!({"id":format!("msg_{}",uuid::Uuid::new_v4().simple()),"model":model,"message":{"role":"assistant","content":""},"usage":{},"finish_reason":"stop"});
-            response["created"]=json!(chrono::Utc::now().timestamp());
-            let mut text_started=false;
-            let start=if wire==Wire::Chat {
-                json!({"id":response["id"],"model":model,"object":"chat.completion.chunk","created":response["created"],"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]})
-            } else {json!({"type":"message_start","message":{"id":response["id"],"type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}})};
+            let mut response = json!({
+                "id": format!("msg_{}",
+                uuid::Uuid::new_v4().simple()),
+                "model": model,
+                "message": {
+                    "role": "assistant",
+                    "content": ""
+                },
+                "usage": {
+                },
+                "finish_reason": "stop"
+            });
+            response["created"] = json!(chrono::Utc::now().timestamp());
+            let mut text_started = false;
+            let start = if wire == Wire::Chat {
+                json!({
+                    "id": response["id"],
+                    "model": model,
+                    "object": "chat.completion.chunk",
+                    "created": response["created"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant"
+                            },
+                            "finish_reason": null
+                        }
+                    ]
+                })
+            } else {
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": response["id"],
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [
+                        ],
+                        "stop_reason": null,
+                        "stop_sequence": null,
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0
+                        }
+                    }
+                })
+            };
             // Gemini's own chunks each carry the role, so that wire opens with
             // its first rendered frame rather than a synthetic role chunk whose
             // model would only be the one the caller asked for.
-            if wire!=Wire::Gemini {
+            if wire != Wire::Gemini {
                 let mut start_event = Event::default();
                 if wire == Wire::Messages {
                     start_event = start_event.event("message_start");
                 }
                 yield Ok::<Event, Infallible>(start_event.data(start.to_string()));
             }
-            let mut reasoning=crate::reasoning::ReasoningAccumulator::default();let mut size=0usize;let mut done=false;
-            while let Some(event)=stream.next().await {
-                let event=match event{Ok(event)=>event,Err(_)=>{yield Ok::<Event,Infallible>(error_frame(wire,error_body(wire,"upstream stream failed")));return;}};
-                size=size.saturating_add(event.len());
-                if size>32*1024*1024 {yield Ok(error_frame(wire,error_body(wire,"response exceeds size limit")));return;}
-                let data:Value=match serde_json::from_str(&event){Ok(data)=>data,Err(_)=>continue};
+            let mut reasoning = crate::reasoning::ReasoningAccumulator::default();
+            let mut size = 0usize;
+            let mut done = false;
+            while let Some(event) = stream.next().await {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(_) => {
+                        yield Ok::<Event, Infallible>(error_frame(
+                            wire,
+                            error_body(wire, "upstream stream failed"),
+                        ));
+                        return;
+                    }
+                };
+                size = size.saturating_add(event.len());
+                if size > 32 * 1024 * 1024 {
+                    yield Ok(error_frame(
+                        wire,
+                        error_body(wire, "response exceeds size limit"),
+                    ));
+                    return;
+                }
+                let data: Value = match serde_json::from_str(&event) {
+                    Ok(data) => data,
+                    Err(_) => continue,
+                };
                 match data["type"].as_str() {
-                    Some("content")=>{
+                    Some("content") => {
                         crate::streaming::append_string_fragment(
                             &mut response["message"]["content"],
                             data["text"].as_str().unwrap_or(""),
                         );
-                        if wire==Wire::Chat {
-                            yield Ok(Event::default().data(json!({"id":response["id"],"model":model,"object":"chat.completion.chunk","created":response["created"],"choices":[{"index":0,"delta":{"content":data["text"]},"finish_reason":null}]}).to_string()));
-                        } else if wire==Wire::Gemini {
-                            yield Ok(Event::default().data(json!({"candidates":[{"content":{"role":"model","parts":[{"text":data["text"]}]},"index":0}]}).to_string()));
+                        if wire == Wire::Chat {
+                            yield Ok(Event::default().data(
+                                json!({
+                                    "id": response["id"],
+                                    "model": model,
+                                    "object": "chat.completion.chunk",
+                                    "created": response["created"],
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {
+                                                "content": data["text"]
+                                            },
+                                            "finish_reason": null
+                                        }
+                                    ]
+                                })
+                                .to_string(),
+                            ));
+                        } else if wire == Wire::Gemini {
+                            yield Ok(Event::default().data(
+                                json!({
+                                    "candidates": [
+                                        {
+                                            "content": {
+                                                "role": "model",
+                                                "parts": [
+                                                    {
+                                                        "text": data["text"]
+                                                    }
+                                                ]
+                                            },
+                                            "index": 0
+                                        }
+                                    ]
+                                })
+                                .to_string(),
+                            ));
                         } else {
-                            if !text_started {yield Ok(Event::default().event("content_block_start").data(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}).to_string()));text_started=true;}
-                            yield Ok(Event::default().event("content_block_delta").data(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":data["text"]}}).to_string()));
+                            if !text_started {
+                                yield Ok(Event::default().event("content_block_start").data(
+                                    json!({
+                                        "type": "content_block_start",
+                                        "index": 0,
+                                        "content_block": {
+                                            "type": "text",
+                                            "text": ""
+                                        }
+                                    })
+                                    .to_string(),
+                                ));
+                                text_started = true;
+                            }
+                            yield Ok(Event::default().event("content_block_delta").data(
+                                json!({
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {
+                                        "type": "text_delta",
+                                        "text": data["text"]
+                                    }
+                                })
+                                .to_string(),
+                            ));
                         }
-                    },
-                    Some("reasoning")=>if reasoning.push(&json!({"reasoning":data["blocks"]})).is_err(){yield Ok(error_frame(wire,error_body(wire,crate::stream_retention::RETENTION_ERROR)));return;},
-                    Some("tool_call")=>{if !response["message"]["tool_calls"].is_array(){response["message"]["tool_calls"]=json!([]);}
-                        let mut call=json!({"id":data["id"],"type":"function","function":{"name":data["name"],"arguments":data["arguments"]},"wire_ids":data["wire_ids"]});if let Some(sig)=data.get("thought_signature"){call["thought_signature"]=sig.clone();}
-                        response["message"]["tool_calls"].as_array_mut().unwrap().push(call);response["finish_reason"]=json!("tool_calls");},
-                    Some("usage")=>response["usage"]=data.clone(),
-                    Some("done")=>{done=true;if let Some(finish)=data.get("finish_reason"){response["finish_reason"]=finish.clone();}
-                        if let Some(served)=data.get("x-llmshim-served-model"){response["x-llmshim-served-model"]=served.clone();}break;},
-                    Some("error")=>{yield Ok(error_frame(wire,error_from_event(wire,&data)));return;},
-                    _=>{},
+                    }
+                    Some("reasoning") => {
+                        if reasoning
+                            .push(&json!({
+                                "reasoning": data["blocks"]
+                            }))
+                            .is_err()
+                        {
+                            yield Ok(error_frame(
+                                wire,
+                                error_body(wire, crate::stream_retention::RETENTION_ERROR),
+                            ));
+                            return;
+                        }
+                    }
+                    Some("tool_call") => {
+                        if !response["message"]["tool_calls"].is_array() {
+                            response["message"]["tool_calls"] = json!([]);
+                        }
+                        let mut call = json!({
+                            "id": data["id"],
+                            "type": "function",
+                            "function": {
+                                "name": data["name"],
+                                "arguments": data["arguments"]
+                            },
+                            "wire_ids": data["wire_ids"]
+                        });
+                        if let Some(sig) = data.get("thought_signature") {
+                            call["thought_signature"] = sig.clone();
+                        }
+                        response["message"]["tool_calls"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(call);
+                        response["finish_reason"] = json!("tool_calls");
+                    }
+                    Some("usage") => response["usage"] = data.clone(),
+                    Some("done") => {
+                        done = true;
+                        if let Some(finish) = data.get("finish_reason") {
+                            response["finish_reason"] = finish.clone();
+                        }
+                        if let Some(served) = data.get("x-llmshim-served-model") {
+                            response["x-llmshim-served-model"] = served.clone();
+                        }
+                        break;
+                    }
+                    Some("error") => {
+                        yield Ok(error_frame(wire, error_from_event(wire, &data)));
+                        return;
+                    }
+                    _ => {}
                 }
             }
-            if !done {yield Ok(error_frame(wire,error_body(wire,"stream ended before completion")));return;}
-            let blocks=reasoning.blocks();if !blocks.is_empty(){response["message"]["reasoning"]=json!(blocks);}
-            let response_receipts=receipts.clone();
-            let response_scope=scope.clone();
-            let native=match receipt_executor.run(ReceiptWorkKind::Egress, move || response_from_chat(&response,wire,&response_receipts,&response_scope)).await {
-                Ok(value)=>value,
-                Err(ReceiptWorkError::Failed(error))=>{yield Ok(error_frame(wire,error_body(wire,&error)));return;},
-                Err(ReceiptWorkError::Busy)=>{yield Ok(error_frame(wire,error_body(wire,"native replay metadata is busy; retry the request")));return;},
+            if !done {
+                yield Ok(error_frame(
+                    wire,
+                    error_body(wire, "stream ended before completion"),
+                ));
+                return;
+            }
+            let blocks = reasoning.blocks();
+            if !blocks.is_empty() {
+                response["message"]["reasoning"] = json!(blocks);
+            }
+            let response_receipts = receipts.clone();
+            let response_scope = scope.clone();
+            let native = match receipt_executor
+                .run(ReceiptWorkKind::Egress, move || {
+                    response_from_chat(&response, wire, &response_receipts, &response_scope)
+                })
+                .await
+            {
+                Ok(value) => value,
+                Err(ReceiptWorkError::Failed(error)) => {
+                    yield Ok(error_frame(wire, error_body(wire, &error)));
+                    return;
+                }
+                Err(ReceiptWorkError::Busy) => {
+                    yield Ok(error_frame(
+                        wire,
+                        error_body(wire, "native replay metadata is busy; retry the request"),
+                    ));
+                    return;
+                }
             };
-            let mut native=native;
-            if wire==Wire::Chat {
+            let mut native = native;
+            if wire == Wire::Chat {
                 // Text was already streamed. Emit completed reasoning/calls once.
-                native["choices"][0]["message"].as_object_mut().unwrap().remove("content");
-            } else if wire==Wire::Gemini {
+                native["choices"][0]["message"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("content");
+            } else if wire == Wire::Gemini {
                 // Only the answer text was streamed already. A thought part
                 // carries `text` too, and reasoning has no other container on
                 // this wire, so dropping it here would lose the block and its
                 // signature from every streamed answer.
-                native["candidates"][0]["content"]["parts"].as_array_mut().unwrap().retain(|part|part.get("thought").is_some()||part.get("text").is_none());
+                native["candidates"][0]["content"]["parts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|part| part.get("thought").is_some() || part.get("text").is_none());
             } else {
-                if text_started {yield Ok(Event::default().event("content_block_stop").data(json!({"type":"content_block_stop","index":0}).to_string()));}
-                native["content"].as_array_mut().unwrap().retain(|block|block["type"]!="text");
+                if text_started {
+                    yield Ok(Event::default().event("content_block_stop").data(
+                        json!({
+                            "type": "content_block_stop",
+                            "index": 0
+                        })
+                        .to_string(),
+                    ));
+                }
+                native["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|block| block["type"] != "text");
             }
-            for (event,data) in stream_frames(&native,wire){
-                if wire==Wire::Messages && event.as_deref()==Some("message_start"){continue;}
-                let data=if wire==Wire::Messages && text_started {
+            for (event, data) in stream_frames(&native, wire) {
+                if wire == Wire::Messages && event.as_deref() == Some("message_start") {
+                    continue;
+                }
+                let data = if wire == Wire::Messages && text_started {
                     match serde_json::from_str::<Value>(&data) {
-                        Ok(mut value)=>{if let Some(index)=value["index"].as_u64(){value["index"]=json!(index+1);}value.to_string()},
-                        Err(_)=>data,
+                        Ok(mut value) => {
+                            if let Some(index) = value["index"].as_u64() {
+                                value["index"] = json!(index + 1);
+                            }
+                            value.to_string()
+                        }
+                        Err(_) => data,
                     }
-                }else{data};
+                } else {
+                    data
+                };
                 let mut out = Event::default();
                 if let Some(event) = event {
                     out = out.event(event);
@@ -1061,7 +1394,7 @@ pub async fn translate(request: Request, next: Next) -> Response {
             )
         }
     };
-    let native = if parts.status.is_success() {
+    let mut native = if parts.status.is_success() {
         let response_receipts = receipts.clone();
         let response_scope = scope.clone();
         match receipt_executor
@@ -1088,6 +1421,20 @@ pub async fn translate(request: Request, next: Next) -> Response {
             )
         }
     };
+    if wire == Wire::Responses && parts.status.is_success() {
+        let mut response = match serde_json::from_value::<responses::Response>(native) {
+            Ok(response) => response,
+            Err(_) => {
+                return fail(
+                    wire,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "malformed Responses output",
+                );
+            }
+        };
+        responses::output_options(&mut response, replay_metadata, include_reasoning);
+        native = json!(response);
+    }
     if let Some(served) = native["x-llmshim-served-model"].as_str() {
         if let Ok(header) = served.parse() {
             parts.headers.insert("x-llmshim-served-model", header);
@@ -1137,29 +1484,46 @@ mod async_receipt_tests {
 
     fn issued_call(id: &str) -> Value {
         json!({
-            "id":id,
-            "type":"function",
-            "function":{"name":"read","arguments":"{}"},
-            "thought_signature":{"data":"ordinary-signature","origin":{"provider":"gemini","model":"model","family":null,"wire":"google-generate-content","received_at":"2026-09-22T00:00:00Z"}},
-            "wire_ids":[{"provider":"gemini","wire":"google-generate-content","scope":"scope","part_id":"0","id":null}]
+            "id": id,
+            "type": "function",
+            "function": {"name": "read","arguments": "{}"},
+            "thought_signature": {
+                "data": "ordinary-signature",
+                "origin": {
+                    "provider": "gemini",
+                    "model": "model",
+                    "family": null,
+                    "wire": "google-generate-content",
+                    "received_at": "2026-09-22T00:00:00Z"
+                }
+            },
+            "wire_ids": [
+                {
+                    "provider": "gemini",
+                    "wire": "google-generate-content",
+                    "scope": "scope",
+                    "part_id": "0",
+                    "id": null
+                }
+            ]
         })
     }
 
     fn canonical_response() -> Value {
         json!({
-            "id":"response-id",
-            "model":"local/test",
-            "message":{
-                "role":"assistant",
-                "content":"",
-                "tool_calls":[{
-                    "id":"call_ls_shared",
-                    "type":"function",
-                    "function":{"name":"read","arguments":"{}"}
+            "id": "response-id",
+            "model": "local/test",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_ls_shared",
+                    "type": "function",
+                    "function": {"name": "read","arguments": "{}"}
                 }]
             },
-            "finish_reason":"tool_calls",
-            "usage":{}
+            "finish_reason": "tool_calls",
+            "usage": {}
         })
     }
 
@@ -1183,7 +1547,7 @@ mod async_receipt_tests {
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(
-                json!({"model":"local/test","messages":[{"role":"user","content":"hi"}]})
+                json!({"model": "local/test","messages": [{"role": "user","content": "hi"}]})
                     .to_string(),
             ))
             .unwrap()
@@ -1227,8 +1591,17 @@ mod async_receipt_tests {
             ));
         let native_call = native_call(&call);
         let repeated = json!({
-            "model":"local/test",
-            "messages":[{"role":"assistant","content":null,"tool_calls":[native_call.clone(),native_call.clone()]}]
+            "model": "local/test",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        native_call.clone(),
+                        native_call.clone()
+                    ]
+                }
+            ]
         });
         let refused = application
             .clone()
@@ -1252,8 +1625,8 @@ mod async_receipt_tests {
         );
 
         let valid = json!({
-            "model":"local/test",
-            "messages":[{"role":"assistant","content":null,"tool_calls":[native_call]}]
+            "model": "local/test",
+            "messages": [{"role": "assistant","content": null,"tool_calls": [native_call]}]
         });
         let accepted = application
             .oneshot(
@@ -1304,8 +1677,16 @@ mod async_receipt_tests {
                     .uri("/v1/messages")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        json!({"model":"local/test","messages":[{"role":"user","content":"ordinary"}]})
-                            .to_string(),
+                        json!({
+                            "model": "local/test",
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": "ordinary"
+                                }
+                            ]
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -1344,20 +1725,26 @@ mod async_receipt_tests {
         let scope = "mixed-scope";
         let call = issued_call("call_ls_mixed");
         receipts.put(scope, "call", &call["id"], &call).unwrap();
-        let exported_block = json!({"type":"redacted_thinking","data":"lsr_mixed"});
+        let exported_block = json!({"type": "redacted_thinking","data": "lsr_mixed"});
         let canonical_block = json!({
-            "kind":"redacted",
-            "data":"ordinary-redacted-data",
-            "origin":{"provider":"openai","model":"model","family":null,"wire":"openai-responses","received_at":"2026-09-22T00:00:00Z"},
-            "payload":{"type":"reasoning","encrypted_content":"ordinary-redacted-data"}
+            "kind": "redacted",
+            "data": "ordinary-redacted-data",
+            "origin": {
+                "provider": "openai",
+                "model": "model",
+                "family": null,
+                "wire": "openai-responses",
+                "received_at": "2026-09-22T00:00:00Z"
+            },
+            "payload": {"type": "reasoning","encrypted_content": "ordinary-redacted-data"}
         });
         receipts
             .put(scope, "block", &exported_block, &canonical_block)
             .unwrap();
         let native = json!({
-            "model":"local/test",
-            "messages":[{"role":"assistant","content":[
-                {"type":"tool_use","id":"call_ls_mixed","name":"read","input":{}},
+            "model": "local/test",
+            "messages": [{"role": "assistant","content": [
+                {"type": "tool_use","id": "call_ls_mixed","name": "read","input": {}},
                 exported_block
             ]}]
         });
@@ -1386,8 +1773,8 @@ mod async_receipt_tests {
         let receipt_directory = tempfile::tempdir().unwrap();
         let receipts = Receipts::new(receipt_directory.path().to_owned());
         let native = json!({
-            "model":"local/test",
-            "messages":[{"role":"user","content":"ordinary"}]
+            "model": "local/test",
+            "messages": [{"role": "user","content": "ordinary"}]
         });
         let error = request_to_chat_with_limits(
             &native,
@@ -1419,9 +1806,9 @@ mod async_receipt_tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "model":"local/test",
-                            "messages":[],
-                            "ignored":wide
+                            "model": "local/test",
+                            "messages": [],
+                            "ignored": wide
                         })
                         .to_string(),
                     ))
@@ -1456,11 +1843,20 @@ mod async_receipt_tests {
                         release_handler.notified().await;
                         if streaming {
                             let events = vec![
-                                Ok::<_, Infallible>(Event::default().data(
-                                    json!({"type":"tool_call","id":"call_ls_overlap","name":"read","arguments":"{}"}).to_string(),
-                                )),
+                                Ok::<_, Infallible>(
+                                    Event::default().data(
+                                        json!({
+                                            "type": "tool_call",
+                                            "id": "call_ls_overlap",
+                                            "name": "read",
+                                            "arguments": "{}"
+                                        })
+                                        .to_string(),
+                                    ),
+                                ),
                                 Ok(Event::default().data(
-                                    json!({"type":"done","finish_reason":"tool_calls"}).to_string(),
+                                    json!({"type": "done","finish_reason": "tool_calls"})
+                                        .to_string(),
                                 )),
                             ];
                             Sse::new(stream::iter(events)).into_response()
@@ -1524,7 +1920,17 @@ mod async_receipt_tests {
             let mut native_request = request();
             if streaming {
                 *native_request.body_mut() = Body::from(
-                    json!({"model":"local/test","stream":true,"messages":[{"role":"user","content":"hi"}]}).to_string(),
+                    json!({
+                        "model": "local/test",
+                        "stream": true,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": "hi"
+                            }
+                        ]
+                    })
+                    .to_string(),
                 );
             }
             let response_task = tokio::spawn(application.oneshot(native_request));

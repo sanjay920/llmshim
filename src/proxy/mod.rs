@@ -109,7 +109,14 @@ fn app_with_origin_policy_and_deadlines(
         .route("/v1/chat/stream", post(handlers::chat_stream))
         .route("/v1/models", get(handlers::list_models))
         .route("/health", get(handlers::health))
-        .layer(axum::middleware::from_fn(wire::translate))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            |axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+            request,
+            next| async move {
+                wire::translate_with_router(request, next, Some(&state.router)).await
+            },
+        ))
         .layer(axum::middleware::from_fn(
             wire::bound_inference_request_json,
         ))
@@ -243,13 +250,16 @@ mod preparation_lifetime_tests {
                             .await
                             .expect("test release semaphore remains open")
                             .forget();
-                        yield Ok::<_, Infallible>(serde_json::json!({
-                            "id": "response",
-                            "model": "local/test",
-                            "message": {"role": "assistant", "content": "ok"},
-                            "usage": {},
-                            "finish_reason": "stop"
-                        }).to_string());
+                        yield Ok::<_, Infallible>(
+                            serde_json::json!({
+                                "id": "response",
+                                "model": "local/test",
+                                "message": {"role": "assistant", "content": "ok"},
+                                "usage": {},
+                                "finish_reason": "stop"
+                            })
+                            .to_string(),
+                        );
                     };
                     (
                         [((axum::http::header::CONTENT_TYPE), "application/json")],
@@ -404,11 +414,14 @@ mod preparation_lifetime_tests {
         );
         let delayed_stream_body = async_stream::stream! {
             tokio::time::sleep(Duration::from_millis(40)).await;
-            yield Ok::<_, Infallible>(serde_json::json!({
-                "model": "local/test",
-                "stream": true,
-                "messages": [{"role": "user", "content": "hi"}]
-            }).to_string());
+            yield Ok::<_, Infallible>(
+                serde_json::json!({
+                    "model": "local/test",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            );
         };
         let first = application
             .clone()
@@ -584,7 +597,7 @@ mod preparation_lifetime_tests {
             std::thread::sleep(Duration::from_millis(20));
             (
                 StatusCode::GATEWAY_TIMEOUT,
-                axum::Json(serde_json::json!({"inner":"must be discarded"})),
+                axum::Json(serde_json::json!({"inner": "must be discarded"})),
             )
         };
         let state = state();
