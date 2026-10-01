@@ -117,6 +117,31 @@ omits an ID, the server assigns one; gateway idempotency replay preserves both.
 when the provider returns reasoning text. `reasoning_tokens` is omitted when
 zero; the other usage fields are always present.
 
+## Normalized token accounting
+
+Every compact `usage` object and typed SSE `usage` event contains
+`uncached_input_tokens` and `x-llmshim-usage`. Native Chat Completions and
+Messages place the same extension inside `usage`; Gemini places it inside
+`usageMetadata`. It survives the final usage frame on every streaming facade.
+
+The extension always contains five unsigned counts: `uncached_input_tokens`,
+`cache_read_tokens`, `cache_write_tokens`, `output_tokens`, and
+`reasoning_tokens`, including zero values. Uncached input excludes both cache
+reads and cache writes. Output and reasoning preserve the upstream counts;
+reasoning may be included in output, so do not add them together. Zero means
+the provider reported no count for that class. Streaming counts are cumulative
+snapshots, not increments.
+
+Native field conventions remain native: Messages `input_tokens` excludes cache
+reads and writes, which travel as `cache_read_input_tokens` and
+`cache_creation_input_tokens`. Chat `prompt_tokens` and Gemini
+`promptTokenCount` include all input classes. Chat also exposes cache reads in
+`prompt_tokens_details.cached_tokens` and reasoning in
+`completion_tokens_details.reasoning_tokens`; Gemini uses
+`cachedContentTokenCount` and `thoughtsTokenCount`. Compact `input_tokens`
+retains the engine's original prompt convention for compatibility; use the
+extension when comparing providers.
+
 ## Idempotency replay retention
 
 For completed unary gateway requests, an idempotency key enables a process-local

@@ -92,10 +92,15 @@ pub(in crate::proxy::wire) fn response(canonical: &Value, usage: &Value, finish:
     })
 }
 
-/// Accepts normalized token/cost counters and defaults absent reasoning tokens to zero.
+/// Renders normalized counters in the Responses convention: `input_tokens` counts every input
+/// token, cached or not, whatever convention the upstream provider reported in.
 fn response_usage(usage: &Value) -> Value {
+    let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+    let input = count("uncached_input_tokens")
+        .saturating_add(count("cache_read_tokens"))
+        .saturating_add(count("cache_write_tokens"));
     json!({
-        "input_tokens": usage["input_tokens"],
+        "input_tokens": input,
         "output_tokens": usage["output_tokens"],
         "total_tokens": usage["total_tokens"],
         "input_tokens_details": {

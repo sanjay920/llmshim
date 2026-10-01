@@ -7,6 +7,7 @@ pub(crate) mod lifetime;
 pub(crate) mod origin;
 pub mod ratelimit;
 pub mod types;
+mod usage;
 pub mod wire;
 
 use crate::log::Logger;

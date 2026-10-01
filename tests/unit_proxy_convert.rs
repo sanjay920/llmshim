@@ -93,6 +93,7 @@ fn response_with_tool_calls() {
         reasoning: None,
         usage: Usage {
             input_tokens: 10,
+            uncached_input_tokens: 0,
             output_tokens: 5,
             reasoning_tokens: 0,
             cache_read_tokens: 0,
@@ -130,6 +131,7 @@ fn response_with_reasoning_tokens() {
         reasoning: Some("I calculated...".into()),
         usage: Usage {
             input_tokens: 10,
+            uncached_input_tokens: 0,
             output_tokens: 5,
             reasoning_tokens: 50,
             cache_read_tokens: 0,
@@ -187,6 +189,7 @@ fn stream_event_tool_call_has_all_fields() {
 fn stream_event_usage_has_tokens() {
     let e = StreamEvent::Usage(Usage {
         input_tokens: 10,
+        uncached_input_tokens: 0,
         output_tokens: 5,
         reasoning_tokens: 3,
         cache_read_tokens: 0,

@@ -744,9 +744,34 @@ components:
           type: boolean
           description: Streaming snapshot replaces the assembled part
 
+    NormalizedUsage:
+      type: object
+      required: [uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens]
+      properties:
+        uncached_input_tokens:
+          type: integer
+          minimum: 0
+        cache_read_tokens:
+          type: integer
+          minimum: 0
+        cache_write_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        reasoning_tokens:
+          type: integer
+          minimum: 0
+
     Usage:
       type: object
       properties:
+        uncached_input_tokens:
+          type: integer
+          minimum: 0
+        x-llmshim-usage:
+          $ref: '#/components/schemas/NormalizedUsage'
         cache_read_tokens:
           type: integer
           description: Input tokens served from a provider cache (zero when not reported)
@@ -828,6 +853,11 @@ components:
             type:
               type: string
               const: usage
+            uncached_input_tokens:
+              type: integer
+              minimum: 0
+            x-llmshim-usage:
+              $ref: '#/components/schemas/NormalizedUsage'
             cache_read_tokens:
               type: integer
             cache_write_tokens:
