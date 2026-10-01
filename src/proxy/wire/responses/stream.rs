@@ -24,6 +24,12 @@ pub(crate) fn stream_identity(chunk: &str) -> Option<Event> {
     )
 }
 
+pub(in crate::proxy::wire) struct StreamOptions {
+    pub metadata: Value,
+    pub include: bool,
+    pub redactor: Option<super::super::ResponseRedactor>,
+}
+
 /// Accepts the shared engine stream and include selection; fails on upstream or receipt errors.
 pub(in crate::proxy::wire) fn stream_response(
     body: Body,
@@ -31,9 +37,13 @@ pub(in crate::proxy::wire) fn stream_response(
     receipts: Arc<Receipts>,
     scope: String,
     executor: ReceiptExecutor,
-    metadata: Value,
-    include: bool,
+    options: StreamOptions,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let StreamOptions {
+        metadata,
+        include,
+        redactor,
+    } = options;
     Sse::new(async_stream::stream! {
         let mut canonical = json!({
             "id": format!("msg_{}",
@@ -176,6 +186,9 @@ pub(in crate::proxy::wire) fn stream_response(
             return;
         }
         canonical["message"]["reasoning"] = json!(reasoning.blocks());
+        if let Some(redactor) = &redactor {
+            canonical = (redactor.0)(&canonical);
+        }
         let failure_snapshot = super::response(&canonical, &canonical["usage"], "stop");
         let native = executor
             .run(ReceiptWorkKind::Egress, move || {
@@ -238,8 +251,11 @@ mod tests {
                 receipts,
                 "scope".into(),
                 ReceiptExecutor::new(),
-                json!({}),
-                false,
+                StreamOptions {
+                    metadata: json!({}),
+                    include: false,
+                    redactor: None,
+                },
             )
             .into_response();
             let body = axum::body::to_bytes(response.into_body(), 100_000)

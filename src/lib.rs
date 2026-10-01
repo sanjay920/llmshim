@@ -70,7 +70,9 @@ pub async fn warmup(router: &Router) {
             _ => None,
         })
         .collect();
-    SHARED_CLIENT.warmup(&urls).await;
+    if let Ok(client) = bound_client(router) {
+        client.warmup(&urls).await;
+    }
 }
 
 /// Top-level entry point. Resolves the provider from the model string and fires the request.
@@ -119,7 +121,7 @@ async fn completion_inner(
         .ok_or(error::ShimError::MissingModel)?;
 
     let (provider, model) = router.resolve(model_str)?;
-    let client = bound_client(router);
+    let client = bound_client(router)?;
     let timer = RequestTimer::start();
 
     // Ordinary traffic feeds provider health too, so a chain's first fallback
@@ -171,8 +173,18 @@ pub async fn embeddings(
     router: &Router,
     request: &embeddings::EmbeddingRequest,
 ) -> Result<embeddings::Embeddings> {
+    embeddings_with_client(router, request, &bound_client(router)?).await
+}
+
+/// Embedding dispatch through an embedder's scoped transport, with the same model and batch
+/// admission.
+pub async fn embeddings_with_client(
+    router: &Router,
+    request: &embeddings::EmbeddingRequest,
+    client: &ShimClient,
+) -> Result<embeddings::Embeddings> {
     let (provider, model) = router.resolve(&request.model)?;
-    let response = bound_client(router)
+    let response = client
         .embeddings(provider, &model, &embeddings::payload(request))
         .await?;
     embeddings::parse(provider.name(), &model, request.input.len(), response)
@@ -263,12 +275,12 @@ async fn stream_resolved(
     // dispatch policy still gates every actual stream-open attempt below.
     let stream = match policy_context {
         Some(context) => {
-            bound_client(router)
+            bound_client(router)?
                 .stream_owned_with_policy(provider, &model, request, context)
                 .await
         }
         None => {
-            bound_client(router)
+            bound_client(router)?
                 .stream_owned(provider, &model, request)
                 .await
         }
@@ -276,10 +288,15 @@ async fn stream_resolved(
     Ok((provider_name, model_str.to_string(), stream))
 }
 
-/// The shared HTTP client, reporting to this router's breaker. The pool is
-/// shared by clone; only the breaker handle is per call.
-pub(crate) fn bound_client(router: &Router) -> ShimClient {
-    SHARED_CLIENT.clone().with_breaker(router.breaker().clone())
+/// A client reporting to this router's breaker. Ambient routers share the pool
+/// by clone; scoped routers build a fallible transport without host proxies.
+pub(crate) fn bound_client(router: &Router) -> Result<ShimClient> {
+    let client = if router.ambient_proxy() {
+        SHARED_CLIENT.clone()
+    } else {
+        ShimClient::new_scoped()?
+    };
+    Ok(client.with_breaker(router.breaker().clone()))
 }
 
 /// Generate images through the router's configured provider and aliases.
@@ -290,7 +307,7 @@ pub async fn images(router: &Router, request: &Value) -> Result<images::ImageRes
         .and_then(Value::as_str)
         .ok_or(error::ShimError::MissingModel)?;
     let (provider, model) = router.resolve(model)?;
-    bound_client(router)
+    bound_client(router)?
         .images(provider, &model, &request)
         .await
 }
@@ -303,7 +320,7 @@ pub async fn speech(router: &Router, request: &Value) -> Result<audio::SpeechRes
         .and_then(Value::as_str)
         .ok_or(error::ShimError::MissingModel)?;
     let (provider, model) = router.resolve(model)?;
-    bound_client(router)
+    bound_client(router)?
         .speech(provider, &model, &request)
         .await
 }
@@ -314,7 +331,7 @@ pub async fn transcription(
     request: &audio::TranscriptionRequest,
 ) -> Result<audio::TranscriptionResponse> {
     let (provider, model) = router.resolve(&request.model)?;
-    bound_client(router)
+    bound_client(router)?
         .transcription(provider, &model, request)
         .await
 }

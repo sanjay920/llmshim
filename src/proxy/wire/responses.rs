@@ -9,7 +9,7 @@ mod stream;
 mod tools;
 pub(super) use replay::{output_options, replay_metadata, restore, retain};
 pub(crate) use stream::stream_identity;
-pub(super) use stream::stream_response;
+pub(super) use stream::{stream_response, StreamOptions};
 
 use super::{array, Result};
 use serde_json::{json, Map, Value};

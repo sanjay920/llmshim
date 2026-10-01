@@ -61,6 +61,7 @@ pub struct Router {
     routes: BTreeMap<String, Route>,
     /// Provider health. Separate from rate-limit backoff: see `crate::breaker`.
     breaker: Arc<ProviderBreaker>,
+    ambient_proxy: bool,
 }
 
 impl Default for Router {
@@ -118,7 +119,18 @@ impl Router {
             aliases: HashMap::new(),
             routes: BTreeMap::new(),
             breaker: Arc::new(ProviderBreaker::from_env()),
+            ambient_proxy: true,
         }
+    }
+
+    /// Refuse proxy configuration from the host environment for scoped credentials.
+    pub fn without_ambient_proxy(mut self) -> Self {
+        self.ambient_proxy = false;
+        self
+    }
+
+    pub(crate) fn ambient_proxy(&self) -> bool {
+        self.ambient_proxy
     }
 
     pub fn register(mut self, key: &str, provider: Box<dyn Provider>) -> Self {
@@ -275,15 +287,32 @@ impl Router {
         stored: &dyn StoredCredentials,
         environment: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
+        Self::from_credential_sources(stored, environment, true)
+    }
+
+    /// A tenant router never reads host routes, exported keys, or host OAuth files.
+    pub fn from_scoped_credentials(stored: &dyn StoredCredentials) -> Self {
+        Self::from_credential_sources(stored, &|_| None, false).without_ambient_proxy()
+    }
+
+    fn from_credential_sources(
+        stored: &dyn StoredCredentials,
+        environment: &dyn Fn(&str) -> Option<String>,
+        host_configuration: bool,
+    ) -> Self {
         let mut router = Router::new();
 
         // Named routes are configuration, not discovery: they come from
         // ~/.llmshim/config.toml and nothing synthesizes a default set.
-        router.routes = crate::config::load().routes;
+        if host_configuration {
+            router.routes = crate::config::load().routes;
+        }
 
-        let chatgpt_auth = ChatGptAuth::from_env();
-        if chatgpt_auth.auth_path().is_file() {
-            router = router.register("chatgpt", Box::new(ChatGpt::new(chatgpt_auth)));
+        if host_configuration {
+            let chatgpt_auth = ChatGptAuth::from_env();
+            if chatgpt_auth.auth_path().is_file() {
+                router = router.register("chatgpt", Box::new(ChatGpt::new(chatgpt_auth)));
+            }
         }
 
         for provider in CREDENTIALED_PROVIDERS {
@@ -313,7 +342,10 @@ impl Router {
         // `<NAME>_WIRE=responses` speaks the Responses API to a server that
         // serves it; anything else is Chat Completions.
         for name in ["vllm", "sglang"] {
-            if let Some(provider) = self_hosted_from_env(name) {
+            if let Some(provider) = host_configuration
+                .then(|| self_hosted_from_env(name))
+                .flatten()
+            {
                 router = router.register(name, Box::new(provider));
             }
         }
