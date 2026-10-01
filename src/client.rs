@@ -94,16 +94,19 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok()?.trim().parse().ok()
 }
 
-fn build_http_client(connect_timeout: Duration) -> Client {
-    Client::builder()
+fn http_client_builder(connect_timeout: Duration, ambient_proxy: bool) -> reqwest::ClientBuilder {
+    let builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout)
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(4)
         .tcp_keepalive(Duration::from_secs(30))
-        .tcp_nodelay(true)
-        .build()
-        .expect("failed to build HTTP client")
+        .tcp_nodelay(true);
+    if ambient_proxy {
+        builder
+    } else {
+        builder.no_proxy()
+    }
 }
 
 fn deadline_after(duration: Duration) -> Option<tokio::time::Instant> {
@@ -198,6 +201,7 @@ async fn finish_transport_failure(
 #[derive(Clone)]
 pub struct ShimClient {
     http: Client,
+    ambient_proxy: bool,
     retry: RetryConfig,
     deadlines: AttemptDeadlines,
     response_body_limits: body::ResponseBodyLimits,
@@ -215,15 +219,32 @@ impl Default for ShimClient {
 
 impl ShimClient {
     pub fn new() -> Self {
+        Self::with_proxy_policy(true).expect("failed to build HTTP client")
+    }
+
+    /// Build a transport without consulting the host's proxy configuration.
+    pub fn new_scoped() -> Result<Self> {
+        Self::with_proxy_policy(false)
+    }
+
+    fn with_proxy_policy(ambient_proxy: bool) -> Result<Self> {
         let deadlines = AttemptDeadlines::from_env();
-        Self {
-            http: build_http_client(deadlines.connect),
+        Ok(Self {
+            http: http_client_builder(deadlines.connect, ambient_proxy).build()?,
+            ambient_proxy,
             retry: RetryConfig::from_env(),
             deadlines,
             response_body_limits: body::ResponseBodyLimits::default(),
             stream_retention_limits: crate::streaming::StreamRetentionLimits::default(),
             breaker: None,
-        }
+        })
+    }
+
+    /// A scoped credential cannot be forwarded through a proxy chosen by the host environment.
+    pub fn without_ambient_proxy(mut self) -> Result<Self> {
+        self.http = http_client_builder(self.deadlines.connect, false).build()?;
+        self.ambient_proxy = false;
+        Ok(self)
     }
 
     pub fn with_attempt_deadlines(
@@ -231,7 +252,9 @@ impl ShimClient {
         deadlines: AttemptDeadlines,
     ) -> std::result::Result<Self, &'static str> {
         self.deadlines = deadlines.validate()?;
-        self.http = build_http_client(self.deadlines.connect);
+        self.http = http_client_builder(self.deadlines.connect, self.ambient_proxy)
+            .build()
+            .map_err(|_| "HTTP client could not be initialized with these deadlines")?;
         Ok(self)
     }
 

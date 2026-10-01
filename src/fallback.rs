@@ -102,7 +102,10 @@ async fn completion_with_fallback_inner(
     let mut attempted_distinct_provider_after_limit = false;
     // Every attempt below is counted by the client against this router's
     // breaker; the loop only asks `admit` before dialling.
-    let client = client_override.unwrap_or_else(|| crate::bound_client(router));
+    let client = match client_override {
+        Some(client) => client,
+        None => crate::bound_client(router)?,
+    };
 
     for model_str in &models {
         // Build request with this model. A named route expands to its model and

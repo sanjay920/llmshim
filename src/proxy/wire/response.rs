@@ -1,4 +1,4 @@
-use super::{call_content, gemini, message_key, native_call, Receipts, Result, Wire};
+use super::{call_content, error_body, gemini, message_key, native_call, Receipts, Result, Wire};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -111,19 +111,41 @@ pub fn stream_frames(response: &Value, wire: Wire) -> Vec<(Option<String>, Strin
         return gemini::frames(response);
     }
     if wire == Wire::Chat {
+        let invalid = || {
+            vec![(
+                None,
+                error_body(
+                    wire,
+                    "native chat response requires object choices, messages, and tool calls",
+                )
+                .to_string(),
+            )]
+        };
         let mut chunk = response.clone();
-        chunk["object"] = json!("chat.completion.chunk");
-        let mut message = chunk["choices"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("message")
-            .unwrap();
-        if let Some(calls) = message["tool_calls"].as_array_mut() {
+        let Some(choice) = chunk
+            .get_mut("choices")
+            .and_then(Value::as_array_mut)
+            .and_then(|choices| choices.first_mut())
+            .and_then(Value::as_object_mut)
+        else {
+            return invalid();
+        };
+        let Some(mut message) = choice.remove("message").filter(Value::is_object) else {
+            return invalid();
+        };
+        if let Some(calls) = message.get_mut("tool_calls") {
+            let Some(calls) = calls.as_array_mut() else {
+                return invalid();
+            };
             for (index, call) in calls.iter_mut().enumerate() {
-                call["index"] = json!(index);
+                let Some(call) = call.as_object_mut() else {
+                    return invalid();
+                };
+                call.insert("index".into(), json!(index));
             }
         }
-        chunk["choices"][0]["delta"] = message;
+        choice.insert("delta".into(), message);
+        chunk["object"] = json!("chat.completion.chunk");
         frames.push((None, chunk.to_string()));
         frames.push((None, "[DONE]".into()));
         return frames;

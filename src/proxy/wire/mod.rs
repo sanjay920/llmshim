@@ -31,6 +31,10 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+/// Host egress filtering applied before canonical replay receipts are persisted.
+#[derive(Clone)]
+pub struct ResponseRedactor(pub Arc<dyn Fn(&Value) -> Value + Send + Sync>);
+
 const RECEIPT_WORKERS: usize = 2;
 const RECEIPT_INGRESS_CAPACITY: usize = 8;
 const RECEIPT_EGRESS_CAPACITY: usize = 4;
@@ -562,7 +566,10 @@ fn request_to_chat_with_limits(
                 "redacted_reasoning_content",
                 "reasoning_origin",
             ] {
-                canonical.as_object_mut().unwrap().remove(field);
+                canonical
+                    .as_object_mut()
+                    .ok_or("message must be an object")?
+                    .remove(field);
             }
             if role == "assistant" {
                 // A message exported before `reasoning_details` existed carries
@@ -573,7 +580,10 @@ fn request_to_chat_with_limits(
                     && key_source.get("reasoning").is_some_and(Value::is_array)
                 {
                     key_source["reasoning_details"] = key_source["reasoning"].clone();
-                    key_source.as_object_mut().unwrap().remove("reasoning");
+                    key_source
+                        .as_object_mut()
+                        .ok_or("message must be an object")?
+                        .remove("reasoning");
                 }
                 if let Some(reasoning) = receipts.get_bounded(
                     scope,
@@ -907,6 +917,7 @@ pub(crate) async fn translate_with_router(
         return next.run(request).await;
     };
     let wire = route.wire;
+    let redactor = request.extensions().get::<ResponseRedactor>().cloned();
     let default_store = request
         .extensions()
         .get::<DefaultReceiptStore>()
@@ -1068,8 +1079,11 @@ pub(crate) async fn translate_with_router(
                 receipts,
                 scope,
                 receipt_executor,
-                replay_metadata,
-                include_reasoning,
+                responses::StreamOptions {
+                    metadata: replay_metadata,
+                    include: include_reasoning,
+                    redactor,
+                },
             )
             .into_response();
             return Response::from_parts(parts, generated.into_body());
@@ -1299,6 +1313,9 @@ pub(crate) async fn translate_with_router(
             if !blocks.is_empty() {
                 response["message"]["reasoning"] = json!(blocks);
             }
+            if let Some(redactor) = &redactor {
+                response = (redactor.0)(&response);
+            }
             let response_receipts = receipts.clone();
             let response_scope = scope.clone();
             let native = match receipt_executor
@@ -1323,19 +1340,27 @@ pub(crate) async fn translate_with_router(
             let mut native = native;
             if wire == Wire::Chat {
                 // Text was already streamed. Emit completed reasoning/calls once.
-                native["choices"][0]["message"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("content");
+                let Some(message) = native.pointer_mut("/choices/0/message")
+                    .and_then(Value::as_object_mut) else {
+                    yield Ok(error_frame(wire, error_body(
+                        wire, "native chat message must be an object",
+                    )));
+                    return;
+                };
+                message.remove("content");
             } else if wire == Wire::Gemini {
                 // Only the answer text was streamed already. A thought part
                 // carries `text` too, and reasoning has no other container on
                 // this wire, so dropping it here would lose the block and its
                 // signature from every streamed answer.
-                native["candidates"][0]["content"]["parts"]
-                    .as_array_mut()
-                    .unwrap()
-                    .retain(|part| part.get("thought").is_some() || part.get("text").is_none());
+                let Some(parts) = native.pointer_mut("/candidates/0/content/parts")
+                    .and_then(Value::as_array_mut) else {
+                    yield Ok(error_frame(wire, error_body(
+                        wire, "native Gemini parts must be an array",
+                    )));
+                    return;
+                };
+                parts.retain(|part| part.get("thought").is_some() || part.get("text").is_none());
             } else {
                 if text_started {
                     yield Ok(Event::default().event("content_block_stop").data(
@@ -1346,10 +1371,13 @@ pub(crate) async fn translate_with_router(
                         .to_string(),
                     ));
                 }
-                native["content"]
-                    .as_array_mut()
-                    .unwrap()
-                    .retain(|block| block["type"] != "text");
+                let Some(content) = native.get_mut("content").and_then(Value::as_array_mut) else {
+                    yield Ok(error_frame(wire, error_body(
+                        wire, "native Messages content must be an array",
+                    )));
+                    return;
+                };
+                content.retain(|block| block["type"] != "text");
             }
             for (event, data) in stream_frames(&native, wire) {
                 if wire == Wire::Messages && event.as_deref() == Some("message_start") {
@@ -1393,6 +1421,10 @@ pub(crate) async fn translate_with_router(
                 "invalid response from handler",
             )
         }
+    };
+    let value = match redactor {
+        Some(redactor) => (redactor.0)(&value),
+        None => value,
     };
     let mut native = if parts.status.is_success() {
         let response_receipts = receipts.clone();
