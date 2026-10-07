@@ -93,6 +93,37 @@ impl TranscriptionRequest {
     }
 }
 
+/// One transcription model a provider accepts, for a caller that offers a
+/// person a choice. Pass `id` as [`TranscriptionRequest::model`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TranscriptionModelInfo {
+    /// The routed id, `<provider>/<model>`, such as `openrouter/openai/whisper-1`.
+    pub id: String,
+    /// The router key of the provider that serves the model.
+    pub provider: String,
+    /// The provider's own model id, as sent upstream.
+    pub model: String,
+    /// The model's name and its provider, such as `Whisper 1 (OpenAI via OpenRouter)`.
+    pub label: String,
+}
+
+impl TranscriptionModelInfo {
+    pub fn new(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        label: impl Into<String>,
+    ) -> Self {
+        let (provider, model) = (provider.into(), model.into());
+        Self {
+            id: format!("{provider}/{model}"),
+            provider,
+            model,
+            label: label.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TranscriptionResponse {
     pub text: String,

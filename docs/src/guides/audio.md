@@ -126,6 +126,43 @@ OpenRouter's `seconds` and token counts. The reported `usage.cost` is the bill
 See OpenRouter's [speech-to-text guide](https://openrouter.ai/docs/guides/overview/multimodal/stt)
 and [transcription reference](https://openrouter.ai/docs/api/api-reference/stt/create-transcription).
 
+### Choosing a transcription model
+
+`llmshim::transcription_models(router)` lists the transcription models of every
+provider configured on the router, so a caller can offer a person a choice.
+Each entry has the routed `id` to pass as the request model, the `provider` key,
+the provider's own `model` id, and a `label` with the model's name and its
+provider. The same model through two providers has two entries:
+
+| `id` | `label` |
+|---|---|
+| `openai/whisper-1` | Whisper (OpenAI) |
+| `openrouter/openai/whisper-1` | Whisper 1 (OpenAI via OpenRouter) |
+
+```rust,no_run
+# async fn example(router: &llmshim::router::Router, bytes: Vec<u8>) -> llmshim::error::Result<()> {
+for model in llmshim::transcription_models(router) {
+    println!("{}  {}", model.id, model.label);
+}
+let request = llmshim::audio::TranscriptionRequest::new(
+    "openrouter/openai/whisper-1", bytes, "recording.wav", "audio/wav"
+);
+println!("{}", llmshim::transcription(router, &request).await?.text);
+# Ok(()) }
+```
+
+The list is ordered by provider key, then by each provider's own order. An `id`
+carries the key the provider is registered under, so it routes back to that
+provider. Each provider owns its list through `Provider::transcription_models`,
+which is empty by default:
+
+- OpenAI lists its three models, the same catalog rows that gate its requests.
+- OpenRouter lists the models in its public
+  [speech-to-text listing](https://openrouter.ai/api/v1/models?output_modalities=transcription),
+  vendored in the crate as read on 2026-10-07. The list does not gate requests:
+  a slug that is not on it is still sent, and OpenRouter decides.
+- Other providers list nothing, as they refuse transcription.
+
 Other providers refuse locally. Transcription has no proxy/CLI, streaming,
 translation, timestamp or dispatch-policy callback surface.
 

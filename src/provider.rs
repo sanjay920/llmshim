@@ -147,6 +147,13 @@ pub trait Provider: Send + Sync {
         ))
     }
 
+    /// The transcription models this provider documents, keyed by its own
+    /// name. A provider without transcription lists none.
+    /// [`crate::transcription_models`] re-keys them by router registration.
+    fn transcription_models(&self) -> Vec<crate::audio::TranscriptionModelInfo> {
+        Vec::new()
+    }
+
     /// Prepare a replayable upload. Providers without transcription refuse locally.
     fn transcription_request(
         &self,
