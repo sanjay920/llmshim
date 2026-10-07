@@ -352,6 +352,10 @@ fn bump_effort(effort: &str) -> &'static str {
 }
 
 impl Provider for OpenAi {
+    fn transcription_models(&self) -> Vec<crate::audio::TranscriptionModelInfo> {
+        super::openai_audio::transcription_models(self.name())
+    }
+
     fn transcription_request(
         &self,
         model: &str,

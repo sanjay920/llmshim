@@ -138,6 +138,10 @@ impl Provider for OpenRouter {
         .bind_account(&self.base_url, Some(&self.api_key))
     }
 
+    fn transcription_models(&self) -> Vec<crate::audio::TranscriptionModelInfo> {
+        super::openrouter_audio::transcription_models(self.name())
+    }
+
     /// OpenRouter's `/audio/transcriptions` takes the OpenAI multipart form.
     /// Its schema has no `prompt` field and answers only `json` or
     /// `verbose_json`, so a prompt and `text` are refused here rather than

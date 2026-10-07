@@ -325,6 +325,34 @@ pub async fn speech(router: &Router, request: &Value) -> Result<audio::SpeechRes
         .await
 }
 
+/// The transcription models of every provider configured on this router,
+/// ordered by provider key and then by each provider's own list. Each `id`
+/// carries the key the provider is registered under, so it routes back to it.
+///
+/// ```no_run
+/// # async fn example(router: &llmshim::router::Router, bytes: Vec<u8>) -> llmshim::error::Result<()> {
+/// for model in llmshim::transcription_models(router) {
+///     println!("{}  {}", model.id, model.label);
+/// }
+/// let request = llmshim::audio::TranscriptionRequest::new(
+///     "openrouter/openai/whisper-1", bytes, "recording.wav", "audio/wav",
+/// );
+/// println!("{}", llmshim::transcription(router, &request).await?.text);
+/// # Ok(()) }
+/// ```
+pub fn transcription_models(router: &Router) -> Vec<audio::TranscriptionModelInfo> {
+    let mut keys = router.provider_keys();
+    keys.sort_unstable();
+    keys.into_iter()
+        .filter_map(|key| Some((key, router.get(key).ok()?.transcription_models())))
+        .flat_map(|(key, models)| {
+            models
+                .into_iter()
+                .map(move |m| audio::TranscriptionModelInfo::new(key, m.model, m.label))
+        })
+        .collect()
+}
+
 /// Transcribe caller-owned audio through the router's configured provider and aliases.
 pub async fn transcription(
     router: &Router,

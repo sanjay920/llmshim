@@ -2,6 +2,27 @@ use super::openai::OpenAi;
 use crate::{error::Result, provider::ProviderRequest};
 use serde_json::{json, Value};
 
+/// One entry per catalog transcription row, the same rows that gate
+/// [`transcription_request`], so the list and the check cannot drift.
+pub(super) fn transcription_models(provider: &str) -> Vec<crate::audio::TranscriptionModelInfo> {
+    llmshim_catalog::audio::TRANSCRIPTION_MODELS
+        .iter()
+        .map(|row| {
+            let name = match row.model {
+                "whisper-1" => "Whisper",
+                "gpt-4o-transcribe" => "GPT-4o Transcribe",
+                "gpt-4o-mini-transcribe" => "GPT-4o mini Transcribe",
+                other => other,
+            };
+            crate::audio::TranscriptionModelInfo::new(
+                provider,
+                row.model,
+                format!("{name} (OpenAI)"),
+            )
+        })
+        .collect()
+}
+
 pub(super) fn transcription_request(
     provider: &OpenAi,
     model: &str,
