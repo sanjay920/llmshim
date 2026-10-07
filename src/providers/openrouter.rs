@@ -138,6 +138,52 @@ impl Provider for OpenRouter {
         .bind_account(&self.base_url, Some(&self.api_key))
     }
 
+    /// OpenRouter's `/audio/transcriptions` takes the OpenAI multipart form.
+    /// Its schema has no `prompt` field and no `text` response format, so both
+    /// are refused here rather than forwarded. Model slugs are not checked
+    /// locally; OpenRouter refuses a model it does not serve.
+    fn transcription_request(
+        &self,
+        model: &str,
+        request: &crate::audio::TranscriptionRequest,
+    ) -> Result<crate::audio::TranscriptionUpload> {
+        use crate::error::provider_error as error;
+        if request.response_format.as_deref().unwrap_or("json") != "json" {
+            return Err(error(
+                400,
+                "OpenRouter transcription supports only json response format",
+            ));
+        }
+        if request.prompt.is_some() {
+            return Err(error(
+                400,
+                "OpenRouter transcription does not accept a prompt",
+            ));
+        }
+        crate::audio::transcription_upload(&self.base_url, &self.api_key, model, request)
+    }
+
+    /// Usage keeps OpenRouter's `seconds` and token counts. The bill is its
+    /// reported `usage.cost`; without one the cost is unknown, because the
+    /// catalog's transcription rates cover only OpenAI's own models.
+    fn transcription_response(
+        &self,
+        _model: &str,
+        _request: &crate::audio::TranscriptionRequest,
+        response: Value,
+    ) -> Result<crate::audio::TranscriptionResponse> {
+        let (text, mut usage) = crate::audio::transcript(response)?;
+        let reported = crate::cost::reported(&usage);
+        usage["cost_usd"] = reported.map_or(Value::Null, Value::from);
+        usage["cost_source"] = if reported.is_some() {
+            crate::cost::SOURCE_PROVIDER
+        } else {
+            "unknown"
+        }
+        .into();
+        Ok(crate::audio::TranscriptionResponse { text, usage })
+    }
+
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
         crate::reasoning::preflight_request(request)?;
         let mut schema_budget = crate::schema::RequestBudget::new();
