@@ -112,6 +112,18 @@ Sources: [transcription reference](https://developers.openai.com/api/reference/r
 [GPT-4o Transcribe](https://developers.openai.com/api/docs/models/gpt-4o-transcribe),
 [Mini Transcribe](https://developers.openai.com/api/docs/models/gpt-4o-mini-transcribe)
 and [Whisper](https://developers.openai.com/api/docs/models/whisper-1).
+
+OpenRouter transcribes through its OpenAI-compatible `/audio/transcriptions`
+with the same multipart upload and bounds. Use an OpenRouter slug, such as
+`openrouter/openai/whisper-1` or `openrouter/openai/whisper-large-v3`. Slugs are
+not checked locally; OpenRouter refuses a model it does not serve. Its schema
+has no `prompt` field and no `text` response format, so both are refused
+locally. Usage keeps OpenRouter's `seconds` and token counts. The reported
+`usage.cost` is the bill (`cost_source: "provider"`); without it the cost is
+`null` with `cost_source: "unknown"`, and no catalog estimate is made.
+See OpenRouter's [speech-to-text guide](https://openrouter.ai/docs/guides/overview/multimodal/stt)
+and [transcription reference](https://openrouter.ai/docs/api/api-reference/stt/create-transcription).
+
 Other providers refuse locally. Transcription has no proxy/CLI, streaming,
 translation, timestamp or dispatch-policy callback surface.
 
