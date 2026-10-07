@@ -139,8 +139,9 @@ impl Provider for OpenRouter {
     }
 
     /// OpenRouter's `/audio/transcriptions` takes the OpenAI multipart form.
-    /// Its schema has no `prompt` field and no `text` response format, so both
-    /// are refused here rather than forwarded. Model slugs are not checked
+    /// Its schema has no `prompt` field and answers only `json` or
+    /// `verbose_json`, so a prompt and `text` are refused here rather than
+    /// forwarded. Model slugs are not checked
     /// locally; OpenRouter refuses a model it does not serve.
     fn transcription_request(
         &self,
@@ -148,10 +149,13 @@ impl Provider for OpenRouter {
         request: &crate::audio::TranscriptionRequest,
     ) -> Result<crate::audio::TranscriptionUpload> {
         use crate::error::provider_error as error;
-        if request.response_format.as_deref().unwrap_or("json") != "json" {
+        if !matches!(
+            request.response_format.as_deref().unwrap_or("json"),
+            "json" | "verbose_json"
+        ) {
             return Err(error(
                 400,
-                "OpenRouter transcription supports only json response format",
+                "OpenRouter transcription supports json or verbose_json response format",
             ));
         }
         if request.prompt.is_some() {
@@ -172,6 +176,7 @@ impl Provider for OpenRouter {
         _request: &crate::audio::TranscriptionRequest,
         response: Value,
     ) -> Result<crate::audio::TranscriptionResponse> {
+        body_error(&response)?;
         let (text, mut usage) = crate::audio::transcript(response)?;
         let reported = crate::cost::reported(&usage);
         usage["cost_usd"] = reported.map_or(Value::Null, Value::from);
@@ -342,27 +347,32 @@ impl OpenRouter {
                 retry_after: None,
             });
         }
-        // Non-stream errors usually surface via HTTP status, but a body-level
-        // `error` object can also appear — turn it into a ProviderError.
-        if let Some(err) = response.get("error") {
-            if !err.is_null() {
-                let message = err
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error")
-                    .to_string();
-                let status = err.get("code").and_then(|c| c.as_u64()).unwrap_or(400) as u16;
-                return Err(ShimError::ProviderError {
-                    status,
-                    body: message,
-                    retry_after: None,
-                });
-            }
-        }
-
+        body_error(&response)?;
         crate::usage::normalize_response(&mut response);
         Ok(response)
     }
+}
+
+/// Non-stream errors usually surface via HTTP status, but a 200 answer can
+/// also carry a body-level `error` object; turn it into a ProviderError with
+/// OpenRouter's own code and message.
+fn body_error(response: &Value) -> Result<()> {
+    if let Some(err) = response.get("error") {
+        if !err.is_null() {
+            let message = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error")
+                .to_string();
+            let status = err.get("code").and_then(|c| c.as_u64()).unwrap_or(400) as u16;
+            return Err(ShimError::ProviderError {
+                status,
+                body: message,
+                retry_after: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl OpenRouter {

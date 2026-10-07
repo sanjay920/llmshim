@@ -195,11 +195,11 @@ pub(crate) fn validate_transcription(request: &TranscriptionRequest) -> Result<(
     }
     if !matches!(
         request.response_format.as_deref().unwrap_or("json"),
-        "json" | "text"
+        "json" | "text" | "verbose_json"
     ) {
         return Err(error(
             400,
-            "transcription response format must be json or text",
+            "transcription response format must be json, text or verbose_json",
         ));
     }
     if request

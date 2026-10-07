@@ -18,6 +18,12 @@ pub(super) fn transcription_request(
         ));
     }
     let format = request.response_format.as_deref().unwrap_or("json");
+    if format == "verbose_json" {
+        return Err(error(
+            400,
+            "OpenAI transcription supports json or text response format",
+        ));
+    }
     if model != "whisper-1" && format != "json" {
         return Err(error(
             400,

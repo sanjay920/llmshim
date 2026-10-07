@@ -20,8 +20,17 @@ async fn multipart_upload_carries_the_slug_file_and_bearer_key() {
     let mut server = mockito::Server::new_async().await;
     let router = router(&server);
     // No local model list: a slug the catalog has never seen still goes out.
-    for slug in ["openai/whisper-1", "acme/new-speech-to-text"] {
+    // `verbose_json` answers with segments beside the text.
+    for (slug, format, answer) in [
+        ("openai/whisper-1", "json", json!({"text":"Ada speaks."})),
+        (
+            "acme/new-speech-to-text",
+            "verbose_json",
+            json!({"task":"transcribe","language":"en","duration":1.5,"text":"Ada speaks.","segments":[{"id":0,"start":0.0,"end":1.5,"text":"Ada speaks."}]}),
+        ),
+    ] {
         let mut request = request(&format!("openrouter/{slug}"));
+        request.response_format = Some(format.into());
         request.language = Some("en".into());
         request.temperature = Some(0.0);
         request.duration_seconds = Some(60.0);
@@ -37,7 +46,7 @@ async fn multipart_upload_carries_the_slug_file_and_bearer_key() {
                     ("model", slug),
                     ("language", "en"),
                     ("temperature", "0"),
-                    ("response_format", "json"),
+                    ("response_format", format),
                 ]
                 .into_iter()
                 .map(|(name, value)| {
@@ -58,7 +67,7 @@ async fn multipart_upload_carries_the_slug_file_and_bearer_key() {
                     && !text.contains("name=\"prompt\"")
             })
             .with_header("content-type", "application/json")
-            .with_body(json!({"text":"Ada speaks."}).to_string())
+            .with_body(answer.to_string())
             .expect(1)
             .create_async()
             .await;
@@ -127,12 +136,20 @@ async fn unsupported_controls_refuse_locally_and_status_errors_pass_through() {
     prompt.prompt = Some("Names: Ada".into());
     let mut empty = request("openrouter/openai/whisper-1");
     empty.bytes.clear();
-    for request in [text, prompt, empty] {
+    let mut srt = request("openrouter/openai/whisper-1");
+    srt.response_format = Some("srt".into());
+    for request in [text, prompt, empty, srt] {
         assert!(matches!(
             llmshim::transcription(&router, &request).await,
             Err(ShimError::ProviderError { status: 400, .. })
         ));
     }
+    let mut text = request("openrouter/openai/whisper-1");
+    text.response_format = Some("text".into());
+    assert!(matches!(
+        llmshim::transcription(&router, &text).await,
+        Err(ShimError::ProviderError { body, .. }) if body.contains("json or verbose_json")
+    ));
     zero.assert_async().await;
     zero.remove_async().await;
     for (status, message) in [(400, "unsupported audio"), (402, "insufficient credits")] {
@@ -153,16 +170,36 @@ async fn unsupported_controls_refuse_locally_and_status_errors_pass_through() {
         mock.assert_async().await;
         mock.remove_async().await;
     }
-    let no_text = server
-        .mock("POST", "/audio/transcriptions")
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"error":{"message":"bad","code":400}}"#)
-        .expect(1)
-        .create_async()
-        .await;
-    assert!(matches!(
-        llmshim::transcription(&router, &request("openrouter/openai/whisper-1")).await,
-        Err(ShimError::ProviderError { status: 502, .. })
-    ));
-    no_text.assert_async().await;
+    // An error inside a 200 answer keeps OpenRouter's code and message, as
+    // on the chat path; an answer with neither error nor text is a 502.
+    for (answer, status, message) in [
+        (
+            json!({"error":{"message":"model not found","code":404}}),
+            404,
+            "model not found",
+        ),
+        (json!({"error":{"message":"bad audio"}}), 400, "bad audio"),
+        (
+            json!({"usage":{"cost":0.1}}),
+            502,
+            "transcription response has no text string",
+        ),
+    ] {
+        let mock = server
+            .mock("POST", "/audio/transcriptions")
+            .with_header("content-type", "application/json")
+            .with_body(answer.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let error = llmshim::transcription(&router, &request("openrouter/openai/whisper-1"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ShimError::ProviderError { status: s, body, .. } if *s == status && body == message),
+            "{error:?}"
+        );
+        mock.assert_async().await;
+        mock.remove_async().await;
+    }
 }

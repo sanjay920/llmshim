@@ -80,9 +80,9 @@ The existing sender handles status errors, retries, header/attempt deadlines and
 redirect refusal. JSON and plain-text responses use the shared bounded body
 reader with idle/total deadlines and circuit-breaker classification.
 
-`response_format` defaults to `json`. Only `json` and `text` are exposed here;
-the GPT transcription models support only `json`, while Whisper also supports
-`text`. Plain text must have a `text/plain` media type and valid UTF-8. JSON must
+`response_format` defaults to `json`. For OpenAI, only `json` and `text` are
+exposed here; the GPT transcription models support only `json`, while Whisper
+also supports `text`. OpenRouter accepts `json` and `verbose_json`. Plain text must have a `text/plain` media type and valid UTF-8. JSON must
 contain a text string. An empty string is valid for silence.
 
 `TranscriptionResponse.usage` preserves native usage. A valid provider
@@ -117,10 +117,12 @@ OpenRouter transcribes through its OpenAI-compatible `/audio/transcriptions`
 with the same multipart upload and bounds. Use an OpenRouter slug, such as
 `openrouter/openai/whisper-1` or `openrouter/openai/whisper-large-v3`. Slugs are
 not checked locally; OpenRouter refuses a model it does not serve. Its schema
-has no `prompt` field and no `text` response format, so both are refused
-locally. Usage keeps OpenRouter's `seconds` and token counts. The reported
-`usage.cost` is the bill (`cost_source: "provider"`); without it the cost is
-`null` with `cost_source: "unknown"`, and no catalog estimate is made.
+has no `prompt` field and answers only `json` or `verbose_json`, so a prompt
+and `text` are refused locally. An error inside a 200 answer becomes an error
+with OpenRouter's own code and message, as on the chat path. Usage keeps
+OpenRouter's `seconds` and token counts. The reported `usage.cost` is the bill
+(`cost_source: "provider"`); without it the cost is `null` with
+`cost_source: "unknown"`, and no catalog estimate is made.
 See OpenRouter's [speech-to-text guide](https://openrouter.ai/docs/guides/overview/multimodal/stt)
 and [transcription reference](https://openrouter.ai/docs/api/api-reference/stt/create-transcription).
 
