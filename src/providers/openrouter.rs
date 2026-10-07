@@ -138,6 +138,57 @@ impl Provider for OpenRouter {
         .bind_account(&self.base_url, Some(&self.api_key))
     }
 
+    /// OpenRouter's `/audio/transcriptions` takes the OpenAI multipart form.
+    /// Its schema has no `prompt` field and answers only `json` or
+    /// `verbose_json`, so a prompt and `text` are refused here rather than
+    /// forwarded. Model slugs are not checked
+    /// locally; OpenRouter refuses a model it does not serve.
+    fn transcription_request(
+        &self,
+        model: &str,
+        request: &crate::audio::TranscriptionRequest,
+    ) -> Result<crate::audio::TranscriptionUpload> {
+        use crate::error::provider_error as error;
+        if !matches!(
+            request.response_format.as_deref().unwrap_or("json"),
+            "json" | "verbose_json"
+        ) {
+            return Err(error(
+                400,
+                "OpenRouter transcription supports json or verbose_json response format",
+            ));
+        }
+        if request.prompt.is_some() {
+            return Err(error(
+                400,
+                "OpenRouter transcription does not accept a prompt",
+            ));
+        }
+        crate::audio::transcription_upload(&self.base_url, &self.api_key, model, request)
+    }
+
+    /// Usage keeps OpenRouter's `seconds` and token counts. The bill is its
+    /// reported `usage.cost`; without one the cost is unknown, because the
+    /// catalog's transcription rates cover only OpenAI's own models.
+    fn transcription_response(
+        &self,
+        _model: &str,
+        _request: &crate::audio::TranscriptionRequest,
+        response: Value,
+    ) -> Result<crate::audio::TranscriptionResponse> {
+        body_error(&response)?;
+        let (text, mut usage) = crate::audio::transcript(response)?;
+        let reported = crate::cost::reported(&usage);
+        usage["cost_usd"] = reported.map_or(Value::Null, Value::from);
+        usage["cost_source"] = if reported.is_some() {
+            crate::cost::SOURCE_PROVIDER
+        } else {
+            "unknown"
+        }
+        .into();
+        Ok(crate::audio::TranscriptionResponse { text, usage })
+    }
+
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
         crate::reasoning::preflight_request(request)?;
         let mut schema_budget = crate::schema::RequestBudget::new();
@@ -296,27 +347,32 @@ impl OpenRouter {
                 retry_after: None,
             });
         }
-        // Non-stream errors usually surface via HTTP status, but a body-level
-        // `error` object can also appear — turn it into a ProviderError.
-        if let Some(err) = response.get("error") {
-            if !err.is_null() {
-                let message = err
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown error")
-                    .to_string();
-                let status = err.get("code").and_then(|c| c.as_u64()).unwrap_or(400) as u16;
-                return Err(ShimError::ProviderError {
-                    status,
-                    body: message,
-                    retry_after: None,
-                });
-            }
-        }
-
+        body_error(&response)?;
         crate::usage::normalize_response(&mut response);
         Ok(response)
     }
+}
+
+/// Non-stream errors usually surface via HTTP status, but a 200 answer can
+/// also carry a body-level `error` object; turn it into a ProviderError with
+/// OpenRouter's own code and message.
+fn body_error(response: &Value) -> Result<()> {
+    if let Some(err) = response.get("error") {
+        if !err.is_null() {
+            let message = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error")
+                .to_string();
+            let status = err.get("code").and_then(|c| c.as_u64()).unwrap_or(400) as u16;
+            return Err(ShimError::ProviderError {
+                status,
+                body: message,
+                retry_after: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl OpenRouter {

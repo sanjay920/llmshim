@@ -108,6 +108,53 @@ pub struct TranscriptionUpload {
     pub media_type: String,
 }
 
+/// Build the OpenAI-style multipart upload shared by compatible endpoints:
+/// `{base_url}/audio/transcriptions` with a bearer key and string fields.
+/// Model and format checks that differ per provider stay with the caller.
+pub(crate) fn transcription_upload(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    request: &TranscriptionRequest,
+) -> Result<TranscriptionUpload> {
+    validate_transcription(request)?;
+    let format = request.response_format.as_deref().unwrap_or("json");
+    let mut body = serde_json::json!({"model": model, "response_format": format});
+    for (key, value) in [("language", &request.language), ("prompt", &request.prompt)] {
+        if let Some(value) = value {
+            body[key] = value.clone().into();
+        }
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = temperature.to_string().into();
+    }
+    Ok(TranscriptionUpload {
+        request: crate::provider::ProviderRequest {
+            url: format!("{}/audio/transcriptions", base_url.trim_end_matches('/')),
+            headers: vec![("Authorization".into(), format!("Bearer {api_key}"))],
+            body,
+        },
+        bytes: bytes::Bytes::copy_from_slice(&request.bytes),
+        filename: request.filename.clone(),
+        media_type: request.media_type.clone(),
+    })
+}
+
+/// Read the transcript text and native usage (an empty object when absent)
+/// from an OpenAI-style JSON answer.
+pub(crate) fn transcript(response: Value) -> Result<(String, Value)> {
+    let text = response["text"]
+        .as_str()
+        .ok_or_else(|| error(502, "transcription response has no text string"))?
+        .to_owned();
+    // Silence can legitimately transcribe to an empty string.
+    let mut usage = response["usage"].clone();
+    if !usage.is_object() {
+        usage = serde_json::json!({});
+    }
+    Ok((text, usage))
+}
+
 /// Conservative decimal interpretation of the provider's published 25 MB limit.
 pub const MAX_TRANSCRIPTION_BYTES: usize = 25_000_000;
 
@@ -148,11 +195,11 @@ pub(crate) fn validate_transcription(request: &TranscriptionRequest) -> Result<(
     }
     if !matches!(
         request.response_format.as_deref().unwrap_or("json"),
-        "json" | "text"
+        "json" | "text" | "verbose_json"
     ) {
         return Err(error(
             400,
-            "transcription response format must be json or text",
+            "transcription response format must be json, text or verbose_json",
         ));
     }
     if request

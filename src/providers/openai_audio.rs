@@ -8,7 +8,6 @@ pub(super) fn transcription_request(
     request: &crate::audio::TranscriptionRequest,
 ) -> Result<crate::audio::TranscriptionUpload> {
     use crate::error::provider_error as error;
-    crate::audio::validate_transcription(request)?;
     if !llmshim_catalog::audio::TRANSCRIPTION_MODELS
         .iter()
         .any(|row| row.model == model)
@@ -19,37 +18,19 @@ pub(super) fn transcription_request(
         ));
     }
     let format = request.response_format.as_deref().unwrap_or("json");
+    if format == "verbose_json" {
+        return Err(error(
+            400,
+            "OpenAI transcription supports json or text response format",
+        ));
+    }
     if model != "whisper-1" && format != "json" {
         return Err(error(
             400,
             "GPT transcription models require json response format",
         ));
     }
-    let mut body = json!({"model": model, "response_format": format});
-    for (key, value) in [("language", &request.language), ("prompt", &request.prompt)] {
-        if let Some(value) = value {
-            body[key] = value.clone().into();
-        }
-    }
-    if let Some(temperature) = request.temperature {
-        body["temperature"] = temperature.to_string().into();
-    }
-    Ok(crate::audio::TranscriptionUpload {
-        request: ProviderRequest {
-            url: format!(
-                "{}/audio/transcriptions",
-                provider.base_url.trim_end_matches('/')
-            ),
-            headers: vec![(
-                "Authorization".into(),
-                format!("Bearer {}", provider.api_key),
-            )],
-            body,
-        },
-        bytes: bytes::Bytes::copy_from_slice(&request.bytes),
-        filename: request.filename.clone(),
-        media_type: request.media_type.clone(),
-    })
+    crate::audio::transcription_upload(&provider.base_url, &provider.api_key, model, request)
 }
 
 pub(super) fn transcription_response(
@@ -57,16 +38,7 @@ pub(super) fn transcription_response(
     request: &crate::audio::TranscriptionRequest,
     response: Value,
 ) -> Result<crate::audio::TranscriptionResponse> {
-    use crate::error::provider_error as error;
-    let text = response["text"]
-        .as_str()
-        .ok_or_else(|| error(502, "transcription response has no text string"))?
-        .to_owned();
-    // Silence can legitimately transcribe to an empty string.
-    let mut usage = response["usage"].clone();
-    if !usage.is_object() {
-        usage = json!({});
-    }
+    let (text, mut usage) = crate::audio::transcript(response)?;
     let reported = crate::cost::reported(&usage);
     let rates = llmshim_catalog::audio::TRANSCRIPTION_MODELS
         .iter()
