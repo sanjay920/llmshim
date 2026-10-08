@@ -238,13 +238,14 @@ fn request(model: &str) -> Value {
     })
 }
 
-/// Streams `body` from a mock of `wire`, recording each completed call on the
-/// policy's timeline as its chunk arrives. Returns every item.
+/// Streams `body` from a mock of `wire`, with `policy` if one is given,
+/// recording each completed call on the recorder's timeline as its chunk
+/// arrives. Returns every item.
 async fn run(
     wire: &Wire,
     body: String,
     request: &Value,
-    policy: Arc<dyn AttemptPolicy>,
+    policy: Option<Arc<dyn AttemptPolicy>>,
     recorder: Option<&Recorder>,
 ) -> Vec<Result<Value, String>> {
     let mut server = mockito::Server::new_async().await;
@@ -255,15 +256,21 @@ async fn run(
         .create_async()
         .await;
     let provider = (wire.provider)(server.url());
-    let mut stream = ShimClient::new()
-        .stream_with_policy(
-            provider.as_ref(),
-            wire.model,
-            request,
-            &DispatchPolicyContext::new(policy),
-        )
-        .await
-        .unwrap();
+    let client = ShimClient::new();
+    let mut stream = match policy {
+        Some(policy) => {
+            client
+                .stream_with_policy(
+                    provider.as_ref(),
+                    wire.model,
+                    request,
+                    &DispatchPolicyContext::new(policy),
+                )
+                .await
+        }
+        None => client.stream(provider.as_ref(), wire.model, request).await,
+    }
+    .unwrap();
     let mut items = Vec::new();
     while let Some(item) = stream.next().await {
         let item = item
@@ -306,7 +313,7 @@ async fn each_wire_reports_a_call_being_written_before_the_completed_call() {
             &wire,
             sse(&wire.events),
             &request(wire.model),
-            recorder.clone(),
+            Some(recorder.clone()),
             Some(&recorder),
         )
         .await;
@@ -351,15 +358,17 @@ fn without_minted_ids(value: &mut Value) {
     }
 }
 
-/// Reporting is opt-in through the observer: a policy that does not implement
-/// it, and one that does, see the same chunks for every wire.
+/// Reporting is opt-in through the observer: a stream with no policy, a policy
+/// that does not implement it, and one that does see the same chunks on every
+/// wire.
 #[tokio::test]
 async fn the_stream_is_the_same_whether_or_not_progress_is_observed() {
     for wire in [anthropic(), chat_completions(), openrouter(), responses()] {
         let mut outputs = Vec::new();
         for policy in [
-            Arc::new(Recorder::default()) as Arc<dyn AttemptPolicy>,
-            Arc::new(DefaultsOnly),
+            None,
+            Some(Arc::new(DefaultsOnly) as Arc<dyn AttemptPolicy>),
+            Some(Arc::new(Recorder::default())),
         ] {
             let mut items: Vec<Value> =
                 run(&wire, sse(&wire.events), &request(wire.model), policy, None)
@@ -378,6 +387,7 @@ async fn the_stream_is_the_same_whether_or_not_progress_is_observed() {
             outputs[0]
         );
         assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[0], outputs[2]);
     }
 }
 
@@ -397,7 +407,7 @@ async fn a_failed_attempt_abandons_the_call_it_was_writing() {
             &wire,
             sse(&events),
             &request(wire.model),
-            recorder.clone(),
+            Some(recorder.clone()),
             Some(&recorder),
         )
         .await;
@@ -461,7 +471,7 @@ async fn a_forced_answer_call_is_never_reported() {
         "x-shim": {"structured_output": "forced_tool"},
     });
     let recorder = Arc::new(Recorder::default());
-    let items = run(&wire, sse(&events), &request, recorder.clone(), None).await;
+    let items = run(&wire, sse(&events), &request, Some(recorder.clone()), None).await;
 
     let answer = items.last().unwrap().as_ref().unwrap();
     assert_eq!(answer["choices"][0]["delta"]["content"], "{\"n\":4}");

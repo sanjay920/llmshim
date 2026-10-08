@@ -199,7 +199,9 @@ pub trait AttemptPolicy: Send + Sync {
     /// synchronous, cannot fail and is called inline, before the output that
     /// carries the completed call is produced: return promptly. The default
     /// ignores every step. Calls llmshim makes for its own output contracts
-    /// (a forced answer tool, prompt-encoded calls) are never reported.
+    /// (a forced answer tool, prompt-encoded calls) are never reported. When a
+    /// reader drops a stream mid-call, the attempt's abandoned outcome can be
+    /// observed before that call's `Abandoned` step.
     fn observe_tool_call_progress(
         &self,
         _attempt: &AttemptIdentity,
