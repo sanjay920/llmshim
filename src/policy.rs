@@ -2,6 +2,7 @@
 
 use crate::error::ShimError;
 use crate::reasoning::{ReplayTarget, WireFormat};
+use crate::toolcall::ToolCallProgress;
 use serde_json::Value;
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
@@ -186,6 +187,25 @@ pub trait AttemptPolicy: Send + Sync {
     /// return promptly. Headers are never passed, by construction. The default
     /// ignores every frame, so implementing it is optional.
     fn observe_native(&self, _attempt: &AttemptIdentity, _frame: NativeFrame<'_>) {}
+
+    /// Each step of a streamed tool call while it is being written, normalized
+    /// across providers: started with its name, its argument text so far, and
+    /// ended or abandoned. See [`ToolCallProgress`] for the order and meaning.
+    ///
+    /// For a reader that shows a call before its arguments are complete. It is
+    /// provisional: the completed call in the stream's output stays the only
+    /// authoritative call, validated as before. `attempt` tells one attempt's
+    /// calls from another's. Like [`AttemptPolicy::observe_native`] it is
+    /// synchronous, cannot fail and is called inline, before the output that
+    /// carries the completed call is produced: return promptly. The default
+    /// ignores every step. Calls llmshim makes for its own output contracts
+    /// (a forced answer tool, prompt-encoded calls) are never reported.
+    fn observe_tool_call_progress(
+        &self,
+        _attempt: &AttemptIdentity,
+        _progress: ToolCallProgress<'_>,
+    ) {
+    }
 }
 
 /// One provider-native frame of an attempt's response, handed to
@@ -585,6 +605,17 @@ impl AttemptTracker {
             .context
             .policy
             .observe_native(&self.shared.identity, frame);
+    }
+
+    /// A sink handing each tool-call progress step to the policy's observer.
+    pub(crate) fn tool_call_progress_sink(&self) -> crate::toolcall::ProgressSink {
+        let shared = self.shared.clone();
+        Box::new(move |progress| {
+            shared
+                .context
+                .policy
+                .observe_tool_call_progress(&shared.identity, progress)
+        })
     }
 
     pub(crate) fn cancellation_guard(&self) -> AttemptCancellationGuard {

@@ -1018,7 +1018,7 @@ impl ShimClient {
         let mut rendered = plan.render().map_err(DispatchFailure::Local)?;
         if !plan.buffered() {
             return self
-                .stream_once(provider, model, &rendered, policy_context)
+                .stream_once(provider, model, &rendered, policy_context, &plan)
                 .await
                 .map(|(stream, _)| stream.stream)
                 .map_err(|error| error.map_upstream(|error| plan.dispatch_error(error)));
@@ -1026,7 +1026,7 @@ impl ShimClient {
         let mut usage = serde_json::json!({});
         for attempt in 0..2 {
             let (stream_dispatch, target) = self
-                .stream_once(provider, model, &rendered, policy_context)
+                .stream_once(provider, model, &rendered, policy_context, &plan)
                 .await
                 .map_err(|error| error.map_upstream(|error| plan.dispatch_error(error)))?;
             let mut result = collect_stream_dispatch(stream_dispatch)
@@ -1118,7 +1118,13 @@ impl ShimClient {
         .map_err(DispatchFailure::Local)?;
         let rendered = plan.render().map_err(DispatchFailure::Local)?;
         let (first_dispatch, target) = self
-            .stream_once(provider.as_ref(), model, &rendered, policy_context.as_ref())
+            .stream_once(
+                provider.as_ref(),
+                model,
+                &rendered,
+                policy_context.as_ref(),
+                &plan,
+            )
             .await
             .map_err(|error| error.map_upstream(|error| plan.dispatch_error(error)))?;
         if !plan.buffered() {
@@ -1157,6 +1163,7 @@ impl ShimClient {
                         &model,
                         &rendered,
                         policy_context.as_ref(),
+                        &plan,
                     )
                     .await
                     .map_err(|error| match error {
@@ -1190,6 +1197,7 @@ impl ShimClient {
         model: &str,
         request: &serde_json::Value,
         policy_context: Option<&DispatchPolicyContext>,
+        plan: &crate::shim::Plan,
     ) -> DispatchResult<(StreamDispatch, crate::reasoning::ReplayTarget)> {
         crate::reasoning::preflight_request(request).map_err(DispatchFailure::Local)?;
         let mut req_value = request.clone();
@@ -1214,9 +1222,14 @@ impl ShimClient {
             )
             .await?;
         let policy_failure = Arc::new(std::sync::Mutex::new(None));
+        let tool_call_progress = tracker
+            .as_ref()
+            .filter(|_| plan.native_calls_are_callers())
+            .map(AttemptTracker::tool_call_progress_sink);
         let stream = eager_stream(
             response,
             tracker,
+            tool_call_progress,
             target.clone(),
             policy_failure.clone(),
             self.deadlines,
@@ -1339,9 +1352,11 @@ fn stamp_usage(target: &ReplayTarget, usage: &mut serde_json::Value) {
     *usage = response["usage"].take();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eager_stream(
     response: reqwest::Response,
     tracker: Option<AttemptTracker>,
+    tool_call_progress: Option<crate::toolcall::ProgressSink>,
     target: ReplayTarget,
     policy_failure: Arc<std::sync::Mutex<Option<AttemptPolicyError>>>,
     deadlines: AttemptDeadlines,
@@ -1357,6 +1372,7 @@ fn eager_stream(
         run_eager_stream_producer(
             response,
             tracker,
+            tool_call_progress,
             target,
             policy_failure,
             deadlines,
@@ -1420,6 +1436,7 @@ impl Drop for EagerReceiverStream {
 async fn run_eager_stream_producer(
     response: reqwest::Response,
     mut tracker: Option<AttemptTracker>,
+    tool_call_progress: Option<crate::toolcall::ProgressSink>,
     target: ReplayTarget,
     policy_failure: Arc<std::sync::Mutex<Option<AttemptPolicyError>>>,
     deadlines: AttemptDeadlines,
@@ -1440,6 +1457,9 @@ async fn run_eager_stream_producer(
             return;
         }
     };
+    if let Some(sink) = tool_call_progress {
+        normalizer.report_tool_call_progress(sink);
+    }
     let mut native_usage =
         crate::usage::NativeStreamUsage::with_limits(target.clone(), retention_limits);
     let mut semantic_idle_remaining = deadlines.stream_semantic_idle;

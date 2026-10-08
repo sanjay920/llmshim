@@ -286,6 +286,11 @@ impl Plan {
             strip_reasoning: caps.reasoning == Support::Unsupported,
         })
     }
+    /// Whether native tool calls in the response are the caller's own, rather
+    /// than llmshim's forced answer call or a prompt-encoded protocol.
+    pub(crate) fn native_calls_are_callers(&self) -> bool {
+        !self.synthetic_call() && !self.protocol()
+    }
     pub fn buffered(&self) -> bool {
         self.output.is_some() || self.capture || (self.prompt_tools && !self.tools.is_empty())
     }
