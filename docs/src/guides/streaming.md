@@ -58,6 +58,43 @@ cumulative snapshots; use the latest values, rather than summing events.
 The [Rust quickstart](../start/rust.md#3-stream-content) contains a complete
 runnable program.
 
+### Showing a tool call while it is written
+
+A long argument, such as a file's new contents, can take many seconds to
+stream. To show the call before it completes, implement
+`AttemptPolicy::observe_tool_call_progress` and stream with a policy
+(`ShimClient::stream_with_policy`, `stream_owned_with_policy` or
+`llmshim::stream_with_policy`). Each call is reported in the same shape for
+every provider: `Started` with the tool's name, `Arguments` with the text so
+far, then `Ended` or `Abandoned`.
+
+```rust
+use llmshim::{policy::{AttemptIdentity, AttemptPolicy}, toolcall::{ToolCallProgress, ToolCallProgressEvent}};
+
+impl AttemptPolicy for MyPolicy {
+    // acquire, observe and observe_abandoned as before …
+
+    fn observe_tool_call_progress(&self, attempt: &AttemptIdentity, progress: ToolCallProgress) {
+        match progress.event {
+            ToolCallProgressEvent::Started { name } => self.show(attempt.id(), progress.id, name),
+            ToolCallProgressEvent::Arguments { text, .. } => self.preview(progress.id, text),
+            ToolCallProgressEvent::Abandoned => self.discard(progress.id),
+            _ => {}
+        }
+    }
+}
+```
+
+The progress is provisional. The completed call in the stream is still the
+only call to execute, validated as before, and it carries the same `id` as its
+progress. `Ended` is reported before that chunk is produced. `Arguments.text`
+is partial JSON; `appended` is the new part, or `None` when the provider
+replaced the text. `attempt` separates one attempt's calls from another's. If
+the stream ends with an error, discard the progress of every call whose
+completed form did not arrive. A policy that does not implement the method
+gets the same stream as before. Calls that llmshim makes for its own output
+contracts (a forced answer tool, prompt-encoded calls) are never reported.
+
 ## Proxy: typed SSE events
 
 Send the compact request to the always-streaming endpoint:
