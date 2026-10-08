@@ -1,3 +1,4 @@
+use super::openrouter_cache;
 use crate::error::{Result, ShimError};
 use crate::provider::{Provider, ProviderRequest};
 use crate::vision;
@@ -197,8 +198,12 @@ impl Provider for OpenRouter {
         crate::reasoning::preflight_request(request)?;
         let mut schema_budget = crate::schema::RequestBudget::new();
         let request = crate::schema::prepare_request(request, &mut schema_budget)?;
-        let request =
-            crate::cache::prepare_request(&request, crate::reasoning::WireFormat::OpenAiChat)?;
+        // Apply cache markers if the model family supports them on OpenRouter.
+        let request = if let Some(config) = openrouter_cache::model_cache_config(model) {
+            crate::cache::prepare_request_with_config(&request, config)?
+        } else {
+            crate::cache::prepare_request(&request, crate::reasoning::WireFormat::OpenAiChat)?
+        };
         let request = crate::reasoning::prepare_request(&request, &self.replay_target(model))?;
         let request = crate::toolcall::prepare_request(&request, &self.replay_target(model))?;
         let obj = request.as_object().ok_or(ShimError::MissingModel)?;
@@ -316,11 +321,15 @@ impl Provider for OpenRouter {
             &mut body,
             &mut schema_budget,
         )?;
-        crate::cache::finish_request(
-            &request,
-            &mut body,
-            crate::reasoning::WireFormat::OpenAiChat,
-        )?;
+        // Finish request with model-specific cache config if needed.
+        if let Some(config) = openrouter_cache::model_cache_config(model) {
+            crate::cache::finish_request_with_config(&request, &mut body, config)?;
+        } else {
+            // For models without explicit cache support, just remove x-cache header.
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("x-cache");
+            }
+        }
         Ok(ProviderRequest { url, headers, body })
     }
 

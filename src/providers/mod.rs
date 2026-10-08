@@ -8,4 +8,5 @@ mod openai_audio;
 pub mod openai_compat;
 pub mod openrouter;
 mod openrouter_audio;
+mod openrouter_cache;
 pub mod xai;
