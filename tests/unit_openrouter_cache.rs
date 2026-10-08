@@ -93,6 +93,47 @@ fn google_model_via_openrouter_receives_markers_without_ttl() {
 }
 
 #[test]
+fn google_model_places_marker_only_on_last_segment() {
+    let p = OpenRouter::new("test-key".into());
+    let req = json!({
+        "model": "google/gemini-3.8-flash",
+        "messages": [
+            {"role": "user", "content": "part0"},
+            {"role": "user", "content": "part1"},
+            {"role": "user", "content": "part2"},
+        ],
+        "x-cache": {
+            "segments": [
+                {"upto_message": 0, "stability": "static"},
+                {"upto_message": 1, "stability": "session"},
+                {"upto_message": 2, "stability": "session"}
+            ]
+        }
+    });
+    let result = p
+        .transform_request("google/gemini-3.8-flash", &req)
+        .unwrap();
+
+    // Google models place only one marker, at the last segment.
+    assert_eq!(markers(&result.body).len(), 1);
+
+    // The marker should be on the last message only.
+    assert!(result.body["messages"][0]["content"][0]
+        .get("cache_control")
+        .is_none());
+    assert!(result.body["messages"][1]["content"][0]
+        .get("cache_control")
+        .is_none());
+    assert_eq!(
+        result.body["messages"][2]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert!(result.body["messages"][2]["content"][0]["cache_control"]
+        .get("ttl")
+        .is_none());
+}
+
+#[test]
 fn openai_model_via_openrouter_ignores_cache_markers() {
     let p = OpenRouter::new("test-key".into());
     let req = json!({

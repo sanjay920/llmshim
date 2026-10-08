@@ -9,12 +9,14 @@ use crate::cache::BreakpointConfig;
 pub fn model_cache_config(slug: &str) -> Option<BreakpointConfig> {
     let vendor = slug.split('/').next().unwrap_or("");
     match vendor {
+        // Anthropic: supports up to four explicit cache_control breakpoints with ttl.
         "anthropic" => Some(BreakpointConfig {
             limit: 4,
             supports_ttl: true,
         }),
+        // Google Gemini: uses only the last cache_control breakpoint; no ttl field.
         "google" => Some(BreakpointConfig {
-            limit: 5,
+            limit: 1,
             supports_ttl: false,
         }),
         _ => None,
@@ -39,7 +41,7 @@ mod tests {
         let cfg = model_cache_config("google/gemini-3.8-flash");
         assert!(cfg.is_some());
         let cfg = cfg.unwrap();
-        assert_eq!(cfg.limit, 5);
+        assert_eq!(cfg.limit, 1);
         assert!(!cfg.supports_ttl);
     }
 
