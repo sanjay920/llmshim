@@ -1,5 +1,8 @@
 //! Owned tool-call identities, persisted wire mappings, and conversation checks.
+mod progress;
 mod streaming;
+pub(crate) use progress::ProgressSink;
+pub use progress::{ToolCallProgress, ToolCallProgressEvent};
 pub use streaming::{ToolDelta, ToolStream, ToolUpdate};
 
 use crate::{

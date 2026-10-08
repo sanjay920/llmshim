@@ -1,3 +1,4 @@
+use super::progress::{ArgumentsBefore, CallView, ProgressReporter, ProgressSink};
 use super::*;
 use crate::reasoning::ThoughtSignature;
 
@@ -61,6 +62,7 @@ pub struct ToolStream {
     emitted: BTreeSet<u64>,
     budget: crate::stream_retention::RetainedBudget,
     retained: crate::stream_retention::RetainedFootprint,
+    progress: Option<ProgressReporter>,
     #[cfg(test)]
     gemini_id_index_operations: usize,
 }
@@ -91,17 +93,55 @@ impl ToolStream {
             emitted: BTreeSet::new(),
             budget,
             retained: crate::stream_retention::RetainedFootprint::default(),
+            progress: None,
             #[cfg(test)]
             gemini_id_index_operations: 0,
         }
     }
 
+    /// Report each call's provisional progress to `sink` as updates arrive.
+    pub(crate) fn report_progress(&mut self, sink: ProgressSink) {
+        self.progress = Some(ProgressReporter::new(sink));
+    }
+
     pub fn apply(&mut self, delta: ToolDelta) -> Result<()> {
+        let progress = self.progress.is_some().then(|| {
+            (
+                delta.part_id.clone(),
+                !matches!(delta.update, ToolUpdate::NameFragment(_)),
+                self.arguments_before(&delta),
+            )
+        });
         let result = self.apply_inner(delta);
         if result.is_err() {
             self.clear();
+        } else if let Some((key, name_settled, before)) = progress {
+            if let (Some(reporter), Some(part)) = (self.progress.as_mut(), self.parts.get(&key)) {
+                reporter.updated(&call_view(&key, part), name_settled, before);
+            }
         }
         result
+    }
+
+    fn arguments_before(&self, delta: &ToolDelta) -> ArgumentsBefore {
+        let visible = self.parts.get(&delta.part_id).map_or("", visible_arguments);
+        let kept = match &delta.update {
+            ToolUpdate::ArgumentsStart(_) => visible.is_empty(),
+            ToolUpdate::Arguments(text) => text.starts_with(visible),
+            _ => true,
+        };
+        ArgumentsBefore {
+            len: visible.len(),
+            kept,
+        }
+    }
+
+    fn abandon_open(&mut self) {
+        if let Some(reporter) = self.progress.as_mut() {
+            for (key, part) in &self.parts {
+                reporter.abandoned(&call_view(key, part));
+            }
+        }
     }
 
     fn apply_inner(&mut self, delta: ToolDelta) -> Result<()> {
@@ -813,6 +853,17 @@ impl ToolStream {
             self.reserve(crate::stream_retention::RetainedFootprint::record(0))?;
             self.emitted.insert(choice);
         }
+        if let Some(reporter) = self.progress.as_mut() {
+            let mut ended: Vec<_> = self
+                .parts
+                .iter()
+                .filter(|(_, part)| part.choice == choice)
+                .collect();
+            ended.sort_by_key(|(_, part)| part.index);
+            for (key, part) in ended {
+                reporter.ended(&call_view(key, part));
+            }
+        }
         let completed_keys: Vec<_> = self
             .parts
             .iter()
@@ -952,6 +1003,7 @@ impl ToolStream {
     }
 
     pub(crate) fn clear(&mut self) {
+        self.abandon_open();
         self.parts.clear();
         self.gemini_last.clear();
         self.gemini_by_id.clear();
@@ -1004,6 +1056,35 @@ impl ToolStream {
             .get(&choice)
             .and_then(|mappings| mappings.get(id))
             .cloned()
+    }
+}
+
+/// A stream dropped mid-call, such as one its reader stopped reading, abandons
+/// the calls it was assembling.
+impl Drop for ToolStream {
+    fn drop(&mut self) {
+        self.abandon_open();
+    }
+}
+
+/// An initial placeholder is replaced by the first fragment, so it is not text
+/// a reader should see.
+fn visible_arguments(part: &Part) -> &str {
+    if part.initial {
+        ""
+    } else {
+        &part.arguments
+    }
+}
+
+fn call_view<'a>(key: &'a str, part: &'a Part) -> CallView<'a> {
+    CallView {
+        key,
+        choice: part.choice,
+        index: part.index,
+        id: &part.id,
+        name: &part.name,
+        arguments: visible_arguments(part),
     }
 }
 
