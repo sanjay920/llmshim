@@ -10,6 +10,26 @@ use std::collections::BTreeMap;
 
 pub const ANTHROPIC_BREAKPOINT_LIMIT: usize = 4;
 
+/// Configuration for where and how to place explicit cache_control markers.
+/// Used internally to parameterize the marker placement logic across wire formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BreakpointConfig {
+    /// Maximum number of explicit markers allowed.
+    pub limit: usize,
+    /// Whether cache_control supports a `ttl` field; if false, omit ttl.
+    pub supports_ttl: bool,
+}
+
+impl BreakpointConfig {
+    /// Anthropic's native configuration: 4 markers with ttl support.
+    pub fn anthropic() -> Self {
+        Self {
+            limit: 4,
+            supports_ttl: true,
+        }
+    }
+}
+
 /// How long the caller expects a prefix to stay byte-stable. Only the caller
 /// knows; llmshim never infers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,9 +168,9 @@ fn markers(value: &Value) -> Vec<String> {
     paths
 }
 
-fn trim_markers(value: &mut Value) {
+fn trim_markers_with_limit(value: &mut Value, limit: usize) {
     let paths = markers(value);
-    let excess = paths.len().saturating_sub(ANTHROPIC_BREAKPOINT_LIMIT);
+    let excess = paths.len().saturating_sub(limit);
     for path in paths.into_iter().take(excess) {
         if let Some(obj) = value.pointer_mut(&path).and_then(Value::as_object_mut) {
             obj.remove("cache_control");
@@ -161,11 +181,28 @@ fn trim_markers(value: &mut Value) {
 /// Annotate the original message indices before system extraction or native
 /// tool-message conversion. Without x-cache this is an exact clone/no-op.
 pub fn prepare_request(request: &Value, wire: WireFormat) -> Result<Value> {
+    // Only Anthropic Messages wire supports explicit cache markers in the current design.
+    if wire != WireFormat::AnthropicMessages {
+        return Ok(request.clone());
+    }
+    prepare_request_with_breakpoints(request, BreakpointConfig::anthropic())
+}
+
+/// Annotate with explicit cache markers for a custom breakpoint configuration.
+/// Used by OpenRouter to support cache markers for Anthropic and Gemini models.
+/// Returns the request unchanged if no x-cache is present or if segments is empty.
+pub fn prepare_request_with_config(request: &Value, config: BreakpointConfig) -> Result<Value> {
+    prepare_request_with_breakpoints(request, config)
+}
+
+/// Internal: annotate with explicit cache markers using the given breakpoint config.
+/// Returns the request unchanged if no x-cache is present or if segments is empty.
+fn prepare_request_with_breakpoints(request: &Value, config: BreakpointConfig) -> Result<Value> {
     let mut request = request.clone();
     let Some(policy) = policy(&request)? else {
         return Ok(request);
     };
-    if wire != WireFormat::AnthropicMessages {
+    if policy.segments.is_empty() {
         return Ok(request);
     }
     let count = request["messages"].as_array().map(Vec::len).unwrap_or(0);
@@ -176,7 +213,7 @@ pub fn prepare_request(request: &Value, wire: WireFormat) -> Result<Value> {
     if !policy.segments.is_empty() {
         request.as_object_mut().unwrap().remove("cache_control");
     }
-    trim_markers(&mut request);
+    trim_markers_with_limit(&mut request, config.limit);
     let mut used = markers(&request).len();
     let mut boundaries = BTreeMap::new();
     for segment in policy.segments {
@@ -188,14 +225,18 @@ pub fn prepare_request(request: &Value, wire: WireFormat) -> Result<Value> {
         }
         let message = &mut request["messages"][index];
         let existing = anchor_has_marker(message);
-        if !existing && used >= ANTHROPIC_BREAKPOINT_LIMIT {
+        if !existing && used >= config.limit {
             continue;
         }
         let Some(anchor) = anchor(message) else {
             continue;
         };
-        anchor["cache_control"] =
-            json!({"type":"ephemeral","ttl":if stability==Stability::Static {"1h"}else{"5m"}});
+        let cache_marker = if config.supports_ttl {
+            json!({"type":"ephemeral","ttl":if stability==Stability::Static {"1h"}else{"5m"}})
+        } else {
+            json!({"type":"ephemeral"})
+        };
+        anchor["cache_control"] = cache_marker;
         if !existing {
             used += 1;
         }
@@ -261,10 +302,26 @@ pub fn finish_request(original: &Value, body: &mut Value, wire: WireFormat) -> R
             }
         }
         if wire == WireFormat::AnthropicMessages {
-            if !policy.segments.is_empty() {
-                body.as_object_mut().unwrap().remove("cache_control");
-            }
-            trim_markers(body);
+            return finish_request_with_config(original, body, BreakpointConfig::anthropic());
+        }
+    }
+    Ok(())
+}
+
+/// Final native-body pass with a specific breakpoint configuration.
+/// Validates marker ordering for configs that support ttl.
+/// Assumes x-cache has already been removed from body.
+pub fn finish_request_with_config(
+    original: &Value,
+    body: &mut Value,
+    config: BreakpointConfig,
+) -> Result<()> {
+    let policy = policy(original)?;
+    if let Some(policy) = policy {
+        // Only check ttl ordering if the config supports ttl and has explicit segments.
+        if config.supports_ttl && !policy.segments.is_empty() {
+            body.as_object_mut().unwrap().remove("cache_control");
+            trim_markers_with_limit(body, config.limit);
             let mut short = false;
             for path in markers(body) {
                 let long = body
