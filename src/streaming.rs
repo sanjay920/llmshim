@@ -66,6 +66,12 @@ impl StreamNormalizer {
             finished: false,
         })
     }
+    /// Report each tool call's provisional progress to `sink` as its native
+    /// events arrive, ahead of the completed call this normalizer emits.
+    pub(crate) fn report_tool_call_progress(&mut self, sink: crate::toolcall::ProgressSink) {
+        self.tools.report_progress(sink);
+    }
+
     pub fn is_finished(&self) -> bool {
         self.finished
     }

@@ -423,6 +423,15 @@ arrive after names/arguments; preserve their exact data/origin and original wire
 container. Parallel choices close independently. The single-message proxy
 projects choice zero; Rust retains choice indices.
 
+`src/toolcall/progress.rs` reports provisional steps of a call while it is
+written (started, arguments so far, ended, abandoned) to
+`AttemptPolicy::observe_tool_call_progress`, a defaulted method. It reads the
+same `ToolStream` updates and never changes the chunks, assembly or
+validation: the completed call stays the only authoritative one, under the
+same id. `Ended` comes from `complete()` for every wire; `clear()` and `Drop`
+abandon open calls. A plan's forced answer call or prompt protocol is never
+reported (`Plan::native_calls_are_callers`). Tests: `unit_tool_call_progress`.
+
 Google's current Generate Content contract requires a signature on the first
 function call of each current Gemini 3 batch, not every parallel call. Validate
 that rule after filtering, preserve additional signatures exactly where present,
