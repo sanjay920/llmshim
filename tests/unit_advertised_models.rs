@@ -8,6 +8,7 @@ const EXPECTED: &[&str] = &[
     "anthropic/claude-opus-5-5",
     "anthropic/claude-sonnet-5-5",
     "anthropic/claude-haiku-4-5-20251001",
+    "gemini/gemini-4-argon",
     "gemini/gemini-3.8-flash",
     "gemini/gemini-3.5-flash-lite",
     "xai/grok-4.7",
@@ -28,7 +29,11 @@ fn catalog_advertises_only_the_selected_current_tiers() {
             .iter()
             .map(|model| model.id)
             .collect::<Vec<_>>(),
-        ["gemini/gemini-3.8-flash", "gemini/gemini-3.5-flash-lite"]
+        [
+            "gemini/gemini-4-argon",
+            "gemini/gemini-3.8-flash",
+            "gemini/gemini-3.5-flash-lite"
+        ]
     );
     assert_eq!(spec("gpt-6-astra").unwrap().id, "openai/gpt-6-astra");
     assert!(available_models(&["openrouter", "vllm", "sglang"]).is_empty());

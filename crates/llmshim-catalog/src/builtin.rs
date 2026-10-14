@@ -231,6 +231,16 @@ pub const MODELS: &[BuiltinModelInfo] = &[
         capabilities: CAPS_FULL,
     },
     BuiltinModelInfo {
+        id: "gemini/gemini-4-argon",
+        provider: "gemini",
+        family: Some(ModelFamily::Gemini),
+        name: "gemini-4-argon",
+        label: "Gemini 4 Argon",
+        context_window_tokens: Some(1_048_576),
+        max_output_tokens: Some(32_768),
+        capabilities: CAPS_STD,
+    },
+    BuiltinModelInfo {
         id: "gemini/gemini-3.8-flash",
         provider: "gemini",
         family: Some(ModelFamily::Gemini),
