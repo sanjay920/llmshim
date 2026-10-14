@@ -99,7 +99,9 @@ fn usage_metadata(usage: &Value) -> Value {
         "promptTokenCount": usage["uncached_input_tokens"].as_u64().unwrap_or(0)
             .saturating_add(usage["cache_read_tokens"].as_u64().unwrap_or(0))
             .saturating_add(usage["cache_write_tokens"].as_u64().unwrap_or(0)),
-        "candidatesTokenCount": usage["output_tokens"],
+        // Google's candidates exclude thoughts; the canonical output includes reasoning.
+        "candidatesTokenCount": usage["output_tokens"].as_u64().unwrap_or(0)
+            .saturating_sub(usage["reasoning_tokens"].as_u64().unwrap_or(0)),
         "thoughtsTokenCount": usage["reasoning_tokens"],
         "totalTokenCount": usage["total_tokens"],
         "cachedContentTokenCount": usage["cache_read_tokens"],

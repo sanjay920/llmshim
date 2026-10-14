@@ -689,3 +689,44 @@ fn gemini_thought_parts_are_restored_through_their_receipt() {
     .unwrap();
     assert_eq!(orphaned["messages"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn gemini_native_usage_counts_thinking_once() {
+    let mut server = mockito::Server::new_async().await;
+    let upstream = server
+        .mock("POST", "/models/gemini-3.8-flash:generateContent")
+        .match_query(mockito::Matcher::Any)
+        .with_body(
+            json!({
+                "candidates": [{
+                    "content": {"role":"model","parts":[{"text":"42"}]},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 33,
+                    "candidatesTokenCount": 5,
+                    "thoughtsTokenCount": 72,
+                    "totalTokenCount": 110,
+                },
+            })
+            .to_string(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (status, body) = post(
+        app(gemini_router(server.url()), None)
+            .layer(Extension(Arc::new(Receipts::new(dir.path().to_owned())))),
+        GEMINI_PATH,
+        json!({"contents": [{"role":"user","parts":[{"text":"hi"}]}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // Google's own shape: candidates exclude thoughts, so a client summing the two counts each token once.
+    assert_eq!(body["usageMetadata"]["candidatesTokenCount"], 5, "{body}");
+    assert_eq!(body["usageMetadata"]["thoughtsTokenCount"], 72, "{body}");
+    assert_eq!(body["usageMetadata"]["totalTokenCount"], 110, "{body}");
+    upstream.assert_async().await;
+}

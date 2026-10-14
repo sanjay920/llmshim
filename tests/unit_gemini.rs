@@ -1442,3 +1442,94 @@ fn reasoning_none_clamps_per_model_disable_capability() {
         );
     }
 }
+
+// ============================================================
+// usage: thinking tokens (thoughtsTokenCount) are reasoning tokens
+// ============================================================
+
+/// The convention: reasoning is a subset of `completion_tokens`, matching the
+/// OpenAI Responses wire (`output_tokens` already includes
+/// `output_tokens_details.reasoning_tokens`) and Anthropic (`output_tokens`
+/// includes thinking). Gemini reports `candidatesTokenCount` *without*
+/// `thoughtsTokenCount`, so completion must fold it in to follow the same rule.
+#[test]
+fn response_thoughts_are_reported_as_reasoning_tokens() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [{"text": "42"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {
+            "promptTokenCount": 33,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 72,
+            "totalTokenCount": 110,
+        },
+        "responseId": "resp_1",
+    });
+    let result = p.transform_response("gemini-3.8-flash", resp).unwrap();
+    assert_eq!(result["usage"]["prompt_tokens"], 33);
+    // 5 candidates + 72 thoughts: reasoning lives inside completion_tokens.
+    assert_eq!(result["usage"]["completion_tokens"], 77);
+    assert_eq!(result["usage"]["reasoning_tokens"], 72);
+    assert_eq!(
+        result["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        72
+    );
+    assert_eq!(result["usage"]["total_tokens"], 110);
+}
+
+#[test]
+fn stream_thoughts_are_reported_as_reasoning_tokens() {
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [{"text": "42"}]}, "finishReason": "STOP", "index": 0}],
+        "usageMetadata": {
+            "promptTokenCount": 33,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 72,
+            "totalTokenCount": 110,
+        },
+    });
+    let result = p
+        .transform_stream_chunk("gemini-3.8-flash", &chunk.to_string())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["usage"]["completion_tokens"], 77);
+    assert_eq!(parsed["usage"]["reasoning_tokens"], 72);
+    assert_eq!(
+        parsed["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        72
+    );
+}
+
+#[test]
+fn gemini_thoughts_are_billed_at_the_output_rate() {
+    let p = provider();
+    let value = json!({
+        "candidates": [{"content": {"parts": [{"text": "42"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {
+            "promptTokenCount": 33,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 72,
+            "totalTokenCount": 110,
+        },
+    });
+    let result = p.transform_response("gemini-3.8-flash", value).unwrap();
+    let output_rate = llmshim::cost::for_target("gemini", "gemini-3.8-flash")
+        .and_then(|cost| cost.output)
+        .expect("gemini-3.8-flash is priced");
+    let billed = llmshim::cost::cost_usd("gemini", "gemini-3.8-flash", &result["usage"]).unwrap();
+    let without_thinking = llmshim::cost::cost_usd(
+        "gemini",
+        "gemini-3.8-flash",
+        &json!({"prompt_tokens": 33, "completion_tokens": 5, "total_tokens": 38}),
+    )
+    .unwrap();
+    let expected_delta = 72.0 * output_rate / 1_000_000.0;
+    assert!(
+        (billed - without_thinking - expected_delta).abs() < 1e-12,
+        "thinking must be billed at the output rate: billed {billed}, \
+         without thinking {without_thinking}, delta {}",
+        billed - without_thinking
+    );
+}
