@@ -15,7 +15,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 - **OpenAI:** `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`
 - **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and `chatgpt/gpt-6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
 - **Anthropic:** `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5-20251001`
-- **Gemini:** `gemini-3.8-flash`, `gemini-3.5-flash-lite`
+- **Gemini:** `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite`
 - **xAI:** `grok-4.7`
 - **OpenRouter:** not enumerated (huge/dynamic catalog) — any `openrouter/<vendor>/<model>` slug routes through, e.g. `openrouter/anthropic/claude-sonnet-5`.
 - **vLLM / SGLang:** not enumerated (self-hosted) — any `vllm/<served-model>` or `sglang/<served-model>` routes through to the configured server, e.g. `sglang/Qwen/Qwen3.6-35B-A3B-FP8`.

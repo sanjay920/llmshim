@@ -1331,12 +1331,13 @@ fn effort_none_disables_thinking_via_minimal() {
         r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
         "minimal"
     );
-    // gemini-3.1-pro / 3.7-flash / 3.8-flash cannot disable thinking (verified
-    // live) — "none" clamps to the floor ("low") instead of "minimal".
+    // gemini-3.1-pro / 3.7-flash / 3.8-flash / 4-argon cannot disable thinking
+    // (verified live) — "none" clamps to the floor ("low") instead of "minimal".
     for model in [
         "gemini-3.1-pro-preview",
         "gemini-3.7-flash",
         "gemini-3.8-flash",
+        "gemini-4-argon",
     ] {
         let r = p.transform_request(model, &req).unwrap();
         assert_eq!(
