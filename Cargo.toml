@@ -31,6 +31,7 @@ bedrock = [
 ]
 
 vertex = ["dep:ring"]
+azure = []
 
 [dependencies]
 llmshim-catalog = { version = "0.3.4", path = "crates/llmshim-catalog" }

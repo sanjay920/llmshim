@@ -1,0 +1,7 @@
+data: {"id":"fixture-filter","object":"chat.completion.chunk","model":"gpt-6-sol","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"content_filter","content_filter_results":{"violence":{"filtered":true,"severity":"high"}}}]}
+
+data: {"id":"fixture-filter","object":"chat.completion.chunk","model":"gpt-6-sol","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10}}
+
+data: [DONE]
+
+: fixture ends

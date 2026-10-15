@@ -137,7 +137,7 @@ pub(crate) fn may_finalize(outcome: AttemptOutcome) -> bool {
 fn conservative_reservation_nanos(attempt: &PreparedAttempt<'_>) -> Option<u64> {
     let identity = attempt.identity();
     let provider = identity.provider_name();
-    let model = identity.native_model();
+    let model = identity.pricing_model();
     let body = attempt.native_body();
 
     if !supported_pricing_shape(provider, model, identity.wire(), body) {

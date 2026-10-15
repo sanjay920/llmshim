@@ -8,6 +8,7 @@
 - [Configure providers](start/configure.md)
 - [Amazon Bedrock](bedrock.md)
 - [Google Vertex](vertex.md)
+- [Azure OpenAI and Foundry](azure.md)
 - [Rust quickstart](start/rust.md)
 - [CLI quickstart](start/cli.md)
 - [HTTP proxy quickstart](start/proxy.md)

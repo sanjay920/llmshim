@@ -16,3 +16,8 @@ pub mod xai;
 
 #[cfg(feature = "vertex")]
 pub mod vertex;
+
+#[cfg(feature = "azure")]
+pub mod azure;
+#[cfg(any(feature = "azure", feature = "vertex"))]
+mod token_cache;

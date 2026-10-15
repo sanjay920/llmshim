@@ -194,86 +194,7 @@ impl Provider for OpenAiCompatible {
     }
 
     fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
-        crate::reasoning::preflight_request(request)?;
-        if self.wire == WireFormat::OpenAiResponses {
-            return self.transform_request_responses(model, request);
-        }
-        let mut schema_budget = crate::schema::RequestBudget::new();
-        let request = crate::schema::prepare_request(request, &mut schema_budget)?;
-        let request =
-            crate::cache::prepare_request(&request, crate::reasoning::WireFormat::OpenAiChat)?;
-        let request = crate::reasoning::prepare_request(&request, &self.replay_target(model))?;
-        let request = crate::toolcall::prepare_request(&request, &self.replay_target(model))?;
-        let obj = request.as_object().ok_or(ShimError::MissingModel)?;
-        let messages = obj
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .ok_or(ShimError::MissingModel)?;
-
-        let mut body = json!({
-            "model": model,
-            "messages": sanitize_messages(messages),
-        });
-        let body_obj = body.as_object_mut().unwrap();
-
-        // Standard Chat Completions params (plus reasoning_effort, which vLLM and
-        // some SGLang models honor natively) — forwarded unchanged.
-        for key in [
-            "max_tokens",
-            "max_completion_tokens",
-            "temperature",
-            "top_p",
-            "frequency_penalty",
-            "presence_penalty",
-            "stop",
-            "seed",
-            "stream",
-            "stream_options",
-            "tools",
-            "tool_choice",
-            "parallel_tool_calls",
-            "response_format",
-            "logprobs",
-            "top_logprobs",
-            "n",
-            "reasoning_effort",
-        ] {
-            if let Some(v) = obj.get(key) {
-                body_obj.insert(key.to_string(), v.clone());
-            }
-        }
-
-        // x-<name> namespace: server-specific params (sampling knobs like top_k /
-        // min_p, guided_json / regex / ebnf, chat_template_kwargs,
-        // separate_reasoning, …) are copied straight into the body.
-        let ns = format!("x-{}", self.name);
-        if let Some(ext) = obj.get(&ns).and_then(|e| e.as_object()) {
-            for (k, v) in ext {
-                body_obj.insert(k.clone(), v.clone());
-            }
-        }
-
-        let headers = self.headers();
-
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        crate::toolcall::validate_native(&body, &self.replay_target(model))?;
-        crate::schema::normalize_native_tools(
-            crate::schema::Target::OpenAiChat,
-            &mut body,
-            &mut schema_budget,
-        )?;
-        crate::shim::native_format(
-            &request,
-            crate::reasoning::WireFormat::OpenAiChat,
-            &mut body,
-            &mut schema_budget,
-        )?;
-        crate::cache::finish_request(
-            &request,
-            &mut body,
-            crate::reasoning::WireFormat::OpenAiChat,
-        )?;
-        Ok(ProviderRequest { url, headers, body })
+        self.request_for_target(model, request, &self.replay_target(model))
     }
 
     fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
@@ -328,7 +249,11 @@ impl Provider for OpenAiCompatible {
 }
 
 impl OpenAiCompatible {
-    fn transform_response_native(&self, _model: &str, mut response: Value) -> Result<Value> {
+    pub(crate) fn transform_response_native(
+        &self,
+        _model: &str,
+        mut response: Value,
+    ) -> Result<Value> {
         if !response.is_object() {
             return Err(ShimError::ProviderError {
                 status: 502,
@@ -358,7 +283,11 @@ impl OpenAiCompatible {
 }
 
 impl OpenAiCompatible {
-    fn transform_stream_chunk_native(&self, _model: &str, chunk: &str) -> Result<Option<String>> {
+    pub(crate) fn transform_stream_chunk_native(
+        &self,
+        _model: &str,
+        chunk: &str,
+    ) -> Result<Option<String>> {
         let mut parsed: Value = match serde_json::from_str(chunk) {
             Ok(v) => v,
             Err(_) => return Ok(None),
@@ -368,5 +297,97 @@ impl OpenAiCompatible {
             crate::usage::normalize_response(&mut parsed);
         }
         Ok(Some(serde_json::to_string(&parsed)?))
+    }
+}
+
+impl OpenAiCompatible {
+    pub(crate) fn request_for_target(
+        &self,
+        model: &str,
+        request: &Value,
+        target: &ReplayTarget,
+    ) -> Result<ProviderRequest> {
+        crate::reasoning::preflight_request(request)?;
+        if self.wire == WireFormat::OpenAiResponses {
+            return self.transform_request_responses(model, request);
+        }
+        let mut schema_budget = crate::schema::RequestBudget::new();
+        let request = crate::schema::prepare_request(request, &mut schema_budget)?;
+        let request =
+            crate::cache::prepare_request(&request, crate::reasoning::WireFormat::OpenAiChat)?;
+        let request = crate::reasoning::prepare_request(&request, target)?;
+        let request = crate::toolcall::prepare_request(&request, target)?;
+        let obj = request.as_object().ok_or(ShimError::MissingModel)?;
+        let messages = obj
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .ok_or(ShimError::MissingModel)?;
+
+        let mut body = json!({
+            "model": model,
+            "messages": sanitize_messages(messages),
+        });
+        let body_obj = body
+            .as_object_mut()
+            .expect("body was constructed as an object above");
+
+        // Standard Chat Completions params (plus reasoning_effort, which vLLM and
+        // some SGLang models honor natively) — forwarded unchanged.
+        for key in [
+            "max_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "stop",
+            "seed",
+            "stream",
+            "stream_options",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "response_format",
+            "logprobs",
+            "top_logprobs",
+            "n",
+            "reasoning_effort",
+        ] {
+            if let Some(v) = obj.get(key) {
+                body_obj.insert(key.to_string(), v.clone());
+            }
+        }
+
+        // x-<name> namespace: server-specific params (sampling knobs like top_k /
+        // min_p, guided_json / regex / ebnf, chat_template_kwargs,
+        // separate_reasoning, …) are copied straight into the body.
+        let ns = format!("x-{}", self.name);
+        if let Some(ext) = obj.get(&ns).and_then(|e| e.as_object()) {
+            for (k, v) in ext {
+                body_obj.insert(k.clone(), v.clone());
+            }
+        }
+
+        let headers = self.headers();
+
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        crate::toolcall::validate_native(&body, target)?;
+        crate::schema::normalize_native_tools(
+            crate::schema::Target::OpenAiChat,
+            &mut body,
+            &mut schema_budget,
+        )?;
+        crate::shim::native_format(
+            &request,
+            crate::reasoning::WireFormat::OpenAiChat,
+            &mut body,
+            &mut schema_budget,
+        )?;
+        crate::cache::finish_request(
+            &request,
+            &mut body,
+            crate::reasoning::WireFormat::OpenAiChat,
+        )?;
+        Ok(ProviderRequest { url, headers, body })
     }
 }

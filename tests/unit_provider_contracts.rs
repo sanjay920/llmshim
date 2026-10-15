@@ -1,4 +1,6 @@
 //! Every shipped Provider implementation must be exercised by this contract.
+#[cfg(feature = "azure")]
+use llmshim::providers::azure::{Azure, AzureIdentity};
 #[cfg(feature = "bedrock")]
 use llmshim::providers::bedrock::{AwsProfile, Bedrock};
 #[cfg(feature = "vertex")]
@@ -53,6 +55,20 @@ fn enumerate(dir: &Path, inventory: &mut Inventory) {
 
 fn providers(auth: &ChatGptAuth) -> Vec<(&'static str, &'static str, Box<dyn Provider>)> {
     vec![
+        #[cfg(feature = "azure")]
+        (
+            "Azure",
+            "gpt-6-sol",
+            Box::new(
+                Azure::new(
+                    "https://fixture.openai.azure.com",
+                    AzureIdentity::api_key("fixture", "unused").unwrap(),
+                )
+                .unwrap()
+                .with_deployment("gpt-6-sol", "gpt-6-sol")
+                .unwrap(),
+            ),
+        ),
         #[cfg(feature = "vertex")]
         (
             "Vertex",
@@ -152,6 +168,8 @@ fn every_provider_filters_reasoning_and_validates_tools_before_serialization() {
     inventory.0.remove("Bedrock");
     #[cfg(not(feature = "vertex"))]
     inventory.0.remove("Vertex");
+    #[cfg(not(feature = "azure"))]
+    inventory.0.remove("Azure");
     let covered = fixtures
         .iter()
         .map(|(name, _, _)| name.to_string())
