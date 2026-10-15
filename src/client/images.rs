@@ -13,7 +13,7 @@ impl ShimClient {
         let prepared = provider.image_request(model, request)?;
         let result = async {
             let attempt = self
-                .send_prepared(None, AttemptKind::Completion, model, None, &prepared)
+                .send_prepared(None, AttemptKind::Completion, model, None, &prepared, None)
                 .await?;
             let mut response = body::read_json(
                 attempt.response,

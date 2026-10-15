@@ -1,4 +1,6 @@
 //! Every shipped Provider implementation must be exercised by this contract.
+#[cfg(feature = "bedrock")]
+use llmshim::providers::bedrock::{AwsProfile, Bedrock};
 use llmshim::{
     catalog::ModelFamily,
     provider::Provider,
@@ -49,6 +51,12 @@ fn enumerate(dir: &Path, inventory: &mut Inventory) {
 
 fn providers(auth: &ChatGptAuth) -> Vec<(&'static str, &'static str, Box<dyn Provider>)> {
     vec![
+        #[cfg(feature = "bedrock")]
+        (
+            "Bedrock",
+            "anthropic.claude-sonnet-4-6",
+            Box::new(Bedrock::new(AwsProfile::new("fixture", "us-east-1"))),
+        ),
         (
             "Anthropic",
             "claude-sonnet-4-6",
@@ -82,7 +90,13 @@ fn providers(auth: &ChatGptAuth) -> Vec<(&'static str, &'static str, Box<dyn Pro
         ("Xai", "grok-4.6", Box::new(Xai::new("test".into()))),
     ]
 }
-fn native(wire: WireFormat) -> Value {
+fn native(_name: &str, wire: WireFormat) -> Value {
+    #[cfg(feature = "bedrock")]
+    if _name == "Bedrock" {
+        return json!({"stopReason":"end_turn","output":{"message":{"role":"assistant",
+            "content":[{"reasoningContent":{"reasoningText":{"text":"ALLOW_REASONING",
+                "signature":"ALLOW_SIGNATURE"}}},{"text":"answer"}]}},"usage":{}});
+    }
     match wire {
         WireFormat::AnthropicMessages => {
             json!({"stop_reason":"end_turn","content":[{"type":"thinking","thinking":"ALLOW_REASONING","signature":"ALLOW_SIGNATURE"},{"type":"text","text":"answer"}]})
@@ -110,6 +124,8 @@ fn every_provider_filters_reasoning_and_validates_tools_before_serialization() {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut inventory,
     );
+    #[cfg(not(feature = "bedrock"))]
+    inventory.0.remove("Bedrock");
     let covered = fixtures
         .iter()
         .map(|(name, _, _)| name.to_string())
@@ -122,7 +138,7 @@ fn every_provider_filters_reasoning_and_validates_tools_before_serialization() {
     for (name, model, provider) in fixtures {
         let target = provider.replay_target(model);
         let normalized = provider
-            .transform_response(model, native(target.wire))
+            .transform_response(model, native(name, target.wire))
             .unwrap();
         let original_message = normalized["choices"][0]["message"].clone();
         let request = json!({"messages":[{"role":"user","content":"question"},original_message,{"role":"user","content":"continue"}]});
@@ -179,7 +195,14 @@ fn every_provider_filters_reasoning_and_validates_tools_before_serialization() {
             foreign_target.origin()
         )]);
         let id = assistant["tool_calls"][0]["id"].clone();
-        let history = json!({"messages":[{"role":"user","content":"read"},assistant,{"role":"tool","tool_call_id":id,"content":"done"},{"role":"user","content":"continue"}]});
+        let mut history = json!({"messages":[
+            {"role":"user","content":"read"}, assistant,
+            {"role":"tool","tool_call_id":id,"content":"done"},
+            {"role":"user","content":"continue"}]});
+        if name == "Bedrock" {
+            history["tools"] = json!([{"type":"function","function":{"name":"read",
+                "parameters":{"type":"object","properties":{}}}}]);
+        }
         let before = history.clone();
         let outbound = provider
             .transform_request(model, &history)
@@ -255,7 +278,7 @@ fn same_role_adjacency_is_merged_only_where_the_wire_rejects_it() {
             text.contains("first") && text.contains("second"),
             "{name} lost a message's content"
         );
-        if wire == WireFormat::GoogleGenerateContent {
+        if wire == WireFormat::GoogleGenerateContent || name == "Bedrock" {
             assert_eq!(
                 assistant_turns.len(),
                 1,
