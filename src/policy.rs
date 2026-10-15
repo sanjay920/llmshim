@@ -67,6 +67,7 @@ impl DispatchPolicyContext {
             provider_name: prepared_target.provider.clone(),
             resolved_model: resolved_model.to_owned(),
             native_model: prepared_target.model.clone(),
+            pricing_model: prepared_target.pricing_model().to_owned(),
             wire: prepared_target.wire,
             account_fingerprint: prepared_target.account.clone(),
             endpoint: sanitized_endpoint(endpoint),
@@ -313,6 +314,7 @@ pub struct AttemptIdentity {
     provider_name: String,
     resolved_model: String,
     native_model: String,
+    pricing_model: String,
     wire: WireFormat,
     account_fingerprint: Option<String>,
     endpoint: String,
@@ -337,6 +339,11 @@ impl AttemptIdentity {
 
     pub fn native_model(&self) -> &str {
         &self.native_model
+    }
+
+    /// Explicit accounting model, separate from the native deployment label.
+    pub fn pricing_model(&self) -> &str {
+        &self.pricing_model
     }
 
     pub fn wire(&self) -> WireFormat {

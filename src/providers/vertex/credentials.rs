@@ -1,6 +1,7 @@
 //! Closed identity selection and a clone-shared, single-flight refresh cache.
 use super::{VertexError, VertexErrorKind};
 use crate::error::Result;
+use crate::providers::token_cache::{BearerToken, CacheError, TokenCache};
 use reqwest::header::HeaderValue;
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
 
@@ -42,43 +43,23 @@ impl CredentialError {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AccessToken {
-    header: HeaderValue,
-    expires: tokio::time::Instant,
-    refresh: tokio::time::Instant,
+    token: BearerToken,
 }
 impl AccessToken {
     pub fn new(value: &str, lifetime: Duration) -> std::result::Result<Self, CredentialError> {
-        if !value.is_ascii()
-            || value.is_empty()
-            || lifetime.is_zero()
-            || value.bytes().any(|b| b.is_ascii_whitespace())
-        {
-            return Err(CredentialError::InvalidToken);
-        }
-        let mut header = HeaderValue::from_str(&format!("Bearer {value}"))
-            .map_err(|_| CredentialError::InvalidToken)?;
-        header.set_sensitive(true);
-        let now = tokio::time::Instant::now();
-        let expires = now
-            .checked_add(lifetime)
-            .ok_or(CredentialError::InvalidToken)?;
-        let margin = (lifetime / 4).min(Duration::from_secs(30));
         Ok(Self {
-            header,
-            expires,
-            refresh: expires - margin,
+            token: BearerToken::new(value, lifetime).ok_or(CredentialError::InvalidToken)?,
         })
     }
 }
+
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct GoogleIdentity {
     pub(super) project: String,
     pub(super) region: String,
     pub(super) binding: String,
-    source: Arc<dyn TokenSource>,
-    cache: Arc<tokio::sync::RwLock<Option<AccessToken>>>,
-    refresh: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
+    cache: TokenCache<CredentialError>,
 }
 impl GoogleIdentity {
     pub fn service_account(project: &str, region: &str, binding: &str, file: PathBuf) -> Self {
@@ -100,87 +81,30 @@ impl GoogleIdentity {
             project: project.into(),
             region: region.into(),
             binding: binding.into(),
-            source,
-            cache: Default::default(),
-            refresh: Default::default(),
+            cache: TokenCache::new(move || {
+                let source = source.clone();
+                Box::pin(async move { source.token().await.map(|token| token.token) })
+            }),
         }
     }
     pub(super) async fn authorize(&self, request: &mut reqwest::Request) -> Result<()> {
         if self.binding.trim().is_empty() {
             return Err(CredentialError::InvalidBinding.into_shim());
         }
-        let cached = self.cache.read().await.clone();
-        let token = if let Some(token) = cached.filter(Self::usable) {
-            if tokio::time::Instant::now() >= token.refresh {
-                if let Ok(mut refresh) = self.refresh.clone().try_lock_owned() {
-                    let now = tokio::time::Instant::now();
-                    if refresh.is_none_or(|retry_at| now >= retry_at) {
-                        // Readers, including this caller, never await source I/O with a live token.
-                        *refresh = now.checked_add(Duration::from_secs(1));
-                        let identity = self.clone();
-                        tokio::spawn(async move {
-                            let _ = identity.load(&mut refresh).await;
-                        });
-                    }
-                }
+        let header = self.cache.header().await.map_err(|error| {
+            match error {
+                CacheError::Source(error) => error,
+                CacheError::Timeout => CredentialError::Timeout,
+                CacheError::InvalidToken => CredentialError::InvalidToken,
             }
-            token
-        } else {
-            let mut refresh = self.refresh.lock().await;
-            let cached = self.cache.read().await.clone();
-            match cached.filter(Self::usable) {
-                Some(token) => token,
-                // Expiry or rejection bypasses the early-refresh cooldown.
-                None => self
-                    .load(&mut refresh)
-                    .await
-                    .map_err(CredentialError::into_shim)?,
-            }
-        };
+            .into_shim()
+        })?;
         request
             .headers_mut()
-            .insert(reqwest::header::AUTHORIZATION, token.header);
+            .insert(reqwest::header::AUTHORIZATION, header);
         Ok(())
     }
-
-    fn usable(token: &AccessToken) -> bool {
-        tokio::time::Instant::now()
-            .checked_add(Duration::from_secs(1))
-            .is_some_and(|send| token.expires > send)
-    }
-
-    async fn load(
-        &self,
-        retry_at: &mut Option<tokio::time::Instant>,
-    ) -> std::result::Result<AccessToken, CredentialError> {
-        let result = tokio::time::timeout(Duration::from_secs(30), self.source.token())
-            .await
-            .unwrap_or(Err(CredentialError::Timeout))
-            .and_then(|token| {
-                if Self::usable(&token) {
-                    Ok(token)
-                } else {
-                    Err(CredentialError::InvalidToken)
-                }
-            });
-        match result {
-            Ok(token) => {
-                *self.cache.write().await = Some(token.clone());
-                *retry_at = None;
-                Ok(token)
-            }
-            Err(error) => {
-                // Keep any live token; throttle failed early refreshes without delaying readers.
-                *retry_at = tokio::time::Instant::now().checked_add(Duration::from_secs(1));
-                Err(error)
-            }
-        }
-    }
     pub(super) async fn reject(&self, sent: &HeaderValue) {
-        let mut cache = self.cache.write().await;
-        // A delayed rejection of an old token must not evict a newer concurrent refresh.
-        if cache.as_ref().is_some_and(|token| token.header == *sent) {
-            *cache = None;
-        }
+        self.cache.reject(sent).await;
     }
 }

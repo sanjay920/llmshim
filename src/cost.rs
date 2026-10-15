@@ -114,8 +114,8 @@ pub fn for_target(provider: &str, model: &str) -> Option<Cost> {
 fn target_info(provider: &str, model: &str) -> Option<std::sync::Arc<crate::catalog::ModelInfo>> {
     let qualified = crate::catalog::lookup_id(&format!("{provider}/{model}"))
         .filter(|model| model.cost.is_some());
-    if provider.starts_with("vertex-") {
-        // Vertex billing is separate from the direct API, including region/version differences.
+    if provider.starts_with("vertex-") || provider == "azure" {
+        // Cloud-resource billing is separate from direct API rates and deployment aliases.
         return qualified;
     }
     qualified.or_else(|| crate::catalog::lookup_id(model))

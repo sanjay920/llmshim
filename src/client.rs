@@ -942,7 +942,7 @@ impl ShimClient {
                     }
                     // Price after the repair path has settled the final usage,
                     // so a repaired answer is costed on both attempts' tokens.
-                    crate::cost::stamp(&target.provider, &target.model, &mut result);
+                    crate::cost::stamp(&target.provider, target.pricing_model(), &mut result);
                     return Ok(result);
                 }
                 Err(feedback)
@@ -1208,7 +1208,7 @@ impl ShimClient {
                     if attempt > 0 {
                         result["usage"] = usage;
                     }
-                    crate::cost::stamp(&target.provider, &target.model, &mut result);
+                    crate::cost::stamp(&target.provider, target.pricing_model(), &mut result);
                     return Ok(Box::pin(futures::stream::iter(crate::shim::chunks(result))));
                 }
                 Err(feedback)
@@ -1354,7 +1354,7 @@ impl ShimClient {
             }
             crate::cost::stamp(
                 &effective_target.provider,
-                &effective_target.model,
+                effective_target.pricing_model(),
                 &mut result,
             );
             crate::shim::chunks(result).pop().unwrap()
@@ -1520,7 +1520,7 @@ async fn finish_invalid_response(
 
 fn stamp_usage(target: &ReplayTarget, usage: &mut serde_json::Value) {
     let mut response = serde_json::json!({"usage": usage.take()});
-    crate::cost::stamp(&target.provider, &target.model, &mut response);
+    crate::cost::stamp(&target.provider, target.pricing_model(), &mut response);
     *usage = response["usage"].take();
 }
 
@@ -1714,7 +1714,8 @@ async fn run_eager_stream_producer(
             }
             match normalized_terminal {
                 Ok(Some(chunk)) => {
-                    let chunk = crate::cost::stamp_chunk(&target.provider, &target.model, chunk);
+                    let chunk =
+                        crate::cost::stamp_chunk(&target.provider, target.pricing_model(), chunk);
                     match send_stream_output(
                         &output_sender,
                         Ok(chunk),
@@ -1839,7 +1840,8 @@ async fn run_eager_stream_producer(
         }
         match normalized {
             Ok(Some(chunk)) => {
-                let chunk = crate::cost::stamp_chunk(&target.provider, &target.model, chunk);
+                let chunk =
+                    crate::cost::stamp_chunk(&target.provider, target.pricing_model(), chunk);
                 match send_stream_output(
                     &output_sender,
                     Ok(chunk),
@@ -2439,8 +2441,11 @@ mod tests {
                     };
                     match normalized {
                         Ok(Some(chunk)) => {
-                            let chunk =
-                                crate::cost::stamp_chunk(&target.provider, &target.model, chunk);
+                            let chunk = crate::cost::stamp_chunk(
+                                &target.provider,
+                                target.pricing_model(),
+                                chunk,
+                            );
                             return Some((Ok(chunk), (events, normalizer, target)));
                         }
                         Ok(None) => continue,
@@ -3291,3 +3296,7 @@ mod vertex_tests;
 #[cfg(all(test, feature = "vertex"))]
 #[path = "client/vertex_auth_tests.rs"]
 mod vertex_auth_tests;
+
+#[cfg(all(test, feature = "azure"))]
+#[path = "client/azure_tests.rs"]
+mod azure_tests;

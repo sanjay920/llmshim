@@ -96,6 +96,8 @@ pub struct ThoughtSignature {
 
 #[derive(Debug, Clone)]
 pub struct ReplayTarget {
+    /// Catalog model used for accounting; absent for an unmapped deployment.
+    pub pricing_model: Option<String>,
     pub provider: String,
     pub model: String,
     pub family: Option<ModelFamily>,
@@ -114,10 +116,16 @@ impl ReplayTarget {
         Self {
             provider: provider.into(),
             model: model.into(),
+            pricing_model: Some(model.into()),
             family,
             wire,
             account: None,
         }
+    }
+
+    /// Accounting never infers a model from an unmapped deployment label.
+    pub fn pricing_model(&self) -> &str {
+        self.pricing_model.as_deref().unwrap_or("")
     }
 
     /// API-key bindings deliberately fail closed across key rotation. An OAuth

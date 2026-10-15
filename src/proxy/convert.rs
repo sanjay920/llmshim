@@ -142,7 +142,10 @@ fn admission_target(provider: &dyn Provider, resolved_model: String) -> Admissio
         provider_name: provider.name().to_string(),
         policy: provider.request_admission_policy(),
         #[cfg(any(feature = "gateway", test))]
-        model: resolved_model,
+        model: provider
+            .replay_target(&resolved_model)
+            .pricing_model()
+            .to_owned(),
     }
 }
 

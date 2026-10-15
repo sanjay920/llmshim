@@ -1,0 +1,1 @@
+{{#include ../azure.md}}

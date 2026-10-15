@@ -680,3 +680,13 @@ Register Gemini and Anthropic transports explicitly with project, location and a
 binding. Service-account files and caller-owned token sources never fall back to ambient ADC.
 Both transports reuse native conversion and the existing authorization/retry/SSE hooks.
 See `docs/vertex.md` for cache refresh, proxy policy, replay isolation and offline fixtures.
+
+### Azure v1 transport
+
+The default-off `azure` feature provides `providers::azure::Azure`, registered explicitly by the
+caller. Deployment names map to underlying models; wire requests keep the deployment name.
+`AzureIdentity` selects a key or one Entra token source with an explicit audience and stable
+binding, with no ambient fallback. Authorization uses the existing transport/retry deadline hooks.
+Azure and Vertex share one private nonblocking bearer cache. `x-azure` carries native Chat
+controls. Only Azure catalog rows supply Azure prices; unknown remains unknown. See
+[Azure OpenAI and Foundry v1](docs/azure.md) for the public API and boundaries.
