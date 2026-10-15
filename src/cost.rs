@@ -108,14 +108,22 @@ pub fn for_model(model: &str) -> Option<Cost> {
 /// the bare name is the fallback for aggregators and self-hosted servers whose
 /// qualified id the catalog does not carry.
 pub fn for_target(provider: &str, model: &str) -> Option<Cost> {
-    for_model(&format!("{provider}/{model}")).or_else(|| for_model(model))
+    target_info(provider, model)?.cost
+}
+
+fn target_info(provider: &str, model: &str) -> Option<std::sync::Arc<crate::catalog::ModelInfo>> {
+    let qualified = crate::catalog::lookup_id(&format!("{provider}/{model}"))
+        .filter(|model| model.cost.is_some());
+    if provider.starts_with("vertex-") {
+        // Vertex billing is separate from the direct API, including region/version differences.
+        return qualified;
+    }
+    qualified.or_else(|| crate::catalog::lookup_id(model))
 }
 
 /// USD cost of one response's usage, or `None` when it cannot be known.
 pub fn cost_usd(provider: &str, model: &str, usage: &Value) -> Option<f64> {
-    let info = crate::catalog::lookup_id(&format!("{provider}/{model}"))
-        .filter(|m| m.cost.is_some())
-        .or_else(|| crate::catalog::lookup_id(model))?;
+    let info = target_info(provider, model)?;
     // Normalized uncached input excludes reads/writes for every provider.
     // Tier selection includes them; subtracting cache hits would undercharge
     // long cached conversations. Legacy usage falls back to its prompt total.

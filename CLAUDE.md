@@ -672,3 +672,11 @@ call-time authorization and binary EventStream decoding through `transport::Requ
 Direct HTTP users need `ShimClient::send_with_transport`; `send` performs unsigned JSON dispatch.
 See `docs/bedrock.md` (also included in the book) for identity caching, stable bindings,
 reasoning-family limits and the separate Converse/SDK credential proxy policies.
+
+## Optional Vertex transports
+
+The default-off `vertex` feature exposes `providers::vertex::{GoogleIdentity, Vertex}`.
+Register Gemini and Anthropic transports explicitly with project, location and a stable identity
+binding. Service-account files and caller-owned token sources never fall back to ambient ADC.
+Both transports reuse native conversion and the existing authorization/retry/SSE hooks.
+See `docs/vertex.md` for cache refresh, proxy policy, replay isolation and offline fixtures.

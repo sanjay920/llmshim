@@ -1,6 +1,8 @@
 //! Every shipped Provider implementation must be exercised by this contract.
 #[cfg(feature = "bedrock")]
 use llmshim::providers::bedrock::{AwsProfile, Bedrock};
+#[cfg(feature = "vertex")]
+use llmshim::providers::vertex::{GoogleIdentity, Vertex};
 use llmshim::{
     catalog::ModelFamily,
     provider::Provider,
@@ -51,6 +53,28 @@ fn enumerate(dir: &Path, inventory: &mut Inventory) {
 
 fn providers(auth: &ChatGptAuth) -> Vec<(&'static str, &'static str, Box<dyn Provider>)> {
     vec![
+        #[cfg(feature = "vertex")]
+        (
+            "Vertex",
+            "gemini-2.5-pro",
+            Box::new(Vertex::gemini(GoogleIdentity::service_account(
+                "fixture-project",
+                "global",
+                "fixture",
+                "unused.json".into(),
+            ))),
+        ),
+        #[cfg(feature = "vertex")]
+        (
+            "Vertex",
+            "claude-sonnet-4-6@20260101",
+            Box::new(Vertex::anthropic(GoogleIdentity::service_account(
+                "fixture-project",
+                "global",
+                "fixture",
+                "unused.json".into(),
+            ))),
+        ),
         #[cfg(feature = "bedrock")]
         (
             "Bedrock",
@@ -126,6 +150,8 @@ fn every_provider_filters_reasoning_and_validates_tools_before_serialization() {
     );
     #[cfg(not(feature = "bedrock"))]
     inventory.0.remove("Bedrock");
+    #[cfg(not(feature = "vertex"))]
+    inventory.0.remove("Vertex");
     let covered = fixtures
         .iter()
         .map(|(name, _, _)| name.to_string())

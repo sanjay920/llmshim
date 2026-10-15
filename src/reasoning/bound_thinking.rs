@@ -10,7 +10,7 @@
 //! eligibility decided by the caller.
 
 /// Whether a block produced by `source_model` may be sent to `target_model`.
-pub(super) fn reader_allows(source_model: &str, target_model: &str) -> bool {
+pub(crate) fn reader_allows(source_model: &str, target_model: &str) -> bool {
     let opus_55_source_ok = source_model != "claude-opus-5-5"
         || matches!(
             target_model,
