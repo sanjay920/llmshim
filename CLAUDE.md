@@ -662,3 +662,13 @@ calls with setup instructions. Provider errors must never print credentials.
 Keep README measurements dated, name the actual models/host/build/workload, and
 separate API latency, full-transform CPU time, and RSS. Do not mix fresh Rust
 figures with old Python results or claim unmeasured network-only latency shares.
+
+## Optional Bedrock transport
+
+The default-off `bedrock` feature exposes `providers::bedrock::{AwsProfile, Bedrock}`.
+Register the provider explicitly; existing constructors and key precedence are unchanged.
+`x-bedrock` carries allowed Converse native controls. `Provider::transport()` selects
+call-time authorization and binary EventStream decoding through `transport::RequestTransport`.
+Direct HTTP users need `ShimClient::send_with_transport`; `send` performs unsigned JSON dispatch.
+See `docs/bedrock.md` (also included in the book) for identity caching, stable bindings,
+reasoning-family limits and the separate Converse/SDK credential proxy policies.

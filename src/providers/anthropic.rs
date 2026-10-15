@@ -1,3 +1,4 @@
+use super::anthropic_constraints as constraints;
 use crate::error::{Result, ShimError};
 use crate::provider::{Provider, ProviderRequest};
 use crate::vision;
@@ -21,32 +22,10 @@ impl Anthropic {
         self
     }
 
-    fn is_fable(model: &str) -> bool {
-        matches!(model, "claude-fable-5" | "claude-fable-5-1")
-    }
-
-    fn requires_adaptive_thinking(model: &str) -> bool {
-        Self::is_fable(model) || matches!(model, "claude-opus-5-5" | "claude-sonnet-5-5")
-    }
-
-    /// Models whose thinking blocks are bound to the conversation prefix, and
-    /// which accept only `auto` / `none` tool choice.
-    fn preserves_bound_system_turns(model: &str) -> bool {
-        matches!(
-            model,
-            "claude-fable-5-1" | "claude-opus-5-5" | "claude-sonnet-5-5"
-        )
-    }
-
-    /// Models that reject an assistant-prefill turn before dispatch.
-    fn rejects_assistant_prefill(model: &str) -> bool {
-        Self::is_fable(model) || model == "claude-opus-5-5"
-    }
-
     /// Models whose native `refusal` stop reason is a content filter rather
     /// than an unsupported terminal status.
     fn refusal_is_content_filter(model: &str) -> bool {
-        Self::is_fable(model) || matches!(model, "claude-opus-5" | "claude-opus-5-5")
+        constraints::is_fable(model) || matches!(model, "claude-opus-5" | "claude-opus-5-5")
     }
 
     /// Models that support the 1M context window beta.
@@ -438,7 +417,7 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
 /// Normalize a unified reasoning effort (`none|low|medium|high|xhigh|max`,
 /// legacy `minimal` accepted) and apply the mode:"pro" one-tier bump.
 /// Unknown values fall back to "medium" (the pre-existing default).
-fn normalize_unified_effort(effort: &str, pro: bool) -> &'static str {
+pub(super) fn normalize_unified_effort(effort: &str, pro: bool) -> &'static str {
     let base = match effort {
         "none" => "none",
         "minimal" | "low" => "low",
@@ -513,7 +492,7 @@ impl Provider for Anthropic {
             })?;
 
         let (system, user_messages) =
-            extract_system_message(messages, Self::preserves_bound_system_turns(model));
+            extract_system_message(messages, constraints::preserves_bound_system_turns(model));
         let anthropic_messages = transform_messages(&user_messages);
 
         let mut body = json!({
@@ -616,11 +595,7 @@ impl Provider for Anthropic {
                     .map(|m| m == "pro")
                     .unwrap_or(false);
                 let effort = normalize_unified_effort(effort, pro);
-                let effort = if effort == "none" && Self::requires_adaptive_thinking(model) {
-                    "low"
-                } else {
-                    effort
-                };
+                let effort = constraints::clamp_effort(model, effort);
 
                 // Reasoning-summary visibility. Newer models (Sonnet 5, Opus
                 // 4.7/4.8, ...) default `display` to "omitted" — a signed but
@@ -686,53 +661,13 @@ impl Provider for Anthropic {
             }
         }
 
-        // Thinking requires temperature=1: strip custom temperature/top_k
-        // whenever thinking is active, however it was configured.
-        if body_obj.contains_key("thinking") {
-            let thinking_type = body_obj
-                .get("thinking")
-                .and_then(|t| t.get("type"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("");
-            if thinking_type == "enabled" || thinking_type == "adaptive" {
-                body_obj.remove("temperature");
-                body_obj.remove("top_k");
-            }
-        }
-
-        // Fable and Opus 5.5 always think. Opus 5 also rejects sampling controls.
-        if Self::requires_adaptive_thinking(model) || model == "claude-opus-5" {
-            for key in ["temperature", "top_p", "top_k"] {
-                body_obj.remove(key);
-            }
-        }
-        if Self::requires_adaptive_thinking(model) {
-            if let Some(thinking) = body_obj.get("thinking") {
-                if thinking["type"] != "adaptive" {
-                    return Err(ShimError::ProviderError { status: 400, body:
-                        "This Claude model requires adaptive thinking; use reasoning_effort to control depth".into(), retry_after: None });
-                }
-            }
-        }
-        if Self::rejects_assistant_prefill(model)
-            && body_obj
-                .get("messages")
-                .and_then(Value::as_array)
-                .and_then(|messages| messages.last())
-                .is_some_and(|message| message["role"] == "assistant")
-        {
-            return Err(ShimError::ProviderError { status: 400, body:
-                "This Claude model does not support assistant prefill; end the request with a user turn".into(), retry_after: None });
-        }
-        if Self::preserves_bound_system_turns(model)
-            && body_obj
-                .get("tool_choice")
-                .and_then(|choice| choice["type"].as_str())
-                .is_some_and(|kind| matches!(kind, "any" | "tool"))
-        {
-            return Err(ShimError::ProviderError { status: 400, body:
-                "This Claude model supports only auto or none tool choice; request the desired tool in the prompt".into(), retry_after: None });
-        }
+        let last_role = body_obj
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["role"].as_str())
+            .map(str::to_owned);
+        constraints::apply(model, body_obj, false, last_role.as_deref())?;
 
         // Fast mode support: extract "speed" from the request and apply
         // Anthropic-specific transformations (body field + beta header).

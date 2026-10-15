@@ -20,6 +20,7 @@ pub(crate) fn append_string_fragment(destination: &mut Value, fragment: &str) {
 
 pub struct StreamNormalizer {
     target: ReplayTarget,
+    output_projection: Option<fn(&Value, &mut Value)>,
     tools: ToolStream,
     usage: StreamUsage,
     seen_terminal: bool,
@@ -53,6 +54,7 @@ impl StreamNormalizer {
             limits.normalizer_entries,
         );
         Ok(Self {
+            output_projection: None,
             tools: ToolStream::with_budget(target.clone(), budget.clone()),
             target,
             usage: StreamUsage::with_budget(budget.clone()),
@@ -66,6 +68,12 @@ impl StreamNormalizer {
             finished: false,
         })
     }
+    /// Project transport-specific usage after semantic normalization.
+    pub fn with_output_projection(mut self, projection: fn(&Value, &mut Value)) -> Self {
+        self.output_projection = Some(projection);
+        self
+    }
+
     /// Report each tool call's provisional progress to `sink` as its native
     /// events arrive, ahead of the completed call this normalizer emits.
     pub(crate) fn report_tool_call_progress(&mut self, sink: crate::toolcall::ProgressSink) {
@@ -273,6 +281,9 @@ impl StreamNormalizer {
                     value["x-llmshim-served-model"] = served.clone();
                 }
             }
+        }
+        if let Some(project) = self.output_projection {
+            project(&native, &mut value);
         }
         let data = value.to_string();
         if self.target.wire == WireFormat::OpenAiChat {

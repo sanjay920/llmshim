@@ -1,6 +1,9 @@
 pub mod anthropic;
+mod anthropic_constraints;
 pub mod anthropic_reasoning;
 pub mod anthropic_signature;
+#[cfg(feature = "bedrock")]
+pub mod bedrock;
 pub mod chatgpt;
 pub mod gemini;
 pub mod openai;

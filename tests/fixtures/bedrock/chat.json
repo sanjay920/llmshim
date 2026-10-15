@@ -1,0 +1,1 @@
+{"messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"}],"max_tokens":64,"temperature":0.2,"tools":[{"type":"function","function":{"name":"weather","description":"Weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}

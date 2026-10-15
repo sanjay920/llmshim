@@ -19,7 +19,9 @@ mod audio;
 mod body;
 mod deadline;
 mod images;
+mod unsent;
 pub use deadline::AttemptDeadlines;
+use unsent::finish_unsent_request;
 
 /// Retry bounds, resolved once from the environment (with defaults) at
 /// construction time. Internal/additive to `ShimClient` — not part of the
@@ -201,6 +203,7 @@ async fn finish_transport_failure(
 #[derive(Clone)]
 pub struct ShimClient {
     http: Client,
+    scoped_http: Arc<tokio::sync::OnceCell<Client>>,
     ambient_proxy: bool,
     retry: RetryConfig,
     deadlines: AttemptDeadlines,
@@ -231,6 +234,7 @@ impl ShimClient {
         let deadlines = AttemptDeadlines::from_env();
         Ok(Self {
             http: http_client_builder(deadlines.connect, ambient_proxy).build()?,
+            scoped_http: Arc::new(tokio::sync::OnceCell::new()),
             ambient_proxy,
             retry: RetryConfig::from_env(),
             deadlines,
@@ -252,6 +256,7 @@ impl ShimClient {
         deadlines: AttemptDeadlines,
     ) -> std::result::Result<Self, &'static str> {
         self.deadlines = deadlines.validate()?;
+        self.scoped_http = Arc::new(tokio::sync::OnceCell::new());
         self.http = http_client_builder(self.deadlines.connect, self.ambient_proxy)
             .build()
             .map_err(|_| "HTTP client could not be initialized with these deadlines")?;
@@ -345,11 +350,32 @@ impl ShimClient {
 
     const RETRYABLE_STATUSES: &'static [u16] = &[429, 500, 502, 503, 504, 529];
 
+    /// Send JSON without provider-specific authorization. For cloud transports use
+    /// `send_with_transport`, or the provider-aware completion/stream entry points.
     pub async fn send(&self, req: &ProviderRequest) -> Result<reqwest::Response> {
-        self.send_prepared(None, AttemptKind::Completion, "", None, req)
+        self.send_prepared(None, AttemptKind::Completion, "", None, req, None)
             .await
             .map(|attempt_response| attempt_response.response)
             .map_err(DispatchFailure::into_public)
+    }
+
+    /// Send with call-time transport authorization, including fresh signing on retries.
+    pub async fn send_with_transport(
+        &self,
+        req: &ProviderRequest,
+        transport: &dyn crate::transport::RequestTransport,
+    ) -> Result<reqwest::Response> {
+        self.send_prepared(
+            None,
+            AttemptKind::Completion,
+            "",
+            None,
+            req,
+            Some(transport),
+        )
+        .await
+        .map(|response| response.response)
+        .map_err(DispatchFailure::into_public)
     }
 
     async fn send_prepared(
@@ -359,6 +385,7 @@ impl ShimClient {
         resolved_model: &str,
         prepared_target: Option<&ReplayTarget>,
         req: &ProviderRequest,
+        transport: Option<&dyn crate::transport::RequestTransport>,
     ) -> DispatchResult<AttemptResponse> {
         self.send_prepared_with_body(
             policy_context,
@@ -366,11 +393,13 @@ impl ShimClient {
             resolved_model,
             prepared_target,
             req,
+            transport,
             |builder| Ok(builder.json(&req.body)),
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_prepared_with_body(
         &self,
         policy_context: Option<&DispatchPolicyContext>,
@@ -378,16 +407,65 @@ impl ShimClient {
         resolved_model: &str,
         prepared_target: Option<&ReplayTarget>,
         req: &ProviderRequest,
+        transport: Option<&dyn crate::transport::RequestTransport>,
         build_body: impl Fn(reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder>,
     ) -> DispatchResult<AttemptResponse> {
+        self.send_prepared_using(
+            policy_context,
+            attempt_kind,
+            resolved_model,
+            prepared_target,
+            req,
+            transport,
+            build_body,
+            |http, request| Box::pin(http.execute(request)),
+        )
+        .await
+    }
+
+    // Keep retry/accounting/authorization in one path regardless of HTTP execution.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_prepared_using(
+        &self,
+        policy_context: Option<&DispatchPolicyContext>,
+        attempt_kind: AttemptKind,
+        resolved_model: &str,
+        prepared_target: Option<&ReplayTarget>,
+        req: &ProviderRequest,
+        transport: Option<&dyn crate::transport::RequestTransport>,
+        build_body: impl Fn(reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder>,
+        execute: impl for<'a> Fn(
+            &'a reqwest::Client,
+            reqwest::Request,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<reqwest::Response, reqwest::Error>,
+                    > + Send
+                    + 'a,
+            >,
+        >,
+    ) -> DispatchResult<AttemptResponse> {
         let max_retries = self.retry.max_retries;
+        let http = if self.ambient_proxy
+            && transport.is_some_and(|transport| transport.requires_scoped_client())
+        {
+            self.scoped_http
+                .get_or_try_init(|| async {
+                    http_client_builder(self.deadlines.connect, false).build()
+                })
+                .await
+                .map_err(|error| DispatchFailure::Local(error.into()))?
+        } else {
+            &self.http
+        };
 
         for attempt in 0..=max_retries {
-            let mut builder = self.http.post(&req.url);
+            let mut builder = http.post(&req.url);
             for (key, value) in &req.headers {
                 builder = builder.header(key, value);
             }
-            let http_request = build_body(builder)
+            let mut http_request = build_body(builder)
                 .map_err(DispatchFailure::Local)?
                 .build()
                 .map_err(|error| DispatchFailure::Local(error.into()))?;
@@ -396,6 +474,47 @@ impl ShimClient {
                 AttemptKind::Stream => self.deadlines.stream_attempt_total,
             };
             let attempt_deadline = deadline_after(attempt_total).ok_or_else(timeout_504)?;
+            if let Some(context) = policy_context {
+                context
+                    .ensure_logical_active()
+                    .map_err(|_| logical_timeout_504())?;
+            }
+            let authorization_deadline = earlier_deadline(
+                attempt_deadline,
+                deadline_after(self.deadlines.response_headers).ok_or_else(timeout_504)?,
+            );
+            let authorization = if let Some(transport) = transport {
+                match tokio::time::timeout_at(
+                    authorization_deadline,
+                    transport.prepare_authorization(&mut http_request),
+                )
+                .await
+                {
+                    Ok(Ok(identity)) => identity,
+                    result => {
+                        let error = match result {
+                            Ok(Err(error)) => error,
+                            Err(_) => transport.authorization_timeout(),
+                            Ok(Ok(_)) => unreachable!(),
+                        };
+                        let retryable = matches!(&error,
+                            ShimError::ProviderError {status, ..}
+                                if Self::RETRYABLE_STATUSES.contains(status));
+                        if retryable && attempt < max_retries {
+                            tokio::time::sleep(backoff_with_jitter(
+                                attempt,
+                                self.retry.base,
+                                self.retry.cap,
+                            ))
+                            .await;
+                            continue;
+                        }
+                        return Err(DispatchFailure::Local(error));
+                    }
+                }
+            } else {
+                None
+            };
             let mut attempt_tracker = match policy_context {
                 Some(context) => {
                     let Some(target) = prepared_target else {
@@ -438,8 +557,19 @@ impl ShimClient {
                 attempt_deadline,
                 deadline_after(self.deadlines.response_headers).ok_or_else(timeout_504)?,
             );
+            if let Some(identity) = authorization {
+                if let Err(error) = identity.sign(&mut http_request) {
+                    finish_unsent_request(
+                        &mut attempt_tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
+                    return Err(DispatchFailure::Local(error));
+                }
+            }
             let response_result =
-                tokio::time::timeout_at(header_deadline, self.http.execute(http_request)).await;
+                tokio::time::timeout_at(header_deadline, execute(http, http_request)).await;
             match response_result {
                 Err(_) if attempt < max_retries => {
                     finish_transport_failure(
@@ -535,6 +665,7 @@ impl ShimClient {
                     // server's own wait, and a caller with its own backoff
                     // above this client gets to honour it too.
                     let retry_after = parse_retry_after(resp.headers());
+                    let error_headers = resp.headers().clone();
                     let error_body_deadline =
                         body_deadline(attempt_deadline, self.deadlines.error_body_total);
                     let error_body = body::read_text_and_bytes(
@@ -578,11 +709,17 @@ impl ShimClient {
                             "upstream error body exceeds JSON complexity limit".into()
                         }
                     };
-                    return Err(DispatchFailure::Upstream(ShimError::ProviderError {
-                        status: status_code,
-                        body,
-                        retry_after,
-                    }));
+                    let error = match transport {
+                        Some(transport) => {
+                            transport.error(status_code, &error_headers, body, retry_after)
+                        }
+                        None => ShimError::ProviderError {
+                            status: status_code,
+                            body,
+                            retry_after,
+                        },
+                    };
+                    return Err(DispatchFailure::Upstream(error));
                 }
                 // Transport errors carry no headers: always jittered backoff.
                 Ok(Err(e)) if Self::is_retryable_transport(&e) && attempt < max_retries => {
@@ -695,6 +832,7 @@ impl ShimClient {
                 model,
                 Some(&target),
                 &provider_req,
+                provider.transport().as_deref(),
             )
             .await?;
         let body = match body::read_json(
@@ -827,6 +965,7 @@ impl ShimClient {
                 model,
                 Some(&target),
                 &provider_req,
+                provider.transport().as_deref(),
             )
             .await?;
         if provider.name() == "chatgpt"
@@ -910,6 +1049,9 @@ impl ShimClient {
             .await?;
             return Ok((result, target));
         }
+        let response_id = provider
+            .transport()
+            .and_then(|transport| transport.response_id(response.headers()));
         let body = match body::read_json(
             response,
             self.response_body_limits.success_bytes,
@@ -934,7 +1076,7 @@ impl ShimClient {
         }
         observe_native_response_usage(
             &target,
-            &body,
+            &provider.response_for_usage(&body),
             &mut tracker,
             self.deadlines.policy_callback,
             attempt_deadline,
@@ -952,6 +1094,9 @@ impl ShimClient {
                 return Err(DispatchFailure::Upstream(error));
             }
         };
+        if let Some(id) = response_id {
+            result["id"] = serde_json::Value::String(id);
+        }
         if let Err(error) = crate::derived_response::bind_unary_context(&mut result, &target) {
             finish_invalid_response(
                 &mut tracker,
@@ -1219,6 +1364,7 @@ impl ShimClient {
                 model,
                 Some(&target),
                 &provider_req,
+                provider.transport().as_deref(),
             )
             .await?;
         let policy_failure = Arc::new(std::sync::Mutex::new(None));
@@ -1235,6 +1381,7 @@ impl ShimClient {
             self.deadlines,
             attempt_deadline,
             self.stream_retention_limits,
+            provider.transport(),
         );
 
         Ok((
@@ -1362,6 +1509,7 @@ fn eager_stream(
     deadlines: AttemptDeadlines,
     attempt_deadline: tokio::time::Instant,
     retention_limits: crate::streaming::StreamRetentionLimits,
+    transport: Option<Arc<dyn crate::transport::RequestTransport>>,
 ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
     let cancellation_guard = tracker.as_ref().map(AttemptTracker::cancellation_guard);
     let (output_sender, output_receiver) = tokio::sync::mpsc::channel(1);
@@ -1381,6 +1529,7 @@ fn eager_stream(
             producer_terminal,
             cancellation_receiver,
             retention_limits,
+            transport,
         )
         .await;
     });
@@ -1445,12 +1594,31 @@ async fn run_eager_stream_producer(
     terminal: Arc<std::sync::Mutex<Option<Result<String>>>>,
     mut cancellation: tokio::sync::watch::Receiver<bool>,
     retention_limits: crate::streaming::StreamRetentionLimits,
+    transport: Option<Arc<dyn crate::transport::RequestTransport>>,
 ) {
-    let mut source = native_events(response.bytes_stream());
-    let mut normalizer = match crate::streaming::StreamNormalizer::with_retention_limits(
-        target.clone(),
-        retention_limits,
-    ) {
+    let mut source = match &transport {
+        Some(transport) => {
+            let id = transport.response_id(response.headers());
+            transport.events_with_response_id(
+                &target.model,
+                id.as_deref(),
+                Box::pin(
+                    response
+                        .bytes_stream()
+                        .map(|result| result.map_err(ShimError::from)),
+                ),
+            )
+        }
+        None => native_events(response.bytes_stream()),
+    };
+    let normalizer = match &transport {
+        Some(transport) => transport.stream_normalizer(target.clone(), retention_limits),
+        None => crate::streaming::StreamNormalizer::with_retention_limits(
+            target.clone(),
+            retention_limits,
+        ),
+    };
+    let mut normalizer = match normalizer {
         Ok(normalizer) => normalizer,
         Err(error) => {
             set_stream_terminal(&terminal, Err(error));
@@ -3078,3 +3246,15 @@ mod tests {
         m200.assert_async().await;
     }
 }
+
+#[cfg(all(test, feature = "bedrock"))]
+#[path = "client/bedrock_tests.rs"]
+mod bedrock_tests;
+
+#[cfg(all(test, feature = "bedrock"))]
+#[path = "client/bedrock_retry_tests.rs"]
+mod bedrock_retry_tests;
+
+#[cfg(all(test, feature = "bedrock"))]
+#[path = "client/bedrock_admission_tests.rs"]
+mod bedrock_admission_tests;

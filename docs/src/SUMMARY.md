@@ -6,6 +6,7 @@
 
 - [Choose a surface](start/choose.md)
 - [Configure providers](start/configure.md)
+- [Amazon Bedrock](bedrock.md)
 - [Rust quickstart](start/rust.md)
 - [CLI quickstart](start/cli.md)
 - [HTTP proxy quickstart](start/proxy.md)

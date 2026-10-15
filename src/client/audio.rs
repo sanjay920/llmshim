@@ -19,6 +19,7 @@ impl ShimClient {
                     model,
                     None,
                     &upload.request,
+                    None,
                     |builder| Ok(builder.multipart(multipart_form(&upload)?)),
                 )
                 .await?;
@@ -76,7 +77,7 @@ impl ShimClient {
         let prepared = provider.speech_request(model, request)?;
         let result = async {
             let attempt = self
-                .send_prepared(None, AttemptKind::Completion, model, None, &prepared)
+                .send_prepared(None, AttemptKind::Completion, model, None, &prepared, None)
                 .await?;
             let media_type = media_type(&attempt.response).to_owned();
             let bytes = body::read(

@@ -63,6 +63,11 @@ impl ProviderRequest {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Override request authorization and stream framing without changing the semantic wire.
+    fn transport(&self) -> Option<std::sync::Arc<dyn crate::transport::RequestTransport>> {
+        None
+    }
+
     /// Describe native request fields that affect proxy admission. Providers
     /// without a merged native namespace keep the empty default.
     fn request_admission_policy(&self) -> RequestAdmissionPolicy {
@@ -210,6 +215,11 @@ pub trait Provider: Send + Sync {
             400,
             "provider does not support image generation",
         ))
+    }
+
+    /// Select native usage semantics before policy accounting, without changing the recorded body.
+    fn response_for_usage<'a>(&self, native: &'a Value) -> std::borrow::Cow<'a, Value> {
+        std::borrow::Cow::Borrowed(native)
     }
 
     /// Transform the provider's native response back into OpenAI format.
