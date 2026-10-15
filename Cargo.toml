@@ -30,6 +30,8 @@ bedrock = [
     "dep:aws-smithy-async", "dep:aws-smithy-http-client", "dep:crc32fast",
 ]
 
+vertex = ["dep:ring"]
+
 [dependencies]
 llmshim-catalog = { version = "0.3.4", path = "crates/llmshim-catalog" }
 tokio = { version = "1", features = ["full"] }
@@ -37,6 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+ring = { version = "0.17", optional = true }
 uuid = { version = "1", features = ["v4"] }
 jsonschema = { version = "0.46", default-features = false }
 futures = "0.3"

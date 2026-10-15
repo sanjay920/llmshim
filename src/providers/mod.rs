@@ -13,3 +13,6 @@ pub mod openrouter;
 mod openrouter_audio;
 mod openrouter_cache;
 pub mod xai;
+
+#[cfg(feature = "vertex")]
+pub mod vertex;

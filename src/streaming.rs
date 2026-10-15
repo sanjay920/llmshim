@@ -21,6 +21,7 @@ pub(crate) fn append_string_fragment(destination: &mut Value, fragment: &str) {
 pub struct StreamNormalizer {
     target: ReplayTarget,
     output_projection: Option<fn(&Value, &mut Value)>,
+    conversion_model: Option<String>,
     tools: ToolStream,
     usage: StreamUsage,
     seen_terminal: bool,
@@ -55,6 +56,7 @@ impl StreamNormalizer {
         );
         Ok(Self {
             output_projection: None,
+            conversion_model: None,
             tools: ToolStream::with_budget(target.clone(), budget.clone()),
             target,
             usage: StreamUsage::with_budget(budget.clone()),
@@ -71,6 +73,13 @@ impl StreamNormalizer {
     /// Project transport-specific usage after semantic normalization.
     pub fn with_output_projection(mut self, projection: fn(&Value, &mut Value)) -> Self {
         self.output_projection = Some(projection);
+        self
+    }
+
+    /// Native capability aliases do not replace the dispatched model or replay origin.
+    #[cfg(feature = "vertex")]
+    pub(crate) fn with_conversion_model(mut self, model: String) -> Self {
+        self.conversion_model = Some(model);
         self
     }
 
@@ -157,7 +166,12 @@ impl StreamNormalizer {
             match self.target.wire {
                 WireFormat::AnthropicMessages => {
                     crate::providers::anthropic::Anthropic::new(String::new())
-                        .transform_stream_chunk(&self.target.model, &data)?
+                        .transform_stream_chunk(
+                            self.conversion_model
+                                .as_deref()
+                                .unwrap_or(&self.target.model),
+                            &data,
+                        )?
                 }
                 WireFormat::GoogleGenerateContent => {
                     crate::providers::gemini::Gemini::new(String::new())
@@ -185,6 +199,9 @@ impl StreamNormalizer {
             return Ok(None);
         };
         let mut value: Value = serde_json::from_str(&chunk)?;
+        if self.conversion_model.is_some() {
+            value["model"] = serde_json::json!(self.target.model);
+        }
         if self.target.wire == WireFormat::OpenAiResponses {
             if value
                 .pointer("/choices/0/delta/refusal")

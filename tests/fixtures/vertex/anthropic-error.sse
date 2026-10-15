@@ -1,0 +1,7 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"fixture","type":"message","role":"assistant","model":"fixture","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}
+
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"fixture explanation"}}
+
+: fixture ends

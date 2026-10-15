@@ -1,6 +1,8 @@
 //! Typed, lossless reasoning and a single fail-closed replay policy.
 //! Opaque data is never inspected to decide where a block may be sent.
 mod bound_thinking;
+#[cfg(feature = "vertex")]
+pub(crate) use bound_thinking::reader_allows as bound_reader_allows;
 mod normalize;
 mod request_budget;
 pub(crate) use normalize::capture_response_with_budget;
@@ -214,6 +216,10 @@ pub fn should_replay(
     }
     if origin.wire != target.wire {
         return Err(DropReason::WireMismatch);
+    }
+    #[cfg(feature = "vertex")]
+    if let Some(reason) = crate::providers::vertex::replay_restriction(origin, target) {
+        return Err(reason);
     }
     if origin.provider == "anthropic"
         && target.provider == "anthropic"

@@ -460,6 +460,7 @@ impl ShimClient {
             &self.http
         };
 
+        let mut authorization_retried = false;
         for attempt in 0..=max_retries {
             let mut builder = http.post(&req.url);
             for (key, value) in &req.headers {
@@ -568,6 +569,12 @@ impl ShimClient {
                     return Err(DispatchFailure::Local(error));
                 }
             }
+            let sent_authorization = transport.and_then(|_| {
+                http_request
+                    .headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .cloned()
+            });
             let response_result =
                 tokio::time::timeout_at(header_deadline, execute(http, http_request)).await;
             match response_result {
@@ -709,6 +716,24 @@ impl ShimClient {
                             "upstream error body exceeds JSON complexity limit".into()
                         }
                     };
+                    if let Some(transport) = transport.filter(|_| matches!(status_code, 401 | 403))
+                    {
+                        let refresh = tokio::time::timeout_at(
+                            attempt_deadline,
+                            transport.authorization_rejected(
+                                status_code,
+                                &body,
+                                sent_authorization.as_ref(),
+                            ),
+                        )
+                        .await
+                        .map_err(|_| DispatchFailure::Local(transport.authorization_timeout()))?
+                        .map_err(DispatchFailure::Local)?;
+                        if refresh && !authorization_retried && attempt < max_retries {
+                            authorization_retried = true;
+                            continue;
+                        }
+                    }
                     let error = match transport {
                         Some(transport) => {
                             transport.error(status_code, &error_headers, body, retry_after)
@@ -3258,3 +3283,11 @@ mod bedrock_retry_tests;
 #[cfg(all(test, feature = "bedrock"))]
 #[path = "client/bedrock_admission_tests.rs"]
 mod bedrock_admission_tests;
+
+#[cfg(all(test, feature = "vertex"))]
+#[path = "client/vertex_tests.rs"]
+mod vertex_tests;
+
+#[cfg(all(test, feature = "vertex"))]
+#[path = "client/vertex_auth_tests.rs"]
+mod vertex_auth_tests;

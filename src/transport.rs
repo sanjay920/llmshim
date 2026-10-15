@@ -39,6 +39,17 @@ pub trait RequestTransport: Send + Sync {
         crate::error::provider_error(503, "authorization timeout")
     }
 
+    /// Invalidate the identity actually sent when a typed upstream rejection permits refresh.
+    /// Dispatch bounds this callback and retries at most once within its configured retry limit.
+    fn authorization_rejected<'a>(
+        &'a self,
+        _status: u16,
+        _body: &'a str,
+        _sent: Option<&'a reqwest::header::HeaderValue>,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async { Ok(false) })
+    }
+
     fn stream_normalizer(
         &self,
         target: crate::reasoning::ReplayTarget,
