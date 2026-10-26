@@ -63,6 +63,12 @@ impl ProviderRequest {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Whether this instance reaches the documented native endpoint for catalog defaults.
+    /// Custom endpoints and adapters must not inherit another endpoint's omitted-control defaults.
+    fn uses_documented_model_defaults(&self) -> bool {
+        false
+    }
+
     /// Override request authorization and stream framing without changing the semantic wire.
     fn transport(&self) -> Option<std::sync::Arc<dyn crate::transport::RequestTransport>> {
         None

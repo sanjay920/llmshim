@@ -635,14 +635,22 @@ pub fn anthropic_reasoning_options(model: &str) -> Vec<crate::ReasoningOption> {
             name = base.into();
         }
     }
+    // Effort levels and defaults, checked 2026-10-26:
+    // https://platform.claude.com/docs/en/build-with-claude/effort
     match name.as_str() {
+        "claude-opus-5-5" | "claude-haiku-5-5" => vec![Effort {
+            values: vec![Low, Medium, High, Xhigh, Max],
+            default: Some(Medium),
+        }],
         "claude-opus-4-6" | "claude-sonnet-4-6" => vec![Effort {
             values: vec![Low, Medium, High, Max],
+            default: Some(High),
         }],
-        "claude-opus-4-7" | "claude-opus-4-8" | "claude-opus-5" | "claude-opus-5-5"
-        | "claude-sonnet-5" | "claude-sonnet-5-5" | "claude-fable-5" | "claude-fable-5-1" => {
+        "claude-opus-4-7" | "claude-opus-4-8" | "claude-opus-5" | "claude-sonnet-5"
+        | "claude-sonnet-5-5" | "claude-fable-5" | "claude-fable-5-1" => {
             vec![Effort {
                 values: vec![Low, Medium, High, Xhigh, Max],
+                default: Some(High),
             }]
         }
         "claude-3-7-sonnet" | "claude-sonnet-4" | "claude-opus-4" | "claude-haiku-4"

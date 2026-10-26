@@ -1,3 +1,4 @@
+use crate::ReasoningOption;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -95,25 +96,6 @@ pub struct ContextCostTier {
 pub struct Modalities {
     pub input: Vec<String>,
     pub output: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EffortLevel {
-    None,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ReasoningOption {
-    Effort { values: Vec<EffortLevel> },
-    BudgetTokens { min: Option<u32>, max: Option<u32> },
 }
 
 /// Owned metadata, usable without the translation crate or a network connection.

@@ -6,25 +6,28 @@
   "openai/gpt-image-1": {"name":"gpt-image-1","last_updated":"2026-09-30","modalities":{"input":["text","image"],"output":["image"]},"cost":{"input":5,"output":40,"cache_read":1.25}},
   "openai/gpt-image-1.5": {"name":"gpt-image-1.5","last_updated":"2026-09-30","modalities":{"input":["text","image"],"output":["text","image"]},"cost":{"input":5,"output":32,"cache_read":1.25}},
   "openai/gpt-image-1-mini": {"name":"gpt-image-1-mini","last_updated":"2026-09-30","modalities":{"input":["text","image"],"output":["image"]},"cost":{"input":2,"output":8,"cache_read":0.2}},
-  "openai/gpt-6-sol": {"name":"GPT-6 Sol","family":"gpt","limit":{"context":1050000,"input":922000,"output":128000},"release_date":"2026-09-22","modalities":{"input":["text","image"],"output":["text"]},"reasoning_options":[{"type":"effort","values":["none","low","medium","high","xhigh","max"]}],"streaming":true,"tool_call":true,"structured_output":true,"cost":{"input":2,"cache_read":0.2,"cache_write":2.5,"output":10},"context_cost_tiers":[{"above_input_tokens":272000,"cost":{"input":4,"cache_read":0.4,"cache_write":5,"output":15}}],"knowledge":"2026-04-20"},
-  "openai/gpt-6-luna": {"name":"GPT-6 Luna","family":"gpt","limit":{"context":1050000,"input":922000,"output":128000},"release_date":"2026-09-22","modalities":{"input":["text","image"],"output":["text"]},"reasoning_options":[{"type":"effort","values":["none","low","medium","high","xhigh","max"]}],"streaming":true,"tool_call":true,"structured_output":true,"cost":{"input":0.1,"cache_read":0.01,"cache_write":0.125,"output":0.5},"context_cost_tiers":[{"above_input_tokens":272000,"cost":{"input":0.2,"cache_read":0.02,"cache_write":0.25,"output":0.75}}],"knowledge":"2026-05-18"},
-  "anthropic/claude-opus-5-5": {"name":"Claude Opus 5.5","family":"claude","limit":{"context":1000000,"output":128000},"release_date":"2026-09-22","modalities":{"input":["text","image"],"output":["text"]},"reasoning_options":[{"type":"effort","values":["low","medium","high","xhigh","max"]}],"streaming":true,"tool_call":true,"structured_output":true,"forced_tool_choice":false,"cost":{"input":4,"cache_read":0.2,"cache_write":8,"output":20}},
-  "anthropic/claude-sonnet-5-5": {"name":"Claude Sonnet 5.5","family":"claude","limit":{"context":1000000,"output":128000},"release_date":"2026-09-28","modalities":{"input":["text","image"],"output":["text"]},"reasoning_options":[{"type":"effort","values":["low","medium","high","xhigh","max"]}],"streaming":true,"tool_call":true,"structured_output":true,"forced_tool_choice":false,"cost":{"input":2,"cache_read":0.2,"cache_write":4,"output":10}},
+  "openai/gpt-6-sol": {"name":"GPT-6 Sol","family":"gpt","limit":{"context":1050000,"input":922000,"output":128000},"release_date":"2026-09-22","modalities":{"input":["text","image"],"output":["text"]},"reasoning_options":[{"type":"effort","values":["none","low","medium","high","xhigh","max"],"default":"medium"}],"streaming":true,"tool_call":true,"structured_output":true,"cost":{"input":2,"cache_read":0.2,"cache_write":2.5,"output":10},"context_cost_tiers":[{"above_input_tokens":272000,"cost":{"input":4,"cache_read":0.4,"cache_write":5,"output":15}}],"knowledge":"2026-04-20","_default_effort_source": {"url":"https://developers.openai.com/api/docs/guides/reasoning","checked":"2026-10-26"}},
+  "openai/gpt-6-luna": {"name":"GPT-6 Luna","family":"gpt","limit":{"context":1050000,"input":922000,"output":128000},"release_date":"2026-09-22","modalities":{"input":["text","image"],"output":["text"]},"reasoning_options":[{"type":"effort","values":["none","low","medium","high","xhigh","max"],"default":"medium"}],"streaming":true,"tool_call":true,"structured_output":true,"cost":{"input":0.1,"cache_read":0.01,"cache_write":0.125,"output":0.5},"context_cost_tiers":[{"above_input_tokens":272000,"cost":{"input":0.2,"cache_read":0.02,"cache_write":0.25,"output":0.75}}],"knowledge":"2026-05-18","_default_effort_source": {"url":"https://developers.openai.com/api/docs/guides/reasoning","checked":"2026-10-26"}},
+  "anthropic/claude-opus-5-5": {"name":"Claude Opus 5.5","family":"claude","limit":{"context":1000000,"output":128000},"release_date":"2026-09-22","modalities":{"input":["text","image"],"output":["text"]},"reasoning_options":[{"type":"effort","values":["low","medium","high","xhigh","max"],"default":"medium"}],"streaming":true,"tool_call":true,"structured_output":true,"forced_tool_choice":false,"cost":{"input":4,"cache_read":0.2,"cache_write":8,"output":20},"_default_effort_source": {"url":"https://platform.claude.com/docs/en/build-with-claude/effort","checked":"2026-10-26"}},
+  "anthropic/claude-sonnet-5-5": {"name":"Claude Sonnet 5.5","family":"claude","limit":{"context":1000000,"output":128000},"release_date":"2026-09-28","modalities":{"input":["text","image"],"output":["text"]},"reasoning_options":[{"type":"effort","values":["low","medium","high","xhigh","max"],"default":"high"}],"streaming":true,"tool_call":true,"structured_output":true,"forced_tool_choice":false,"cost":{"input":2,"cache_read":0.2,"cache_write":4,"output":10},"_default_effort_source": {"url":"https://platform.claude.com/docs/en/build-with-claude/effort","checked":"2026-10-26"}},
   "xai/grok-4.7": {
     "name": "Grok 4.7",
     "family": "grok",
     "limit": {"context": 500000},
     "release_date": "2026-09-21",
     "modalities": {"input": ["text", "image"], "output": ["text"]},
-    "reasoning_options": [{"type": "effort", "values": ["low", "medium", "high", "xhigh"]}],
+    "reasoning_options": [{"type":"effort","values":["low","medium","high","xhigh"],"default":"high"}],
     "streaming": true,
     "forced_tool_choice": true,
     "cost": {"input": 2, "cache_read": 0.5, "output": 6},
-    "context_cost_tiers": [{"above_input_tokens": 200000, "cost": {"input": 4, "cache_read": 1, "output": 12}}]
+    "context_cost_tiers": [{"above_input_tokens": 200000, "cost": {"input": 4, "cache_read": 1, "output": 12}}],
+    "_default_effort_source": {"url":"https://docs.x.ai/developers/model-capabilities/text/reasoning","checked":"2026-10-26"}
   },
   "xai/grok-4.6": {
     "cost": {"input": 2, "cache_read": 0.5, "output": 6},
-    "context_cost_tiers": [{"above_input_tokens": 200000, "cost": {"input": 4, "cache_read": 1, "output": 12}}]
+    "context_cost_tiers": [{"above_input_tokens": 200000, "cost": {"input": 4, "cache_read": 1, "output": 12}}],
+    "reasoning_options": [{"type":"effort","values":["low","medium","high","xhigh"],"default":"high"}],
+    "_default_effort_source": {"url":"https://docs.x.ai/developers/model-capabilities/text/reasoning","checked":"2026-10-26"}
   },
   "openrouter/x-ai/grok-4.7:nitro": {
     "name": "Grok 4.7 (Nitro)",
@@ -53,5 +56,16 @@
   },
   "openrouter/deepseek/deepseek-v4.1-flash": {
     "cost": {"input": 0.3, "output": 1.2, "cache_read": 0.006}
-  }
+  },
+  "anthropic/claude-haiku-5-5": {"name":"Claude Haiku 5.5","family":"claude","reasoning":true,"reasoning_options":[{"type":"effort","values":["low","medium","high","xhigh","max"],"default":"medium"}],"_default_effort_source":{"url":"https://platform.claude.com/docs/en/build-with-claude/effort","checked":"2026-10-26"}},
+  "openai/gpt-6-astra": {"reasoning_options":[{"type":"effort","values":["low","medium","high","xhigh","max"],"default":"medium"}],"_default_effort_source":{"url":"https://developers.openai.com/api/docs/guides/latest-model","checked":"2026-10-26"}},
+  "openai/gpt-5.6": {"reasoning_options":[{"type":"effort","values":["none","low","medium","high","xhigh","max"],"default":"medium"}],"_default_effort_source":{"url":"https://developers.openai.com/api/docs/guides/reasoning","checked":"2026-10-26"}},
+  "openai/gpt-5.6-sol": {"reasoning_options":[{"type":"effort","values":["none","low","medium","high","xhigh","max"],"default":"medium"}],"_default_effort_source":{"url":"https://developers.openai.com/api/docs/guides/reasoning","checked":"2026-10-26"}},
+  "gemini/gemini-3.8-flash": {"reasoning_options":[{"type":"effort","values":["low","medium","high"],"default":"medium"}],"_default_effort_source":{"url":"https://ai.google.dev/gemini-api/docs/generate-content/thinking.md","checked":"2026-10-26"}},
+  "gemini/gemini-3.6-flash": {"reasoning_options":[{"type":"effort","values":["minimal","low","medium","high"],"default":"medium"}],"_default_effort_source":{"url":"https://ai.google.dev/gemini-api/docs/generate-content/thinking.md","checked":"2026-10-26"}},
+  "gemini/gemini-3.5-flash-lite": {"reasoning_options":[{"type":"effort","values":["minimal","low","medium","high"],"default":"minimal"}],"_default_effort_source":{"url":"https://ai.google.dev/gemini-api/docs/generate-content/thinking.md","checked":"2026-10-26"}},
+  "gemini/gemini-3.1-flash-lite": {"reasoning_options":[{"type":"effort","values":["minimal","low","medium","high"],"default":"minimal"}],"_default_effort_source":{"url":"https://ai.google.dev/gemini-api/docs/generate-content/thinking.md","checked":"2026-10-26"}},
+  "gemini/gemini-3.1-flash-lite-image": {"reasoning_options":[{"type":"effort","values":["minimal","high"],"default":"minimal"}],"_default_effort_source":{"url":"https://ai.google.dev/gemini-api/docs/generate-content/thinking.md","checked":"2026-10-26"}},
+  "gemini/gemini-3-flash-preview": {"reasoning_options":[{"type":"effort","values":["minimal","low","medium","high"],"default":"high"}],"_default_effort_source":{"url":"https://ai.google.dev/gemini-api/docs/generate-content/thinking.md","checked":"2026-10-26"}},
+  "xai/grok-4.5": {"reasoning_options":[{"type":"effort","values":["low","medium","high"],"default":"high"}],"_default_effort_source":{"url":"https://docs.x.ai/developers/model-capabilities/text/reasoning","checked":"2026-10-26"}}
 }
