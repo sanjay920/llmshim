@@ -64,6 +64,7 @@ fn new_frontier_models_have_verified_pricing_and_legacy_specs() {
     assert_eq!(
         sonnet.reasoning_options,
         vec![ReasoningOption::Effort {
+            default: Some(EffortLevel::High),
             values: vec![
                 EffortLevel::Low,
                 EffortLevel::Medium,

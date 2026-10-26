@@ -167,3 +167,22 @@ cargo package -p llmshim-catalog --allow-dirty
 
 Publish this crate before a llmshim version that depends on it. Packaging is a
 local operation; publication is a separate release action.
+
+## Reasoning defaults
+
+An effort option can carry `default`, the documented effort used when a request omits controls.
+An absent default means unknown. The literal level `none` is a known value, not an absent default.
+Deserialization discards an invalid default while preserving valid effort choices.
+A catalog merge also clears a programmatic default that does not occur in `values`.
+The complete option list replaces the previous list by source rank.
+A stronger list with an unknown default does not inherit a weaker list's default.
+
+Verified assertions carry their source URL and check date in `data/verified.json`.
+The Anthropic fallback carries its citation beside its effort entries in `src/builtin.rs`.
+Claude Haiku 5.5 has five accepted levels and defaults to medium.
+Unknown routes, including resellers and subscription backends, retain absent defaults.
+
+This metadata does not set request controls.
+A consumer must also verify the actual route before it labels an omitted-control request.
+The translation crate's `Provider::uses_documented_model_defaults()` identifies native endpoints.
+Its default is false. Custom endpoints do not inherit the native endpoint's documented defaults.

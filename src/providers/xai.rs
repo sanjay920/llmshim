@@ -3,6 +3,8 @@ use crate::provider::{Provider, ProviderRequest};
 use crate::vision;
 use serde_json::{json, Value};
 
+const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+
 pub struct Xai {
     pub api_key: String,
     pub base_url: String,
@@ -12,7 +14,7 @@ impl Xai {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            base_url: "https://api.x.ai/v1".to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
         }
     }
 
@@ -212,6 +214,10 @@ fn reasoning_cannot_disable(model: &str) -> bool {
 }
 
 impl Provider for Xai {
+    fn uses_documented_model_defaults(&self) -> bool {
+        self.base_url == DEFAULT_BASE_URL
+    }
+
     fn name(&self) -> &str {
         "xai"
     }

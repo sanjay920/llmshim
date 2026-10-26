@@ -5,6 +5,8 @@ use crate::provider::{Provider, ProviderRequest};
 use crate::vision;
 use serde_json::{json, Value};
 
+const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
+
 pub struct Anthropic {
     pub api_key: String,
     pub base_url: String,
@@ -14,7 +16,7 @@ impl Anthropic {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            base_url: "https://api.anthropic.com/v1".to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
         }
     }
 
@@ -442,6 +444,10 @@ pub(super) fn normalize_unified_effort(effort: &str, pro: bool) -> &'static str 
 }
 
 impl Provider for Anthropic {
+    fn uses_documented_model_defaults(&self) -> bool {
+        self.base_url == DEFAULT_BASE_URL
+    }
+
     fn name(&self) -> &str {
         "anthropic"
     }

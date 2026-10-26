@@ -3,6 +3,8 @@ use crate::provider::{Provider, ProviderRequest};
 use crate::vision;
 use serde_json::{json, Value};
 
+const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
 pub struct OpenAi {
     pub api_key: String,
     pub base_url: String,
@@ -12,7 +14,7 @@ impl OpenAi {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            base_url: "https://api.openai.com/v1".to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
         }
     }
 
@@ -352,6 +354,10 @@ fn bump_effort(effort: &str) -> &'static str {
 }
 
 impl Provider for OpenAi {
+    fn uses_documented_model_defaults(&self) -> bool {
+        self.base_url == DEFAULT_BASE_URL
+    }
+
     fn transcription_models(&self) -> Vec<crate::audio::TranscriptionModelInfo> {
         super::openai_audio::transcription_models(self.name())
     }

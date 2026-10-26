@@ -32,7 +32,7 @@ impl Profile {
             return Self::Unsupported;
         }
         for option in options {
-            if let ReasoningOption::Effort { values } = option {
+            if let ReasoningOption::Effort { values, .. } = option {
                 if !values.is_empty() {
                     return Self::Effort(values.clone());
                 }

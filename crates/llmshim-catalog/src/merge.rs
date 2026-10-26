@@ -37,7 +37,11 @@ pub(crate) fn merge(target: &mut ModelInfo, incoming: &ModelInfo) {
     );
     field!(max_output_tokens, incoming.max_output_tokens.is_some());
     field!(family, incoming.family.is_some());
+    // Choices and their default replace together. A stronger unknown default must stay unknown.
     field!(reasoning_options, !incoming.reasoning_options.is_empty());
+    for option in &mut target.reasoning_options {
+        option.clear_invalid_default();
+    }
     if source != CatalogSource::ProviderApi {
         field!(knowledge_cutoff, incoming.knowledge_cutoff.is_some());
         field!(release_date, incoming.release_date.is_some());
