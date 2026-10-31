@@ -10,6 +10,7 @@ use llmshim::{
     provider::Provider,
     providers::{
         anthropic::Anthropic,
+        cerebras::Cerebras,
         chatgpt::{ChatGpt, ChatGptAuth},
         gemini::Gemini,
         openai::OpenAi,
@@ -126,6 +127,11 @@ fn providers(auth: &ChatGptAuth) -> Vec<(&'static str, &'static str, Box<dyn Pro
             "OpenRouter",
             "anthropic/claude-sonnet-4-6",
             Box::new(OpenRouter::new("test".into())),
+        ),
+        (
+            "Cerebras",
+            "qwen-3.8-27b",
+            Box::new(Cerebras::new("test".into())),
         ),
         ("Xai", "grok-4.6", Box::new(Xai::new("test".into()))),
     ]

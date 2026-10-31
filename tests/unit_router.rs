@@ -515,3 +515,16 @@ fn offline_constructor_resolves_a_bundled_model() {
     assert_eq!(model, "claude-sonnet-5");
     assert!(llmshim::catalog::resolve("anthropic/claude-sonnet-5").is_some());
 }
+
+#[test]
+fn parse_cerebras_bare_model_and_dedicated_endpoint() {
+    let aliases = std::collections::HashMap::new();
+    assert_eq!(
+        llmshim::router::parse_model("qwen-3.8-27b", &aliases).unwrap(),
+        ("cerebras".into(), "qwen-3.8-27b".into())
+    );
+    assert_eq!(
+        llmshim::router::parse_model("cerebras/my-endpoint", &aliases).unwrap(),
+        ("cerebras".into(), "my-endpoint".into())
+    );
+}

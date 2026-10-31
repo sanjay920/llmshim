@@ -41,7 +41,7 @@ pricing. Catalog entries do not imply credentials or account entitlement.
 ## Advertised catalog
 
 The CLI picker, `llmshim models`, and `/v1/models` share this curated set of
-13 routes. It keeps the current model in each retained tier. Google entries
+16 routes. It keeps the current model in each retained tier. Google entries
 are stable releases only. Credentials determine which providers are listed.
 
 ### OpenAI
@@ -67,6 +67,12 @@ are stable releases only. Credentials determine which providers are listed.
 |---|---|
 | `gemini/gemini-3.8-flash` | Gemini 3.8 Flash |
 | `gemini/gemini-3.5-flash-lite` | Gemini 3.5 Flash Lite |
+
+### Cerebras
+
+| ID | Display name |
+|---|---|
+| `cerebras/qwen-3.8-27b` | Qwen 3.8 27B (Cerebras) |
 
 ### xAI
 

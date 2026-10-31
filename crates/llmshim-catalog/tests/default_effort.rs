@@ -35,12 +35,17 @@ fn documented_defaults_survive_the_final_catalog_merge() {
         ("xai/grok-4.5", "high"),
         ("xai/grok-4.6", "high"),
         ("xai/grok-4.7", "high"),
+        ("cerebras/qwen-3.8-27b", "high"),
     ] {
         assert_eq!(options(&catalog, id)[0]["default"], expected, "{id}");
     }
     assert_eq!(
         options(&catalog, "anthropic/claude-haiku-5-5")[0]["values"],
         json!(["low", "medium", "high", "xhigh", "max"])
+    );
+    assert_eq!(
+        options(&catalog, "cerebras/qwen-3.8-27b")[0]["values"],
+        json!(["none", "low", "medium", "high"])
     );
     for id in ["openrouter/x-ai/grok-4.7", "openai/gpt-5.6-luna"] {
         assert!(options(&catalog, id)[0].get("default").is_none(), "{id}");

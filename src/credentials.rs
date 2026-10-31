@@ -27,8 +27,14 @@
 /// rotation, not a secret, and is registered from its own auth file; the self-hosted `vllm` and
 /// `sglang` entries are selected by a base URL rather than by a key, and their key is optional.
 /// Neither is something an embedder can supply as a string, so neither is asked for here.
-pub const CREDENTIALED_PROVIDERS: [&str; 5] =
-    ["openai", "anthropic", "gemini", "xai", "openrouter"];
+pub const CREDENTIALED_PROVIDERS: [&str; 6] = [
+    "openai",
+    "anthropic",
+    "gemini",
+    "xai",
+    "openrouter",
+    "cerebras",
+];
 
 /// A saved login an embedder holds, asked by provider name.
 pub trait StoredCredentials {
@@ -187,7 +193,14 @@ mod tests {
         }
         assert_eq!(
             asked.into_inner(),
-            vec!["openai", "anthropic", "gemini", "xai", "openrouter"]
+            vec![
+                "openai",
+                "anthropic",
+                "gemini",
+                "xai",
+                "openrouter",
+                "cerebras"
+            ]
         );
     }
 

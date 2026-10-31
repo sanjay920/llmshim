@@ -1,6 +1,6 @@
 # llmshim
 
-A blazing-fast LLM API translation layer written in **pure Rust**. One request format, every provider — OpenAI, ChatGPT subscriptions, Anthropic, Google Gemini, xAI, OpenRouter, and self-hosted vLLM / SGLang.
+A blazing-fast LLM API translation layer written in **pure Rust**. One request format, every provider — OpenAI, ChatGPT subscriptions, Anthropic, Google Gemini, xAI, OpenRouter, Cerebras, and self-hosted vLLM / SGLang.
 
 Send an OpenAI-style request, pick any model, and llmshim translates it to that provider's native API (and translates the response back). Switch providers by changing one string.
 
@@ -79,8 +79,16 @@ export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
 export GEMINI_API_KEY=AIza...
 export XAI_API_KEY=xai-...
+export CEREBRAS_API_KEY=csk-...
 export OPENROUTER_API_KEY=sk-or-...
 ```
+
+Use `cerebras/qwen-3.8-27b` (or bare `qwen-3.8-27b`) for Cerebras.
+Chat Completions, streams, reasoning, tool calls, and JSON schema output use
+the Cerebras endpoint at `https://api.cerebras.ai/v1`. Put native controls
+such as `clear_thinking` and `reasoning_format` under `x-cerebras`.
+See the [Cerebras compatibility guide](https://inference-docs.cerebras.ai/resources/openai)
+for model-specific limits.
 
 Reach any model through [OpenRouter](https://openrouter.ai) by addressing it as
 `openrouter/<vendor>/<model>` (e.g. `openrouter/anthropic/claude-sonnet-5`).
@@ -520,6 +528,7 @@ Standard library only. Full docs: [`clients/ruby/README.md`](clients/ruby/README
 | **Anthropic** | `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5-20251001` | Yes (thinking summaries) |
 | **Google Gemini** | `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite` | Yes (thought summaries) |
 | **xAI** | `grok-4.7` | No (hidden) |
+| **Cerebras** | `qwen-3.8-27b` | Yes |
 
 The CLI and server advertise these current tiers. ChatGPT subscription access
 also includes `chatgpt/gpt-6.1-sol`. OpenRouter and self-hosted
