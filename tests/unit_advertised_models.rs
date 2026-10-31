@@ -16,6 +16,7 @@ const EXPECTED: &[&str] = &[
     "chatgpt/gpt-6-sol",
     "chatgpt/gpt-6-luna",
     "chatgpt/gpt-6.1-sol",
+    "cerebras/qwen-3.8-27b",
 ];
 
 #[test]
@@ -50,6 +51,7 @@ fn cli_discovery_uses_the_same_curated_catalog() {
         .env("ANTHROPIC_API_KEY", "test")
         .env("GEMINI_API_KEY", "test")
         .env("XAI_API_KEY", "test")
+        .env("CEREBRAS_API_KEY", "test")
         .env("CHATGPT_TOKEN_DIR", dir.path())
         .env("CHATGPT_AUTH_FILE", "auth.json")
         .output()
@@ -82,7 +84,11 @@ async fn proxy_discovery_excludes_legacy_and_preview_models() {
         .register("anthropic", Box::new(Anthropic::new("test".into())))
         .register("gemini", Box::new(Gemini::new("test".into())))
         .register("xai", Box::new(Xai::new("test".into())))
-        .register("chatgpt", Box::new(ChatGpt::default()));
+        .register("chatgpt", Box::new(ChatGpt::default()))
+        .register(
+            "cerebras",
+            Box::new(llmshim::providers::cerebras::Cerebras::new("test".into())),
+        );
     // Pruning discovery must not block explicit legacy requests.
     assert_eq!(router.resolve("openai/gpt-5.4").unwrap().1, "gpt-5.4");
     assert_eq!(

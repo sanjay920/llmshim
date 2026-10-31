@@ -7,6 +7,7 @@ use crate::credentials::{
 use crate::error::{Result, ShimError};
 use crate::provider::Provider;
 use crate::providers::anthropic::Anthropic;
+use crate::providers::cerebras::Cerebras;
 use crate::providers::chatgpt::{ChatGpt, ChatGptAuth};
 use crate::providers::gemini::Gemini;
 use crate::providers::openai::OpenAi;
@@ -34,6 +35,8 @@ pub fn parse_model(model: &str, aliases: &HashMap<String, String>) -> Result<(St
             || lower.starts_with("o4")
         {
             Ok(("openai".to_string(), resolved.to_string()))
+        } else if lower == "qwen-3.8-27b" {
+            Ok(("cerebras".to_string(), resolved.to_string()))
         } else if lower.starts_with("claude") {
             Ok(("anthropic".to_string(), resolved.to_string()))
         } else if lower.starts_with("gemini") {
@@ -108,6 +111,7 @@ fn hosted_provider(
         "gemini" => on_base!(Gemini::new(key)),
         "xai" => on_base!(Xai::new(key)),
         "openrouter" => on_base!(OpenRouter::new(key)),
+        "cerebras" => on_base!(Cerebras::new(key)),
         _ => return None,
     })
 }

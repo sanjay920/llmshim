@@ -492,6 +492,11 @@ fn cmd_configure() {
         cfg.keys.openrouter = Some(openrouter);
     }
 
+    let cerebras = config_prompt("Cerebras API Key", cfg.keys.cerebras.as_deref());
+    if !cerebras.is_empty() {
+        cfg.keys.cerebras = Some(cerebras);
+    }
+
     let host = config_prompt_plain("Proxy host", &cfg.proxy.host);
     if !host.is_empty() {
         cfg.proxy.host = host;
@@ -524,6 +529,7 @@ fn cmd_set(key: &str, value: &str) {
         "gemini" => cfg.keys.gemini = Some(value.to_string()),
         "xai" => cfg.keys.xai = Some(value.to_string()),
         "openrouter" => cfg.keys.openrouter = Some(value.to_string()),
+        "cerebras" => cfg.keys.cerebras = Some(value.to_string()),
         "proxy.host" => cfg.proxy.host = value.to_string(),
         "proxy.port" => {
             cfg.proxy.port = value.parse().unwrap_or_else(|_| {
@@ -533,7 +539,7 @@ fn cmd_set(key: &str, value: &str) {
         }
         _ => {
             eprintln!(
-                "Unknown key: {}. Valid: openai, anthropic, gemini, xai, openrouter, proxy.host, proxy.port",
+                "Unknown key: {}. Valid: openai, anthropic, gemini, xai, openrouter, cerebras, proxy.host, proxy.port",
                 key
             );
             std::process::exit(1);
@@ -564,6 +570,7 @@ fn cmd_get(key: &str) {
         "gemini" => cfg.keys.gemini.as_deref().map(mask_key),
         "xai" => cfg.keys.xai.as_deref().map(mask_key),
         "openrouter" => cfg.keys.openrouter.as_deref().map(mask_key),
+        "cerebras" => cfg.keys.cerebras.as_deref().map(mask_key),
         "proxy.host" => Some(cfg.proxy.host.clone()),
         "proxy.port" => Some(cfg.proxy.port.to_string()),
         _ => {
@@ -584,6 +591,7 @@ fn cmd_list() {
         ("gemini", &cfg.keys.gemini),
         ("xai", &cfg.keys.xai),
         ("openrouter", &cfg.keys.openrouter),
+        ("cerebras", &cfg.keys.cerebras),
     ] {
         let display = match value {
             Some(v) if !v.is_empty() => mask_key(v),
@@ -879,6 +887,7 @@ fn docker_start(args: &[String]) {
         ("ANTHROPIC_API_KEY", &cfg.keys.anthropic),
         ("GEMINI_API_KEY", &cfg.keys.gemini),
         ("XAI_API_KEY", &cfg.keys.xai),
+        ("CEREBRAS_API_KEY", &cfg.keys.cerebras),
     ];
     for (env_name, cfg_value) in key_mappings {
         if let Ok(val) = std::env::var(env_name) {

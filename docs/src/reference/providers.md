@@ -10,6 +10,7 @@ different native API and translates only the fields that API understands.
 | Anthropic | Messages API | `claude*` | `x-anthropic` |
 | Google Gemini | `generateContent` / `streamGenerateContent` | `gemini*` | `x-gemini` |
 | xAI | Responses API | `grok*` | none |
+| Cerebras | Chat Completions | `qwen-3.8-27b` | `x-cerebras` |
 | OpenRouter | Chat Completions (aggregator) | none — address as `openrouter/<vendor>/<model>` | `x-openrouter` |
 | vLLM | Chat Completions (self-hosted, `VLLM_BASE_URL`); Responses API with `VLLM_WIRE=responses` | none — address as `vllm/<served-model>` | `x-vllm` |
 | SGLang | Chat Completions (self-hosted, `SGLANG_BASE_URL`); Responses API with `SGLANG_WIRE=responses` | none — address as `sglang/<served-model>` | `x-sglang` |
@@ -44,6 +45,7 @@ call includes its ID, name, and full JSON arguments, including in the proxy's
 | Anthropic | Messages become Anthropic content blocks; tools use `input_schema`, `tool_use`, and `tool_result` | `max_tokens` defaults to 8192 when absent; supported models receive the 1M-context beta by default; `x-anthropic.extra_betas` appends beta headers and `disable_1m_context` suppresses that automatic header |
 | Gemini | Messages become `contents`; tools use `functionDeclarations`, `functionCall`, and `functionResponse` | Base64 images become `inline_data`, but a remote image URL becomes a text placeholder because Gemini cannot consume it directly; `x-gemini.thinkingConfig` replaces mapped thinking configuration |
 | xAI | System/developer text becomes Responses `instructions`; tools are flattened like OpenAI Responses | Unified reasoning becomes `reasoning: {effort}` where the model accepts it; Grok 4.7 clamps `none` to `low` and `max` to `xhigh`; there is no `x-xai` namespace |
+| Cerebras | Chat Completions through `https://api.cerebras.ai/v1` | `reasoning_effort` passes through. Native `reasoning` becomes provenance-bearing blocks. `x-cerebras` carries controls such as `clear_thinking` and `reasoning_format`. |
 | OpenRouter | Passthrough — messages, tools, `image_url` vision, and `response_format` are already Chat Completions and forwarded unchanged | `reasoning_effort` maps 1:1 to OpenRouter's `reasoning:{effort}` (superset vocabulary, no clamping); reasoning is normalized to provenance-bearing blocks; the `middle-out` transform is disabled by default; `x-openrouter` carries `provider`/`models`/`transforms`/`route`/native `reasoning` (and `http_referer`/`x_title` headers) |
 | vLLM / SGLang | Passthrough to a self-hosted server — configured by base URL (local or remote), auth optional | reasoning normalized to provenance-bearing blocks; `reasoning_effort` forwarded (honored per-model); server-specific params (`chat_template_kwargs`, `guided_json`, `top_k`, `separate_reasoning`, …) go under `x-vllm`/`x-sglang`. Reasoning/tool parsing depend on the server's launch flags (`--reasoning-parser`, `--tool-call-parser`) |
 
@@ -115,7 +117,7 @@ does not download the URL.
 Embeddings are a separate operation rather than a chat translation. OpenAI's
 `/v1/embeddings`, Gemini's `batchEmbedContents`, and an OpenAI-compatible
 server's `/v1/embeddings` are reached through `llmshim::embeddings`; Anthropic,
-xAI, OpenRouter, and the ChatGPT subscription backend have no embeddings route
+Cerebras, xAI, OpenRouter, and the ChatGPT subscription backend have no embeddings route
 and refuse by name. See the [embeddings guide](../guides/embeddings.md).
 
 ## Reasoning and native controls
@@ -127,3 +129,35 @@ merely by provider. Floors, ceilings, and name-locked models are listed in the
 Use [native provider controls](../guides/native-controls.md) when exact native
 semantics matter. Native objects are not rewritten or made portable. Changing
 the provider address means reconsidering the namespace as well.
+
+### Cerebras
+
+Set `CEREBRAS_API_KEY`, or save the key with `llmshim set cerebras KEY`.
+Environment keys take precedence over saved keys. Library callers can use
+`providers::cerebras::Cerebras` or supply `cerebras` through `StoredCredentials`.
+A stored base URL applies only to its stored key.
+
+Use `cerebras/qwen-3.8-27b` for the advertised model. Bare `qwen-3.8-27b`
+also selects Cerebras. Use `cerebras/<endpoint-id>` for a dedicated endpoint.
+
+Qwen accepts `none`, `low`, `medium`, and `high` for `reasoning_effort`.
+Its default is `high`. Use `none` to disable reasoning.
+Cerebras returns separate reasoning text in both responses and stream chunks.
+The adapter preserves compatible reasoning across conversation turns and removes foreign reasoning.
+
+```json
+{
+  "model": "cerebras/qwen-3.8-27b",
+  "messages": [{"role": "user", "content": "What is 2 + 2?"}],
+  "reasoning_effort": "low",
+  "max_tokens": 1024,
+  "x-cerebras": {"clear_thinking": false}
+}
+```
+
+Model and account limits vary. Unknown catalog prices remain unknown.
+The adapter does not expose embeddings, speech, or image generation.
+For image input, Cerebras requires a base64 PNG or JPEG data URI.
+Some models reject tools together with `response_format`.
+See the official [compatibility](https://inference-docs.cerebras.ai/resources/openai)
+and [reasoning](https://inference-docs.cerebras.ai/capabilities/reasoning) guides.

@@ -274,6 +274,23 @@ pub const MODELS: &[BuiltinModelInfo] = &[
     CHATGPT_MODELS[1],
     CHATGPT_MODELS[2],
     CHATGPT_MODELS[3],
+    BuiltinModelInfo {
+        id: "cerebras/qwen-3.8-27b",
+        provider: "cerebras",
+        family: Some(ModelFamily::Qwen),
+        name: "qwen-3.8-27b",
+        label: "Qwen 3.8 27B (Cerebras)",
+        // Limits vary by account tier. Do not assert a universal ceiling.
+        context_window_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            tools: Support::Supported,
+            streaming: Support::Supported,
+            structured_output: Support::Supported,
+            reasoning: Support::Supported,
+            ..ModelCapabilities::unknown()
+        },
+    },
 ];
 
 /// Historical metadata remains available to explicit `spec()` lookups without

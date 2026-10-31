@@ -57,6 +57,8 @@ pub struct Keys {
     pub xai: Option<String>,
     #[serde(default)]
     pub openrouter: Option<String>,
+    #[serde(default)]
+    pub cerebras: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -196,6 +198,7 @@ pub fn apply_to_env(config: &Config) {
         ("GEMINI_API_KEY", &config.keys.gemini),
         ("XAI_API_KEY", &config.keys.xai),
         ("OPENROUTER_API_KEY", &config.keys.openrouter),
+        ("CEREBRAS_API_KEY", &config.keys.cerebras),
     ];
     for (env_key, value) in mappings {
         if std::env::var(env_key).is_err() {
