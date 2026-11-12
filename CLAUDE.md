@@ -14,7 +14,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 
 - **OpenAI:** `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`
 - **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and `chatgpt/gpt-6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
-- **Anthropic:** `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5-20251001`
+- **Anthropic:** `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5-20251001`
 - **Gemini:** `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite`
 - **xAI:** `grok-4.7`
 - **Cerebras:** `cerebras/qwen-3.8-27b` (bare name also accepted); native controls under `x-cerebras`.
@@ -360,7 +360,7 @@ Callers pass provider-specific controls under these keys. Each provider copies w
 
 ### Unified reasoning controls
 
-**Fable compatibility (verified September 2026).** Advertise Fable 5.1;
+**Fable compatibility (verified November 2026).** Advertise Fable 5.2 (released 2026-11-09; prefix-binding check applies to every account; its thinking is readable only by Fable/Mythos 5.2);
 retain Fable 5 behavior and metadata for explicit requests. Both use always-on adaptive thinking; unified `none` clamps to `low`,
 and native disabled/manual thinking fails locally. Strip `temperature`,
 `top_p`, and `top_k` for Fable and Opus 5 even without an explicit thinking

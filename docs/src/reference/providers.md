@@ -56,32 +56,32 @@ forwarded blindly.
 
 ## Tools and multimodal round trips
 
-### Claude Fable 5.1
+### Claude Fable 5.2 (and 5.1)
 
-Fable 5.1 uses always-on adaptive thinking, with `low`, `medium`,
+Fable 5.2 and 5.1 use always-on adaptive thinking, with `low`, `medium`,
 `high`, `xhigh`, and `max` effort. Unified `none` maps to `low`; explicit
 native disabled/manual thinking and assistant prefill return local errors.
-Sampling parameters are omitted for Fable 5.1, Opus 5, and Opus 5.5
+Sampling parameters are omitted for Fable 5.1/5.2, Opus 5, and Opus 5.5
 because those models reject them.
 
-Fable 5.1 and Opus 5.5 accept only `auto` and `none`:
+Fable 5.1/5.2 and Opus 5.5 accept only `auto` and `none`:
 `required` or a named forced tool returns a local 400 rather than changing the
 request's meaning. Describe the desired tool in the prompt, or use structured
 output when the requirement is a JSON schema. Native `stop_reason: "refusal"`
 maps to `finish_reason: "content_filter"` for Fable and Opus 5/5.5.
 
-Fable 5.1 binds thinking blocks to the preceding system prompt, tools, and
+Fable 5.1/5.2 bind thinking blocks to the preceding system prompt, tools, and
 conversation. Keep that prefix unchanged when replaying signed reasoning.
 Appending turns is supported; llmshim preserves appended system/developer
-instructions as system turns for Fable 5.1. If your application edits or
+instructions as system turns for Fable 5.1/5.2. If your application edits or
 compacts prior history, remove stale thinking or use Anthropic's explicit
 binding controls under `x-anthropic`. A binding failure remains an error.
-See [Anthropic's migration and history rules](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide).
+See [Anthropic's migration and history rules](https://platform.claude.com/docs/en/models/fable-5-2/migration-guide).
 
 Opus 5.5 also requires adaptive thinking, rejects assistant prefill,
 and binds thinking to the conversation prefix. It accepts thinking from older
 Opus, Sonnet, and Haiku models, but not Fable or Mythos. Its thinking blocks
-replay only to Opus 5.5, Fable 5.1, or Mythos 5.1. See the
+replay only to Opus 5.5, Fable 5.1/5.2, or Mythos 5.1/5.2. Fable 5.2 thinking replays only to Fable 5.2 or Mythos 5.2. See the
 [Opus 5.5 migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
 
 Sonnet 5.5 requires adaptive thinking and binds thinking to the conversation

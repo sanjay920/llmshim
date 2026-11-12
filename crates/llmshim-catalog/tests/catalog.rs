@@ -548,3 +548,15 @@ fn a_models_dev_refresh_cannot_erase_a_builtin_embedding_assertion() {
     assert_eq!(model.embedding_dimensions, Some(1536));
     assert_eq!(model.field_sources["embeds"], CatalogSource::Builtin);
 }
+
+#[test]
+fn fable_5_2_is_priced_at_the_published_rates() {
+    let catalog = Catalog::vendored();
+    let cost = catalog
+        .resolve("anthropic/claude-fable-5-2")
+        .unwrap()
+        .cost
+        .unwrap();
+    assert_eq!((cost.input, cost.output), (Some(8.0), Some(40.0)));
+    assert_eq!((cost.cache_read, cost.cache_write), (Some(0.2), Some(10.0)));
+}

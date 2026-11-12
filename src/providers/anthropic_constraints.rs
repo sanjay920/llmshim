@@ -10,7 +10,10 @@ fn provider_error(status: u16, message: &str) -> ShimError {
 use serde_json::{Map, Value};
 
 pub(super) fn is_fable(model: &str) -> bool {
-    matches!(model, "claude-fable-5" | "claude-fable-5-1")
+    matches!(
+        model,
+        "claude-fable-5" | "claude-fable-5-1" | "claude-fable-5-2"
+    )
 }
 pub(super) fn requires_adaptive_thinking(model: &str) -> bool {
     is_fable(model) || matches!(model, "claude-opus-5-5" | "claude-sonnet-5-5")
@@ -19,7 +22,7 @@ pub(super) fn requires_adaptive_thinking(model: &str) -> bool {
 pub(super) fn preserves_bound_system_turns(model: &str) -> bool {
     matches!(
         model,
-        "claude-fable-5-1" | "claude-opus-5-5" | "claude-sonnet-5-5"
+        "claude-fable-5-1" | "claude-fable-5-2" | "claude-opus-5-5" | "claude-sonnet-5-5"
     )
 }
 fn rejects_assistant_prefill(model: &str) -> bool {

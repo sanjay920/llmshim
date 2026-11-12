@@ -190,12 +190,12 @@ pub const MODELS: &[BuiltinModelInfo] = &[
         capabilities: CAPS_STD,
     },
     BuiltinModelInfo {
-        id: "anthropic/claude-fable-5-1",
+        id: "anthropic/claude-fable-5-2",
         provider: "anthropic",
         family: Some(ModelFamily::Claude),
-        name: "claude-fable-5-1",
-        label: "Claude Fable 5.1",
-        // Anthropic Models API and official model docs, verified 2026-09-15.
+        name: "claude-fable-5-2",
+        label: "Claude Fable 5.2",
+        // Anthropic model docs, verified 2026-11-11 (released 2026-11-09).
         context_window_tokens: Some(1_000_000),
         max_output_tokens: Some(128_000),
         capabilities: CAPS_FULL.with_forced_tool_choice(Support::Unsupported),
@@ -474,6 +474,17 @@ const LEGACY_MODELS: &[BuiltinModelInfo] = &[
         capabilities: CAPS_STD,
     },
     BuiltinModelInfo {
+        id: "anthropic/claude-fable-5-1",
+        provider: "anthropic",
+        family: Some(ModelFamily::Claude),
+        name: "claude-fable-5-1",
+        label: "Claude Fable 5.1",
+        // Anthropic Models API and official model docs, verified 2026-09-15.
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_FULL.with_forced_tool_choice(Support::Unsupported),
+    },
+    BuiltinModelInfo {
         id: "anthropic/claude-fable-5",
         provider: "anthropic",
         family: Some(ModelFamily::Claude),
@@ -664,7 +675,7 @@ pub fn anthropic_reasoning_options(model: &str) -> Vec<crate::ReasoningOption> {
             default: Some(High),
         }],
         "claude-opus-4-7" | "claude-opus-4-8" | "claude-opus-5" | "claude-sonnet-5"
-        | "claude-sonnet-5-5" | "claude-fable-5" | "claude-fable-5-1" => {
+        | "claude-sonnet-5-5" | "claude-fable-5" | "claude-fable-5-1" | "claude-fable-5-2" => {
             vec![Effort {
                 values: vec![Low, Medium, High, Xhigh, Max],
                 default: Some(High),

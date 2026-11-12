@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 fn provider() -> Anthropic {
     Anthropic::new("test-key".into())
 }
-const FABLES: [&str; 2] = ["claude-fable-5", "claude-fable-5-1"];
+const FABLES: [&str; 3] = ["claude-fable-5", "claude-fable-5-1", "claude-fable-5-2"];
 
 #[test]
 fn fable_uses_always_on_adaptive_thinking_and_all_effort_levels() {
@@ -41,6 +41,7 @@ fn fable_and_opus5_strip_sampling_even_without_explicit_thinking() {
     for model in [
         "claude-fable-5",
         "claude-fable-5-1",
+        "claude-fable-5-2",
         "claude-opus-5",
         "claude-opus-5-5",
         "claude-sonnet-5-5",
@@ -189,14 +190,13 @@ fn fable51_rejects_forced_tools_without_silently_weakening_the_request() {
         assert!(provider()
             .transform_request("claude-fable-5", &input)
             .is_ok());
-        let error = provider()
-            .transform_request("claude-fable-5-1", &input)
-            .err()
-            .unwrap();
-        assert!(matches!(
-            error,
-            ShimError::ProviderError { status: 400, .. }
-        ));
+        for model in ["claude-fable-5-1", "claude-fable-5-2"] {
+            let error = provider().transform_request(model, &input).err().unwrap();
+            assert!(matches!(
+                error,
+                ShimError::ProviderError { status: 400, .. }
+            ));
+        }
     }
     let error = provider()
         .transform_request(
@@ -243,33 +243,35 @@ fn fable_rejects_assistant_prefill_but_accepts_tool_results() {
 }
 
 #[test]
-fn fable51_keeps_appended_system_turns_out_of_the_bound_initial_prompt() {
-    let messages = json!([
-        {"role": "system", "content": "Initial instruction"},
-        {"role": "user", "content": "First question"},
-        {"role": "assistant", "content": "Answer", "reasoning_content": "", "reasoning_signature": "opaque-signed-block", "reasoning_origin": provider().replay_target("claude-fable-5-1").origin()},
-        {"role": "developer", "content": "Instruction for this turn"},
-        {"role": "user", "content": "Second question"}
-    ]);
-    let result = provider()
-        .transform_request("claude-fable-5-1", &json!({"messages": messages}))
-        .unwrap();
-    assert_eq!(result.body["system"], "Initial instruction");
-    assert_eq!(
-        result.body["messages"][2],
-        json!({"role": "system", "content": "Instruction for this turn"})
-    );
-    assert_eq!(
-        result.body["messages"][1]["content"][0],
-        json!({"type": "thinking", "thinking": "", "signature": "opaque-signed-block"})
-    );
-    let older = provider()
-        .transform_request("claude-opus-5", &json!({"messages": messages}))
-        .unwrap();
-    assert_eq!(
-        older.body["system"],
-        "Initial instruction\n\nInstruction for this turn"
-    );
+fn fable_5_1_and_5_2_keep_appended_system_turns_out_of_the_bound_initial_prompt() {
+    for model in ["claude-fable-5-1", "claude-fable-5-2"] {
+        let messages = json!([
+            {"role": "system", "content": "Initial instruction"},
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "Answer", "reasoning_content": "", "reasoning_signature": "opaque-signed-block", "reasoning_origin": provider().replay_target(model).origin()},
+            {"role": "developer", "content": "Instruction for this turn"},
+            {"role": "user", "content": "Second question"}
+        ]);
+        let result = provider()
+            .transform_request(model, &json!({"messages": messages}))
+            .unwrap();
+        assert_eq!(result.body["system"], "Initial instruction");
+        assert_eq!(
+            result.body["messages"][2],
+            json!({"role": "system", "content": "Instruction for this turn"})
+        );
+        assert_eq!(
+            result.body["messages"][1]["content"][0],
+            json!({"type": "thinking", "thinking": "", "signature": "opaque-signed-block"})
+        );
+        let older = provider()
+            .transform_request("claude-opus-5", &json!({"messages": messages}))
+            .unwrap();
+        assert_eq!(
+            older.body["system"],
+            "Initial instruction\n\nInstruction for this turn"
+        );
+    }
 }
 
 #[test]
@@ -277,6 +279,7 @@ fn refusal_has_a_content_filter_finish_reason_instead_of_success_or_502() {
     for model in [
         "claude-fable-5",
         "claude-fable-5-1",
+        "claude-fable-5-2",
         "claude-opus-5",
         "claude-opus-5-5",
     ] {

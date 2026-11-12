@@ -21,6 +21,7 @@ fn documented_defaults_survive_the_final_catalog_merge() {
         ("anthropic/claude-sonnet-5", "high"),
         ("anthropic/claude-fable-5", "high"),
         ("anthropic/claude-fable-5-1", "high"),
+        ("anthropic/claude-fable-5-2", "high"),
         ("gemini/gemini-3.8-flash", "medium"),
         ("gemini/gemini-3.6-flash", "medium"),
         ("gemini/gemini-3.5-flash-lite", "minimal"),

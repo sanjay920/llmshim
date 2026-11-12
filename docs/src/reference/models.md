@@ -56,7 +56,7 @@ are stable releases only. Credentials determine which providers are listed.
 
 | ID | Display name |
 |---|---|
-| `anthropic/claude-fable-5-1` | Claude Fable 5.1 |
+| `anthropic/claude-fable-5-2` | Claude Fable 5.2 |
 | `anthropic/claude-opus-5-5` | Claude Opus 5.5 |
 | `anthropic/claude-sonnet-5-5` | Claude Sonnet 5.5 |
 | `anthropic/claude-haiku-4-5-20251001` | Claude Haiku 4.5 |
