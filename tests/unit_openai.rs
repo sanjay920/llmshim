@@ -137,7 +137,7 @@ fn request_passes_prompt_cache_controls() {
 #[test]
 fn gpt_6_sol_and_luna_accept_none_and_max_without_a_pro_downgrade() {
     let provider = provider();
-    for model in ["gpt-6-sol", "gpt-6-luna"] {
+    for model in ["gpt-6-sol", "gpt-6.1-terra", "gpt-6-luna"] {
         for (requested_effort, expected_effort) in
             [("none", "none"), ("minimal", "low"), ("max", "max")]
         {
@@ -890,6 +890,7 @@ fn mode_pro_native_on_gpt_6_and_supported_older_models() {
     for model in [
         "gpt-6-astra",
         "gpt-6-sol",
+        "gpt-6.1-terra",
         "gpt-6-luna",
         "gpt-5.6-terra",
         "gpt-5.5-pro",

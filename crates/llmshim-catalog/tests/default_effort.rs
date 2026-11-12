@@ -30,6 +30,7 @@ fn documented_defaults_survive_the_final_catalog_merge() {
         ("gemini/gemini-3-flash-preview", "high"),
         ("openai/gpt-6-astra", "medium"),
         ("openai/gpt-6-sol", "medium"),
+        ("openai/gpt-6.1-terra", "medium"),
         ("openai/gpt-6-luna", "medium"),
         ("openai/gpt-5.6", "medium"),
         ("openai/gpt-5.6-sol", "medium"),
