@@ -14,6 +14,7 @@ fn new_frontier_models_have_verified_pricing_and_legacy_specs() {
     let catalog = Catalog::vendored();
     for (identifier, short_input, short_output, long_input, long_output) in [
         ("openai/gpt-6-sol", 2.0, 10.0, 4.0, 15.0),
+        ("openai/gpt-6.1-terra", 1.0, 5.0, 2.0, 7.5),
         ("openai/gpt-6-luna", 0.1, 0.5, 0.2, 0.75),
     ] {
         let model = catalog.resolve(identifier).unwrap();

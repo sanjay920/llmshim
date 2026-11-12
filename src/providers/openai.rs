@@ -290,7 +290,7 @@ fn is_gpt_5_6(model: &str) -> bool {
 fn is_gpt_6_model(model: &str) -> bool {
     matches!(
         model,
-        "gpt-6-astra" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6-luna"
+        "gpt-6-astra" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-luna"
     )
 }
 
@@ -320,7 +320,7 @@ fn clamp_reasoning_effort<'a>(model: &str, effort: &'a str) -> &'a str {
             other => other,
         }
     } else if is_gpt_5_6(model) || is_gpt_6_model(model) {
-        // GPT-5.6 and GPT-6 Sol/Luna accept max and none, but reject minimal.
+        // GPT-5.6 and GPT-6 Sol/Terra/Luna accept max and none, but reject minimal.
         match effort {
             "minimal" => "low",
             other => other,

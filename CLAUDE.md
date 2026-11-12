@@ -12,7 +12,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 
 ## Advertised models
 
-- **OpenAI:** `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`
+- **OpenAI:** `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-terra`, `gpt-6-luna`
 - **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and `chatgpt/gpt-6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
 - **Anthropic:** `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`
 - **Gemini:** `gemini-4-carbon`, `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite`
@@ -159,7 +159,7 @@ repair remain a separate concern. See `docs/src/guides/schemas.md`.
 
 `src/models.rs::MODELS` is the single advertised list, imported directly by
 `src/main.rs` and used by `available_models()` for proxy discovery. Keep the
-current model in each retained tier: three OpenAI, four Anthropic, three stable
+current model in each retained tier: four OpenAI, four Anthropic, three stable
 Gemini, one xAI, and three ChatGPT routes. Do not add previews or bring back
 superseded generations without an explicit catalog decision.
 

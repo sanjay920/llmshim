@@ -30,6 +30,7 @@ async fn new_frontier_models_complete_and_stream() {
     let router = Router::from_env_without_catalog_refresh();
     for model in [
         "openai/gpt-6-sol",
+        "openai/gpt-6.1-terra",
         "openai/gpt-6-luna",
         "anthropic/claude-opus-5-5",
         "anthropic/claude-sonnet-5-5",
@@ -145,6 +146,7 @@ async fn current_frontier_models_work_on_real_proxy_routes() {
         .collect();
     for model in [
         "openai/gpt-6-sol",
+        "openai/gpt-6.1-terra",
         "openai/gpt-6-luna",
         "anthropic/claude-opus-5-5",
         "anthropic/claude-sonnet-5-5",
@@ -168,6 +170,7 @@ async fn current_frontier_models_work_on_real_proxy_routes() {
     }
     for model in [
         "openai/gpt-6-sol",
+        "openai/gpt-6.1-terra",
         "openai/gpt-6-luna",
         "anthropic/claude-opus-5-5",
         "anthropic/claude-sonnet-5-5",

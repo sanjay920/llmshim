@@ -50,6 +50,7 @@ are stable releases only. Credentials determine which providers are listed.
 |---|---|
 | `openai/gpt-6-astra` | GPT-6 Astra |
 | `openai/gpt-6-sol` | GPT-6 Sol |
+| `openai/gpt-6.1-terra` | GPT-6.1 Terra |
 | `openai/gpt-6-luna` | GPT-6 Luna |
 
 ### Anthropic
