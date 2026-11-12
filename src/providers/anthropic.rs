@@ -28,7 +28,11 @@ impl Anthropic {
     /// Models whose native `refusal` stop reason is a content filter rather
     /// than an unsupported terminal status.
     fn refusal_is_content_filter(model: &str) -> bool {
-        constraints::is_fable(model) || matches!(model, "claude-opus-5" | "claude-opus-5-5")
+        constraints::is_fable(model)
+            || matches!(
+                model,
+                "claude-opus-5" | "claude-opus-5-5" | "claude-haiku-5-5"
+            )
     }
 
     /// Models that support the 1M context window beta.
