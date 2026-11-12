@@ -957,3 +957,19 @@ fn request_strips_foreign_reasoning_signature() {
     assert!(!body.contains("redacted-should-not-leak"));
     assert!(!body.contains("reasoning_signature"));
 }
+
+#[test]
+fn gpt_6_1_sol_api_clamps_none_to_low_but_keeps_max_and_pro() {
+    // The API rejects "none" for gpt-6.1-sol (verified live 2026-11-11).
+    let keyed = provider();
+    for (requested, expected) in [("none", "low"), ("minimal", "low"), ("max", "max")] {
+        let request = json!({"messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": requested});
+        let native = keyed.transform_request("gpt-6.1-sol", &request).unwrap();
+        assert_eq!(native.body["reasoning"]["effort"], expected);
+    }
+    let request = json!({"messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high", "reasoning_mode": "pro"});
+    let native = keyed.transform_request("gpt-6.1-sol", &request).unwrap();
+    assert_eq!(native.body["reasoning"]["mode"], "pro");
+}

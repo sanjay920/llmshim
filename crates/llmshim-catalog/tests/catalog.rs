@@ -14,6 +14,7 @@ fn new_frontier_models_have_verified_pricing_and_legacy_specs() {
     let catalog = Catalog::vendored();
     for (identifier, short_input, short_output, long_input, long_output) in [
         ("openai/gpt-6-sol", 2.0, 10.0, 4.0, 15.0),
+        ("openai/gpt-6.1-sol", 2.0, 10.0, 4.0, 15.0),
         ("openai/gpt-6.1-terra", 1.0, 5.0, 2.0, 7.5),
         ("openai/gpt-6-luna", 0.1, 0.5, 0.2, 0.75),
     ] {
@@ -408,7 +409,7 @@ fn vendored_artifact_has_broad_coverage_without_changing_discovery() {
     let providers: std::collections::BTreeSet<_> = c.models().map(|m| &m.provider).collect();
     assert!(providers.len() >= 200);
     assert!(c.models().count() >= 7000);
-    assert_eq!(llmshim_catalog::builtin::MODELS.len(), 18);
+    assert_eq!(llmshim_catalog::builtin::MODELS.len(), 19);
     assert_eq!(llmshim_catalog::builtin::CHATGPT_MODELS.len(), 4);
     assert_eq!(c.resolve("gpt-6-astra").unwrap().provider, "openai");
     assert!(llmshim_catalog::builtin::all().all(|m| m.family.is_some()));
