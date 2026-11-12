@@ -159,7 +159,7 @@ repair remain a separate concern. See `docs/src/guides/schemas.md`.
 
 `src/models.rs::MODELS` is the single advertised list, imported directly by
 `src/main.rs` and used by `available_models()` for proxy discovery. Keep the
-- **OpenAI:** `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-luna`
+current model in each retained tier: five OpenAI, four Anthropic, three stable
 Gemini, one xAI, and three ChatGPT routes. Do not add previews or bring back
 superseded generations without an explicit catalog decision.
 
