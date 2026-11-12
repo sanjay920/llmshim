@@ -571,3 +571,15 @@ fn haiku_5_5_prices_follow_the_published_context_tiers() {
     assert_eq!((long.input, long.output), (Some(0.5), Some(2.5)));
     assert_eq!(long.cache_read, Some(0.05));
 }
+
+#[test]
+fn gemini_4_carbon_is_priced_at_the_published_rates() {
+    let catalog = Catalog::vendored();
+    let cost = catalog
+        .resolve("gemini/gemini-4-carbon")
+        .unwrap()
+        .cost
+        .unwrap();
+    assert_eq!((cost.input, cost.output), (Some(2.0), Some(10.0)));
+    assert_eq!(cost.cache_read, Some(0.1));
+}
