@@ -30,7 +30,9 @@ rpm = 3000
 tpm = 2000000
 
 # Callers. Either reference the bearer token, or give only its SHA-256 so the
-# deployment holds no caller secret.
+# deployment holds no caller secret. Generate a token and its digest with:
+#   openssl rand -hex 32 | tee token.txt | tr -d '\n' | shasum -a 256
+# The digest below is of random bytes; replace it with your own.
 [[keys]]
 name = "checkout-service"
 tenant = "payments"
@@ -43,7 +45,7 @@ budget_window_secs = 86400
 [[keys]]
 name = "batch-jobs"
 tenant = "analytics"
-sha256 = "9f86d081884c7d659a2feae0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+sha256 = "87ef19fa6c094740371b20b400a8ebb1c3df48a413957f0bb3df39ba245337ba"
 
 [routes.summarize]
 model = "anthropic/claude-haiku-5-5"

@@ -665,6 +665,22 @@ Keep README measurements dated, name the actual models/host/build/workload, and
 separate API latency, full-transform CPU time, and RSS. Do not mix fresh Rust
 figures with old Python results or claim unmeasured network-only latency shares.
 
+## In development: `serve` (enterprise gateway)
+
+The default-off `serve` feature (`serve = ["gateway"]`, implied by nothing) holds
+the config-file-driven server being built toward an enterprise gateway. Read
+`docs/design/enterprise-gateway/README.md` first: it has the working rules and
+the roadmap checklist, and each contract has a numbered design note there.
+Today only `llmshim serve --config <file> --check` exists (`src/serve/config.rs`):
+a versioned TOML/JSON file, unknown fields rejected, secrets by reference only
+and never echoed, unauthenticated serving explicit. The feature is **unstable
+and outside the semver rule** until declared stable. Default, `proxy`,
+`gateway` and `gateway-redis` builds must not change; `tests/unit_serve_cli.rs`
+pins that a build without the feature does not know the command. Never drive
+`from_env` constructors by setting environment variables, and never call
+`process::exit` below `main` on this path. The `Serve feature` CI job builds and
+tests it on every PR; the release gate does not.
+
 ## Optional Bedrock transport
 
 The default-off `bedrock` feature exposes `providers::bedrock::{AwsProfile, Bedrock}`.

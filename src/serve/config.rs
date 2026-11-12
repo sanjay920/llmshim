@@ -64,14 +64,45 @@ pub struct ServeConfig {
     pub version: u32,
     #[serde(default)]
     pub server: Server,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_map")]
     pub providers: BTreeMap<String, Provider>,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
     pub keys: Vec<GatewayKey>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_map")]
     pub routes: BTreeMap<String, Route>,
+}
+
+/// Read a table, refusing a repeated name. JSON parsers otherwise keep the
+/// last duplicate silently; TOML already refuses one.
+fn unique_map<'de, D, V>(deserializer: D) -> Result<BTreeMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct Reader<V>(std::marker::PhantomData<V>);
+    impl<'de, V: Deserialize<'de>> serde::de::Visitor<'de> for Reader<V> {
+        type Value = BTreeMap<String, V>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a table")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some(name) = map.next_key::<String>()? {
+                if out.contains_key(&name) {
+                    return Err(serde::de::Error::custom(format!("duplicate name `{name}`")));
+                }
+                let value = map.next_value()?;
+                out.insert(name, value);
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_map(Reader(std::marker::PhantomData))
 }
 
 /// Listener and authentication posture.
@@ -220,7 +251,7 @@ pub struct Limits {
     /// Tokens per minute for every provider without its own entry.
     #[serde(default)]
     pub tpm: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_map")]
     pub providers: BTreeMap<String, ProviderLimits>,
 }
 
@@ -274,7 +305,7 @@ pub struct GatewayKey {
 pub struct Route {
     pub model: String,
     /// Request settings applied when the request does not set them itself.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "unique_map")]
     pub settings: BTreeMap<String, serde_json::Value>,
 }
 
@@ -420,6 +451,12 @@ impl ServeConfig {
         let mut names = BTreeSet::new();
         let mut digests = BTreeSet::new();
         let mut references = BTreeSet::new();
+        let upstream: BTreeSet<String> = self
+            .providers
+            .values()
+            .filter_map(|provider| provider.api_key.as_ref())
+            .map(|secret| format!("{secret:?}"))
+            .collect();
         for (index, key) in self.keys.iter().enumerate() {
             let at = format!("keys[{index}]");
             if !valid_name(&key.name) {
@@ -430,8 +467,8 @@ impl ServeConfig {
                     "duplicates another key's name",
                 ));
             }
-            if key.tenant.trim().is_empty() {
-                issues.push(Issue::new(format!("{at}.tenant"), "must not be empty"));
+            if !valid_tenant(&key.tenant) {
+                issues.push(Issue::new(format!("{at}.tenant"), TENANT_RULE));
             }
             match (&key.secret, &key.sha256) {
                 (Some(_), Some(_)) => {
@@ -440,6 +477,12 @@ impl ServeConfig {
                 (None, None) => issues.push(Issue::new(&at, "set secret or sha256")),
                 (Some(secret), None) => {
                     validate_secret(secret, &format!("{at}.secret"), issues);
+                    if upstream.contains(&format!("{secret:?}")) {
+                        issues.push(Issue::new(
+                            format!("{at}.secret"),
+                            "refers to a provider's api_key; a caller key must be a different secret",
+                        ));
+                    }
                     if !references.insert(format!("{secret:?}")) {
                         issues.push(Issue::new(
                             format!("{at}.secret"),
@@ -504,6 +547,21 @@ impl ServeConfig {
                     format!("{at}.model"),
                     "routes do not chain; name a provider model",
                 ));
+            } else {
+                match model.split_once('/') {
+                    Some((provider, name))
+                        if self.providers.contains_key(provider) && !name.is_empty() => {}
+                    Some((provider, _)) if !self.providers.contains_key(provider) => {
+                        issues.push(Issue::new(
+                            format!("{at}.model"),
+                            format!("no provider named \"{provider}\" is defined"),
+                        ))
+                    }
+                    _ => issues.push(Issue::new(
+                        format!("{at}.model"),
+                        "must be written as <provider>/<model>",
+                    )),
+                }
             }
             if route.settings.contains_key("model") {
                 issues.push(Issue::new(
@@ -535,6 +593,39 @@ impl ServeConfig {
     /// caller (or a test) decides what the environment is.
     pub fn check_references(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<Issue> {
         let mut issues = Vec::new();
+        let read = |secret: &SecretRef| -> Option<String> {
+            let value = match (&secret.env, &secret.file) {
+                (Some(name), _) => env(name)?,
+                (None, Some(path)) => std::fs::read_to_string(path).ok()?,
+                (None, None) => return None,
+            };
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        };
+        // Two references can name the same value. A caller token equal to an
+        // upstream key would make that upstream key a valid bearer token.
+        let upstream: Vec<String> = self
+            .providers
+            .values()
+            .filter_map(|provider| provider.api_key.as_ref())
+            .filter_map(read)
+            .collect();
+        let mut callers = BTreeSet::new();
+        for (index, key) in self.keys.iter().enumerate() {
+            let Some(value) = key.secret.as_ref().and_then(read) else {
+                continue;
+            };
+            let at = format!("keys[{index}].secret");
+            if upstream.contains(&value) {
+                issues.push(Issue::new(
+                    &at,
+                    "has the same value as a provider's api_key",
+                ));
+            }
+            if !callers.insert(value) {
+                issues.push(Issue::new(&at, "has the same value as another caller key"));
+            }
+        }
         for (at, secret) in self.secret_refs() {
             if let Some(name) = &secret.env {
                 match env(name) {
@@ -582,23 +673,42 @@ fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
 }
 
+const TENANT_RULE: &str = "tenants use 1 to 64 letters, digits, '-', '_' or '.'";
+
+/// Tenants become parts of ledger keys and metric labels, so separators such
+/// as ':' and whitespace are not allowed.
+fn valid_tenant(tenant: &str) -> bool {
+    (1..=64).contains(&tenant.len())
+        && tenant
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 fn validate_secret(secret: &SecretRef, at: &str, issues: &mut Vec<Issue>) {
     match (&secret.env, &secret.file) {
         (Some(_), Some(_)) => issues.push(Issue::new(at, "set either env or file, not both")),
         (None, None) => issues.push(Issue::new(at, "set env or file")),
         (Some(name), None) => {
+            // Upper-case only: a token pasted here by mistake almost always
+            // has a lower-case letter or punctuation, and is then refused
+            // without being printed.
             let valid = !name.is_empty()
+                && name.len() <= 128
                 && !name.as_bytes()[0].is_ascii_digit()
-                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
             if !valid {
                 issues.push(Issue::new(
                     format!("{at}.env"),
-                    "must be an environment variable name (letters, digits, '_')",
+                    "must be an environment variable name: upper-case letters, digits and '_'",
                 ));
             }
         }
         (None, Some(path)) => {
-            if !path.is_absolute() {
+            // `has_root` rather than `is_absolute`, so a Unix-style path in a
+            // shared file is judged the same on every platform.
+            if !path.has_root() {
                 issues.push(Issue::new(format!("{at}.file"), "must be an absolute path"));
             }
         }
@@ -779,6 +889,8 @@ mod tests {
             budget_usd = -1.0
             [routes.loop]
             model = "route/other"
+            [routes.orphan]
+            model = "nowhere/model"
             [routes.empty]
             model = ""
             "#,
@@ -803,10 +915,67 @@ mod tests {
             "keys[2]",
             "keys[2].budget_usd",
             "routes.loop.model",
+            "routes.orphan.model",
             "routes.empty.model",
         ] {
             assert!(has(&found, path), "missing {path} in {found:#?}");
         }
+    }
+
+    #[test]
+    fn json_duplicate_names_are_refused_instead_of_last_one_winning() {
+        let json = r#"{"version":1,"server":{"allow_unauthenticated":true},
+            "providers":{"openai":{"kind":"openai","api_key":{"env":"A"}},
+                         "openai":{"kind":"anthropic","api_key":{"env":"B"}}}}"#;
+        let found = ServeConfig::parse(json, Format::Json).unwrap_err();
+        assert!(
+            found[0].message.contains("duplicate name `openai`"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn routes_must_name_a_defined_provider() {
+        for (model, ok) in [
+            ("openai/gpt-6-luna", true),
+            ("openai/vendor/model", true),
+            ("gpt-6-luna", false),
+            ("missing/gpt-6-luna", false),
+            ("openai/", false),
+        ] {
+            let text = format!("{MINIMAL}\n[routes.r]\nmodel = \"{model}\"");
+            assert_eq!(
+                ServeConfig::parse(&text, Format::Toml).is_ok(),
+                ok,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_caller_key_cannot_be_an_upstream_key() {
+        let same_reference = MINIMAL.replace("CI_GATEWAY_KEY", "OPENAI_API_KEY");
+        assert!(has(&issues(&same_reference), "keys[0].secret"));
+        let config = ServeConfig::parse(MINIMAL, Format::Toml).unwrap();
+        let same_value = |_: &str| Some("identical-value".to_string());
+        let found = config.check_references(&same_value);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "keys[0].secret");
+        assert!(!found[0].message.contains("identical-value"));
+    }
+
+    #[test]
+    fn tenants_and_variable_names_are_restricted() {
+        for tenant in ["a:b", "has space", "", "tenant/x"] {
+            let text = MINIMAL.replace("tenant = \"platform\"", &format!("tenant = \"{tenant}\""));
+            assert!(has(&issues(&text), "keys[0].tenant"), "{tenant}");
+        }
+        assert!(
+            ServeConfig::parse(&MINIMAL.replace("platform", "Team.A-1_x"), Format::Toml).is_ok()
+        );
+        let pasted = MINIMAL.replace("OPENAI_API_KEY", "sk_live_AbCdEf123");
+        let found = issues(&pasted);
+        assert!(has(&found, "providers.openai.api_key.env"), "{found:?}");
     }
 
     #[test]
