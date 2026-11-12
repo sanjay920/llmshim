@@ -76,3 +76,24 @@ fn spec_and_price_are_published() {
     assert_eq!(spec.context_window_tokens, Some(1_000_000));
     assert_eq!(spec.max_output_tokens, Some(128_000));
 }
+
+#[test]
+fn refusal_is_a_content_filter_finish_reason() {
+    let result = provider()
+        .transform_response(
+            "claude-haiku-5-5",
+            json!({"content": [{"type": "text", "text": "Declined"}],
+                "stop_reason": "refusal", "usage": {"input_tokens": 5, "output_tokens": 1}}),
+        )
+        .unwrap();
+    assert_eq!(result["choices"][0]["finish_reason"], "content_filter");
+    let chunk = provider()
+        .transform_stream_chunk(
+            "claude-haiku-5-5",
+            &json!({"type": "message_delta", "delta": {"stop_reason": "refusal"}}).to_string(),
+        )
+        .unwrap()
+        .unwrap();
+    let chunk: serde_json::Value = serde_json::from_str(&chunk).unwrap();
+    assert_eq!(chunk["choices"][0]["finish_reason"], "content_filter");
+}
