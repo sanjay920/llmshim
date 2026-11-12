@@ -3,8 +3,9 @@
 //! Anthropic records the producing model on every thinking block. Opus 5.5 and
 //! Sonnet 5.5 both bind thinking to the conversation prefix, but their
 //! documented readers differ, so family-level eligibility is not enough.
-//! Opus 5.5 blocks replay to Opus 5.5, Fable 5.1, and Mythos 5.1; Sonnet 5.5
-//! blocks replay only to Sonnet 5.5. Sonnet 5.5 itself reads Sonnet 5,
+//! Opus 5.5 blocks replay to Opus 5.5, Fable 5.1/5.2, and Mythos 5.1/5.2;
+//! Sonnet 5.5 blocks replay to Sonnet 5.5 and Fable/Mythos 5.2; Fable 5.2
+//! blocks replay only to Fable 5.2 and Mythos 5.2. Sonnet 5.5 itself reads Sonnet 5,
 //! Opus 4.8, Haiku 4.5, and earlier — never Opus 5, Opus 5.5, or a Fable/Mythos
 //! model. A source or target with no binding rule here keeps the family-level
 //! eligibility decided by the caller.
@@ -14,18 +15,32 @@ pub(crate) fn reader_allows(source_model: &str, target_model: &str) -> bool {
     let opus_55_source_ok = source_model != "claude-opus-5-5"
         || matches!(
             target_model,
-            "claude-opus-5-5" | "claude-fable-5-1" | "claude-mythos-5-1"
+            "claude-opus-5-5"
+                | "claude-fable-5-1"
+                | "claude-mythos-5-1"
+                | "claude-fable-5-2"
+                | "claude-mythos-5-2"
         );
     let opus_55_target_ok = target_model != "claude-opus-5-5"
         || !(source_model.starts_with("claude-fable") || source_model.starts_with("claude-mythos"));
-    let sonnet_55_source_ok =
-        source_model != "claude-sonnet-5-5" || target_model == "claude-sonnet-5-5";
+    let sonnet_55_source_ok = source_model != "claude-sonnet-5-5"
+        || matches!(
+            target_model,
+            "claude-sonnet-5-5" | "claude-fable-5-2" | "claude-mythos-5-2"
+        );
+    // Only Fable 5.2 and Mythos 5.2 read Fable 5.2 thinking.
+    let fable_52_source_ok = source_model != "claude-fable-5-2"
+        || matches!(target_model, "claude-fable-5-2" | "claude-mythos-5-2");
     let sonnet_55_target_ok = target_model != "claude-sonnet-5-5"
         || !(source_model.starts_with("claude-fable")
             || source_model.starts_with("claude-mythos")
             || source_model == "claude-opus-5"
             || source_model == "claude-opus-5-5");
-    opus_55_source_ok && opus_55_target_ok && sonnet_55_source_ok && sonnet_55_target_ok
+    opus_55_source_ok
+        && opus_55_target_ok
+        && sonnet_55_source_ok
+        && sonnet_55_target_ok
+        && fable_52_source_ok
 }
 
 #[cfg(test)]
@@ -67,6 +82,39 @@ mod tests {
             assert!(
                 !reader_allows(source, "claude-sonnet-5-5"),
                 "Sonnet 5.5 read {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn fable_5_2_blocks_reach_only_fable_and_mythos_5_2() {
+        assert!(reader_allows("claude-fable-5-2", "claude-fable-5-2"));
+        assert!(reader_allows("claude-fable-5-2", "claude-mythos-5-2"));
+        for target in [
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-opus-4-8",
+        ] {
+            assert!(
+                !reader_allows("claude-fable-5-2", target),
+                "Fable 5.2 blocks reached {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn fable_5_2_reads_earlier_fable_opus_5_5_and_sonnet_5_5() {
+        for source in [
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ] {
+            assert!(
+                reader_allows(source, "claude-fable-5-2"),
+                "Fable 5.2 refused {source}"
             );
         }
     }

@@ -160,7 +160,7 @@ on the three advertised GPT-6 models. See the
 
 Adaptive models use `thinking: {type}` plus `output_config: {effort}`:
 
-| unified | Fable 5.1 / Opus 5.5 / Sonnet 5.5 | Opus 5 / Sonnet 5 |
+| unified | Fable 5.1–5.2 / Opus 5.5 / Sonnet 5.5 | Opus 5 / Sonnet 5 |
 |---|---|---|
 | `none` | `adaptive` + **`low`** | `thinking: {type: "disabled"}` |
 | `low` | `adaptive` + `low` | `adaptive` + `low` |
@@ -170,11 +170,11 @@ Adaptive models use `thinking: {type}` plus `output_config: {effort}`:
 | `max` | `adaptive` + `max` | `adaptive` + `max` |
 
 On models that can disable thinking, `reasoning_effort: "none"` maps to disabled
-thinking. Fable 5.1, Opus 5.5, and Sonnet 5.5 always use adaptive thinking, so
+thinking. Fable 5.1, Fable 5.2, Opus 5.5, and Sonnet 5.5 always use adaptive thinking, so
 `none` maps to `low`. Explicit native disabled/manual thinking is rejected
 locally for those models, as is forced tool choice. Opus 5.5 thinking blocks
-replay to Fable 5.1, while older Opus models cannot consume them. Sonnet 5.5
-blocks replay only to Sonnet 5.5, and Sonnet 5.5 reads thinking from Sonnet 5,
+replay to Fable 5.1 and 5.2, while older Opus models cannot consume them.
+Sonnet 5.5 blocks replay to Sonnet 5.5 and Fable/Mythos 5.2, and Sonnet 5.5 reads thinking from Sonnet 5,
 Opus 4.8, Haiku 4.5, and earlier, but not from Opus 5, Opus 5.5, or a
 Fable/Mythos model. Opus 5.5 and Sonnet 5.5 omit `temperature`, `top_p`, and
 `top_k`, as do Fable and Opus 5. See the
@@ -182,8 +182,11 @@ Fable/Mythos model. Opus 5.5 and Sonnet 5.5 omit `temperature`, `top_p`, and
 and the
 [Sonnet 5.5 model page](https://platform.claude.com/docs/en/models/sonnet-5-5/overview).
 
+Fable 5.2 thinking blocks replay only to Fable 5.2 and Mythos 5.2 (it reads
+thinking from Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5 and earlier).
+
 Fable behavior and its five effort levels follow Anthropic's
-[migration guide](https://platform.claude.com/docs/en/models/fable-5-1/migration-guide)
+[migration guide](https://platform.claude.com/docs/en/models/fable-5-2/migration-guide)
 and Models API. The low-effort and rejected-parameter paths are also checked
 against the live API in this repository.
 

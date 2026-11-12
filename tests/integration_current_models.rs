@@ -12,7 +12,7 @@ async fn current_models_completion_and_streaming() {
         "gemini/gemini-3.8-flash",
         "anthropic/claude-opus-5",
         "anthropic/claude-fable-5",
-        "anthropic/claude-fable-5-1",
+        "anthropic/claude-fable-5-2",
         "xai/grok-4.7",
     ] {
         let input = json!({"model": model, "messages": [{"role": "user", "content": "Reply with only pong."}],
@@ -46,16 +46,20 @@ async fn current_models_completion_and_streaming() {
 async fn fable_tool_roundtrips_and_history_binding() {
     llmshim::env::load_all();
     let router = llmshim::router::Router::from_env();
-    for model in ["anthropic/claude-fable-5", "anthropic/claude-fable-5-1"] {
+    for model in [
+        "anthropic/claude-fable-5",
+        "anthropic/claude-fable-5-1",
+        "anthropic/claude-fable-5-2",
+    ] {
         let mut input = json!({"model": model, "max_tokens": 2048,
             "messages": [{"role": "system", "content": "Use the weather tool when asked about weather. Reply briefly."},
                 {"role": "user", "content": "Call lookup_weather for Paris. After receiving the result, repeat the condition."}],
             "tools": [{"type": "function", "function": {"name": "lookup_weather", "description": "Look up weather for a city.",
                 "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"], "additionalProperties": false}}}],
-            "tool_choice": if model.ends_with("5-1") { "auto" } else { "required" },
+            "tool_choice": if !model.ends_with("fable-5") { "auto" } else { "required" },
             "reasoning_effort": "low"
         });
-        if model.ends_with("5-1") {
+        if !model.ends_with("fable-5") {
             input["messages"][1]["content"] = json!("Work out whether 1739 times 2843 is divisible by 7, then call lookup_weather for Paris. After receiving the tool result, reply with the weather condition only.");
             input["x-anthropic"] = json!({
                 "thinking": {"type": "adaptive", "display": "summarized", "block_binding": {"prefix_mismatch_behavior": "error"}},
@@ -71,7 +75,7 @@ async fn fable_tool_roundtrips_and_history_binding() {
                 ["city"],
             "Paris"
         );
-        if model.ends_with("5-1") {
+        if !model.ends_with("fable-5") {
             assert!(
                 assistant["reasoning"][0]["signature"]
                     .as_str()
@@ -89,7 +93,7 @@ async fn fable_tool_roundtrips_and_history_binding() {
             .unwrap()
             .push(json!({"role": "tool", "tool_call_id": call["id"], "content": "Sunny"}));
         input["tool_choice"] = json!("none");
-        if model.ends_with("5-1") {
+        if !model.ends_with("fable-5") {
             input["messages"].as_array_mut().unwrap().push(json!({"role": "system", "content": "For this turn, reply with only the weather condition."}));
         }
         let reply = llmshim::completion(&router, &input).await.unwrap();
@@ -99,7 +103,7 @@ async fn fable_tool_roundtrips_and_history_binding() {
             .to_lowercase()
             .contains("sunny"));
         println!("PASS {model} tool-result round trip");
-        if model.ends_with("5-1") {
+        if !model.ends_with("fable-5") {
             input["messages"][0]["content"] =
                 json!("Changed initial instructions, invalidating signed thinking.");
             let error = llmshim::completion(&router, &input).await.unwrap_err();
@@ -150,7 +154,7 @@ async fn current_models_proxy_routes() {
         "gemini/gemini-3.8-flash",
         "anthropic/claude-opus-5",
         "anthropic/claude-fable-5",
-        "anthropic/claude-fable-5-1",
+        "anthropic/claude-fable-5-2",
         "xai/grok-4.7",
     ] {
         let advertised = catalog["models"]

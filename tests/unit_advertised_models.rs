@@ -4,7 +4,7 @@ const EXPECTED: &[&str] = &[
     "openai/gpt-6-astra",
     "openai/gpt-6-sol",
     "openai/gpt-6-luna",
-    "anthropic/claude-fable-5-1",
+    "anthropic/claude-fable-5-2",
     "anthropic/claude-opus-5-5",
     "anthropic/claude-sonnet-5-5",
     "anthropic/claude-haiku-4-5-20251001",
