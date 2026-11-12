@@ -221,13 +221,14 @@ pub const MODELS: &[BuiltinModelInfo] = &[
         capabilities: CAPS_FULL.with_forced_tool_choice(Support::Unsupported),
     },
     BuiltinModelInfo {
-        id: "anthropic/claude-haiku-4-5-20251001",
+        id: "anthropic/claude-haiku-5-5",
         provider: "anthropic",
         family: Some(ModelFamily::Claude),
-        name: "claude-haiku-4-5-20251001",
-        label: "Claude Haiku 4.5",
-        context_window_tokens: Some(200_000),
-        max_output_tokens: Some(64_000),
+        name: "claude-haiku-5-5",
+        label: "Claude Haiku 5.5",
+        // Anthropic model docs, verified 2026-11-11 (released 2026-10-07).
+        context_window_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
         capabilities: CAPS_FULL,
     },
     BuiltinModelInfo {
@@ -483,6 +484,16 @@ const LEGACY_MODELS: &[BuiltinModelInfo] = &[
         context_window_tokens: Some(1_000_000),
         max_output_tokens: Some(128_000),
         capabilities: CAPS_FULL.with_forced_tool_choice(Support::Unsupported),
+    },
+    BuiltinModelInfo {
+        id: "anthropic/claude-haiku-4-5-20251001",
+        provider: "anthropic",
+        family: Some(ModelFamily::Claude),
+        name: "claude-haiku-4-5-20251001",
+        label: "Claude Haiku 4.5",
+        context_window_tokens: Some(200_000),
+        max_output_tokens: Some(64_000),
+        capabilities: CAPS_FULL,
     },
     BuiltinModelInfo {
         id: "anthropic/claude-fable-5",

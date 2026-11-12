@@ -7,7 +7,7 @@ const EXPECTED: &[&str] = &[
     "anthropic/claude-fable-5-2",
     "anthropic/claude-opus-5-5",
     "anthropic/claude-sonnet-5-5",
-    "anthropic/claude-haiku-4-5-20251001",
+    "anthropic/claude-haiku-5-5",
     "gemini/gemini-4-argon",
     "gemini/gemini-3.8-flash",
     "gemini/gemini-3.5-flash-lite",

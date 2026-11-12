@@ -14,7 +14,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 
 - **OpenAI:** `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`
 - **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and `chatgpt/gpt-6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
-- **Anthropic:** `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5-20251001`
+- **Anthropic:** `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`
 - **Gemini:** `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite`
 - **xAI:** `grok-4.7`
 - **Cerebras:** `cerebras/qwen-3.8-27b` (bare name also accepted); native controls under `x-cerebras`.
