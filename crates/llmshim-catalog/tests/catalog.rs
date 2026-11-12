@@ -45,7 +45,7 @@ fn new_frontier_models_have_verified_pricing_and_legacy_specs() {
     assert_eq!(opus.cost.unwrap().input, Some(4.0));
     assert_eq!(opus.cost.unwrap().output, Some(20.0));
     assert_eq!(opus.cost.unwrap().cache_read, Some(0.2));
-    assert_eq!(opus.cost.unwrap().cache_write, Some(8.0));
+    assert_eq!(opus.cost.unwrap().cache_write, Some(5.0));
     assert_eq!(opus.capabilities.forced_tool_choice, Support::Unsupported);
     assert!(llmshim_catalog::builtin::spec("claude-opus-5").is_some());
     assert!(!llmshim_catalog::builtin::MODELS
@@ -58,8 +58,8 @@ fn new_frontier_models_have_verified_pricing_and_legacy_specs() {
     assert_eq!(sonnet.max_output_tokens, Some(128_000));
     assert_eq!(sonnet.cost.unwrap().input, Some(2.0));
     assert_eq!(sonnet.cost.unwrap().output, Some(10.0));
-    assert_eq!(sonnet.cost.unwrap().cache_read, Some(0.2));
-    assert_eq!(sonnet.cost.unwrap().cache_write, Some(4.0));
+    assert_eq!(sonnet.cost.unwrap().cache_read, Some(0.1));
+    assert_eq!(sonnet.cost.unwrap().cache_write, Some(2.5));
     assert_eq!(sonnet.capabilities.forced_tool_choice, Support::Unsupported);
     assert_eq!(sonnet.release_date.unwrap().to_string(), "2026-09-28");
     assert_eq!(sonnet.field_sources["cost.input"], CatalogSource::Builtin);
@@ -584,4 +584,26 @@ fn gemini_4_carbon_is_priced_at_the_published_rates() {
         .unwrap();
     assert_eq!((cost.input, cost.output), (Some(2.0), Some(10.0)));
     assert_eq!(cost.cache_read, Some(0.1));
+}
+
+#[test]
+fn anthropic_5_5_cache_rates_match_the_published_table() {
+    let catalog = Catalog::vendored();
+    let sonnet = catalog
+        .resolve("anthropic/claude-sonnet-5-5")
+        .unwrap()
+        .cost
+        .unwrap();
+    assert_eq!((sonnet.input, sonnet.output), (Some(2.0), Some(10.0)));
+    assert_eq!(
+        (sonnet.cache_read, sonnet.cache_write),
+        (Some(0.1), Some(2.5))
+    );
+    let argon = catalog
+        .resolve("gemini/gemini-4-argon")
+        .unwrap()
+        .cost
+        .unwrap();
+    assert_eq!((argon.input, argon.output), (Some(2.0), Some(10.0)));
+    assert_eq!(argon.cache_read, Some(0.1));
 }
