@@ -180,6 +180,17 @@ pub const MODELS: &[BuiltinModelInfo] = &[
         capabilities: CAPS_STD,
     },
     BuiltinModelInfo {
+        id: "openai/gpt-6.1-sol",
+        provider: "openai",
+        family: Some(ModelFamily::Gpt),
+        name: "gpt-6.1-sol",
+        label: "GPT-6.1 Sol",
+        // OpenAI model page, verified 2026-11-11.
+        context_window_tokens: Some(1_050_000),
+        max_output_tokens: Some(128_000),
+        capabilities: CAPS_STD,
+    },
+    BuiltinModelInfo {
         id: "openai/gpt-6.1-terra",
         provider: "openai",
         family: Some(ModelFamily::Gpt),

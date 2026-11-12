@@ -809,7 +809,13 @@ impl OpenAi {
         if let Some(effort) = effort {
             // Clamp efforts the target model would reject up to its nearest
             // accepted tier (per-family rules in clamp_reasoning_effort).
-            let effort = clamp_reasoning_effort(model, effort);
+            let mut effort = clamp_reasoning_effort(model, effort);
+            // GPT-6.1 Sol rejects "none" on the API (verified live 2026-11-11).
+            // The ChatGPT subscription backend accepts it, and its translator
+            // is built without an API key, so only keyed requests clamp.
+            if model == "gpt-6.1-sol" && effort == "none" && !self.api_key.is_empty() {
+                effort = "low";
+            }
             let mut reasoning = json!({
                 "effort": effort,
                 "summary": "auto",
