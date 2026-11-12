@@ -1,0 +1,24 @@
+name: Serve feature
+
+# The `serve` feature is off by default and in development, so the release
+# gate does not build it. This keeps it compiling and tested on every PR.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  serve-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --features serve -- -D warnings
+      - name: Tests
+        env:
+          LLMSHIM_CATALOG_OFFLINE: '1'
+        run: cargo test --locked --features serve --lib --test unit_serve_cli serve

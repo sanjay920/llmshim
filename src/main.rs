@@ -782,6 +782,48 @@ async fn build_gateway_state(
     llmshim::gateway::http::GatewayState::from_env(router, logger)
 }
 
+/// Validate a server configuration file. Exit codes: 0 valid, 1 invalid,
+/// 2 valid but serving from a file is not built yet.
+#[cfg(feature = "serve")]
+fn cmd_serve(options: &cli::ServeOptions) -> i32 {
+    let path = std::path::Path::new(options.config.as_deref().unwrap_or_default());
+    let report = |issues: &[llmshim::serve::Issue]| {
+        eprintln!("{}: {} problem(s)", path.display(), issues.len());
+        for issue in issues {
+            eprintln!("  {issue}");
+        }
+    };
+    let config = match llmshim::serve::ServeConfig::load(path) {
+        Ok(config) => config,
+        Err(issues) => {
+            report(&issues);
+            return 1;
+        }
+    };
+    let missing = config.check_references(&|name| std::env::var(name).ok());
+    if !missing.is_empty() {
+        report(&missing);
+        return 1;
+    }
+    if options.check {
+        println!(
+            "{}: valid (version {}, {} provider(s), {} key(s), {} route(s))",
+            path.display(),
+            config.version,
+            config.providers.len(),
+            config.keys.len(),
+            config.routes.len()
+        );
+        return 0;
+    }
+    eprintln!(
+        "{} is valid, but serving from a configuration file is not available in this build yet. \
+         Use --check to validate, or run `llmshim gateway`.",
+        path.display()
+    );
+    2
+}
+
 // ============================================================
 // Main entrypoint — subcommand dispatch
 // ============================================================
@@ -795,6 +837,8 @@ fn print_global_usage() {
     eprintln!("Server:");
     eprintln!("  proxy                 Start HTTP proxy server (--host IP, --port PORT)");
     eprintln!("  gateway               Start priority-queue gateway (--host IP, --port PORT)");
+    #[cfg(feature = "serve")]
+    eprintln!("  serve --config PATH   Validate a server configuration (--check); in development");
     eprintln!("  docker start          Start proxy in Docker");
     eprintln!("  docker stop           Stop Docker proxy");
     eprintln!("  docker status|logs    Container status and logs");
@@ -1143,6 +1187,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(feature = "serve")]
+        "serve" => std::process::exit(cmd_serve(&options.serve)),
         "chat" => { /* fall through to chat */ }
         _ => {
             eprintln!("Unknown command: {}\n", cmd);
