@@ -21,4 +21,6 @@ jobs:
       - name: Tests
         env:
           LLMSHIM_CATALOG_OFFLINE: '1'
-        run: cargo test --locked --features serve --lib --test unit_serve_cli serve
+        run: |
+          cargo test --locked --features serve --lib serve::
+          cargo test --locked --features serve --test unit_serve_cli
