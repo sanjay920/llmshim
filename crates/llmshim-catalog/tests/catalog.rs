@@ -560,3 +560,14 @@ fn fable_5_2_is_priced_at_the_published_rates() {
     assert_eq!((cost.input, cost.output), (Some(8.0), Some(40.0)));
     assert_eq!((cost.cache_read, cost.cache_write), (Some(0.2), Some(10.0)));
 }
+
+#[test]
+fn haiku_5_5_prices_follow_the_published_context_tiers() {
+    let catalog = Catalog::vendored();
+    let model = catalog.resolve("anthropic/claude-haiku-5-5").unwrap();
+    let short = model.cost_for_input_tokens(100_000).unwrap();
+    assert_eq!((short.input, short.output), (Some(0.1), Some(0.5)));
+    let long = model.cost_for_input_tokens(100_001).unwrap();
+    assert_eq!((long.input, long.output), (Some(0.5), Some(2.5)));
+    assert_eq!(long.cache_read, Some(0.05));
+}

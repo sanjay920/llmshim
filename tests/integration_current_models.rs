@@ -13,6 +13,7 @@ async fn current_models_completion_and_streaming() {
         "anthropic/claude-opus-5",
         "anthropic/claude-fable-5",
         "anthropic/claude-fable-5-2",
+        "anthropic/claude-haiku-5-5",
         "xai/grok-4.7",
     ] {
         let input = json!({"model": model, "messages": [{"role": "user", "content": "Reply with only pong."}],
@@ -155,6 +156,7 @@ async fn current_models_proxy_routes() {
         "anthropic/claude-opus-5",
         "anthropic/claude-fable-5",
         "anthropic/claude-fable-5-2",
+        "anthropic/claude-haiku-5-5",
         "xai/grok-4.7",
     ] {
         let advertised = catalog["models"]
@@ -184,4 +186,33 @@ async fn current_models_proxy_routes() {
             .contains("pong"));
         println!("PASS {model} real HTTP proxy request (advertised: {advertised})");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires provider API keys and incurs usage charges"]
+async fn haiku_5_5_thinking_tool_roundtrip_with_appended_system_turn() {
+    llmshim::env::load_all();
+    let router = llmshim::router::Router::from_env();
+    let mut input = json!({"model": "anthropic/claude-haiku-5-5", "max_tokens": 4096,
+        "reasoning_effort": "medium", "tool_choice": "required",
+        "messages": [{"role": "system", "content": "Use tools when asked. Reply briefly."},
+            {"role": "user", "content": "Call lookup_weather for Paris, then state the condition."}],
+        "tools": [{"type": "function", "function": {"name": "lookup_weather", "description": "Look up weather for a city.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"], "additionalProperties": false}}}]});
+    let first = llmshim::completion(&router, &input).await.unwrap();
+    let assistant = first["choices"][0]["message"].clone();
+    let call = assistant["tool_calls"][0].clone();
+    assert_eq!(call["function"]["name"], "lookup_weather");
+    input["tool_choice"] = json!("auto");
+    let messages = input["messages"].as_array_mut().unwrap();
+    messages.push(assistant);
+    messages.push(json!({"role": "tool", "tool_call_id": call["id"], "content": "sunny"}));
+    messages.push(json!({"role": "developer", "content": "Answer in one word."}));
+    let second = llmshim::completion(&router, &input).await.unwrap();
+    let text = second["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .to_lowercase();
+    assert!(text.contains("sunny"), "{text}");
+    println!("PASS anthropic/claude-haiku-5-5 thinking + tool round trip");
 }
