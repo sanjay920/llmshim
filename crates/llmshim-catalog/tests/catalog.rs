@@ -407,7 +407,7 @@ fn vendored_artifact_has_broad_coverage_without_changing_discovery() {
     let providers: std::collections::BTreeSet<_> = c.models().map(|m| &m.provider).collect();
     assert!(providers.len() >= 200);
     assert!(c.models().count() >= 7000);
-    assert_eq!(llmshim_catalog::builtin::MODELS.len(), 16);
+    assert_eq!(llmshim_catalog::builtin::MODELS.len(), 17);
     assert_eq!(llmshim_catalog::builtin::CHATGPT_MODELS.len(), 4);
     assert_eq!(c.resolve("gpt-6-astra").unwrap().provider, "openai");
     assert!(llmshim_catalog::builtin::all().all(|m| m.family.is_some()));
@@ -570,4 +570,16 @@ fn haiku_5_5_prices_follow_the_published_context_tiers() {
     let long = model.cost_for_input_tokens(100_001).unwrap();
     assert_eq!((long.input, long.output), (Some(0.5), Some(2.5)));
     assert_eq!(long.cache_read, Some(0.05));
+}
+
+#[test]
+fn gemini_4_carbon_is_priced_at_the_published_rates() {
+    let catalog = Catalog::vendored();
+    let cost = catalog
+        .resolve("gemini/gemini-4-carbon")
+        .unwrap()
+        .cost
+        .unwrap();
+    assert_eq!((cost.input, cost.output), (Some(2.0), Some(10.0)));
+    assert_eq!(cost.cache_read, Some(0.1));
 }

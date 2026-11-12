@@ -436,11 +436,12 @@ fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
 }
 
 /// Models that cannot turn thinking off: gemini-3.1-pro, gemini-3.7-flash,
-/// gemini-3.8-flash and gemini-4-argon reject thinkingLevel "minimal" —
+/// gemini-3.8-flash, gemini-4-argon and gemini-4-carbon reject thinkingLevel "minimal" —
 /// verified live. Unified effort "none" clamps to "low" for them.
 fn cannot_disable_thinking(model: &str) -> bool {
     let m = model.to_lowercase();
-    // gemini-3.1-pro, gemini-3.7-flash, gemini-3.8-flash and gemini-4-argon reject
+    // gemini-3.1-pro, gemini-3.7-flash, gemini-3.8-flash, gemini-4-argon and
+    // gemini-4-carbon reject
     // thinkingLevel "minimal", verified live — unified "none" clamps to "low".
     // Other flash models (3.5/3.6/3.5-lite) accept "minimal" and can disable
     // thinking.
@@ -448,6 +449,7 @@ fn cannot_disable_thinking(model: &str) -> bool {
         || m.contains("3.7-flash")
         || m.contains("3.8-flash")
         || m.contains("4-argon")
+        || m.contains("4-carbon")
 }
 
 impl Provider for Gemini {

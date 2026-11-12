@@ -8,6 +8,7 @@ const EXPECTED: &[&str] = &[
     "anthropic/claude-opus-5-5",
     "anthropic/claude-sonnet-5-5",
     "anthropic/claude-haiku-5-5",
+    "gemini/gemini-4-carbon",
     "gemini/gemini-4-argon",
     "gemini/gemini-3.8-flash",
     "gemini/gemini-3.5-flash-lite",
@@ -31,6 +32,7 @@ fn catalog_advertises_only_the_selected_current_tiers() {
             .map(|model| model.id)
             .collect::<Vec<_>>(),
         [
+            "gemini/gemini-4-carbon",
             "gemini/gemini-4-argon",
             "gemini/gemini-3.8-flash",
             "gemini/gemini-3.5-flash-lite"

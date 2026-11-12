@@ -526,7 +526,7 @@ Standard library only. Full docs: [`clients/ruby/README.md`](clients/ruby/README
 |----------|--------|-------------------|
 | **OpenAI** | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | Yes (summaries) |
 | **Anthropic** | `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` | Yes (thinking summaries) |
-| **Google Gemini** | `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite` | Yes (thought summaries) |
+| **Google Gemini** | `gemini-4-carbon`, `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite` | Yes (thought summaries) |
 | **xAI** | `grok-4.7` | No (hidden) |
 | **Cerebras** | `qwen-3.8-27b` | Yes |
 

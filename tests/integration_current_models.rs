@@ -10,6 +10,7 @@ async fn current_models_completion_and_streaming() {
     let router = llmshim::router::Router::from_env();
     for model in [
         "gemini/gemini-3.8-flash",
+        "gemini/gemini-4-carbon",
         "anthropic/claude-opus-5",
         "anthropic/claude-fable-5",
         "anthropic/claude-fable-5-2",
