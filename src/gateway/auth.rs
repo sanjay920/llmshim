@@ -8,6 +8,7 @@
 //! dev and honors the header, so nothing breaks out of the box.
 
 use std::collections::HashMap;
+#[cfg(feature = "serve")]
 use std::sync::{Arc, PoisonError, RwLock};
 
 use axum::http::HeaderMap;
@@ -63,33 +64,40 @@ pub(crate) struct IdentifiedCaller {
 
 /// API-key registry. `Open` = no auth (dev); `Enforced` = Bearer required.
 /// `Hashed` is `Enforced` for a store that holds only SHA-256 digests of the
-/// keys, so the plaintext of a caller key never sits in this process's memory
-/// after it is configured.
+/// keys, so the store itself never keeps a caller key's plaintext. (A token
+/// that came from an environment variable is still in the environment.)
 pub enum KeyStore {
     Open,
     Enforced(HashMap<String, Identity>),
     /// Identities keyed by the lower-case hex SHA-256 of the bearer token.
+    /// Only in a `serve` build, so the `gateway` feature's public enum is what
+    /// it was.
+    #[cfg(feature = "serve")]
     Hashed(HashMap<String, Identity>),
     /// Bearer tokens as in [`Self::Hashed`], and identities for workloads that
     /// authenticate with a client certificate. The certificate's name reaches
     /// this store in [`PEER_SAN_HEADER`], which the server sets from the
     /// verified TLS handshake and strips from every inbound request, so a caller
-    /// can never supply it.
+    /// can never supply it. Only in a `serve` build.
+    #[cfg(feature = "serve")]
     Mutual {
         tokens: HashMap<String, Identity>,
         peers: HashMap<String, Identity>,
     },
     /// A store that can be replaced while the server runs. Every clone of the
     /// handle sees a replacement at the same moment, and each request is
-    /// authenticated against exactly one version.
+    /// authenticated against exactly one version. Only in a `serve` build.
+    #[cfg(feature = "serve")]
     Live(LiveKeys),
 }
 
 /// A shared, replaceable [`KeyStore`]. Replacing it is how a configuration
 /// reload revokes, adds or re-limits a caller key without a restart.
+#[cfg(feature = "serve")]
 #[derive(Clone)]
 pub struct LiveKeys(Arc<RwLock<Arc<KeyStore>>>);
 
+#[cfg(feature = "serve")]
 impl LiveKeys {
     /// Start with `initial`. A store that is itself live contributes its
     /// current contents, so handles never nest.
@@ -123,6 +131,7 @@ impl LiveKeys {
 /// The header through which a verified client certificate's matched name
 /// reaches the key store. It is internal: the server removes it from every
 /// inbound request before setting it, so only the TLS layer can.
+#[cfg(feature = "serve")]
 pub const PEER_SAN_HEADER: &str = "x-llmshim-peer-san";
 
 impl KeyStore {
@@ -174,6 +183,7 @@ impl KeyStore {
     /// Build an enforced store that holds only key digests. Each map key is the
     /// lower-case hex SHA-256 of a bearer token. Requests are authenticated and
     /// scoped exactly as with [`Self::enforced`] given the same tokens.
+    #[cfg(feature = "serve")]
     pub fn from_digests(digests: HashMap<String, Identity>) -> Self {
         KeyStore::Hashed(digests)
     }
@@ -182,6 +192,7 @@ impl KeyStore {
     /// by the SHA-256 digest of a bearer token as for [`Self::from_digests`];
     /// `peers` by the canonical name (`dns:<lower-case>` or `uri:<uri>`) a
     /// verified certificate carries.
+    #[cfg(feature = "serve")]
     pub fn mutual(tokens: HashMap<String, Identity>, peers: HashMap<String, Identity>) -> Self {
         KeyStore::Mutual { tokens, peers }
     }
@@ -190,14 +201,17 @@ impl KeyStore {
     pub fn is_enforced(&self) -> bool {
         match self {
             KeyStore::Open => false,
+            KeyStore::Enforced(_) => true,
+            #[cfg(feature = "serve")]
+            KeyStore::Hashed(_) | KeyStore::Mutual { .. } => true,
+            #[cfg(feature = "serve")]
             KeyStore::Live(live) => live.current().is_enforced(),
-            _ => true,
         }
     }
 
     /// Whether `name` (`dns:<lower-case>` or `uri:<uri>`) is a workload that a
     /// client certificate can authenticate as.
-    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    #[cfg(feature = "serve")]
     pub(crate) fn has_peer(&self, name: &str) -> bool {
         match self {
             KeyStore::Mutual { peers, .. } => peers.contains_key(name),
@@ -207,6 +221,7 @@ impl KeyStore {
     }
 
     /// How many credentials the store holds.
+    #[cfg(feature = "serve")]
     pub fn credential_count(&self) -> usize {
         match self {
             KeyStore::Open => 0,
@@ -220,7 +235,7 @@ impl KeyStore {
     /// (themselves hashed first, so a plaintext key never reaches the input) and
     /// the identity each carries. Two stores with the same fingerprint authenticate
     /// every request the same way.
-    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    #[cfg(feature = "serve")]
     pub(crate) fn fingerprint(&self) -> String {
         fn entries(kind: &str, map: &HashMap<String, Identity>, out: &mut Vec<String>) {
             for (credential, identity) in map {
@@ -259,6 +274,7 @@ impl KeyStore {
         headers: &HeaderMap,
     ) -> Result<IdentifiedCaller, AuthError> {
         match self {
+            #[cfg(feature = "serve")]
             KeyStore::Live(live) => live.current().identify_caller(headers),
             KeyStore::Open => Ok(IdentifiedCaller {
                 identity: Identity {
@@ -281,6 +297,7 @@ impl KeyStore {
                     credential_scope,
                 })
             }
+            #[cfg(feature = "serve")]
             KeyStore::Mutual { tokens, peers } => match bearer_token(headers) {
                 // A bearer token decides on its own; a certificate never rescues a
                 // wrong token.
@@ -309,6 +326,7 @@ impl KeyStore {
                     })
                 }
             },
+            #[cfg(feature = "serve")]
             KeyStore::Hashed(map) => {
                 let key = bearer_token(headers).ok_or(AuthError::MissingKey)?;
                 // The digest is the credential scope in both modes, so state
@@ -436,10 +454,12 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "serve")]
     fn digest(token: &str) -> String {
         format!("{:x}", Sha256::digest(token.as_bytes()))
     }
 
+    #[cfg(feature = "serve")]
     fn identity(tenant: &str, tier: u8) -> Identity {
         Identity {
             tenant: tenant.into(),
@@ -452,6 +472,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn a_hashed_store_authenticates_and_scopes_like_a_plaintext_store() {
         let plain = KeyStore::enforced(HashMap::from([
@@ -484,6 +505,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn a_hashed_store_rejects_missing_wrong_and_digest_as_token() {
         let hashed =
@@ -504,6 +526,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "serve")]
     fn mutual() -> KeyStore {
         KeyStore::mutual(
             HashMap::from([(digest("sk-paid"), identity("platform", 1))]),
@@ -517,6 +540,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn a_mutual_store_identifies_a_workload_by_its_bound_name_and_scopes_it_apart() {
         let store = mutual();
@@ -544,6 +568,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn in_a_mutual_store_a_bearer_token_decides_alone() {
         let store = mutual();
@@ -576,6 +601,7 @@ mod tests {
         assert_eq!(capped.budget_usd, Some(25.0));
         assert_eq!(capped.budget_window_secs, Some(3600));
     }
+    #[cfg(feature = "serve")]
     #[test]
     fn replacing_a_live_store_revokes_adds_and_relimits_for_every_holder() {
         let live = LiveKeys::new(KeyStore::from_digests(HashMap::from([(
@@ -612,6 +638,7 @@ mod tests {
         assert_eq!(first.credential_count(), 1);
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn live_handles_never_nest() {
         let inner = LiveKeys::new(KeyStore::from_digests(HashMap::from([(
@@ -623,11 +650,22 @@ mod tests {
         // replacing the inner one does not reach it, and nothing can loop.
         inner.replace(KeyStore::Open);
         let headers = hdrs(&[("authorization", "Bearer sk-a")]);
-        assert!(KeyStore::Live(outer.clone()).identify(&headers).is_ok());
+        // `inner` was replaced by an open store after `outer` took its contents; the
+        // tenant proves `outer` still holds the enforced store it began with (an
+        // open store would answer "anonymous" to anyone).
+        let held = KeyStore::Live(outer.clone()).identify(&headers).unwrap();
+        assert_eq!(held.tenant, "a");
+        assert!(KeyStore::Live(outer.clone())
+            .identify(&hdrs(&[("authorization", "Bearer sk-b")]))
+            .is_err());
         outer.replace(KeyStore::Live(outer.clone()));
-        assert!(KeyStore::Live(outer).identify(&headers).is_ok());
+        assert_eq!(
+            KeyStore::Live(outer).identify(&headers).unwrap().tenant,
+            "a"
+        );
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn a_fingerprint_follows_what_decides_a_request_and_nothing_else() {
         let a = KeyStore::from_digests(HashMap::from([
@@ -670,6 +708,7 @@ mod tests {
         assert!(!same_in_another_order.fingerprint().contains("sk-1"));
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn only_a_mutual_store_knows_workload_names() {
         let store = mutual();

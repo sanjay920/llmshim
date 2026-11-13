@@ -42,10 +42,19 @@ moving a key to hashed storage does not orphan state it owns.
 
 ## Token rules
 
-A configured secret must be at least 16 characters and contain no whitespace
-(the gateway trims the `Authorization` header, so an inner space could never
-match). Generate tokens with at least 128 bits of randomness. A digest cannot be
-checked for strength; that is the operator's responsibility.
+A configured secret must be at least 16 characters and consist only of visible
+ASCII characters (`!` to `~`). The gateway reads the `Authorization` header as
+visible ASCII, so a space, a control character, a non-ASCII character or a
+byte-order mark left by an editor could never match; refusing it at `--check`
+turns a silent lockout into an error naming the key. The 16-character floor is
+a guard against a typo, not a strength guarantee: generate tokens with at least
+128 bits of randomness. A digest cannot be checked for strength; that is the
+operator's responsibility.
+
+The store holds only digests. A secret given as `{ env = ... }` is read once
+and not kept, but it remains in the process environment (readable by the same
+user and inherited by child processes); `{ file = ... }` and `sha256` keys do
+not have that property.
 
 Two keys that resolve to the same token are refused, as is a caller token equal
 to a provider key (checked in `--check` against resolved values).

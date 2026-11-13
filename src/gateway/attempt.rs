@@ -954,9 +954,14 @@ impl AttemptCoordinator {
             .set(crate::gateway::usage::UsageRecorder::new(setup));
     }
 
-    fn note_usage(&self, attempt_id: uuid::Uuid, usage: &serde_json::Value) {
+    fn note_usage(
+        &self,
+        attempt_id: uuid::Uuid,
+        usage: &serde_json::Value,
+        observation: &crate::gateway::budget::SpendObservation,
+    ) {
         if let Some(recorder) = self.usage.get() {
-            recorder.observe(attempt_id, usage);
+            recorder.observe(attempt_id, usage, observation);
         }
     }
 
@@ -1052,16 +1057,14 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
                     Ok(())
                 }
                 AttemptEvent::Usage { usage } => {
-                    self.coordinator.note_usage(attempt.id(), usage);
+                    let observation = crate::gateway::budget::spend_observation(
+                        AttemptUsageObservation::new(usage, false, false, false),
+                    );
+                    self.coordinator
+                        .note_usage(attempt.id(), usage, &observation);
                     self.coordinator
                         .rates
-                        .observe_usage(
-                            &self.scope,
-                            attempt.id(),
-                            crate::gateway::budget::spend_observation(
-                                AttemptUsageObservation::new(usage, false, false, false),
-                            ),
-                        )
+                        .observe_usage(&self.scope, attempt.id(), observation)
                         .await
                         .map_err(|_| {
                             AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
@@ -1078,15 +1081,12 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
         observation: AttemptUsageObservation<'a>,
     ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>> {
         Box::pin(async move {
+            let spend = crate::gateway::budget::spend_observation(observation);
             self.coordinator
-                .note_usage(attempt.id(), observation.usage());
+                .note_usage(attempt.id(), observation.usage(), &spend);
             self.coordinator
                 .rates
-                .observe_usage(
-                    &self.scope,
-                    attempt.id(),
-                    crate::gateway::budget::spend_observation(observation),
-                )
+                .observe_usage(&self.scope, attempt.id(), spend)
                 .await
                 .map_err(|_| {
                     AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
@@ -4506,7 +4506,7 @@ mod usage_records {
                 record.output_tokens,
                 record.reasoning_tokens
             ),
-            (100, 40, 25)
+            (100, 40, Some(25))
         );
         assert_eq!(
             (record.cache_read_tokens, record.cache_write_tokens),
@@ -4516,6 +4516,137 @@ mod usage_records {
         assert_eq!(record.cost_source.as_deref(), Some("catalog"));
         assert!(record.usage_reported);
         assert_eq!(coordinator.usage.get().unwrap().in_flight(), 0);
+    }
+
+    /// The usage a provider that reports its own charge would send.
+    fn provider_charge(usd: f64) -> serde_json::Value {
+        json!({"prompt_tokens": 10, "completion_tokens": 1,
+            "cost_usd": usd, "cost_source": "provider"})
+    }
+
+    #[tokio::test]
+    async fn a_lower_terminal_estimate_cannot_erase_what_the_provider_already_charged() {
+        // The spend ledger pins this sequence (a partial provider charge of 80,
+        // again 80, then a terminal catalog estimate of 15 settles at 80); the
+        // record has to agree with what the cap counted.
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Stream,
+        )
+        .await
+        .unwrap();
+        tracker
+            .usage(&provider_charge(0.08), false, false, false)
+            .await
+            .unwrap();
+        tracker
+            .usage(&provider_charge(0.08), false, false, false)
+            .await
+            .unwrap();
+        let estimate = json!({"prompt_tokens": 10, "completion_tokens": 1,
+            "cost_usd": 0.015, "cost_source": "catalog"});
+        tracker.usage(&estimate, true, true, false).await.unwrap();
+        tracker.finish(done()).await.unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].cost_usd, Some(0.08), "{records:#?}");
+        assert_eq!(records[0].cost_source.as_deref(), Some("provider_floor"));
+    }
+
+    #[tokio::test]
+    async fn a_providers_exact_terminal_bill_wins_even_when_lower_than_a_partial_one() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Stream,
+        )
+        .await
+        .unwrap();
+        tracker
+            .usage(&provider_charge(0.08), false, false, false)
+            .await
+            .unwrap();
+        tracker
+            .usage(&provider_charge(0.05), true, true, false)
+            .await
+            .unwrap();
+        tracker.finish(done()).await.unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].cost_usd, Some(0.05), "{records:#?}");
+        assert_eq!(records[0].cost_source.as_deref(), Some("provider"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_keeps_the_charge_the_provider_reported_as_a_floor() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Stream,
+        )
+        .await
+        .unwrap();
+        tracker
+            .usage(&provider_charge(0.03), false, false, false)
+            .await
+            .unwrap();
+        tracker
+            .finish(AttemptOutcome::StreamFailure {
+                accounting: AttemptAccounting::UsageObserved,
+            })
+            .await
+            .unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].outcome, "stream_failure");
+        assert_eq!(records[0].cost_usd, Some(0.03));
+        assert_eq!(records[0].cost_source.as_deref(), Some("provider_floor"));
+    }
+
+    #[tokio::test]
+    async fn reasoning_and_uncached_counts_are_read_where_each_wire_puts_them() {
+        let (coordinator, collected) = coordinator();
+        let mut chat = admit(
+            &coordinator,
+            scope(Some("a"), None),
+            AttemptKind::Completion,
+        )
+        .await
+        .unwrap();
+        // Chat-wire providers nest the reasoning count in the details object.
+        chat.usage(
+            &json!({"prompt_tokens": 50, "completion_tokens": 9, "uncached_input_tokens": 30,
+                "completion_tokens_details": {"reasoning_tokens": 7}}),
+            true,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        chat.finish(done()).await.unwrap();
+        let mut bare = admit(
+            &coordinator,
+            scope(Some("a"), None),
+            AttemptKind::Completion,
+        )
+        .await
+        .unwrap();
+        bare.usage(
+            &json!({"prompt_tokens": 5, "completion_tokens": 2}),
+            true,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        bare.finish(done()).await.unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].reasoning_tokens, Some(7));
+        assert_eq!(records[0].uncached_input_tokens, Some(30));
+        // A provider that reported neither is "not reported", not zero.
+        assert_eq!(records[1].reasoning_tokens, None);
+        assert_eq!(records[1].uncached_input_tokens, None);
     }
 
     #[tokio::test]

@@ -289,17 +289,17 @@ where
         let handshake = self.inner.accept(stream, service);
         Box::pin(async move {
             let (stream, service) = handshake.await?;
-            let names = stream
+            let peer = stream
                 .get_ref()
                 .1
                 .peer_certificates()
-                .map(llmshim::serve::mtls::peer_sans)
+                .map(llmshim::serve::mtls::PeerSans::from_chain)
                 .unwrap_or_default();
             Ok((
                 stream,
                 WithPeer {
                     inner: service,
-                    peer: llmshim::serve::mtls::PeerSans(Arc::new(names)),
+                    peer,
                 },
             ))
         })

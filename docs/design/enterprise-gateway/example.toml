@@ -88,4 +88,4 @@ interval_secs = 30
 [admin]
 host = "0.0.0.0"
 port = 9090
-token = { env = "GATEWAY_ADMIN_TOKEN" }
+token = { env = "GATEWAY_ADMIN_TOKEN" }  # or allow_unauthenticated = true

@@ -7,26 +7,86 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Build the server configuration from the PEM files, and check that the key
+/// A digest of a file's contents. Contents rather than timestamps or sizes:
+/// a renewed certificate often has the same length as the one it replaces, and
+/// some filesystems only keep one-second timestamps. The files are small, so
+/// reading both every interval costs nothing.
+type FileState = [u8; 32];
+
+/// The state of both files. `None` for a file that cannot be read right now,
+/// which is also a change worth noticing.
+pub(crate) type Signature = (Option<FileState>, Option<FileState>, Option<FileState>);
+
+/// What was read from the two files, once. The reload loads from exactly these
+/// bytes and the signature is taken from them, so what is loaded and what is
+/// remembered as loaded cannot disagree (a renewal that lands between two
+/// separate reads would otherwise be loaded but not noticed, or noticed but
+/// never loaded).
+struct Snapshot {
+    cert: Option<Vec<u8>>,
+    key: Option<Vec<u8>>,
+    /// The client CA bundle, read only when the listener requires client
+    /// certificates.
+    client_ca: Option<Vec<u8>>,
+}
+
+impl Snapshot {
+    /// `read` follows symlinks, which is how certificate managers swap in a
+    /// renewed secret. Async, so a hung network volume stalls a task rather
+    /// than a runtime worker.
+    async fn take(tls: &Tls) -> Self {
+        Self {
+            cert: tokio::fs::read(&tls.cert_file).await.ok(),
+            key: tokio::fs::read(&tls.key_file).await.ok(),
+            client_ca: match &tls.client_ca_file {
+                Some(path) => tokio::fs::read(path).await.ok(),
+                None => None,
+            },
+        }
+    }
+
+    fn signature(&self) -> Signature {
+        let state = |bytes: &Option<Vec<u8>>| bytes.as_ref().map(|b| Sha256::digest(b).into());
+        (state(&self.cert), state(&self.key), state(&self.client_ca))
+    }
+}
+
+/// The files of one listener and what was loaded from them at startup, for the
+/// reload watcher.
+#[derive(Clone)]
+pub(crate) struct Watched {
+    files: Tls,
+    loaded: Signature,
+}
+
+/// Build the server configuration from what was read, and check that the key
 /// belongs to the certificate. With `client_ca_file`, every client must present
 /// a certificate signed by one of those authorities or the handshake fails.
 /// Messages name files and never their contents.
-fn build_server_config(tls: &Tls) -> Result<Arc<rustls::ServerConfig>, String> {
+fn build_server_config(tls: &Tls, files: &Snapshot) -> Result<Arc<rustls::ServerConfig>, String> {
     use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-    let chain = CertificateDer::pem_file_iter(&tls.cert_file)
-        .and_then(|certificates| certificates.collect::<Result<Vec<_>, _>>())
+    let (Some(cert), Some(key)) = (&files.cert, &files.key) else {
+        return Err("a file cannot be read".into());
+    };
+    let chain = CertificateDer::pem_slice_iter(cert)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("cannot read the certificate chain: {error}"))?;
     if chain.is_empty() {
         return Err("the certificate file holds no certificate".into());
     }
-    let key = PrivateKeyDer::from_pem_file(&tls.key_file)
+    let key = PrivateKeyDer::from_pem_slice(key)
         .map_err(|error| format!("cannot read the private key: {error}"))?;
     let builder = rustls::ServerConfig::builder();
+    let requires_clients = tls.client_ca_file.is_some();
     let builder = match &tls.client_ca_file {
         Some(path) => {
+            let bundle = files
+                .client_ca
+                .as_ref()
+                .ok_or_else(|| format!("cannot read the client CA bundle {}", path.display()))?;
             let mut roots = rustls::RootCertStore::empty();
-            let authorities = CertificateDer::pem_file_iter(path)
-                .and_then(|certificates| certificates.collect::<Result<Vec<_>, _>>())
+            let authorities = CertificateDer::pem_slice_iter(bundle)
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| {
                     format!(
                         "cannot read the client CA bundle {}: {error}",
@@ -56,78 +116,84 @@ fn build_server_config(tls: &Tls) -> Result<Arc<rustls::ServerConfig>, String> {
     })?;
     // `RustlsConfig::from_config` leaves the protocols to the caller.
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    if requires_clients {
+        // A resumed session skips the client certificate request, and rustls
+        // restores the peer's certificate chain from the session, where it is
+        // not re-verified. A client whose certificate has expired (or whose
+        // authority was removed) could then reconnect as long as the session
+        // lives, and each resumption issues a fresh ticket from the same chain.
+        // With client certificates every connection does a full handshake, so
+        // each one is checked against the CA bundle and the clock.
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+    }
     Ok(Arc::new(config))
 }
 
 /// Read the certificate chain and key (and the client CA bundle, if any), and
-/// check that they belong together.
-pub(crate) async fn load(tls: &Tls) -> Result<RustlsConfig, String> {
+/// check that they belong together. The message names the files, never their
+/// contents.
+pub(crate) async fn load(tls: &Tls) -> Result<(RustlsConfig, Watched), String> {
     // Installing twice is harmless; the first provider wins.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    build_server_config(tls)
-        .map(RustlsConfig::from_config)
-        .map_err(|error| {
-            format!(
-                "cannot load the TLS certificate {} and key {}: {error}",
-                tls.cert_file.display(),
-                tls.key_file.display()
-            )
-        })
-}
-
-/// A digest of a file's contents. Contents rather than timestamps or sizes:
-/// a renewed certificate often has the same length as the one it replaces, and
-/// some filesystems only keep one-second timestamps. The files are small, so
-/// reading both every interval costs nothing.
-type FileState = [u8; 32];
-
-fn file_state(path: &std::path::Path) -> Option<FileState> {
-    // `read` follows symlinks, which is how certificate managers swap in a
-    // renewed secret.
-    let contents = std::fs::read(path).ok()?;
-    Some(Sha256::digest(&contents).into())
-}
-
-/// The state of both files. `None` for a file that cannot be read right now,
-/// which is also a change worth noticing.
-type Signature = (Option<FileState>, Option<FileState>, Option<FileState>);
-
-fn signature(tls: &Tls) -> Signature {
-    (
-        file_state(&tls.cert_file),
-        file_state(&tls.key_file),
-        tls.client_ca_file.as_deref().and_then(file_state),
-    )
+    let snapshot = Snapshot::take(tls).await;
+    let config = build_server_config(tls, &snapshot).map_err(|error| {
+        format!(
+            "cannot load the TLS certificate {} and key {}: {error}",
+            tls.cert_file.display(),
+            tls.key_file.display()
+        )
+    })?;
+    Ok((
+        RustlsConfig::from_config(config),
+        Watched {
+            files: tls.clone(),
+            loaded: snapshot.signature(),
+        },
+    ))
 }
 
 /// Reload `config` whenever the files change. A replacement that does not load
 /// (a half-written pair, a bad file) is reported once and ignored: the previous
-/// certificate stays in service, and the next change is tried again.
-pub(crate) fn watch(config: RustlsConfig, tls: Tls, label: &'static str) {
+/// certificate stays in service. It is also tried again every interval, because
+/// a failure can be transient (a descriptor limit, a swap in progress); only a
+/// successful load, never a failed one, counts as having applied the files.
+pub(crate) fn watch(config: RustlsConfig, watched: Watched, label: &'static str) {
+    let Watched { files: tls, loaded } = watched;
     let interval = Duration::from_secs(
         tls.reload_interval_secs
             .unwrap_or(Tls::DEFAULT_RELOAD_INTERVAL_SECS),
     );
     tokio::spawn(async move {
-        let mut last = signature(&tls);
+        // The state of the files that is in service. It starts as what the
+        // startup load read, not as a fresh read here, so a renewal that landed
+        // between that load and this task is still picked up.
+        let mut applied = loaded;
+        // The state last reported as failing, so a bad pair is logged once.
+        let mut reported: Option<Signature> = None;
         loop {
             tokio::time::sleep(interval).await;
-            let now = signature(&tls);
-            if now == last {
+            let snapshot = Snapshot::take(&tls).await;
+            let now = snapshot.signature();
+            if now == applied {
                 continue;
             }
-            // Remember the state even if loading fails, so one bad file is
-            // reported once instead of every interval.
-            last = now;
-            match build_server_config(&tls) {
+            match build_server_config(&tls, &snapshot) {
                 Ok(rebuilt) => {
                     config.reload_from_config(rebuilt);
+                    applied = now;
+                    reported = None;
                     eprintln!("{label}: reloaded the TLS certificate");
                 }
-                Err(error) => eprintln!(
-                    "{label}: the TLS files changed but do not load ({error}); \
-                     keeping the previous certificate"
-                ),
+                Err(error) => {
+                    if reported != Some(now) {
+                        eprintln!(
+                            "{label}: the TLS files changed but do not load ({error}); \
+                             keeping the previous certificate"
+                        );
+                        reported = Some(now);
+                    }
+                }
             }
         }
     });
@@ -151,6 +217,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("llmshim-tls-sig-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tls = tls_in(&dir);
+        let signature = |tls: &Tls| {
+            let tls = tls.clone();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move { Snapshot::take(&tls).await.signature() })
+        };
         let missing = signature(&tls);
         assert_eq!(
             missing,
@@ -180,6 +254,90 @@ mod tests {
         let second = signature(&tls);
         std::fs::write(&tls.cert_file, "three").unwrap();
         assert_ne!(second, signature(&tls), "a certificate change is noticed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn pair() -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        (certificate.pem(), key.serialize_pem())
+    }
+
+    fn fast_tls_in(dir: &std::path::Path) -> Tls {
+        let toml = format!(
+            "cert_file = {:?}\nkey_file = {:?}\nreload_interval_secs = 1",
+            dir.join("c.pem"),
+            dir.join("k.pem")
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    /// Identifies the configuration in service: a reload replaces it.
+    fn in_service(config: &RustlsConfig) -> usize {
+        std::sync::Arc::as_ptr(&config.get_inner()) as *const () as usize
+    }
+
+    async fn changes_within(config: &RustlsConfig, was: usize, seconds: u64) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+        while std::time::Instant::now() < deadline {
+            if in_service(config) != was {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_renewal_between_the_startup_load_and_the_watcher_is_not_lost() {
+        let dir = std::env::temp_dir().join(format!("llmshim-tls-gap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tls = fast_tls_in(&dir);
+        let (cert, key) = pair();
+        std::fs::write(&tls.cert_file, cert).unwrap();
+        std::fs::write(&tls.key_file, key).unwrap();
+        let (config, watched) = load(&tls).await.unwrap();
+        let before = in_service(&config);
+        // The certificate is renewed after startup loaded it but before the
+        // watcher began: the watcher must compare with what was loaded, not with
+        // whatever it finds when it first looks.
+        let (cert, key) = pair();
+        std::fs::write(&tls.cert_file, cert).unwrap();
+        std::fs::write(&tls.key_file, key).unwrap();
+        watch(config.clone(), watched, "test");
+        assert!(
+            changes_within(&config, before, 6).await,
+            "the renewed certificate was never loaded"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_bad_replacement_is_ignored_and_a_later_good_one_is_applied() {
+        let dir = std::env::temp_dir().join(format!("llmshim-tls-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tls = fast_tls_in(&dir);
+        let (cert, key) = pair();
+        std::fs::write(&tls.cert_file, cert).unwrap();
+        std::fs::write(&tls.key_file, key).unwrap();
+        let (config, watched) = load(&tls).await.unwrap();
+        watch(config.clone(), watched, "test");
+        let before = in_service(&config);
+        std::fs::write(&tls.cert_file, "half a certificate").unwrap();
+        assert!(
+            !changes_within(&config, before, 3).await,
+            "a pair that does not load must leave the old certificate in service"
+        );
+        let (cert, key) = pair();
+        std::fs::write(&tls.cert_file, cert).unwrap();
+        std::fs::write(&tls.key_file, key).unwrap();
+        assert!(
+            changes_within(&config, before, 6).await,
+            "the good pair was never applied after the bad one"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

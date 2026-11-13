@@ -40,6 +40,25 @@ exactly.
   and bearer keys keep working beside certificate keys.
 - **Unknown workload fails closed.** A certificate the authority signed, naming a
   workload no key lists, completes the handshake and gets 401.
+- **One name, or none.** A certificate that carries two names configured for two
+  workloads is ambiguous, and which it would be would depend on the order the
+  issuer wrote them, so it is no identity (401). The same name written twice is
+  one workload. A `client_san` is ASCII only, because it travels in a header.
+- **Every handshake is a full one.** With client certificates required, TLS
+  session resumption is off (no session storage, no tickets). A resumed session
+  skips the client certificate request and restores the earlier chain without
+  verifying it again, so a client could keep reconnecting as a workload after its
+  short-lived certificate expired or its authority was removed. A test connects
+  with a certificate that expires seconds later and checks that, after it does,
+  the same client (with its session cache) cannot get in; a mutation that turns
+  resumption back on fails it.
+- **A connection does not outlive its certificate.** The leaf's `notAfter` is
+  carried with the connection, and a request made after it is no identity, even
+  on an HTTP/2 connection that was authenticated while the certificate was valid
+  (a test pins this; removing the check fails it). Removing a CA, by contrast,
+  takes effect for new connections only: a connection established under the old
+  authority stays until the certificate expires or the connection closes, so
+  short-lived certificates (hours) are what bound the exposure.
 - **Main listener only.** `admin.tls.client_ca_file` is refused; scrapers and
   probes keep using the admin token (0005).
 - Validation: a `client_san` key needs `server.tls.client_ca_file` (otherwise no
@@ -55,8 +74,12 @@ reads the verified peer's names (`llmshim::serve::mtls::peer_sans`, using
 outermost middleware, `bind_peer_identity`, then:
 
 1. **removes** the internal header `x-llmshim-peer-san` from the request, always;
-2. sets it to the first of the certificate's names that a configured key lists,
-   if any.
+2. sets it to the one name of the certificate that a configured key lists, if
+   there is exactly one and the certificate has not expired.
+
+The strip also runs on the admin listener and when client certificates are not
+required (with no names to bind), so the header is absent on every request
+whatever the configuration validation guarantees.
 
 The key store (`KeyStore::Mutual`) reads that header. Because the middleware
 strips whatever the caller sent before setting its own value, and runs outside
