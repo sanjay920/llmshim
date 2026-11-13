@@ -44,6 +44,7 @@ pub mod http;
 pub mod idempotency;
 pub mod metrics;
 pub mod quota;
+pub(crate) mod usage;
 
 #[cfg(feature = "redis-coordination")]
 pub mod distributed;

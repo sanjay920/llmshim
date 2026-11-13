@@ -53,6 +53,23 @@ pub struct Built {
     pub authenticated: bool,
     /// Whether the admin listener (when there is one) requires its token.
     pub admin_authenticated: bool,
+    /// The log files this server writes, to be closed at shutdown.
+    pub logs: Logs,
+}
+
+/// The log destinations the server writes. Each queues lines for a writer
+/// thread, so [`Logs::close`] must run at shutdown or lines still queued are
+/// lost.
+pub struct Logs(Vec<super::jsonl::JsonLines>);
+
+impl Logs {
+    /// Write everything queued and stop the writers. Call once, after the
+    /// listeners have stopped.
+    pub fn close(&self) {
+        for log in &self.0 {
+            log.close();
+        }
+    }
 }
 
 /// The digest of the admin token, if one is configured, after the rules a
@@ -197,19 +214,55 @@ pub async fn build_app(
         }]);
     }
 
-    // The log is opened last, with the receipts directory, so a configuration
+    // The logs are opened last, with the receipts directory, so a configuration
     // that fails earlier creates no file; a path that cannot be written fails
     // the start.
+    let mut logs = Vec::new();
     let access_log = match config
         .logging
         .access_log
         .as_deref()
-        .map(super::access_log::AccessLog::open)
+        .map(super::jsonl::JsonLines::open)
     {
-        Some(Ok(log)) => Some(std::sync::Arc::new(log)),
+        Some(Ok(log)) => {
+            logs.push(log.clone());
+            Some(std::sync::Arc::new(log))
+        }
         Some(Err(message)) => {
             return Err(vec![Issue {
                 path: "logging.access_log".into(),
+                message,
+            }]);
+        }
+        None => None,
+    };
+
+    // Opened with the access log, after the configuration is accepted. Tenants
+    // are named from this configuration, because the policy scope that crosses
+    // Redis in a fleet carries only a hash of the tenant.
+    let usage = match config
+        .logging
+        .usage_log
+        .as_deref()
+        .map(super::jsonl::JsonLines::open)
+    {
+        Some(Ok(log)) => {
+            logs.push(log.clone());
+            // An open server (`allow_unauthenticated`) attributes every request to
+            // the tenant "anonymous", which no key names.
+            let mut tenants: std::collections::BTreeSet<String> =
+                config.keys.iter().map(|key| key.tenant.clone()).collect();
+            if !keystore.is_enforced() {
+                tenants.insert("anonymous".into());
+            }
+            Some(crate::gateway::usage::UsageSetup {
+                sink: Arc::new(UsageLog(log)),
+                tenants: tenants.into_iter().collect(),
+            })
+        }
+        Some(Err(message)) => {
+            return Err(vec![Issue {
+                path: "logging.usage_log".into(),
                 message,
             }]);
         }
@@ -261,16 +314,20 @@ pub async fn build_app(
                 keystore,
                 idempotency_ttl_secs,
                 max_retained_accounting_attempts: retained,
+                usage,
             },
         ),
         Some(url) => match fleet_state(
             router,
             &url,
-            gateway,
-            rate_limits,
-            keystore,
-            idempotency_ttl_secs,
-            retained,
+            FleetInputs {
+                gateway,
+                rate_limits,
+                keystore,
+                idempotency_ttl_secs,
+                max_retained_accounting_attempts: retained,
+                usage,
+            },
         )
         .await
         {
@@ -342,6 +399,7 @@ pub async fn build_app(
         caller_keys: config.keys.len(),
         authenticated,
         admin_authenticated,
+        logs: Logs(logs),
     })
 }
 
@@ -475,30 +533,38 @@ fn hosted(kind: ProviderKind, key: String, base_url: Option<String>) -> Box<dyn 
     }
 }
 
+/// What fleet state is built from, besides the router and the Redis URL.
+#[cfg_attr(not(feature = "serve-redis"), allow(dead_code))]
+struct FleetInputs {
+    gateway: GatewayConfig,
+    rate_limits: RateLimitConfig,
+    keystore: crate::gateway::auth::KeyStore,
+    idempotency_ttl_secs: u64,
+    max_retained_accounting_attempts: usize,
+    usage: Option<crate::gateway::usage::UsageSetup>,
+}
+
 /// Build the fleet (Redis-backed) state. Without the `serve-redis` feature this
 /// cannot be reached: `feature_issues` has already refused the configuration.
 #[cfg(feature = "serve-redis")]
 async fn fleet_state(
     router: Router,
     url: &str,
-    gateway: GatewayConfig,
-    rate_limits: RateLimitConfig,
-    keystore: crate::gateway::auth::KeyStore,
-    idempotency_ttl_secs: u64,
-    max_retained_accounting_attempts: usize,
+    inputs: FleetInputs,
 ) -> Result<Arc<GatewayState>, String> {
     use crate::gateway::distributed::Tuning;
     use crate::gateway::http::DistributedParts;
     use crate::proxy::ratelimit::build_limiter_with;
     let parts = DistributedParts {
-        tuning: Tuning::defaults(&gateway),
+        tuning: Tuning::defaults(&inputs.gateway),
         breaker: crate::proxy::health::build_breaker_with(BreakerConfig::default(), Some(url)),
-        limiter: build_limiter_with(rate_limits.clone(), Some(url)),
-        config: gateway,
-        rate_limits,
-        keystore,
-        idempotency_ttl_secs,
-        max_retained_accounting_attempts,
+        limiter: build_limiter_with(inputs.rate_limits.clone(), Some(url)),
+        config: inputs.gateway,
+        rate_limits: inputs.rate_limits,
+        keystore: inputs.keystore,
+        idempotency_ttl_secs: inputs.idempotency_ttl_secs,
+        max_retained_accounting_attempts: inputs.max_retained_accounting_attempts,
+        usage: inputs.usage,
     };
     GatewayState::distributed_unstarted(router, None, url, parts)
         .await
@@ -509,13 +575,18 @@ async fn fleet_state(
 async fn fleet_state(
     _router: Router,
     _url: &str,
-    _gateway: GatewayConfig,
-    _rate_limits: RateLimitConfig,
-    _keystore: crate::gateway::auth::KeyStore,
-    _idempotency_ttl_secs: u64,
-    _max_retained_accounting_attempts: usize,
+    _inputs: FleetInputs,
 ) -> Result<Arc<GatewayState>, String> {
     Err("fleet mode needs a binary built with --features serve-redis".into())
+}
+
+/// Writes each usage record as a JSON line.
+struct UsageLog(super::jsonl::JsonLines);
+
+impl crate::gateway::usage::UsageSink for UsageLog {
+    fn record(&self, record: &crate::gateway::usage::UsageRecord) {
+        self.0.write(record);
+    }
 }
 
 /// Remove the Redis URL, and any password inside it, from an error message.

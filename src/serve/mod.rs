@@ -14,8 +14,9 @@
 mod access_log;
 pub mod build;
 pub mod config;
+mod jsonl;
 pub mod keys;
 
-pub use build::{admin_token_digest, build_app, fleet_redis_url, start_fleet_workers, Built};
+pub use build::{admin_token_digest, build_app, fleet_redis_url, start_fleet_workers, Built, Logs};
 pub use config::{Format, Issue, ServeConfig};
 pub use keys::build_key_store;

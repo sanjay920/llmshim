@@ -389,12 +389,25 @@ async fn without_fleet_mode_each_replica_counts_its_own_requests() {
     mock.assert_async().await;
 }
 
-fn access_lines(path: &std::path::Path) -> Vec<Value> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("each line is JSON"))
-        .collect()
+/// The JSON lines in a log file, once `expected` of them have been written. The
+/// server queues lines for a writer thread, so a line is not on disk the instant
+/// its response returns; this waits for them, then waits a moment longer and
+/// reads again so that an unexpected extra line fails the count rather than
+/// slipping in afterwards.
+fn access_lines(path: &std::path::Path, expected: usize) -> Vec<Value> {
+    let read = || -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is JSON"))
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while read().len() < expected && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    read()
 }
 
 /// The first eight hex characters of the SHA-256 of a token, as the log prints.
@@ -440,10 +453,11 @@ async fn the_access_log_attributes_each_request_without_recording_a_secret() {
         .unwrap();
     assert_eq!(health.status(), 200);
 
-    let lines = access_lines(&log_path);
+    let lines = access_lines(&log_path, 4);
     assert_eq!(lines.len(), 4, "{lines:#?}");
 
     let accepted = &lines[0];
+    assert_eq!(accepted["event"], "access");
     assert_eq!(accepted["status"], 200);
     assert_eq!(accepted["method"], "POST");
     assert_eq!(accepted["path"], "/v1/chat/completions");
@@ -515,7 +529,7 @@ async fn a_native_routes_credential_header_is_attributed_in_the_access_log() {
         .unwrap();
     assert_eq!(refused.status(), 401);
 
-    let lines = access_lines(&log_path);
+    let lines = access_lines(&log_path, 2);
     assert_eq!(lines.len(), 2, "{lines:#?}");
     assert_eq!(lines[0]["path"], "/v1/messages");
     assert_eq!(lines[0]["tenant"], "platform", "{lines:#?}");
@@ -548,6 +562,194 @@ fn an_unwritable_access_log_fails_the_start_with_the_setting_named() {
         "{stderr}"
     );
     assert!(!stderr.contains("listening on"), "{stderr}");
+}
+
+/// A configuration with a hosted, priced provider whose address is the mock, so
+/// the catalog can compute a cost.
+fn priced_config(upstream: &str, extra: &str) -> String {
+    format!(
+        r#"
+        version = 1
+        [server]
+        port = 0
+        [state]
+        receipts_dir = "{{DIR}}/receipts"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{upstream}"
+        api_key = {{ env = "SERVE_E2E_UPSTREAM_KEY" }}
+        [[keys]]
+        name = "ci"
+        tenant = "platform"
+        secret = {{ env = "SERVE_E2E_CALLER_KEY" }}
+        {extra}
+        "#
+    )
+}
+
+fn responses_body(text: &str, input_tokens: u64, output_tokens: u64) -> String {
+    json!({
+        "id": "resp_1", "object": "response", "status": "completed", "model": "gpt-6-luna",
+        "output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]}],
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens}
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn the_usage_log_attributes_tokens_and_cost_to_the_tenant() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/responses")
+        .with_header("content-type", "application/json")
+        .with_body(responses_body("pong", 1000, 500))
+        .expect(1)
+        .create_async()
+        .await;
+    let dir = tempdir::Dir::new("usage-log");
+    let usage_path = dir.0.join("usage.jsonl");
+    let extra = format!("[logging]\nusage_log = \"{}\"", usage_path.display());
+    let server = start(&priced_config(&upstream.url(), &extra), "usage", &[]);
+
+    let response = chat(&server, Some(CALLER_KEY), "openai/gpt-6-luna").await;
+    assert_eq!(response.status(), 200);
+
+    let lines = access_lines(&usage_path, 1);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    let record = &lines[0];
+    assert_eq!(record["event"], "usage");
+    assert_eq!(record["tenant"], "platform");
+    assert_eq!(record["provider"], "openai");
+    assert_eq!(record["model"], "gpt-6-luna");
+    assert_eq!(record["kind"], "completion");
+    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["input_tokens"], 1000);
+    assert_eq!(record["output_tokens"], 500);
+    assert_eq!(record["usage_reported"], true);
+    // GPT-6 Luna: $0.10 per million input tokens, $0.50 per million output.
+    let cost = record["cost_usd"]
+        .as_f64()
+        .expect("a priced model has a cost");
+    assert!((cost - 0.00035).abs() < 1e-9, "cost_usd was {cost}");
+    assert_eq!(record["cost_source"], "catalog");
+    assert!(record["attempt_id"]
+        .as_str()
+        .is_some_and(|id| id.len() == 36));
+
+    // No secret, prompt or completion is in the usage log either.
+    let raw = std::fs::read_to_string(&usage_path).unwrap();
+    for secret in [CALLER_KEY, UPSTREAM_KEY, "ping", "pong"] {
+        assert!(!raw.contains(secret), "{secret} leaked into the usage log");
+    }
+}
+
+#[tokio::test]
+async fn an_open_server_attributes_usage_to_the_anonymous_tenant() {
+    // With allow_unauthenticated no key names a tenant, but every request is
+    // attributed to "anonymous"; the record must say so, not `null`, which is
+    // reserved for a tenant this replica's configuration does not know.
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/responses")
+        .with_header("content-type", "application/json")
+        .with_body(responses_body("pong", 10, 5))
+        .create_async()
+        .await;
+    let dir = tempdir::Dir::new("usage-open");
+    let usage_path = dir.0.join("usage.jsonl");
+    let text = format!(
+        r#"
+        version = 1
+        [server]
+        port = 0
+        allow_unauthenticated = true
+        [state]
+        receipts_dir = "{{DIR}}/receipts"
+        [providers.openai]
+        kind = "openai"
+        base_url = "{}"
+        api_key = {{ env = "SERVE_E2E_UPSTREAM_KEY" }}
+        [logging]
+        usage_log = "{}"
+        "#,
+        upstream.url(),
+        usage_path.display()
+    );
+    let server = start(&text, "usage-open", &[]);
+    let response = chat(&server, None, "openai/gpt-6-luna").await;
+    assert_eq!(response.status(), 200);
+    let lines = access_lines(&usage_path, 1);
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert_eq!(lines[0]["tenant"], "anonymous", "{lines:#?}");
+}
+
+#[test]
+fn two_logs_on_one_file_are_refused_at_startup() {
+    let dir = tempdir::Dir::new("shared-log");
+    let path = dir.0.join("gateway.toml");
+    let shared = dir.0.join("both.jsonl");
+    let text = config(
+        "http://127.0.0.1:1",
+        &format!(
+            "[logging]\naccess_log = \"{0}\"\nusage_log = \"{0}\"",
+            shared.display()
+        ),
+    )
+    .replace("{DIR}", dir.0.to_str().unwrap());
+    std::fs::write(&path, text).unwrap();
+    let (code, stderr) = run_to_exit(
+        &path,
+        &[
+            ("LLMSHIM_CATALOG_OFFLINE", "1"),
+            ("SERVE_E2E_CALLER_KEY", CALLER_KEY),
+            ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("logging.usage_log"), "{stderr}");
+    assert!(!shared.exists());
+}
+
+#[tokio::test]
+async fn every_failed_attempt_is_recorded_with_an_unknown_cost() {
+    let mut upstream = mockito::Server::new_async().await;
+    let mock = upstream
+        .mock("POST", "/responses")
+        .with_status(500)
+        .with_body("{\"error\":{\"message\":\"boom\"}}")
+        .expect(2)
+        .create_async()
+        .await;
+    let dir = tempdir::Dir::new("usage-failed");
+    let usage_path = dir.0.join("usage.jsonl");
+    let extra = format!("[logging]\nusage_log = \"{}\"", usage_path.display());
+    // One retry and a short backoff, so the test stays quick; the client's own
+    // retry settings are the one thing `serve` still reads from the environment.
+    let server = start(
+        &priced_config(&upstream.url(), &extra),
+        "usage-failed",
+        &[
+            ("LLMSHIM_MAX_RETRIES", "1"),
+            ("LLMSHIM_MAX_BACKOFF_SECS", "1"),
+        ],
+    );
+
+    let response = chat(&server, Some(CALLER_KEY), "openai/gpt-6-luna").await;
+    assert!(response.status().is_server_error(), "{}", response.status());
+    let lines = access_lines(&usage_path, 2);
+    // One retry means two sends, and each send is its own attempt, so two
+    // charges the tenant would have borne had the provider billed them.
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    mock.assert_async().await;
+    for record in &lines {
+        assert_eq!(record["outcome"], "http_failure", "{record}");
+        assert_eq!(record["http_status"], 500);
+        assert_eq!(record["tenant"], "platform");
+        assert!(record["cost_usd"].is_null(), "unknown, not free: {record}");
+        assert_eq!(record["usage_reported"], false);
+    }
 }
 
 #[test]

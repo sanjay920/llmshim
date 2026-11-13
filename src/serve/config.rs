@@ -260,6 +260,12 @@ pub struct Logging {
     /// stdout). Off when absent.
     #[serde(default)]
     pub access_log: Option<String>,
+    /// One JSON line per provider attempt when it ends: tenant, provider, model,
+    /// outcome, tokens and USD cost. Per attempt, not per request: a retry or a
+    /// fallback is a separate charge. For showback and chargeback; sum `cost_usd`
+    /// per tenant, treating `null` as unknown. Same targets as `access_log`.
+    #[serde(default)]
+    pub usage_log: Option<String>,
 }
 
 /// Which adapter a provider entry uses.
@@ -690,18 +696,29 @@ impl ServeConfig {
     }
 
     fn validate_logging(&self, issues: &mut Vec<Issue>) {
-        if let Some(target) = &self.logging.access_log {
+        for (field, target) in [
+            ("logging.access_log", &self.logging.access_log),
+            ("logging.usage_log", &self.logging.usage_log),
+        ] {
+            let Some(target) = target else { continue };
             let is_file = std::path::Path::new(target).has_root();
             if target != "stdout" && !is_file {
                 issues.push(Issue::new(
-                    "logging.access_log",
+                    field,
                     "must be \"stdout\" or an absolute file path",
                 ));
             }
             if is_file && target.ends_with('/') {
+                issues.push(Issue::new(field, "must name a file, not a directory"));
+            }
+        }
+        // Two writers on one file would interleave their lines. Both on
+        // "stdout" is fine: each writes whole lines to the same stream.
+        if let (Some(access), Some(usage)) = (&self.logging.access_log, &self.logging.usage_log) {
+            if access == usage && access != "stdout" {
                 issues.push(Issue::new(
-                    "logging.access_log",
-                    "must name a file, not a directory",
+                    "logging.usage_log",
+                    "must differ from logging.access_log; two logs cannot share a file",
                 ));
             }
         }
@@ -1532,15 +1549,39 @@ mod tests {
     }
 
     #[test]
-    fn the_access_log_target_is_validated() {
-        for ok in ["stdout", "/var/log/llmshim/access.jsonl"] {
-            let text = format!("{MINIMAL}\n[logging]\naccess_log = \"{ok}\"");
-            assert!(ServeConfig::parse(&text, Format::Toml).is_ok(), "{ok}");
+    fn the_log_targets_are_validated() {
+        for field in ["access_log", "usage_log"] {
+            for ok in ["stdout", "/var/log/llmshim/out.jsonl"] {
+                let text = format!("{MINIMAL}\n[logging]\n{field} = \"{ok}\"");
+                assert!(
+                    ServeConfig::parse(&text, Format::Toml).is_ok(),
+                    "{field} {ok}"
+                );
+            }
+            for bad in ["stderr", "out.jsonl", "", "/var/log/dir/"] {
+                let found = issues(&format!("{MINIMAL}\n[logging]\n{field} = \"{bad}\""));
+                assert!(
+                    has(&found, &format!("logging.{field}")),
+                    "{field} {bad:?}: {found:?}"
+                );
+            }
         }
-        for bad in ["stderr", "access.jsonl", "", "/var/log/dir/"] {
-            let found = issues(&format!("{MINIMAL}\n[logging]\naccess_log = \"{bad}\""));
-            assert!(has(&found, "logging.access_log"), "{bad:?}: {found:?}");
-        }
+    }
+
+    #[test]
+    fn two_logs_cannot_share_a_file_but_may_share_stdout() {
+        let same_file = format!(
+            "{MINIMAL}\n[logging]\naccess_log = \"/var/log/a.jsonl\"\nusage_log = \"/var/log/a.jsonl\""
+        );
+        let found = issues(&same_file);
+        assert!(has(&found, "logging.usage_log"), "{found:?}");
+        let both_stdout =
+            format!("{MINIMAL}\n[logging]\naccess_log = \"stdout\"\nusage_log = \"stdout\"");
+        assert!(ServeConfig::parse(&both_stdout, Format::Toml).is_ok());
+        let two_files = format!(
+            "{MINIMAL}\n[logging]\naccess_log = \"/var/log/a.jsonl\"\nusage_log = \"/var/log/u.jsonl\""
+        );
+        assert!(ServeConfig::parse(&two_files, Format::Toml).is_ok());
     }
 
     #[test]

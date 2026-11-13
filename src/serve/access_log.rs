@@ -24,6 +24,7 @@
 //! characters. No token, header value, query string, body or model output is
 //! ever written.
 
+use super::jsonl::JsonLines;
 use crate::gateway::auth::KeyStore;
 use axum::extract::Request;
 use axum::http::HeaderMap;
@@ -31,11 +32,12 @@ use axum::middleware::Next;
 use axum::response::Response;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Serialize, Debug, PartialEq)]
 pub(crate) struct Record {
+    /// Always `"access"`, so lines can share a stream with other records.
+    pub event: &'static str,
     pub ts: String,
     pub request_id: Option<String>,
     pub method: String,
@@ -44,54 +46,6 @@ pub(crate) struct Record {
     pub latency_ms: u64,
     pub tenant: Option<String>,
     pub credential: Option<String>,
-}
-
-/// Where lines go.
-pub(crate) struct AccessLog {
-    writer: Mutex<Box<dyn Write + Send>>,
-}
-
-impl AccessLog {
-    /// `"stdout"` or an absolute file path (owner-only, appended to).
-    pub(crate) fn open(target: &str) -> Result<Self, String> {
-        let writer: Box<dyn Write + Send> = if target == "stdout" {
-            Box::new(std::io::stdout())
-        } else {
-            let mut options = std::fs::OpenOptions::new();
-            options.create(true).append(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            Box::new(
-                options
-                    .open(target)
-                    .map_err(|error| format!("cannot open {target}: {}", error.kind()))?,
-            )
-        };
-        Ok(Self::to_writer(writer))
-    }
-
-    pub(crate) fn to_writer(writer: Box<dyn Write + Send>) -> Self {
-        Self {
-            writer: Mutex::new(writer),
-        }
-    }
-
-    fn write(&self, record: &Record) {
-        if let Ok(mut line) = serde_json::to_string(record) {
-            // One `write_all` of the whole line: `writeln!` on an unbuffered file
-            // is two writes, and a failure (or a second writer) between them
-            // would glue the next record onto a partial one.
-            line.push('\n');
-            if let Ok(mut writer) = self.writer.lock() {
-                // A full disk or closed pipe must not fail the request.
-                let _ = writer.write_all(line.as_bytes());
-                let _ = writer.flush();
-            }
-        }
-    }
 }
 
 /// The first eight hex characters of the SHA-256 of the presented bearer token.
@@ -119,7 +73,7 @@ fn bounded(text: &str) -> String {
 /// a deadline cancelled it), when this is dropped, so an abandoned request that
 /// may already have been billed upstream is not missing from the audit trail.
 struct Pending {
-    log: Arc<AccessLog>,
+    log: Arc<JsonLines>,
     started: std::time::Instant,
     method: String,
     path: String,
@@ -132,6 +86,7 @@ impl Pending {
     fn write(&mut self, status: Option<u16>, request_id: Option<String>) {
         self.written = true;
         self.log.write(&Record {
+            event: "access",
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             request_id,
             method: std::mem::take(&mut self.method),
@@ -153,7 +108,7 @@ impl Drop for Pending {
 }
 
 pub(crate) async fn record_request(
-    log: Arc<AccessLog>,
+    log: Arc<JsonLines>,
     keys: Arc<KeyStore>,
     request: Request,
     next: Next,
@@ -190,6 +145,8 @@ pub(crate) async fn record_request(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use std::io::Write;
+    use std::sync::Mutex;
 
     #[test]
     fn the_fingerprint_is_a_digest_prefix_never_the_token() {
@@ -225,6 +182,7 @@ mod tests {
     #[test]
     fn a_record_is_one_line_of_json_with_null_for_the_unknown() {
         let record = Record {
+            event: "access",
             ts: "2026-11-13T00:00:00.000Z".into(),
             request_id: None,
             method: "POST".into(),
@@ -284,7 +242,7 @@ mod tests {
         )])))
     }
 
-    fn app(log: Arc<AccessLog>) -> axum::Router {
+    fn app(log: Arc<JsonLines>) -> axum::Router {
         use axum::routing::{get, post};
         let keys = store();
         axum::Router::new()
@@ -325,7 +283,8 @@ mod tests {
     #[tokio::test]
     async fn the_native_routes_credential_headers_attribute_the_request() {
         let out = Shared::default();
-        let app = app(Arc::new(AccessLog::to_writer(Box::new(out.clone()))));
+        let log = Arc::new(JsonLines::to_writer(Box::new(out.clone())));
+        let app = app(log.clone());
         // Anthropic and Gemini clients send their key in these headers; the
         // gateway reads them on the native routes, so the log must too.
         send(&app, "POST", "/v1/messages", Some(("x-api-key", TOKEN))).await;
@@ -347,6 +306,7 @@ mod tests {
         // Off the native routes the gateway does not read x-api-key, so neither
         // does the log.
         send(&app, "POST", "/v1/other", Some(("x-api-key", TOKEN))).await;
+        log.sync();
         let lines = out.lines();
         assert_eq!(lines[0]["tenant"], "payments", "{lines:?}");
         assert_eq!(lines[1]["tenant"], "payments", "{lines:?}");
@@ -357,7 +317,8 @@ mod tests {
     #[tokio::test]
     async fn a_request_cancelled_before_its_response_still_gets_a_line() {
         let out = Shared::default();
-        let app = app(Arc::new(AccessLog::to_writer(Box::new(out.clone()))));
+        let log = Arc::new(JsonLines::to_writer(Box::new(out.clone())));
+        let app = app(log.clone());
         // The handler never answers; the deadline drops the future, as a client
         // disconnect does.
         let abandoned = tokio::time::timeout(
@@ -366,21 +327,25 @@ mod tests {
         )
         .await;
         assert!(abandoned.is_err(), "the request should have been abandoned");
+        log.sync();
         let lines = out.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0]["status"].is_null(), "{lines:?}");
         assert_eq!(lines[0]["path"], "/slow");
         // A finished request writes exactly one line, not two.
         send(&app, "POST", "/v1/other", None).await;
+        log.sync();
         assert_eq!(out.lines().len(), 2);
     }
 
     #[tokio::test]
     async fn caller_controlled_fields_are_cut_and_every_line_ends_in_one_newline() {
         let out = Shared::default();
-        let app = app(Arc::new(AccessLog::to_writer(Box::new(out.clone()))));
+        let log = Arc::new(JsonLines::to_writer(Box::new(out.clone())));
+        let app = app(log.clone());
         let long = format!("/{}", "a".repeat(5000));
         send(&app, "GET", &long, None).await;
+        log.sync();
         let raw = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
         assert!(raw.ends_with('\n') && raw.matches('\n').count() == 1);
         let line = &out.lines()[0];
@@ -389,37 +354,5 @@ mod tests {
         // A non-ASCII path is cut on a character boundary, not in the middle of
         // one.
         assert_eq!(bounded(&"é".repeat(300)).chars().count(), 256);
-    }
-
-    #[test]
-    fn a_file_target_is_created_owner_only_and_appended_to() {
-        let dir = std::env::temp_dir().join(format!("llmshim-access-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("access.jsonl");
-        let target = path.to_str().unwrap();
-        for _ in 0..2 {
-            let log = AccessLog::open(target).unwrap();
-            log.write(&Record {
-                ts: "t".into(),
-                request_id: Some("r".into()),
-                method: "GET".into(),
-                path: "/x".into(),
-                status: Some(200),
-                latency_ms: 1,
-                tenant: Some("acme".into()),
-                credential: None,
-            });
-        }
-        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
-                0
-            );
-        }
-        assert!(AccessLog::open(dir.join("missing/dir/log").to_str().unwrap()).is_err());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

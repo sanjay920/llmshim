@@ -158,3 +158,66 @@ fn an_unreachable_redis_fails_the_start_without_leaking_the_url() {
     assert!(!stderr.contains("hunter2hunter2"), "{stderr}");
     assert!(!stderr.contains("listening on"), "{stderr}");
 }
+
+#[tokio::test]
+#[ignore = "needs Redis: set LLMSHIM_TEST_REDIS_URL"]
+async fn usage_records_name_the_tenant_whichever_replica_dispatches() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .expect_at_least(2)
+        .create_async()
+        .await;
+    let url = redis_url();
+    let env = [("SERVE_E2E_REDIS_URL", url.as_str())];
+    let names = Names::new();
+    let directory = harness::tempdir::Dir::new("fleet-usage");
+    let log_for = |replica: &str| directory.0.join(format!("usage-{replica}.jsonl"));
+    let text = |replica: &str| {
+        fleet_config(&upstream.url(), &names, "").replace(
+            "[state]",
+            &format!(
+                "[logging]\nusage_log = \"{}\"\n[state]",
+                log_for(replica).display()
+            ),
+        )
+    };
+    let a = start(&text("a"), "usage-a", &env);
+    let b = start(&text("b"), "usage-b", &env);
+    let read = |replica: &str| -> Vec<Value> {
+        std::fs::read_to_string(log_for(replica))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+
+    // Every request enters through replica A; either replica may dispatch it.
+    // Keep going until both have dispatched at least one, which they do within a
+    // handful of requests (they split evenly in practice).
+    let mut sent = 0;
+    let (mut from_a, mut from_b) = (Vec::new(), Vec::new());
+    while sent < 40 && (from_a.is_empty() || from_b.is_empty()) {
+        let response = chat(&a, Some(CALLER_KEY), &names.model()).await;
+        assert_eq!(response.status(), 200);
+        sent += 1;
+        (from_a, from_b) = (read("a"), read("b"));
+    }
+    assert!(
+        !from_a.is_empty() && !from_b.is_empty(),
+        "one replica never dispatched ({sent} requests): a={} b={}",
+        from_a.len(),
+        from_b.len()
+    );
+    // One record per request, each naming the tenant, including those written
+    // by the replica the caller never connected to.
+    assert_eq!(from_a.len() + from_b.len(), sent);
+    for record in from_a.iter().chain(&from_b) {
+        assert_eq!(record["tenant"], names.tenant.as_str(), "{record}");
+        assert_eq!(record["provider"], names.provider.as_str());
+        assert_eq!(record["outcome"], "completed");
+    }
+    drop((a, b));
+}

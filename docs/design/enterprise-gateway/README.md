@@ -43,6 +43,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0007: TLS termination and certificate renewal](0007-tls.md)
 - [0008: Helm chart](0008-helm-chart.md)
 - [0009: The access log](0009-access-log.md)
+- [0010: Usage and cost records per tenant](0010-usage-records.md)
 
 ## Roadmap
 
@@ -67,7 +68,8 @@ Phase 0: a production server mode
 - [x] TLS termination with renewal on file change (0007)
 - [ ] Mutual TLS and certificate-derived identity
 - [x] Access log with tenant attribution and credential fingerprints (0009)
-- [ ] OpenTelemetry traces and metrics; token and cost attribution per tenant
+- [x] Token and cost attribution per tenant and attempt (0010)
+- [ ] OpenTelemetry traces and metrics
 - [x] Helm chart, validated by rendering and `serve --check` (0008)
 - [ ] Published, signed images and an SBOM
 - [ ] Reproducible benchmark and an outage-survival test

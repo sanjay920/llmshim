@@ -714,6 +714,8 @@ pub(crate) struct AttemptCoordinator {
     concurrency_wait: Duration,
     semaphores: Mutex<HashMap<String, Arc<Semaphore>>>,
     active_permits: Mutex<HashMap<uuid::Uuid, OwnedSemaphorePermit>>,
+    /// Set at most once, before the first request.
+    usage: std::sync::OnceLock<crate::gateway::usage::UsageRecorder>,
 }
 
 impl AttemptCoordinator {
@@ -748,6 +750,7 @@ impl AttemptCoordinator {
             concurrency_wait,
             semaphores: Mutex::new(HashMap::new()),
             active_permits: Mutex::new(HashMap::new()),
+            usage: std::sync::OnceLock::new(),
         })
     }
 
@@ -787,6 +790,7 @@ impl AttemptCoordinator {
             concurrency_wait,
             semaphores: Mutex::new(HashMap::new()),
             active_permits: Mutex::new(HashMap::new()),
+            usage: std::sync::OnceLock::new(),
         }))
     }
 
@@ -822,6 +826,7 @@ impl AttemptCoordinator {
             concurrency_wait,
             semaphores: Mutex::new(HashMap::new()),
             active_permits: Mutex::new(HashMap::new()),
+            usage: std::sync::OnceLock::new(),
         })
     }
 
@@ -893,6 +898,9 @@ impl AttemptCoordinator {
                     .lock()
                     .unwrap()
                     .insert(attempt.identity().id(), permit);
+                if let Some(recorder) = self.usage.get() {
+                    recorder.begin(attempt.identity(), &scope.tenant_key);
+                }
                 Ok(())
             }
             Err(RateRefusal::Provider(wait)) => Err(AttemptPolicyRefusal::new(
@@ -916,6 +924,31 @@ impl AttemptCoordinator {
 
     fn release(&self, attempt_id: uuid::Uuid) {
         self.active_permits.lock().unwrap().remove(&attempt_id);
+    }
+
+    /// Record every attempt that ends from now on. Takes effect once; a second
+    /// call is ignored.
+    pub(crate) fn set_usage_sink(&self, setup: crate::gateway::usage::UsageSetup) {
+        let _ = self
+            .usage
+            .set(crate::gateway::usage::UsageRecorder::new(setup));
+    }
+
+    fn note_usage(
+        &self,
+        attempt_id: uuid::Uuid,
+        usage: &serde_json::Value,
+        observation: &crate::gateway::budget::SpendObservation,
+    ) {
+        if let Some(recorder) = self.usage.get() {
+            recorder.observe(attempt_id, usage, observation);
+        }
+    }
+
+    fn end_usage(&self, attempt_id: uuid::Uuid, outcome: AttemptOutcome) {
+        if let Some(recorder) = self.usage.get() {
+            recorder.finish(attempt_id, outcome);
+        }
     }
 }
 
@@ -992,6 +1025,7 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
                         AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
                     }),
                 AttemptEvent::Finished(outcome) => {
+                    self.coordinator.end_usage(attempt.id(), outcome);
                     self.coordinator.release(attempt.id());
                     self.coordinator
                         .rates
@@ -1002,20 +1036,20 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
                         })?;
                     Ok(())
                 }
-                AttemptEvent::Usage { usage } => self
-                    .coordinator
-                    .rates
-                    .observe_usage(
-                        &self.scope,
-                        attempt.id(),
-                        crate::gateway::budget::spend_observation(AttemptUsageObservation::new(
-                            usage, false, false, false,
-                        )),
-                    )
-                    .await
-                    .map_err(|_| {
-                        AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
-                    }),
+                AttemptEvent::Usage { usage } => {
+                    let observation = crate::gateway::budget::spend_observation(
+                        AttemptUsageObservation::new(usage, false, false, false),
+                    );
+                    self.coordinator
+                        .note_usage(attempt.id(), usage, &observation);
+                    self.coordinator
+                        .rates
+                        .observe_usage(&self.scope, attempt.id(), observation)
+                        .await
+                        .map_err(|_| {
+                            AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
+                        })
+                }
                 AttemptEvent::ResponseHeaders { .. } => Ok(()),
             }
         })
@@ -1027,13 +1061,12 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
         observation: AttemptUsageObservation<'a>,
     ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>> {
         Box::pin(async move {
+            let spend = crate::gateway::budget::spend_observation(observation);
+            self.coordinator
+                .note_usage(attempt.id(), observation.usage(), &spend);
             self.coordinator
                 .rates
-                .observe_usage(
-                    &self.scope,
-                    attempt.id(),
-                    crate::gateway::budget::spend_observation(observation),
-                )
+                .observe_usage(&self.scope, attempt.id(), spend)
                 .await
                 .map_err(|_| {
                     AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
@@ -1044,8 +1077,9 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
     fn observe_abandoned(
         &self,
         attempt: &AttemptIdentity,
-        _outcome: AttemptOutcome,
+        outcome: AttemptOutcome,
     ) -> Result<(), AttemptPolicyError> {
+        self.coordinator.end_usage(attempt.id(), outcome);
         self.coordinator.release(attempt.id());
         Ok(())
     }
@@ -1816,6 +1850,7 @@ mod tests {
             concurrency_wait: Duration::from_secs(1),
             semaphores: Mutex::new(HashMap::new()),
             active_permits: Mutex::new(HashMap::new()),
+            usage: std::sync::OnceLock::new(),
         });
         let context = coordinator.context(scope("finish-timeout", None, None));
         let target = crate::reasoning::ReplayTarget::new(
@@ -4275,5 +4310,351 @@ mod retention_environment_contract {
                 "{bad:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_records {
+    use super::*;
+    use crate::gateway::usage::testing::Collected;
+    use crate::policy::{AttemptAccounting, AttemptKind};
+    use serde_json::json;
+
+    /// Tenants this replica's configuration names: the ones the scopes below use.
+    const KNOWN: [&str; 3] = ["payments", "a", "b"];
+
+    fn coordinator() -> (Arc<AttemptCoordinator>, Arc<Collected>) {
+        let coordinator = AttemptCoordinator::local_with_retention(
+            RateLimitConfig::default(),
+            4,
+            Duration::from_secs(1),
+            1000,
+        );
+        let collected = Arc::new(Collected::default());
+        coordinator.set_usage_sink(crate::gateway::usage::UsageSetup {
+            sink: collected.clone(),
+            tenants: KNOWN.iter().map(|tenant| tenant.to_string()).collect(),
+        });
+        (coordinator, collected)
+    }
+
+    /// A scope for `tenant`, or for one this replica does not know.
+    fn scope(tenant: Option<&str>, rpm: Option<u32>) -> TrustedPolicyScope {
+        TrustedPolicyScope {
+            version: 1,
+            tenant_key: crate::gateway::usage::UsageSetup::tenant_key(
+                tenant.unwrap_or("not-in-this-replicas-config"),
+            ),
+            rpm,
+            tpm: None,
+            budget: None,
+            legacy_spend_floor: None,
+        }
+    }
+
+    async fn admit(
+        coordinator: &Arc<AttemptCoordinator>,
+        scope: TrustedPolicyScope,
+        kind: AttemptKind,
+    ) -> Option<crate::policy::AttemptTracker> {
+        let target = crate::reasoning::ReplayTarget::new(
+            "test-provider",
+            "test-model",
+            crate::reasoning::WireFormat::OpenAiChat,
+        );
+        coordinator
+            .context(scope)
+            .acquire(
+                kind,
+                "test-provider/test-model",
+                &target,
+                "http://127.0.0.1/provider",
+                &json!({"model": "test-model", "messages": []}),
+            )
+            .await
+            .ok()
+    }
+
+    fn done() -> AttemptOutcome {
+        AttemptOutcome::Completed {
+            accounting: AttemptAccounting::UsageObserved,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attempt_yields_one_record_with_the_tenant_and_the_final_usage() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Completion,
+        )
+        .await
+        .unwrap();
+        // Snapshots are cumulative: the last one wins.
+        let early = json!({"prompt_tokens": 10, "completion_tokens": 1});
+        let last = json!({
+            "prompt_tokens": 100, "completion_tokens": 40, "reasoning_tokens": 25,
+            "cache_read_tokens": 60, "cache_write_tokens": 5,
+            "cost_usd": 0.0123, "cost_source": "catalog"
+        });
+        tracker.usage(&early, false, false, false).await.unwrap();
+        tracker.usage(&last, true, true, false).await.unwrap();
+        tracker.finish(done()).await.unwrap();
+        drop(tracker);
+
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records.len(), 1, "{records:#?}");
+        let record = &records[0];
+        assert_eq!(record.event, "usage");
+        assert_eq!(record.tenant.as_deref(), Some("payments"));
+        assert_eq!(record.provider, "test-provider");
+        assert_eq!(record.model, "test-model");
+        assert_eq!((record.kind, record.outcome), ("completion", "completed"));
+        assert_eq!(
+            (
+                record.input_tokens,
+                record.output_tokens,
+                record.reasoning_tokens
+            ),
+            (100, 40, Some(25))
+        );
+        assert_eq!(
+            (record.cache_read_tokens, record.cache_write_tokens),
+            (60, 5)
+        );
+        assert_eq!(record.cost_usd, Some(0.0123));
+        assert_eq!(record.cost_source.as_deref(), Some("catalog"));
+        assert!(record.usage_reported);
+        assert_eq!(coordinator.usage.get().unwrap().in_flight(), 0);
+    }
+
+    /// The usage a provider that reports its own charge would send.
+    fn provider_charge(usd: f64) -> serde_json::Value {
+        json!({"prompt_tokens": 10, "completion_tokens": 1,
+            "cost_usd": usd, "cost_source": "provider"})
+    }
+
+    #[tokio::test]
+    async fn a_lower_terminal_estimate_cannot_erase_what_the_provider_already_charged() {
+        // The spend ledger pins this sequence (a partial provider charge of 80,
+        // again 80, then a terminal catalog estimate of 15 settles at 80); the
+        // record has to agree with what the cap counted.
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Stream,
+        )
+        .await
+        .unwrap();
+        tracker
+            .usage(&provider_charge(0.08), false, false, false)
+            .await
+            .unwrap();
+        tracker
+            .usage(&provider_charge(0.08), false, false, false)
+            .await
+            .unwrap();
+        let estimate = json!({"prompt_tokens": 10, "completion_tokens": 1,
+            "cost_usd": 0.015, "cost_source": "catalog"});
+        tracker.usage(&estimate, true, true, false).await.unwrap();
+        tracker.finish(done()).await.unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].cost_usd, Some(0.08), "{records:#?}");
+        assert_eq!(records[0].cost_source.as_deref(), Some("provider_floor"));
+    }
+
+    #[tokio::test]
+    async fn a_providers_exact_terminal_bill_wins_even_when_lower_than_a_partial_one() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Stream,
+        )
+        .await
+        .unwrap();
+        tracker
+            .usage(&provider_charge(0.08), false, false, false)
+            .await
+            .unwrap();
+        tracker
+            .usage(&provider_charge(0.05), true, true, false)
+            .await
+            .unwrap();
+        tracker.finish(done()).await.unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].cost_usd, Some(0.05), "{records:#?}");
+        assert_eq!(records[0].cost_source.as_deref(), Some("provider"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_keeps_the_charge_the_provider_reported_as_a_floor() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Stream,
+        )
+        .await
+        .unwrap();
+        tracker
+            .usage(&provider_charge(0.03), false, false, false)
+            .await
+            .unwrap();
+        tracker
+            .finish(AttemptOutcome::StreamFailure {
+                accounting: AttemptAccounting::UsageObserved,
+            })
+            .await
+            .unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].outcome, "stream_failure");
+        assert_eq!(records[0].cost_usd, Some(0.03));
+        assert_eq!(records[0].cost_source.as_deref(), Some("provider_floor"));
+    }
+
+    #[tokio::test]
+    async fn reasoning_and_uncached_counts_are_read_where_each_wire_puts_them() {
+        let (coordinator, collected) = coordinator();
+        let mut chat = admit(
+            &coordinator,
+            scope(Some("a"), None),
+            AttemptKind::Completion,
+        )
+        .await
+        .unwrap();
+        // Chat-wire providers nest the reasoning count in the details object.
+        chat.usage(
+            &json!({"prompt_tokens": 50, "completion_tokens": 9, "uncached_input_tokens": 30,
+                "completion_tokens_details": {"reasoning_tokens": 7}}),
+            true,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        chat.finish(done()).await.unwrap();
+        let mut bare = admit(
+            &coordinator,
+            scope(Some("a"), None),
+            AttemptKind::Completion,
+        )
+        .await
+        .unwrap();
+        bare.usage(
+            &json!({"prompt_tokens": 5, "completion_tokens": 2}),
+            true,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        bare.finish(done()).await.unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].reasoning_tokens, Some(7));
+        assert_eq!(records[0].uncached_input_tokens, Some(30));
+        // A provider that reported neither is "not reported", not zero.
+        assert_eq!(records[1].reasoning_tokens, None);
+        assert_eq!(records[1].uncached_input_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn an_attempt_with_no_usage_has_an_unknown_cost_not_a_free_one() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(&coordinator, scope(Some("a"), None), AttemptKind::Stream)
+            .await
+            .unwrap();
+        tracker
+            .finish(AttemptOutcome::HttpFailure {
+                status: 503,
+                accounting: AttemptAccounting::Unknown,
+            })
+            .await
+            .unwrap();
+        let records = collected.0.lock().unwrap();
+        let record = &records[0];
+        assert_eq!((record.kind, record.outcome), ("stream", "http_failure"));
+        assert_eq!(record.http_status, Some(503));
+        assert_eq!(record.cost_usd, None, "unknown must stay null");
+        assert!(!record.usage_reported);
+        assert_eq!(record.input_tokens + record.output_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn finishing_and_then_dropping_records_once_and_a_bare_drop_records_abandonment() {
+        let (coordinator, collected) = coordinator();
+        let mut finished = admit(
+            &coordinator,
+            scope(Some("a"), None),
+            AttemptKind::Completion,
+        )
+        .await
+        .unwrap();
+        finished.finish(done()).await.unwrap();
+        drop(finished);
+        let dropped = admit(&coordinator, scope(Some("b"), None), AttemptKind::Stream)
+            .await
+            .unwrap();
+        drop(dropped);
+        let records = collected.0.lock().unwrap();
+        let outcomes: Vec<_> = records
+            .iter()
+            .map(|r| (r.tenant.clone(), r.outcome))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                (Some("a".to_string()), "completed"),
+                (Some("b".to_string()), "abandoned")
+            ]
+        );
+        assert_eq!(coordinator.usage.get().unwrap().in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_attempt_costs_nothing_and_leaves_no_record() {
+        let (coordinator, collected) = coordinator();
+        // A tenant limit of zero refuses before anything is sent.
+        let refused = admit(
+            &coordinator,
+            scope(Some("a"), Some(0)),
+            AttemptKind::Completion,
+        )
+        .await;
+        assert!(refused.is_none());
+        assert!(collected.0.lock().unwrap().is_empty());
+        assert_eq!(coordinator.usage.get().unwrap().in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_this_replica_does_not_know_is_recorded_as_unknown() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(&coordinator, scope(None, None), AttemptKind::Completion)
+            .await
+            .unwrap();
+        tracker.finish(done()).await.unwrap();
+        assert_eq!(collected.0.lock().unwrap()[0].tenant, None);
+    }
+
+    #[test]
+    fn the_scope_never_carries_the_tenants_name() {
+        // Policy scopes cross Redis in a fleet, and tenant names are kept out of
+        // shared storage on purpose: only a hash travels. Usage records get the
+        // name from each replica's own configuration instead.
+        let scope = TrustedPolicyScope::from_identity(&crate::gateway::auth::Identity {
+            tenant: "payments".into(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: None,
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+        });
+        let json = serde_json::to_string(&scope).unwrap();
+        assert!(!json.contains("payments"), "{json}");
+        assert!(json.contains(&crate::gateway::usage::UsageSetup::tenant_key("payments")));
+        assert!(!format!("{scope:?}").contains("payments"));
     }
 }
