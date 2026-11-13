@@ -163,6 +163,13 @@ pub struct Tls {
     /// How often to look for changed files, in seconds. Defaults to 30.
     #[serde(default)]
     pub reload_interval_secs: Option<u64>,
+    /// PEM bundle of the certificate authorities whose client certificates are
+    /// accepted. When set, **every** connection to this listener must present a
+    /// certificate signed by one of them, or the handshake fails; a key with
+    /// `client_san` then authenticates by that certificate alone. Main listener
+    /// only. The file is watched with the certificate and key.
+    #[serde(default)]
+    pub client_ca_file: Option<PathBuf>,
 }
 
 impl Tls {
@@ -410,6 +417,14 @@ pub struct GatewayKey {
     /// caller secret at all. Mutually exclusive with `secret`.
     #[serde(default)]
     pub sha256: Option<String>,
+    /// Authenticate by client certificate instead of a bearer token: the
+    /// subject alternative name to match, written `dns:<name>` or
+    /// `uri:<uri>` (for example `uri:spiffe://corp/payments/checkout`). Needs
+    /// `server.tls.client_ca_file`. A certificate is renewed far more often than
+    /// a token, so this names the workload, not one certificate. A request that
+    /// also sends a bearer token is authenticated by the token alone.
+    #[serde(default)]
+    pub client_san: Option<String>,
     pub tenant: String,
     /// Queue priority; higher is served sooner.
     #[serde(default)]
@@ -537,7 +552,11 @@ impl ServeConfig {
     }
 
     fn validate_tls(tls: &Tls, at: &str, issues: &mut Vec<Issue>) {
-        for (field, path) in [("cert_file", &tls.cert_file), ("key_file", &tls.key_file)] {
+        let ca = tls.client_ca_file.iter().map(|p| ("client_ca_file", p));
+        for (field, path) in [("cert_file", &tls.cert_file), ("key_file", &tls.key_file)]
+            .into_iter()
+            .chain(ca)
+        {
             if !path.has_root() {
                 issues.push(Issue::new(
                     format!("{at}.{field}"),
@@ -567,6 +586,12 @@ impl ServeConfig {
         }
         if let Some(tls) = self.admin.as_ref().and_then(|admin| admin.tls.as_ref()) {
             Self::validate_tls(tls, "admin.tls", issues);
+            if tls.client_ca_file.is_some() {
+                issues.push(Issue::new(
+                    "admin.tls.client_ca_file",
+                    "client certificates are supported on the main listener only",
+                ));
+            }
         }
         let Some(admin) = &self.admin else {
             return;
@@ -706,6 +731,7 @@ impl ServeConfig {
         let mut names = BTreeSet::new();
         let mut digests = BTreeSet::new();
         let mut references = BTreeSet::new();
+        let mut client_sans = BTreeSet::new();
         let upstream: BTreeSet<String> = self
             .providers
             .values()
@@ -725,41 +751,76 @@ impl ServeConfig {
             if !valid_tenant(&key.tenant) {
                 issues.push(Issue::new(format!("{at}.tenant"), TENANT_RULE));
             }
-            match (&key.secret, &key.sha256) {
-                (Some(_), Some(_)) => {
-                    issues.push(Issue::new(&at, "set either secret or sha256, not both"))
+            if let Some(san) = &key.client_san {
+                if key.secret.is_some() || key.sha256.is_some() {
+                    issues.push(Issue::new(
+                        &at,
+                        "set client_san, or secret or sha256, not both",
+                    ));
                 }
-                (None, None) => issues.push(Issue::new(&at, "set secret or sha256")),
-                (Some(secret), None) => {
-                    validate_secret(secret, &format!("{at}.secret"), issues);
-                    if upstream.contains(&format!("{secret:?}")) {
-                        issues.push(Issue::new(
+                if !valid_client_san(san) {
+                    issues.push(Issue::new(
+                        format!("{at}.client_san"),
+                        "must be \"dns:<name>\" or \"uri:<uri>\"",
+                    ));
+                } else if !client_sans.insert(canonical_san(san)) {
+                    issues.push(Issue::new(
+                        format!("{at}.client_san"),
+                        "duplicates another key's client_san",
+                    ));
+                }
+                if self
+                    .server
+                    .tls
+                    .as_ref()
+                    .and_then(|tls| tls.client_ca_file.as_ref())
+                    .is_none()
+                {
+                    issues.push(Issue::new(
+                        format!("{at}.client_san"),
+                        "needs server.tls.client_ca_file; without it no client certificate is requested",
+                    ));
+                }
+                // The remaining checks below concern bearer credentials.
+            } else {
+                match (&key.secret, &key.sha256) {
+                    (Some(_), Some(_)) => {
+                        issues.push(Issue::new(&at, "set either secret or sha256, not both"))
+                    }
+                    (None, None) => {
+                        issues.push(Issue::new(&at, "set secret, sha256 or client_san"))
+                    }
+                    (Some(secret), None) => {
+                        validate_secret(secret, &format!("{at}.secret"), issues);
+                        if upstream.contains(&format!("{secret:?}")) {
+                            issues.push(Issue::new(
                             format!("{at}.secret"),
                             "refers to a provider's api_key; a caller key must be a different secret",
                         ));
+                        }
+                        if !references.insert(format!("{secret:?}")) {
+                            issues.push(Issue::new(
+                                format!("{at}.secret"),
+                                "refers to the same secret as another key",
+                            ));
+                        }
                     }
-                    if !references.insert(format!("{secret:?}")) {
-                        issues.push(Issue::new(
-                            format!("{at}.secret"),
-                            "refers to the same secret as another key",
-                        ));
-                    }
-                }
-                (None, Some(digest)) => {
-                    let well_formed = digest.len() == 64
-                        && digest
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-                    if !well_formed {
-                        issues.push(Issue::new(
-                            format!("{at}.sha256"),
-                            "must be 64 lower-case hexadecimal characters",
-                        ));
-                    } else if !digests.insert(digest.as_str()) {
-                        issues.push(Issue::new(
-                            format!("{at}.sha256"),
-                            "duplicates another key's digest",
-                        ));
+                    (None, Some(digest)) => {
+                        let well_formed = digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                        if !well_formed {
+                            issues.push(Issue::new(
+                                format!("{at}.sha256"),
+                                "must be 64 lower-case hexadecimal characters",
+                            ));
+                        } else if !digests.insert(digest.as_str()) {
+                            issues.push(Issue::new(
+                                format!("{at}.sha256"),
+                                "duplicates another key's digest",
+                            ));
+                        }
                     }
                 }
             }
@@ -991,6 +1052,25 @@ fn valid_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
 }
 
+/// `dns:<name>` or `uri:<uri>`, with something after the prefix and no
+/// whitespace or control characters.
+fn valid_client_san(san: &str) -> bool {
+    let rest = san
+        .strip_prefix("dns:")
+        .or_else(|| san.strip_prefix("uri:"));
+    rest.is_some_and(|rest| {
+        !rest.is_empty() && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
+    })
+}
+
+/// DNS names compare case-insensitively; URIs exactly.
+pub(crate) fn canonical_san(san: &str) -> String {
+    match san.strip_prefix("dns:") {
+        Some(name) => format!("dns:{}", name.to_ascii_lowercase()),
+        None => san.to_string(),
+    }
+}
+
 const TENANT_RULE: &str = "tenants use 1 to 64 letters, digits, '-', '_' or '.'";
 
 /// Tenants become parts of ledger keys and metric labels, so separators such
@@ -1092,7 +1172,7 @@ mod tests {
         let example = include_str!("../../docs/design/enterprise-gateway/example.toml");
         let config = ServeConfig::parse(example, Format::Toml).unwrap();
         assert_eq!(config.providers.len(), 3);
-        assert_eq!(config.keys.len(), 2);
+        assert_eq!(config.keys.len(), 3);
     }
 
     #[test]
@@ -1294,6 +1374,41 @@ mod tests {
         let pasted = MINIMAL.replace("OPENAI_API_KEY", "sk_live_AbCdEf123");
         let found = issues(&pasted);
         assert!(has(&found, "providers.openai.api_key.env"), "{found:?}");
+    }
+
+    #[test]
+    fn certificate_keys_are_validated() {
+        let tls = "[server.tls]\ncert_file = \"/c\"\nkey_file = \"/k\"\nclient_ca_file = \"/ca\"\n";
+        let key = |body: &str| format!("{MINIMAL}\n[[keys]]\nname = \"w\"\ntenant = \"t\"\n{body}");
+        let with_tls = |body: &str| {
+            format!("{MINIMAL}\n{tls}\n[[keys]]\nname = \"w\"\ntenant = \"t\"\n{body}")
+        };
+        // A workload key and a bearer key coexist.
+        let ok = with_tls("client_san = \"uri:spiffe://corp/a/b\"");
+        assert!(ServeConfig::parse(&ok, Format::Toml).is_ok());
+        let dns = with_tls("client_san = \"dns:Service.Corp\"");
+        assert!(ServeConfig::parse(&dns, Format::Toml).is_ok());
+        for (body, path) in [
+            ("client_san = \"spiffe://corp/a\"", "keys[1].client_san"),
+            ("client_san = \"uri:\"", "keys[1].client_san"),
+            ("client_san = \"dns:has space\"", "keys[1].client_san"),
+            ("client_san = \"dns:x\"\nsha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"", "keys[1]"),
+        ] {
+            let found = issues(&with_tls(body));
+            assert!(has(&found, path), "{body}: {found:?}");
+        }
+        // Without required client certificates the key could never match.
+        let found = issues(&key("client_san = \"uri:spiffe://corp/a/b\""));
+        assert!(has(&found, "keys[1].client_san"), "{found:?}");
+        // DNS names compare case-insensitively, so these collide; URIs are exact.
+        let twice = with_tls("client_san = \"dns:Svc.Corp\"")
+            + "\n[[keys]]\nname = \"x\"\ntenant = \"u\"\nclient_san = \"dns:svc.corp\"";
+        assert!(has(&issues(&twice), "keys[2].client_san"));
+        // Client certificates are for the main listener.
+        let admin = format!(
+            "{MINIMAL}\n[admin]\nport = 9090\n[admin.tls]\ncert_file = \"/c\"\nkey_file = \"/k\"\nclient_ca_file = \"/ca\""
+        );
+        assert!(has(&issues(&admin), "admin.tls.client_ca_file"));
     }
 
     #[test]

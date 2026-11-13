@@ -48,6 +48,7 @@ drift from the code.
 | A hosted provider (`openai`, `anthropic`, `gemini`, `xai`, `cerebras`, `openrouter`) must be named for its kind, once. A self-hosted `openai-compatible` server may not use a hosted name. | Prices, limits and the catalog are looked up by provider name. Multiple credentials per provider is a later feature. |
 | `server.tls` and `admin.tls` take absolute PEM file paths (never inline key material) and a reload interval of 1 to 86400 seconds. | Keys stay in files that a certificate manager can renew (0007). |
 | `logging.access_log` and `logging.usage_log` are `"stdout"` or an absolute file path. | A relative path would depend on the working directory (0009). |
+| `client_san` is `dns:<name>` or `uri:<uri>`, needs `server.tls.client_ca_file`, and excludes `secret`/`sha256`; `client_ca_file` is refused on `admin.tls`. | A certificate key could never match unless client certificates are required (0011). |
 | `[admin]` needs a port that differs from `server.port` on the same address; its token is a separate secret from every provider and caller key. | The admin listener must not share a credential with traffic (0005). |
 | `state.receipts_dir` is absolute; `state.idempotency_ttl_secs` is 1 to 604800. | Operators mount a volume for receipts; the bound keeps a typo from holding answers for years. |
 | `base_url` must be `http(s)://host[/path]` with no credentials, query or fragment. | Redirects are disabled in the client, so this must be the final endpoint; credentials belong in `api_key`. |

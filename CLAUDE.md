@@ -681,7 +681,10 @@ only source of settings (it reads the environment solely to resolve
 `--features serve-redis`) shares the queue, limits, spend and provider health
 through Redis; an `[admin]` table moves the operational endpoints to their own
 listener, and `[server.tls]` / `[admin.tls]` terminate TLS with the PEM files
-watched for renewal, and `[logging] access_log` writes a tenant-attributed JSON
+watched for renewal, `client_ca_file` requires client certificates and a
+`[[keys]] client_san` authenticates a workload by certificate (the internal
+`x-llmshim-peer-san` header is stripped from every request and set only from the
+handshake; a mutation test pins that), and `[logging] access_log` writes a tenant-attributed JSON
 line per request (never a token, query or body); `[logging] usage_log` writes one
 per provider attempt with tokens and USD cost (`null` cost = unknown, never
 free). The fleet job scope carries only a hash of the tenant, and a test pins

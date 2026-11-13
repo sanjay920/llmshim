@@ -16,6 +16,7 @@ pub mod build;
 pub mod config;
 mod jsonl;
 pub mod keys;
+pub mod mtls;
 
 pub use build::{build_app, Built};
 pub use config::{Format, Issue, ServeConfig};

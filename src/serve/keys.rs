@@ -29,8 +29,30 @@ pub fn build_key_store(
     }
     let mut issues = Vec::new();
     let mut identities: HashMap<String, Identity> = HashMap::new();
+    let mut peers: HashMap<String, Identity> = HashMap::new();
     for (index, key) in config.keys.iter().enumerate() {
         let at = format!("keys[{index}]");
+        if let Some(san) = &key.client_san {
+            let identity = Identity {
+                tenant: key.tenant.clone(),
+                tier: key.tier,
+                rpm: key.rpm,
+                tpm: key.tpm,
+                budget_usd: key.budget_usd,
+                budget_window_secs: key.budget_window_secs,
+                budget_allow_unpriced: key.budget_allow_unpriced,
+            };
+            if peers
+                .insert(super::config::canonical_san(san), identity)
+                .is_some()
+            {
+                issues.push(Issue {
+                    path: at,
+                    message: "has the same client_san as another key".into(),
+                });
+            }
+            continue;
+        }
         let digest = match (&key.secret, &key.sha256) {
             (Some(secret), None) => match read_secret(secret, env) {
                 Ok(token) if token.chars().any(char::is_whitespace) => {
@@ -77,7 +99,11 @@ pub fn build_key_store(
         }
     }
     if issues.is_empty() {
-        Ok(KeyStore::from_digests(identities))
+        Ok(if peers.is_empty() {
+            KeyStore::from_digests(identities)
+        } else {
+            KeyStore::mutual(identities, peers)
+        })
     } else {
         Err(issues)
     }

@@ -11,6 +11,10 @@ port = 3000
 [server.tls]
 cert_file = "/etc/llmshim/tls/tls.crt"
 key_file = "/etc/llmshim/tls/tls.key"
+# Require a client certificate from this authority on every connection. Workloads
+# then authenticate by certificate (see the "reporting" key below). Remove this
+# line, and that key, to use bearer tokens only.
+client_ca_file = "/etc/llmshim/tls/ca.crt"
 
 # The table name is the routing prefix: "openai/gpt-6-sol".
 [providers.openai]
@@ -54,6 +58,14 @@ secret = { env = "CHECKOUT_GATEWAY_KEY" }
 rpm = 1200
 budget_usd = 250.0
 budget_window_secs = 86400
+
+# A workload that authenticates by client certificate instead of a token. Needs
+# client_ca_file in [server.tls]; every connection then must present a
+# certificate that authority signed.
+[[keys]]
+name = "reporting"
+tenant = "analytics"
+client_san = "uri:spiffe://corp/analytics/reporting"
 
 [[keys]]
 name = "batch-jobs"

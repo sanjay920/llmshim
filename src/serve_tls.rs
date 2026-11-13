@@ -4,15 +4,68 @@
 use axum_server::tls_rustls::RustlsConfig;
 use llmshim::serve::config::Tls;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::Duration;
 
-/// Read the certificate chain and key, and check that they belong together.
-/// The message names the files, never their contents.
+/// Build the server configuration from the PEM files, and check that the key
+/// belongs to the certificate. With `client_ca_file`, every client must present
+/// a certificate signed by one of those authorities or the handshake fails.
+/// Messages name files and never their contents.
+fn build_server_config(tls: &Tls) -> Result<Arc<rustls::ServerConfig>, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let chain = CertificateDer::pem_file_iter(&tls.cert_file)
+        .and_then(|certificates| certificates.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| format!("cannot read the certificate chain: {error}"))?;
+    if chain.is_empty() {
+        return Err("the certificate file holds no certificate".into());
+    }
+    let key = PrivateKeyDer::from_pem_file(&tls.key_file)
+        .map_err(|error| format!("cannot read the private key: {error}"))?;
+    let builder = rustls::ServerConfig::builder();
+    let builder = match &tls.client_ca_file {
+        Some(path) => {
+            let mut roots = rustls::RootCertStore::empty();
+            let authorities = CertificateDer::pem_file_iter(path)
+                .and_then(|certificates| certificates.collect::<Result<Vec<_>, _>>())
+                .map_err(|error| {
+                    format!(
+                        "cannot read the client CA bundle {}: {error}",
+                        path.display()
+                    )
+                })?;
+            if authorities.is_empty() {
+                return Err(format!(
+                    "the client CA bundle {} holds no certificate",
+                    path.display()
+                ));
+            }
+            for authority in authorities {
+                roots
+                    .add(authority)
+                    .map_err(|error| format!("a client CA certificate is not usable: {error}"))?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|error| format!("cannot build the client verifier: {error}"))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut config = builder.with_single_cert(chain, key).map_err(|error| {
+        format!("the key does not match the certificate or is unusable: {error}")
+    })?;
+    // `RustlsConfig::from_config` leaves the protocols to the caller.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// Read the certificate chain and key (and the client CA bundle, if any), and
+/// check that they belong together.
 pub(crate) async fn load(tls: &Tls) -> Result<RustlsConfig, String> {
     // Installing twice is harmless; the first provider wins.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
-        .await
+    build_server_config(tls)
+        .map(RustlsConfig::from_config)
         .map_err(|error| {
             format!(
                 "cannot load the TLS certificate {} and key {}: {error}",
@@ -37,10 +90,14 @@ fn file_state(path: &std::path::Path) -> Option<FileState> {
 
 /// The state of both files. `None` for a file that cannot be read right now,
 /// which is also a change worth noticing.
-type Signature = (Option<FileState>, Option<FileState>);
+type Signature = (Option<FileState>, Option<FileState>, Option<FileState>);
 
 fn signature(tls: &Tls) -> Signature {
-    (file_state(&tls.cert_file), file_state(&tls.key_file))
+    (
+        file_state(&tls.cert_file),
+        file_state(&tls.key_file),
+        tls.client_ca_file.as_deref().and_then(file_state),
+    )
 }
 
 /// Reload `config` whenever the files change. A replacement that does not load
@@ -62,11 +119,11 @@ pub(crate) fn watch(config: RustlsConfig, tls: Tls, label: &'static str) {
             // Remember the state even if loading fails, so one bad file is
             // reported once instead of every interval.
             last = now;
-            match config
-                .reload_from_pem_file(&tls.cert_file, &tls.key_file)
-                .await
-            {
-                Ok(()) => eprintln!("{label}: reloaded the TLS certificate"),
+            match build_server_config(&tls) {
+                Ok(rebuilt) => {
+                    config.reload_from_config(rebuilt);
+                    eprintln!("{label}: reloaded the TLS certificate");
+                }
                 Err(error) => eprintln!(
                     "{label}: the TLS files changed but do not load ({error}); \
                      keeping the previous certificate"
@@ -95,7 +152,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tls = tls_in(&dir);
         let missing = signature(&tls);
-        assert_eq!(missing, (None, None), "unreadable files are a state too");
+        assert_eq!(
+            missing,
+            (None, None, None),
+            "unreadable files are a state too"
+        );
         std::fs::write(&tls.cert_file, "one").unwrap();
         std::fs::write(&tls.key_file, "a").unwrap();
         let first = signature(&tls);

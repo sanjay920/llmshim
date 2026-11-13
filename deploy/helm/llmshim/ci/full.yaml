@@ -6,6 +6,7 @@ server:
     enabled: true
     secretName: llmshim-tls
     reloadIntervalSecs: 10
+    requireClientCertificate: true
 admin:
   tokenEnv: GATEWAY_ADMIN_TOKEN
 fleet:
@@ -47,6 +48,11 @@ config: |
   secret = { env = "CHECKOUT_GATEWAY_KEY" }
   rpm = 120
   budget_usd = 250.0
+
+  [[keys]]
+  name = "reporting"
+  tenant = "analytics"
+  client_san = "uri:spiffe://corp/analytics/reporting"
 
   [routes.summarize]
   model = "anthropic/claude-haiku-5-5"

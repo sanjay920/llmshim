@@ -320,6 +320,31 @@ pub async fn build_app(
         },
         None => app,
     };
+    // With client certificates required, bind the verified certificate's name to
+    // each request, and strip the internal header from everything a caller sends.
+    // Outermost, so nothing (not the access log, not the gateway) sees a value
+    // the TLS layer did not set.
+    let app = if config
+        .server
+        .tls
+        .as_ref()
+        .is_some_and(|tls| tls.client_ca_file.is_some())
+    {
+        let known: std::collections::HashSet<String> = config
+            .keys
+            .iter()
+            .filter_map(|key| key.client_san.as_deref())
+            .map(super::config::canonical_san)
+            .collect();
+        let known = Arc::new(known);
+        app.layer(axum::middleware::from_fn(
+            move |request: Request, next: Next| {
+                super::mtls::bind_peer_identity(known.clone(), request, next)
+            },
+        ))
+    } else {
+        app
+    };
     Ok(Built {
         app,
         admin,
