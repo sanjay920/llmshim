@@ -53,6 +53,23 @@ pub struct Built {
     pub authenticated: bool,
     /// Whether the admin listener (when there is one) requires its token.
     pub admin_authenticated: bool,
+    /// The log files this server writes, to be closed at shutdown.
+    pub logs: Logs,
+}
+
+/// The log destinations the server writes. Each queues lines for a writer
+/// thread, so [`Logs::close`] must run at shutdown or lines still queued are
+/// lost.
+pub struct Logs(Vec<super::jsonl::JsonLines>);
+
+impl Logs {
+    /// Write everything queued and stop the writers. Call once, after the
+    /// listeners have stopped.
+    pub fn close(&self) {
+        for log in &self.0 {
+            log.close();
+        }
+    }
 }
 
 /// The digest of the admin token, if one is configured, after the rules a
@@ -197,16 +214,20 @@ pub async fn build_app(
         }]);
     }
 
-    // The log is opened last, with the receipts directory, so a configuration
+    // The logs are opened last, with the receipts directory, so a configuration
     // that fails earlier creates no file; a path that cannot be written fails
     // the start.
+    let mut logs = Vec::new();
     let access_log = match config
         .logging
         .access_log
         .as_deref()
         .map(super::jsonl::JsonLines::open)
     {
-        Some(Ok(log)) => Some(std::sync::Arc::new(log)),
+        Some(Ok(log)) => {
+            logs.push(log.clone());
+            Some(std::sync::Arc::new(log))
+        }
         Some(Err(message)) => {
             return Err(vec![Issue {
                 path: "logging.access_log".into(),
@@ -225,16 +246,20 @@ pub async fn build_app(
         .as_deref()
         .map(super::jsonl::JsonLines::open)
     {
-        Some(Ok(log)) => Some(crate::gateway::usage::UsageSetup {
-            sink: Arc::new(UsageLog(log)),
-            tenants: config
-                .keys
-                .iter()
-                .map(|key| key.tenant.clone())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect(),
-        }),
+        Some(Ok(log)) => {
+            logs.push(log.clone());
+            // An open server (`allow_unauthenticated`) attributes every request to
+            // the tenant "anonymous", which no key names.
+            let mut tenants: std::collections::BTreeSet<String> =
+                config.keys.iter().map(|key| key.tenant.clone()).collect();
+            if !keystore.is_enforced() {
+                tenants.insert("anonymous".into());
+            }
+            Some(crate::gateway::usage::UsageSetup {
+                sink: Arc::new(UsageLog(log)),
+                tenants: tenants.into_iter().collect(),
+            })
+        }
         Some(Err(message)) => {
             return Err(vec![Issue {
                 path: "logging.usage_log".into(),
@@ -374,6 +399,7 @@ pub async fn build_app(
         caller_keys: config.keys.len(),
         authenticated,
         admin_authenticated,
+        logs: Logs(logs),
     })
 }
 

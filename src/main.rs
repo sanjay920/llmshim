@@ -994,6 +994,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         wait_for_stop(stopped.clone()),
         main_tls.map(|(rustls_config, _)| rustls_config),
     );
+    let logs = built.logs;
     let result = match admin {
         Some((routes, admin_listener, _)) => {
             let admin_server = serve_listener(
@@ -1020,6 +1021,8 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         }
         None => main_server.await,
     };
+    // The logs queue their lines for writer threads: write what is still queued.
+    logs.close();
     match result {
         Ok(()) => 0,
         Err(error) => {

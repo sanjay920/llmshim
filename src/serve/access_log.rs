@@ -283,7 +283,8 @@ mod tests {
     #[tokio::test]
     async fn the_native_routes_credential_headers_attribute_the_request() {
         let out = Shared::default();
-        let app = app(Arc::new(JsonLines::to_writer(Box::new(out.clone()))));
+        let log = Arc::new(JsonLines::to_writer(Box::new(out.clone())));
+        let app = app(log.clone());
         // Anthropic and Gemini clients send their key in these headers; the
         // gateway reads them on the native routes, so the log must too.
         send(&app, "POST", "/v1/messages", Some(("x-api-key", TOKEN))).await;
@@ -305,6 +306,7 @@ mod tests {
         // Off the native routes the gateway does not read x-api-key, so neither
         // does the log.
         send(&app, "POST", "/v1/other", Some(("x-api-key", TOKEN))).await;
+        log.sync();
         let lines = out.lines();
         assert_eq!(lines[0]["tenant"], "payments", "{lines:?}");
         assert_eq!(lines[1]["tenant"], "payments", "{lines:?}");
@@ -315,7 +317,8 @@ mod tests {
     #[tokio::test]
     async fn a_request_cancelled_before_its_response_still_gets_a_line() {
         let out = Shared::default();
-        let app = app(Arc::new(JsonLines::to_writer(Box::new(out.clone()))));
+        let log = Arc::new(JsonLines::to_writer(Box::new(out.clone())));
+        let app = app(log.clone());
         // The handler never answers; the deadline drops the future, as a client
         // disconnect does.
         let abandoned = tokio::time::timeout(
@@ -324,21 +327,25 @@ mod tests {
         )
         .await;
         assert!(abandoned.is_err(), "the request should have been abandoned");
+        log.sync();
         let lines = out.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0]["status"].is_null(), "{lines:?}");
         assert_eq!(lines[0]["path"], "/slow");
         // A finished request writes exactly one line, not two.
         send(&app, "POST", "/v1/other", None).await;
+        log.sync();
         assert_eq!(out.lines().len(), 2);
     }
 
     #[tokio::test]
     async fn caller_controlled_fields_are_cut_and_every_line_ends_in_one_newline() {
         let out = Shared::default();
-        let app = app(Arc::new(JsonLines::to_writer(Box::new(out.clone()))));
+        let log = Arc::new(JsonLines::to_writer(Box::new(out.clone())));
+        let app = app(log.clone());
         let long = format!("/{}", "a".repeat(5000));
         send(&app, "GET", &long, None).await;
+        log.sync();
         let raw = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
         assert!(raw.ends_with('\n') && raw.matches('\n').count() == 1);
         let line = &out.lines()[0];

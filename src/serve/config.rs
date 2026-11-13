@@ -712,6 +712,16 @@ impl ServeConfig {
                 issues.push(Issue::new(field, "must name a file, not a directory"));
             }
         }
+        // Two writers on one file would interleave their lines. Both on
+        // "stdout" is fine: each writes whole lines to the same stream.
+        if let (Some(access), Some(usage)) = (&self.logging.access_log, &self.logging.usage_log) {
+            if access == usage && access != "stdout" {
+                issues.push(Issue::new(
+                    "logging.usage_log",
+                    "must differ from logging.access_log; two logs cannot share a file",
+                ));
+            }
+        }
     }
 
     fn validate_state(&self, issues: &mut Vec<Issue>) {
@@ -1556,6 +1566,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn two_logs_cannot_share_a_file_but_may_share_stdout() {
+        let same_file = format!(
+            "{MINIMAL}\n[logging]\naccess_log = \"/var/log/a.jsonl\"\nusage_log = \"/var/log/a.jsonl\""
+        );
+        let found = issues(&same_file);
+        assert!(has(&found, "logging.usage_log"), "{found:?}");
+        let both_stdout =
+            format!("{MINIMAL}\n[logging]\naccess_log = \"stdout\"\nusage_log = \"stdout\"");
+        assert!(ServeConfig::parse(&both_stdout, Format::Toml).is_ok());
+        let two_files = format!(
+            "{MINIMAL}\n[logging]\naccess_log = \"/var/log/a.jsonl\"\nusage_log = \"/var/log/u.jsonl\""
+        );
+        assert!(ServeConfig::parse(&two_files, Format::Toml).is_ok());
     }
 
     #[test]
