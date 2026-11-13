@@ -60,29 +60,32 @@ impl BreakerConfig {
     /// `LLMSHIM_BREAKER_COOLDOWN_SECS`, keeping the defaults for anything unset
     /// or unparseable. `LLMSHIM_BREAKER_TRIP_THRESHOLD=0` turns it off.
     pub fn from_env() -> Self {
+        Self::from_lookup(&|key| std::env::var(key).ok())
+    }
+
+    /// The same parsing as [`Self::from_env`], reading each variable through
+    /// `lookup` instead of the process environment.
+    pub(crate) fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
         let default = Self::default();
-        Self {
-            window: env_secs("LLMSHIM_BREAKER_WINDOW_SECS").unwrap_or(default.window),
-            trip_threshold: std::env::var("LLMSHIM_BREAKER_TRIP_THRESHOLD")
+        let secs = |key: &str| -> Option<Duration> {
+            lookup(key)?
+                .trim()
+                .parse::<u64>()
                 .ok()
+                .map(Duration::from_secs)
+        };
+        Self {
+            window: secs("LLMSHIM_BREAKER_WINDOW_SECS").unwrap_or(default.window),
+            trip_threshold: lookup("LLMSHIM_BREAKER_TRIP_THRESHOLD")
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(default.trip_threshold),
-            cooldown: env_secs("LLMSHIM_BREAKER_COOLDOWN_SECS").unwrap_or(default.cooldown),
+            cooldown: secs("LLMSHIM_BREAKER_COOLDOWN_SECS").unwrap_or(default.cooldown),
         }
     }
 
     fn is_disabled(&self) -> bool {
         self.trip_threshold == 0
     }
-}
-
-fn env_secs(key: &str) -> Option<Duration> {
-    std::env::var(key)
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
 }
 
 enum TargetState {
@@ -452,5 +455,55 @@ mod tests {
             !breaker.admit("anthropic").await,
             "another replica's finding must reach this one"
         );
+    }
+}
+
+#[cfg(test)]
+mod environment_contract {
+    //! Pins how the breaker variables are parsed, independently of the process
+    //! environment.
+    use super::BreakerConfig;
+    use std::time::Duration;
+
+    fn read(vars: &[(&str, &str)]) -> BreakerConfig {
+        BreakerConfig::from_lookup(&|key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn an_empty_environment_gives_the_defaults() {
+        let (read, default) = (read(&[]), BreakerConfig::default());
+        assert_eq!(read.window, default.window);
+        assert_eq!(read.trip_threshold, default.trip_threshold);
+        assert_eq!(read.cooldown, default.cooldown);
+    }
+
+    #[test]
+    fn values_are_trimmed_and_zero_disables_the_breaker() {
+        let config = read(&[
+            ("LLMSHIM_BREAKER_WINDOW_SECS", " 10 "),
+            ("LLMSHIM_BREAKER_TRIP_THRESHOLD", " 0 "),
+            ("LLMSHIM_BREAKER_COOLDOWN_SECS", "7"),
+        ]);
+        assert_eq!(config.window, Duration::from_secs(10));
+        assert_eq!(config.trip_threshold, 0);
+        assert!(config.is_disabled());
+        assert_eq!(config.cooldown, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn unparsable_values_keep_their_defaults() {
+        let default = BreakerConfig::default();
+        let config = read(&[
+            ("LLMSHIM_BREAKER_WINDOW_SECS", "soon"),
+            ("LLMSHIM_BREAKER_TRIP_THRESHOLD", "-1"),
+            ("LLMSHIM_BREAKER_COOLDOWN_SECS", "1.5"),
+        ]);
+        assert_eq!(config.window, default.window);
+        assert_eq!(config.trip_threshold, default.trip_threshold);
+        assert_eq!(config.cooldown, default.cooldown);
     }
 }

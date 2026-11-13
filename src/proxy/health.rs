@@ -13,10 +13,18 @@ use std::sync::Arc;
 /// one is configured and available. Falls back to a purely local breaker with a
 /// clear warning, exactly as `build_limiter` does.
 pub fn build_breaker() -> Arc<ProviderBreaker> {
-    let config = BreakerConfig::from_env();
+    build_breaker_with(
+        BreakerConfig::from_env(),
+        std::env::var("LLMSHIM_REDIS_URL").ok().as_deref(),
+    )
+}
+
+/// [`build_breaker`] with its two inputs given: the configuration and the Redis
+/// URL (if any). Reads nothing from the environment.
+pub fn build_breaker_with(config: BreakerConfig, redis_url: Option<&str>) -> Arc<ProviderBreaker> {
     let breaker = ProviderBreaker::with_config(config);
 
-    if let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") {
+    if let Some(url) = redis_url {
         let url = url.trim().to_string();
         if !url.is_empty() {
             #[cfg(feature = "redis-coordination")]
@@ -204,3 +212,22 @@ mod redis_impl {
 
 #[cfg(feature = "redis-coordination")]
 pub use redis_impl::RedisHealth;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_inputs_build_a_local_breaker_when_there_is_no_redis() {
+        for url in [None, Some(""), Some("   ")] {
+            // No shared backend is attached, and nothing reads the environment.
+            let config = BreakerConfig {
+                trip_threshold: 7,
+                ..BreakerConfig::default()
+            };
+            let breaker = build_breaker_with(config, url);
+            assert_eq!(breaker.config().trip_threshold, 7);
+            assert!(!breaker.should_skip("openai"));
+        }
+    }
+}

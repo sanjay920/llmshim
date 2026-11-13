@@ -1015,7 +1015,23 @@ fn app_with_origin_policy_and_deadlines(
     origin_policy: OriginPolicy,
     logical_deadlines: crate::proxy::lifetime::LogicalRequestDeadlines,
 ) -> axum::Router {
-    let default_receipt_store = crate::proxy::wire::DefaultReceiptStore::from_env();
+    app_with_parts(
+        state,
+        origin_policy,
+        logical_deadlines,
+        crate::proxy::wire::DefaultReceiptStore::from_env(),
+    )
+}
+
+/// Build the gateway application from every input it needs, reading nothing
+/// from the environment. The `app*` functions above are this with
+/// environment-derived values.
+pub(crate) fn app_with_parts(
+    state: Arc<GatewayState>,
+    origin_policy: OriginPolicy,
+    logical_deadlines: crate::proxy::lifetime::LogicalRequestDeadlines,
+    default_receipt_store: crate::proxy::wire::DefaultReceiptStore,
+) -> axum::Router {
     let ingress_state = IngressAdmissionState {
         gateway: state.clone(),
         deadlines: logical_deadlines,

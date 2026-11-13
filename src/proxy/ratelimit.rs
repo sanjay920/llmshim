@@ -1200,9 +1200,19 @@ fn largest_provider_output_budget(provider_config: &serde_json::Value) -> Option
 /// compiled in, use the distributed limiter; otherwise (or on init failure) fall
 /// back to the in-memory limiter, logging a clear warning.
 pub fn build_limiter() -> Arc<dyn RateLimiter> {
-    let config = RateLimitConfig::from_env();
+    build_limiter_with(
+        RateLimitConfig::from_env(),
+        std::env::var("LLMSHIM_REDIS_URL").ok().as_deref(),
+    )
+}
 
-    if let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") {
+/// [`build_limiter`] with its two inputs given: the limits and the Redis URL
+/// (if any). Reads nothing from the environment.
+pub fn build_limiter_with(
+    config: RateLimitConfig,
+    redis_url: Option<&str>,
+) -> Arc<dyn RateLimiter> {
+    if let Some(url) = redis_url {
         let url = url.trim().to_string();
         if !url.is_empty() {
             #[cfg(feature = "redis-coordination")]
