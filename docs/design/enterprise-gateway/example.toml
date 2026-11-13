@@ -76,6 +76,13 @@ sha256 = "87ef19fa6c094740371b20b400a8ebb1c3df48a413957f0bb3df39ba245337ba"
 model = "anthropic/claude-haiku-5-5"
 settings = { reasoning_effort = "low", max_tokens = 4096 }
 
+# Caller keys reload without a restart: on SIGHUP, and when the file or a secret
+# file it references changes. Everything else in this file needs a restart, and a
+# reload that changes any of it is refused by path. Both settings are optional.
+[reload]
+watch = true
+interval_secs = 30
+
 # Operational endpoints (/metrics, /v1/gateway/stats, /health, /ready) on their
 # own listener. Without this table they are on the main listener, unauthenticated.
 [admin]

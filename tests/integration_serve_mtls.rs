@@ -478,6 +478,99 @@ async fn an_unusable_replacement_client_ca_keeps_the_previous_one() {
     }
 }
 
+const LATE: &str = "spiffe://corp/payments/late";
+
+/// The mTLS configuration with an admin listener and exactly these workloads,
+/// given as `(key name, tenant, uri)`.
+#[cfg(unix)]
+fn reloadable_config(upstream: &str, directory: &Path, workloads: &[(&str, &str, &str)]) -> String {
+    let tls = format!(
+        "[server.tls]\ncert_file = \"{0}/tls.crt\"\nkey_file = \"{0}/tls.key\"\nclient_ca_file = \"{0}/ca.crt\"\n",
+        directory.display()
+    );
+    let mut extra =
+        String::from("[admin]\nport = 0\ntoken = { env = \"SERVE_E2E_ADMIN_TOKEN\" }\n");
+    for (name, tenant, uri) in workloads {
+        extra.push_str(&format!(
+            "[[keys]]\nname = \"{name}\"\ntenant = \"{tenant}\"\nclient_san = \"uri:{uri}\"\n"
+        ));
+    }
+    config(upstream, &extra).replace("[state]", &format!("{tls}[state]"))
+}
+
+/// A client that keeps its connection: HTTP/2 multiplexes every request onto one.
+#[cfg(unix)]
+fn persistent_client(pki: &Pki, identity: (String, String)) -> reqwest::Client {
+    let (certificate, key) = identity;
+    let pem = format!("{certificate}\n{key}");
+    reqwest::Client::builder()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(pki.server_certificate.as_bytes()).unwrap(),
+        )
+        .identity(reqwest::Identity::from_pem(pem.as_bytes()).unwrap())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_reload_revokes_and_admits_workloads_on_connections_already_open() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .expect(3)
+        .create_async()
+        .await;
+    let directory = tempdir::Dir::new("mtls-reload");
+    let pki = Pki::install(&directory.0);
+    let url = upstream.url();
+    let server = start(
+        &reloadable_config(&url, &directory.0, &[("checkout", "payments", CHECKOUT)]),
+        "mtls-reload",
+        &[],
+    );
+
+    let checkout = persistent_client(&pki, client_certificate(&pki.ca, CHECKOUT));
+    let request = |client: &reqwest::Client| {
+        client
+            .post(format!("{}/v1/chat/completions", server.base))
+            .json(&json!({"model": "inference/test-model",
+                "messages": [{"role": "user", "content": "ping"}]}))
+            .send()
+    };
+    let first = request(&checkout).await.unwrap();
+    assert_eq!(first.version(), reqwest::Version::HTTP_2, "one connection");
+    assert_eq!(first.status(), 200);
+
+    // Revoke checkout, admit batch and a workload the first file never knew.
+    harness::rewrite(
+        &server,
+        &reloadable_config(
+            &url,
+            &directory.0,
+            &[("batch", "analytics", BATCH), ("late", "payments", LATE)],
+        ),
+    );
+    harness::hangup(&server);
+    harness::wait_for_reload(&server, "generation 1", |status| status["generation"] == 1).await;
+
+    // The connection that was open is now refused: the certificate is still
+    // valid, the workload is no longer one this server knows.
+    let revoked = request(&checkout).await.unwrap();
+    assert_eq!(revoked.version(), reqwest::Version::HTTP_2);
+    assert_eq!(revoked.status(), 401);
+    // And workloads the reload added are recognized, so the certificate binding
+    // reads the current keys rather than the ones it started with.
+    for uri in [BATCH, LATE] {
+        let client = persistent_client(&pki, client_certificate(&pki.ca, uri));
+        assert_eq!(request(&client).await.unwrap().status(), 200, "{uri}");
+    }
+}
+
 #[test]
 fn a_certificate_key_needs_client_certificates_to_be_required() {
     let directory = tempdir::Dir::new("mtls-config");

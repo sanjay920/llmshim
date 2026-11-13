@@ -830,6 +830,89 @@ async fn load_tls(config: &llmshim::serve::ServeConfig) -> Result<(LoadedTls, Lo
 /// Run the server described by a configuration file, or with `--check` only
 /// validate it. Exit codes: 0 valid (or clean shutdown), 1 invalid or failed
 /// to start, 2 usage error (reported before this runs).
+/// Reload the caller keys on `SIGHUP` and, when `poll` is set, on a timer. A
+/// reload that changes nothing is silent when the timer ran it; one a signal
+/// asked for always answers. A rejection is reported once per distinct failure,
+/// so a bad file does not fill the log every few seconds, and the admin
+/// listener's `/v1/serve/config` keeps showing it until it is fixed.
+#[cfg(feature = "serve")]
+async fn reload_loop(
+    reloader: std::sync::Arc<llmshim::serve::Reloader>,
+    poll: Option<std::time::Duration>,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
+    #[cfg(unix)] mut hangup: Option<tokio::signal::unix::Signal>,
+) {
+    let mut ticker = poll.map(|period| {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker
+    });
+    if let Some(ticker) = ticker.as_mut() {
+        // The first tick is immediate, and the file was just read.
+        ticker.tick().await;
+    }
+    loop {
+        let asked = tokio::select! {
+            _ = stopped.wait_for(|stop| *stop) => return,
+            _ = async {
+                match ticker.as_mut() {
+                    Some(ticker) => { ticker.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => false,
+            _ = async {
+                #[cfg(unix)]
+                if let Some(signal) = hangup.as_mut() {
+                    signal.recv().await;
+                    return;
+                }
+                std::future::pending::<()>().await
+            } => true,
+        };
+        if asked {
+            eprintln!("reload: SIGHUP received");
+        }
+        let current = reloader.clone();
+        // A signal is an operator's decision and applies at once. A poll could
+        // catch a file in the middle of being written, so it applies a change
+        // only once it has seen the same one on two checks in a row.
+        let outcome = tokio::task::spawn_blocking(move || {
+            let env = |name: &str| std::env::var(name).ok();
+            if asked {
+                current.reload(&env)
+            } else {
+                current.poll(&env)
+            }
+        })
+        .await;
+        match outcome {
+            Ok(llmshim::serve::Outcome::Deferred) => {}
+            Ok(llmshim::serve::Outcome::Applied {
+                generation,
+                credentials,
+            }) => eprintln!(
+                "reload: applied (generation {generation}, {credentials} caller credential(s))"
+            ),
+            Ok(llmshim::serve::Outcome::Unchanged) if asked => {
+                eprintln!("reload: no change")
+            }
+            Ok(llmshim::serve::Outcome::Unchanged) => {}
+            Ok(llmshim::serve::Outcome::Rejected { issues, repeated }) => {
+                if asked || !repeated {
+                    eprintln!(
+                        "reload: rejected, the running configuration is unchanged ({} problem(s))",
+                        issues.len()
+                    );
+                    for issue in &issues {
+                        eprintln!("  {issue}");
+                    }
+                }
+            }
+            Err(error) => eprintln!("reload: failed: {error}"),
+        }
+    }
+}
+
 #[cfg(feature = "serve")]
 async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     let path = std::path::Path::new(options.config.as_deref().unwrap_or_default());
@@ -840,8 +923,12 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         }
     };
     let env = |name: &str| std::env::var(name).ok();
-    let config = match llmshim::serve::ServeConfig::load(path) {
-        Ok(config) => config,
+    let llmshim::serve::Loaded {
+        config,
+        text,
+        format,
+    } = match llmshim::serve::ServeConfig::load_with_text(path) {
+        Ok(loaded) => loaded,
         Err(issues) => {
             report(&issues);
             return 1;
@@ -892,6 +979,17 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         );
         return 0;
     }
+    // Registered before anything is built or bound, so a SIGHUP that arrives
+    // while the server is starting is held until it can be acted on, rather than
+    // taking the process's default action (ending it).
+    #[cfg(unix)]
+    let hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(signal) => Some(signal),
+        Err(error) => {
+            eprintln!("warning: cannot listen for SIGHUP ({error}); it will not reload the keys");
+            None
+        }
+    };
     let mut built = match llmshim::serve::build_app(&config, &env).await {
         Ok(built) => built,
         Err(issues) => {
@@ -901,6 +999,14 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     };
     // Held back until every listener is bound (see below).
     let unstarted_fleet = built.unstarted_fleet.take();
+    // Measured against the text the server started from, not a second read.
+    let reloader = match llmshim::serve::Reloader::new(path, &text, format, built.reload.clone()) {
+        Ok(reloader) => std::sync::Arc::new(reloader),
+        Err(issues) => {
+            report(&issues);
+            return 1;
+        }
+    };
     let listener = match cli::bind(built.address).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -958,6 +1064,23 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     } else {
         eprintln!("  Auth: OPEN (server.allow_unauthenticated = true)");
     }
+    let poll = config.reload.poll_interval();
+    #[cfg(unix)]
+    let sighup = hangup.is_some();
+    #[cfg(not(unix))]
+    let sighup = false;
+    match (sighup, poll) {
+        (true, Some(every)) => eprintln!(
+            "  Reload: caller keys on SIGHUP, and when the file changes (checked every {}s)",
+            every.as_secs()
+        ),
+        (true, None) => eprintln!("  Reload: caller keys on SIGHUP"),
+        (false, Some(every)) => eprintln!(
+            "  Reload: caller keys when the file changes (checked every {}s)",
+            every.as_secs()
+        ),
+        (false, None) => eprintln!("  Reload: off"),
+    }
     match &admin {
         Some((_, _, admin_address)) => {
             let protection = if built.admin_authenticated {
@@ -966,8 +1089,8 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
                 "OPEN (admin.allow_unauthenticated = true)"
             };
             eprintln!(
-                "  Admin: {}://{admin_address} (/metrics, /v1/gateway/stats, /health, /ready): \
-                 {protection}",
+                "  Admin: {}://{admin_address} (/metrics, /v1/gateway/stats, /v1/serve/config, \
+                 /health, /ready): {protection}",
                 scheme(&admin_tls)
             )
         }
@@ -986,6 +1109,13 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     let wait_for_stop = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
         let _ = stopped.wait_for(|stop| *stop).await;
     };
+    tokio::spawn(reload_loop(
+        reloader,
+        poll,
+        stopped.clone(),
+        #[cfg(unix)]
+        hangup,
+    ));
     // A renewed certificate is picked up without a restart.
     for (tls, label) in [(&main_tls, "tls"), (&admin_tls, "admin tls")] {
         if let Some((rustls_config, watched)) = tls {

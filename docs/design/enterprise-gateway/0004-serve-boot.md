@@ -1,7 +1,7 @@
 # 0004: `llmshim serve` runs the gateway from a file
 
 Status: implemented. A single instance is described here, fleet mode in 0006 and
-TLS in 0007; configuration reload is not implemented.
+TLS in 0007; caller keys reload without a restart (0012), nothing else does.
 
 ## What it does
 
@@ -67,8 +67,8 @@ server works.
   base URL); set `NO_PROXY` for internal servers.
 - TLS is optional (`[server.tls]`, 0007); without it the listener is plain HTTP and
   belongs behind a terminating proxy or service mesh.
-- No reload. A change needs a restart; the parsed configuration is immutable so
-  a swap can be added without touching the data plane.
+- Only `[[keys]]` reload (0012). Any other change needs a restart; the parsed
+  configuration is immutable.
 - Process-wide settings still read the environment where they are consumed:
   the shared HTTP client's retry and timeout variables, and the HTTP listener's
   connection and header limits (`LLMSHIM_HTTP_*`). They default sensibly and are

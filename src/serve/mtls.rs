@@ -11,14 +11,13 @@
 //! inbound request and then sets it only from the handshake. It runs outside
 //! everything else, so no handler and no log line sees a caller-supplied value.
 
-use crate::gateway::auth::PEER_SAN_HEADER;
+use crate::gateway::auth::{KeyStore, PEER_SAN_HEADER};
 use crate::serve::config::canonical_san;
 use axum::extract::Request;
 use axum::http::HeaderValue;
 use axum::middleware::Next;
 use axum::response::Response;
 use rustls::pki_types::CertificateDer;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// What the TLS layer learned about a connection's verified peer certificate:
@@ -84,14 +83,14 @@ pub fn peer_sans(chain: &[CertificateDer<'_>]) -> Vec<String> {
 /// ambiguous, and which of them it would be depends on the order the issuer
 /// wrote them in, so it is no identity at all. A certificate past its `notAfter`
 /// is none either, even on a connection that was established while it was valid.
-fn matched_name(peer: &PeerSans, known: &HashSet<String>, now: i64) -> Option<String> {
+fn matched_name(peer: &PeerSans, is_workload: impl Fn(&str) -> bool, now: i64) -> Option<String> {
     if peer.not_after.is_some_and(|not_after| now >= not_after) {
         return None;
     }
     let mut matches = peer
         .names
         .iter()
-        .filter(|name| known.contains(*name))
+        .filter(|name| is_workload(name))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter();
     match (matches.next(), matches.next()) {
@@ -114,19 +113,17 @@ pub async fn strip_peer_header(mut request: Request, next: Next) -> Response {
 }
 
 /// Strip [`PEER_SAN_HEADER`] from the request, then set it to the name of the
-/// connection's verified certificate that `known` contains (see
+/// connection's verified certificate that `keys` lists as a workload (see
 /// [`matched_name`]). Without a certificate, or with no usable match, the
-/// header is simply absent.
-pub async fn bind_peer_identity(
-    known: Arc<HashSet<String>>,
-    mut request: Request,
-    next: Next,
-) -> Response {
+/// header is simply absent. `keys` is asked on every request, so a reload that
+/// adds or removes a workload takes effect on the next one, on connections
+/// already open.
+pub async fn bind_peer_identity(keys: Arc<KeyStore>, mut request: Request, next: Next) -> Response {
     request.headers_mut().remove(PEER_SAN_HEADER);
     let matched = request
         .extensions()
         .get::<PeerSans>()
-        .and_then(|peer| matched_name(peer, &known, unix_now()));
+        .and_then(|peer| matched_name(peer, |name| keys.has_peer(name), unix_now()));
     if let Some(name) = matched {
         // A name with characters a header cannot carry is not bound; the caller
         // is then unidentified, which fails closed.
@@ -140,6 +137,7 @@ pub async fn bind_peer_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn certificate(sans: Vec<rcgen::SanType>) -> CertificateDer<'static> {
         let key = rcgen::KeyPair::generate().unwrap();
@@ -172,8 +170,9 @@ mod tests {
         }
     }
 
-    fn known(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|n| n.to_string()).collect()
+    fn known(names: &[&str]) -> impl Fn(&str) -> bool {
+        let names: HashSet<String> = names.iter().map(|n| n.to_string()).collect();
+        move |name| names.contains(name)
     }
 
     #[test]

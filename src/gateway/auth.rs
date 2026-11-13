@@ -8,6 +8,8 @@
 //! dev and honors the header, so nothing breaks out of the box.
 
 use std::collections::HashMap;
+#[cfg(feature = "serve")]
+use std::sync::{Arc, PoisonError, RwLock};
 
 use axum::http::HeaderMap;
 use serde::Deserialize;
@@ -82,6 +84,48 @@ pub enum KeyStore {
         tokens: HashMap<String, Identity>,
         peers: HashMap<String, Identity>,
     },
+    /// A store that can be replaced while the server runs. Every clone of the
+    /// handle sees a replacement at the same moment, and each request is
+    /// authenticated against exactly one version. Only in a `serve` build.
+    #[cfg(feature = "serve")]
+    Live(LiveKeys),
+}
+
+/// A shared, replaceable [`KeyStore`]. Replacing it is how a configuration
+/// reload revokes, adds or re-limits a caller key without a restart.
+#[cfg(feature = "serve")]
+#[derive(Clone)]
+pub struct LiveKeys(Arc<RwLock<Arc<KeyStore>>>);
+
+#[cfg(feature = "serve")]
+impl LiveKeys {
+    /// Start with `initial`. A store that is itself live contributes its
+    /// current contents, so handles never nest.
+    pub fn new(initial: KeyStore) -> Self {
+        Self(Arc::new(RwLock::new(Self::settled(initial))))
+    }
+
+    fn settled(store: KeyStore) -> Arc<KeyStore> {
+        match store {
+            KeyStore::Live(live) => live.current(),
+            other => Arc::new(other),
+        }
+    }
+
+    /// The version in force now. Hold it for the duration of one decision.
+    pub fn current(&self) -> Arc<KeyStore> {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Make `next` the version in force. Requests already decided keep their
+    /// answer; the next one is decided by `next`.
+    pub fn replace(&self, next: KeyStore) {
+        let next = Self::settled(next);
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = next;
+    }
 }
 
 /// The header through which a verified client certificate's matched name
@@ -160,7 +204,60 @@ impl KeyStore {
             KeyStore::Enforced(_) => true,
             #[cfg(feature = "serve")]
             KeyStore::Hashed(_) | KeyStore::Mutual { .. } => true,
+            #[cfg(feature = "serve")]
+            KeyStore::Live(live) => live.current().is_enforced(),
         }
+    }
+
+    /// Whether `name` (`dns:<lower-case>` or `uri:<uri>`) is a workload that a
+    /// client certificate can authenticate as.
+    #[cfg(feature = "serve")]
+    pub(crate) fn has_peer(&self, name: &str) -> bool {
+        match self {
+            KeyStore::Mutual { peers, .. } => peers.contains_key(name),
+            KeyStore::Live(live) => live.current().has_peer(name),
+            _ => false,
+        }
+    }
+
+    /// How many credentials the store holds.
+    #[cfg(feature = "serve")]
+    pub fn credential_count(&self) -> usize {
+        match self {
+            KeyStore::Open => 0,
+            KeyStore::Enforced(map) | KeyStore::Hashed(map) => map.len(),
+            KeyStore::Mutual { tokens, peers } => tokens.len() + peers.len(),
+            KeyStore::Live(live) => live.current().credential_count(),
+        }
+    }
+
+    /// A digest of everything that decides who a request is: the credentials
+    /// (themselves hashed first, so a plaintext key never reaches the input) and
+    /// the identity each carries. Two stores with the same fingerprint authenticate
+    /// every request the same way.
+    #[cfg(feature = "serve")]
+    pub(crate) fn fingerprint(&self) -> String {
+        fn entries(kind: &str, map: &HashMap<String, Identity>, out: &mut Vec<String>) {
+            for (credential, identity) in map {
+                out.push(format!(
+                    "{kind}|{:x}|{identity:?}",
+                    Sha256::digest(credential.as_bytes())
+                ));
+            }
+        }
+        let mut lines = Vec::new();
+        match self {
+            KeyStore::Open => lines.push("open".to_string()),
+            KeyStore::Enforced(map) => entries("plain", map, &mut lines),
+            KeyStore::Hashed(map) => entries("digest", map, &mut lines),
+            KeyStore::Mutual { tokens, peers } => {
+                entries("digest", tokens, &mut lines);
+                entries("peer", peers, &mut lines);
+            }
+            KeyStore::Live(live) => return live.current().fingerprint(),
+        }
+        lines.sort();
+        format!("{:x}", Sha256::digest(lines.join("\n").as_bytes()))
     }
 
     /// Resolve the caller's identity. Open mode reads the tier from the client
@@ -177,6 +274,8 @@ impl KeyStore {
         headers: &HeaderMap,
     ) -> Result<IdentifiedCaller, AuthError> {
         match self {
+            #[cfg(feature = "serve")]
+            KeyStore::Live(live) => live.current().identify_caller(headers),
             KeyStore::Open => Ok(IdentifiedCaller {
                 identity: Identity {
                     tenant: anonymous(),
@@ -501,5 +600,123 @@ mod tests {
                 .unwrap();
         assert_eq!(capped.budget_usd, Some(25.0));
         assert_eq!(capped.budget_window_secs, Some(3600));
+    }
+    #[cfg(feature = "serve")]
+    #[test]
+    fn replacing_a_live_store_revokes_adds_and_relimits_for_every_holder() {
+        let live = LiveKeys::new(KeyStore::from_digests(HashMap::from([(
+            digest("sk-old"),
+            identity("acme", 1),
+        )])));
+        let first = KeyStore::Live(live.clone());
+        let second = KeyStore::Live(live.clone());
+        let old = hdrs(&[("authorization", "Bearer sk-old")]);
+        let new = hdrs(&[("authorization", "Bearer sk-new")]);
+        assert_eq!(first.identify(&old).unwrap().tier, 1);
+        assert!(second.identify(&new).is_err());
+
+        live.replace(KeyStore::from_digests(HashMap::from([
+            (digest("sk-old"), identity("acme", 9)),
+            (digest("sk-new"), identity("globex", 2)),
+        ])));
+        // Every holder of the handle sees it, and a re-limited key carries its new
+        // identity.
+        for store in [&first, &second] {
+            assert_eq!(store.identify(&old).unwrap().tier, 9);
+            assert_eq!(store.identify(&new).unwrap().tenant, "globex");
+        }
+
+        live.replace(KeyStore::from_digests(HashMap::from([(
+            digest("sk-new"),
+            identity("globex", 2),
+        )])));
+        for store in [&first, &second] {
+            assert!(matches!(store.identify(&old), Err(AuthError::InvalidKey)));
+            assert!(store.identify(&new).is_ok());
+        }
+        assert!(first.is_enforced());
+        assert_eq!(first.credential_count(), 1);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn live_handles_never_nest() {
+        let inner = LiveKeys::new(KeyStore::from_digests(HashMap::from([(
+            digest("sk-a"),
+            identity("a", 0),
+        )])));
+        let outer = LiveKeys::new(KeyStore::Live(inner.clone()));
+        // The outer handle holds what the inner one held at that moment; later
+        // replacing the inner one does not reach it, and nothing can loop.
+        inner.replace(KeyStore::Open);
+        let headers = hdrs(&[("authorization", "Bearer sk-a")]);
+        // `inner` was replaced by an open store after `outer` took its contents; the
+        // tenant proves `outer` still holds the enforced store it began with (an
+        // open store would answer "anonymous" to anyone).
+        let held = KeyStore::Live(outer.clone()).identify(&headers).unwrap();
+        assert_eq!(held.tenant, "a");
+        assert!(KeyStore::Live(outer.clone())
+            .identify(&hdrs(&[("authorization", "Bearer sk-b")]))
+            .is_err());
+        outer.replace(KeyStore::Live(outer.clone()));
+        assert_eq!(
+            KeyStore::Live(outer).identify(&headers).unwrap().tenant,
+            "a"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn a_fingerprint_follows_what_decides_a_request_and_nothing_else() {
+        let a = KeyStore::from_digests(HashMap::from([
+            (digest("sk-1"), identity("acme", 1)),
+            (digest("sk-2"), identity("globex", 2)),
+        ]));
+        let same_in_another_order = KeyStore::from_digests(HashMap::from([
+            (digest("sk-2"), identity("globex", 2)),
+            (digest("sk-1"), identity("acme", 1)),
+        ]));
+        assert_eq!(a.fingerprint(), same_in_another_order.fingerprint());
+        for changed in [
+            // a different tier, tenant, token or a removed key
+            HashMap::from([
+                (digest("sk-1"), identity("acme", 7)),
+                (digest("sk-2"), identity("globex", 2)),
+            ]),
+            HashMap::from([
+                (digest("sk-1"), identity("initech", 1)),
+                (digest("sk-2"), identity("globex", 2)),
+            ]),
+            HashMap::from([
+                (digest("sk-1"), identity("acme", 1)),
+                (digest("sk-3"), identity("globex", 2)),
+            ]),
+            HashMap::from([(digest("sk-1"), identity("acme", 1))]),
+        ] {
+            assert_ne!(
+                a.fingerprint(),
+                KeyStore::from_digests(changed).fingerprint()
+            );
+        }
+        // A handle reports the fingerprint of what it holds now.
+        let live = LiveKeys::new(a);
+        assert_eq!(
+            KeyStore::Live(live.clone()).fingerprint(),
+            same_in_another_order.fingerprint()
+        );
+        // The fingerprint holds no credential: it is a digest of digests.
+        assert!(!same_in_another_order.fingerprint().contains("sk-1"));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn only_a_mutual_store_knows_workload_names() {
+        let store = mutual();
+        assert!(store.has_peer("uri:spiffe://corp/payments/checkout"));
+        assert!(!store.has_peer("uri:spiffe://corp/other"));
+        assert!(!KeyStore::Open.has_peer("uri:spiffe://corp/payments/checkout"));
+        assert!(
+            KeyStore::Live(LiveKeys::new(store)).has_peer("uri:spiffe://corp/payments/checkout")
+        );
     }
 }

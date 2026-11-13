@@ -103,6 +103,62 @@ pub struct ServeConfig {
     pub keys: Vec<GatewayKey>,
     #[serde(default, deserialize_with = "unique_map")]
     pub routes: BTreeMap<String, Route>,
+    /// How a running server picks up changes to `keys`.
+    #[serde(default)]
+    pub reload: Reload,
+}
+
+/// Reloading `[[keys]]` without a restart.
+///
+/// Only the caller keys can change while the server runs; a change to anything
+/// else in the file is refused by path and needs a restart. The whole new file
+/// must pass the checks `--check` applies, or none of it is used. `SIGHUP`
+/// always triggers a reload (on platforms that have it); this table controls
+/// whether the file is also polled.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Reload {
+    /// Look for a changed file (and changed secret files) on a timer. Defaults
+    /// to true.
+    #[serde(default = "default_true")]
+    pub watch: bool,
+    /// How often to look, in seconds. Defaults to 30.
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+}
+
+impl Default for Reload {
+    fn default() -> Self {
+        Self {
+            watch: true,
+            interval_secs: None,
+        }
+    }
+}
+
+impl Reload {
+    pub const DEFAULT_INTERVAL_SECS: u64 = 30;
+
+    /// The polling interval, or `None` when polling is off.
+    pub fn poll_interval(&self) -> Option<std::time::Duration> {
+        self.watch.then(|| {
+            std::time::Duration::from_secs(
+                self.interval_secs.unwrap_or(Self::DEFAULT_INTERVAL_SECS),
+            )
+        })
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A configuration and the text it was parsed from.
+pub struct Loaded {
+    pub config: ServeConfig,
+    pub text: String,
+    pub format: Format,
 }
 
 /// Read a table, refusing a repeated name. JSON parsers otherwise keep the
@@ -512,6 +568,13 @@ impl ServeConfig {
 
     /// Read `path`, choosing the format from its extension.
     pub fn load(path: &Path) -> Result<Self, Vec<Issue>> {
+        Self::load_with_text(path).map(|loaded| loaded.config)
+    }
+
+    /// As [`Self::load`], also returning the text that was parsed and its
+    /// format, so a caller that compares files later compares what it started
+    /// from rather than a second read.
+    pub fn load_with_text(path: &Path) -> Result<Loaded, Vec<Issue>> {
         let format = match path.extension().and_then(|e| e.to_str()) {
             Some("toml") => Format::Toml,
             Some("json") => Format::Json,
@@ -528,7 +591,12 @@ impl ServeConfig {
                 format!("cannot read {}: {}", path.display(), error.kind()),
             )]
         })?;
-        Self::parse(&text, format)
+        let config = Self::parse(&text, format)?;
+        Ok(Loaded {
+            config,
+            text,
+            format,
+        })
     }
 
     fn validate(&self) -> Vec<Issue> {
@@ -546,6 +614,7 @@ impl ServeConfig {
         }
         self.validate_server(&mut issues);
         self.validate_admin(&mut issues);
+        self.validate_reload(&mut issues);
         if let Some(fleet) = &self.fleet {
             validate_secret(&fleet.redis_url, "fleet.redis_url", &mut issues);
         }
@@ -554,6 +623,7 @@ impl ServeConfig {
         self.validate_state(&mut issues);
         self.validate_logging(&mut issues);
         self.validate_keys(&mut issues);
+        self.validate_tenant_limits(&mut issues);
         self.validate_routes(&mut issues);
         issues
     }
@@ -604,6 +674,17 @@ impl ServeConfig {
             if !(1..=86_400).contains(&seconds) {
                 issues.push(Issue::new(
                     format!("{at}.reload_interval_secs"),
+                    "must be between 1 and 86400",
+                ));
+            }
+        }
+    }
+
+    fn validate_reload(&self, issues: &mut Vec<Issue>) {
+        if let Some(seconds) = self.reload.interval_secs {
+            if !(1..=86_400).contains(&seconds) {
+                issues.push(Issue::new(
+                    "reload.interval_secs",
                     "must be between 1 and 86400",
                 ));
             }
@@ -775,6 +856,32 @@ impl ServeConfig {
                     format!("limits.providers.{name}"),
                     "no provider with this name is defined",
                 ));
+            }
+        }
+    }
+
+    /// The keys of one tenant share one rate bucket (rate limits are per tenant
+    /// and provider, not per key), so they must agree on its size. Otherwise the
+    /// bucket would be sized by whichever key happened to arrive first, and a
+    /// reload that retunes buckets would flip it back and forth as the keys
+    /// alternate.
+    fn validate_tenant_limits(&self, issues: &mut Vec<Issue>) {
+        let mut first: BTreeMap<&str, (usize, &GatewayKey)> = BTreeMap::new();
+        for (index, key) in self.keys.iter().enumerate() {
+            let Some((earlier, other)) = first.get(key.tenant.as_str()).copied() else {
+                first.insert(&key.tenant, (index, key));
+                continue;
+            };
+            for (name, mine, theirs) in [("rpm", key.rpm, other.rpm), ("tpm", key.tpm, other.tpm)] {
+                if mine != theirs {
+                    issues.push(Issue::new(
+                        format!("keys[{index}].{name}"),
+                        format!(
+                            "differs from keys[{earlier}].{name}; the keys of one tenant share \
+                             one rate bucket, so they must carry the same rpm and tpm"
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -987,6 +1094,47 @@ impl ServeConfig {
     /// returning or printing any value. `env` looks up one variable, so a
     /// caller (or a test) decides what the environment is.
     pub fn check_references(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<Issue> {
+        let mut issues = self.check_same_values(env);
+        for (at, secret) in self.secret_refs() {
+            if let Some(name) = &secret.env {
+                match env(name) {
+                    Some(value) if !value.trim().is_empty() => {}
+                    Some(_) => issues.push(Issue::new(
+                        at,
+                        format!("environment variable {name} is empty"),
+                    )),
+                    None => issues.push(Issue::new(
+                        at,
+                        format!("environment variable {name} is not set"),
+                    )),
+                }
+            } else if let Some(path) = &secret.file {
+                match std::fs::read_to_string(path) {
+                    Ok(value) if !value.trim().is_empty() => {}
+                    Ok(_) => issues.push(Issue::new(
+                        at,
+                        format!("secret file {} is empty", path.display()),
+                    )),
+                    Err(error) => issues.push(Issue::new(
+                        at,
+                        format!(
+                            "cannot read secret file {}: {}",
+                            path.display(),
+                            error.kind()
+                        ),
+                    )),
+                }
+            }
+        }
+        issues
+    }
+
+    /// The rules that compare resolved secret values: a caller token must not
+    /// equal an upstream key, another caller's token, or the admin token. A
+    /// secret that cannot be read is skipped here ([`Self::check_references`]
+    /// reports it), so a reload can ask about the caller keys without being
+    /// blocked by an unrelated secret that is unreadable at that moment.
+    pub fn check_same_values(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<Issue> {
         let mut issues = Vec::new();
         let read = |secret: &SecretRef| read_secret(secret, env).ok();
         // Two references can name the same value. A caller token equal to an
@@ -1034,37 +1182,6 @@ impl ServeConfig {
                     "admin.token",
                     "has the same value as a provider key or a caller key",
                 ));
-            }
-        }
-        for (at, secret) in self.secret_refs() {
-            if let Some(name) = &secret.env {
-                match env(name) {
-                    Some(value) if !value.trim().is_empty() => {}
-                    Some(_) => issues.push(Issue::new(
-                        at,
-                        format!("environment variable {name} is empty"),
-                    )),
-                    None => issues.push(Issue::new(
-                        at,
-                        format!("environment variable {name} is not set"),
-                    )),
-                }
-            } else if let Some(path) = &secret.file {
-                match std::fs::read_to_string(path) {
-                    Ok(value) if !value.trim().is_empty() => {}
-                    Ok(_) => issues.push(Issue::new(
-                        at,
-                        format!("secret file {} is empty", path.display()),
-                    )),
-                    Err(error) => issues.push(Issue::new(
-                        at,
-                        format!(
-                            "cannot read secret file {}: {}",
-                            path.display(),
-                            error.kind()
-                        ),
-                    )),
-                }
             }
         }
         issues
@@ -1285,6 +1402,35 @@ mod tests {
         tenant = "platform"
         secret = { env = "CI_GATEWAY_KEY" }
     "#;
+
+    #[test]
+    fn reload_watches_every_thirty_seconds_unless_told_otherwise() {
+        let config = ServeConfig::parse(MINIMAL, Format::Toml).unwrap();
+        assert!(config.reload.watch);
+        assert_eq!(
+            config.reload.poll_interval(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        let tuned = format!("{MINIMAL}\n[reload]\ninterval_secs = 5");
+        let tuned = ServeConfig::parse(&tuned, Format::Toml).unwrap();
+        assert_eq!(
+            tuned.reload.poll_interval(),
+            Some(std::time::Duration::from_secs(5))
+        );
+        let off = format!("{MINIMAL}\n[reload]\nwatch = false");
+        let off = ServeConfig::parse(&off, Format::Toml).unwrap();
+        assert_eq!(off.reload.poll_interval(), None);
+    }
+
+    #[test]
+    fn reload_settings_are_validated_and_closed() {
+        for bad in ["0", "90000"] {
+            let found = issues(&format!("{MINIMAL}\n[reload]\ninterval_secs = {bad}"));
+            assert!(has(&found, "reload.interval_secs"), "{found:?}");
+        }
+        let found = issues(&format!("{MINIMAL}\n[reload]\nsignal = true"));
+        assert!(!found.is_empty(), "an unknown reload setting is refused");
+    }
 
     fn issues(text: &str) -> Vec<String> {
         ServeConfig::parse(text, Format::Toml)
@@ -1686,6 +1832,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_keys_of_one_tenant_must_agree_on_their_rate_limits() {
+        let keys = |second: &str| {
+            format!(
+                "{MINIMAL}\n[[keys]]\nname = \"ci-two\"\ntenant = \"platform\"\n\
+                 secret = {{ env = \"OTHER_KEY\" }}\n{second}"
+            )
+        };
+        // MINIMAL's key has no limits; a second key of the tenant with one differs.
+        let found = issues(&keys("rpm = 60"));
+        assert!(has(&found, "keys[1].rpm"), "{found:?}");
+        let found = issues(&keys("tpm = 1000"));
+        assert!(has(&found, "keys[1].tpm"), "{found:?}");
+        // Agreeing (here, both unlimited) is fine, and so are different tenants.
+        assert!(ServeConfig::parse(&keys(""), Format::Toml).is_ok());
+        let other_tenant = keys("rpm = 60").replace(
+            "tenant = \"platform\"\nsecret",
+            "tenant = \"other\"\nsecret",
+        );
+        assert!(ServeConfig::parse(&other_tenant, Format::Toml).is_ok());
     }
 
     #[test]

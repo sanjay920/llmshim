@@ -8,8 +8,11 @@
 
 use super::config::{read_secret, Issue, ProviderKind, ServeConfig};
 use super::keys::build_key_store;
+use super::reload::ReloadHandles;
 use crate::breaker::BreakerConfig;
+use crate::gateway::auth::{KeyStore, LiveKeys};
 use crate::gateway::http::{app_with_parts, GatewayState, LocalParts};
+use crate::gateway::usage::TenantNames;
 use crate::gateway::GatewayConfig;
 use crate::provider::Provider;
 use crate::providers::{
@@ -55,6 +58,8 @@ pub struct Built {
     pub admin_authenticated: bool,
     /// The log files this server writes, to be closed at shutdown.
     pub logs: Logs,
+    /// What a [`super::Reloader`] replaces while the server runs.
+    pub reload: ReloadHandles,
 }
 
 /// The log destinations the server writes. Each queues lines for a writer
@@ -145,13 +150,16 @@ pub async fn build_app(
         }
     };
 
-    let keystore = match build_key_store(config, env) {
-        Ok(store) => Some(store),
+    // One key store, shared by the gateway, the access log and the certificate
+    // binding, so a reload replaces what all three consult in a single step.
+    let keys = match build_key_store(config, env) {
+        Ok(store) => Some(LiveKeys::new(store)),
         Err(found) => {
             issues.extend(found);
             None
         }
     };
+    let tenants = TenantNames::new(config.keys.iter().map(|key| key.tenant.clone()));
 
     let router = build_router(config, env, &mut issues);
 
@@ -192,9 +200,10 @@ pub async fn build_app(
         issues.extend(config.check_references(env));
     }
 
-    let (Some(keystore), true) = (keystore, issues.is_empty()) else {
+    let (Some(keys), true) = (keys, issues.is_empty()) else {
         return Err(issues);
     };
+    let keystore = KeyStore::Live(keys.clone());
 
     // Nothing is created on disk until the configuration is known to be good,
     // and the directory is private, as the receipt store makes its own.
@@ -250,14 +259,12 @@ pub async fn build_app(
             logs.push(log.clone());
             // An open server (`allow_unauthenticated`) attributes every request to
             // the tenant "anonymous", which no key names.
-            let mut tenants: std::collections::BTreeSet<String> =
-                config.keys.iter().map(|key| key.tenant.clone()).collect();
             if !keystore.is_enforced() {
-                tenants.insert("anonymous".into());
+                tenants.add(["anonymous".to_owned()]);
             }
             Some(crate::gateway::usage::UsageSetup {
                 sink: Arc::new(UsageLog(log)),
-                tenants: tenants.into_iter().collect(),
+                tenants: tenants.clone(),
             })
         }
         Some(Err(message)) => {
@@ -315,6 +322,11 @@ pub async fn build_app(
                 idempotency_ttl_secs,
                 max_retained_accounting_attempts: retained,
                 usage,
+                // A reload can re-limit a tenant, and the bucket it already has
+                // must follow. Validation requires the keys of one tenant to
+                // agree on their limits, so no two of them can pull one bucket
+                // in different directions.
+                retune_tenant_limits: true,
             },
         ),
         Some(url) => match fleet_state(
@@ -346,6 +358,8 @@ pub async fn build_app(
 
     let admin_authenticated = admin_token.is_some();
     let admin_state = state.clone();
+    let reload = ReloadHandles::new(keys.clone(), tenants);
+    let reload_status = reload.status_handle();
     let app = app_with_parts(
         state,
         // No browser origin is trusted. Browsers are not callers of a gateway.
@@ -358,6 +372,13 @@ pub async fn build_app(
             // The admin routes never read the key store, but the internal header
             // is stripped here too, so it is never present on any listener.
             let routes = crate::gateway::http::admin_routes(admin_state)
+                .route(
+                    "/v1/serve/config",
+                    axum::routing::get(move || {
+                        let status = reload_status.snapshot();
+                        async move { axum::Json(status) }
+                    }),
+                )
                 .layer(axum::middleware::from_fn(super::mtls::strip_peer_header));
             let routes = match admin_token {
                 Some(digest) => routes.layer(axum::middleware::from_fn(
@@ -379,46 +400,29 @@ pub async fn build_app(
     // before it reaches a handler and the 404 for a hidden admin path. It
     // resolves the caller with a store of its own built from the same file.
     let app = match access_log {
-        Some(log) => match build_key_store(config, env) {
-            Ok(keys) => {
-                let keys = Arc::new(keys);
-                app.layer(axum::middleware::from_fn(
-                    move |request: Request, next: Next| {
-                        super::access_log::record_request(log.clone(), keys.clone(), request, next)
-                    },
-                ))
-            }
-            Err(issues) => return Err(issues),
-        },
+        Some(log) => {
+            let keys = Arc::new(KeyStore::Live(keys.clone()));
+            app.layer(axum::middleware::from_fn(
+                move |request: Request, next: Next| {
+                    super::access_log::record_request(log.clone(), keys.clone(), request, next)
+                },
+            ))
+        }
         None => app,
     };
-    // With client certificates required, bind the verified certificate's name to
-    // each request, and strip the internal header from everything a caller sends.
-    // Outermost, so nothing (not the access log, not the gateway) sees a value
-    // the TLS layer did not set.
+    // Bind the verified client certificate's name to each request, and strip the
+    // internal header from everything a caller sends. Outermost, so nothing (not
+    // the access log, not the gateway) sees a value the TLS layer did not set.
     // The layer runs whether or not client certificates are required: without
-    // them the set of known names is empty, so it strips the header and binds
-    // nothing, and the defence does not depend on what the configuration
-    // validation guarantees about `client_san`.
-    let known: std::collections::HashSet<String> = if config
-        .server
-        .tls
-        .as_ref()
-        .is_some_and(|tls| tls.client_ca_file.is_some())
-    {
-        config
-            .keys
-            .iter()
-            .filter_map(|key| key.client_san.as_deref())
-            .map(super::config::canonical_san)
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
-    let known = Arc::new(known);
+    // them there is no certificate to bind, so it only strips, and the defence
+    // does not depend on what the configuration validation guarantees about
+    // `client_san`. It asks the same live key store as the gateway which workloads
+    // exist, so a reload that adds or removes one applies to connections that are
+    // already open.
+    let peers = Arc::new(KeyStore::Live(keys.clone()));
     let app = app.layer(axum::middleware::from_fn(
         move |request: Request, next: Next| {
-            super::mtls::bind_peer_identity(known.clone(), request, next)
+            super::mtls::bind_peer_identity(peers.clone(), request, next)
         },
     ));
     Ok(Built {
@@ -432,6 +436,7 @@ pub async fn build_app(
         authenticated,
         admin_authenticated,
         logs: Logs(logs),
+        reload,
     })
 }
 
