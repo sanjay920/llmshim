@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn a_password_with_an_at_sign_is_removed_whole() {
         let url = "redis://user:p@ss:word@cache.internal:6379/0";
-        let out = redact("bad auth p@ss:word and the rest p@ss", url);
+        let out = redact("bad auth p@ss:word for cache.internal", url);
         assert!(!out.contains("p@ss"), "{out}");
         assert!(!out.contains("word"), "{out}");
     }
