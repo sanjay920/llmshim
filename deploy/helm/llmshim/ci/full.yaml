@@ -1,6 +1,7 @@
 # Every optional feature on, for validation.
 replicaCount: 3
 existingSecret: llmshim-secrets
+secretRevision: "2026-11-13"
 server:
   tls:
     enabled: true
