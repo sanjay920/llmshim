@@ -24,7 +24,7 @@ RUN mkdir -p examples benchmarks && \
           benchmarks/bench.rs benchmarks/loadtest.rs benchmarks/gateway_loadtest.rs
 
 # Build with rustls (no OpenSSL needed) + strip binary
-RUN cargo build --release --features ${FEATURES} && \
+RUN cargo build --release --locked --features ${FEATURES} && \
     strip target/release/llmshim
 
 # Runtime stage — distroless (just glibc + CA certs, no shell)

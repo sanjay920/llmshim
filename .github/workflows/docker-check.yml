@@ -24,15 +24,17 @@ jobs:
         run: docker build --tag llmshim-ci .
       - name: Start it and probe /health
         run: |
-          id=$(docker run -d --rm -e OPENAI_API_KEY=ci-not-a-real-key \
+          # No --rm: a binary that dies at exec (a glibc mismatch, say) must
+          # leave its container behind so the log below can still be read.
+          id=$(docker run -d -e OPENAI_API_KEY=ci-not-a-real-key \
             -e LLMSHIM_CATALOG_OFFLINE=1 -p 3000:3000 llmshim-ci proxy)
           for attempt in $(seq 1 20); do
             if curl --fail --silent http://127.0.0.1:3000/health; then
-              docker stop "$id" >/dev/null
+              docker rm -f "$id" >/dev/null
               exit 0
             fi
             sleep 1
           done
           docker logs "$id"
-          docker stop "$id" >/dev/null || true
+          docker rm -f "$id" >/dev/null || true
           exit 1
