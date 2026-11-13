@@ -950,7 +950,7 @@ mod tests {
             (Format::Json, &json_files[..]),
         ] {
             for text in files {
-                let found = ServeConfig::parse(text, format).err().expect(text);
+                let found = ServeConfig::parse(text, format).expect_err(text);
                 let shown = found
                     .iter()
                     .map(Issue::to_string)
