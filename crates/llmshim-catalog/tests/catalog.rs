@@ -582,8 +582,8 @@ fn gemini_4_carbon_is_priced_at_the_published_rates() {
         .unwrap()
         .cost
         .unwrap();
-    assert_eq!((cost.input, cost.output), (Some(2.0), Some(10.0)));
-    assert_eq!(cost.cache_read, Some(0.1));
+    assert_eq!((cost.input, cost.output), (Some(4.0), Some(20.0)));
+    assert_eq!(cost.cache_read, Some(0.2));
 }
 
 #[test]
@@ -604,6 +604,6 @@ fn anthropic_5_5_cache_rates_match_the_published_table() {
         .unwrap()
         .cost
         .unwrap();
-    assert_eq!((argon.input, argon.output), (Some(2.0), Some(10.0)));
-    assert_eq!(argon.cache_read, Some(0.1));
+    assert_eq!((argon.input, argon.output), (Some(4.0), Some(20.0)));
+    assert_eq!(argon.cache_read, Some(0.2));
 }
