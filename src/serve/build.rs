@@ -534,7 +534,8 @@ mod tests {
         let url = "redis://user:p@ss:word@cache.internal:6379/0";
         let out = redact("bad auth p@ss:word for cache.internal", url);
         assert!(!out.contains("p@ss"), "{out}");
-        assert!(!out.contains("word"), "{out}");
+        assert!(!out.contains(":word"), "{out}");
+        assert!(out.contains("<password>"), "{out}");
     }
 
     #[test]
