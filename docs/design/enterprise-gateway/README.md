@@ -39,6 +39,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0003: Caller keys under serve](0003-caller-keys.md)
 - [0004: serve runs the gateway from a file](0004-serve-boot.md)
 - [0005: A separate listener for operational endpoints](0005-admin-listener.md)
+- [0006: Fleet mode under serve](0006-fleet-mode.md)
 
 ## Roadmap
 
@@ -57,7 +58,7 @@ Phase 0: a production server mode
       hashed caller keys (0004)
 - [ ] Bedrock, Vertex and Azure configurable from the file; a provider whose
       feature is not compiled is a startup error naming the rebuild flag
-- [ ] Redis fleet mode under `serve`
+- [x] Redis fleet mode under `serve`, behind `serve-redis` (0006)
 - [ ] Configuration reload without restart
 - [x] Separately bound, optionally token-protected `/metrics`, stats and probes (0005)
 - [ ] TLS termination

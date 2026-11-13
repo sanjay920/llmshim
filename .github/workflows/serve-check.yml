@@ -25,3 +25,32 @@ jobs:
           cargo test --locked --features serve --lib serve::
           cargo test --locked --features serve --test unit_serve_cli
           cargo test --locked --features serve --test integration_serve
+
+  serve-redis-check:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --features serve-redis -- -D warnings
+      - name: Fleet tests against a real Redis
+        env:
+          LLMSHIM_CATALOG_OFFLINE: '1'
+          LLMSHIM_TEST_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          cargo test --locked --features serve-redis --lib serve::
+          # The shared gateway code `serve` converted to take explicit parts:
+          # its regression tests are in the library, which no other PR job runs.
+          cargo test --locked --features serve-redis --lib gateway::
+          cargo test --locked --features serve-redis --test integration_serve
+          cargo test --locked --features serve-redis --test integration_serve_fleet -- --ignored

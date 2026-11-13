@@ -40,6 +40,13 @@ pub struct Built {
     /// The operational endpoints on a listener of their own, when `[admin]` is
     /// configured. The main application then answers 404 for those paths.
     pub admin: Option<(axum::Router, SocketAddr)>,
+    /// Whether this replica shares state with a fleet through Redis.
+    pub fleet: bool,
+    /// The fleet state whose queue workers are not running yet. They lease jobs
+    /// from peers, so they start only after both listeners are bound
+    /// ([`start_fleet_workers`]); until then a failure to start leaves nothing
+    /// leased.
+    pub unstarted_fleet: Option<Arc<GatewayState>>,
     /// Provider names, for the startup banner.
     pub providers: Vec<String>,
     pub caller_keys: usize,
@@ -69,13 +76,46 @@ pub fn admin_token_digest(
     Ok(Some(Sha256::digest(token.as_bytes()).to_vec()))
 }
 
+/// Start the queue workers of a fleet replica (`Built::unstarted_fleet`, taken
+/// out of the `Built`). Call once, after every listener is bound.
+pub fn start_fleet_workers(unstarted: Option<Arc<GatewayState>>) {
+    #[cfg(feature = "serve-redis")]
+    if let Some(state) = unstarted {
+        state.start_workers();
+    }
+    #[cfg(not(feature = "serve-redis"))]
+    drop(unstarted);
+}
+
+/// The fleet's Redis URL, if `[fleet]` is configured, after the check that it
+/// is a Redis URL. Shared by `build_app` and `serve --check`, so a URL that
+/// `--check` accepts is one the server can start with. The error never carries
+/// the URL.
+pub fn fleet_redis_url(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>, Issue> {
+    let Some(fleet) = &config.fleet else {
+        return Ok(None);
+    };
+    let issue = |message: String| Issue {
+        path: "fleet.redis_url".into(),
+        message,
+    };
+    let url = read_secret(&fleet.redis_url, env).map_err(issue)?;
+    if !super::config::is_redis_url(&url) {
+        return Err(issue("must start with redis:// or rediss://".into()));
+    }
+    Ok(Some(url))
+}
+
 /// Build the application. Must be called inside a Tokio runtime, because the
 /// scheduler starts its lane tasks.
-pub fn build_app(
+pub async fn build_app(
     config: &ServeConfig,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Built, Vec<Issue>> {
-    let mut issues = Vec::new();
+    let mut issues = config.feature_issues();
 
     let address = match parse_address(&config.server.host, config.server.port) {
         Ok(address) => address,
@@ -97,6 +137,14 @@ pub fn build_app(
     };
 
     let router = build_router(config, env, &mut issues);
+
+    let redis_url = match fleet_redis_url(config, env) {
+        Ok(url) => url,
+        Err(issue) => {
+            issues.push(issue);
+            None
+        }
+    };
 
     let admin_token = match admin_token_digest(config, env) {
         Ok(digest) => digest,
@@ -178,18 +226,47 @@ pub fn build_app(
 
     let authenticated = keystore.is_enforced();
     let providers = config.providers.keys().cloned().collect();
-    let state = GatewayState::from_parts(
-        router,
-        None,
-        LocalParts {
-            config: gateway,
-            breaker: crate::proxy::health::build_breaker_with(BreakerConfig::default(), None),
-            limiter: Arc::new(InMemoryRateLimiter::new(rate_limits.clone())),
+    let retained = crate::gateway::attempt::default_retained_accounting_attempts();
+    let breaker_config = BreakerConfig::default();
+    let fleet = redis_url.is_some();
+    let mut unstarted_fleet = None;
+    let state = match redis_url {
+        None => GatewayState::from_parts(
+            router,
+            None,
+            LocalParts {
+                config: gateway,
+                breaker: crate::proxy::health::build_breaker_with(breaker_config, None),
+                limiter: Arc::new(InMemoryRateLimiter::new(rate_limits.clone())),
+                rate_limits,
+                keystore,
+                idempotency_ttl_secs,
+                max_retained_accounting_attempts: retained,
+            },
+        ),
+        Some(url) => match fleet_state(
+            router,
+            &url,
+            gateway,
             rate_limits,
             keystore,
             idempotency_ttl_secs,
+            retained,
+        )
+        .await
+        {
+            Ok(state) => {
+                unstarted_fleet = Some(state.clone());
+                state
+            }
+            Err(message) => {
+                return Err(vec![Issue {
+                    path: "fleet.redis_url".into(),
+                    message,
+                }])
+            }
         },
-    );
+    };
 
     let admin_authenticated = admin_token.is_some();
     let admin_state = state.clone();
@@ -224,6 +301,8 @@ pub fn build_app(
         admin,
         address,
         providers,
+        fleet,
+        unstarted_fleet,
         caller_keys: config.keys.len(),
         authenticated,
         admin_authenticated,
@@ -360,6 +439,67 @@ fn hosted(kind: ProviderKind, key: String, base_url: Option<String>) -> Box<dyn 
     }
 }
 
+/// Build the fleet (Redis-backed) state. Without the `serve-redis` feature this
+/// cannot be reached: `feature_issues` has already refused the configuration.
+#[cfg(feature = "serve-redis")]
+async fn fleet_state(
+    router: Router,
+    url: &str,
+    gateway: GatewayConfig,
+    rate_limits: RateLimitConfig,
+    keystore: crate::gateway::auth::KeyStore,
+    idempotency_ttl_secs: u64,
+    max_retained_accounting_attempts: usize,
+) -> Result<Arc<GatewayState>, String> {
+    use crate::gateway::distributed::Tuning;
+    use crate::gateway::http::DistributedParts;
+    use crate::proxy::ratelimit::build_limiter_with;
+    let parts = DistributedParts {
+        tuning: Tuning::defaults(&gateway),
+        breaker: crate::proxy::health::build_breaker_with(BreakerConfig::default(), Some(url)),
+        limiter: build_limiter_with(rate_limits.clone(), Some(url)),
+        config: gateway,
+        rate_limits,
+        keystore,
+        idempotency_ttl_secs,
+        max_retained_accounting_attempts,
+    };
+    GatewayState::distributed_unstarted(router, None, url, parts)
+        .await
+        .map_err(|error| format!("cannot start fleet mode: {}", redact(&error, url)))
+}
+
+#[cfg(not(feature = "serve-redis"))]
+async fn fleet_state(
+    _router: Router,
+    _url: &str,
+    _gateway: GatewayConfig,
+    _rate_limits: RateLimitConfig,
+    _keystore: crate::gateway::auth::KeyStore,
+    _idempotency_ttl_secs: u64,
+    _max_retained_accounting_attempts: usize,
+) -> Result<Arc<GatewayState>, String> {
+    Err("fleet mode needs a binary built with --features serve-redis".into())
+}
+
+/// Remove the Redis URL, and any password inside it, from an error message.
+#[cfg_attr(not(feature = "serve-redis"), allow(dead_code))]
+fn redact(message: &str, url: &str) -> String {
+    let mut out = message.replace(url, "<redis_url>");
+    // Split at the LAST '@': a host never contains one, so everything before it
+    // is the user info even when the password holds an unescaped '@'.
+    if let Some(password) = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.rsplit_once('@'))
+        .and_then(|(userinfo, _)| userinfo.split_once(':'))
+        .map(|(_, password)| password)
+        .filter(|password| !password.is_empty())
+    {
+        out = out.replace(password, "<password>");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +515,27 @@ mod tests {
 
     fn with(value: &'static str) -> impl Fn(&str) -> Option<String> {
         move |name| (name == "ADMIN").then(|| value.to_string())
+    }
+
+    #[test]
+    fn errors_never_carry_the_redis_url_or_its_password() {
+        let url = "redis://user:s3cretpass@cache.internal:6379/0";
+        let message = format!("failed to connect to {url}: bad auth s3cretpass");
+        let out = redact(&message, url);
+        assert!(
+            !out.contains("s3cretpass") && !out.contains("cache.internal"),
+            "{out}"
+        );
+        assert_eq!(redact("Connection refused", url), "Connection refused");
+    }
+
+    #[test]
+    fn a_password_with_an_at_sign_is_removed_whole() {
+        let url = "redis://user:p@ss:word@cache.internal:6379/0";
+        let out = redact("bad auth p@ss:word for cache.internal", url);
+        assert!(!out.contains("p@ss"), "{out}");
+        assert!(!out.contains(":word"), "{out}");
+        assert!(out.contains("<password>"), "{out}");
     }
 
     #[test]

@@ -24,6 +24,9 @@ redis-coordination = ["proxy", "dep:redis"]
 # In development: a config-file-driven server (`llmshim serve`). Off by default
 # and implied by no other feature; see docs/design/enterprise-gateway.
 serve = ["gateway"]
+# `serve` with fleet mode: a shared Redis queue, rate limits, spend ledger and
+# provider health across replicas. Needed for the `[fleet]` configuration table.
+serve-redis = ["serve", "gateway-redis"]
 
 # Cloud transport dependencies are opt-in for library consumers and bundled binaries.
 bedrock = [

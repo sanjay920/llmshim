@@ -680,7 +680,10 @@ only and never echoed, unauthenticated serving is explicit, and the file is the
 source of every setting that belongs to the server (it reads the environment
 to resolve `{ env = ... }` references; the process-wide settings of the shared
 HTTP client and listener, and the standard `HTTP_PROXY`/`HTTPS_PROXY`/
-`ALL_PROXY` variables, still apply and are listed in 0002 and 0004). Fleet (Redis) mode, reload and TLS are not
+`ALL_PROXY` variables, still apply and are listed in 0002 and 0004). A `[fleet]`
+table (binary built with `--features serve-redis`) shares the queue, limits,
+spend and provider health through Redis; an `[admin]` table moves the
+operational endpoints to their own listener. Reload and TLS are not
 implemented. The feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,
 `gateway` and `gateway-redis` builds must not change; `tests/unit_serve_cli.rs`
