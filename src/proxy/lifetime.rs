@@ -28,17 +28,28 @@ pub(crate) struct LogicalRequestDeadlines {
 
 impl LogicalRequestDeadlines {
     pub(crate) fn from_env() -> Self {
+        Self::proxy_from_lookup(&|key| std::env::var(key).ok())
+    }
+
+    #[cfg(feature = "gateway")]
+    pub(crate) fn gateway_from_env() -> Self {
+        Self::gateway_from_lookup(&|key| std::env::var(key).ok())
+    }
+
+    /// The proxy's two lifetimes, under their real variable names.
+    pub(crate) fn proxy_from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
         Self::from_lookup(
-            &|key| std::env::var(key).ok(),
+            lookup,
             "LLMSHIM_PROXY_UNARY_TIMEOUT_MS",
             "LLMSHIM_PROXY_STREAM_TIMEOUT_MS",
         )
     }
 
+    /// The gateway's two job deadlines, under their real variable names.
     #[cfg(feature = "gateway")]
-    pub(crate) fn gateway_from_env() -> Self {
+    pub(crate) fn gateway_from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
         Self::from_lookup(
-            &|key| std::env::var(key).ok(),
+            lookup,
             "LLMSHIM_GATEWAY_UNARY_JOB_TIMEOUT_MS",
             "LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS",
         )
@@ -810,6 +821,28 @@ mod environment_contract {
             "UNARY",
             "STREAM",
         )
+    }
+
+    #[test]
+    fn the_real_variable_names_map_to_the_right_lifetimes() {
+        // Swapping the proxy and gateway names, or unary and stream, would
+        // otherwise pass: the other tests use stand-in names.
+        let proxy = |key: &str| match key {
+            "LLMSHIM_PROXY_UNARY_TIMEOUT_MS" => Some("11".to_string()),
+            "LLMSHIM_PROXY_STREAM_TIMEOUT_MS" => Some("22".to_string()),
+            "LLMSHIM_GATEWAY_UNARY_JOB_TIMEOUT_MS" => Some("33".to_string()),
+            "LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS" => Some("44".to_string()),
+            _ => None,
+        };
+        let deadlines = LogicalRequestDeadlines::proxy_from_lookup(&proxy);
+        assert_eq!(deadlines.unary, Duration::from_millis(11));
+        assert_eq!(deadlines.stream, Duration::from_millis(22));
+        #[cfg(feature = "gateway")]
+        {
+            let deadlines = LogicalRequestDeadlines::gateway_from_lookup(&proxy);
+            assert_eq!(deadlines.unary, Duration::from_millis(33));
+            assert_eq!(deadlines.stream, Duration::from_millis(44));
+        }
     }
 
     #[test]
