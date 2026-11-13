@@ -55,8 +55,14 @@ reload_interval_secs = {{ .Values.server.tls.reloadIntervalSecs }}
 [admin]
 host = "0.0.0.0"
 port = {{ .Values.admin.port }}
-{{- if .Values.admin.tokenEnv }}
+{{- if and .Values.admin.tokenEnv .Values.admin.allowUnauthenticated }}
+{{- fail "admin.tokenEnv and admin.allowUnauthenticated are mutually exclusive" }}
+{{- else if .Values.admin.tokenEnv }}
 token = { env = {{ .Values.admin.tokenEnv | quote }} }
+{{- else if .Values.admin.allowUnauthenticated }}
+allow_unauthenticated = true
+{{- else }}
+{{- fail "set admin.tokenEnv, or set admin.allowUnauthenticated=true to serve /metrics and the stats without a token" }}
 {{- end }}
 
 [state]
@@ -71,6 +77,10 @@ access_log = {{ .Values.logging.accessLog | quote }}
 
 [fleet]
 redis_url = { env = {{ .Values.fleet.redisUrlEnv | quote }} }
+{{- end }}
+
+{{- if contains "admin.tls" .Values.config }}
+{{- fail "the chart does not support [admin.tls]: the probes use plain HTTP on the admin port" }}
 {{- end }}
 
 {{ .Values.config }}

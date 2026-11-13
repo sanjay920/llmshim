@@ -15,6 +15,7 @@
 //! Design notes: `docs/design/enterprise-gateway/0001-server-config.md`.
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -37,10 +38,28 @@ pub struct Issue {
 impl Issue {
     fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            path: path.into(),
-            message: message.into(),
+            path: printable(&path.into()),
+            message: printable(&message.into()),
         }
     }
+}
+
+/// Paths and messages can carry a name taken from the file. Escape control
+/// characters so one cannot break a line, or forge a CI annotation, in the
+/// output of `--check`.
+fn printable(text: &str) -> String {
+    if !text.chars().any(char::is_control) {
+        return text.to_string();
+    }
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
 }
 
 impl fmt::Display for Issue {
@@ -199,13 +218,17 @@ pub struct Admin {
     pub port: u16,
     /// Bearer token required for `/metrics` and `/v1/gateway/stats`, by
     /// reference. `/health` and `/ready` stay open so orchestrators can probe.
-    /// Without it the admin listener is open and must be protected by the
-    /// network.
+    /// Set this or `allow_unauthenticated`; neither is an error.
     #[serde(default)]
     pub token: Option<SecretRef>,
     /// Terminate TLS on the admin listener as well.
     #[serde(default)]
     pub tls: Option<Tls>,
+    /// Serve the operational endpoints without a token. Without this, an
+    /// `[admin]` table must set `token`: like the main listener, the admin
+    /// listener is never open by accident.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 /// Where the server keeps what it must remember between requests.
@@ -438,17 +461,24 @@ impl ServeConfig {
     /// Parse and validate. Returns every semantic issue found; a syntax or
     /// shape error is reported alone, because nothing after it can be trusted.
     pub fn parse(text: &str, format: Format) -> Result<Self, Vec<Issue>> {
+        // A different version may mean different fields, so it is judged before
+        // the strict parse would reject a field of the newer schema by name.
+        if let Some(issue) = unsupported_version(text, format) {
+            return Err(vec![issue]);
+        }
         let config: Self = match format {
-            Format::Toml => {
-                toml::from_str(text).map_err(|error| vec![Issue::new("(file)", error.message())])?
-            }
+            Format::Toml => toml::from_str(text).map_err(|error| {
+                let at = error.span().map(|span| position(text, span.start));
+                vec![Issue::new("(file)", describe(error.message(), at))]
+            })?,
             Format::Json => serde_json::from_str(text).map_err(|error| {
-                vec![Issue::new(
-                    "(file)",
-                    // serde_json's message carries no input text beyond the
-                    // offending key name.
-                    error.to_string(),
-                )]
+                let at = (error.line() > 0).then(|| (error.line(), error.column()));
+                // serde_json appends " at line L column C" to its text.
+                let full = error.to_string();
+                let message = full
+                    .rsplit_once(" at line ")
+                    .map_or(&*full, |(head, _)| head);
+                vec![Issue::new("(file)", describe(message, at))]
             })?,
         };
         let issues = config.validate();
@@ -581,6 +611,18 @@ impl ServeConfig {
                 "admin.port",
                 "must differ from server.port when both listen on the same address",
             ));
+        }
+        match (&admin.token, admin.allow_unauthenticated) {
+            (None, false) => issues.push(Issue::new(
+                "admin.token",
+                "set a token, or set admin.allow_unauthenticated = true to serve \
+                 /metrics and /v1/gateway/stats without one",
+            )),
+            (Some(_), true) => issues.push(Issue::new(
+                "admin.allow_unauthenticated",
+                "cannot be true while admin.token is set",
+            )),
+            _ => {}
         }
         if let Some(token) = &admin.token {
             validate_secret(token, "admin.token", issues);
@@ -790,6 +832,11 @@ impl ServeConfig {
             let model = route.model.trim();
             if model.is_empty() {
                 issues.push(Issue::new(format!("{at}.model"), "must not be empty"));
+            } else if model != route.model {
+                issues.push(Issue::new(
+                    format!("{at}.model"),
+                    "must not have leading or trailing whitespace",
+                ));
             } else if model.starts_with("route/") {
                 issues.push(Issue::new(
                     format!("{at}.model"),
@@ -866,25 +913,33 @@ impl ServeConfig {
         let read = |secret: &SecretRef| read_secret(secret, env).ok();
         // Two references can name the same value. A caller token equal to an
         // upstream key would make that upstream key a valid bearer token.
+        // Compared as digests, so a `sha256` key is held to the same rule as a
+        // `secret` key.
+        let digest = |value: &str| format!("{:x}", Sha256::digest(value.as_bytes()));
         let upstream: Vec<String> = self
             .providers
             .values()
             .filter_map(|provider| provider.api_key.as_ref())
             .filter_map(read)
+            .map(|value| digest(&value))
             .collect();
         let mut callers = BTreeSet::new();
         for (index, key) in self.keys.iter().enumerate() {
-            let Some(value) = key.secret.as_ref().and_then(read) else {
-                continue;
+            let (at, caller) = match (&key.secret, &key.sha256) {
+                (Some(secret), None) => match read(secret) {
+                    Some(value) => (format!("keys[{index}].secret"), digest(&value)),
+                    None => continue,
+                },
+                (None, Some(sha256)) => (format!("keys[{index}].sha256"), sha256.clone()),
+                _ => continue,
             };
-            let at = format!("keys[{index}].secret");
-            if upstream.contains(&value) {
+            if upstream.contains(&caller) {
                 issues.push(Issue::new(
                     &at,
                     "has the same value as a provider's api_key",
                 ));
             }
-            if !callers.insert(value) {
+            if !callers.insert(caller) {
                 issues.push(Issue::new(&at, "has the same value as another caller key"));
             }
         }
@@ -893,7 +948,9 @@ impl ServeConfig {
             .as_ref()
             .and_then(|admin| admin.token.as_ref())
             .and_then(read)
+            .map(|value| digest(&value))
         {
+            // Both sets hold digests, so this holds for `sha256` caller keys too.
             if upstream.contains(&value) || callers.contains(&value) {
                 issues.push(Issue::new(
                     "admin.token",
@@ -970,6 +1027,68 @@ pub(crate) fn read_secret(
         });
     }
     Ok(value.to_string())
+}
+
+/// Line and column (1-based) of a byte offset.
+fn position(text: &str, offset: usize) -> (usize, usize) {
+    let offset = offset.min(text.len());
+    let before = &text.as_bytes()[..offset];
+    let line = before.iter().filter(|b| **b == b'\n').count() + 1;
+    let column = offset
+        - before
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |i| i + 1)
+        + 1;
+    (line, column)
+}
+
+/// Turn a parser message into one that is safe to print.
+///
+/// serde formats a value of the wrong kind as `invalid type: string "<value>",
+/// expected ...`, and an unknown enum value as ``unknown variant `<value>` ``,
+/// so a secret pasted where a table or a name was expected would be echoed.
+/// Those two shapes keep only what the format expected; every other shape
+/// names a key, a count or a fixed phrase, and is kept.
+fn describe(raw: &str, at: Option<(usize, usize)>) -> String {
+    let after = |marker: &str| raw.rfind(marker).map(|i| &raw[i + marker.len()..]);
+    let message = if raw.starts_with("unknown variant `") {
+        match after("`, expected ") {
+            Some(expected) => format!("unknown value, expected {expected}"),
+            None => "unknown value".to_string(),
+        }
+    } else if raw.starts_with("invalid type: ") || raw.starts_with("invalid value: ") {
+        match after(", expected ") {
+            Some(expected) => format!("wrong kind of value (not shown), expected {expected}"),
+            None => "wrong kind of value (not shown)".to_string(),
+        }
+    } else {
+        raw.to_string()
+    };
+    match at {
+        Some((line, column)) => format!("{message} (line {line}, column {column})"),
+        None => message,
+    }
+}
+
+/// `version` read on its own, so that a file of another version is reported as
+/// such whatever else it contains.
+fn unsupported_version(text: &str, format: Format) -> Option<Issue> {
+    #[derive(Deserialize)]
+    struct Probe {
+        version: Option<i64>,
+    }
+    let probe: Probe = match format {
+        Format::Toml => toml::from_str(text).ok()?,
+        Format::Json => serde_json::from_str(text).ok()?,
+    };
+    let version = probe.version?;
+    (version != i64::from(VERSION)).then(|| {
+        Issue::new(
+            "version",
+            format!("unsupported version {version}; this build reads version {VERSION}"),
+        )
+    })
 }
 
 const NAME_RULE: &str =
@@ -1110,8 +1229,13 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_errors_at_every_level() {
+        // Before `version`, so it sits at the top level rather than inside the
+        // last `[[keys]]` table.
+        let at_top = format!("surprise = 1\n{MINIMAL}");
+        let found = issues(&at_top);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("surprise"), "{found:?}");
         for extra in [
-            "\nsurprise = 1",
             "\n[server]\nsurprise = 1",
             "\n[limits]\nsurprise = 1",
             "\n[limits.providers.openai]\nsurprise = 1",
@@ -1130,6 +1254,124 @@ mod tests {
             "{ env = \"OPENAI_API_KEY\", surprise = 1 }",
         );
         assert!(issues(&in_secret)[0].contains("surprise"));
+    }
+
+    #[test]
+    fn a_value_in_the_wrong_place_is_never_echoed() {
+        const TOKEN: &str = "tok-0123456789-do-not-print";
+        let toml_files = [
+            format!("version = 1\nkeys = [\"{TOKEN}\"]"),
+            format!("version = 1\n[providers]\nopenai = \"{TOKEN}\""),
+            format!("{MINIMAL}\n[providers.other]\nkind = \"{TOKEN}\""),
+            "version = 1\n[providers.p]\nkind = \"openai\"\napi_key = 4929183".to_string(),
+            format!("version = 1\n[server]\nport = \"{TOKEN}\""),
+            format!("version = 1\n[server]\nhost = [\"{TOKEN}\"]"),
+        ];
+        let json_files = [
+            format!(r#"{{"version":1,"keys":["{TOKEN}"]}}"#),
+            format!(r#"{{"version":1,"providers":{{"openai":"{TOKEN}"}}}}"#),
+            format!(r#"{{"version":1,"providers":{{"p":{{"kind":"{TOKEN}"}}}}}}"#),
+            r#"{"version":1,"providers":{"p":{"kind":"openai","api_key":4929183}}}"#.to_string(),
+            format!(r#"{{"version":1,"server":{{"port":"{TOKEN}"}}}}"#),
+        ];
+        for (format, files) in [
+            (Format::Toml, &toml_files[..]),
+            (Format::Json, &json_files[..]),
+        ] {
+            for text in files {
+                let found = ServeConfig::parse(text, format).expect_err(text);
+                let shown = found
+                    .iter()
+                    .map(Issue::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(!shown.contains(TOKEN), "{format:?}: {shown}");
+                assert!(!shown.contains("4929183"), "{format:?}: {shown}");
+                assert!(shown.contains("line"), "{format:?}: no position in {shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unknown_enum_value_keeps_the_choices_and_drops_the_value() {
+        let found = issues(&MINIMAL.replace("kind = \"openai\"", "kind = \"hunter2-secret\""));
+        assert!(found[0].contains("expected one of"), "{found:?}");
+        assert!(!found[0].contains("hunter2-secret"), "{found:?}");
+    }
+
+    #[test]
+    fn control_characters_in_a_name_cannot_break_a_line() {
+        let found = issues(&format!(
+            "{MINIMAL}\n[routes.\"a\\nb\"]\nmodel = \"openai/x\""
+        ));
+        assert!(!found.is_empty());
+        for issue in &found {
+            assert!(!issue.contains('\n'), "{issue:?}");
+        }
+    }
+
+    #[test]
+    fn a_digest_key_cannot_equal_a_provider_key_or_another_callers_secret() {
+        let digest_of = |value: &str| format!("{:x}", Sha256::digest(value.as_bytes()));
+        let text = format!(
+            r#"
+            version = 1
+            [providers.openai]
+            kind = "openai"
+            api_key = {{ env = "UPSTREAM" }}
+            [[keys]]
+            name = "a"
+            tenant = "t"
+            sha256 = "{upstream}"
+            [[keys]]
+            name = "b"
+            tenant = "t"
+            secret = {{ env = "CALLER" }}
+            [[keys]]
+            name = "c"
+            tenant = "t"
+            sha256 = "{caller}"
+            "#,
+            upstream = digest_of("upstream-key-value"),
+            caller = digest_of("caller-token-value-0123"),
+        );
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        let env = |name: &str| match name {
+            "UPSTREAM" => Some("upstream-key-value".to_string()),
+            "CALLER" => Some("caller-token-value-0123".to_string()),
+            _ => None,
+        };
+        let found: Vec<String> = config
+            .check_references(&env)
+            .iter()
+            .map(Issue::to_string)
+            .collect();
+        assert!(has(&found, "keys[0].sha256"), "{found:?}");
+        assert!(found.iter().any(|i| i.contains("provider's api_key")));
+        assert!(has(&found, "keys[2].sha256"), "{found:?}");
+        assert!(found.iter().any(|i| i.contains("another caller key")));
+    }
+
+    #[test]
+    fn a_route_model_with_surrounding_whitespace_is_refused() {
+        let found = issues(&format!(
+            "{MINIMAL}\n[routes.fast]\nmodel = \" openai/gpt-6-luna\""
+        ));
+        assert!(has(&found, "routes.fast.model"), "{found:?}");
+    }
+
+    #[test]
+    fn a_future_version_is_reported_as_such_even_with_fields_this_build_lacks() {
+        let found = issues("version = 2\nsurprise = 1\n[new_table]\nx = 1");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("unsupported version 2"), "{found:?}");
+        let json = ServeConfig::parse(r#"{"version":3,"surprise":1}"#, Format::Json)
+            .err()
+            .unwrap();
+        assert!(
+            json[0].message.contains("unsupported version 3"),
+            "{json:?}"
+        );
     }
 
     #[test]
@@ -1399,8 +1641,44 @@ mod tests {
             assert!(has(&found, path), "{bad}: {found:?}");
         }
         // Port 0 means "pick one", so two zeros do not collide.
-        let zeros = format!("{MINIMAL}\n[server]\nport = 0\n[admin]\nport = 0");
+        let zeros = format!(
+            "{MINIMAL}\n[server]\nport = 0\n[admin]\nport = 0\nallow_unauthenticated = true"
+        );
         assert!(ServeConfig::parse(&zeros, Format::Toml).is_ok());
+    }
+
+    #[test]
+    fn an_admin_listener_needs_a_token_or_an_explicit_opt_out() {
+        let tokenless = format!("{MINIMAL}\n[admin]\nport = 9090");
+        let found = issues(&tokenless);
+        assert!(has(&found, "admin.token"), "{found:?}");
+        assert!(found[0].contains("allow_unauthenticated"), "{found:?}");
+        let opted_out = format!("{MINIMAL}\n[admin]\nport = 9090\nallow_unauthenticated = true");
+        assert!(ServeConfig::parse(&opted_out, Format::Toml).is_ok());
+        let both = format!(
+            "{MINIMAL}\n[admin]\nport = 9090\nallow_unauthenticated = true\n\
+             token = {{ env = \"ADMIN_TOKEN\" }}"
+        );
+        assert!(has(&issues(&both), "admin.allow_unauthenticated"));
+    }
+
+    #[test]
+    fn an_admin_token_cannot_equal_a_sha256_caller_key() {
+        let digest = format!("{:x}", Sha256::digest(b"the-admin-token-0123456789"));
+        let text = format!(
+            "version = 1\n\
+             [providers.openai]\nkind = \"openai\"\napi_key = {{ env = \"OPENAI_API_KEY\" }}\n\
+             [[keys]]\nname = \"batch\"\ntenant = \"t\"\nsha256 = \"{digest}\"\n\
+             [admin]\nport = 9090\ntoken = {{ env = \"ADMIN_TOKEN\" }}"
+        );
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        let env = |name: &str| match name {
+            "OPENAI_API_KEY" => Some("upstream-key-0123456789".to_string()),
+            "ADMIN_TOKEN" => Some("the-admin-token-0123456789".to_string()),
+            _ => None,
+        };
+        let found = config.check_references(&env);
+        assert!(found.iter().any(|i| i.path == "admin.token"), "{found:?}");
     }
 
     #[test]
@@ -1413,6 +1691,23 @@ mod tests {
         assert!(!found
             .iter()
             .any(|i| i.message.contains("one-value-for-everything")));
+        // Each arm alone: equal to a provider key, and equal to a caller key.
+        let as_provider = |name: &str| match name {
+            "ADMIN_TOKEN" | "OPENAI_API_KEY" => Some("shared-with-the-provider".to_string()),
+            _ => Some("different-value-0123456789".to_string()),
+        };
+        assert!(config
+            .check_references(&as_provider)
+            .iter()
+            .any(|i| i.path == "admin.token"));
+        let as_caller = |name: &str| match name {
+            "ADMIN_TOKEN" | "CI_GATEWAY_KEY" => Some("shared-with-the-caller".to_string()),
+            _ => Some("different-value-0123456789".to_string()),
+        };
+        assert!(config
+            .check_references(&as_caller)
+            .iter()
+            .any(|i| i.path == "admin.token"));
     }
 
     #[test]

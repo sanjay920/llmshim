@@ -801,10 +801,7 @@ async fn serve_listener(
 /// A listener's loaded TLS configuration with the files it came from, for the
 /// reload watcher.
 #[cfg(feature = "serve")]
-type LoadedTls = Option<(
-    axum_server::tls_rustls::RustlsConfig,
-    llmshim::serve::config::Tls,
-)>;
+type LoadedTls = Option<(axum_server::tls_rustls::RustlsConfig, serve_tls::Watched)>;
 
 #[cfg(feature = "serve")]
 async fn load_tls(config: &llmshim::serve::ServeConfig) -> Result<(LoadedTls, LoadedTls), String> {
@@ -812,7 +809,7 @@ async fn load_tls(config: &llmshim::serve::ServeConfig) -> Result<(LoadedTls, Lo
         match tls {
             Some(files) => serve_tls::load(files)
                 .await
-                .map(|loaded| Some((loaded, files.clone())))
+                .map(Some)
                 .map_err(|error| format!("{at}: {error}")),
             None => Ok(None),
         }
@@ -873,6 +870,14 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             report(&issues);
             return 1;
         }
+        if let Err(issue) = llmshim::serve::admin_token_digest(&config, &env) {
+            report(&[issue]);
+            return 1;
+        }
+        if let Err(issue) = llmshim::serve::fleet_redis_url(&config, &env) {
+            report(&[issue]);
+            return 1;
+        }
         println!(
             "{}: valid (version {}, {} provider(s), {} key(s), {} route(s))",
             path.display(),
@@ -883,13 +888,15 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         );
         return 0;
     }
-    let built = match llmshim::serve::build_app(&config, &env).await {
+    let mut built = match llmshim::serve::build_app(&config, &env).await {
         Ok(built) => built,
         Err(issues) => {
             report(&issues);
             return 1;
         }
     };
+    // Held back until every listener is bound (see below).
+    let unstarted_fleet = built.unstarted_fleet.take();
     let listener = match cli::bind(built.address).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -929,6 +936,9 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             "http"
         }
     };
+    // Only now, with every listener bound, may a fleet replica start leasing
+    // peers' jobs: a failure above must leave nothing leased.
+    llmshim::serve::start_fleet_workers(unstarted_fleet);
     eprintln!(
         "llmshim serve listening on {}://{address}",
         scheme(&main_tls)
@@ -946,8 +956,14 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     }
     match &admin {
         Some((_, _, admin_address)) => {
+            let protection = if built.admin_authenticated {
+                "token required except /health and /ready"
+            } else {
+                "OPEN (admin.allow_unauthenticated = true)"
+            };
             eprintln!(
-                "  Admin: {}://{admin_address} (/metrics, /v1/gateway/stats, /health, /ready)",
+                "  Admin: {}://{admin_address} (/metrics, /v1/gateway/stats, /health, /ready): \
+                 {protection}",
                 scheme(&admin_tls)
             )
         }
@@ -958,6 +974,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     }
     // One signal stops both listeners.
     let (stop, stopped) = tokio::sync::watch::channel(false);
+    let stop_all = stop.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         let _ = stop.send(true);
@@ -967,8 +984,8 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     };
     // A renewed certificate is picked up without a restart.
     for (tls, label) in [(&main_tls, "tls"), (&admin_tls, "admin tls")] {
-        if let Some((rustls_config, files)) = tls {
-            serve_tls::watch(rustls_config.clone(), files.clone(), label);
+        if let Some((rustls_config, watched)) = tls {
+            serve_tls::watch(rustls_config.clone(), watched.clone(), label);
         }
     }
     let main_server = serve_listener(
@@ -985,7 +1002,20 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
                 wait_for_stop(stopped),
                 admin_tls.map(|(rustls_config, _)| rustls_config),
             );
-            let (main_result, admin_result) = tokio::join!(main_server, admin_server);
+            // If either listener ends, stop the other too. Waiting for both would
+            // leave a server running with half of its surface gone, and its
+            // readiness probe on the surviving listener still passing.
+            tokio::pin!(main_server, admin_server);
+            let (main_result, admin_result) = tokio::select! {
+                result = &mut main_server => {
+                    let _ = stop_all.send(true);
+                    (result, admin_server.await)
+                }
+                result = &mut admin_server => {
+                    let _ = stop_all.send(true);
+                    (main_server.await, result)
+                }
+            };
             main_result.and(admin_result)
         }
         None => main_server.await,

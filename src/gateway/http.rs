@@ -264,9 +264,11 @@ impl GatewayState {
         Self::from_parts(router, logger, LocalParts::from_env())
     }
 
-    /// Build in-memory (single-instance) gateway state from explicit parts,
-    /// reading nothing from the environment. [`Self::from_env`] is this
-    /// function applied to [`LocalParts::from_env`].
+    /// Build in-memory (single-instance) gateway state from explicit parts.
+    /// The parts themselves are read from nothing; a few process-wide settings
+    /// are still read later (retained accounting attempts, the penalty after a
+    /// 429, the shared HTTP client), as the 0002 design note lists.
+    /// [`Self::from_env`] is this function applied to [`LocalParts::from_env`].
     pub(crate) fn from_parts(
         router: Router,
         logger: Option<Logger>,
@@ -359,6 +361,23 @@ impl GatewayState {
         redis_url: &str,
         parts: DistributedParts,
     ) -> Result<Arc<Self>, String> {
+        let state = Self::distributed_unstarted(router, logger, redis_url, parts).await?;
+        state.start_workers();
+        Ok(state)
+    }
+
+    /// Everything [`Self::distributed_from_parts`] does except start the workers
+    /// that lease jobs from the shared queue. A caller that can still fail after
+    /// this (`serve` binds its listeners next) must not have workers running, or
+    /// a replica that exits at once leaves leases on peers' jobs until they
+    /// expire and spends one delivery attempt from each.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) async fn distributed_unstarted(
+        router: Router,
+        logger: Option<Logger>,
+        redis_url: &str,
+        parts: DistributedParts,
+    ) -> Result<Arc<Self>, String> {
         let DistributedParts {
             config,
             tuning,
@@ -393,13 +412,6 @@ impl GatewayState {
         )
         .await
         .map_err(|e| e.to_string())?;
-        // This instance serves every configured provider's queue.
-        let providers: Vec<String> = router
-            .provider_keys()
-            .into_iter()
-            .map(String::from)
-            .collect();
-        gateway.spawn_workers(providers);
         Ok(Arc::new(Self {
             router,
             backend: Backend::Distributed(gateway),
@@ -415,6 +427,21 @@ impl GatewayState {
             ),
             overloaded_retry_after: config.overloaded_retry_after,
         }))
+    }
+
+    /// Start the workers that serve every configured provider's shared queue.
+    /// Call once; a local (single-instance) state has none.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn start_workers(&self) {
+        if let Backend::Distributed(gateway) = &self.backend {
+            let providers: Vec<String> = self
+                .router
+                .provider_keys()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            gateway.spawn_workers(providers);
+        }
     }
 
     async fn trusted_policy_scope(

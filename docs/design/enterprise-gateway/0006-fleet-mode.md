@@ -22,9 +22,24 @@ the existing `gateway` does under `gateway-redis`:
 It is built through the same `distributed_from_parts` constructor as the
 environment path (`distributed_from_env` is that function applied to
 environment-derived parts), so there is one implementation. Like single-instance
-`serve`, fleet mode reads nothing from the environment except the variables the
-file names; a test starts it with the matching `LLMSHIM_*` variables set to
-values that would break it.
+`serve`, fleet mode takes its settings from the file, not from `LLMSHIM_*`
+variables: every serve test starts the server with the gateway, rate-limit and
+fleet tuning variables set to values that would break it (a 1 ms Redis deadline,
+a 1 ms job deadline and lease, one retained job), and the fleet tests pass. The
+process-wide settings listed in 0002 (the shared HTTP client, the listener's
+limits, the penalty after a 429) are the exceptions, as for single-instance
+`serve`.
+
+**Start order.** The queue workers lease jobs from peers, so they start only
+after the configuration is valid, Redis is reachable and *both* listeners are
+bound. A replica that fails to start (a port in use, say) therefore leaves no
+lease on any peer's job; before this rule it could, and each lease spends one
+of the job's delivery attempts and holds the job for the lease timeout. The
+state is built by `distributed_unstarted` and the workers started by
+`start_workers`; `distributed_from_parts`, which `llmshim gateway` uses, is the
+two in sequence, so the gateway path is unchanged. Ordering is structural and
+not covered by a test, because the window between a worker's first poll and the
+process exiting cannot be observed deterministically.
 
 ## Building and running
 
@@ -63,6 +78,16 @@ each other's jobs.
   closed when Redis is unavailable, as documented for `gateway-redis`: requests
   are refused rather than admitted without accounting. A bounded local
   allowance for degraded operation is a roadmap item.
+- **One Redis per environment.** Queues, rate buckets, health and the spend
+  index are keyed by provider name and tenant only, with no fleet or environment
+  prefix. Two fleets (staging and production, say) that share a Redis and a
+  provider name would take each other's jobs, and a job runs under the upstream
+  key of the replica that leases it. Give each environment its own Redis (or at
+  least its own database number and provider names); a namespace setting is a
+  roadmap item.
+- **A stopped replica's leases.** On SIGTERM a replica drains its own requests
+  but does not release leases it holds for peers' jobs; they return to the queue
+  when the lease expires and the reaper requeues them, as under `gateway`.
 - **All replicas must agree** on the provider list and limits; there is no
   version check between replicas. Deploy a configuration change as a rolling
   update and expect a window with mixed settings.
