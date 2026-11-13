@@ -1,7 +1,7 @@
 # 0004: `llmshim serve` runs the gateway from a file
 
-Status: implemented for a single instance. Fleet mode, reload and TLS are not
-implemented.
+Status: implemented. A single instance is described here, fleet mode in 0006;
+reload and TLS are not implemented.
 
 ## What it does
 
@@ -49,8 +49,8 @@ server works.
   The gateway is called by services.
 - **Caller keys are authenticated before the upstream is touched**, and a
   caller token is never forwarded; the upstream sees only the provider key.
-- **`ProviderBreaker` and the rate limiter are in-process.** A fleet needs the
-  Redis mode, which `serve` does not offer yet.
+- **`ProviderBreaker` and the rate limiter are in-process** unless the file has
+  a `[fleet]` table (0006).
 
 ## Known limits (each is a roadmap item)
 

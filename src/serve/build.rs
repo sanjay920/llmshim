@@ -40,6 +40,8 @@ pub struct Built {
     /// The operational endpoints on a listener of their own, when `[admin]` is
     /// configured. The main application then answers 404 for those paths.
     pub admin: Option<(axum::Router, SocketAddr)>,
+    /// Whether this replica shares state with a fleet through Redis.
+    pub fleet: bool,
     /// Provider names, for the startup banner.
     pub providers: Vec<String>,
     pub caller_keys: usize,
@@ -48,11 +50,11 @@ pub struct Built {
 
 /// Build the application. Must be called inside a Tokio runtime, because the
 /// scheduler starts its lane tasks.
-pub fn build_app(
+pub async fn build_app(
     config: &ServeConfig,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Built, Vec<Issue>> {
-    let mut issues = Vec::new();
+    let mut issues = config.feature_issues();
 
     let address = match parse_address(&config.server.host, config.server.port) {
         Ok(address) => address,
@@ -74,6 +76,27 @@ pub fn build_app(
     };
 
     let router = build_router(config, env, &mut issues);
+
+    let redis_url = match &config.fleet {
+        Some(fleet) => match read_secret(&fleet.redis_url, env) {
+            Ok(url) if super::config::is_redis_url(&url) => Some(url),
+            Ok(_) => {
+                issues.push(Issue {
+                    path: "fleet.redis_url".into(),
+                    message: "must start with redis:// or rediss://".into(),
+                });
+                None
+            }
+            Err(message) => {
+                issues.push(Issue {
+                    path: "fleet.redis_url".into(),
+                    message,
+                });
+                None
+            }
+        },
+        None => None,
+    };
 
     let receipts_root = config
         .state
@@ -165,18 +188,43 @@ pub fn build_app(
 
     let authenticated = keystore.is_enforced();
     let providers = config.providers.keys().cloned().collect();
-    let state = GatewayState::from_parts(
-        router,
-        None,
-        LocalParts {
-            config: gateway,
-            breaker: crate::proxy::health::build_breaker_with(BreakerConfig::default(), None),
-            limiter: Arc::new(InMemoryRateLimiter::new(rate_limits.clone())),
+    let retained = crate::gateway::attempt::default_retained_accounting_attempts();
+    let breaker_config = BreakerConfig::default();
+    let fleet = redis_url.is_some();
+    let state = match redis_url {
+        None => GatewayState::from_parts(
+            router,
+            None,
+            LocalParts {
+                config: gateway,
+                breaker: crate::proxy::health::build_breaker_with(breaker_config, None),
+                limiter: Arc::new(InMemoryRateLimiter::new(rate_limits.clone())),
+                rate_limits,
+                keystore,
+                idempotency_ttl_secs,
+                max_retained_accounting_attempts: retained,
+            },
+        ),
+        Some(url) => match fleet_state(
+            router,
+            &url,
+            gateway,
             rate_limits,
             keystore,
             idempotency_ttl_secs,
+            retained,
+        )
+        .await
+        {
+            Ok(state) => state,
+            Err(message) => {
+                return Err(vec![Issue {
+                    path: "fleet.redis_url".into(),
+                    message,
+                }])
+            }
         },
-    );
+    };
 
     let admin_state = state.clone();
     let app = app_with_parts(
@@ -210,6 +258,7 @@ pub fn build_app(
         admin,
         address,
         providers,
+        fleet,
         caller_keys: config.keys.len(),
         authenticated,
     })
@@ -329,5 +378,81 @@ fn hosted(kind: ProviderKind, key: String, base_url: Option<String>) -> Box<dyn 
         ProviderKind::Openrouter => on_base!(OpenRouter::new(key)),
         // Handled by the caller; kept total so a new kind cannot be forgotten.
         ProviderKind::OpenaiCompatible => unreachable!("self-hosted servers are built by name"),
+    }
+}
+
+/// Build the fleet (Redis-backed) state. Without the `serve-redis` feature this
+/// cannot be reached: `feature_issues` has already refused the configuration.
+#[cfg(feature = "serve-redis")]
+async fn fleet_state(
+    router: Router,
+    url: &str,
+    gateway: GatewayConfig,
+    rate_limits: RateLimitConfig,
+    keystore: crate::gateway::auth::KeyStore,
+    idempotency_ttl_secs: u64,
+    max_retained_accounting_attempts: usize,
+) -> Result<Arc<GatewayState>, String> {
+    use crate::gateway::distributed::Tuning;
+    use crate::gateway::http::DistributedParts;
+    use crate::proxy::ratelimit::build_limiter_with;
+    let parts = DistributedParts {
+        tuning: Tuning::defaults(&gateway),
+        breaker: crate::proxy::health::build_breaker_with(BreakerConfig::default(), Some(url)),
+        limiter: build_limiter_with(rate_limits.clone(), Some(url)),
+        config: gateway,
+        rate_limits,
+        keystore,
+        idempotency_ttl_secs,
+        max_retained_accounting_attempts,
+    };
+    GatewayState::distributed_from_parts(router, None, url, parts)
+        .await
+        .map_err(|error| format!("cannot start fleet mode: {}", redact(&error, url)))
+}
+
+#[cfg(not(feature = "serve-redis"))]
+async fn fleet_state(
+    _router: Router,
+    _url: &str,
+    _gateway: GatewayConfig,
+    _rate_limits: RateLimitConfig,
+    _keystore: crate::gateway::auth::KeyStore,
+    _idempotency_ttl_secs: u64,
+    _max_retained_accounting_attempts: usize,
+) -> Result<Arc<GatewayState>, String> {
+    Err("fleet mode needs a binary built with --features serve-redis".into())
+}
+
+/// Remove the Redis URL, and any password inside it, from an error message.
+#[cfg_attr(not(feature = "serve-redis"), allow(dead_code))]
+fn redact(message: &str, url: &str) -> String {
+    let mut out = message.replace(url, "<redis_url>");
+    if let Some(password) = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('@'))
+        .and_then(|(userinfo, _)| userinfo.split_once(':'))
+        .map(|(_, password)| password)
+        .filter(|password| !password.is_empty())
+    {
+        out = out.replace(password, "<password>");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact;
+
+    #[test]
+    fn errors_never_carry_the_redis_url_or_its_password() {
+        let url = "redis://user:s3cretpass@cache.internal:6379/0";
+        let message = format!("failed to connect to {url}: bad auth s3cretpass");
+        let out = redact(&message, url);
+        assert!(
+            !out.contains("s3cretpass") && !out.contains("cache.internal"),
+            "{out}"
+        );
+        assert_eq!(redact("Connection refused", url), "Connection refused");
     }
 }

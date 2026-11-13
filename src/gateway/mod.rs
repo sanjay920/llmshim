@@ -37,7 +37,7 @@
 //! is caller-supplied. Remaining follow-up: an actual AWS deployment; a
 //! redelivered distributed request may run twice (at-least-once semantics).
 
-mod attempt;
+pub(crate) mod attempt;
 pub mod auth;
 mod budget;
 pub mod http;

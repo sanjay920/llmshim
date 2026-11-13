@@ -684,6 +684,7 @@ impl DistributedGateway {
         Self::connect_inner(redis_url, dispatch, limiter, config, None).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn connect_with_coordinator(
         redis_url: &str,
         dispatch: Arc<dyn Dispatch>,
@@ -691,12 +692,35 @@ impl DistributedGateway {
         config: GatewayConfig,
         attempt_coordinator: Arc<crate::gateway::attempt::AttemptCoordinator>,
     ) -> redis::RedisResult<Arc<Self>> {
-        Self::connect_inner(
+        let tuning = Tuning::from_env(&config);
+        Self::connect_with_tuning(
+            redis_url,
+            dispatch,
+            limiter,
+            config,
+            attempt_coordinator,
+            tuning,
+        )
+        .await
+    }
+
+    /// Connect with the timeouts and retention bounds given instead of read from
+    /// the environment.
+    pub(crate) async fn connect_with_tuning(
+        redis_url: &str,
+        dispatch: Arc<dyn Dispatch>,
+        limiter: Arc<dyn RateLimiter>,
+        config: GatewayConfig,
+        attempt_coordinator: Arc<crate::gateway::attempt::AttemptCoordinator>,
+        tuning: Tuning,
+    ) -> redis::RedisResult<Arc<Self>> {
+        Self::connect_with(
             redis_url,
             dispatch,
             limiter,
             config,
             Some(attempt_coordinator),
+            tuning,
         )
         .await
     }
@@ -708,24 +732,34 @@ impl DistributedGateway {
         config: GatewayConfig,
         attempt_coordinator: Option<Arc<crate::gateway::attempt::AttemptCoordinator>>,
     ) -> redis::RedisResult<Arc<Self>> {
+        let tuning = Tuning::from_env(&config);
+        Self::connect_with(
+            redis_url,
+            dispatch,
+            limiter,
+            config,
+            attempt_coordinator,
+            tuning,
+        )
+        .await
+    }
+
+    async fn connect_with(
+        redis_url: &str,
+        dispatch: Arc<dyn Dispatch>,
+        limiter: Arc<dyn RateLimiter>,
+        config: GatewayConfig,
+        attempt_coordinator: Option<Arc<crate::gateway::attempt::AttemptCoordinator>>,
+        tuning: Tuning,
+    ) -> redis::RedisResult<Arc<Self>> {
         let client = redis::Client::open(redis_url)?;
         let nonce = uuid::Uuid::new_v4().as_u128();
-        let configured_redis_operation_timeout = positive_duration_from_env(
-            "LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS",
-            Duration::from_secs(5),
-        );
-        let redis_operation_timeout = configured_redis_operation_timeout
-            .min((config.lease_timeout / 4).max(Duration::from_millis(1)));
-        let worker_job_timeout = positive_duration_from_env(
-            "LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS",
-            Duration::from_secs(6 * 60 * 60),
-        );
-        let origin_lease_timeout = positive_duration_from_env(
-            "LLMSHIM_GATEWAY_ORIGIN_LEASE_MS",
-            config.lease_timeout.min(Duration::from_secs(60)),
-        )
-        .min(Duration::from_secs(5 * 60));
-        let lifecycle_limits = lifecycle::Limits::from_env();
+        let Tuning {
+            redis_operation_timeout,
+            worker_job_timeout,
+            origin_lease_timeout,
+            lifecycle_limits,
+        } = tuning;
         let cancellation_capacity = usize::try_from(lifecycle_limits.max_jobs)
             .unwrap_or(usize::MAX)
             .min(config.max_queue_depth.max(1))
@@ -2394,9 +2428,64 @@ impl DistributedGateway {
     }
 }
 
-fn positive_duration_from_env(name: &str, fallback: Duration) -> Duration {
-    std::env::var(name)
-        .ok()
+/// Timeouts and retention bounds of the distributed gateway, resolved once.
+/// `from_env` reads the `LLMSHIM_GATEWAY_*` variables; `from_lookup` reads them
+/// through a function; `defaults` uses none.
+#[derive(Clone, Copy)]
+pub(crate) struct Tuning {
+    redis_operation_timeout: Duration,
+    worker_job_timeout: Duration,
+    origin_lease_timeout: Duration,
+    lifecycle_limits: lifecycle::Limits,
+}
+
+impl Tuning {
+    pub(crate) fn from_env(config: &GatewayConfig) -> Self {
+        Self::from_lookup(&|key| std::env::var(key).ok(), config)
+    }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn defaults(config: &GatewayConfig) -> Self {
+        Self::from_lookup(&|_| None, config)
+    }
+
+    pub(crate) fn from_lookup(
+        lookup: &dyn Fn(&str) -> Option<String>,
+        config: &GatewayConfig,
+    ) -> Self {
+        let configured_redis_operation_timeout = positive_duration(
+            lookup,
+            "LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS",
+            Duration::from_secs(5),
+        );
+        let redis_operation_timeout = configured_redis_operation_timeout
+            .min((config.lease_timeout / 4).max(Duration::from_millis(1)));
+        let worker_job_timeout = positive_duration(
+            lookup,
+            "LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS",
+            Duration::from_secs(6 * 60 * 60),
+        );
+        let origin_lease_timeout = positive_duration(
+            lookup,
+            "LLMSHIM_GATEWAY_ORIGIN_LEASE_MS",
+            config.lease_timeout.min(Duration::from_secs(60)),
+        )
+        .min(Duration::from_secs(5 * 60));
+        Self {
+            redis_operation_timeout,
+            worker_job_timeout,
+            origin_lease_timeout,
+            lifecycle_limits: lifecycle::Limits::from_lookup(lookup),
+        }
+    }
+}
+
+fn positive_duration(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+    fallback: Duration,
+) -> Duration {
+    lookup(name)
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|milliseconds| *milliseconds > 0)
         .map(Duration::from_millis)
@@ -6139,4 +6228,94 @@ mod tests {
         // tier 3 first, then tier 1 in FIFO (a before b).
         assert_eq!(got, vec!["c", "a", "b"]);
     }
+}
+
+#[cfg(test)]
+mod environment_contract {
+    //! Pins how the distributed gateway's timeouts and retention bounds are
+    //! parsed, independently of the process environment.
+    use super::*;
+
+    fn tuning(vars: &[(&str, &str)]) -> Tuning {
+        tests_support_tuning(vars)
+    }
+
+    #[test]
+    fn defaults_follow_the_lease_timeout() {
+        let tuning = tuning(&[]);
+        // lease 60s: the Redis operation timeout is at most a quarter of it.
+        assert_eq!(tuning.redis_operation_timeout, Duration::from_secs(5));
+        assert_eq!(tuning.worker_job_timeout, Duration::from_secs(6 * 60 * 60));
+        assert_eq!(tuning.origin_lease_timeout, Duration::from_secs(60));
+        assert_eq!(
+            tuning.lifecycle_limits.max_jobs,
+            lifecycle::DEFAULT_MAX_JOBS
+        );
+        let none = Tuning::defaults(&GatewayConfig::default());
+        assert_eq!(none.origin_lease_timeout, tuning.origin_lease_timeout);
+    }
+
+    #[test]
+    fn values_are_clamped_by_the_lease_and_a_ceiling() {
+        let tuning = tuning(&[
+            ("LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS", "100"),
+            ("LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS", "9000"),
+            ("LLMSHIM_GATEWAY_ORIGIN_LEASE_MS", "99999999"),
+        ]);
+        assert_eq!(tuning.redis_operation_timeout, Duration::from_millis(100));
+        assert_eq!(tuning.worker_job_timeout, Duration::from_millis(9000));
+        assert_eq!(tuning.origin_lease_timeout, Duration::from_secs(5 * 60));
+        let slow =
+            tests_support_tuning(&[("LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS", "999999")]);
+        assert_eq!(slow.redis_operation_timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn zero_and_unparsable_values_keep_the_fallback() {
+        for bad in ["0", "soon", " 7 ", "-1"] {
+            let tuning = tuning(&[
+                ("LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS", bad),
+                ("LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS", bad),
+                ("LLMSHIM_GATEWAY_ORIGIN_LEASE_MS", bad),
+            ]);
+            assert_eq!(
+                tuning.redis_operation_timeout,
+                Duration::from_secs(5),
+                "{bad}"
+            );
+            assert_eq!(tuning.worker_job_timeout, Duration::from_secs(6 * 60 * 60));
+            assert_eq!(tuning.origin_lease_timeout, Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn retention_limits_are_positive_and_terminal_sizes_have_a_floor() {
+        let tuning = tuning(&[
+            ("LLMSHIM_GATEWAY_RETAINED_JOBS", "12"),
+            ("LLMSHIM_GATEWAY_RETAINED_BASE_BYTES", "13"),
+            ("LLMSHIM_GATEWAY_RETAINED_TERMINAL_BYTES", "14"),
+            ("LLMSHIM_GATEWAY_UNARY_TERMINAL_BYTES", "1"),
+            ("LLMSHIM_GATEWAY_STREAM_TERMINAL_BYTES", "100000"),
+        ]);
+        let limits = tuning.lifecycle_limits;
+        assert_eq!(limits.max_jobs, 12);
+        assert_eq!(limits.max_base_bytes, 13);
+        assert_eq!(limits.max_terminal_bytes, 14);
+        assert_eq!(limits.unary_terminal_bytes, 4 * 1024, "raised to the floor");
+        assert_eq!(limits.stream_terminal_bytes, 100_000);
+        let zero = tests_support_tuning(&[("LLMSHIM_GATEWAY_RETAINED_JOBS", "0")]);
+        assert_eq!(zero.lifecycle_limits.max_jobs, lifecycle::DEFAULT_MAX_JOBS);
+    }
+}
+
+#[cfg(test)]
+fn tests_support_tuning(vars: &[(&str, &str)]) -> Tuning {
+    Tuning::from_lookup(
+        &|key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        },
+        &GatewayConfig::default(),
+    )
 }

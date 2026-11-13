@@ -52,6 +52,8 @@ environment):
 | `LLMSHIM_REDIS_URL` for limiter and breaker | `build_limiter`, `build_breaker` | `build_limiter_with`, `build_breaker_with` |
 | `LLMSHIM_PROXY_*_TIMEOUT_MS`, `LLMSHIM_GATEWAY_*_JOB_TIMEOUT_MS` | `LogicalRequestDeadlines` | `from_lookup`; `from_durations` (errors instead of defaulting) |
 | `LLMSHIM_REPLAY_RECEIPTS_*` (dir, three limits, rescan flag) | `Receipts` | `from_lookup`; `from_parts` with `Limits::new` (errors instead of defaulting) |
+| `LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS` | `gateway/attempt.rs` | `retained_accounting_attempt_limit_from`; the ledgers take the limit as a parameter. |
+| Distributed timeouts and retention (`LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS`, `_WORKER_JOB_TIMEOUT_MS`, `_ORIGIN_LEASE_MS`, `_RETAINED_*`, `_UNARY/STREAM_TERMINAL_BYTES`) | `DistributedGateway` | `Tuning::from_lookup`; `distributed_from_parts(DistributedParts)` |
 | Application assembly | proxy and gateway `app*` | `app_with_parts(state, origin_policy, deadlines, receipt_store)` |
 | Caller keys | `KeyStore` | the hashed store in 0003 |
 | `LLMSHIM_TRUSTED_ORIGINS` | `OriginPolicy` | already had an env-free constructor, `from_csv`; `from_env` only handles the missing and non-Unicode cases |
@@ -60,12 +62,10 @@ Still read from the environment, to convert before `serve` can boot:
 
 | Setting | Where | Notes |
 |---|---|---|
-| `LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS` | `gateway/attempt.rs` | Read when the ledger is built. |
 | `LLMSHIM_PENALTY_SECS` | `penalty_duration()` | Read on each upstream 429. |
 | `LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS` | `configured_http_lock_timeout()` | Read per request. |
 | `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`, `LLMSHIM_UPSTREAM_*`, `LLMSHIM_HTTP_*` | shared HTTP client | Process-wide, initialized once. Needs a per-router client before it can come from a file. |
 | `LLMSHIM_MAX_CONCURRENCY`, `LLMSHIM_QUEUE_TIMEOUT_MS` | `Backpressure::from_env` | Proxy only; `Backpressure::new` already takes values. |
-| Distributed-mode limits | `gateway/distributed*` | Converted with fleet support. |
 
 ## Quirks found and preserved
 

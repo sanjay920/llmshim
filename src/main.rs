@@ -802,6 +802,11 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             return 1;
         }
     };
+    let unsupported = config.feature_issues();
+    if !unsupported.is_empty() {
+        report(&unsupported);
+        return 1;
+    }
     let missing = config.check_references(&env);
     if !missing.is_empty() {
         report(&missing);
@@ -825,7 +830,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         );
         return 0;
     }
-    let built = match llmshim::serve::build_app(&config, &env) {
+    let built = match llmshim::serve::build_app(&config, &env).await {
         Ok(built) => built,
         Err(issues) => {
             report(&issues);
@@ -866,6 +871,11 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     };
     eprintln!("llmshim serve listening on http://{address}");
     eprintln!("  Providers: {:?}", built.providers);
+    if built.fleet {
+        eprintln!("  Mode: fleet (shared Redis queue, limits, spend and provider health)");
+    } else {
+        eprintln!("  Mode: single instance (in-process state)");
+    }
     if built.authenticated {
         eprintln!("  Auth: ENFORCED ({} caller key(s))", built.caller_keys);
     } else {

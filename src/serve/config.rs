@@ -70,6 +70,10 @@ pub struct ServeConfig {
     pub limits: Limits,
     #[serde(default)]
     pub state: State,
+    /// Run as one replica of a fleet sharing a Redis instance. Without it the
+    /// server is a single instance with in-process state.
+    #[serde(default)]
+    pub fleet: Option<Fleet>,
     /// A separate listener for operational endpoints. Without it they are
     /// served on the main listener, as the gateway does.
     #[serde(default)]
@@ -142,6 +146,16 @@ fn default_host() -> String {
 }
 fn default_port() -> u16 {
     3000
+}
+
+/// Fleet mode. Requires a binary built with `--features serve-redis`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Fleet {
+    /// The Redis URL (`redis://` or `rediss://`), by reference because it can
+    /// carry a password.
+    pub redis_url: SecretRef,
 }
 
 /// A second listener for operational endpoints: `/metrics`,
@@ -435,6 +449,9 @@ impl ServeConfig {
         }
         self.validate_server(&mut issues);
         self.validate_admin(&mut issues);
+        if let Some(fleet) = &self.fleet {
+            validate_secret(&fleet.redis_url, "fleet.redis_url", &mut issues);
+        }
         self.validate_providers(&mut issues);
         self.validate_limits(&mut issues);
         self.validate_state(&mut issues);
@@ -725,7 +742,24 @@ impl ServeConfig {
             .iter()
             .filter_map(|admin| admin.token.as_ref())
             .map(|secret| ("admin.token".to_string(), secret));
-        providers.chain(keys).chain(admin).collect()
+        let fleet = self
+            .fleet
+            .iter()
+            .map(|fleet| ("fleet.redis_url".to_string(), &fleet.redis_url));
+        providers.chain(keys).chain(admin).chain(fleet).collect()
+    }
+
+    /// Settings this build cannot honour because a Cargo feature is off. Reported
+    /// at `--check` and at startup, naming the flag to rebuild with.
+    pub fn feature_issues(&self) -> Vec<Issue> {
+        let mut issues = Vec::new();
+        if self.fleet.is_some() && !cfg!(feature = "serve-redis") {
+            issues.push(Issue::new(
+                "fleet",
+                "fleet mode needs a binary built with --features serve-redis",
+            ));
+        }
+        issues
     }
 
     /// Check that every referenced secret exists and is non-empty, without
@@ -804,6 +838,12 @@ impl ServeConfig {
         }
         issues
     }
+}
+
+/// The Redis URL schemes fleet mode accepts.
+pub(crate) fn is_redis_url(url: &str) -> bool {
+    (url.starts_with("redis://") || url.starts_with("rediss://"))
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// Resolve a secret reference to its value, trimmed. The error names the
@@ -1151,6 +1191,33 @@ mod tests {
         let pasted = MINIMAL.replace("OPENAI_API_KEY", "sk_live_AbCdEf123");
         let found = issues(&pasted);
         assert!(has(&found, "providers.openai.api_key.env"), "{found:?}");
+    }
+
+    #[test]
+    fn fleet_mode_is_a_secret_reference_and_needs_its_feature() {
+        let text = format!("{MINIMAL}\n[fleet]\nredis_url = {{ env = \"REDIS_URL\" }}");
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        assert!(config.fleet.is_some());
+        let inline = format!("{MINIMAL}\n[fleet]\nredis_url = \"redis://:pw@host\"");
+        let found = issues(&inline);
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].contains("pw@host"), "{found:?}");
+        // The reference is resolved by --check like any other secret.
+        let missing = config.check_references(&|name| (name != "REDIS_URL").then(|| "x".into()));
+        assert!(
+            missing.iter().any(|i| i.path == "fleet.redis_url"),
+            "{missing:?}"
+        );
+        // A build without serve-redis reports the flag to rebuild with.
+        let feature = config.feature_issues();
+        assert_eq!(feature.is_empty(), cfg!(feature = "serve-redis"));
+        if let Some(issue) = feature.first() {
+            assert!(issue.message.contains("--features serve-redis"));
+        }
+        assert!(is_redis_url("redis://127.0.0.1/0") && is_redis_url("rediss://h:6380"));
+        for bad in ["http://h", "redis://h /0", "host:6379", ""] {
+            assert!(!is_redis_url(bad), "{bad}");
+        }
     }
 
     #[test]

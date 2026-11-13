@@ -20,11 +20,25 @@ const ACCOUNTING_EXPIRY_CLEANUP_BATCH: usize = 128;
 #[cfg(feature = "redis-coordination")]
 pub(crate) const REDIS_ACCOUNTING_INDEX_KEY: &str = "llmshim:gw:budget:v1:attempt-index";
 
+#[cfg(test)]
 fn retained_accounting_attempt_limit() -> usize {
-    std::env::var("LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS")
-        .ok()
+    retained_accounting_attempt_limit_from(&|key| std::env::var(key).ok())
+}
+
+/// The same parsing as the environment path, reading through `lookup`.
+pub(crate) fn retained_accounting_attempt_limit_from(
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> usize {
+    lookup("LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS")
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS)
+}
+
+/// How many finished attempts the spend ledger keeps for late settlement when
+/// nothing configures it.
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+pub(crate) const fn default_retained_accounting_attempts() -> usize {
+    DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -234,10 +248,15 @@ struct LocalAttemptRates {
 }
 
 impl LocalAttemptRates {
+    #[cfg(test)]
     fn new(config: RateLimitConfig) -> Self {
+        Self::with_retention(config, retained_accounting_attempt_limit())
+    }
+
+    fn with_retention(config: RateLimitConfig, max_retained_attempts: usize) -> Self {
         Self::with_accounting_limits(
             config,
-            retained_accounting_attempt_limit(),
+            max_retained_attempts,
             LATE_SETTLEMENT_RETENTION_SECS,
         )
     }
@@ -698,13 +717,33 @@ pub(crate) struct AttemptCoordinator {
 }
 
 impl AttemptCoordinator {
+    #[cfg(test)]
     pub(crate) fn local(
         config: RateLimitConfig,
         concurrency_limit: usize,
         concurrency_wait: Duration,
     ) -> Arc<Self> {
+        Self::local_with_retention(
+            config,
+            concurrency_limit,
+            concurrency_wait,
+            retained_accounting_attempt_limit(),
+        )
+    }
+
+    /// [`Self::local`] with the ledger's retention limit given instead of read
+    /// from the environment.
+    pub(crate) fn local_with_retention(
+        config: RateLimitConfig,
+        concurrency_limit: usize,
+        concurrency_wait: Duration,
+        max_retained_attempts: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            rates: Arc::new(LocalAttemptRates::new(config)),
+            rates: Arc::new(LocalAttemptRates::with_retention(
+                config,
+                max_retained_attempts,
+            )),
             concurrency_limit: concurrency_limit.max(1),
             concurrency_wait,
             semaphores: Mutex::new(HashMap::new()),
@@ -712,15 +751,38 @@ impl AttemptCoordinator {
         })
     }
 
-    #[cfg(feature = "redis-coordination")]
+    #[cfg(all(test, feature = "redis-coordination"))]
     pub(crate) fn redis(
         redis_url: &str,
         config: RateLimitConfig,
         concurrency_limit: usize,
         concurrency_wait: Duration,
     ) -> redis::RedisResult<Arc<Self>> {
+        Self::redis_with_retention(
+            redis_url,
+            config,
+            concurrency_limit,
+            concurrency_wait,
+            retained_accounting_attempt_limit(),
+        )
+    }
+
+    /// [`Self::redis`] with the ledger's retention limit given instead of read
+    /// from the environment.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn redis_with_retention(
+        redis_url: &str,
+        config: RateLimitConfig,
+        concurrency_limit: usize,
+        concurrency_wait: Duration,
+        max_retained_attempts: usize,
+    ) -> redis::RedisResult<Arc<Self>> {
         Ok(Arc::new(Self {
-            rates: Arc::new(RedisAttemptRates::new(redis_url, config)?),
+            rates: Arc::new(RedisAttemptRates::with_retention(
+                redis_url,
+                config,
+                max_retained_attempts,
+            )?),
             concurrency_limit: concurrency_limit.max(1),
             concurrency_wait,
             semaphores: Mutex::new(HashMap::new()),
@@ -1365,11 +1427,20 @@ mod redis_rates {
     }
 
     impl RedisAttemptRates {
+        #[cfg(test)]
         pub(super) fn new(url: &str, config: RateLimitConfig) -> redis::RedisResult<Self> {
+            Self::with_retention(url, config, retained_accounting_attempt_limit())
+        }
+
+        pub(super) fn with_retention(
+            url: &str,
+            config: RateLimitConfig,
+            max_retained_attempts: usize,
+        ) -> redis::RedisResult<Self> {
             Self::with_accounting_limits(
                 url,
                 config,
-                retained_accounting_attempt_limit(),
+                max_retained_attempts,
                 LATE_SETTLEMENT_RETENTION_SECS,
                 REDIS_ACCOUNTING_INDEX_KEY.to_owned(),
             )
@@ -4174,5 +4245,35 @@ mod tests {
                 .await,
             Err(RateRefusal::Budget(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod retention_environment_contract {
+    use super::*;
+
+    fn read(vars: &[(&str, &str)]) -> usize {
+        retained_accounting_attempt_limit_from(&|key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn the_default_applies_unless_a_number_is_given() {
+        let name = "LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS";
+        assert_eq!(read(&[]), DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS);
+        assert_eq!(default_retained_accounting_attempts(), read(&[]));
+        assert_eq!(read(&[(name, "250")]), 250);
+        // Zero is accepted as written; garbage and untrimmed text are not.
+        assert_eq!(read(&[(name, "0")]), 0);
+        for bad in ["many", " 250", "-5", ""] {
+            assert_eq!(
+                read(&[(name, bad)]),
+                DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS,
+                "{bad:?}"
+            );
+        }
     }
 }

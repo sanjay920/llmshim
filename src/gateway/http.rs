@@ -215,6 +215,21 @@ pub(crate) struct LocalParts {
     pub rate_limits: crate::proxy::ratelimit::RateLimitConfig,
     pub keystore: crate::gateway::auth::KeyStore,
     pub idempotency_ttl_secs: u64,
+    /// Finished attempts the spend ledger keeps for late settlement.
+    pub max_retained_accounting_attempts: usize,
+}
+
+/// Everything the fleet (Redis-backed) gateway state is built from.
+#[cfg(feature = "redis-coordination")]
+pub(crate) struct DistributedParts {
+    pub config: GatewayConfig,
+    pub tuning: crate::gateway::distributed::Tuning,
+    pub breaker: Arc<crate::breaker::ProviderBreaker>,
+    pub limiter: Arc<dyn crate::proxy::ratelimit::RateLimiter>,
+    pub rate_limits: crate::proxy::ratelimit::RateLimitConfig,
+    pub keystore: crate::gateway::auth::KeyStore,
+    pub idempotency_ttl_secs: u64,
+    pub max_retained_accounting_attempts: usize,
 }
 
 impl LocalParts {
@@ -233,6 +248,10 @@ impl LocalParts {
             rate_limits,
             keystore,
             idempotency_ttl_secs: idem_ttl_secs(),
+            max_retained_accounting_attempts:
+                crate::gateway::attempt::retained_accounting_attempt_limit_from(&|key| {
+                    std::env::var(key).ok()
+                }),
         }
     }
 }
@@ -260,6 +279,7 @@ impl GatewayState {
             rate_limits,
             keystore,
             idempotency_ttl_secs,
+            max_retained_accounting_attempts,
         } = parts;
         // Same fleet-wide provider health the proxy uses.
         let router = Arc::new(router.with_breaker(breaker));
@@ -268,10 +288,11 @@ impl GatewayState {
             logger,
         });
         let scheduler = Scheduler::new(config.clone(), limiter, dispatch);
-        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local(
+        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local_with_retention(
             rate_limits,
             config.max_concurrency_per_provider,
             config.max_wait,
+            max_retained_accounting_attempts,
         );
         Arc::new(Self {
             router,
@@ -300,25 +321,75 @@ impl GatewayState {
         redis_url: &str,
     ) -> Result<Arc<Self>, String> {
         let config = GatewayConfig::from_env();
+        let tuning = crate::gateway::distributed::Tuning::from_env(&config);
         // Same fleet-wide provider health the proxy uses.
-        let router = Arc::new(router.with_breaker(crate::proxy::health::build_breaker()));
+        let breaker = crate::proxy::health::build_breaker();
+        let rate_limits = crate::proxy::ratelimit::RateLimitConfig::from_env();
+        let limiter = build_limiter();
+        let keystore = crate::gateway::auth::KeyStore::from_env();
+        Self::distributed_from_parts(
+            router,
+            logger,
+            redis_url,
+            DistributedParts {
+                config,
+                tuning,
+                breaker,
+                limiter,
+                rate_limits,
+                keystore,
+                idempotency_ttl_secs: idem_ttl_secs(),
+                max_retained_accounting_attempts:
+                    crate::gateway::attempt::retained_accounting_attempt_limit_from(&|key| {
+                        std::env::var(key).ok()
+                    }),
+            },
+        )
+        .await
+    }
+
+    /// Build fleet gateway state from explicit parts, reading nothing from the
+    /// environment. [`Self::distributed_from_env`] is this function applied to
+    /// environment-derived parts (the caller-key file is now read before the
+    /// Redis connection rather than after it).
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) async fn distributed_from_parts(
+        router: Router,
+        logger: Option<Logger>,
+        redis_url: &str,
+        parts: DistributedParts,
+    ) -> Result<Arc<Self>, String> {
+        let DistributedParts {
+            config,
+            tuning,
+            breaker,
+            limiter,
+            rate_limits,
+            keystore,
+            idempotency_ttl_secs,
+            max_retained_accounting_attempts,
+        } = parts;
+        let router = Arc::new(router.with_breaker(breaker));
         let dispatch = Arc::new(RealDispatch {
             router: router.clone(),
             logger,
         });
-        let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::redis(
-            redis_url,
-            crate::proxy::ratelimit::RateLimitConfig::from_env(),
-            config.max_concurrency_per_provider,
-            config.max_wait,
-        )
-        .map_err(|error| error.to_string())?;
-        let gateway = crate::gateway::distributed::DistributedGateway::connect_with_coordinator(
+        let attempt_coordinator =
+            crate::gateway::attempt::AttemptCoordinator::redis_with_retention(
+                redis_url,
+                rate_limits,
+                config.max_concurrency_per_provider,
+                config.max_wait,
+                max_retained_accounting_attempts,
+            )
+            .map_err(|error| error.to_string())?;
+        let gateway = crate::gateway::distributed::DistributedGateway::connect_with_tuning(
             redis_url,
             dispatch,
-            build_limiter(),
+            limiter,
             config.clone(),
             attempt_coordinator.clone(),
+            tuning,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -332,12 +403,12 @@ impl GatewayState {
         Ok(Arc::new(Self {
             router,
             backend: Backend::Distributed(gateway),
-            keystore: crate::gateway::auth::KeyStore::from_env(),
+            keystore,
             attempt_coordinator,
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(
-                std::time::Duration::from_secs(idem_ttl_secs()),
+                std::time::Duration::from_secs(idempotency_ttl_secs),
             ),
-            idempotency_ttl_secs: idem_ttl_secs(),
+            idempotency_ttl_secs,
             prequeue_backpressure: Backpressure::new(
                 config.max_concurrency_per_provider,
                 config.max_wait,

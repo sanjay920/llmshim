@@ -477,24 +477,29 @@ impl Default for Limits {
 }
 
 impl Limits {
-    pub(super) fn from_env() -> Self {
+    /// The environment parsing, reading each variable through `lookup`.
+    pub(super) fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
         let defaults = Self::default();
         Self {
-            max_jobs: positive_env("LLMSHIM_GATEWAY_RETAINED_JOBS", defaults.max_jobs),
+            max_jobs: positive_env(lookup, "LLMSHIM_GATEWAY_RETAINED_JOBS", defaults.max_jobs),
             max_base_bytes: positive_env(
+                lookup,
                 "LLMSHIM_GATEWAY_RETAINED_BASE_BYTES",
                 defaults.max_base_bytes,
             ),
             max_terminal_bytes: positive_env(
+                lookup,
                 "LLMSHIM_GATEWAY_RETAINED_TERMINAL_BYTES",
                 defaults.max_terminal_bytes,
             ),
             unary_terminal_bytes: positive_env(
+                lookup,
                 "LLMSHIM_GATEWAY_UNARY_TERMINAL_BYTES",
                 defaults.unary_terminal_bytes,
             )
             .max(MIN_TERMINAL_BYTES),
             stream_terminal_bytes: positive_env(
+                lookup,
                 "LLMSHIM_GATEWAY_STREAM_TERMINAL_BYTES",
                 defaults.stream_terminal_bytes,
             )
@@ -503,9 +508,8 @@ impl Limits {
     }
 }
 
-fn positive_env(name: &str, fallback: u64) -> u64 {
-    std::env::var(name)
-        .ok()
+fn positive_env(lookup: &dyn Fn(&str) -> Option<String>, name: &str, fallback: u64) -> u64 {
+    lookup(name)
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
         .unwrap_or(fallback)

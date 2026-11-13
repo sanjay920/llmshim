@@ -2,159 +2,12 @@
 //! HTTP. Runs offline; the "upstream" is a local mock.
 #![cfg(feature = "serve")]
 
+#[path = "support/serve_harness.rs"]
+mod harness;
+
+use harness::{chat, completion, config, start, tempdir, ADMIN_TOKEN, CALLER_KEY, UPSTREAM_KEY};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
-
-const CALLER_KEY: &str = "caller-key-0123456789abcdef";
-const UPSTREAM_KEY: &str = "upstream-key-0123456789abcdef";
-const ADMIN_TOKEN: &str = "admin-token-0123456789abcdef";
-
-struct Server {
-    child: Child,
-    base: String,
-    /// The admin listener's address, when the configuration has `[admin]`.
-    admin: Option<String>,
-    _dir: tempdir::Dir,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// A scratch directory that removes itself.
-mod tempdir {
-    pub struct Dir(pub std::path::PathBuf);
-    impl Dir {
-        pub fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "llmshim-serve-e2e-{label}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-}
-
-fn start(config: &str, label: &str) -> Server {
-    let dir = tempdir::Dir::new(label);
-    let path = dir.0.join("gateway.toml");
-    std::fs::write(&path, config.replace("{DIR}", dir.0.to_str().unwrap())).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_llmshim"))
-        .args(["serve", "--config", path.to_str().unwrap()])
-        .env_clear()
-        .env("HOME", &dir.0)
-        .env("LLMSHIM_CATALOG_OFFLINE", "1")
-        .env("SERVE_E2E_CALLER_KEY", CALLER_KEY)
-        .env("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY)
-        .env("SERVE_E2E_ADMIN_TOKEN", ADMIN_TOKEN)
-        // Canaries: each of these would break or refuse requests if `serve`
-        // read it. The file is the only source of settings.
-        .env(
-            "LLMSHIM_GATEWAY_KEYS_FILE",
-            dir.0.join("does-not-exist.json"),
-        )
-        .env("LLMSHIM_GATEWAY_QUEUE_DEPTH", "0")
-        .env("LLMSHIM_RATE_LIMIT_RPM", "0")
-        .env("LLMSHIM_REDIS_URL", "redis://127.0.0.1:1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    // Owned by the guard from here on, so a failed start still reaps the process.
-    let wants_admin = config.contains("[admin]");
-    let mut server = Server {
-        child,
-        base: String::new(),
-        admin: None,
-        _dir: dir,
-    };
-    let stderr = server.child.stderr.take().unwrap();
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            let _ = sender.send(line);
-        }
-    });
-    let mut seen = Vec::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        match receiver.recv_timeout(remaining) {
-            Ok(line) => {
-                if let Some(base) = line.split("listening on ").nth(1) {
-                    server.base = base.trim().to_string();
-                }
-                if let Some(admin) = line.trim().strip_prefix("Admin: ") {
-                    server.admin = admin.split_whitespace().next().map(str::to_string);
-                }
-                // The banner prints the main address, then the admin line.
-                if !server.base.is_empty() && (!wants_admin || server.admin.is_some()) {
-                    return server;
-                }
-                seen.push(line);
-            }
-            Err(_) => panic!("server did not start; stderr: {seen:#?}"),
-        }
-    }
-}
-
-fn config(upstream: &str, extra: &str) -> String {
-    format!(
-        r#"
-        version = 1
-        [server]
-        port = 0
-        [state]
-        receipts_dir = "{{DIR}}/receipts"
-        [providers.inference]
-        kind = "openai-compatible"
-        base_url = "{upstream}"
-        api_key = {{ env = "SERVE_E2E_UPSTREAM_KEY" }}
-        [[keys]]
-        name = "ci"
-        tenant = "platform"
-        secret = {{ env = "SERVE_E2E_CALLER_KEY" }}
-        {extra}
-        "#
-    )
-}
-
-fn completion(text: &str) -> String {
-    json!({
-        "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "test-model",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-            "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
-    })
-    .to_string()
-}
-
-async fn chat(server: &Server, key: Option<&str>, model: &str) -> reqwest::Response {
-    let mut request = reqwest::Client::new()
-        .post(format!("{}/v1/chat/completions", server.base))
-        .json(&json!({"model": model, "messages": [{"role": "user", "content": "ping"}]}));
-    if let Some(key) = key {
-        request = request.bearer_auth(key);
-    }
-    request.send().await.unwrap()
-}
+use std::process::Command;
 
 #[tokio::test]
 async fn a_caller_with_a_key_reaches_the_upstream_with_the_upstream_key_only() {
@@ -167,7 +20,7 @@ async fn a_caller_with_a_key_reaches_the_upstream_with_the_upstream_key_only() {
         .expect(1)
         .create_async()
         .await;
-    let server = start(&config(&upstream.url(), ""), "ok");
+    let server = start(&config(&upstream.url(), ""), "ok", &[]);
 
     let response = chat(&server, Some(CALLER_KEY), "inference/test-model").await;
     assert_eq!(response.status(), 200);
@@ -185,7 +38,7 @@ async fn missing_and_wrong_keys_are_refused_before_the_upstream_is_called() {
         .expect(0)
         .create_async()
         .await;
-    let server = start(&config(&upstream.url(), ""), "deny");
+    let server = start(&config(&upstream.url(), ""), "deny", &[]);
 
     assert_eq!(
         chat(&server, None, "inference/test-model").await.status(),
@@ -229,7 +82,7 @@ async fn a_named_route_applies_its_model_and_default_settings() {
         model = "inference/test-model"
         settings = { max_tokens = 77 }
     "#;
-    let server = start(&config(&upstream.url(), extra), "route");
+    let server = start(&config(&upstream.url(), extra), "route", &[]);
 
     let response = chat(&server, Some(CALLER_KEY), "route/fast").await;
     assert_eq!(response.status(), 200);
@@ -242,7 +95,7 @@ async fn a_named_route_applies_its_model_and_default_settings() {
 #[tokio::test]
 async fn the_gateway_surface_is_served_and_unauthenticated_probes_stay_open() {
     let upstream = mockito::Server::new_async().await;
-    let server = start(&config(&upstream.url(), ""), "surface");
+    let server = start(&config(&upstream.url(), ""), "surface", &[]);
     let client = reqwest::Client::new();
     for path in ["/health", "/ready"] {
         let response = client
@@ -297,7 +150,7 @@ async fn operational_endpoints_move_to_their_own_listener() {
         .expect(1)
         .create_async()
         .await;
-    let server = start(&admin_config(&upstream.url()), "admin");
+    let server = start(&admin_config(&upstream.url()), "admin", &[]);
     let admin = server.admin.clone().expect("admin listener banner");
     let client = reqwest::Client::new();
 
@@ -379,4 +232,28 @@ fn a_taken_admin_port_fails_the_start_cleanly() {
         !stderr.contains("listening on"),
         "nothing is announced: {stderr}"
     );
+}
+
+#[tokio::test]
+async fn without_fleet_mode_each_replica_counts_its_own_requests() {
+    // The control for the fleet test of the same name: the same key limit, but
+    // two independent replicas. Each sees two requests, under the limit of
+    // three, so all four succeed. Only a shared store can make the fourth fail.
+    let mut upstream = mockito::Server::new_async().await;
+    let mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .expect(4)
+        .create_async()
+        .await;
+    let text = config(&upstream.url(), "")
+        .replace("tenant = \"platform\"", "tenant = \"platform\"\nrpm = 3");
+    let a = start(&text, "solo-a", &[]);
+    let b = start(&text, "solo-b", &[]);
+    for server in [&a, &b, &a, &b] {
+        let response = chat(server, Some(CALLER_KEY), "inference/test-model").await;
+        assert_eq!(response.status(), 200);
+    }
+    mock.assert_async().await;
 }
