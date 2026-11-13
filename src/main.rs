@@ -815,6 +815,10 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             report(&issues);
             return 1;
         }
+        if let Err(issue) = llmshim::serve::admin_token_digest(&config, &env) {
+            report(&[issue]);
+            return 1;
+        }
         println!(
             "{}: valid (version {}, {} provider(s), {} key(s), {} route(s))",
             path.display(),
@@ -846,6 +850,24 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             return 1;
         }
     };
+    // Bind the admin listener before announcing anything, so a failure to bind
+    // either one leaves nothing half-started.
+    let admin = match built.admin {
+        Some((routes, requested)) => match cli::bind(requested).await {
+            Ok(listener) => match listener.local_addr() {
+                Ok(address) => Some((routes, listener, address)),
+                Err(error) => {
+                    eprintln!("cannot read admin listener address: {error}");
+                    return 1;
+                }
+            },
+            Err(error) => {
+                eprintln!("admin: {error}");
+                return 1;
+            }
+        },
+        None => None,
+    };
     eprintln!("llmshim serve listening on http://{address}");
     eprintln!("  Providers: {:?}", built.providers);
     if built.authenticated {
@@ -853,7 +875,56 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     } else {
         eprintln!("  Auth: OPEN (server.allow_unauthenticated = true)");
     }
-    match http_server::serve(listener, built.app, shutdown_signal()).await {
+    match &admin {
+        Some((_, _, admin_address)) => {
+            let protection = if built.admin_authenticated {
+                "token required except /health and /ready"
+            } else {
+                "OPEN (admin.allow_unauthenticated = true)"
+            };
+            eprintln!(
+                "  Admin: http://{admin_address} (/metrics, /v1/gateway/stats, /health, /ready): \
+                 {protection}"
+            )
+        }
+        None => eprintln!(
+            "  Admin endpoints (/metrics, /v1/gateway/stats, /health, /ready) are on the main \
+             listener without authentication; configure [admin] to separate them."
+        ),
+    }
+    // One signal stops both listeners.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let stop_all = stop.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = stop.send(true);
+    });
+    let wait_for_stop = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = stopped.wait_for(|stop| *stop).await;
+    };
+    let main_server = http_server::serve(listener, built.app, wait_for_stop(stopped.clone()));
+    let result = match admin {
+        Some((routes, admin_listener, _)) => {
+            let admin_server = http_server::serve(admin_listener, routes, wait_for_stop(stopped));
+            // If either listener ends, stop the other too. Waiting for both would
+            // leave a server running with half of its surface gone, and its
+            // readiness probe on the surviving listener still passing.
+            tokio::pin!(main_server, admin_server);
+            let (main_result, admin_result) = tokio::select! {
+                result = &mut main_server => {
+                    let _ = stop_all.send(true);
+                    (result, admin_server.await)
+                }
+                result = &mut admin_server => {
+                    let _ = stop_all.send(true);
+                    (main_server.await, result)
+                }
+            };
+            main_result.and(admin_result)
+        }
+        None => main_server.await,
+    };
+    match result {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("{error}");

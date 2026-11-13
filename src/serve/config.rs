@@ -89,6 +89,10 @@ pub struct ServeConfig {
     pub limits: Limits,
     #[serde(default)]
     pub state: State,
+    /// A separate listener for operational endpoints. Without it they are
+    /// served on the main listener, as the gateway does.
+    #[serde(default)]
+    pub admin: Option<Admin>,
     #[serde(default)]
     pub keys: Vec<GatewayKey>,
     #[serde(default, deserialize_with = "unique_map")]
@@ -157,6 +161,29 @@ fn default_host() -> String {
 }
 fn default_port() -> u16 {
     3000
+}
+
+/// A second listener for operational endpoints: `/metrics`,
+/// `/v1/gateway/stats`, `/health` and `/ready`. When it is configured the main
+/// listener answers 404 for all four, so callers never reach them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Admin {
+    /// IP address to bind. Defaults to loopback.
+    #[serde(default = "default_host")]
+    pub host: String,
+    pub port: u16,
+    /// Bearer token required for `/metrics` and `/v1/gateway/stats`, by
+    /// reference. `/health` and `/ready` stay open so orchestrators can probe.
+    /// Set this or `allow_unauthenticated`; neither is an error.
+    #[serde(default)]
+    pub token: Option<SecretRef>,
+    /// Serve the operational endpoints without a token. Without this, an
+    /// `[admin]` table must set `token`: like the main listener, the admin
+    /// listener is never open by accident.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 /// Where the server keeps what it must remember between requests.
@@ -437,6 +464,7 @@ impl ServeConfig {
             return issues;
         }
         self.validate_server(&mut issues);
+        self.validate_admin(&mut issues);
         self.validate_providers(&mut issues);
         self.validate_limits(&mut issues);
         self.validate_state(&mut issues);
@@ -465,6 +493,57 @@ impl ServeConfig {
                 "server.allow_unauthenticated",
                 "cannot be true while [[keys]] are defined",
             ));
+        }
+    }
+
+    fn validate_admin(&self, issues: &mut Vec<Issue>) {
+        let Some(admin) = &self.admin else {
+            return;
+        };
+        let bare = admin
+            .host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&admin.host);
+        if bare.parse::<std::net::IpAddr>().is_err() {
+            issues.push(Issue::new("admin.host", "must be an IPv4 or IPv6 address"));
+        }
+        if admin.port != 0
+            && admin.port == self.server.port
+            && admin.host.trim_matches(['[', ']']) == self.server.host.trim_matches(['[', ']'])
+        {
+            issues.push(Issue::new(
+                "admin.port",
+                "must differ from server.port when both listen on the same address",
+            ));
+        }
+        match (&admin.token, admin.allow_unauthenticated) {
+            (None, false) => issues.push(Issue::new(
+                "admin.token",
+                "set a token, or set admin.allow_unauthenticated = true to serve \
+                 /metrics and /v1/gateway/stats without one",
+            )),
+            (Some(_), true) => issues.push(Issue::new(
+                "admin.allow_unauthenticated",
+                "cannot be true while admin.token is set",
+            )),
+            _ => {}
+        }
+        if let Some(token) = &admin.token {
+            validate_secret(token, "admin.token", issues);
+            let reference = format!("{token:?}");
+            let shared = self
+                .providers
+                .values()
+                .filter_map(|p| p.api_key.as_ref())
+                .chain(self.keys.iter().filter_map(|k| k.secret.as_ref()))
+                .any(|other| format!("{other:?}") == reference);
+            if shared {
+                issues.push(Issue::new(
+                    "admin.token",
+                    "refers to a provider key or a caller key; use a separate secret",
+                ));
+            }
         }
     }
 
@@ -688,7 +767,12 @@ impl ServeConfig {
                 .as_ref()
                 .map(|secret| (format!("keys[{index}].secret"), secret))
         });
-        providers.chain(keys).collect()
+        let admin = self
+            .admin
+            .iter()
+            .filter_map(|admin| admin.token.as_ref())
+            .map(|secret| ("admin.token".to_string(), secret));
+        providers.chain(keys).chain(admin).collect()
     }
 
     /// Check that every referenced secret exists and is non-empty, without
@@ -727,6 +811,21 @@ impl ServeConfig {
             }
             if !callers.insert(caller) {
                 issues.push(Issue::new(&at, "has the same value as another caller key"));
+            }
+        }
+        if let Some(value) = self
+            .admin
+            .as_ref()
+            .and_then(|admin| admin.token.as_ref())
+            .and_then(read)
+            .map(|value| digest(&value))
+        {
+            // Both sets hold digests, so this holds for `sha256` caller keys too.
+            if upstream.contains(&value) || callers.contains(&value) {
+                issues.push(Issue::new(
+                    "admin.token",
+                    "has the same value as a provider key or a caller key",
+                ));
             }
         }
         for (at, secret) in self.secret_refs() {
@@ -1294,6 +1393,100 @@ mod tests {
         let pasted = MINIMAL.replace("OPENAI_API_KEY", "sk_live_AbCdEf123");
         let found = issues(&pasted);
         assert!(has(&found, "providers.openai.api_key.env"), "{found:?}");
+    }
+
+    #[test]
+    fn the_admin_listener_is_validated() {
+        let ok = format!("{MINIMAL}\n[admin]\nport = 9090\ntoken = {{ env = \"ADMIN_TOKEN\" }}");
+        let config = ServeConfig::parse(&ok, Format::Toml).unwrap();
+        assert_eq!(config.admin.as_ref().unwrap().host, "127.0.0.1");
+        for (bad, path) in [
+            ("host = \"nope\"\nport = 9090", "admin.host"),
+            ("port = 3000", "admin.port"),
+            (
+                "port = 9090\ntoken = { env = \"OPENAI_API_KEY\" }",
+                "admin.token",
+            ),
+            (
+                "port = 9090\ntoken = { env = \"CI_GATEWAY_KEY\" }",
+                "admin.token",
+            ),
+            (
+                "port = 9090\ntoken = { env = \"lower\" }",
+                "admin.token.env",
+            ),
+        ] {
+            let found = issues(&format!("{MINIMAL}\n[admin]\n{bad}"));
+            assert!(has(&found, path), "{bad}: {found:?}");
+        }
+        // Port 0 means "pick one", so two zeros do not collide.
+        let zeros = format!(
+            "{MINIMAL}\n[server]\nport = 0\n[admin]\nport = 0\nallow_unauthenticated = true"
+        );
+        assert!(ServeConfig::parse(&zeros, Format::Toml).is_ok());
+    }
+
+    #[test]
+    fn an_admin_listener_needs_a_token_or_an_explicit_opt_out() {
+        let tokenless = format!("{MINIMAL}\n[admin]\nport = 9090");
+        let found = issues(&tokenless);
+        assert!(has(&found, "admin.token"), "{found:?}");
+        assert!(found[0].contains("allow_unauthenticated"), "{found:?}");
+        let opted_out = format!("{MINIMAL}\n[admin]\nport = 9090\nallow_unauthenticated = true");
+        assert!(ServeConfig::parse(&opted_out, Format::Toml).is_ok());
+        let both = format!(
+            "{MINIMAL}\n[admin]\nport = 9090\nallow_unauthenticated = true\n\
+             token = {{ env = \"ADMIN_TOKEN\" }}"
+        );
+        assert!(has(&issues(&both), "admin.allow_unauthenticated"));
+    }
+
+    #[test]
+    fn an_admin_token_cannot_equal_a_sha256_caller_key() {
+        let digest = format!("{:x}", Sha256::digest(b"the-admin-token-0123456789"));
+        let text = format!(
+            "version = 1\n\
+             [providers.openai]\nkind = \"openai\"\napi_key = {{ env = \"OPENAI_API_KEY\" }}\n\
+             [[keys]]\nname = \"batch\"\ntenant = \"t\"\nsha256 = \"{digest}\"\n\
+             [admin]\nport = 9090\ntoken = {{ env = \"ADMIN_TOKEN\" }}"
+        );
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        let env = |name: &str| match name {
+            "OPENAI_API_KEY" => Some("upstream-key-0123456789".to_string()),
+            "ADMIN_TOKEN" => Some("the-admin-token-0123456789".to_string()),
+            _ => None,
+        };
+        let found = config.check_references(&env);
+        assert!(found.iter().any(|i| i.path == "admin.token"), "{found:?}");
+    }
+
+    #[test]
+    fn an_admin_token_cannot_share_a_value_with_other_secrets() {
+        let text = format!("{MINIMAL}\n[admin]\nport = 9090\ntoken = {{ env = \"ADMIN_TOKEN\" }}");
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        let all_same = |_: &str| Some("one-value-for-everything".to_string());
+        let found = config.check_references(&all_same);
+        assert!(found.iter().any(|i| i.path == "admin.token"), "{found:?}");
+        assert!(!found
+            .iter()
+            .any(|i| i.message.contains("one-value-for-everything")));
+        // Each arm alone: equal to a provider key, and equal to a caller key.
+        let as_provider = |name: &str| match name {
+            "ADMIN_TOKEN" | "OPENAI_API_KEY" => Some("shared-with-the-provider".to_string()),
+            _ => Some("different-value-0123456789".to_string()),
+        };
+        assert!(config
+            .check_references(&as_provider)
+            .iter()
+            .any(|i| i.path == "admin.token"));
+        let as_caller = |name: &str| match name {
+            "ADMIN_TOKEN" | "CI_GATEWAY_KEY" => Some("shared-with-the-caller".to_string()),
+            _ => Some("different-value-0123456789".to_string()),
+        };
+        assert!(config
+            .check_references(&as_caller)
+            .iter()
+            .any(|i| i.path == "admin.token"));
     }
 
     #[test]

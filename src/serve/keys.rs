@@ -16,6 +16,24 @@ use std::collections::HashMap;
 /// a weaker one; generate tokens with at least 128 bits of randomness.
 pub const MIN_TOKEN_LEN: usize = 16;
 
+/// Why `token` cannot serve as a bearer token, if it cannot. Shared by caller
+/// keys and the admin token so the two rules cannot drift apart.
+///
+/// The gateway reads the `Authorization` header as visible ASCII, so a token
+/// with anything else (a space, a byte-order mark left by an editor, a control
+/// or non-ASCII character) could never match.
+pub(crate) fn token_problem(token: &str) -> Option<String> {
+    if !token.chars().all(|c| ('!'..='~').contains(&c)) {
+        return Some(
+            "must contain only visible ASCII characters \
+             (no whitespace, control or non-ASCII characters)"
+                .into(),
+        );
+    }
+    (token.chars().count() < MIN_TOKEN_LEN)
+        .then(|| format!("must be at least {MIN_TOKEN_LEN} characters"))
+}
+
 /// Build the caller-key store.
 ///
 /// With `server.allow_unauthenticated` the store is [`KeyStore::Open`], which is
@@ -44,26 +62,16 @@ pub fn build_key_store(
         let at = format!("keys[{index}]");
         let digest = match (&key.secret, &key.sha256) {
             (Some(secret), None) => match read_secret(secret, env) {
-                // The gateway reads the Authorization header as visible ASCII, so a
-                // token with anything else (a space, a byte-order mark left by an
-                // editor, a control or non-ASCII character) could never match.
-                Ok(token) if !token.chars().all(|c| ('!'..='~').contains(&c)) => {
-                    issues.push(Issue {
-                        path: format!("{at}.secret"),
-                        message: "must contain only visible ASCII characters \
-                                  (no whitespace, control or non-ASCII characters)"
-                            .into(),
-                    });
-                    continue;
-                }
-                Ok(token) if token.chars().count() < MIN_TOKEN_LEN => {
-                    issues.push(Issue {
-                        path: format!("{at}.secret"),
-                        message: format!("must be at least {MIN_TOKEN_LEN} characters"),
-                    });
-                    continue;
-                }
-                Ok(token) => format!("{:x}", Sha256::digest(token.as_bytes())),
+                Ok(token) => match token_problem(&token) {
+                    Some(message) => {
+                        issues.push(Issue {
+                            path: format!("{at}.secret"),
+                            message,
+                        });
+                        continue;
+                    }
+                    None => format!("{:x}", Sha256::digest(token.as_bytes())),
+                },
                 Err(message) => {
                     issues.push(Issue {
                         path: format!("{at}.secret"),

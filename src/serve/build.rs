@@ -19,9 +19,15 @@ use crate::providers::{
 use crate::proxy::ratelimit::{InMemoryRateLimiter, ProviderLimit, RateLimitConfig};
 use crate::proxy::wire::{DefaultReceiptStore, Receipts};
 use crate::router::Router;
+use axum::extract::Request;
+use axum::http::{header, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 
 /// Idempotency answers are kept this long unless `state.idempotency_ttl_secs`
 /// says otherwise (the gateway's existing default).
@@ -31,10 +37,36 @@ const DEFAULT_IDEMPOTENCY_TTL_SECS: u64 = 300;
 pub struct Built {
     pub app: axum::Router,
     pub address: SocketAddr,
+    /// The operational endpoints on a listener of their own, when `[admin]` is
+    /// configured. The main application then answers 404 for those paths.
+    pub admin: Option<(axum::Router, SocketAddr)>,
     /// Provider names, for the startup banner.
     pub providers: Vec<String>,
     pub caller_keys: usize,
     pub authenticated: bool,
+    /// Whether the admin listener (when there is one) requires its token.
+    pub admin_authenticated: bool,
+}
+
+/// The digest of the admin token, if one is configured, after the rules a
+/// caller token must meet. `build_app` and `serve --check` share this, so a
+/// token that `--check` accepts is one the server starts with.
+pub fn admin_token_digest(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<Vec<u8>>, Issue> {
+    let Some(secret) = config.admin.as_ref().and_then(|admin| admin.token.as_ref()) else {
+        return Ok(None);
+    };
+    let issue = |message| Issue {
+        path: "admin.token".into(),
+        message,
+    };
+    let token = read_secret(secret, env).map_err(issue)?;
+    if let Some(message) = super::keys::token_problem(&token) {
+        return Err(issue(message));
+    }
+    Ok(Some(Sha256::digest(token.as_bytes()).to_vec()))
 }
 
 /// Build the application. Must be called inside a Tokio runtime, because the
@@ -65,6 +97,27 @@ pub fn build_app(
     };
 
     let router = build_router(config, env, &mut issues);
+
+    let admin_token = match admin_token_digest(config, env) {
+        Ok(digest) => digest,
+        Err(issue) => {
+            issues.push(issue);
+            None
+        }
+    };
+    let admin_address = match &config.admin {
+        Some(admin) => match parse_address(&admin.host, admin.port) {
+            Ok(address) => Some(address),
+            Err(message) => {
+                issues.push(Issue {
+                    path: "admin.host".into(),
+                    message,
+                });
+                None
+            }
+        },
+        None => None,
+    };
 
     // The rules that compare secrets (a caller token that is also an upstream
     // key) belong to assembly too, so a caller of `build_app` cannot skip them.
@@ -138,6 +191,8 @@ pub fn build_app(
         },
     );
 
+    let admin_authenticated = admin_token.is_some();
+    let admin_state = state.clone();
     let app = app_with_parts(
         state,
         // No browser origin is trusted. Browsers are not callers of a gateway.
@@ -145,13 +200,73 @@ pub fn build_app(
         crate::proxy::lifetime::LogicalRequestDeadlines::from_lookup(&|_| None, "unused", "unused"),
         DefaultReceiptStore::at(receipts_root),
     );
+    let (app, admin) = match admin_address {
+        Some(admin_address) => {
+            let routes = crate::gateway::http::admin_routes(admin_state);
+            let routes = match admin_token {
+                Some(digest) => routes.layer(axum::middleware::from_fn(
+                    move |request: Request, next: Next| {
+                        let digest = digest.clone();
+                        async move { require_admin_token(&digest, request, next).await }
+                    },
+                )),
+                None => routes,
+            };
+            (
+                app.layer(axum::middleware::from_fn(hide_admin_paths)),
+                Some((routes, admin_address)),
+            )
+        }
+        None => (app, None),
+    };
     Ok(Built {
         app,
+        admin,
         address,
         providers,
         caller_keys: config.keys.len(),
         authenticated,
+        admin_authenticated,
     })
+}
+
+/// The main listener does not serve operational endpoints once they have a
+/// listener of their own.
+async fn hide_admin_paths(request: Request, next: Next) -> Response {
+    if crate::gateway::http::ADMIN_PATHS.contains(&request.uri().path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    next.run(request).await
+}
+
+/// `/metrics` and `/v1/gateway/stats` need the admin token; probes stay open.
+async fn require_admin_token(expected: &[u8], request: Request, next: Next) -> Response {
+    if matches!(request.uri().path(), "/health" | "/ready") {
+        return next.run(request).await;
+    }
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let accepted = presented
+        .map(|token| bool::from(Sha256::digest(token.as_bytes()).as_slice().ct_eq(expected)))
+        .unwrap_or(false);
+    if accepted {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response()
+    }
 }
 
 /// Create `path` and any missing parents with mode 0700 (unix). An existing
@@ -242,5 +357,51 @@ fn hosted(kind: ProviderKind, key: String, base_url: Option<String>) -> Box<dyn 
         ProviderKind::Openrouter => on_base!(OpenRouter::new(key)),
         // Handled by the caller; kept total so a new kind cannot be forgotten.
         ProviderKind::OpenaiCompatible => unreachable!("self-hosted servers are built by name"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve::config::Format;
+
+    fn config(admin: &str) -> ServeConfig {
+        let text = format!(
+            "version = 1\n[server]\nallow_unauthenticated = true\n\
+             [providers.openai]\nkind = \"openai\"\napi_key = {{ env = \"UPSTREAM\" }}\n{admin}"
+        );
+        ServeConfig::parse(&text, Format::Toml).unwrap()
+    }
+
+    fn with(value: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |name| (name == "ADMIN").then(|| value.to_string())
+    }
+
+    #[test]
+    fn the_admin_token_meets_the_rules_a_caller_token_does() {
+        let admin = "[admin]\nport = 9090\ntoken = { env = \"ADMIN\" }";
+        let config = config(admin);
+        for (value, expected) in [
+            ("short", "at least 16 characters"),
+            ("has a space inside it 0123", "visible ASCII"),
+            ("\u{feff}admin-token-0123456789", "visible ASCII"),
+        ] {
+            let issue = admin_token_digest(&config, &with(value)).unwrap_err();
+            assert_eq!(issue.path, "admin.token");
+            assert!(issue.message.contains(expected), "{issue:?}");
+            assert!(!issue.message.contains(value), "{issue:?}");
+        }
+        let digest = admin_token_digest(&config, &with("admin-token-0123456789"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(digest, Sha256::digest(b"admin-token-0123456789").to_vec());
+        let unset = admin_token_digest(&config, &|_| None).unwrap_err();
+        assert!(unset.message.contains("ADMIN is not set"), "{unset:?}");
+    }
+
+    #[test]
+    fn no_token_configured_is_not_an_error_here() {
+        let config = config("[admin]\nport = 9090\nallow_unauthenticated = true");
+        assert_eq!(admin_token_digest(&config, &|_| None).unwrap(), None);
     }
 }

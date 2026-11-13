@@ -15,6 +15,6 @@ pub mod build;
 pub mod config;
 pub mod keys;
 
-pub use build::{build_app, Built};
+pub use build::{admin_token_digest, build_app, Built};
 pub use config::{Format, Issue, ServeConfig};
 pub use keys::build_key_store;

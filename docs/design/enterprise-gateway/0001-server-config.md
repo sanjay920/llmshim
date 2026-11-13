@@ -46,6 +46,7 @@ drift from the code.
 | `server.host` defaults to `127.0.0.1`. | Listening on every interface is opt-in. |
 | A provider's table name is its routing prefix. `route` is reserved. | Matches the existing `provider/model` grammar and named routes. |
 | A hosted provider (`openai`, `anthropic`, `gemini`, `xai`, `cerebras`, `openrouter`) must be named for its kind, once. A self-hosted `openai-compatible` server may not use a hosted name. | Prices, limits and the catalog are looked up by provider name. Multiple credentials per provider is a later feature. |
+| `[admin]` needs a port that differs from `server.port` on the same address; its token is a separate secret from every provider and caller key. | The admin listener must not share a credential with traffic (0005). |
 | `state.receipts_dir` is absolute; `state.idempotency_ttl_secs` is 1 to 604800. | Operators mount a volume for receipts; the bound keeps a typo from holding answers for years. |
 | `base_url` must be `http(s)://host[/path]` with no credentials, query or fragment. | Redirects are disabled in the client, so this must be the final endpoint; credentials belong in `api_key`. |
 | Routes carry their defaults in an explicit `settings` table, name their model as `<provider>/<model>` with a defined provider, and may not point at another route. | Keeps unknown-field checking on the route itself, and a route that could never resolve fails at `--check`, not at the first request. |

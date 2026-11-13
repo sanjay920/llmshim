@@ -10,10 +10,15 @@ use std::time::Duration;
 
 const CALLER_KEY: &str = "caller-key-0123456789abcdef";
 const UPSTREAM_KEY: &str = "upstream-key-0123456789abcdef";
+const ADMIN_TOKEN: &str = "admin-token-0123456789abcdef";
 
 struct Server {
     child: Child,
     base: String,
+    /// The admin listener's address, when the configuration has `[admin]`.
+    admin: Option<String>,
+    /// The whole `Admin:` banner line, which says whether a token is required.
+    admin_banner: String,
     _dir: tempdir::Dir,
 }
 
@@ -59,6 +64,7 @@ fn start(config: &str, label: &str) -> Server {
         .env("LLMSHIM_CATALOG_OFFLINE", "1")
         .env("SERVE_E2E_CALLER_KEY", CALLER_KEY)
         .env("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY)
+        .env("SERVE_E2E_ADMIN_TOKEN", ADMIN_TOKEN)
         // Canaries: each of these would break or refuse requests if `serve`
         // read it. The file is the only source of settings.
         .env(
@@ -74,9 +80,12 @@ fn start(config: &str, label: &str) -> Server {
         .spawn()
         .unwrap();
     // Owned by the guard from here on, so a failed start still reaps the process.
+    let wants_admin = config.contains("[admin]");
     let mut server = Server {
         child,
         base: String::new(),
+        admin: None,
+        admin_banner: String::new(),
         _dir: dir,
     };
     let stderr = server.child.stderr.take().unwrap();
@@ -94,6 +103,13 @@ fn start(config: &str, label: &str) -> Server {
             Ok(line) => {
                 if let Some(base) = line.split("listening on ").nth(1) {
                     server.base = base.trim().to_string();
+                }
+                if let Some(admin) = line.trim().strip_prefix("Admin: ") {
+                    server.admin = admin.split_whitespace().next().map(str::to_string);
+                    server.admin_banner = line.trim().to_string();
+                }
+                // The banner prints the main address, then the admin line.
+                if !server.base.is_empty() && (!wants_admin || server.admin.is_some()) {
                     return server;
                 }
                 seen.push(line);
@@ -293,6 +309,161 @@ fn a_configuration_problem_exits_one_without_binding_a_port() {
     assert_eq!(code, Some(1));
     assert!(stderr.contains("server.host"), "{stderr}");
     assert!(!stderr.contains("listening on"), "{stderr}");
+}
+
+fn admin_config(upstream: &str) -> String {
+    config(
+        upstream,
+        r#"
+        [admin]
+        port = 0
+        token = { env = "SERVE_E2E_ADMIN_TOKEN" }
+        "#,
+    )
+}
+
+#[tokio::test]
+async fn operational_endpoints_move_to_their_own_listener() {
+    let mut upstream = mockito::Server::new_async().await;
+    let mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .expect(1)
+        .create_async()
+        .await;
+    let server = start(&admin_config(&upstream.url()), "admin");
+    let admin = server.admin.clone().expect("admin listener banner");
+    let client = reqwest::Client::new();
+
+    // The main listener no longer exposes any of them, even to a valid caller.
+    for path in ["/metrics", "/v1/gateway/stats", "/health", "/ready"] {
+        let response = client
+            .get(format!("{}{path}", server.base))
+            .bearer_auth(CALLER_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "main listener {path}");
+    }
+    // Traffic still flows on the main listener.
+    let response = chat(&server, Some(CALLER_KEY), "inference/test-model").await;
+    assert_eq!(response.status(), 200);
+    mock.assert_async().await;
+
+    // Probes are open on the admin listener.
+    for path in ["/health", "/ready"] {
+        let response = client.get(format!("{admin}{path}")).send().await.unwrap();
+        assert_eq!(response.status(), 200, "admin {path}");
+    }
+    // Metrics and stats need the admin token; no other secret opens them.
+    for path in ["/metrics", "/v1/gateway/stats"] {
+        let url = format!("{admin}{path}");
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            401,
+            "{path}"
+        );
+        for wrong in [CALLER_KEY, UPSTREAM_KEY, "not-the-admin-token-0123456789"] {
+            let response = client.get(&url).bearer_auth(wrong).send().await.unwrap();
+            assert_eq!(response.status(), 401, "{path} with a wrong token");
+        }
+        let response = client
+            .get(&url)
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{path} with the admin token");
+    }
+    // The admin listener serves no inference route. Everything but the probes
+    // needs the token, so a caller key is refused outright, and even the admin
+    // token finds nothing there.
+    let inference = format!("{admin}/v1/chat/completions");
+    let body = json!({"model": "inference/test-model", "messages": []});
+    let with_caller = client.post(&inference).bearer_auth(CALLER_KEY).json(&body);
+    assert_eq!(with_caller.send().await.unwrap().status(), 401);
+    let with_admin = client.post(&inference).bearer_auth(ADMIN_TOKEN).json(&body);
+    assert_eq!(with_admin.send().await.unwrap().status(), 404);
+}
+
+#[test]
+fn an_admin_listener_without_a_token_must_be_opted_into() {
+    let dir = tempdir::Dir::new("tokenless-admin");
+    let path = dir.0.join("gateway.toml");
+    let text =
+        config("http://127.0.0.1:1", "[admin]\nport = 0").replace("{DIR}", dir.0.to_str().unwrap());
+    std::fs::write(&path, text).unwrap();
+    let (code, stderr) = run_to_exit(
+        &path,
+        &[
+            ("SERVE_E2E_CALLER_KEY", CALLER_KEY),
+            ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("admin.token"), "{stderr}");
+    assert!(stderr.contains("allow_unauthenticated"), "{stderr}");
+    assert!(!stderr.contains("listening on"), "{stderr}");
+}
+
+#[tokio::test]
+async fn an_opted_in_open_admin_listener_says_so_and_serves_without_a_token() {
+    let upstream = mockito::Server::new_async().await;
+    let extra = "[admin]\nport = 0\nallow_unauthenticated = true";
+    let server = start(&config(&upstream.url(), extra), "open-admin");
+    assert!(
+        server.admin_banner.contains("OPEN"),
+        "{}",
+        server.admin_banner
+    );
+    let admin = server.admin.clone().unwrap();
+    let response = reqwest::get(format!("{admin}/metrics")).await.unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn a_protected_admin_listener_says_a_token_is_required() {
+    let upstream = mockito::Server::new_async().await;
+    let server = start(&admin_config(&upstream.url()), "protected-admin");
+    assert!(
+        server.admin_banner.contains("token required"),
+        "{}",
+        server.admin_banner
+    );
+    assert!(!server.admin_banner.contains("OPEN"));
+}
+
+#[test]
+fn a_taken_admin_port_fails_the_start_cleanly() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let dir = tempdir::Dir::new("taken");
+    let path = dir.0.join("gateway.toml");
+    let text = config(
+        "http://127.0.0.1:1",
+        &format!("[admin]\nport = {port}\nallow_unauthenticated = true"),
+    )
+    .replace("{DIR}", dir.0.to_str().unwrap());
+    std::fs::write(&path, text).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args(["serve", "--config", path.to_str().unwrap()])
+        .env_clear()
+        .env("LLMSHIM_CATALOG_OFFLINE", "1")
+        .env("SERVE_E2E_CALLER_KEY", CALLER_KEY)
+        .env("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("admin:") && stderr.contains("already in use"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("listening on"),
+        "nothing is announced: {stderr}"
+    );
 }
 
 #[test]

@@ -55,13 +55,12 @@ server works.
 
 ## Known limits (each is a roadmap item)
 
-- `/metrics`, `/ready` and `/health` are unauthenticated, as they are under
-  `gateway`. Bind to an internal interface or restrict them at the network
-  layer until they are separately configurable.
-- `/v1/models` and `/v1/gateway/stats` are unauthenticated, as under `gateway`
-  (the stats name providers and queue depths). Bind to an internal interface or
-  restrict them at the network layer until the operational routes move to a
-  listener of their own.
+- Without an `[admin]` table, `/metrics`, `/ready`, `/health` and
+  `/v1/gateway/stats` are on the main listener and unauthenticated, as under
+  `gateway` (the stats name providers and queue depths). `[admin]` (0005) moves
+  them to a listener of their own.
+- `/v1/models` is unauthenticated on the main listener, as under `gateway`.
+  Bind to an internal interface or restrict it at the network layer.
 - The shared HTTP client honours the standard `HTTP_PROXY`, `HTTPS_PROXY` and
   `ALL_PROXY` variables. Enterprises need that, but a stray proxy variable
   carries provider keys and prompts through the proxy (in clear for an `http://`

@@ -996,6 +996,23 @@ async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> 
     })
 }
 
+/// The operational endpoints alone, for a listener of their own. These are the
+/// same handlers the main application serves at the same paths.
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+pub(crate) fn admin_routes(state: Arc<GatewayState>) -> axum::Router {
+    axum::Router::new()
+        .route("/v1/gateway/stats", get(stats))
+        .route("/metrics", get(metrics))
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .layer(axum::middleware::from_fn(request_id))
+        .with_state(state)
+}
+
+/// Paths that [`admin_routes`] serves.
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+pub(crate) const ADMIN_PATHS: [&str; 4] = ["/v1/gateway/stats", "/metrics", "/health", "/ready"];
+
 /// Build the gateway axum application.
 pub fn app(state: Arc<GatewayState>) -> axum::Router {
     app_with_origin_policy(state, OriginPolicy::from_env())
