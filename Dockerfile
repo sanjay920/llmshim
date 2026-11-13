@@ -1,8 +1,14 @@
 # Build stage
-FROM rust:1.86-slim AS builder
+# The builder and the runtime must share a glibc: bookworm here matches the
+# distroless debian12 runtime below. A newer builder image links a newer glibc
+# than the runtime has, and the binary fails to start.
+FROM rust:1.99-slim-bookworm AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+# The workspace has a second member, the model catalog, that the root crate
+# depends on by path.
+COPY crates/ crates/
 COPY src/ src/
 COPY api/ api/
 
