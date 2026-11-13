@@ -24,6 +24,10 @@ spec:
       annotations:
         # A changed configuration rolls the pods; the gateway has no reload.
         checksum/config: {{ include "llmshim.config" . | sha256sum }}
+        {{- if .Values.secretRevision }}
+        # Bumped by the operator when a value in the Secret changes (see values).
+        llmshim/secret-revision: {{ .Values.secretRevision | quote }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -67,9 +71,12 @@ spec:
               containerPort: {{ .Values.server.port }}
             - name: admin
               containerPort: {{ .Values.admin.port }}
+          # /health, not /ready: in fleet mode /ready is 503 while Redis is
+          # down, and a startup probe that waited on it would kill a pod that
+          # was only waiting for Redis, turning an outage into a crash loop.
           startupProbe:
             httpGet:
-              path: /ready
+              path: /health
               port: admin
             periodSeconds: 2
             failureThreshold: 30

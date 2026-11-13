@@ -40,9 +40,13 @@ impl JsonLines {
     }
 
     pub(crate) fn write<T: Serialize>(&self, record: &T) {
-        if let Ok(line) = serde_json::to_string(record) {
+        if let Ok(mut line) = serde_json::to_string(record) {
+            // One `write_all` of the whole line: `writeln!` on an unbuffered file
+            // is two writes, and a failure (or another writer on the same file)
+            // between them would glue the next record onto a partial one.
+            line.push('\n');
             if let Ok(mut writer) = self.writer.lock() {
-                let _ = writeln!(writer, "{line}");
+                let _ = writer.write_all(line.as_bytes());
                 let _ = writer.flush();
             }
         }
