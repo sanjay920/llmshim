@@ -17,6 +17,11 @@ imagePullSecrets: []
 # the configuration names them: provider keys (`api_key = { env = "..." }`),
 # caller keys, the admin token and the Redis URL. The chart never creates it.
 existingSecret: ""
+# The pods read the Secret above as environment variables, so a changed Secret
+# changes nothing in the pod spec and the pods keep the values they started with
+# (a pod that restarts later then differs from its peers). Change this string
+# whenever you change a value in the Secret, to roll the pods onto it.
+secretRevision: ""
 
 server:
   port: 3000
@@ -37,10 +42,13 @@ admin:
   # use it. The kubelet reaches it over the pod network, so it binds all
   # interfaces; restrict it with the NetworkPolicy below or the service mesh.
   port: 9090
-  # Name of the environment variable (from existingSecret) holding a bearer
-  # token that /metrics and stats require. Empty leaves the port open to
-  # whatever can reach it.
-  tokenEnv: ""
+  # Name of the environment variable (from existingSecret) holding the bearer
+  # token that /metrics and stats require. The Secret must contain it, or the
+  # pod refuses to start. To serve those endpoints with no token, which leaves
+  # them open to anything that can reach the port, set tokenEnv to "" and
+  # allowUnauthenticated to true; the render fails if neither is set.
+  tokenEnv: GATEWAY_ADMIN_TOKEN
+  allowUnauthenticated: false
 
 fleet:
   # Share the queue, limits, spend ledger and provider health between replicas
@@ -90,6 +98,9 @@ resources:
   limits:
     memory: 512Mi
 
+# Not rendered with a single replica (replicaCount, or autoscaling.minReplicas
+# when autoscaling is on), because minAvailable: 1 would then block every node
+# drain.
 podDisruptionBudget:
   enabled: true
   minAvailable: 1
@@ -100,8 +111,10 @@ autoscaling:
   maxReplicas: 10
   targetCPUUtilizationPercentage: 70
 
-# Allow traffic to the gateway port from these peers, and to the admin port only
-# from the monitoring namespace. Empty selectors allow nothing extra.
+# Allow traffic to the gateway port from `gatewayFrom` and to the admin port
+# only from `adminFrom` (for example your monitoring namespace). Both are lists
+# of NetworkPolicyPeer; an empty list allows nothing extra, so enabling the
+# policy without them denies all ingress.
 networkPolicy:
   enabled: false
   gatewayFrom: []        # list of NetworkPolicyPeer

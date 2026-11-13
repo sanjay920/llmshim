@@ -70,4 +70,32 @@ if helm template release /charts/llmshim --set server.tls.enabled=true >/dev/nul
   echo "expected the render to fail"; exit 1
 fi
 grep -q "server.tls.secretName is required" "$work/err"
+echo "== the admin port is never open by accident"
+if helm template release /charts/llmshim --set admin.tokenEnv= >/dev/null 2>"$work/err"; then
+  echo "expected a render with neither a token nor an opt-out to fail"; exit 1
+fi
+grep -q "admin.allowUnauthenticated=true" "$work/err"
+helm template release /charts/llmshim --set admin.tokenEnv= --set admin.allowUnauthenticated=true \
+  > "$work/open.yaml"
+grep -q "allow_unauthenticated = true" "$work/open.yaml"
+if helm template release /charts/llmshim --set admin.allowUnauthenticated=true >/dev/null 2>"$work/err"; then
+  echo "expected a token and an opt-out together to fail"; exit 1
+fi
+grep -q "mutually exclusive" "$work/err"
+
+echo "== [admin.tls] in the operator's config is refused"
+if helm template release /charts/llmshim --set-string config='[admin.tls]' >/dev/null 2>"$work/err"; then
+  echo "expected the render to fail"; exit 1
+fi
+grep -q "does not support \[admin.tls\]" "$work/err"
+
+echo "== a changed Secret revision rolls the pods; a single replica has no PDB"
+helm template release /charts/llmshim --set secretRevision=a > "$work/rev-a.yaml"
+helm template release /charts/llmshim --set secretRevision=b > "$work/rev-b.yaml"
+! cmp -s "$work/rev-a.yaml" "$work/rev-b.yaml"
+grep -q "llmshim/secret-revision" "$work/rev-a.yaml"
+helm template release /charts/llmshim --set replicaCount=1 > "$work/one.yaml"
+! grep -q "kind: PodDisruptionBudget" "$work/one.yaml"
+grep -q "kind: PodDisruptionBudget" "$work/default.yaml"
+
 echo "chart validation passed"

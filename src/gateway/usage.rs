@@ -13,10 +13,20 @@
 //! exact has to treat nulls as a gap rather than as zero.
 //!
 //! The recorder holds no more than the latest usage snapshot of each attempt
-//! still in flight, and drops it when the attempt finishes or is abandoned. An
-//! attempt is recorded exactly once, and only if it was admitted: a request the
-//! gateway refused before sending costs nothing and produces no record.
+//! still in flight (plus three cost figures), and drops them when the attempt
+//! finishes or is abandoned. An attempt is recorded exactly once, and only if it
+//! was admitted: a request the gateway refused before sending costs nothing and
+//! produces no record. An attempt that was admitted and then dropped before its
+//! request left (a deadline, a cancelled client) is recorded as `abandoned` with
+//! no usage.
+//!
+//! The cost of a record is settled by the same rule as the spend ledger, so the
+//! two cannot disagree: a provider's exact terminal bill wins; otherwise the
+//! terminal catalog estimate, but never below the highest charge the provider
+//! reported along the way (`provider_floor`). A later, lower catalog estimate
+//! cannot erase a charge the provider already reported.
 
+use crate::gateway::budget::{may_finalize, SpendAuthority, SpendObservation};
 use crate::policy::{AttemptIdentity, AttemptKind, AttemptOutcome};
 use serde::Serialize;
 use serde_json::Value;
@@ -46,9 +56,16 @@ pub struct UsageRecord {
     /// The upstream HTTP status, for an `http_failure`.
     pub http_status: Option<u16>,
     pub duration_ms: u64,
+    /// The provider's prompt count. Providers disagree on whether it already
+    /// includes cache reads (Anthropic's does not, OpenAI's does); use
+    /// `uncached_input_tokens` with the two cache fields for chargeback.
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub reasoning_tokens: u64,
+    /// `None` when the provider reported no reasoning count, which is not the
+    /// same as none being used.
+    pub reasoning_tokens: Option<u64>,
+    /// Prompt tokens billed at the full input rate; `None` when not reported.
+    pub uncached_input_tokens: Option<u64>,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     /// USD for this attempt. A provider floor is a lower bound; `None` means
@@ -93,7 +110,14 @@ struct Open {
     model: String,
     kind: &'static str,
     started: Instant,
+    /// The latest usage snapshot: counters are cumulative, so the last wins.
     usage: Option<Value>,
+    /// The three figures the ledger settles from, in USD. The highest charge
+    /// the provider reported, its exact terminal bill, and the largest terminal
+    /// catalog estimate.
+    max_provider_usd: Option<f64>,
+    terminal_provider_usd: Option<f64>,
+    terminal_catalog_usd: Option<f64>,
 }
 
 /// Tracks attempts in flight and emits one record when each ends.
@@ -127,17 +151,38 @@ impl UsageRecorder {
             kind: kind_name(identity.kind()),
             started: Instant::now(),
             usage: None,
+            max_provider_usd: None,
+            terminal_provider_usd: None,
+            terminal_catalog_usd: None,
         };
         if let Ok(mut attempts) = self.open.lock() {
             attempts.insert(identity.id(), open);
         }
     }
 
-    /// The attempt's cumulative usage snapshot; the latest one wins.
-    pub(crate) fn observe(&self, id: uuid::Uuid, usage: &Value) {
+    /// The attempt's cumulative usage snapshot. Counters take the latest; the
+    /// cost figures are kept as the ledger keeps them (see the module docs).
+    /// `observation` is the same value the ledger is given for this snapshot.
+    pub(crate) fn observe(&self, id: uuid::Uuid, usage: &Value, observation: &SpendObservation) {
+        let usd = crate::cost::stamped(usage)
+            .or_else(|| (observation.amount_nanos == Some(0)).then_some(0.0))
+            .filter(|usd| usd.is_finite() && *usd >= 0.0);
         if let Ok(mut attempts) = self.open.lock() {
             if let Some(open) = attempts.get_mut(&id) {
                 open.usage = Some(usage.clone());
+                let Some(usd) = usd else { return };
+                if observation.authority == SpendAuthority::Provider {
+                    open.max_provider_usd = Some(open.max_provider_usd.map_or(usd, |m| m.max(usd)));
+                }
+                if observation.terminal_authoritative {
+                    match observation.authority {
+                        SpendAuthority::Provider => open.terminal_provider_usd = Some(usd),
+                        SpendAuthority::Catalog => {
+                            open.terminal_catalog_usd =
+                                Some(open.terminal_catalog_usd.map_or(usd, |c| c.max(usd)));
+                        }
+                    }
+                }
             }
         }
     }
@@ -176,15 +221,49 @@ fn outcome_parts(outcome: AttemptOutcome) -> (&'static str, Option<u16>) {
     }
 }
 
+/// The cost and its source, settled as the spend ledger settles an attempt.
+fn settle(open: &Open, finalizes: bool) -> (Option<f64>, Option<String>) {
+    let source = |usd: f64, name: &str| (Some(usd), Some(name.to_owned()));
+    if finalizes {
+        if let Some(bill) = open.terminal_provider_usd {
+            return source(bill, "provider");
+        }
+        if let Some(estimate) = open.terminal_catalog_usd {
+            return match open.max_provider_usd {
+                Some(floor) if floor > estimate => source(floor, "provider_floor"),
+                _ => source(estimate, "catalog"),
+            };
+        }
+    }
+    // Not finalized (the attempt failed or was abandoned, or reported nothing
+    // terminal): what is known is a lower bound. A provider's reported charge
+    // is that floor; failing that, the latest snapshot as it was stamped.
+    if let Some(floor) = open.max_provider_usd {
+        return source(floor, "provider_floor");
+    }
+    let usage = open.usage.as_ref();
+    (
+        usage.and_then(crate::cost::stamped),
+        usage
+            .and_then(|usage| usage.get("cost_source"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    )
+}
+
 fn build(id: uuid::Uuid, open: Open, outcome: AttemptOutcome) -> UsageRecord {
+    let (cost_usd, cost_source) = settle(&open, may_finalize(outcome));
     let (outcome, http_status) = outcome_parts(outcome);
     let usage = open.usage.as_ref();
-    let count = |key: &str| -> u64 {
-        usage
-            .and_then(|usage| usage.get(key))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-    };
+    let optional = |value: Option<&Value>| value.and_then(Value::as_u64);
+    let count =
+        |key: &str| -> u64 { optional(usage.and_then(|usage| usage.get(key))).unwrap_or(0) };
+    // Chat-wire providers keep the reasoning count in the details object.
+    let reasoning = optional(usage.and_then(|usage| usage.get("reasoning_tokens"))).or_else(|| {
+        optional(
+            usage.and_then(|usage| usage.pointer("/completion_tokens_details/reasoning_tokens")),
+        )
+    });
     UsageRecord {
         event: "usage",
         ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -198,16 +277,12 @@ fn build(id: uuid::Uuid, open: Open, outcome: AttemptOutcome) -> UsageRecord {
         duration_ms: open.started.elapsed().as_millis() as u64,
         input_tokens: count("prompt_tokens"),
         output_tokens: count("completion_tokens"),
-        reasoning_tokens: count("reasoning_tokens"),
+        reasoning_tokens: reasoning,
+        uncached_input_tokens: optional(usage.and_then(|usage| usage.get("uncached_input_tokens"))),
         cache_read_tokens: count("cache_read_tokens"),
         cache_write_tokens: count("cache_write_tokens"),
-        cost_usd: usage
-            .and_then(|usage| usage.get("cost_usd"))
-            .and_then(Value::as_f64),
-        cost_source: usage
-            .and_then(|usage| usage.get("cost_source"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        cost_usd,
+        cost_source,
         usage_reported: usage.is_some(),
     }
 }

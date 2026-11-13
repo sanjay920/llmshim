@@ -62,8 +62,8 @@ pub(crate) struct IdentifiedCaller {
 
 /// API-key registry. `Open` = no auth (dev); `Enforced` = Bearer required.
 /// `Hashed` is `Enforced` for a store that holds only SHA-256 digests of the
-/// keys, so the plaintext of a caller key never sits in this process's memory
-/// after it is configured.
+/// keys, so the store itself never keeps a caller key's plaintext. (A token
+/// that came from an environment variable is still in the environment.)
 pub enum KeyStore {
     Open,
     Enforced(HashMap<String, Identity>),
