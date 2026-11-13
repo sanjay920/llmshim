@@ -805,6 +805,13 @@ fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         report(&missing);
         return 1;
     }
+    // Building the caller-key store is the stricter check: it also enforces
+    // token length and whitespace, which a reference check cannot.
+    if let Err(issues) = llmshim::serve::build_key_store(&config, &|name| std::env::var(name).ok())
+    {
+        report(&issues);
+        return 1;
+    }
     if options.check {
         println!(
             "{}: valid (version {}, {} provider(s), {} key(s), {} route(s))",
