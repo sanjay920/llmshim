@@ -30,9 +30,10 @@ path before any port is bound or directory is created.
 | `[routes.<name>]` | named routes: `route/<name>` |
 | `[state] receipts_dir, idempotency_ttl_secs` | where replay receipts live, and how long an idempotent answer is kept |
 
-Everything else takes the gateway's documented default, never an `LLMSHIM_*`
-variable. `serve` reads the environment only to resolve `{ env = ... }`
-references. A test starts the server with `LLMSHIM_GATEWAY_KEYS_FILE` pointing
+Everything else that belongs to the server takes the gateway's documented
+default, never an `LLMSHIM_*` variable. `serve` reads the environment to resolve
+`{ env = ... }` references; the process-wide settings in "Known limits" below
+are the exceptions. A test starts the server with `LLMSHIM_GATEWAY_KEYS_FILE` pointing
 at a missing file, `LLMSHIM_GATEWAY_QUEUE_DEPTH=0`, `LLMSHIM_RATE_LIMIT_RPM=0`
 and a dead `LLMSHIM_REDIS_URL`; each would break the server if read, and the
 server works.
@@ -57,6 +58,14 @@ server works.
 - `/metrics`, `/ready` and `/health` are unauthenticated, as they are under
   `gateway`. Bind to an internal interface or restrict them at the network
   layer until they are separately configurable.
+- `/v1/models` and `/v1/gateway/stats` are unauthenticated, as under `gateway`
+  (the stats name providers and queue depths). Bind to an internal interface or
+  restrict them at the network layer until the operational routes move to a
+  listener of their own.
+- The shared HTTP client honours the standard `HTTP_PROXY`, `HTTPS_PROXY` and
+  `ALL_PROXY` variables. Enterprises need that, but a stray proxy variable
+  carries provider keys and prompts through the proxy (in clear for an `http://`
+  base URL); set `NO_PROXY` for internal servers.
 - No TLS termination. Run behind a terminating proxy or service mesh.
 - No reload. A change needs a restart; the parsed configuration is immutable so
   a swap can be added without touching the data plane.

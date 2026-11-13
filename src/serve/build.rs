@@ -66,25 +66,35 @@ pub fn build_app(
 
     let router = build_router(config, env, &mut issues);
 
+    // The rules that compare secrets (a caller token that is also an upstream
+    // key) belong to assembly too, so a caller of `build_app` cannot skip them.
+    // Run only once nothing else failed, because they repeat the missing-secret
+    // issues found above.
+    if issues.is_empty() {
+        issues.extend(config.check_references(env));
+    }
+
+    let (Some(keystore), true) = (keystore, issues.is_empty()) else {
+        return Err(issues);
+    };
+
+    // Nothing is created on disk until the configuration is known to be good,
+    // and the directory is private, as the receipt store makes its own.
     let receipts_root = config
         .state
         .receipts_dir
         .clone()
         .unwrap_or_else(Receipts::default_root);
-    if let Err(error) = std::fs::create_dir_all(&receipts_root) {
-        issues.push(Issue {
+    if let Err(error) = create_private_directory(&receipts_root) {
+        return Err(vec![Issue {
             path: "state.receipts_dir".into(),
             message: format!(
                 "cannot create {}: {}",
                 receipts_root.display(),
                 error.kind()
             ),
-        });
+        }]);
     }
-
-    let (Some(keystore), true) = (keystore, issues.is_empty()) else {
-        return Err(issues);
-    };
 
     let mut gateway = GatewayConfig::default();
     if let Some(max) = config.limits.max_concurrency {
@@ -142,6 +152,19 @@ pub fn build_app(
         caller_keys: config.keys.len(),
         authenticated,
     })
+}
+
+/// Create `path` and any missing parents with mode 0700 (unix). An existing
+/// directory is left as it is.
+fn create_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 fn parse_address(host: &str, port: u16) -> Result<SocketAddr, String> {

@@ -248,18 +248,135 @@ async fn the_gateway_surface_is_served_and_unauthenticated_probes_stay_open() {
     assert_eq!(metrics.status(), 200);
 }
 
+/// Run `serve` to its end. A regression that starts serving would never end,
+/// so the wait is bounded and the process killed instead of hanging CI.
+fn run_to_exit(config_path: &std::path::Path, env: &[(&str, &str)]) -> (Option<i32>, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_llmshim"));
+    command
+        .args(["serve", "--config", config_path.to_str().unwrap()])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        text
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status.code();
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = reader.join().unwrap();
+            panic!("serve did not exit; stderr: {stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (status, reader.join().unwrap())
+}
+
 #[test]
 fn a_configuration_problem_exits_one_without_binding_a_port() {
     let dir = tempdir::Dir::new("bad");
     let path = dir.0.join("bad.toml");
     std::fs::write(&path, "version = 1\n[server]\nhost = \"nope\"\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_llmshim"))
-        .args(["serve", "--config", path.to_str().unwrap()])
-        .env_clear()
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (code, stderr) = run_to_exit(&path, &[]);
+    assert_eq!(code, Some(1));
     assert!(stderr.contains("server.host"), "{stderr}");
     assert!(!stderr.contains("listening on"), "{stderr}");
+}
+
+#[test]
+fn a_failed_start_creates_nothing_on_disk() {
+    // A caller token that is too short is found while the application is
+    // assembled, after the receipts directory used to be created.
+    let dir = tempdir::Dir::new("nothing-created");
+    let path = dir.0.join("bad.toml");
+    let receipts = dir.0.join("receipts");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+            version = 1
+            [state]
+            receipts_dir = "{}"
+            [providers.inference]
+            kind = "openai-compatible"
+            base_url = "http://127.0.0.1:9/v1"
+            api_key = {{ env = "SERVE_E2E_UPSTREAM_KEY" }}
+            [[keys]]
+            name = "ci"
+            tenant = "platform"
+            secret = {{ env = "SERVE_E2E_CALLER_KEY" }}
+            "#,
+            receipts.display()
+        ),
+    )
+    .unwrap();
+    let (code, stderr) = run_to_exit(
+        &path,
+        &[
+            ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+            ("SERVE_E2E_CALLER_KEY", "short"),
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("keys[0].secret"), "{stderr}");
+    assert!(!receipts.exists(), "a failed start must not create files");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_receipts_directory_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let upstream = mockito::Server::new_async().await;
+    let server = start(&config(&upstream.url(), ""), "private-dir");
+    let mode = std::fs::metadata(server._dir.0.join("receipts"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+}
+
+#[test]
+fn a_caller_token_equal_to_an_upstream_key_is_refused_at_startup() {
+    // `check_references` runs in `serve --check`; assembly repeats it so that a
+    // caller of `build_app` cannot skip the rule.
+    let dir = tempdir::Dir::new("same-value");
+    let path = dir.0.join("bad.toml");
+    std::fs::write(
+        &path,
+        r#"
+        version = 1
+        [providers.inference]
+        kind = "openai-compatible"
+        base_url = "http://127.0.0.1:9/v1"
+        api_key = { env = "SERVE_E2E_UPSTREAM_KEY" }
+        [[keys]]
+        name = "ci"
+        tenant = "platform"
+        secret = { env = "SERVE_E2E_CALLER_KEY" }
+        "#,
+    )
+    .unwrap();
+    // Two different variables that hold the same value: only the values show it.
+    let (code, stderr) = run_to_exit(
+        &path,
+        &[
+            ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+            ("SERVE_E2E_CALLER_KEY", UPSTREAM_KEY),
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("same value as a provider"), "{stderr}");
+    assert!(!stderr.contains(UPSTREAM_KEY), "{stderr}");
 }

@@ -676,8 +676,10 @@ versioned TOML/JSON file (`src/serve/`: `config.rs` the contract, `keys.rs` the
 hashed caller-key store, `build.rs` the assembly), and `--check` validates it
 without starting anything. Unknown fields are rejected, secrets are references
 only and never echoed, unauthenticated serving is explicit, and the file is the
-only source of settings (it reads the environment solely to resolve
-`{ env = ... }` references). Fleet (Redis) mode, reload and TLS are not
+source of every setting that belongs to the server (it reads the environment
+to resolve `{ env = ... }` references; the process-wide settings of the shared
+HTTP client and listener, and the standard `HTTP_PROXY`/`HTTPS_PROXY`/
+`ALL_PROXY` variables, still apply and are listed in 0002 and 0004). Fleet (Redis) mode, reload and TLS are not
 implemented. The feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,
 `gateway` and `gateway-redis` builds must not change; `tests/unit_serve_cli.rs`
