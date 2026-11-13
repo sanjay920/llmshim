@@ -11,6 +11,7 @@
 //!
 //! Roadmap and decisions: `docs/design/enterprise-gateway/README.md`.
 
+mod access_log;
 pub mod build;
 pub mod config;
 pub mod keys;

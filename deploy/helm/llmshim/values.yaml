@@ -52,6 +52,12 @@ fleet:
   enabled: false
   redisUrlEnv: REDIS_URL   # name of the variable in existingSecret
 
+logging:
+  # "stdout" writes one JSON access line per request for the platform to
+  # collect (tenant, status, latency, request id, credential fingerprint).
+  # Empty turns it off.
+  accessLog: ""
+
 state:
   # Replay receipts. emptyDir loses them on rescheduling; a client that replays
   # through another replica then gets an error. Use a ReadWriteMany claim, or

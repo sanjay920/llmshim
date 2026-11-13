@@ -684,8 +684,9 @@ HTTP client and listener, and the standard `HTTP_PROXY`/`HTTPS_PROXY`/
 table (binary built with `--features serve-redis`) shares the queue, limits,
 spend and provider health through Redis; an `[admin]` table moves the
 operational endpoints to their own listener, and `[server.tls]` / `[admin.tls]`
-terminate TLS with the PEM files watched for renewal. `deploy/helm/llmshim`
-deploys it (`deploy/helm/validate.sh` checks the chart and feeds each rendered
+terminate TLS with the PEM files watched for renewal, and `[logging]
+access_log` writes a tenant-attributed JSON line per request (never a token,
+query or body). `deploy/helm/llmshim` deploys it (`deploy/helm/validate.sh` checks the chart and feeds each rendered
 config back through `serve --check`). Configuration reload and mutual TLS are
 not implemented. The feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,

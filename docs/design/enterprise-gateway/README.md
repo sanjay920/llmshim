@@ -42,6 +42,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0006: Fleet mode under serve](0006-fleet-mode.md)
 - [0007: TLS termination and certificate renewal](0007-tls.md)
 - [0008: Helm chart](0008-helm-chart.md)
+- [0009: The access log](0009-access-log.md)
 
 ## Roadmap
 
@@ -65,7 +66,8 @@ Phase 0: a production server mode
 - [x] Separately bound, optionally token-protected `/metrics`, stats and probes (0005)
 - [x] TLS termination with renewal on file change (0007)
 - [ ] Mutual TLS and certificate-derived identity
-- [ ] OpenTelemetry traces and metrics
+- [x] Access log with tenant attribution and credential fingerprints (0009)
+- [ ] OpenTelemetry traces and metrics; token and cost attribution per tenant
 - [x] Helm chart, validated by rendering and `serve --check` (0008)
 - [ ] Published, signed images and an SBOM
 - [ ] Reproducible benchmark and an outage-survival test

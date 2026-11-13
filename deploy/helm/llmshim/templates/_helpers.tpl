@@ -68,6 +68,11 @@ allow_unauthenticated = true
 [state]
 receipts_dir = "/var/lib/llmshim/receipts"
 idempotency_ttl_secs = {{ .Values.state.idempotencyTtlSecs }}
+{{- if .Values.logging.accessLog }}
+
+[logging]
+access_log = {{ .Values.logging.accessLog | quote }}
+{{- end }}
 {{- if .Values.fleet.enabled }}
 
 [fleet]

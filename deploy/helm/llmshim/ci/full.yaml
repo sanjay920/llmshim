@@ -11,6 +11,8 @@ admin:
   tokenEnv: GATEWAY_ADMIN_TOKEN
 fleet:
   enabled: true
+logging:
+  accessLog: stdout
 state:
   receiptsClaimName: llmshim-receipts
 autoscaling:
