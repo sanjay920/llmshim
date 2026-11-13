@@ -91,6 +91,22 @@ mod with_feature {
     }
 
     #[test]
+    fn check_rejects_a_weak_caller_token_without_printing_it() {
+        let path = write("weak.toml", CONFIG);
+        let output = run(
+            &["serve", "--config", path.to_str().unwrap(), "--check"],
+            &[
+                ("SERVE_TEST_PROVIDER_KEY", "provider-secret-value"),
+                ("SERVE_TEST_CALLER_KEY", "short-weak"),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr.contains("keys[0].secret: must be at least 16 characters"));
+        assert!(!stderr.contains("short-weak"));
+    }
+
+    #[test]
     fn an_invalid_file_fails_with_every_problem_listed() {
         let path = write("invalid.toml", "version = 1\n[server]\nhost = \"nope\"\n");
         let output = run(

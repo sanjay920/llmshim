@@ -36,6 +36,7 @@ Each step must be correct, tested and reversible before the next begins.
 
 - [0001: Server configuration file](0001-server-config.md)
 - [0002: Environment variables and the configuration file](0002-environment-and-configuration.md)
+- [0003: Caller keys under serve](0003-caller-keys.md)
 
 ## Roadmap
 
@@ -45,9 +46,9 @@ Phase 0: a production server mode
       `llmshim serve --config <file> --check` (0001)
 - [x] Environment-free constructors, first part: scheduler tuning, rate
       limits and single-instance gateway assembly; precedence written down (0002)
-- [ ] Environment-free constructors, second part: the remaining rows of the
-      inventory in 0002 that `serve` needs (caller keys with hashed lookup and
-      returned errors, origin policy, deadlines, receipts, breaker)
+- [x] Caller keys: hashed key store built from the file, errors returned (0003)
+- [ ] Environment-free constructors, remaining rows of the inventory in 0002 that
+      `serve` needs (origin policy, deadlines, receipts, breaker)
 - [ ] `llmshim serve` boots the gateway backend from the file, including
       hashed caller keys
 - [ ] Bedrock, Vertex and Azure configurable from the file; a provider whose

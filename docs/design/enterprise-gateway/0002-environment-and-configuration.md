@@ -52,7 +52,7 @@ Still read from the environment, to convert before `serve` can boot:
 
 | Setting | Where | Notes |
 |---|---|---|
-| `LLMSHIM_GATEWAY_KEYS_FILE` | `KeyStore::from_env` | Exits the process on a bad file. `serve` needs a hashed-key store that returns errors. |
+| `LLMSHIM_GATEWAY_KEYS_FILE` | `KeyStore::from_env` | Exits the process on a bad file. `serve` uses the hashed store in 0003 instead. |
 | `LLMSHIM_GATEWAY_IDEMPOTENCY_TTL_SECS` | `gateway/http.rs` | Already a plain field of `LocalParts`. |
 | `LLMSHIM_TRUSTED_ORIGINS` | `OriginPolicy::from_env` | Read when the router is built. |
 | `LLMSHIM_PROXY_*_TIMEOUT_MS`, gateway job deadlines | `LogicalRequestDeadlines` | Read when the router is built. |

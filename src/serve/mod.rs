@@ -12,5 +12,7 @@
 //! Roadmap and decisions: `docs/design/enterprise-gateway/README.md`.
 
 pub mod config;
+pub mod keys;
 
 pub use config::{Format, Issue, ServeConfig};
+pub use keys::build_key_store;

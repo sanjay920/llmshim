@@ -61,9 +61,14 @@ pub(crate) struct IdentifiedCaller {
 }
 
 /// API-key registry. `Open` = no auth (dev); `Enforced` = Bearer required.
+/// `Hashed` is `Enforced` for a store that holds only SHA-256 digests of the
+/// keys, so the store itself never keeps a caller key's plaintext. (A token
+/// that came from an environment variable is still in the environment.)
 pub enum KeyStore {
     Open,
     Enforced(HashMap<String, Identity>),
+    /// Identities keyed by the lower-case hex SHA-256 of the bearer token.
+    Hashed(HashMap<String, Identity>),
 }
 
 impl KeyStore {
@@ -112,9 +117,16 @@ impl KeyStore {
         KeyStore::Enforced(keys)
     }
 
+    /// Build an enforced store that holds only key digests. Each map key is the
+    /// lower-case hex SHA-256 of a bearer token. Requests are authenticated and
+    /// scoped exactly as with [`Self::enforced`] given the same tokens.
+    pub fn from_digests(digests: HashMap<String, Identity>) -> Self {
+        KeyStore::Hashed(digests)
+    }
+
     /// Whether Bearer auth is required.
     pub fn is_enforced(&self) -> bool {
-        matches!(self, KeyStore::Enforced(_))
+        matches!(self, KeyStore::Enforced(_) | KeyStore::Hashed(_))
     }
 
     /// Resolve the caller's identity. Open mode reads the tier from the client
@@ -147,6 +159,20 @@ impl KeyStore {
                 let key = bearer_token(headers).ok_or(AuthError::MissingKey)?;
                 let identity = map.get(key).cloned().ok_or(AuthError::InvalidKey)?;
                 let credential_scope = format!("{:x}", Sha256::digest(key.as_bytes()));
+                Ok(IdentifiedCaller {
+                    identity,
+                    credential_scope,
+                })
+            }
+            KeyStore::Hashed(map) => {
+                let key = bearer_token(headers).ok_or(AuthError::MissingKey)?;
+                // The digest is the credential scope in both modes, so state
+                // owned by a key survives moving it from plaintext to hashed.
+                let credential_scope = format!("{:x}", Sha256::digest(key.as_bytes()));
+                let identity = map
+                    .get(&credential_scope)
+                    .cloned()
+                    .ok_or(AuthError::InvalidKey)?;
                 Ok(IdentifiedCaller {
                     identity,
                     credential_scope,
@@ -261,6 +287,74 @@ mod tests {
         ));
         assert!(matches!(
             store.identify(&hdrs(&[("authorization", "Bearer nope")])),
+            Err(AuthError::InvalidKey)
+        ));
+    }
+
+    fn digest(token: &str) -> String {
+        format!("{:x}", Sha256::digest(token.as_bytes()))
+    }
+
+    fn identity(tenant: &str, tier: u8) -> Identity {
+        Identity {
+            tenant: tenant.into(),
+            tier,
+            rpm: None,
+            tpm: None,
+            budget_usd: None,
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+        }
+    }
+
+    #[test]
+    fn a_hashed_store_authenticates_and_scopes_like_a_plaintext_store() {
+        let plain = KeyStore::enforced(HashMap::from([
+            ("sk-paid".to_string(), identity("acme", 5)),
+            ("sk-other".to_string(), identity("acme", 1)),
+        ]));
+        let hashed = KeyStore::from_digests(HashMap::from([
+            (digest("sk-paid"), identity("acme", 5)),
+            (digest("sk-other"), identity("acme", 1)),
+        ]));
+        assert!(hashed.is_enforced());
+        for token in ["sk-paid", "sk-other"] {
+            let header = format!("Bearer {token}");
+            let spoof = [
+                ("authorization", header.as_str()),
+                ("x-llmshim-priority", "255"),
+            ];
+            let (a, b) = (
+                plain.identify_caller(&hdrs(&spoof)).unwrap(),
+                hashed.identify_caller(&hdrs(&spoof)).unwrap(),
+            );
+            assert_eq!(
+                (a.identity.tenant, a.identity.tier),
+                (b.identity.tenant, b.identity.tier)
+            );
+            assert_eq!(
+                a.credential_scope, b.credential_scope,
+                "moving a key to hashed storage must not orphan state it owns"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hashed_store_rejects_missing_wrong_and_digest_as_token() {
+        let hashed =
+            KeyStore::from_digests(HashMap::from([(digest("sk-paid"), identity("acme", 5))]));
+        assert!(matches!(
+            hashed.identify(&hdrs(&[])),
+            Err(AuthError::MissingKey)
+        ));
+        assert!(matches!(
+            hashed.identify(&hdrs(&[("authorization", "Bearer sk-nope")])),
+            Err(AuthError::InvalidKey)
+        ));
+        // The digest is not the credential: presenting it must not authenticate.
+        let as_token = format!("Bearer {}", digest("sk-paid"));
+        assert!(matches!(
+            hashed.identify(&hdrs(&[("authorization", as_token.as_str())])),
             Err(AuthError::InvalidKey)
         ));
     }

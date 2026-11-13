@@ -624,15 +624,7 @@ impl ServeConfig {
     /// caller (or a test) decides what the environment is.
     pub fn check_references(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<Issue> {
         let mut issues = Vec::new();
-        let read = |secret: &SecretRef| -> Option<String> {
-            let value = match (&secret.env, &secret.file) {
-                (Some(name), _) => env(name)?,
-                (None, Some(path)) => std::fs::read_to_string(path).ok()?,
-                (None, None) => return None,
-            };
-            let value = value.trim().to_string();
-            (!value.is_empty()).then_some(value)
-        };
+        let read = |secret: &SecretRef| read_secret(secret, env).ok();
         // Two references can name the same value. A caller token equal to an
         // upstream key would make that upstream key a valid bearer token.
         // Compared as digests, so a `sha256` key is held to the same rule as a
@@ -698,6 +690,36 @@ impl ServeConfig {
         }
         issues
     }
+}
+
+/// Resolve a secret reference to its value, trimmed. The error names the
+/// variable or file, never a value.
+pub(crate) fn read_secret(
+    secret: &SecretRef,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let value = match (&secret.env, &secret.file) {
+        (Some(name), _) => {
+            env(name).ok_or_else(|| format!("environment variable {name} is not set"))?
+        }
+        (None, Some(path)) => std::fs::read_to_string(path).map_err(|error| {
+            format!(
+                "cannot read secret file {}: {}",
+                path.display(),
+                error.kind()
+            )
+        })?,
+        (None, None) => return Err("no secret reference".into()),
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(match (&secret.env, &secret.file) {
+            (Some(name), _) => format!("environment variable {name} is empty"),
+            (None, Some(path)) => format!("secret file {} is empty", path.display()),
+            (None, None) => unreachable!("handled above"),
+        });
+    }
+    Ok(value.to_string())
 }
 
 /// Line and column (1-based) of a byte offset.
