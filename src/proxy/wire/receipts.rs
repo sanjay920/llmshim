@@ -343,11 +343,7 @@ impl Receipts {
     fn from_lookup(lookup: OsLookup<'_>) -> Self {
         let root = lookup("LLMSHIM_REPLAY_RECEIPTS_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::data_local_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join("llmshim/replay-receipts")
-            });
+            .unwrap_or_else(Self::default_root);
         let mut receipts = Self::with_limits(root, Limits::from_lookup(lookup));
         receipts.rescan_incomplete_baseline =
             lookup("LLMSHIM_REPLAY_RECEIPTS_RESCAN_INCOMPLETE_BASELINE")
@@ -355,10 +351,17 @@ impl Receipts {
         receipts
     }
 
+    /// Where receipts live when no directory is configured.
+    pub(crate) fn default_root() -> PathBuf {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("llmshim/replay-receipts")
+    }
+
     /// A store at `root` with explicit limits, reading nothing from the
     /// environment.
     // Used by `serve` once it boots from the configuration file (roadmap).
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub(crate) fn from_parts(
         root: PathBuf,
         limits: Limits,

@@ -53,6 +53,17 @@ impl DefaultReceiptStore {
         Self::new(Arc::new(Receipts::from_env()))
     }
 
+    /// A store at `root` with the default retention limits, reading nothing from
+    /// the environment.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn at(root: std::path::PathBuf) -> Self {
+        Self::new(Arc::new(Receipts::from_parts(
+            root,
+            receipts::Limits::default(),
+            false,
+        )))
+    }
+
     pub(crate) fn new(receipts: Arc<Receipts>) -> Self {
         Self {
             receipts,

@@ -121,16 +121,6 @@ mod with_feature {
     }
 
     #[test]
-    fn without_check_it_refuses_to_pretend_it_is_serving() {
-        let path = write("noserve.toml", CONFIG);
-        let output = run(&["serve", "--config", path.to_str().unwrap()], &SECRETS);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(2));
-        assert!(stderr.contains("not available in this build yet"));
-        assert!(!stderr.contains("starting on"));
-    }
-
-    #[test]
     fn arguments_are_validated_before_any_file_is_read() {
         let missing_config = run(&["serve", "--check"], &[]);
         assert_eq!(missing_config.status.code(), Some(2));

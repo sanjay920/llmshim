@@ -69,6 +69,8 @@ pub struct ServeConfig {
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
+    pub state: State,
+    #[serde(default)]
     pub keys: Vec<GatewayKey>,
     #[serde(default, deserialize_with = "unique_map")]
     pub routes: BTreeMap<String, Route>,
@@ -138,6 +140,22 @@ fn default_port() -> u16 {
     3000
 }
 
+/// Where the server keeps what it must remember between requests.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct State {
+    /// Directory for replay receipts (signed reasoning and tool-call identity a
+    /// client replays later). Defaults to the platform's local data directory.
+    /// Mount a persistent volume here to keep receipts across restarts.
+    #[serde(default)]
+    pub receipts_dir: Option<PathBuf>,
+    /// How long a completed idempotent request's answer is kept, in seconds.
+    /// Defaults to 300.
+    #[serde(default)]
+    pub idempotency_ttl_secs: Option<u64>,
+}
+
 /// Which adapter a provider entry uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -153,7 +171,31 @@ pub enum ProviderKind {
     OpenaiCompatible,
 }
 
+/// The names of the hosted providers. A hosted provider is registered under its
+/// own name, because the catalog, rate limits and prices are looked up by it.
+const HOSTED_NAMES: [&str; 6] = [
+    "openai",
+    "anthropic",
+    "gemini",
+    "xai",
+    "cerebras",
+    "openrouter",
+];
+
 impl ProviderKind {
+    /// The only name a hosted provider may have; `None` for a self-hosted server.
+    pub fn hosted_name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+            Self::Xai => "xai",
+            Self::Cerebras => "cerebras",
+            Self::Openrouter => "openrouter",
+            Self::OpenaiCompatible => return None,
+        })
+    }
+
     fn requires_base_url(self) -> bool {
         matches!(self, Self::OpenaiCompatible)
     }
@@ -371,6 +413,7 @@ impl ServeConfig {
         self.validate_server(&mut issues);
         self.validate_providers(&mut issues);
         self.validate_limits(&mut issues);
+        self.validate_state(&mut issues);
         self.validate_keys(&mut issues);
         self.validate_routes(&mut issues);
         issues
@@ -411,6 +454,19 @@ impl ServeConfig {
             if name == "route" {
                 issues.push(Issue::new(&at, "\"route\" is reserved for named routes"));
             }
+            match provider.kind.hosted_name() {
+                Some(expected) if name != expected => issues.push(Issue::new(
+                    &at,
+                    format!(
+                        "a {expected} provider must be named \"{expected}\" (one per kind for now)"
+                    ),
+                )),
+                None if HOSTED_NAMES.contains(&name.as_str()) => issues.push(Issue::new(
+                    &at,
+                    "is the name of a hosted provider; name an openai-compatible server differently",
+                )),
+                _ => {}
+            }
             match &provider.api_key {
                 Some(secret) => validate_secret(secret, &format!("{at}.api_key"), issues),
                 None if provider.kind.requires_api_key() => {
@@ -429,6 +485,22 @@ impl ServeConfig {
                     "is required for kind \"openai-compatible\"",
                 )),
                 None => {}
+            }
+        }
+    }
+
+    fn validate_state(&self, issues: &mut Vec<Issue>) {
+        if let Some(dir) = &self.state.receipts_dir {
+            if !dir.has_root() {
+                issues.push(Issue::new("state.receipts_dir", "must be an absolute path"));
+            }
+        }
+        if let Some(ttl) = self.state.idempotency_ttl_secs {
+            if !(1..=604_800).contains(&ttl) {
+                issues.push(Issue::new(
+                    "state.idempotency_ttl_secs",
+                    "must be between 1 and 604800 (seven days)",
+                ));
             }
         }
     }
@@ -1001,6 +1073,43 @@ mod tests {
     }
 
     #[test]
+    fn hosted_providers_use_their_own_name_and_servers_may_not_borrow_one() {
+        let renamed = MINIMAL.replace("[providers.openai]", "[providers.openai-eu]");
+        assert!(has(&issues(&renamed), "providers.openai-eu"));
+        let borrowed = r#"
+            version = 1
+            [server]
+            allow_unauthenticated = true
+            [providers.openai]
+            kind = "openai-compatible"
+            base_url = "http://x.example/v1"
+        "#;
+        assert!(has(&issues(borrowed), "providers.openai"));
+        let server = borrowed.replace("[providers.openai]", "[providers.inference]");
+        assert!(ServeConfig::parse(&server, Format::Toml).is_ok());
+    }
+
+    #[test]
+    fn state_settings_are_bounded() {
+        let ok = format!(
+            "{MINIMAL}\n[state]\nreceipts_dir = \"/var/lib/llmshim\"\nidempotency_ttl_secs = 600"
+        );
+        let config = ServeConfig::parse(&ok, Format::Toml).unwrap();
+        assert_eq!(config.state.idempotency_ttl_secs, Some(600));
+        for bad in [
+            "receipts_dir = \"relative/dir\"",
+            "idempotency_ttl_secs = 0",
+            "idempotency_ttl_secs = 604801",
+        ] {
+            let found = issues(&format!("{MINIMAL}\n[state]\n{bad}"));
+            assert!(
+                has(&found, "state.receipts_dir") || has(&found, "state.idempotency_ttl_secs"),
+                "{bad}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
     fn base_urls_must_be_final_endpoints_without_credentials() {
         assert!(validate_base_url("https://llm.internal.example/v1").is_ok());
         assert!(validate_base_url("http://localhost:8000/v1").is_ok());
@@ -1061,22 +1170,28 @@ mod tests {
             r#"
             version = 1
             [providers.a]
-            kind = "openai"
+            kind = "openai-compatible"
+            base_url = "http://a.example/v1"
             api_key = {{ env = "SET" }}
             [providers.b]
-            kind = "openai"
+            kind = "openai-compatible"
+            base_url = "http://b.example/v1"
             api_key = {{ env = "UNSET" }}
             [providers.c]
-            kind = "openai"
+            kind = "openai-compatible"
+            base_url = "http://c.example/v1"
             api_key = {{ env = "BLANK" }}
             [providers.d]
-            kind = "openai"
+            kind = "openai-compatible"
+            base_url = "http://d.example/v1"
             api_key = {{ file = "{}" }}
             [providers.e]
-            kind = "openai"
+            kind = "openai-compatible"
+            base_url = "http://e.example/v1"
             api_key = {{ file = "{}" }}
             [providers.f]
-            kind = "openai"
+            kind = "openai-compatible"
+            base_url = "http://f.example/v1"
             api_key = {{ file = "{}" }}
             [[keys]]
             name = "k"
