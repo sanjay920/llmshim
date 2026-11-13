@@ -476,6 +476,54 @@ async fn the_access_log_attributes_each_request_without_recording_a_secret() {
     }
 }
 
+#[tokio::test]
+async fn a_native_routes_credential_header_is_attributed_in_the_access_log() {
+    // Anthropic clients send `x-api-key`. The gateway authenticates it on the
+    // native routes, so the log must name the tenant it admitted, and must
+    // fingerprint a wrong one rather than call the request anonymous.
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .create_async()
+        .await;
+    let dir = tempdir::Dir::new("access-native");
+    let log_path = dir.0.join("access.jsonl");
+    let extra = format!("[logging]\naccess_log = \"{}\"", log_path.display());
+    let server = start(&config(&upstream.url(), &extra), "access-native", &[]);
+    let body = json!({"model": "inference/test-model", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "ping"}]});
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/messages", server.base);
+
+    let admitted = client
+        .post(&url)
+        .header("x-api-key", CALLER_KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(admitted.status(), 401, "the gateway admits this key");
+    let wrong = "a-wrong-x-api-key-0123456789";
+    let refused = client
+        .post(&url)
+        .header("x-api-key", wrong)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 401);
+
+    let lines = access_lines(&log_path);
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    assert_eq!(lines[0]["path"], "/v1/messages");
+    assert_eq!(lines[0]["tenant"], "platform", "{lines:#?}");
+    assert_eq!(lines[0]["credential"], fingerprint(CALLER_KEY));
+    assert!(lines[1]["tenant"].is_null());
+    assert_eq!(lines[1]["credential"], fingerprint(wrong));
+}
+
 #[test]
 fn an_unwritable_access_log_fails_the_start_with_the_setting_named() {
     let dir = tempdir::Dir::new("access-bad");
