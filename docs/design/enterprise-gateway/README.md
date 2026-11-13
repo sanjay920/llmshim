@@ -41,6 +41,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0005: A separate listener for operational endpoints](0005-admin-listener.md)
 - [0006: Fleet mode under serve](0006-fleet-mode.md)
 - [0007: TLS termination and certificate renewal](0007-tls.md)
+- [0008: Helm chart](0008-helm-chart.md)
 
 ## Roadmap
 
@@ -65,7 +66,8 @@ Phase 0: a production server mode
 - [x] TLS termination with renewal on file change (0007)
 - [ ] Mutual TLS and certificate-derived identity
 - [ ] OpenTelemetry traces and metrics
-- [ ] Helm chart, signed images, SBOM
+- [x] Helm chart, validated by rendering and `serve --check` (0008)
+- [ ] Published, signed images and an SBOM
 - [ ] Reproducible benchmark and an outage-survival test
 
 Later phases (each needs its own design note before work starts)

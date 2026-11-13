@@ -1,0 +1,51 @@
+# Every optional feature on, for validation.
+replicaCount: 3
+existingSecret: llmshim-secrets
+secretRevision: "2026-11-13"
+server:
+  tls:
+    enabled: true
+    secretName: llmshim-tls
+    reloadIntervalSecs: 10
+admin:
+  tokenEnv: GATEWAY_ADMIN_TOKEN
+fleet:
+  enabled: true
+state:
+  receiptsClaimName: llmshim-receipts
+autoscaling:
+  enabled: true
+podDisruptionBudget:
+  enabled: true
+networkPolicy:
+  enabled: true
+  gatewayFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: apps
+  adminFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+config: |
+  [providers.openai]
+  kind = "openai"
+  api_key = { env = "OPENAI_API_KEY" }
+
+  [providers.anthropic]
+  kind = "anthropic"
+  api_key = { env = "ANTHROPIC_API_KEY" }
+
+  [limits]
+  rpm = 600
+
+  [[keys]]
+  name = "checkout"
+  tenant = "payments"
+  secret = { env = "CHECKOUT_GATEWAY_KEY" }
+  rpm = 120
+  budget_usd = 250.0
+
+  [routes.summarize]
+  model = "anthropic/claude-haiku-5-5"
+  settings = { max_tokens = 2048 }

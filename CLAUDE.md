@@ -684,8 +684,10 @@ HTTP client and listener, and the standard `HTTP_PROXY`/`HTTPS_PROXY`/
 table (binary built with `--features serve-redis`) shares the queue, limits,
 spend and provider health through Redis; an `[admin]` table moves the
 operational endpoints to their own listener, and `[server.tls]` / `[admin.tls]`
-terminate TLS with the PEM files watched for renewal. Configuration reload and
-mutual TLS are not implemented. The feature is **unstable
+terminate TLS with the PEM files watched for renewal. `deploy/helm/llmshim`
+deploys it (`deploy/helm/validate.sh` checks the chart and feeds each rendered
+config back through `serve --check`). Configuration reload and mutual TLS are
+not implemented. The feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,
 `gateway` and `gateway-redis` builds must not change; `tests/unit_serve_cli.rs`
 pins that a build without the feature does not know the command. Never drive
