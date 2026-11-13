@@ -623,6 +623,7 @@ impl ServeConfig {
         self.validate_state(&mut issues);
         self.validate_logging(&mut issues);
         self.validate_keys(&mut issues);
+        self.validate_tenant_limits(&mut issues);
         self.validate_routes(&mut issues);
         issues
     }
@@ -859,6 +860,32 @@ impl ServeConfig {
         }
     }
 
+    /// The keys of one tenant share one rate bucket (rate limits are per tenant
+    /// and provider, not per key), so they must agree on its size. Otherwise the
+    /// bucket would be sized by whichever key happened to arrive first, and a
+    /// reload that retunes buckets would flip it back and forth as the keys
+    /// alternate.
+    fn validate_tenant_limits(&self, issues: &mut Vec<Issue>) {
+        let mut first: BTreeMap<&str, (usize, &GatewayKey)> = BTreeMap::new();
+        for (index, key) in self.keys.iter().enumerate() {
+            let Some((earlier, other)) = first.get(key.tenant.as_str()).copied() else {
+                first.insert(&key.tenant, (index, key));
+                continue;
+            };
+            for (name, mine, theirs) in [("rpm", key.rpm, other.rpm), ("tpm", key.tpm, other.tpm)] {
+                if mine != theirs {
+                    issues.push(Issue::new(
+                        format!("keys[{index}].{name}"),
+                        format!(
+                            "differs from keys[{earlier}].{name}; the keys of one tenant share \
+                             one rate bucket, so they must carry the same rpm and tpm"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     fn validate_keys(&self, issues: &mut Vec<Issue>) {
         let mut names = BTreeSet::new();
         let mut digests = BTreeSet::new();
@@ -1067,6 +1094,47 @@ impl ServeConfig {
     /// returning or printing any value. `env` looks up one variable, so a
     /// caller (or a test) decides what the environment is.
     pub fn check_references(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<Issue> {
+        let mut issues = self.check_same_values(env);
+        for (at, secret) in self.secret_refs() {
+            if let Some(name) = &secret.env {
+                match env(name) {
+                    Some(value) if !value.trim().is_empty() => {}
+                    Some(_) => issues.push(Issue::new(
+                        at,
+                        format!("environment variable {name} is empty"),
+                    )),
+                    None => issues.push(Issue::new(
+                        at,
+                        format!("environment variable {name} is not set"),
+                    )),
+                }
+            } else if let Some(path) = &secret.file {
+                match std::fs::read_to_string(path) {
+                    Ok(value) if !value.trim().is_empty() => {}
+                    Ok(_) => issues.push(Issue::new(
+                        at,
+                        format!("secret file {} is empty", path.display()),
+                    )),
+                    Err(error) => issues.push(Issue::new(
+                        at,
+                        format!(
+                            "cannot read secret file {}: {}",
+                            path.display(),
+                            error.kind()
+                        ),
+                    )),
+                }
+            }
+        }
+        issues
+    }
+
+    /// The rules that compare resolved secret values: a caller token must not
+    /// equal an upstream key, another caller's token, or the admin token. A
+    /// secret that cannot be read is skipped here ([`Self::check_references`]
+    /// reports it), so a reload can ask about the caller keys without being
+    /// blocked by an unrelated secret that is unreadable at that moment.
+    pub fn check_same_values(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<Issue> {
         let mut issues = Vec::new();
         let read = |secret: &SecretRef| read_secret(secret, env).ok();
         // Two references can name the same value. A caller token equal to an
@@ -1114,37 +1182,6 @@ impl ServeConfig {
                     "admin.token",
                     "has the same value as a provider key or a caller key",
                 ));
-            }
-        }
-        for (at, secret) in self.secret_refs() {
-            if let Some(name) = &secret.env {
-                match env(name) {
-                    Some(value) if !value.trim().is_empty() => {}
-                    Some(_) => issues.push(Issue::new(
-                        at,
-                        format!("environment variable {name} is empty"),
-                    )),
-                    None => issues.push(Issue::new(
-                        at,
-                        format!("environment variable {name} is not set"),
-                    )),
-                }
-            } else if let Some(path) = &secret.file {
-                match std::fs::read_to_string(path) {
-                    Ok(value) if !value.trim().is_empty() => {}
-                    Ok(_) => issues.push(Issue::new(
-                        at,
-                        format!("secret file {} is empty", path.display()),
-                    )),
-                    Err(error) => issues.push(Issue::new(
-                        at,
-                        format!(
-                            "cannot read secret file {}: {}",
-                            path.display(),
-                            error.kind()
-                        ),
-                    )),
-                }
             }
         }
         issues
@@ -1795,6 +1832,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_keys_of_one_tenant_must_agree_on_their_rate_limits() {
+        let keys = |second: &str| {
+            format!(
+                "{MINIMAL}\n[[keys]]\nname = \"ci-two\"\ntenant = \"platform\"\n\
+                 secret = {{ env = \"OTHER_KEY\" }}\n{second}"
+            )
+        };
+        // MINIMAL's key has no limits; a second key of the tenant with one differs.
+        let found = issues(&keys("rpm = 60"));
+        assert!(has(&found, "keys[1].rpm"), "{found:?}");
+        let found = issues(&keys("tpm = 1000"));
+        assert!(has(&found, "keys[1].tpm"), "{found:?}");
+        // Agreeing (here, both unlimited) is fine, and so are different tenants.
+        assert!(ServeConfig::parse(&keys(""), Format::Toml).is_ok());
+        let other_tenant = keys("rpm = 60").replace(
+            "tenant = \"platform\"\nsecret",
+            "tenant = \"other\"\nsecret",
+        );
+        assert!(ServeConfig::parse(&other_tenant, Format::Toml).is_ok());
     }
 
     #[test]

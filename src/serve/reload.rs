@@ -98,6 +98,11 @@ pub struct ReloadStatus {
     pub credentials: usize,
     pub loaded_at_epoch_secs: u64,
     pub last_check_epoch_secs: Option<u64>,
+    /// Whether the running keys are what the file says, as of the last check.
+    /// False after a rejected file (the old keys keep serving) and while a
+    /// valid change waits to be seen twice; true again once the file is
+    /// accepted, applied, or put back to what is running. Alert on false.
+    pub in_sync: bool,
     /// The latest applied or rejected reload. A no-change check is not recorded
     /// here.
     pub last_reload: Option<ReloadAttempt>,
@@ -130,6 +135,12 @@ pub enum Outcome {
     /// Nothing changed. `repeated` is true when the same file failed the same
     /// way last time, so a poller can stay quiet about it.
     Rejected { issues: Vec<Issue>, repeated: bool },
+    /// A poll found a change that is valid but has not yet been seen twice. A
+    /// file caught mid-write can parse as a smaller, valid set of keys (cut at a
+    /// `[[keys]]` boundary), and applying it would revoke callers or drop a
+    /// key's limits until the next check. A change is applied once two polls in
+    /// a row see exactly the same one. A signal never defers.
+    Deferred,
 }
 
 struct Active {
@@ -139,6 +150,8 @@ struct Active {
     enforced: bool,
     /// A digest of the last rejection, to recognize a repeat.
     last_rejection: Option<String>,
+    /// The change a poll saw last time and did not apply yet.
+    pending: Option<String>,
 }
 
 /// Reloads `[[keys]]` from the configuration file the server started from.
@@ -169,6 +182,7 @@ impl Reloader {
             fingerprint: current.fingerprint(),
             enforced: current.is_enforced(),
             last_rejection: None,
+            pending: None,
         };
         let credentials = current.credential_count();
         let config_sha256 = sha256_hex(text.as_bytes());
@@ -179,6 +193,7 @@ impl Reloader {
                 credentials,
                 loaded_at_epoch_secs: epoch_secs(),
                 last_check_epoch_secs: None,
+                in_sync: true,
                 last_reload: None,
             };
         });
@@ -194,14 +209,25 @@ impl Reloader {
         self.handles.status()
     }
 
-    /// Read the file again and, if all of it is acceptable, replace the keys.
-    /// Blocking: it reads files, so call it from a blocking task.
+    /// Read the file again and, if all of it is acceptable, replace the keys at
+    /// once. For an operator's signal. Blocking: it reads files, so call it from
+    /// a blocking task.
     pub fn reload(&self, env: &dyn Fn(&str) -> Option<String>) -> Outcome {
+        self.run(env, false)
+    }
+
+    /// [`Self::reload`] for a timer: a change is applied only after two polls in
+    /// a row have seen exactly the same one ([`Outcome::Deferred`] until then).
+    pub fn poll(&self, env: &dyn Fn(&str) -> Option<String>) -> Outcome {
+        self.run(env, true)
+    }
+
+    fn run(&self, env: &dyn Fn(&str) -> Option<String>, debounce: bool) -> Outcome {
         // One reload at a time; a second caller waits and then sees the first's
         // result as its starting point.
         let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
         let now = epoch_secs();
-        let step = self.attempt(&mut active, env);
+        let step = self.attempt(&mut active, env, debounce);
         self.handles.status.update(|status| {
             status.last_check_epoch_secs = Some(now);
             match &step {
@@ -212,6 +238,7 @@ impl Reloader {
                 } => {
                     status.generation = *generation;
                     status.credentials = *credentials;
+                    status.in_sync = true;
                     status.config_sha256.clone_from(config_sha256);
                     status.last_reload = Some(ReloadAttempt {
                         at_epoch_secs: now,
@@ -221,8 +248,13 @@ impl Reloader {
                 }
                 Step::Unchanged { config_sha256 } => {
                     status.config_sha256.clone_from(config_sha256);
+                    // Whatever was rejected earlier has been put right: the file
+                    // is what is running again.
+                    status.in_sync = true;
                 }
+                Step::Deferred => status.in_sync = false,
                 Step::Rejected { issues, repeated } => {
+                    status.in_sync = false;
                     // A repeat keeps the time it first failed.
                     if !repeated {
                         status.last_reload = Some(ReloadAttempt {
@@ -244,11 +276,17 @@ impl Reloader {
                 credentials,
             },
             Step::Unchanged { .. } => Outcome::Unchanged,
+            Step::Deferred => Outcome::Deferred,
             Step::Rejected { issues, repeated } => Outcome::Rejected { issues, repeated },
         }
     }
 
-    fn attempt(&self, active: &mut Active, env: &dyn Fn(&str) -> Option<String>) -> Step {
+    fn attempt(
+        &self,
+        active: &mut Active,
+        env: &dyn Fn(&str) -> Option<String>,
+        debounce: bool,
+    ) -> Step {
         let loaded = match ServeConfig::load_with_text(&self.path) {
             Ok(loaded) => loaded,
             Err(issues) => return reject(active, "", issues),
@@ -277,7 +315,11 @@ impl Reloader {
             message: "cannot change while the server is running; restart to apply".into(),
         }));
         issues.extend(loaded.config.feature_issues());
-        issues.extend(loaded.config.check_references(env));
+        // Only the rules about caller keys. A provider, admin or Redis secret
+        // that cannot be read right now must not stop a revocation from
+        // applying, and a rotated one is not this reload's business (it is
+        // outside the keys and needs a restart, 0012).
+        issues.extend(loaded.config.check_same_values(env));
         if !issues.is_empty() {
             return reject_now(active, issues);
         }
@@ -304,8 +346,17 @@ impl Reloader {
         active.last_rejection = None;
         let fingerprint = store.fingerprint();
         if fingerprint == active.fingerprint {
+            active.pending = None;
             return Step::Unchanged { config_sha256 };
         }
+        if debounce {
+            let candidate = format!("{config_sha256}:{fingerprint}");
+            if active.pending.as_deref() != Some(candidate.as_str()) {
+                active.pending = Some(candidate);
+                return Step::Deferred;
+            }
+        }
+        active.pending = None;
         let credentials = store.credential_count();
         // Names first: a request admitted under the new keys must find its
         // tenant's name already resolvable.
@@ -332,6 +383,7 @@ enum Step {
     Unchanged {
         config_sha256: String,
     },
+    Deferred,
     Rejected {
         issues: Vec<Issue>,
         repeated: bool,
@@ -352,6 +404,7 @@ fn reject(active: &mut Active, config_sha256: &str, issues: Vec<Issue>) -> Step 
     );
     let repeated = active.last_rejection.as_deref() == Some(digest.as_str());
     active.last_rejection = Some(digest);
+    active.pending = None;
     Step::Rejected { issues, repeated }
 }
 
@@ -476,6 +529,10 @@ mod tests {
             self.reloader.reload(&env)
         }
 
+        fn poll(&self) -> Outcome {
+            self.reloader.poll(&env)
+        }
+
         fn identity(&self, token: &str) -> Option<crate::gateway::auth::Identity> {
             let mut headers = HeaderMap::new();
             headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -527,6 +584,103 @@ mod tests {
         assert_eq!(status.generation, 2);
         assert_eq!(status.credentials, 1);
         assert_eq!(status.last_reload.unwrap().outcome, "applied");
+    }
+
+    #[test]
+    fn a_poll_applies_a_change_only_once_it_has_seen_the_same_one_twice() {
+        let fixture = Fixture::new(&text(
+            "",
+            &format!("{}{}", key("a", "acme", OLD, ""), key("c", "acme", NEW, "")),
+        ));
+        // A file caught mid-write can parse as a smaller, valid set of keys.
+        fixture.write(&text("", &key("a", "acme", OLD, "")));
+        assert_eq!(fixture.poll(), Outcome::Deferred);
+        assert!(fixture.identity(NEW).is_some(), "nothing was applied yet");
+        assert!(!fixture.reloader.status().in_sync);
+        // The write finishes: a different file, so the first sighting is void.
+        fixture.write(&text(
+            "",
+            &format!(
+                "{}{}",
+                key("a", "acme", OLD, ""),
+                key("c", "acme", NEW, "tier = 3")
+            ),
+        ));
+        assert_eq!(fixture.poll(), Outcome::Deferred);
+        assert_eq!(fixture.identity(NEW).unwrap().tier, 0);
+        // Seen twice in a row, it is applied.
+        assert!(matches!(
+            fixture.poll(),
+            Outcome::Applied { generation: 1, .. }
+        ));
+        assert_eq!(fixture.identity(NEW).unwrap().tier, 3);
+        assert!(fixture.reloader.status().in_sync);
+    }
+
+    #[test]
+    fn a_signal_applies_a_change_at_once() {
+        let fixture = Fixture::new(&text("", &key("a", "acme", OLD, "")));
+        fixture.write(&text("", &key("b", "globex", NEW, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        assert!(fixture.identity(OLD).is_none());
+    }
+
+    #[test]
+    fn a_change_that_comes_and_goes_between_polls_is_never_applied() {
+        let initial = text("", &key("a", "acme", OLD, ""));
+        let fixture = Fixture::new(&initial);
+        fixture.write(&text("", &key("b", "globex", NEW, "")));
+        assert_eq!(fixture.poll(), Outcome::Deferred);
+        // Put back before the second look.
+        fixture.write(&initial);
+        assert_eq!(fixture.poll(), Outcome::Unchanged);
+        // And a later sighting of the change starts over.
+        fixture.write(&text("", &key("b", "globex", NEW, "")));
+        assert_eq!(fixture.poll(), Outcome::Deferred);
+        assert!(fixture.identity(OLD).is_some());
+        assert!(!fixture.reloader.status().in_sync);
+    }
+
+    #[test]
+    fn putting_a_rejected_file_back_clears_the_alert() {
+        let initial = text("", &key("a", "acme", OLD, ""));
+        let fixture = Fixture::new(&initial);
+        fixture.write(&text("[limits]\nrpm = 1", &key("a", "acme", OLD, "")));
+        assert!(matches!(fixture.reload(), Outcome::Rejected { .. }));
+        let rejected = fixture.reloader.status();
+        assert!(!rejected.in_sync, "the file is not what is running");
+        assert_eq!(rejected.last_reload.as_ref().unwrap().outcome, "rejected");
+        // The edit is reverted: the running keys are the file's again.
+        fixture.write(&initial);
+        assert_eq!(fixture.reload(), Outcome::Unchanged);
+        let status = fixture.reloader.status();
+        assert!(
+            status.in_sync,
+            "an operator alerting on in_sync sees it clear"
+        );
+        // The history still says what happened.
+        assert_eq!(status.last_reload.unwrap().outcome, "rejected");
+    }
+
+    #[test]
+    fn an_unreadable_provider_secret_does_not_block_a_revocation() {
+        let fixture = Fixture::new(&text(
+            "",
+            &format!(
+                "{}{}",
+                key("a", "acme", OLD, ""),
+                key("b", "globex", NEW, "")
+            ),
+        ));
+        fixture.write(&text("", &key("b", "globex", NEW, "")));
+        // The environment can no longer resolve the provider's key, which has
+        // nothing to do with who may call.
+        let nothing = |_: &str| None;
+        assert!(matches!(
+            fixture.reloader.reload(&nothing),
+            Outcome::Applied { .. }
+        ));
+        assert!(fixture.identity(OLD).is_none());
     }
 
     #[test]

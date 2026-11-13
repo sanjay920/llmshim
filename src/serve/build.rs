@@ -322,6 +322,11 @@ pub async fn build_app(
                 idempotency_ttl_secs,
                 max_retained_accounting_attempts: retained,
                 usage,
+                // A reload can re-limit a tenant, and the bucket it already has
+                // must follow. Validation requires the keys of one tenant to
+                // agree on their limits, so no two of them can pull one bucket
+                // in different directions.
+                retune_tenant_limits: true,
             },
         ),
         Some(url) => match fleet_state(

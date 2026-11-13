@@ -26,6 +26,10 @@
 //! reported along the way (`provider_floor`). A later, lower catalog estimate
 //! cannot erase a charge the provider already reported.
 
+// The module is the seam `serve` plugs its usage log into; without that feature
+// nothing installs a sink, and the setup types go unused.
+#![cfg_attr(not(feature = "serve"), allow(dead_code))]
+
 use crate::gateway::budget::{may_finalize, SpendAuthority, SpendObservation};
 use crate::policy::{AttemptIdentity, AttemptKind, AttemptOutcome};
 use serde::Serialize;

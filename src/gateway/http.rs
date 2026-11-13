@@ -219,6 +219,10 @@ pub(crate) struct LocalParts {
     pub max_retained_accounting_attempts: usize,
     /// Receives one record per provider attempt that ends.
     pub usage: Option<crate::gateway::usage::UsageSetup>,
+    /// Follow a tenant's limit when a later request carries a different one (a
+    /// reloaded configuration re-limited it). The gateway's own construction
+    /// leaves this off, so a tenant's bucket keeps the limit it began with.
+    pub retune_tenant_limits: bool,
 }
 
 /// Everything the fleet (Redis-backed) gateway state is built from.
@@ -256,6 +260,7 @@ impl LocalParts {
                     std::env::var(key).ok()
                 }),
             usage: None,
+            retune_tenant_limits: false,
         }
     }
 }
@@ -287,6 +292,7 @@ impl GatewayState {
             idempotency_ttl_secs,
             max_retained_accounting_attempts,
             usage,
+            retune_tenant_limits,
         } = parts;
         // Same fleet-wide provider health the proxy uses.
         let router = Arc::new(router.with_breaker(breaker));
@@ -300,6 +306,7 @@ impl GatewayState {
             config.max_concurrency_per_provider,
             config.max_wait,
             max_retained_accounting_attempts,
+            retune_tenant_limits,
         );
         if let Some(setup) = usage {
             attempt_coordinator.set_usage_sink(setup);

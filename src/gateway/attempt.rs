@@ -262,6 +262,13 @@ struct AttemptLiability {
 
 struct LocalAttemptRates {
     config: RateLimitConfig,
+    /// Follow a tenant's limit when a later request carries a different one.
+    /// Off, a tenant's bucket keeps the limit it was made with, as it always
+    /// has under `gateway`. `serve` turns it on because a configuration reload
+    /// can re-limit a tenant; it also requires every key of one tenant to carry
+    /// the same limits, since otherwise two credentials would retune one shared
+    /// bucket back and forth.
+    retune_tenant_limits: bool,
     max_retained_attempts: usize,
     retention_secs: u64,
     state: tokio::sync::Mutex<LocalRateState>,
@@ -271,6 +278,12 @@ impl LocalAttemptRates {
     #[cfg(test)]
     fn new(config: RateLimitConfig) -> Self {
         Self::with_retention(config, retained_accounting_attempt_limit())
+    }
+
+    /// Follow a tenant's limit when it changes (see the field).
+    fn with_tenant_retuning(mut self) -> Self {
+        self.retune_tenant_limits = true;
+        self
     }
 
     fn with_retention(config: RateLimitConfig, max_retained_attempts: usize) -> Self {
@@ -288,6 +301,7 @@ impl LocalAttemptRates {
     ) -> Self {
         Self {
             config,
+            retune_tenant_limits: false,
             max_retained_attempts,
             retention_secs,
             state: tokio::sync::Mutex::new(LocalRateState {
@@ -327,13 +341,21 @@ impl LocalAttemptRates {
         let mut provider_wait = None;
         let mut tenant_wait = None;
         for wait in [
-            check_dimension(&mut state.global.rpm, provider, global_limit.rpm, 1.0, now),
+            check_dimension(
+                &mut state.global.rpm,
+                provider,
+                global_limit.rpm,
+                1.0,
+                now,
+                false,
+            ),
             check_dimension(
                 &mut state.global.tpm,
                 provider,
                 global_limit.tpm,
                 permits.max(1) as f64,
                 now,
+                false,
             ),
         ]
         .into_iter()
@@ -342,13 +364,21 @@ impl LocalAttemptRates {
             provider_wait = Some(provider_wait.map_or(wait, |current: Duration| current.max(wait)));
         }
         for wait in [
-            check_dimension(&mut state.tenant.rpm, &tenant_key, scope.rpm, 1.0, now),
+            check_dimension(
+                &mut state.tenant.rpm,
+                &tenant_key,
+                scope.rpm,
+                1.0,
+                now,
+                self.retune_tenant_limits,
+            ),
             check_dimension(
                 &mut state.tenant.tpm,
                 &tenant_key,
                 scope.tpm,
                 permits.max(1) as f64,
                 now,
+                self.retune_tenant_limits,
             ),
         ]
         .into_iter()
@@ -506,6 +536,7 @@ fn check_dimension(
     limit: Option<u32>,
     required: f64,
     now: Instant,
+    retune: bool,
 ) -> Option<Duration> {
     let limit = limit?;
     if limit == 0 {
@@ -514,7 +545,9 @@ fn check_dimension(
     let bucket = buckets
         .entry(key.to_owned())
         .or_insert_with(|| Bucket::new(limit, now));
-    bucket.retune(limit, now);
+    if retune {
+        bucket.retune(limit, now);
+    }
     bucket.check(required, now).err()
 }
 
@@ -750,6 +783,7 @@ impl AttemptCoordinator {
             concurrency_limit,
             concurrency_wait,
             retained_accounting_attempt_limit(),
+            false,
         )
     }
 
@@ -760,12 +794,16 @@ impl AttemptCoordinator {
         concurrency_limit: usize,
         concurrency_wait: Duration,
         max_retained_attempts: usize,
+        retune_tenant_limits: bool,
     ) -> Arc<Self> {
+        let rates = LocalAttemptRates::with_retention(config, max_retained_attempts);
+        let rates = if retune_tenant_limits {
+            rates.with_tenant_retuning()
+        } else {
+            rates
+        };
         Arc::new(Self {
-            rates: Arc::new(LocalAttemptRates::with_retention(
-                config,
-                max_retained_attempts,
-            )),
+            rates: Arc::new(rates),
             concurrency_limit: concurrency_limit.max(1),
             concurrency_wait,
             semaphores: Mutex::new(HashMap::new()),
@@ -2010,7 +2048,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_changed_tenant_limit_applies_to_the_bucket_that_already_exists() {
-        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let rates = LocalAttemptRates::new(RateLimitConfig::default()).with_tenant_retuning();
         // Created at 6 per minute, and used once.
         assert_eq!(admitted_before_refusal(&rates, "relimited", 6).await, 6);
 
@@ -2034,7 +2072,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_lowered_tenant_limit_caps_the_burst_the_bucket_had_saved() {
-        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let rates = LocalAttemptRates::new(RateLimitConfig::default()).with_tenant_retuning();
         // One request at 60 per minute leaves 59 unspent.
         assert_eq!(admitted_before_refusal(&rates, "trimmed", 60).await, 60);
         tokio::time::advance(Duration::from_secs(60)).await;
@@ -2046,12 +2084,31 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_unchanged_tenant_limit_leaves_the_bucket_alone() {
-        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let rates = LocalAttemptRates::new(RateLimitConfig::default()).with_tenant_retuning();
         assert_eq!(admitted_before_refusal(&rates, "steady", 4).await, 4);
         // Asking again with the same limit neither refills nor resets.
         assert_eq!(admitted_before_refusal(&rates, "steady", 4).await, 0);
         tokio::time::advance(Duration::from_secs(15)).await;
         assert_eq!(admitted_before_refusal(&rates, "steady", 4).await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_retuning_a_tenants_bucket_keeps_the_limit_it_was_made_with() {
+        // The behaviour `llmshim gateway` has always had, and still has: two keys
+        // of one tenant may carry different limits, and the first to arrive
+        // fixes the shared bucket. Retuning there would let a 2-per-minute key
+        // borrow a 1200-per-minute key's refill rate (and clip its burst) every
+        // time the two alternate.
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        assert_eq!(admitted_before_refusal(&rates, "shared", 2).await, 2);
+        // The other key, at 1200 per minute, finds the 2-per-minute bucket empty.
+        assert_eq!(admitted_before_refusal(&rates, "shared", 1200).await, 0);
+        // Thirty seconds earn one request at 2 per minute, not 600 at 1200.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(admitted_before_refusal(&rates, "shared", 1200).await, 1);
+        // And going back to the low-limit key is not credited at the high rate.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(admitted_before_refusal(&rates, "shared", 2).await, 1);
     }
 
     #[tokio::test]
@@ -4416,6 +4473,7 @@ mod usage_records {
             4,
             Duration::from_secs(1),
             1000,
+            false,
         );
         let collected = Arc::new(Collected::default());
         coordinator.set_usage_sink(crate::gateway::usage::UsageSetup {

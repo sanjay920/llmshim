@@ -302,7 +302,9 @@ async fn the_file_is_watched_without_a_signal() {
 async fn with_polling_off_only_a_signal_reloads() {
     let (upstream, _mock) = mock_upstream(0).await;
     let url = upstream.url();
-    let top = "[reload]\nwatch = false";
+    // A short interval, so that a server which ignored `watch = false` would
+    // have polled several times during the wait below.
+    let top = "[reload]\nwatch = false\ninterval_secs = 1";
     let server = start(
         &render(&url, top, &key("second", "second", SECOND, "")),
         "reload-signal-only",
