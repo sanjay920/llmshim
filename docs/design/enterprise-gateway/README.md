@@ -94,9 +94,9 @@ Later phases (each needs its own design note before work starts)
 ## Review follow-ups
 
 Every PR in the first stack (0001 to 0012) was reviewed by an independent
-reviewer before it merged, and each real finding was fixed in the PR. These are
-the findings that were judged out of scope or a design decision, so that none is
-lost. They are not blockers; the ones that touch a contract are marked, because a
+reviewer before it merged. A finding that held up was fixed in its PR unless it
+is listed here; these are the findings that were judged out of scope, or a
+decision about a contract, so that none is lost. They are not blockers; the ones that touch a contract are marked, because a
 contract is cheaper to change before the feature is declared stable.
 
 Contracts and decisions (change before stability)
@@ -128,16 +128,21 @@ Contracts and decisions (change before stability)
 - **Optional client certificates and revocation** (0011), a CRL file watched like
   the CA bundle.
 - **Tokens**: the length floor of 16 characters is below the 128 bits that 0003
-  advises; consider 32. A `sha256` caller key is compared with provider and admin
-  keys by digest in `check_references`, but `build_key_store` alone does not.
+  advises; consider 32. Caller keys are compared with provider and admin
+  keys by digest in `check_references`, which `--check` and startup run, but
+  `build_key_store` alone does not.
 
 Operability
 
-- **The CI jobs run `serve` only.** The default, `proxy`, `gateway` and
-  `gateway-redis` test suites run in the release gate, not on a pull request, so
-  a shared-code regression is found at tag time. A pull-request job that runs
-  `cargo test --features proxy --tests` and `--features gateway-redis` (with a
-  Redis service) closes that.
+- **Pull requests run the `serve` jobs only.** The release gate runs just
+  `cargo test --workspace --features proxy --tests`, and only at tag time. The
+  `gateway` and `gateway-redis` suites under `tests/` (for example
+  `unit_gateway_key_diagnostics.rs` and `unit_redis_diagnostics.rs`) run
+  nowhere in CI; a pull request reaches the gateway code only through the
+  `gateway::` library tests that the `serve-redis` job runs. A shared-code
+  regression is therefore found late. A pull-request job that runs
+  `cargo test --features proxy --tests` and the same with `gateway-redis` (with
+  a Redis service) closes that.
 - **Gemini thinking tokens are left out of the normalized completion count** on
   the native path (`usage::normalize_native_usage`), while the non-streaming
   response folds them in. The spend ledger, the cap and the usage records all use
