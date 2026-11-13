@@ -44,6 +44,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0008: Helm chart](0008-helm-chart.md)
 - [0009: The access log](0009-access-log.md)
 - [0010: Usage and cost records per tenant](0010-usage-records.md)
+- [0011: Mutual TLS and certificate-derived identity](0011-mutual-tls.md)
 
 ## Roadmap
 
@@ -66,7 +67,8 @@ Phase 0: a production server mode
 - [ ] Configuration reload without restart
 - [x] Separately bound, optionally token-protected `/metrics`, stats and probes (0005)
 - [x] TLS termination with renewal on file change (0007)
-- [ ] Mutual TLS and certificate-derived identity
+- [x] Mutual TLS and certificate-derived identity (0011)
+- [ ] JWT/OIDC workload identity; optional client certificates; revocation
 - [x] Access log with tenant attribution and credential fingerprints (0009)
 - [x] Token and cost attribution per tenant and attempt (0010)
 - [ ] OpenTelemetry traces and metrics
@@ -80,7 +82,7 @@ Later phases (each needs its own design note before work starts)
       policy snapshots, bounded local spend allowance during a Redis outage
 - [ ] Hierarchical budgets, model allowlists, tags, alerts, cost exports
 - [ ] Deployments and load balancing across credentials and regions
-- [ ] Workload JWT authentication, mTLS, IP allowlists
+- [ ] Workload JWT authentication, IP allowlists (mTLS is done: 0011)
 - [ ] Audit log
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy
 - [ ] Secret-manager integrations

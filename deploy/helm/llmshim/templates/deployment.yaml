@@ -1,3 +1,6 @@
+{{- if and .Values.server.tls.requireClientCertificate (not .Values.server.tls.enabled) }}
+{{- fail "server.tls.requireClientCertificate needs server.tls.enabled" }}
+{{- end }}
 {{- if and .Values.server.tls.enabled (not .Values.server.tls.secretName) }}
 {{- fail "server.tls.secretName is required when server.tls.enabled is true" }}
 {{- end }}

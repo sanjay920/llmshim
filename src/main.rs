@@ -791,8 +791,12 @@ async fn serve_listener(
     application: axum::Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     tls: Option<axum_server::tls_rustls::RustlsConfig>,
+    require_client_certificate: bool,
 ) -> Result<(), String> {
     match tls {
+        Some(tls) if require_client_certificate => {
+            http_server::serve_mtls(listener, application, shutdown, tls).await
+        }
         Some(tls) => http_server::serve_tls(listener, application, shutdown, tls).await,
         None => http_server::serve(listener, application, shutdown).await,
     }
@@ -992,7 +996,14 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         listener,
         built.app,
         wait_for_stop(stopped.clone()),
-        main_tls.map(|(rustls_config, _)| rustls_config),
+        main_tls
+            .as_ref()
+            .map(|(rustls_config, _)| rustls_config.clone()),
+        config
+            .server
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.client_ca_file.is_some()),
     );
     let logs = built.logs;
     let result = match admin {
@@ -1002,6 +1013,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
                 routes,
                 wait_for_stop(stopped),
                 admin_tls.map(|(rustls_config, _)| rustls_config),
+                false,
             );
             // If either listener ends, stop the other too. Waiting for both would
             // leave a server running with half of its surface gone, and its

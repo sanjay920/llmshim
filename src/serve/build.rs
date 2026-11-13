@@ -355,7 +355,10 @@ pub async fn build_app(
     );
     let (app, admin) = match admin_address {
         Some(admin_address) => {
-            let routes = crate::gateway::http::admin_routes(admin_state);
+            // The admin routes never read the key store, but the internal header
+            // is stripped here too, so it is never present on any listener.
+            let routes = crate::gateway::http::admin_routes(admin_state)
+                .layer(axum::middleware::from_fn(super::mtls::strip_peer_header));
             let routes = match admin_token {
                 Some(digest) => routes.layer(axum::middleware::from_fn(
                     move |request: Request, next: Next| {
@@ -389,6 +392,35 @@ pub async fn build_app(
         },
         None => app,
     };
+    // With client certificates required, bind the verified certificate's name to
+    // each request, and strip the internal header from everything a caller sends.
+    // Outermost, so nothing (not the access log, not the gateway) sees a value
+    // the TLS layer did not set.
+    // The layer runs whether or not client certificates are required: without
+    // them the set of known names is empty, so it strips the header and binds
+    // nothing, and the defence does not depend on what the configuration
+    // validation guarantees about `client_san`.
+    let known: std::collections::HashSet<String> = if config
+        .server
+        .tls
+        .as_ref()
+        .is_some_and(|tls| tls.client_ca_file.is_some())
+    {
+        config
+            .keys
+            .iter()
+            .filter_map(|key| key.client_san.as_deref())
+            .map(super::config::canonical_san)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let known = Arc::new(known);
+    let app = app.layer(axum::middleware::from_fn(
+        move |request: Request, next: Next| {
+            super::mtls::bind_peer_identity(known.clone(), request, next)
+        },
+    ));
     Ok(Built {
         app,
         admin,

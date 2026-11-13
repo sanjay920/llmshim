@@ -50,6 +50,9 @@ port = {{ .Values.server.port }}
 cert_file = "/etc/llmshim/tls/tls.crt"
 key_file = "/etc/llmshim/tls/tls.key"
 reload_interval_secs = {{ .Values.server.tls.reloadIntervalSecs }}
+{{- if .Values.server.tls.requireClientCertificate }}
+client_ca_file = "/etc/llmshim/tls/ca.crt"
+{{- end }}
 {{- end }}
 
 [admin]

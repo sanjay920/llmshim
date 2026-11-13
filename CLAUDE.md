@@ -684,15 +684,18 @@ HTTP client and listener, and the standard `HTTP_PROXY`/`HTTPS_PROXY`/
 table (binary built with `--features serve-redis`) shares the queue, limits,
 spend and provider health through Redis; an `[admin]` table moves the
 operational endpoints to their own listener, and `[server.tls]` / `[admin.tls]`
-terminate TLS with the PEM files watched for renewal, and `[logging]
-access_log` writes a tenant-attributed JSON line per request (never a token,
+terminate TLS with the PEM files watched for renewal, `client_ca_file`
+requires client certificates and a `[[keys]] client_san` authenticates a
+workload by certificate (the internal `x-llmshim-peer-san` header is stripped
+from every request and set only from the handshake; a mutation test pins that),
+and `[logging] access_log` writes a tenant-attributed JSON line per request (never a token,
 query or body); `[logging] usage_log` writes one per provider attempt with
 tokens and USD cost (`null` cost = unknown, never free). The fleet job scope
 carries only a hash of the tenant, and a test pins that names stay out of Redis;
 each replica names tenants from its own config. `deploy/helm/llmshim` deploys it
 (`deploy/helm/validate.sh` checks the chart and feeds each rendered config back
-through `serve --check`). Configuration reload and mutual TLS are not
-implemented. The feature is **unstable
+through `serve --check`). Configuration reload is not implemented. The
+feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,
 `gateway` and `gateway-redis` builds must not change; `tests/unit_serve_cli.rs`
 pins that a build without the feature does not know the command. Never drive

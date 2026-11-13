@@ -4,6 +4,7 @@
 use axum_server::tls_rustls::RustlsConfig;
 use llmshim::serve::config::Tls;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// A digest of a file's contents. Contents rather than timestamps or sizes:
@@ -14,7 +15,7 @@ type FileState = [u8; 32];
 
 /// The state of both files. `None` for a file that cannot be read right now,
 /// which is also a change worth noticing.
-pub(crate) type Signature = (Option<FileState>, Option<FileState>);
+pub(crate) type Signature = (Option<FileState>, Option<FileState>, Option<FileState>);
 
 /// What was read from the two files, once. The reload loads from exactly these
 /// bytes and the signature is taken from them, so what is loaded and what is
@@ -24,6 +25,9 @@ pub(crate) type Signature = (Option<FileState>, Option<FileState>);
 struct Snapshot {
     cert: Option<Vec<u8>>,
     key: Option<Vec<u8>>,
+    /// The client CA bundle, read only when the listener requires client
+    /// certificates.
+    client_ca: Option<Vec<u8>>,
 }
 
 impl Snapshot {
@@ -34,12 +38,16 @@ impl Snapshot {
         Self {
             cert: tokio::fs::read(&tls.cert_file).await.ok(),
             key: tokio::fs::read(&tls.key_file).await.ok(),
+            client_ca: match &tls.client_ca_file {
+                Some(path) => tokio::fs::read(path).await.ok(),
+                None => None,
+            },
         }
     }
 
     fn signature(&self) -> Signature {
         let state = |bytes: &Option<Vec<u8>>| bytes.as_ref().map(|b| Sha256::digest(b).into());
-        (state(&self.cert), state(&self.key))
+        (state(&self.cert), state(&self.key), state(&self.client_ca))
     }
 }
 
@@ -51,27 +59,93 @@ pub(crate) struct Watched {
     loaded: Signature,
 }
 
-/// Read the certificate chain and key, and check that they belong together.
-/// The message names the files, never their contents.
+/// Build the server configuration from what was read, and check that the key
+/// belongs to the certificate. With `client_ca_file`, every client must present
+/// a certificate signed by one of those authorities or the handshake fails.
+/// Messages name files and never their contents.
+fn build_server_config(tls: &Tls, files: &Snapshot) -> Result<Arc<rustls::ServerConfig>, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let (Some(cert), Some(key)) = (&files.cert, &files.key) else {
+        return Err("a file cannot be read".into());
+    };
+    let chain = CertificateDer::pem_slice_iter(cert)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read the certificate chain: {error}"))?;
+    if chain.is_empty() {
+        return Err("the certificate file holds no certificate".into());
+    }
+    let key = PrivateKeyDer::from_pem_slice(key)
+        .map_err(|error| format!("cannot read the private key: {error}"))?;
+    let builder = rustls::ServerConfig::builder();
+    let requires_clients = tls.client_ca_file.is_some();
+    let builder = match &tls.client_ca_file {
+        Some(path) => {
+            let bundle = files
+                .client_ca
+                .as_ref()
+                .ok_or_else(|| format!("cannot read the client CA bundle {}", path.display()))?;
+            let mut roots = rustls::RootCertStore::empty();
+            let authorities = CertificateDer::pem_slice_iter(bundle)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    format!(
+                        "cannot read the client CA bundle {}: {error}",
+                        path.display()
+                    )
+                })?;
+            if authorities.is_empty() {
+                return Err(format!(
+                    "the client CA bundle {} holds no certificate",
+                    path.display()
+                ));
+            }
+            for authority in authorities {
+                roots
+                    .add(authority)
+                    .map_err(|error| format!("a client CA certificate is not usable: {error}"))?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|error| format!("cannot build the client verifier: {error}"))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut config = builder.with_single_cert(chain, key).map_err(|error| {
+        format!("the key does not match the certificate or is unusable: {error}")
+    })?;
+    // `RustlsConfig::from_config` leaves the protocols to the caller.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    if requires_clients {
+        // A resumed session skips the client certificate request, and rustls
+        // restores the peer's certificate chain from the session, where it is
+        // not re-verified. A client whose certificate has expired (or whose
+        // authority was removed) could then reconnect as long as the session
+        // lives, and each resumption issues a fresh ticket from the same chain.
+        // With client certificates every connection does a full handshake, so
+        // each one is checked against the CA bundle and the clock.
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+    }
+    Ok(Arc::new(config))
+}
+
+/// Read the certificate chain and key (and the client CA bundle, if any), and
+/// check that they belong together. The message names the files, never their
+/// contents.
 pub(crate) async fn load(tls: &Tls) -> Result<(RustlsConfig, Watched), String> {
     // Installing twice is harmless; the first provider wins.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let snapshot = Snapshot::take(tls).await;
-    let named = || {
+    let config = build_server_config(tls, &snapshot).map_err(|error| {
         format!(
-            "the TLS certificate {} and key {}",
+            "cannot load the TLS certificate {} and key {}: {error}",
             tls.cert_file.display(),
             tls.key_file.display()
         )
-    };
-    let (Some(cert), Some(key)) = (snapshot.cert.clone(), snapshot.key.clone()) else {
-        return Err(format!("cannot read {}", named()));
-    };
-    let config = RustlsConfig::from_pem(cert, key)
-        .await
-        .map_err(|error| format!("cannot load {}: {error}", named()))?;
+    })?;
     Ok((
-        config,
+        RustlsConfig::from_config(config),
         Watched {
             files: tls.clone(),
             loaded: snapshot.signature(),
@@ -104,15 +178,9 @@ pub(crate) fn watch(config: RustlsConfig, watched: Watched, label: &'static str)
             if now == applied {
                 continue;
             }
-            let result = match (snapshot.cert, snapshot.key) {
-                (Some(cert), Some(key)) => config
-                    .reload_from_pem(cert, key)
-                    .await
-                    .map_err(|error| error.to_string()),
-                _ => Err("a file cannot be read".to_string()),
-            };
-            match result {
-                Ok(()) => {
+            match build_server_config(&tls, &snapshot) {
+                Ok(rebuilt) => {
+                    config.reload_from_config(rebuilt);
                     applied = now;
                     reported = None;
                     eprintln!("{label}: reloaded the TLS certificate");
@@ -158,7 +226,11 @@ mod tests {
                 .block_on(async move { Snapshot::take(&tls).await.signature() })
         };
         let missing = signature(&tls);
-        assert_eq!(missing, (None, None), "unreadable files are a state too");
+        assert_eq!(
+            missing,
+            (None, None, None),
+            "unreadable files are a state too"
+        );
         std::fs::write(&tls.cert_file, "one").unwrap();
         std::fs::write(&tls.key_file, "a").unwrap();
         let first = signature(&tls);

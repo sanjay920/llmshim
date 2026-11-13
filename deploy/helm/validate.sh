@@ -52,11 +52,18 @@ work = sys.argv[3]
 # Point the pod's mount paths at files that exist here.
 body = body.replace("/etc/llmshim/tls/tls.crt", f"{work}/tls.crt")
 body = body.replace("/etc/llmshim/tls/tls.key", f"{work}/tls.key")
+body = body.replace("/etc/llmshim/tls/ca.crt", f"{work}/tls.crt")
 body = body.replace("/var/lib/llmshim/receipts", f"{work}/receipts")
 open(sys.argv[2], "w").write(body)
 PY
   LLMSHIM_CATALOG_OFFLINE=1 "$bin" serve --config "$work/$variant.toml" --check
 done
+
+echo "== requiring client certificates without TLS is refused"
+if helm template release /charts/llmshim --set server.tls.requireClientCertificate=true >/dev/null 2>"$work/err2"; then
+  echo "expected the render to fail"; exit 1
+fi
+grep -q "requireClientCertificate needs server.tls.enabled" "$work/err2"
 
 echo "== a missing TLS secret name is refused"
 if helm template release /charts/llmshim --set server.tls.enabled=true >/dev/null 2>"$work/err"; then

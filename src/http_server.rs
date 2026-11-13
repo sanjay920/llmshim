@@ -239,6 +239,101 @@ pub(crate) async fn serve_tls(
     drive(running, handle, shutdown).await
 }
 
+/// [`serve_tls`] for a listener that requires client certificates: after the
+/// handshake the verified certificate's names are attached to every request of
+/// the connection as [`llmshim::serve::mtls::PeerSans`]. The certificate itself
+/// was verified by the TLS configuration; this only reads it.
+#[cfg(feature = "serve")]
+pub(crate) async fn serve_mtls(
+    listener: tokio::net::TcpListener,
+    application: axum::Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    tls: axum_server::tls_rustls::RustlsConfig,
+) -> Result<(), String> {
+    let limits = HttpServerLimits::from_env();
+    let acceptor = PeerCertAcceptor {
+        inner: axum_server::tls_rustls::RustlsAcceptor::new(tls)
+            .handshake_timeout(limits.header_timeout),
+    };
+    let mut server =
+        axum_server::Server::<ConnectionAddress>::from_listener(limited_listener(listener, limits))
+            .acceptor(acceptor);
+    harden(server.http_builder(), limits);
+    let handle = axum_server::Handle::<ConnectionAddress>::new();
+    let application = application.layer(axum::middleware::from_fn(mark_first_headers));
+    let running = server
+        .handle(handle.clone())
+        .serve(application.into_make_service_with_connect_info::<FirstHeadersReceived>());
+    drive(running, handle, shutdown).await
+}
+
+/// Completes the TLS handshake, then wraps the connection's service so each
+/// request carries the verified peer's names.
+#[cfg(feature = "serve")]
+#[derive(Clone)]
+struct PeerCertAcceptor {
+    inner: axum_server::tls_rustls::RustlsAcceptor,
+}
+
+#[cfg(feature = "serve")]
+impl<S> axum_server::accept::Accept<LimitedStream, S> for PeerCertAcceptor
+where
+    S: Send + 'static,
+{
+    type Stream = tokio_rustls::server::TlsStream<LimitedStream>;
+    type Service = WithPeer<S>;
+    type Future =
+        Pin<Box<dyn Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send>>;
+
+    fn accept(&self, stream: LimitedStream, service: S) -> Self::Future {
+        let handshake = self.inner.accept(stream, service);
+        Box::pin(async move {
+            let (stream, service) = handshake.await?;
+            let peer = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .map(llmshim::serve::mtls::PeerSans::from_chain)
+                .unwrap_or_default();
+            Ok((
+                stream,
+                WithPeer {
+                    inner: service,
+                    peer,
+                },
+            ))
+        })
+    }
+}
+
+/// A service that adds the connection's [`llmshim::serve::mtls::PeerSans`] to
+/// each request before passing it on.
+#[cfg(feature = "serve")]
+#[derive(Clone)]
+struct WithPeer<S> {
+    inner: S,
+    peer: llmshim::serve::mtls::PeerSans,
+}
+
+#[cfg(feature = "serve")]
+impl<S, B> tower::Service<axum::http::Request<B>> for WithPeer<S>
+where
+    S: tower::Service<axum::http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, mut request: axum::http::Request<B>) -> Self::Future {
+        request.extensions_mut().insert(self.peer.clone());
+        self.inner.call(request)
+    }
+}
+
 fn limited_listener(
     listener: tokio::net::TcpListener,
     limits: HttpServerLimits,

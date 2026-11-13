@@ -32,6 +32,10 @@ server:
     enabled: false
     secretName: ""
     reloadIntervalSecs: 30
+    # Require a client certificate on every connection, signed by the CA in the
+    # Secret's ca.crt (cert-manager puts it there). Workloads then authenticate
+    # with `client_san` keys in `config`. Needs tls.enabled.
+    requireClientCertificate: false
 
 admin:
   # /metrics, /v1/gateway/stats, /health and /ready on their own port. Probes
