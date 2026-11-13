@@ -13,7 +13,7 @@ This is a public crate on crates.io. Do NOT make breaking changes to `pub` items
 ## Advertised models
 
 - **OpenAI:** `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-luna`
-- **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, and `chatgpt/gpt-6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
+- **ChatGPT subscription (OAuth):** only `chatgpt/gpt-6-astra`, `chatgpt/gpt-6-sol`, `chatgpt/gpt-6.1-sol`, and `chatgpt/gpt-6-luna`. `CHATGPT_MODELS` in `src/models.rs` is shared by discovery, CLI selection, and validation; older/unlisted models fail before authentication or network calls.
 - **Anthropic:** `claude-fable-5-2`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`
 - **Gemini:** `gemini-4-carbon`, `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.5-flash-lite`
 - **xAI:** `grok-4.7`
@@ -43,7 +43,7 @@ API keys: `~/.llmshim/config.toml` (via `llmshim configure`) or env vars `OPENAI
 `llmshim-catalog` is a standalone workspace member. Its `builtin` module owns
 the curated/historical constants; `src/models.rs` reexports the legacy borrowed
 API. Owned metadata and snapshots live in `llmshim::catalog`. Keep the curated
-13-route discovery and three-entry ChatGPT allowlist distinct from catalog
+19-route discovery and four-entry ChatGPT allowlist distinct from catalog
 coverage. Local policy > provider capabilities > verified builtin assertions >
 models.dev, per field; unknowns never erase assertions. Provider APIs never
 contribute pricing. See `crates/llmshim-catalog/README.md` for cache and override
@@ -159,13 +159,14 @@ repair remain a separate concern. See `docs/src/guides/schemas.md`.
 
 `src/models.rs::MODELS` is the single advertised list, imported directly by
 `src/main.rs` and used by `available_models()` for proxy discovery. Keep the
-- **OpenAI:** `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-luna`
-Gemini, one xAI, and three ChatGPT routes. Do not add previews or bring back
-superseded generations without an explicit catalog decision.
+current model in each retained tier: five OpenAI, four Anthropic, four Gemini,
+one xAI, four ChatGPT routes and one Cerebras route (19 in all, pinned by
+`tests/unit_models.rs`). Do not add previews or bring back superseded
+generations without an explicit catalog decision.
 
 Historical metadata lives in private `LEGACY_MODELS` and remains queryable via
 `spec()`. Pruning discovery does not delete legacy transforms, tests, or
-explicit-ID routing. ChatGPT keeps its separately authorized three-ID request
+explicit-ID routing. ChatGPT keeps its separately authorized four-ID request
 allowlist. Keep reader-facing model tables and examples current; retain the
 actual model IDs in historical benchmark results and regression fixtures.
 
@@ -390,7 +391,7 @@ Opus 5, Opus 5.5, or Fable/Mythos — and only Sonnet 5.5 can read its own
 thinking. GPT-6 Sol/Luna accept
 `none` and `max` reasoning effort and native `pro` mode. Their current routes
 replace GPT-5.6 discovery entries, while historical OpenAI and Anthropic IDs
-remain explicitly routable. ChatGPT accepts only the three GPT-6 IDs; removal
+remain explicitly routable. ChatGPT accepts only the four GPT-6 and GPT-6.1 IDs; removal
 of its older 5.6 request IDs is a public behavior change in v0.13.0.
 
 `tests/unit_fable.rs` pins these rules. Live checks for Fable 5, Fable 5.1,
@@ -402,7 +403,7 @@ cargo test --features proxy --test integration_current_models -- --ignored --noc
 
 The live tests consume API usage and are ignored during offline preflight.
 Gemini 3.8 Flash and Opus 5 already had catalog/adapter support; Grok 4.7 is
-the current xAI model ID (verified live 2026-09-21); retain Grok 4.6 for explicit routing. Keep the ChatGPT three-model allowlist independent.
+the current xAI model ID (verified live 2026-09-21); retain Grok 4.6 for explicit routing. Keep the ChatGPT four-model allowlist independent.
 
 Two knobs work across every provider: `reasoning_effort` (`none|low|medium|high|xhigh|max`) and `reasoning_mode` (`standard|pro`). A third, `reasoning_summary` (`auto|none`), controls reasoning-text visibility → Anthropic `thinking.display` (`auto`→`summarized`, the default when `reasoning_effort` is present so newer models like Sonnet 5 / Opus 4.7-4.8 return reasoning text instead of the API-default `omitted`; `none`→`omitted` for lower latency). Applies to both the adaptive and pre-4.6 enabled thinking builders; a caller-supplied `thinking` block bypasses it. Each provider transform maps them to its native dialect, **clamping to the nearest tier the target model accepts** (boundaries grounded in provider docs and live tests — e.g. `max` is native on OpenAI gpt-5.6 and all GPT-6 models; Anthropic 4.6 rejects `xhigh` but has `max`; Gemini's enum tops out at `high`; xAI grok-4.20 models reject any reasoning param). `mode: "pro"` is native on OpenAI gpt-5.6, GPT-6, and -pro models (`reasoning.mode`), emulated as a one-tier effort bump elsewhere; explicit `none` always wins. Native passthrough (`x-openai.reasoning`, `x-anthropic.thinking`, `x-gemini.thinkingConfig`) bypasses the mapping entirely and always takes precedence. **Full per-provider mapping tables: `docs/src/guides/reasoning.md`** — update it and the pinning tests in `tests/unit_*.rs` together whenever a mapping changes.
 
@@ -676,11 +677,14 @@ versioned TOML/JSON file (`src/serve/`: `config.rs` the contract, `keys.rs` the
 hashed caller-key store, `build.rs` the assembly), and `--check` validates it
 without starting anything. Unknown fields are rejected, secrets are references
 only and never echoed, unauthenticated serving is explicit, and the file is the
-only source of settings (it reads the environment solely to resolve
-`{ env = ... }` references). A `[fleet]` table (binary built with
-`--features serve-redis`) shares the queue, limits, spend and provider health
-through Redis; an `[admin]` table moves the operational endpoints to their own
-listener. Reload and TLS are not implemented. The feature is **unstable
+source of every setting that belongs to the server (it reads the environment
+to resolve `{ env = ... }` references; the process-wide settings of the shared
+HTTP client and listener, and the standard `HTTP_PROXY`/`HTTPS_PROXY`/
+`ALL_PROXY` variables, still apply and are listed in 0002 and 0004). A `[fleet]`
+table (binary built with `--features serve-redis`) shares the queue, limits,
+spend and provider health through Redis; an `[admin]` table moves the
+operational endpoints to their own listener. Reload and TLS are not
+implemented. The feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,
 `gateway` and `gateway-redis` builds must not change; `tests/unit_serve_cli.rs`
 pins that a build without the feature does not know the command. Never drive

@@ -46,6 +46,29 @@ pub struct Built {
     pub providers: Vec<String>,
     pub caller_keys: usize,
     pub authenticated: bool,
+    /// Whether the admin listener (when there is one) requires its token.
+    pub admin_authenticated: bool,
+}
+
+/// The digest of the admin token, if one is configured, after the rules a
+/// caller token must meet. `build_app` and `serve --check` share this, so a
+/// token that `--check` accepts is one the server starts with.
+pub fn admin_token_digest(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<Vec<u8>>, Issue> {
+    let Some(secret) = config.admin.as_ref().and_then(|admin| admin.token.as_ref()) else {
+        return Ok(None);
+    };
+    let issue = |message| Issue {
+        path: "admin.token".into(),
+        message,
+    };
+    let token = read_secret(secret, env).map_err(issue)?;
+    if let Some(message) = super::keys::token_problem(&token) {
+        return Err(issue(message));
+    }
+    Ok(Some(Sha256::digest(token.as_bytes()).to_vec()))
 }
 
 /// Build the application. Must be called inside a Tokio runtime, because the
@@ -98,48 +121,12 @@ pub async fn build_app(
         None => None,
     };
 
-    let receipts_root = config
-        .state
-        .receipts_dir
-        .clone()
-        .unwrap_or_else(Receipts::default_root);
-    if let Err(error) = std::fs::create_dir_all(&receipts_root) {
-        issues.push(Issue {
-            path: "state.receipts_dir".into(),
-            message: format!(
-                "cannot create {}: {}",
-                receipts_root.display(),
-                error.kind()
-            ),
-        });
-    }
-
-    let admin_token = match config.admin.as_ref().and_then(|admin| admin.token.as_ref()) {
-        Some(secret) => match read_secret(secret, env) {
-            Ok(token) if token.chars().any(char::is_whitespace) => {
-                issues.push(Issue {
-                    path: "admin.token".into(),
-                    message: "must not contain whitespace".into(),
-                });
-                None
-            }
-            Ok(token) if token.chars().count() < super::keys::MIN_TOKEN_LEN => {
-                issues.push(Issue {
-                    path: "admin.token".into(),
-                    message: format!("must be at least {} characters", super::keys::MIN_TOKEN_LEN),
-                });
-                None
-            }
-            Ok(token) => Some(Sha256::digest(token.as_bytes()).to_vec()),
-            Err(message) => {
-                issues.push(Issue {
-                    path: "admin.token".into(),
-                    message,
-                });
-                None
-            }
-        },
-        None => None,
+    let admin_token = match admin_token_digest(config, env) {
+        Ok(digest) => digest,
+        Err(issue) => {
+            issues.push(issue);
+            None
+        }
     };
     let admin_address = match &config.admin {
         Some(admin) => match parse_address(&admin.host, admin.port) {
@@ -155,9 +142,35 @@ pub async fn build_app(
         None => None,
     };
 
+    // The rules that compare secrets (a caller token that is also an upstream
+    // key) belong to assembly too, so a caller of `build_app` cannot skip them.
+    // Run only once nothing else failed, because they repeat the missing-secret
+    // issues found above.
+    if issues.is_empty() {
+        issues.extend(config.check_references(env));
+    }
+
     let (Some(keystore), true) = (keystore, issues.is_empty()) else {
         return Err(issues);
     };
+
+    // Nothing is created on disk until the configuration is known to be good,
+    // and the directory is private, as the receipt store makes its own.
+    let receipts_root = config
+        .state
+        .receipts_dir
+        .clone()
+        .unwrap_or_else(Receipts::default_root);
+    if let Err(error) = create_private_directory(&receipts_root) {
+        return Err(vec![Issue {
+            path: "state.receipts_dir".into(),
+            message: format!(
+                "cannot create {}: {}",
+                receipts_root.display(),
+                error.kind()
+            ),
+        }]);
+    }
 
     let mut gateway = GatewayConfig::default();
     if let Some(max) = config.limits.max_concurrency {
@@ -226,6 +239,7 @@ pub async fn build_app(
         },
     };
 
+    let admin_authenticated = admin_token.is_some();
     let admin_state = state.clone();
     let app = app_with_parts(
         state,
@@ -261,6 +275,7 @@ pub async fn build_app(
         fleet,
         caller_keys: config.keys.len(),
         authenticated,
+        admin_authenticated,
     })
 }
 
@@ -301,6 +316,19 @@ async fn require_admin_token(expected: &[u8], request: Request, next: Next) -> R
         )
             .into_response()
     }
+}
+
+/// Create `path` and any missing parents with mode 0700 (unix). An existing
+/// directory is left as it is.
+fn create_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 fn parse_address(host: &str, port: u16) -> Result<SocketAddr, String> {
@@ -442,7 +470,20 @@ fn redact(message: &str, url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redact;
+    use super::*;
+    use crate::serve::config::Format;
+
+    fn config(admin: &str) -> ServeConfig {
+        let text = format!(
+            "version = 1\n[server]\nallow_unauthenticated = true\n\
+             [providers.openai]\nkind = \"openai\"\napi_key = {{ env = \"UPSTREAM\" }}\n{admin}"
+        );
+        ServeConfig::parse(&text, Format::Toml).unwrap()
+    }
+
+    fn with(value: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |name| (name == "ADMIN").then(|| value.to_string())
+    }
 
     #[test]
     fn errors_never_carry_the_redis_url_or_its_password() {
@@ -454,5 +495,33 @@ mod tests {
             "{out}"
         );
         assert_eq!(redact("Connection refused", url), "Connection refused");
+    }
+
+    #[test]
+    fn the_admin_token_meets_the_rules_a_caller_token_does() {
+        let admin = "[admin]\nport = 9090\ntoken = { env = \"ADMIN\" }";
+        let config = config(admin);
+        for (value, expected) in [
+            ("short", "at least 16 characters"),
+            ("has a space inside it 0123", "visible ASCII"),
+            ("\u{feff}admin-token-0123456789", "visible ASCII"),
+        ] {
+            let issue = admin_token_digest(&config, &with(value)).unwrap_err();
+            assert_eq!(issue.path, "admin.token");
+            assert!(issue.message.contains(expected), "{issue:?}");
+            assert!(!issue.message.contains(value), "{issue:?}");
+        }
+        let digest = admin_token_digest(&config, &with("admin-token-0123456789"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(digest, Sha256::digest(b"admin-token-0123456789").to_vec());
+        let unset = admin_token_digest(&config, &|_| None).unwrap_err();
+        assert!(unset.message.contains("ADMIN is not set"), "{unset:?}");
+    }
+
+    #[test]
+    fn no_token_configured_is_not_an_error_here() {
+        let config = config("[admin]\nport = 9090\nallow_unauthenticated = true");
+        assert_eq!(admin_token_digest(&config, &|_| None).unwrap(), None);
     }
 }

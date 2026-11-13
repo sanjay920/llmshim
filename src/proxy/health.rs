@@ -220,7 +220,8 @@ mod tests {
     #[test]
     fn explicit_inputs_build_a_local_breaker_when_there_is_no_redis() {
         for url in [None, Some(""), Some("   ")] {
-            // No shared backend is attached, and nothing reads the environment.
+            // Nothing reads the environment, and an absent or blank URL builds a
+            // working local breaker (a shared backend is not observable here).
             let config = BreakerConfig {
                 trip_threshold: 7,
                 ..BreakerConfig::default()

@@ -2,8 +2,10 @@
 //!
 //! Every caller key ends up as a SHA-256 digest: keys given as `secret`
 //! references are read once, digested, and dropped, and keys given as `sha256`
-//! are used as they are. The process therefore never retains a caller token.
-//! Errors are returned, never printed-and-exited, and never contain a token.
+//! are used as they are. The store therefore holds only digests. A `secret`
+//! given as `{ env = ... }` still leaves the token in the process environment;
+//! a `{ file = ... }` or `sha256` key does not. Errors are returned, never
+//! printed-and-exited, and never contain a token.
 
 use super::config::{read_secret, Issue, ServeConfig};
 use crate::gateway::auth::{Identity, KeyStore};
@@ -13,6 +15,24 @@ use std::collections::HashMap;
 /// Shortest caller token accepted, in characters. A configuration cannot choose
 /// a weaker one; generate tokens with at least 128 bits of randomness.
 pub const MIN_TOKEN_LEN: usize = 16;
+
+/// Why `token` cannot serve as a bearer token, if it cannot. Shared by caller
+/// keys and the admin token so the two rules cannot drift apart.
+///
+/// The gateway reads the `Authorization` header as visible ASCII, so a token
+/// with anything else (a space, a byte-order mark left by an editor, a control
+/// or non-ASCII character) could never match.
+pub(crate) fn token_problem(token: &str) -> Option<String> {
+    if !token.chars().all(|c| ('!'..='~').contains(&c)) {
+        return Some(
+            "must contain only visible ASCII characters \
+             (no whitespace, control or non-ASCII characters)"
+                .into(),
+        );
+    }
+    (token.chars().count() < MIN_TOKEN_LEN)
+        .then(|| format!("must be at least {MIN_TOKEN_LEN} characters"))
+}
 
 /// Build the caller-key store.
 ///
@@ -25,6 +45,15 @@ pub fn build_key_store(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<KeyStore, Vec<Issue>> {
     if config.server.allow_unauthenticated {
+        // Validation refuses this combination for a parsed file; a configuration
+        // assembled by hand must not turn configured keys into an open server.
+        if !config.keys.is_empty() {
+            return Err(vec![Issue {
+                path: "keys".into(),
+                message: "caller keys are configured but server.allow_unauthenticated is true"
+                    .into(),
+            }]);
+        }
         return Ok(KeyStore::Open);
     }
     let mut issues = Vec::new();
@@ -33,21 +62,16 @@ pub fn build_key_store(
         let at = format!("keys[{index}]");
         let digest = match (&key.secret, &key.sha256) {
             (Some(secret), None) => match read_secret(secret, env) {
-                Ok(token) if token.chars().any(char::is_whitespace) => {
-                    issues.push(Issue {
-                        path: format!("{at}.secret"),
-                        message: "must not contain whitespace".into(),
-                    });
-                    continue;
-                }
-                Ok(token) if token.chars().count() < MIN_TOKEN_LEN => {
-                    issues.push(Issue {
-                        path: format!("{at}.secret"),
-                        message: format!("must be at least {MIN_TOKEN_LEN} characters"),
-                    });
-                    continue;
-                }
-                Ok(token) => format!("{:x}", Sha256::digest(token.as_bytes())),
+                Ok(token) => match token_problem(&token) {
+                    Some(message) => {
+                        issues.push(Issue {
+                            path: format!("{at}.secret"),
+                            message,
+                        });
+                        continue;
+                    }
+                    None => format!("{:x}", Sha256::digest(token.as_bytes())),
+                },
                 Err(message) => {
                     issues.push(Issue {
                         path: format!("{at}.secret"),
@@ -57,8 +81,15 @@ pub fn build_key_store(
                 }
             },
             (None, Some(digest)) => digest.clone(),
-            // Rejected by validation; unreachable for a loaded configuration.
-            _ => continue,
+            // Rejected by validation for a parsed file; a configuration assembled
+            // by hand must not silently drop a key.
+            _ => {
+                issues.push(Issue {
+                    path: at,
+                    message: "must set exactly one of secret and sha256".into(),
+                });
+                continue;
+            }
         };
         let identity = Identity {
             tenant: key.tenant.clone(),
@@ -163,7 +194,12 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(b"batch-token-0123456789"));
         let extra =
             format!("[[keys]]\nname = \"batch\"\ntenant = \"analytics\"\nsha256 = \"{digest}\"");
-        let store = build_key_store(&config(&extra), &env_with(TOKEN)).unwrap();
+        // A file holding only a digest key resolves without any environment.
+        let text = format!(
+            "version = 1\n[providers.openai]\nkind = \"openai\"\napi_key = {{ env = \"UPSTREAM_KEY\" }}\n{extra}"
+        );
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        let store = build_key_store(&config, &|_| None).unwrap();
         let caller = store.identify(&bearer("batch-token-0123456789")).unwrap();
         assert_eq!(caller.tenant, "analytics");
         assert_eq!(caller.tier, 0);
@@ -176,7 +212,11 @@ mod tests {
         assert!(unset[0].message.contains("CI_KEY is not set"));
         for (value, expected) in [
             ("short-token", "at least 16 characters"),
-            ("has a space inside it 0123", "must not contain whitespace"),
+            ("has a space inside it 0123", "visible ASCII"),
+            // A byte-order mark survives `trim` and is not whitespace.
+            ("\u{feff}ci-token-0123456789abcdef", "visible ASCII"),
+            ("caf\u{e9}-token-0123456789abcd", "visible ASCII"),
+            ("tab\tseparated-0123456789abc", "visible ASCII"),
         ] {
             let issues = build_key_store(&config(""), &env_with(value))
                 .err()
@@ -184,6 +224,28 @@ mod tests {
             assert!(issues[0].message.contains(expected), "{issues:?}");
             assert!(!issues[0].message.contains(value), "{issues:?}");
         }
+    }
+
+    #[test]
+    fn the_length_floor_is_exactly_sixteen_characters() {
+        let fifteen = "abcdefghijklmno";
+        let sixteen = "abcdefghijklmnop";
+        assert_eq!(fifteen.chars().count(), 15);
+        assert!(build_key_store(&config(""), &env_with(fifteen)).is_err());
+        let store = build_key_store(&config(""), &env_with(sixteen)).unwrap();
+        assert!(store.identify(&bearer(sixteen)).is_ok());
+    }
+
+    #[test]
+    fn configured_keys_never_yield_an_open_store() {
+        let mut open = config("");
+        open.server.allow_unauthenticated = true;
+        let issues = build_key_store(&open, &env_with(TOKEN)).err().unwrap();
+        assert_eq!(issues[0].path, "keys");
+        let mut neither = config("");
+        neither.keys[0].secret = None;
+        let issues = build_key_store(&neither, &env_with(TOKEN)).err().unwrap();
+        assert_eq!(issues[0].path, "keys[0]");
     }
 
     #[test]

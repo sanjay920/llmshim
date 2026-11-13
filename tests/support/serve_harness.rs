@@ -17,6 +17,8 @@ pub struct Server {
     pub base: String,
     /// The admin listener's address, when the configuration has `[admin]`.
     pub admin: Option<String>,
+    /// The whole `Admin:` banner line, which says whether a token is required.
+    pub admin_banner: String,
     pub dir: tempdir::Dir,
 }
 
@@ -84,6 +86,7 @@ pub fn start(config: &str, label: &str, extra_env: &[(&str, &str)]) -> Server {
         child,
         base: String::new(),
         admin: None,
+        admin_banner: String::new(),
         dir,
     };
     let stderr = server.child.stderr.take().unwrap();
@@ -104,6 +107,7 @@ pub fn start(config: &str, label: &str, extra_env: &[(&str, &str)]) -> Server {
                 }
                 if let Some(admin) = line.trim().strip_prefix("Admin: ") {
                     server.admin = admin.split_whitespace().next().map(str::to_string);
+                    server.admin_banner = line.trim().to_string();
                 }
                 // The banner prints the main address, then the admin line.
                 if !server.base.is_empty() && (!wants_admin || server.admin.is_some()) {
@@ -155,4 +159,40 @@ pub async fn chat(server: &Server, key: Option<&str>, model: &str) -> reqwest::R
         request = request.bearer_auth(key);
     }
     request.send().await.unwrap()
+}
+
+/// Run `serve` to its end. A regression that starts serving would never end,
+/// so the wait is bounded and the process killed instead of hanging CI.
+pub fn run_to_exit(config_path: &std::path::Path, env: &[(&str, &str)]) -> (Option<i32>, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_llmshim"));
+    command
+        .args(["serve", "--config", config_path.to_str().unwrap()])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        text
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status.code();
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr = reader.join().unwrap();
+            panic!("serve did not exit; stderr: {stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (status, reader.join().unwrap())
 }

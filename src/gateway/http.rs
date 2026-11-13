@@ -264,9 +264,11 @@ impl GatewayState {
         Self::from_parts(router, logger, LocalParts::from_env())
     }
 
-    /// Build in-memory (single-instance) gateway state from explicit parts,
-    /// reading nothing from the environment. [`Self::from_env`] is this
-    /// function applied to [`LocalParts::from_env`].
+    /// Build in-memory (single-instance) gateway state from explicit parts.
+    /// The parts themselves are read from nothing; a few process-wide settings
+    /// are still read later (retained accounting attempts, the penalty after a
+    /// 429, the shared HTTP client), as the 0002 design note lists.
+    /// [`Self::from_env`] is this function applied to [`LocalParts::from_env`].
     pub(crate) fn from_parts(
         router: Router,
         logger: Option<Logger>,
