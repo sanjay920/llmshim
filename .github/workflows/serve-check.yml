@@ -25,6 +25,8 @@ jobs:
           cargo test --locked --features serve --lib serve::
           cargo test --locked --features serve --test unit_serve_cli
           cargo test --locked --features serve --test integration_serve
+          cargo test --locked --features serve --test integration_serve_tls
+          cargo test --locked --features serve --bin llmshim serve_tls
 
   serve-redis-check:
     runs-on: ubuntu-latest

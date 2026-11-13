@@ -3,6 +3,8 @@ mod cli;
 mod http_server;
 #[cfg(feature = "proxy")]
 mod managed_server;
+#[cfg(feature = "serve")]
+mod serve_tls;
 mod terminal_text;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -782,6 +784,48 @@ async fn build_gateway_state(
     llmshim::gateway::http::GatewayState::from_env(router, logger)
 }
 
+/// Serve one listener, over TLS when a certificate is configured for it.
+#[cfg(feature = "serve")]
+async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    application: axum::Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+) -> Result<(), String> {
+    match tls {
+        Some(tls) => http_server::serve_tls(listener, application, shutdown, tls).await,
+        None => http_server::serve(listener, application, shutdown).await,
+    }
+}
+
+/// A listener's loaded TLS configuration with the files it came from, for the
+/// reload watcher.
+#[cfg(feature = "serve")]
+type LoadedTls = Option<(
+    axum_server::tls_rustls::RustlsConfig,
+    llmshim::serve::config::Tls,
+)>;
+
+#[cfg(feature = "serve")]
+async fn load_tls(config: &llmshim::serve::ServeConfig) -> Result<(LoadedTls, LoadedTls), String> {
+    async fn one(tls: Option<&llmshim::serve::config::Tls>, at: &str) -> Result<LoadedTls, String> {
+        match tls {
+            Some(files) => serve_tls::load(files)
+                .await
+                .map(|loaded| Some((loaded, files.clone())))
+                .map_err(|error| format!("{at}: {error}")),
+            None => Ok(None),
+        }
+    }
+    let main = one(config.server.tls.as_ref(), "server.tls").await?;
+    let admin = one(
+        config.admin.as_ref().and_then(|admin| admin.tls.as_ref()),
+        "admin.tls",
+    )
+    .await?;
+    Ok((main, admin))
+}
+
 /// Run the server described by a configuration file, or with `--check` only
 /// validate it. Exit codes: 0 valid (or clean shutdown), 1 invalid or failed
 /// to start, 2 usage error (reported before this runs).
@@ -812,6 +856,15 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         report(&missing);
         return 1;
     }
+    // Load the TLS material before anything is created or started, so a bad
+    // certificate, or a key that does not match it, stops the start cleanly.
+    let (main_tls, admin_tls) = match load_tls(&config).await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("{}: {error}", path.display());
+            return 1;
+        }
+    };
     if options.check {
         // Building the caller-key store is the stricter check: it also enforces
         // token length and whitespace, which a reference check cannot. Nothing
@@ -869,7 +922,17 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         },
         None => None,
     };
-    eprintln!("llmshim serve listening on http://{address}");
+    let scheme = |tls: &Option<(axum_server::tls_rustls::RustlsConfig, _)>| {
+        if tls.is_some() {
+            "https"
+        } else {
+            "http"
+        }
+    };
+    eprintln!(
+        "llmshim serve listening on {}://{address}",
+        scheme(&main_tls)
+    );
     eprintln!("  Providers: {:?}", built.providers);
     if built.fleet {
         eprintln!("  Mode: fleet (shared Redis queue, limits, spend and provider health)");
@@ -884,7 +947,8 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     match &admin {
         Some((_, _, admin_address)) => {
             eprintln!(
-                "  Admin: http://{admin_address} (/metrics, /v1/gateway/stats, /health, /ready)"
+                "  Admin: {}://{admin_address} (/metrics, /v1/gateway/stats, /health, /ready)",
+                scheme(&admin_tls)
             )
         }
         None => eprintln!(
@@ -901,10 +965,26 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     let wait_for_stop = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
         let _ = stopped.wait_for(|stop| *stop).await;
     };
-    let main_server = http_server::serve(listener, built.app, wait_for_stop(stopped.clone()));
+    // A renewed certificate is picked up without a restart.
+    for (tls, label) in [(&main_tls, "tls"), (&admin_tls, "admin tls")] {
+        if let Some((rustls_config, files)) = tls {
+            serve_tls::watch(rustls_config.clone(), files.clone(), label);
+        }
+    }
+    let main_server = serve_listener(
+        listener,
+        built.app,
+        wait_for_stop(stopped.clone()),
+        main_tls.map(|(rustls_config, _)| rustls_config),
+    );
     let result = match admin {
         Some((routes, admin_listener, _)) => {
-            let admin_server = http_server::serve(admin_listener, routes, wait_for_stop(stopped));
+            let admin_server = serve_listener(
+                admin_listener,
+                routes,
+                wait_for_stop(stopped),
+                admin_tls.map(|(rustls_config, _)| rustls_config),
+            );
             let (main_result, admin_result) = tokio::join!(main_server, admin_server);
             main_result.and(admin_result)
         }

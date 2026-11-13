@@ -40,6 +40,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0004: serve runs the gateway from a file](0004-serve-boot.md)
 - [0005: A separate listener for operational endpoints](0005-admin-listener.md)
 - [0006: Fleet mode under serve](0006-fleet-mode.md)
+- [0007: TLS termination and certificate renewal](0007-tls.md)
 
 ## Roadmap
 
@@ -61,7 +62,8 @@ Phase 0: a production server mode
 - [x] Redis fleet mode under `serve`, behind `serve-redis` (0006)
 - [ ] Configuration reload without restart
 - [x] Separately bound, optionally token-protected `/metrics`, stats and probes (0005)
-- [ ] TLS termination
+- [x] TLS termination with renewal on file change (0007)
+- [ ] Mutual TLS and certificate-derived identity
 - [ ] OpenTelemetry traces and metrics
 - [ ] Helm chart, signed images, SBOM
 - [ ] Reproducible benchmark and an outage-survival test

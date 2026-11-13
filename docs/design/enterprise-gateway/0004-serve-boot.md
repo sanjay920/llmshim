@@ -1,7 +1,7 @@
 # 0004: `llmshim serve` runs the gateway from a file
 
-Status: implemented. A single instance is described here, fleet mode in 0006;
-reload and TLS are not implemented.
+Status: implemented. A single instance is described here, fleet mode in 0006 and
+TLS in 0007; configuration reload is not implemented.
 
 ## What it does
 
@@ -57,7 +57,8 @@ server works.
 - Without an `[admin]` table, `/metrics`, `/ready`, `/health` and
   `/v1/gateway/stats` are on the main listener and unauthenticated, as under
   `gateway`. `[admin]` (0005) moves them to a listener of their own.
-- No TLS termination. Run behind a terminating proxy or service mesh.
+- TLS is optional (`[server.tls]`, 0007); without it the listener is plain HTTP and
+  belongs behind a terminating proxy or service mesh.
 - No reload. A change needs a restart; the parsed configuration is immutable so
   a swap can be added without touching the data plane.
 - Process-wide settings still read the environment where they are consumed:

@@ -680,7 +680,8 @@ only source of settings (it reads the environment solely to resolve
 `{ env = ... }` references). A `[fleet]` table (binary built with
 `--features serve-redis`) shares the queue, limits, spend and provider health
 through Redis; an `[admin]` table moves the operational endpoints to their own
-listener. Reload and TLS are not implemented. The feature is **unstable
+listener, and `[server.tls]` / `[admin.tls]` terminate TLS with the PEM files
+watched for renewal. Configuration reload and mutual TLS are not implemented. The feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,
 `gateway` and `gateway-redis` builds must not change; `tests/unit_serve_cli.rs`
 pins that a build without the feature does not know the command. Never drive

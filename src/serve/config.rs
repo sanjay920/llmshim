@@ -129,6 +129,10 @@ pub struct Server {
     /// is refused unless this is set.
     #[serde(default)]
     pub allow_unauthenticated: bool,
+    /// Terminate TLS on the main listener. Without it the listener is plain
+    /// HTTP and belongs behind a terminating proxy or service mesh.
+    #[serde(default)]
+    pub tls: Option<Tls>,
 }
 
 impl Default for Server {
@@ -137,8 +141,30 @@ impl Default for Server {
             host: default_host(),
             port: default_port(),
             allow_unauthenticated: false,
+            tls: None,
         }
     }
+}
+
+/// Server certificate and key, as PEM files. The files are watched: when either
+/// changes (a certificate manager renewed it) new connections use the new
+/// material without a restart. A replacement that does not load is ignored and
+/// the previous certificate stays in service.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Tls {
+    /// PEM certificate chain, leaf first.
+    pub cert_file: PathBuf,
+    /// PEM private key (PKCS#8, PKCS#1 or SEC1).
+    pub key_file: PathBuf,
+    /// How often to look for changed files, in seconds. Defaults to 30.
+    #[serde(default)]
+    pub reload_interval_secs: Option<u64>,
+}
+
+impl Tls {
+    pub const DEFAULT_RELOAD_INTERVAL_SECS: u64 = 30;
 }
 
 fn default_host() -> String {
@@ -175,6 +201,9 @@ pub struct Admin {
     /// network.
     #[serde(default)]
     pub token: Option<SecretRef>,
+    /// Terminate TLS on the admin listener as well.
+    #[serde(default)]
+    pub tls: Option<Tls>,
 }
 
 /// Where the server keeps what it must remember between requests.
@@ -483,7 +512,38 @@ impl ServeConfig {
         }
     }
 
+    fn validate_tls(tls: &Tls, at: &str, issues: &mut Vec<Issue>) {
+        for (field, path) in [("cert_file", &tls.cert_file), ("key_file", &tls.key_file)] {
+            if !path.has_root() {
+                issues.push(Issue::new(
+                    format!("{at}.{field}"),
+                    "must be an absolute path",
+                ));
+            }
+        }
+        if tls.cert_file == tls.key_file {
+            issues.push(Issue::new(
+                format!("{at}.key_file"),
+                "must be a different file from cert_file",
+            ));
+        }
+        if let Some(seconds) = tls.reload_interval_secs {
+            if !(1..=86_400).contains(&seconds) {
+                issues.push(Issue::new(
+                    format!("{at}.reload_interval_secs"),
+                    "must be between 1 and 86400",
+                ));
+            }
+        }
+    }
+
     fn validate_admin(&self, issues: &mut Vec<Issue>) {
+        if let Some(tls) = &self.server.tls {
+            Self::validate_tls(tls, "server.tls", issues);
+        }
+        if let Some(tls) = self.admin.as_ref().and_then(|admin| admin.tls.as_ref()) {
+            Self::validate_tls(tls, "admin.tls", issues);
+        }
         let Some(admin) = &self.admin else {
             return;
         };
@@ -1191,6 +1251,52 @@ mod tests {
         let pasted = MINIMAL.replace("OPENAI_API_KEY", "sk_live_AbCdEf123");
         let found = issues(&pasted);
         assert!(has(&found, "providers.openai.api_key.env"), "{found:?}");
+    }
+
+    #[test]
+    fn tls_settings_are_validated() {
+        let ok = format!(
+            "{MINIMAL}\n[server.tls]\ncert_file = \"/etc/tls/tls.crt\"\nkey_file = \"/etc/tls/tls.key\"\nreload_interval_secs = 5"
+        );
+        let config = ServeConfig::parse(&ok, Format::Toml).unwrap();
+        assert_eq!(
+            config.server.tls.as_ref().unwrap().reload_interval_secs,
+            Some(5)
+        );
+        for (bad, path) in [
+            (
+                "cert_file = \"tls.crt\"\nkey_file = \"/k\"",
+                "server.tls.cert_file",
+            ),
+            (
+                "cert_file = \"/c\"\nkey_file = \"key\"",
+                "server.tls.key_file",
+            ),
+            (
+                "cert_file = \"/same\"\nkey_file = \"/same\"",
+                "server.tls.key_file",
+            ),
+            (
+                "cert_file = \"/c\"\nkey_file = \"/k\"\nreload_interval_secs = 0",
+                "server.tls.reload_interval_secs",
+            ),
+            (
+                "cert_file = \"/c\"\nkey_file = \"/k\"\nreload_interval_secs = 90000",
+                "server.tls.reload_interval_secs",
+            ),
+        ] {
+            let found = issues(&format!("{MINIMAL}\n[server.tls]\n{bad}"));
+            assert!(has(&found, path), "{bad}: {found:?}");
+        }
+        // The admin listener has its own table, validated the same way.
+        let admin = format!(
+            "{MINIMAL}\n[admin]\nport = 9090\n[admin.tls]\ncert_file = \"rel\"\nkey_file = \"/k\""
+        );
+        assert!(has(&issues(&admin), "admin.tls.cert_file"));
+        // A private key is never an inline value.
+        let inline =
+            format!("{MINIMAL}\n[server.tls]\ncert_file = \"/c\"\nkey_file = \"/k\"\nkey = \"x\"");
+        assert!(issues(&inline)[0].contains("unknown field"));
     }
 
     #[test]

@@ -6,6 +6,12 @@ version = 1
 host = "0.0.0.0"
 port = 3000
 
+# Terminate TLS here. The files are watched, so a renewed certificate is served
+# without a restart. Without this table the listener is plain HTTP.
+[server.tls]
+cert_file = "/etc/llmshim/tls/tls.crt"
+key_file = "/etc/llmshim/tls/tls.key"
+
 # The table name is the routing prefix: "openai/gpt-6-sol".
 [providers.openai]
 kind = "openai"
