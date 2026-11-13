@@ -1,0 +1,29 @@
+name: Helm chart
+
+# The chart is rendered, checked against the Kubernetes schemas, and each
+# rendered gateway configuration is fed back through `llmshim serve --check`, so
+# the chart and the server cannot drift apart.
+on:
+  pull_request:
+    paths:
+      - deploy/**
+      - src/serve/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/helm-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  helm-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the server with fleet mode
+        run: cargo build --locked --features serve-redis
+      - name: Validate the chart
+        env:
+          LLMSHIM_BIN: target/debug/llmshim
+        run: deploy/helm/validate.sh

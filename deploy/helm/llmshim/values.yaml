@@ -1,0 +1,108 @@
+# llmshim enterprise gateway (`llmshim serve`). In development: it follows the
+# unstable `serve` feature and its configuration contract, and may change.
+
+replicaCount: 2
+
+image:
+  # No public image is published yet. Build one with
+  #   docker build --build-arg FEATURES=serve-redis -t <registry>/llmshim:<tag> .
+  # (serve-redis includes fleet mode; use FEATURES=serve for a single instance.)
+  repository: llmshim
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Environment variables for every secret the configuration refers to, taken
+# from one Secret you create. Its keys are exported under their own names, and
+# the configuration names them: provider keys (`api_key = { env = "..." }`),
+# caller keys, the admin token and the Redis URL. The chart never creates it.
+existingSecret: ""
+
+server:
+  port: 3000
+  # Terminate TLS in the pod from a kubernetes.io/tls Secret (tls.crt, tls.key).
+  # A renewed Secret is picked up without a restart; the kubelet refreshes the
+  # mounted files and the server reloads them.
+  tls:
+    enabled: false
+    secretName: ""
+    reloadIntervalSecs: 30
+
+admin:
+  # /metrics, /v1/gateway/stats, /health and /ready on their own port. Probes
+  # use it. The kubelet reaches it over the pod network, so it binds all
+  # interfaces; restrict it with the NetworkPolicy below or the service mesh.
+  port: 9090
+  # Name of the environment variable (from existingSecret) holding a bearer
+  # token that /metrics and stats require. Empty leaves the port open to
+  # whatever can reach it.
+  tokenEnv: ""
+
+fleet:
+  # Share the queue, limits, spend ledger and provider health between replicas
+  # through Redis. Needs an image built with FEATURES=serve-redis.
+  enabled: false
+  redisUrlEnv: REDIS_URL   # name of the variable in existingSecret
+
+state:
+  # Replay receipts. emptyDir loses them on rescheduling; a client that replays
+  # through another replica then gets an error. Use a ReadWriteMany claim, or
+  # sticky routing, if clients depend on receipts.
+  receiptsClaimName: ""
+  idempotencyTtlSecs: 300
+
+# The rest of the gateway configuration, in TOML, appended after the sections
+# the chart writes from the values above ([server], [admin], [fleet], [state]).
+# Providers, caller keys, limits and routes go here. See
+# docs/design/enterprise-gateway/example.toml for every setting.
+config: |
+  [providers.openai]
+  kind = "openai"
+  api_key = { env = "OPENAI_API_KEY" }
+
+  [[keys]]
+  name = "example"
+  tenant = "example"
+  secret = { env = "EXAMPLE_GATEWAY_KEY" }
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+# Allow traffic to the gateway port from these peers, and to the admin port only
+# from the monitoring namespace. Empty selectors allow nothing extra.
+networkPolicy:
+  enabled: false
+  gatewayFrom: []        # list of NetworkPolicyPeer
+  adminFrom: []          # list of NetworkPolicyPeer
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+terminationGracePeriodSeconds: 60

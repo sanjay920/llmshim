@@ -1,0 +1,9 @@
+apiVersion: v2
+name: llmshim
+description: llmshim enterprise gateway (llmshim serve) on Kubernetes
+type: application
+# Chart version moves with the chart; appVersion is the llmshim release it was
+# written against. The chart is in development with the `serve` feature.
+version: 0.1.0
+appVersion: "0.31.0"
+kubeVersion: ">=1.25.0-0"

@@ -1,0 +1,137 @@
+{{- if and .Values.server.tls.enabled (not .Values.server.tls.secretName) }}
+{{- fail "server.tls.secretName is required when server.tls.enabled is true" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "llmshim.fullname" . }}
+  labels:
+    {{- include "llmshim.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "llmshim.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      annotations:
+        # A changed configuration rolls the pods; the gateway has no reload.
+        checksum/config: {{ include "llmshim.config" . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "llmshim.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "llmshim.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: llmshim
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--config", "/etc/llmshim/gateway.toml"]
+          env:
+            # Use the model catalog compiled into the image; never fetch one at
+            # runtime. Everything else comes from the mounted configuration.
+            - name: LLMSHIM_CATALOG_OFFLINE
+              value: "1"
+          {{- if .Values.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          {{- end }}
+          ports:
+            - name: gateway
+              containerPort: {{ .Values.server.port }}
+            - name: admin
+              containerPort: {{ .Values.admin.port }}
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: admin
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/llmshim
+              readOnly: true
+            - name: receipts
+              mountPath: /var/lib/llmshim/receipts
+            {{- if .Values.server.tls.enabled }}
+            - name: tls
+              mountPath: /etc/llmshim/tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "llmshim.fullname" . }}
+        - name: receipts
+          {{- if .Values.state.receiptsClaimName }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.state.receiptsClaimName }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.server.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.server.tls.secretName }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
