@@ -21,6 +21,9 @@ gateway-redis = ["gateway", "redis-coordination"]
 # Opt-in distributed rate-limit coordination via Redis. Keeps the default proxy
 # binary lean — redis is only pulled in when this feature is explicitly enabled.
 redis-coordination = ["proxy", "dep:redis"]
+# In development: a config-file-driven server (`llmshim serve`). Off by default
+# and implied by no other feature; see docs/design/enterprise-gateway.
+serve = ["gateway"]
 
 # Cloud transport dependencies are opt-in for library consumers and bundled binaries.
 bedrock = [

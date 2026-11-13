@@ -41,6 +41,9 @@ pub mod proxy;
 #[cfg(feature = "gateway")]
 pub mod gateway;
 
+#[cfg(feature = "serve")]
+pub mod serve;
+
 use client::ShimClient;
 use error::Result;
 pub use fallback::{completion_with_fallback, completion_with_fallback_and_policy, FallbackConfig};

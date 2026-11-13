@@ -1,0 +1,52 @@
+# Example server configuration for `llmshim serve --config`.
+# Validate with: llmshim serve --config example.toml --check
+version = 1
+
+[server]
+host = "0.0.0.0"
+port = 3000
+
+# The table name is the routing prefix: "openai/gpt-6-sol".
+[providers.openai]
+kind = "openai"
+api_key = { env = "OPENAI_API_KEY" }
+
+[providers.anthropic]
+kind = "anthropic"
+api_key = { file = "/run/secrets/anthropic-api-key" }
+
+# A self-hosted OpenAI-compatible server. The key is optional.
+[providers.local]
+kind = "openai-compatible"
+base_url = "http://inference.internal.example:8000/v1"
+
+[limits]
+max_concurrency = 256
+queue_timeout_ms = 5000
+rpm = 600
+
+[limits.providers.openai]
+rpm = 3000
+tpm = 2000000
+
+# Callers. Either reference the bearer token, or give only its SHA-256 so the
+# deployment holds no caller secret. Generate a token and its digest with:
+#   openssl rand -hex 32 | tee token.txt | tr -d '\n' | shasum -a 256
+# The digest below is of random bytes; replace it with your own.
+[[keys]]
+name = "checkout-service"
+tenant = "payments"
+tier = 2
+secret = { env = "CHECKOUT_GATEWAY_KEY" }
+rpm = 1200
+budget_usd = 250.0
+budget_window_secs = 86400
+
+[[keys]]
+name = "batch-jobs"
+tenant = "analytics"
+sha256 = "87ef19fa6c094740371b20b400a8ebb1c3df48a413957f0bb3df39ba245337ba"
+
+[routes.summarize]
+model = "anthropic/claude-haiku-5-5"
+settings = { reasoning_effort = "low", max_tokens = 4096 }

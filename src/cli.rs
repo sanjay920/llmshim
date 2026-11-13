@@ -4,6 +4,14 @@ pub(crate) struct Options {
     pub help: bool,
     #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
     pub server: ServerOptions,
+    #[cfg(feature = "serve")]
+    pub serve: ServeOptions,
+}
+#[cfg(feature = "serve")]
+#[derive(Debug, Default)]
+pub(crate) struct ServeOptions {
+    pub config: Option<String>,
+    pub check: bool,
 }
 #[derive(Debug, Default)]
 pub(crate) struct ServerOptions {
@@ -83,6 +91,28 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, String> {
                 return Err("--managed selects its own loopback port and cannot be combined with --host or --port".into());
             }
         }
+        #[cfg(feature = "serve")]
+        "serve" => {
+            let mut at = 0;
+            while at < tail.len() {
+                let arg = tail[at].as_str();
+                match arg {
+                    "--help" | "-h" => options.help = true,
+                    "--check" => options.serve.check = true,
+                    "--config" | "-c" => {
+                        options.serve.config = Some(value(tail, &mut at, arg)?.into())
+                    }
+                    _ if arg.starts_with("--config=") && arg.len() > 9 => {
+                        options.serve.config = Some(arg[9..].into())
+                    }
+                    _ => return Err(format!("unknown argument for serve: {arg}")),
+                }
+                at += 1;
+            }
+            if !options.help && options.serve.config.is_none() {
+                return Err("serve requires --config <PATH>".into());
+            }
+        }
         "chat" => {
             let mut at = 0;
             while at < tail.len() {
@@ -153,6 +183,8 @@ pub(crate) fn usage(command: &str) -> Option<&'static str> {
     Some(match command {
         "proxy"=>"Usage: llmshim proxy [--host <IP>] [--port <PORT>]\n\nCLI options override LLMSHIM_HOST/LLMSHIM_PORT and saved configuration.\n  -h, --help  Print help without starting the server",
         "gateway"=>"Usage: llmshim gateway [--host <IP>] [--port <PORT>]\n\nCLI options override LLMSHIM_HOST/LLMSHIM_PORT and saved configuration.\n  -h, --help  Print help without starting the server",
+        #[cfg(feature = "serve")]
+        "serve"=>"Usage: llmshim serve --config <PATH> [--check]\n\nIn development. Reads a versioned .toml or .json server configuration.\n  --check     Validate the file and its secret references, then exit\n  -h, --help  Print help without starting the server",
         "chat"=>"Usage: llmshim chat [--log <PATH>]",
         "models"=>"Usage: llmshim models [--all] [--json] [--refresh]",
         "get"=>"Usage: llmshim get <key>",
