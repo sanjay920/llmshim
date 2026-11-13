@@ -12,6 +12,7 @@ fleet:
   enabled: true
 logging:
   accessLog: stdout
+  usageLog: stdout
 state:
   receiptsClaimName: llmshim-receipts
 autoscaling:

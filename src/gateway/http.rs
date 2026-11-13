@@ -217,6 +217,8 @@ pub(crate) struct LocalParts {
     pub idempotency_ttl_secs: u64,
     /// Finished attempts the spend ledger keeps for late settlement.
     pub max_retained_accounting_attempts: usize,
+    /// Receives one record per provider attempt that ends.
+    pub usage: Option<crate::gateway::usage::UsageSetup>,
 }
 
 /// Everything the fleet (Redis-backed) gateway state is built from.
@@ -230,6 +232,7 @@ pub(crate) struct DistributedParts {
     pub keystore: crate::gateway::auth::KeyStore,
     pub idempotency_ttl_secs: u64,
     pub max_retained_accounting_attempts: usize,
+    pub usage: Option<crate::gateway::usage::UsageSetup>,
 }
 
 impl LocalParts {
@@ -252,6 +255,7 @@ impl LocalParts {
                 crate::gateway::attempt::retained_accounting_attempt_limit_from(&|key| {
                     std::env::var(key).ok()
                 }),
+            usage: None,
         }
     }
 }
@@ -280,6 +284,7 @@ impl GatewayState {
             keystore,
             idempotency_ttl_secs,
             max_retained_accounting_attempts,
+            usage,
         } = parts;
         // Same fleet-wide provider health the proxy uses.
         let router = Arc::new(router.with_breaker(breaker));
@@ -294,6 +299,9 @@ impl GatewayState {
             config.max_wait,
             max_retained_accounting_attempts,
         );
+        if let Some(setup) = usage {
+            attempt_coordinator.set_usage_sink(setup);
+        }
         Arc::new(Self {
             router,
             backend: Backend::Local(scheduler),
@@ -343,6 +351,7 @@ impl GatewayState {
                     crate::gateway::attempt::retained_accounting_attempt_limit_from(&|key| {
                         std::env::var(key).ok()
                     }),
+                usage: None,
             },
         )
         .await
@@ -368,6 +377,7 @@ impl GatewayState {
             keystore,
             idempotency_ttl_secs,
             max_retained_accounting_attempts,
+            usage,
         } = parts;
         let router = Arc::new(router.with_breaker(breaker));
         let dispatch = Arc::new(RealDispatch {
@@ -383,6 +393,9 @@ impl GatewayState {
                 max_retained_accounting_attempts,
             )
             .map_err(|error| error.to_string())?;
+        if let Some(setup) = usage {
+            attempt_coordinator.set_usage_sink(setup);
+        }
         let gateway = crate::gateway::distributed::DistributedGateway::connect_with_tuning(
             redis_url,
             dispatch,

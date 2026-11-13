@@ -682,7 +682,10 @@ only source of settings (it reads the environment solely to resolve
 through Redis; an `[admin]` table moves the operational endpoints to their own
 listener, and `[server.tls]` / `[admin.tls]` terminate TLS with the PEM files
 watched for renewal, and `[logging] access_log` writes a tenant-attributed JSON
-line per request (never a token, query or body). `deploy/helm/llmshim` deploys it (`deploy/helm/validate.sh`
+line per request (never a token, query or body); `[logging] usage_log` writes one
+per provider attempt with tokens and USD cost (`null` cost = unknown, never
+free). The fleet job scope carries only a hash of the tenant, and a test pins
+that names stay out of Redis; each replica names tenants from its own config. `deploy/helm/llmshim` deploys it (`deploy/helm/validate.sh`
 checks the chart and feeds each rendered config back through `serve --check`).
 Configuration reload and mutual TLS are not implemented. The feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,

@@ -14,6 +14,7 @@
 mod access_log;
 pub mod build;
 pub mod config;
+mod jsonl;
 pub mod keys;
 
 pub use build::{build_app, Built};

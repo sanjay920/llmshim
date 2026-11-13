@@ -59,11 +59,9 @@ appended to; opening it happens at startup, so an unwritable path exits 1 with
 
 ## Not done
 
-- **Token and cost per request.** Usage and cost are known inside the gateway at
-  the attempt level (retries and fallbacks are separate charges), and the job
-  scope that crosses Redis in fleet mode carries a hash of the tenant, not its
-  name. Attributing tokens and cost to a tenant needs a change to that job
-  format, so it gets its own design note before any code.
+- **Token and cost per tenant.** See 0010 (`usage_log`): per attempt, because a
+  retry or a fallback is a separate charge, and made possible by carrying the
+  tenant's name in the fleet job scope.
 - **Rotation.** Use `copytruncate`, or log to `stdout` and let the platform
   collect and rotate it. A reopen-on-signal is a later item.
 - **Remote address and TLS client details.** The listener does not yet pass the

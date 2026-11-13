@@ -49,6 +49,9 @@ logging:
   # collect (tenant, status, latency, request id, credential fingerprint).
   # Empty turns it off.
   accessLog: ""
+  # "stdout" also writes one usage line per provider attempt: tenant, model,
+  # tokens and USD cost, for showback and chargeback. Empty turns it off.
+  usageLog: ""
 
 state:
   # Replay receipts. emptyDir loses them on rescheduling; a client that replays
