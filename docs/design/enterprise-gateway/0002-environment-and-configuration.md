@@ -66,6 +66,9 @@ Still read from the environment, to convert before `serve` can boot:
 | `LLMSHIM_GATEWAY_IDEMPOTENCY_TTL_SECS` | `distributed_from_env` | Single-instance mode carries it in `LocalParts`; the distributed path still reads it from the environment. |
 | `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`, `LLMSHIM_UPSTREAM_*`, `LLMSHIM_HTTP_*` | shared HTTP client | Process-wide, initialized once. Needs a per-router client before it can come from a file. |
 | `LLMSHIM_MAX_CONCURRENCY`, `LLMSHIM_QUEUE_TIMEOUT_MS` | `Backpressure::from_env` | Proxy only; `Backpressure::new` already takes values. |
+| `LLMSHIM_HTTP_MAX_CONNECTIONS`, `LLMSHIM_HTTP_HEADER_TIMEOUT_MS` | `http_server` | Inbound listener limits; read by the proxy and gateway entry points. |
+| `LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS` | shared HTTP client deadlines | Process-wide, with the `LLMSHIM_UPSTREAM_*` timeouts above. |
+| `LLMSHIM_NO_STRICT`, `LLMSHIM_NO_SCHEMA_NORMALIZATION`, `LLMSHIM_NO_SCHEMA_CACHE` | schema normalization | Debugging bypasses; process-wide, read at use. A deployment that sets them changes what the server sends upstream, so `serve` documents them as unsupported settings. |
 | Distributed-mode limits | `gateway/distributed*` | Converted with fleet support. |
 
 ## Quirks found and preserved
