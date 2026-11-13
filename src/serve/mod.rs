@@ -17,7 +17,9 @@ pub mod config;
 mod jsonl;
 pub mod keys;
 pub mod mtls;
+pub mod reload;
 
 pub use build::{build_app, Built};
-pub use config::{Format, Issue, ServeConfig};
+pub use config::{Format, Issue, Loaded, ServeConfig};
 pub use keys::build_key_store;
+pub use reload::{Outcome, ReloadHandles, ReloadStatus, Reloader};

@@ -25,7 +25,7 @@ Each step must be correct, tested and reversible before the next begins.
    echo a secret.
 5. **No process-global shortcuts.** `serve` never sets environment variables to
    drive `from_env` constructors, and never calls `process::exit` below `main`.
-   Configuration is an immutable value that can later be swapped for hot reload
+   Configuration is an immutable value; a reload swaps the caller keys (0012)
    while rate buckets, the spend ledger, breakers and queues survive.
 6. **llmshim does not learn harness vocabulary.** Names of teams, routes, tags
    and policies are opaque.
@@ -45,6 +45,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0009: The access log](0009-access-log.md)
 - [0010: Usage and cost records per tenant](0010-usage-records.md)
 - [0011: Mutual TLS and certificate-derived identity](0011-mutual-tls.md)
+- [0012: Reloading caller keys without a restart](0012-key-reload.md)
 
 ## Roadmap
 
@@ -64,7 +65,8 @@ Phase 0: a production server mode
 - [ ] Bedrock, Vertex and Azure configurable from the file; a provider whose
       feature is not compiled is a startup error naming the rebuild flag
 - [x] Redis fleet mode under `serve`, behind `serve-redis` (0006)
-- [ ] Configuration reload without restart
+- [x] Caller keys reload without a restart: SIGHUP and a watched file (0012)
+- [ ] Reload of everything else (providers, routes, limits)
 - [x] Separately bound, optionally token-protected `/metrics`, stats and probes (0005)
 - [x] TLS termination with renewal on file change (0007)
 - [x] Mutual TLS and certificate-derived identity (0011)

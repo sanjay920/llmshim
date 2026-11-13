@@ -30,8 +30,10 @@ port therefore cannot disagree.
   or store a credential.
 - **TLS from a `kubernetes.io/tls` Secret**, mounted read-only. A renewed Secret
   updates the mounted files and the server reloads them (0007); no rollout.
-- **A configuration change rolls the pods** (a checksum annotation). The server
-  has no reload, so a rolling update is how settings change. `maxUnavailable: 0`
+- **A configuration change rolls the pods** (a checksum annotation). Keys can
+  reload in place (0012), but the chart's secrets are environment variables,
+  which a running process cannot see change, so a rolling update is how settings
+  change. `maxUnavailable: 0`
   keeps capacity during it, and a PodDisruptionBudget guards voluntary
   disruption.
 - **Hardened pod:** non-root (65532, matching the distroless image),

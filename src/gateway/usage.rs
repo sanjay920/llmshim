@@ -76,7 +76,41 @@ pub trait UsageSink: Send + Sync {
 /// configuration, so they agree; a tenant a replica does not know is `None`.
 pub struct UsageSetup {
     pub sink: Arc<dyn UsageSink>,
-    pub tenants: Vec<String>,
+    pub tenants: TenantNames,
+}
+
+/// Tenant names by the hash a policy scope carries.
+///
+/// Clones share one table, so a configuration reload that adds a tenant makes
+/// its name resolvable for every holder at once. The table only grows: a name
+/// is a label on a record, not a permission, and an attempt that was admitted
+/// under a tenant a later reload removed (or one queued on another replica that
+/// has not reloaded yet) is still better named than left blank.
+#[derive(Clone, Default)]
+pub struct TenantNames(Arc<std::sync::RwLock<HashMap<String, String>>>);
+
+impl TenantNames {
+    pub fn new(tenants: impl IntoIterator<Item = String>) -> Self {
+        let names = Self::default();
+        names.add(tenants);
+        names
+    }
+
+    /// Make more tenants resolvable. Names already known stay known.
+    pub fn add(&self, tenants: impl IntoIterator<Item = String>) {
+        let mut table = self.0.write().unwrap_or_else(|p| p.into_inner());
+        for tenant in tenants {
+            table.insert(UsageSetup::tenant_key(&tenant), tenant);
+        }
+    }
+
+    pub(crate) fn name(&self, key: &str) -> Option<String> {
+        self.0
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .cloned()
+    }
 }
 
 impl UsageSetup {
@@ -99,8 +133,7 @@ struct Open {
 /// Tracks attempts in flight and emits one record when each ends.
 pub(crate) struct UsageRecorder {
     sink: Arc<dyn UsageSink>,
-    /// Tenant name by the hash a policy scope carries.
-    tenants: HashMap<String, String>,
+    tenants: TenantNames,
     open: Mutex<HashMap<uuid::Uuid, Open>>,
 }
 
@@ -108,11 +141,7 @@ impl UsageRecorder {
     pub(crate) fn new(setup: UsageSetup) -> Self {
         Self {
             sink: setup.sink,
-            tenants: setup
-                .tenants
-                .into_iter()
-                .map(|tenant| (UsageSetup::tenant_key(&tenant), tenant))
-                .collect(),
+            tenants: setup.tenants,
             open: Mutex::new(HashMap::new()),
         }
     }
@@ -121,7 +150,7 @@ impl UsageRecorder {
     /// from the policy scope.
     pub(crate) fn begin(&self, identity: &AttemptIdentity, tenant_key: &str) {
         let open = Open {
-            tenant: self.tenants.get(tenant_key).cloned(),
+            tenant: self.tenants.name(tenant_key),
             provider: identity.provider_name().to_owned(),
             model: identity.native_model().to_owned(),
             kind: kind_name(identity.kind()),
@@ -224,5 +253,33 @@ pub(crate) mod testing {
         fn record(&self, record: &UsageRecord) {
             self.0.lock().unwrap().push(record.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tenant_name_tests {
+    use super::*;
+
+    #[test]
+    fn tenant_names_are_shared_grow_only_and_hash_keyed() {
+        let names = TenantNames::new(["acme".to_string()]);
+        let clone = names.clone();
+        assert_eq!(
+            names.name(&UsageSetup::tenant_key("acme")).as_deref(),
+            Some("acme")
+        );
+        assert!(names.name(&UsageSetup::tenant_key("globex")).is_none());
+        // A name added through one handle resolves through the other.
+        clone.add(["globex".to_string()]);
+        assert_eq!(
+            names.name(&UsageSetup::tenant_key("globex")).as_deref(),
+            Some("globex")
+        );
+        // Adding more never forgets: an attempt admitted before a reload removed
+        // its tenant is still named when it ends.
+        clone.add(["initech".to_string()]);
+        assert!(names.name(&UsageSetup::tenant_key("acme")).is_some());
+        // The table is keyed by the hash, never by the name.
+        assert!(names.name("acme").is_none());
     }
 }

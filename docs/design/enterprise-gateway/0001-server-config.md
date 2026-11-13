@@ -77,7 +77,8 @@ without `--check`.
   their identity settings.
 - **Scheduler tuning** (aging, queue depth, leases, Redis). Added as the
   environment-free constructors land.
-- **Reload.** The parsed value is immutable so it can be swapped later.
+- **Reload.** The parsed value is immutable; `[[keys]]` reload without a restart
+  (0012) and everything else is fixed at start.
 
 ## Compatibility
 

@@ -156,3 +156,57 @@ pub async fn chat(server: &Server, key: Option<&str>, model: &str) -> reqwest::R
     }
     request.send().await.unwrap()
 }
+
+/// Ask the server to reload its configuration, as an operator's `kill -HUP` does.
+#[cfg(unix)]
+pub fn hangup(server: &Server) {
+    let status = Command::new("kill")
+        .args(["-HUP", &server.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Rewrite the configuration file the server started from.
+pub fn rewrite(server: &Server, config: &str) {
+    let path = server.dir.0.join("gateway.toml");
+    std::fs::write(
+        path,
+        config.replace("{DIR}", server.dir.0.to_str().unwrap()),
+    )
+    .unwrap();
+}
+
+/// What the admin listener says about reloads.
+pub async fn reload_status(server: &Server) -> serde_json::Value {
+    let admin = server.admin.clone().expect("a configuration with [admin]");
+    reqwest::Client::new()
+        .get(format!("{admin}/v1/serve/config"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Poll the reload status until `done` accepts it, or fail after 20 seconds.
+pub async fn wait_for_reload(
+    server: &Server,
+    what: &str,
+    done: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = reload_status(server).await;
+        if done(&status) {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}; last status: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

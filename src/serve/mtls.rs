@@ -11,14 +11,13 @@
 //! inbound request and then sets it only from the handshake. It runs outside
 //! everything else, so no handler and no log line sees a caller-supplied value.
 
-use crate::gateway::auth::PEER_SAN_HEADER;
+use crate::gateway::auth::{KeyStore, PEER_SAN_HEADER};
 use crate::serve::config::canonical_san;
 use axum::extract::Request;
 use axum::http::HeaderValue;
 use axum::middleware::Next;
 use axum::response::Response;
 use rustls::pki_types::CertificateDer;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// The names in a verified peer certificate, in canonical form: `dns:<lower-case
@@ -55,18 +54,16 @@ pub fn peer_sans(chain: &[CertificateDer<'_>]) -> Vec<String> {
 }
 
 /// Strip [`PEER_SAN_HEADER`] from the request, then set it to the first name of
-/// the connection's verified certificate that `known` contains. Without a
-/// certificate, or with no matching name, the header is simply absent.
-pub async fn bind_peer_identity(
-    known: Arc<HashSet<String>>,
-    mut request: Request,
-    next: Next,
-) -> Response {
+/// the connection's verified certificate that `keys` lists as a workload.
+/// Without a certificate, or with no matching name, the header is simply absent.
+/// `keys` is asked on every request, so a reload that adds or removes a workload
+/// takes effect on the next one, on connections already open.
+pub async fn bind_peer_identity(keys: Arc<KeyStore>, mut request: Request, next: Next) -> Response {
     request.headers_mut().remove(PEER_SAN_HEADER);
     let matched = request
         .extensions()
         .get::<PeerSans>()
-        .and_then(|peer| peer.0.iter().find(|name| known.contains(*name)).cloned());
+        .and_then(|peer| peer.0.iter().find(|name| keys.has_peer(name)).cloned());
     if let Some(name) = matched {
         // A name with characters a header cannot carry is not bound; the caller
         // is then unidentified, which fails closed.

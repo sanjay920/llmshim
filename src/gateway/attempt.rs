@@ -198,6 +198,26 @@ impl Bucket {
         self.tokens -= required;
     }
 
+    /// Follow a limit that changed since the bucket was made (a reloaded
+    /// configuration re-limited a tenant). Time so far is credited at the old
+    /// rate; a lowered limit takes effect at once by capping what is stored, and
+    /// a raised one refills at the new rate from what is there. A limit that did
+    /// not change leaves the bucket untouched.
+    fn retune(&mut self, per_minute: u32, now: Instant) {
+        let capacity = per_minute as f64;
+        if capacity == self.capacity {
+            return;
+        }
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_second).min(self.capacity);
+        self.last_refill = now;
+        self.capacity = capacity;
+        self.refill_per_second = capacity / 60.0;
+        self.tokens = self.tokens.min(capacity);
+    }
+
     fn penalize(&mut self, duration: Duration, now: Instant) {
         let deadline = now + duration;
         self.penalty_until = Some(self.penalty_until.map_or(deadline, |old| old.max(deadline)));
@@ -491,11 +511,11 @@ fn check_dimension(
     if limit == 0 {
         return Some(ZERO_LIMIT_RETRY_AFTER);
     }
-    buckets
+    let bucket = buckets
         .entry(key.to_owned())
-        .or_insert_with(|| Bucket::new(limit, now))
-        .check(required, now)
-        .err()
+        .or_insert_with(|| Bucket::new(limit, now));
+    bucket.retune(limit, now);
+    bucket.check(required, now).err()
 }
 
 fn debit_dimension(
@@ -1965,6 +1985,73 @@ mod tests {
             })
             .copied()
             .unwrap_or_default()
+    }
+
+    /// How many requests a tenant gets through before its bucket refuses one.
+    async fn admitted_before_refusal(rates: &LocalAttemptRates, tenant: &str, rpm: u32) -> usize {
+        let mut admitted = 0;
+        for _ in 0..(rpm as usize + 3) {
+            match rates
+                .acquire(
+                    "provider",
+                    &scope(tenant, Some(rpm), None),
+                    1,
+                    uuid::Uuid::new_v4(),
+                    None,
+                )
+                .await
+            {
+                Ok(()) => admitted += 1,
+                Err(_) => break,
+            }
+        }
+        admitted
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_tenant_limit_applies_to_the_bucket_that_already_exists() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        // Created at 6 per minute, and used once.
+        assert_eq!(admitted_before_refusal(&rates, "relimited", 6).await, 6);
+
+        // Lowered: the bucket is refused at once, not after the old burst. (It
+        // is empty here, so this is also a refusal at the old limit, which is
+        // the point: lowering never grants.)
+        assert_eq!(admitted_before_refusal(&rates, "relimited", 2).await, 0);
+
+        // Time passes and the bucket refills, capped at the lowered limit.
+        tokio::time::advance(Duration::from_secs(600)).await;
+        assert_eq!(admitted_before_refusal(&rates, "relimited", 2).await, 2);
+
+        // Raised: nothing is granted at once (the time so far was earned at the
+        // old rate), but from now on the bucket refills at the new one. Thirty
+        // seconds at 60 per minute is 30 requests, where 2 per minute earned 1.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(admitted_before_refusal(&rates, "relimited", 60).await, 2);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(admitted_before_refusal(&rates, "relimited", 60).await, 30);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lowered_tenant_limit_caps_the_burst_the_bucket_had_saved() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        // One request at 60 per minute leaves 59 unspent.
+        assert_eq!(admitted_before_refusal(&rates, "trimmed", 60).await, 60);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(admitted_before_refusal(&rates, "trimmed", 60).await, 60);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        // Lowered to 5: the 30 saved requests are not honoured.
+        assert_eq!(admitted_before_refusal(&rates, "trimmed", 5).await, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_tenant_limit_leaves_the_bucket_alone() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        assert_eq!(admitted_before_refusal(&rates, "steady", 4).await, 4);
+        // Asking again with the same limit neither refills nor resets.
+        assert_eq!(admitted_before_refusal(&rates, "steady", 4).await, 0);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert_eq!(admitted_before_refusal(&rates, "steady", 4).await, 1);
     }
 
     #[tokio::test]
@@ -4333,7 +4420,9 @@ mod usage_records {
         let collected = Arc::new(Collected::default());
         coordinator.set_usage_sink(crate::gateway::usage::UsageSetup {
             sink: collected.clone(),
-            tenants: KNOWN.iter().map(|tenant| tenant.to_string()).collect(),
+            tenants: crate::gateway::usage::TenantNames::new(
+                KNOWN.iter().map(|tenant| tenant.to_string()),
+            ),
         });
         (coordinator, collected)
     }

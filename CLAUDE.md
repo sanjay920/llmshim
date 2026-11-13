@@ -690,7 +690,12 @@ per provider attempt with tokens and USD cost (`null` cost = unknown, never
 free). The fleet job scope carries only a hash of the tenant, and a test pins
 that names stay out of Redis; each replica names tenants from its own config. `deploy/helm/llmshim` deploys it (`deploy/helm/validate.sh`
 checks the chart and feeds each rendered config back through `serve --check`).
-Configuration reload is not implemented. The feature is **unstable
+Only `[[keys]]` reload without a restart (`SIGHUP`, plus a watched file; design note 0012): the
+reload is all-or-nothing, refuses a change to anything else by path, swaps one `LiveKeys`
+handle that the gateway, the access log and the client-certificate binding share, and
+reports its outcome on the admin listener's `/v1/serve/config`. Rate buckets and spend
+windows survive it, and a changed local per-tenant `rpm` is retuned on the existing bucket.
+The feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,
 `gateway` and `gateway-redis` builds must not change; `tests/unit_serve_cli.rs`
 pins that a build without the feature does not know the command. Never drive
