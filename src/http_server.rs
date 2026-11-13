@@ -203,41 +203,87 @@ async fn serve_with_limits(
     shutdown: impl Future<Output = ()> + Send + 'static,
     limits: HttpServerLimits,
 ) -> Result<(), String> {
-    let limited_listener = LimitedListener {
+    let mut server =
+        axum_server::Server::<ConnectionAddress>::from_listener(limited_listener(listener, limits));
+    harden(server.http_builder(), limits);
+    let handle = axum_server::Handle::<ConnectionAddress>::new();
+    let application = application.layer(axum::middleware::from_fn(mark_first_headers));
+    let running = server
+        .handle(handle.clone())
+        .serve(application.into_make_service_with_connect_info::<FirstHeadersReceived>());
+    drive(running, handle, shutdown).await
+}
+
+/// [`serve`] over TLS: the same connection limits and header deadline, with the
+/// handshake inside the first-headers window. `tls` can be reloaded while the
+/// server runs; connections already open keep the certificate they started with.
+#[cfg(feature = "serve")]
+pub(crate) async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    application: axum::Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    tls: axum_server::tls_rustls::RustlsConfig,
+) -> Result<(), String> {
+    let limits = HttpServerLimits::from_env();
+    let acceptor =
+        axum_server::tls_rustls::RustlsAcceptor::new(tls).handshake_timeout(limits.header_timeout);
+    let mut server =
+        axum_server::Server::<ConnectionAddress>::from_listener(limited_listener(listener, limits))
+            .acceptor(acceptor);
+    harden(server.http_builder(), limits);
+    let handle = axum_server::Handle::<ConnectionAddress>::new();
+    let application = application.layer(axum::middleware::from_fn(mark_first_headers));
+    let running = server
+        .handle(handle.clone())
+        .serve(application.into_make_service_with_connect_info::<FirstHeadersReceived>());
+    drive(running, handle, shutdown).await
+}
+
+fn limited_listener(
+    listener: tokio::net::TcpListener,
+    limits: HttpServerLimits,
+) -> LimitedListener {
+    LimitedListener {
         listener,
         connection_permits: Arc::new(Semaphore::new(limits.maximum_connections)),
         header_timeout: limits.header_timeout,
-    };
-    let mut server = axum_server::Server::<ConnectionAddress>::from_listener(limited_listener);
-    server
-        .http_builder()
+    }
+}
+
+fn harden(
+    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
+    limits: HttpServerLimits,
+) {
+    builder
         .http1()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(Some(limits.header_timeout))
         .max_headers(MAX_HEADER_COUNT)
         .max_buf_size(MAX_HEADER_BYTES);
-    server
-        .http_builder()
+    builder
         .http2()
         .timer(hyper_util::rt::TokioTimer::new())
         .max_concurrent_streams(MAX_HTTP2_STREAMS)
         .max_header_list_size(MAX_HEADER_BYTES as u32)
         .keep_alive_interval(Some(Duration::from_secs(30)))
         .keep_alive_timeout(Duration::from_secs(10));
-    let shutdown_handle = axum_server::Handle::<ConnectionAddress>::new();
-    let application = application.layer(axum::middleware::from_fn(mark_first_headers));
-    let server_future = server
-        .handle(shutdown_handle.clone())
-        .serve(application.into_make_service_with_connect_info::<FirstHeadersReceived>());
-    tokio::pin!(server_future);
-    let server_result = tokio::select! {
-        server_result = &mut server_future => server_result,
+}
+
+/// Run until the server stops or `shutdown` resolves, then drain gracefully.
+async fn drive(
+    running: impl Future<Output = std::io::Result<()>>,
+    handle: axum_server::Handle<ConnectionAddress>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), String> {
+    tokio::pin!(running);
+    let result = tokio::select! {
+        result = &mut running => result,
         _ = shutdown => {
-            shutdown_handle.graceful_shutdown(None);
-            server_future.await
+            handle.graceful_shutdown(None);
+            running.await
         }
     };
-    server_result.map_err(|error| format!("server failed: {error}"))
+    result.map_err(|error| format!("server failed: {error}"))
 }
 
 #[cfg(test)]

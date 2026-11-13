@@ -172,9 +172,19 @@ pub async fn chat(server: &Server, key: Option<&str>, model: &str) -> reqwest::R
 /// Run `serve` to its end. A regression that starts serving would never end,
 /// so the wait is bounded and the process killed instead of hanging CI.
 pub fn run_to_exit(config_path: &std::path::Path, env: &[(&str, &str)]) -> (Option<i32>, String) {
+    run_with_args(config_path, &[], env)
+}
+
+/// [`run_to_exit`] with extra command-line arguments (`--check`, say).
+pub fn run_with_args(
+    config_path: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (Option<i32>, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_llmshim"));
     command
         .args(["serve", "--config", config_path.to_str().unwrap()])
+        .args(args)
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
