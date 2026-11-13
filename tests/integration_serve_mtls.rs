@@ -300,6 +300,51 @@ async fn a_bearer_token_decides_alone_and_a_certificate_never_rescues_a_wrong_on
     );
 }
 
+#[tokio::test]
+async fn a_replaced_client_ca_takes_effect_without_a_restart() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .expect(2)
+        .create_async()
+        .await;
+    let directory = tempdir::Dir::new("mtls-ca-rotate");
+    let pki = Pki::install(&directory.0);
+    let server = start(
+        &mtls_config(&upstream.url(), &directory.0),
+        "mtls-ca-rotate",
+        &[],
+    );
+
+    let before = pki.client(Some(client_certificate(&pki.ca, CHECKOUT)));
+    assert_eq!(
+        chat_as(&before, &server.base, None, None).await.unwrap(),
+        200
+    );
+
+    // Replace the authority, as a certificate manager does when it rotates one.
+    let next_ca = new_ca();
+    std::fs::write(directory.0.join("ca.crt"), next_ca.pem()).unwrap();
+    let after = pki.client(Some(client_certificate(&next_ca, CHECKOUT)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(status) = chat_as(&after, &server.base, None, None).await {
+            assert_eq!(status, 200);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replaced client CA was never applied"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // A certificate from the authority that was removed is no longer accepted,
+    // on a new connection.
+    assert!(chat_as(&before, &server.base, None, None).await.is_err());
+}
+
 #[test]
 fn a_certificate_key_needs_client_certificates_to_be_required() {
     let directory = tempdir::Dir::new("mtls-config");

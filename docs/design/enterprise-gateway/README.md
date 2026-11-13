@@ -82,7 +82,7 @@ Later phases (each needs its own design note before work starts)
       policy snapshots, bounded local spend allowance during a Redis outage
 - [ ] Hierarchical budgets, model allowlists, tags, alerts, cost exports
 - [ ] Deployments and load balancing across credentials and regions
-- [ ] Workload JWT authentication, mTLS, IP allowlists
+- [ ] Workload JWT authentication, IP allowlists (mTLS is done: 0011)
 - [ ] Audit log
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy
 - [ ] Secret-manager integrations

@@ -690,7 +690,7 @@ per provider attempt with tokens and USD cost (`null` cost = unknown, never
 free). The fleet job scope carries only a hash of the tenant, and a test pins
 that names stay out of Redis; each replica names tenants from its own config. `deploy/helm/llmshim` deploys it (`deploy/helm/validate.sh`
 checks the chart and feeds each rendered config back through `serve --check`).
-Configuration reload and mutual TLS are not implemented. The feature is **unstable
+Configuration reload is not implemented. The feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,
 `gateway` and `gateway-redis` builds must not change; `tests/unit_serve_cli.rs`
 pins that a build without the feature does not know the command. Never drive
