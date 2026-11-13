@@ -2475,4 +2475,34 @@ mod environment_contract {
             );
         }
     }
+
+    #[test]
+    fn an_override_that_limits_nothing_is_dropped() {
+        // `resolve` falls back per field, so only `is_unlimited` shows whether
+        // the empty override was kept.
+        let none = RateLimitConfig::with_limits(
+            ProviderLimit::default(),
+            [("gemini".to_string(), ProviderLimit::default())],
+        );
+        assert!(none.is_unlimited());
+        let some = RateLimitConfig::with_limits(
+            ProviderLimit::default(),
+            [(
+                "gemini".to_string(),
+                ProviderLimit {
+                    rpm: Some(1),
+                    tpm: None,
+                },
+            )],
+        );
+        assert!(!some.is_unlimited());
+    }
+
+    #[test]
+    fn a_provider_outside_the_known_list_has_no_override_variable() {
+        // Pins KNOWN_PROVIDERS: adding a provider there is a deliberate change.
+        let config = read(&[("LLMSHIM_CEREBRAS_RPM", "5"), ("LLMSHIM_OPENAI_RPM", "6")]);
+        assert_eq!(config.resolve("cerebras"), ProviderLimit::default());
+        assert_eq!(config.resolve("openai").rpm, Some(6));
+    }
 }
