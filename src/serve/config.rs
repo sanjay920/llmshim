@@ -1187,8 +1187,13 @@ fn valid_client_san(san: &str) -> bool {
     let rest = san
         .strip_prefix("dns:")
         .or_else(|| san.strip_prefix("uri:"));
+    // ASCII only: the name travels in an HTTP header, which cannot carry
+    // anything else, so a non-ASCII name could never match.
     rest.is_some_and(|rest| {
-        !rest.is_empty() && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
+        !rest.is_empty()
+            && rest
+                .chars()
+                .all(|c| c.is_ascii() && !c.is_whitespace() && !c.is_control())
     })
 }
 

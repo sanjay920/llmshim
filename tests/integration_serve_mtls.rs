@@ -345,6 +345,139 @@ async fn a_replaced_client_ca_takes_effect_without_a_restart() {
     assert!(chat_as(&before, &server.base, None, None).await.is_err());
 }
 
+/// A client certificate valid for the next `seconds` seconds.
+fn short_lived_certificate(
+    ca: &CertifiedIssuer<'static, KeyPair>,
+    uri: &str,
+    seconds: u64,
+) -> (String, String) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // `date_time_ymd` is the only constructor rcgen exports; adding a duration to
+    // the epoch gives an exact instant without naming the `time` crate.
+    let epoch = rcgen::date_time_ymd(1970, 1, 1);
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.subject_alt_names = vec![SanType::URI(uri.try_into().unwrap())];
+    params.not_before = epoch + Duration::from_secs(now - 3600);
+    params.not_after = epoch + Duration::from_secs(now + seconds);
+    let key = KeyPair::generate().unwrap();
+    let certificate = params.signed_by(&key, ca).unwrap();
+    (certificate.pem(), key.serialize_pem())
+}
+
+#[tokio::test]
+async fn an_expired_client_certificate_cannot_resume_an_earlier_session() {
+    // A resumed TLS session skips the client certificate request and restores
+    // the earlier chain without verifying it again, so with session tickets on a
+    // client could keep reconnecting as a workload long after its short-lived
+    // certificate expired. Every handshake must be a full one.
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .create_async()
+        .await;
+    let directory = tempdir::Dir::new("mtls-expiry");
+    let pki = Pki::install(&directory.0);
+    let server = start(
+        &mtls_config(&upstream.url(), &directory.0),
+        "mtls-expiry",
+        &[],
+    );
+    // One client keeps its TLS session cache across requests; the connection pool
+    // is off, so each request is a new connection that could resume.
+    let client = pki.client(Some(short_lived_certificate(&pki.ca, CHECKOUT, 4)));
+    assert_eq!(
+        chat_as(&client, &server.base, None, None).await.unwrap(),
+        200,
+        "valid while it is valid"
+    );
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(
+        chat_as(&client, &server.base, None, None).await.is_err(),
+        "an expired certificate must not get in by resuming the session it had"
+    );
+}
+
+#[tokio::test]
+async fn a_connection_that_outlives_its_certificate_loses_the_identity() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .create_async()
+        .await;
+    let directory = tempdir::Dir::new("mtls-open-connection");
+    let pki = Pki::install(&directory.0);
+    let server = start(
+        &mtls_config(&upstream.url(), &directory.0),
+        "mtls-open-connection",
+        &[],
+    );
+    let identity = short_lived_certificate(&pki.ca, CHECKOUT, 4);
+    let pem = format!("{}\n{}", identity.0, identity.1);
+    // A pooled client, so the second request reuses the first one's connection
+    // and no new handshake can refuse it.
+    let client = reqwest::Client::builder()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(pki.server_certificate.as_bytes()).unwrap(),
+        )
+        .identity(reqwest::Identity::from_pem(pem.as_bytes()).unwrap())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    assert_eq!(
+        chat_as(&client, &server.base, None, None).await.unwrap(),
+        200
+    );
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    // The connection is still open and was authenticated while the certificate
+    // was valid; it is no longer an identity once the certificate has expired.
+    assert_eq!(
+        chat_as(&client, &server.base, None, None).await.unwrap(),
+        401
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_replacement_client_ca_keeps_the_previous_one() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .create_async()
+        .await;
+    let directory = tempdir::Dir::new("mtls-bad-ca");
+    let pki = Pki::install(&directory.0);
+    let server = start(
+        &mtls_config(&upstream.url(), &directory.0),
+        "mtls-bad-ca",
+        &[],
+    );
+    let client = pki.client(Some(client_certificate(&pki.ca, CHECKOUT)));
+    assert_eq!(
+        chat_as(&client, &server.base, None, None).await.unwrap(),
+        200
+    );
+    // A bundle that is not PEM, then an empty one: neither may leave the server
+    // without a working authority.
+    for bad in ["not a certificate", ""] {
+        std::fs::write(directory.0.join("ca.crt"), bad).unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            chat_as(&client, &server.base, None, None).await.unwrap(),
+            200,
+            "the previous authority must stay in service after {bad:?}"
+        );
+    }
+}
+
 #[test]
 fn a_certificate_key_needs_client_certificates_to_be_required() {
     let directory = tempdir::Dir::new("mtls-config");

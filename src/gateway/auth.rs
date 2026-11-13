@@ -68,12 +68,16 @@ pub enum KeyStore {
     Open,
     Enforced(HashMap<String, Identity>),
     /// Identities keyed by the lower-case hex SHA-256 of the bearer token.
+    /// Only in a `serve` build, so the `gateway` feature's public enum is what
+    /// it was.
+    #[cfg(feature = "serve")]
     Hashed(HashMap<String, Identity>),
     /// Bearer tokens as in [`Self::Hashed`], and identities for workloads that
     /// authenticate with a client certificate. The certificate's name reaches
     /// this store in [`PEER_SAN_HEADER`], which the server sets from the
     /// verified TLS handshake and strips from every inbound request, so a caller
-    /// can never supply it.
+    /// can never supply it. Only in a `serve` build.
+    #[cfg(feature = "serve")]
     Mutual {
         tokens: HashMap<String, Identity>,
         peers: HashMap<String, Identity>,
@@ -83,6 +87,7 @@ pub enum KeyStore {
 /// The header through which a verified client certificate's matched name
 /// reaches the key store. It is internal: the server removes it from every
 /// inbound request before setting it, so only the TLS layer can.
+#[cfg(feature = "serve")]
 pub const PEER_SAN_HEADER: &str = "x-llmshim-peer-san";
 
 impl KeyStore {
@@ -134,6 +139,7 @@ impl KeyStore {
     /// Build an enforced store that holds only key digests. Each map key is the
     /// lower-case hex SHA-256 of a bearer token. Requests are authenticated and
     /// scoped exactly as with [`Self::enforced`] given the same tokens.
+    #[cfg(feature = "serve")]
     pub fn from_digests(digests: HashMap<String, Identity>) -> Self {
         KeyStore::Hashed(digests)
     }
@@ -142,16 +148,19 @@ impl KeyStore {
     /// by the SHA-256 digest of a bearer token as for [`Self::from_digests`];
     /// `peers` by the canonical name (`dns:<lower-case>` or `uri:<uri>`) a
     /// verified certificate carries.
+    #[cfg(feature = "serve")]
     pub fn mutual(tokens: HashMap<String, Identity>, peers: HashMap<String, Identity>) -> Self {
         KeyStore::Mutual { tokens, peers }
     }
 
     /// Whether Bearer auth is required.
     pub fn is_enforced(&self) -> bool {
-        matches!(
-            self,
-            KeyStore::Enforced(_) | KeyStore::Hashed(_) | KeyStore::Mutual { .. }
-        )
+        match self {
+            KeyStore::Open => false,
+            KeyStore::Enforced(_) => true,
+            #[cfg(feature = "serve")]
+            KeyStore::Hashed(_) | KeyStore::Mutual { .. } => true,
+        }
     }
 
     /// Resolve the caller's identity. Open mode reads the tier from the client
@@ -189,6 +198,7 @@ impl KeyStore {
                     credential_scope,
                 })
             }
+            #[cfg(feature = "serve")]
             KeyStore::Mutual { tokens, peers } => match bearer_token(headers) {
                 // A bearer token decides on its own; a certificate never rescues a
                 // wrong token.
@@ -217,6 +227,7 @@ impl KeyStore {
                     })
                 }
             },
+            #[cfg(feature = "serve")]
             KeyStore::Hashed(map) => {
                 let key = bearer_token(headers).ok_or(AuthError::MissingKey)?;
                 // The digest is the credential scope in both modes, so state
@@ -344,10 +355,12 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "serve")]
     fn digest(token: &str) -> String {
         format!("{:x}", Sha256::digest(token.as_bytes()))
     }
 
+    #[cfg(feature = "serve")]
     fn identity(tenant: &str, tier: u8) -> Identity {
         Identity {
             tenant: tenant.into(),
@@ -360,6 +373,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn a_hashed_store_authenticates_and_scopes_like_a_plaintext_store() {
         let plain = KeyStore::enforced(HashMap::from([
@@ -392,6 +406,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn a_hashed_store_rejects_missing_wrong_and_digest_as_token() {
         let hashed =
@@ -412,6 +427,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "serve")]
     fn mutual() -> KeyStore {
         KeyStore::mutual(
             HashMap::from([(digest("sk-paid"), identity("platform", 1))]),
@@ -425,6 +441,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn a_mutual_store_identifies_a_workload_by_its_bound_name_and_scopes_it_apart() {
         let store = mutual();
@@ -452,6 +469,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     fn in_a_mutual_store_a_bearer_token_decides_alone() {
         let store = mutual();
