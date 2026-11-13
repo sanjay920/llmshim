@@ -40,29 +40,32 @@ then saved configuration).
 
 ## Inventory
 
-Converted in this step:
+Converted (the parser takes a lookup; `from_env` is the lookup applied to the
+environment):
 
 | Setting | Where | Now built from |
 |---|---|---|
 | `LLMSHIM_GATEWAY_*` scheduler tuning (10 variables) | `GatewayConfig` | `from_lookup` |
 | `LLMSHIM_RATE_LIMIT_RPM/TPM`, `LLMSHIM_<PROVIDER>_RPM/TPM` | `RateLimitConfig` | `from_lookup`, `with_limits` |
 | Gateway state assembly | `GatewayState` | `from_parts(LocalParts)` |
+| `LLMSHIM_BREAKER_*` | `BreakerConfig` | `from_lookup`; `build_breaker_with(config, redis_url)` |
+| `LLMSHIM_REDIS_URL` for limiter and breaker | `build_limiter`, `build_breaker` | `build_limiter_with`, `build_breaker_with` |
+| `LLMSHIM_PROXY_*_TIMEOUT_MS`, `LLMSHIM_GATEWAY_*_JOB_TIMEOUT_MS` | `LogicalRequestDeadlines` | `from_lookup`; `from_durations` (errors instead of defaulting) |
+| `LLMSHIM_REPLAY_RECEIPTS_*` (dir, three limits, rescan flag) | `Receipts` | `from_lookup`; `from_parts` with `Limits::new` (errors instead of defaulting) |
+| Application assembly | proxy and gateway `app*` | `app_with_parts(state, origin_policy, deadlines, receipt_store)` |
+| Caller keys | `KeyStore` | the hashed store in 0003 |
+| `LLMSHIM_TRUSTED_ORIGINS` | `OriginPolicy` | already had an env-free constructor, `from_csv`; `from_env` only handles the missing and non-Unicode cases. `from_csv("")` is an error, so `serve` uses `OriginPolicy::default()` for an empty list |
 
 Still read from the environment, to convert before `serve` can boot:
 
 | Setting | Where | Notes |
 |---|---|---|
-| `LLMSHIM_GATEWAY_KEYS_FILE` | `KeyStore::from_env` | Exits the process on a bad file. `serve` uses the hashed store in 0003 instead. |
-| `LLMSHIM_GATEWAY_IDEMPOTENCY_TTL_SECS` | `gateway/http.rs` | Already a plain field of `LocalParts`. |
-| `LLMSHIM_TRUSTED_ORIGINS` | `OriginPolicy::from_env` | Read when the router is built. |
-| `LLMSHIM_PROXY_*_TIMEOUT_MS`, gateway job deadlines | `LogicalRequestDeadlines` | Read when the router is built. |
-| `LLMSHIM_REPLAY_RECEIPTS_*` | `Receipts::from_env` | A process-wide default store. |
-| `LLMSHIM_REDIS_URL` | limiter, breaker, gateway | Selects fleet mode. |
-| `LLMSHIM_BREAKER_*` | `BreakerConfig::from_env` | |
-| `LLMSHIM_PENALTY_SECS` | `penalty_duration()` | Read on each upstream 429. |
 | `LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS` | `gateway/attempt.rs` | Read when the ledger is built. |
-| `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`, `LLMSHIM_UPSTREAM_*` | shared HTTP client | Process-wide, initialized once. Needs a per-router client before it can come from a file. |
-| `LLMSHIM_MAX_CONCURRENCY`, `LLMSHIM_QUEUE_TIMEOUT_MS` | `Backpressure::from_env` | Proxy only. |
+| `LLMSHIM_PENALTY_SECS` | `penalty_duration()` | Read on each upstream 429. |
+| `LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS` | `ReceiptExecutor::new` | Read once, when the receipt store is constructed (not per request), so the store `serve` builds still obeys an ambient value until `DefaultReceiptStore` takes the timeout as an argument. |
+| `LLMSHIM_GATEWAY_IDEMPOTENCY_TTL_SECS` | `distributed_from_env` | Single-instance mode carries it in `LocalParts`; the distributed path still reads it from the environment. |
+| `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`, `LLMSHIM_UPSTREAM_*`, `LLMSHIM_HTTP_*` | shared HTTP client | Process-wide, initialized once. Needs a per-router client before it can come from a file. |
+| `LLMSHIM_MAX_CONCURRENCY`, `LLMSHIM_QUEUE_TIMEOUT_MS` | `Backpressure::from_env` | Proxy only; `Backpressure::new` already takes values. |
 | `LLMSHIM_HTTP_MAX_CONNECTIONS`, `LLMSHIM_HTTP_HEADER_TIMEOUT_MS` | `http_server` | Inbound listener limits; read by the proxy and gateway entry points. |
 | `LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS` | shared HTTP client deadlines | Process-wide, with the `LLMSHIM_UPSTREAM_*` timeouts above. |
 | `LLMSHIM_NO_STRICT`, `LLMSHIM_NO_SCHEMA_NORMALIZATION`, `LLMSHIM_NO_SCHEMA_CACHE` | schema normalization | Debugging bypasses; process-wide, read at use. A deployment that sets them changes what the server sends upstream, so `serve` documents them as unsupported settings. |
@@ -79,6 +82,10 @@ These are pinned by tests, not fixed, because fixing them would change
 - An unparsable value is ignored silently and the default is used.
 - Zero is refused for the two job timeouts but accepted for `MAX_WAIT_MS` and
   `QUEUE_DEPTH`.
+- Receipt-store numbers outside their allowed range, and the lifetimes when zero,
+  fall back to the default. The explicit constructors (`Limits::new`,
+  `from_durations`) return an error for the same values instead.
+- Only the exact string `1` turns on `LLMSHIM_REPLAY_RECEIPTS_RESCAN_INCOMPLETE_BASELINE`.
 - Per-provider rate-limit variables exist only for `openai`, `anthropic`,
   `gemini` and `xai`. Other providers get the global limit only.
 

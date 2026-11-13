@@ -131,6 +131,7 @@ thread_local! {
 
 pub(super) fn configured_http_lock_timeout() -> Duration {
     Duration::from_millis(configured_number(
+        &|key| std::env::var_os(key),
         "LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS",
         DEFAULT_LOCK_TIMEOUT.as_millis() as u64,
         1,
@@ -159,7 +160,7 @@ pub(super) fn with_http_lock_timeout<T>(timeout: Duration, operation: impl FnOnc
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Limits {
+pub(crate) struct Limits {
     max_entries: u64,
     max_total_bytes: u64,
     ttl_secs: u64,
@@ -175,22 +176,61 @@ impl Default for Limits {
     }
 }
 
+/// Looks a variable up by name. Values are `OsString` because the receipts
+/// directory may be a non-UTF-8 path; numbers use [`configured_number`], which
+/// ignores a non-Unicode value exactly as `std::env::var` did.
+type OsLookup<'a> = &'a dyn Fn(&str) -> Option<std::ffi::OsString>;
+
 impl Limits {
-    fn from_env() -> Self {
+    /// Explicit limits, with the bounds the environment path enforces by
+    /// falling back to a default. Out-of-range values are errors here.
+    // Used by `serve` once it boots from the configuration file (roadmap).
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        max_entries: u64,
+        max_total_bytes: u64,
+        ttl_secs: u64,
+    ) -> Result<Self, String> {
+        let in_range = |name: &str, value: u64, minimum: u64, maximum: u64| {
+            if (minimum..=maximum).contains(&value) {
+                Ok(())
+            } else {
+                Err(format!("{name} must be between {minimum} and {maximum}"))
+            }
+        };
+        in_range("max_entries", max_entries, 1, MAX_CONFIGURED_ENTRIES)?;
+        in_range(
+            "max_total_bytes",
+            max_total_bytes,
+            MAX_RECEIPT_BYTES,
+            MAX_CONFIGURED_TOTAL_BYTES,
+        )?;
+        in_range("ttl_secs", ttl_secs, 60, MAX_CONFIGURED_TTL_SECS)?;
+        Ok(Self {
+            max_entries,
+            max_total_bytes,
+            ttl_secs,
+        })
+    }
+
+    fn from_lookup(lookup: OsLookup<'_>) -> Self {
         Self {
             max_entries: configured_number(
+                lookup,
                 "LLMSHIM_REPLAY_RECEIPTS_MAX_ENTRIES",
                 DEFAULT_MAX_ENTRIES,
                 1,
                 MAX_CONFIGURED_ENTRIES,
             ),
             max_total_bytes: configured_number(
+                lookup,
                 "LLMSHIM_REPLAY_RECEIPTS_MAX_BYTES",
                 DEFAULT_MAX_TOTAL_BYTES,
                 MAX_RECEIPT_BYTES,
                 MAX_CONFIGURED_TOTAL_BYTES,
             ),
             ttl_secs: configured_number(
+                lookup,
                 "LLMSHIM_REPLAY_RECEIPTS_TTL_SECS",
                 DEFAULT_TTL_SECS,
                 60,
@@ -295,17 +335,37 @@ impl Receipts {
     }
 
     pub fn from_env() -> Self {
-        let root = std::env::var_os("LLMSHIM_REPLAY_RECEIPTS_DIR")
+        Self::from_lookup(&|key| std::env::var_os(key))
+    }
+
+    /// The same parsing as [`Self::from_env`], reading each variable through
+    /// `lookup` instead of the process environment.
+    fn from_lookup(lookup: OsLookup<'_>) -> Self {
+        let root = lookup("LLMSHIM_REPLAY_RECEIPTS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 dirs::data_local_dir()
                     .unwrap_or_else(|| PathBuf::from("."))
                     .join("llmshim/replay-receipts")
             });
-        let mut receipts = Self::with_limits(root, Limits::from_env());
+        let mut receipts = Self::with_limits(root, Limits::from_lookup(lookup));
         receipts.rescan_incomplete_baseline =
-            std::env::var_os("LLMSHIM_REPLAY_RECEIPTS_RESCAN_INCOMPLETE_BASELINE")
+            lookup("LLMSHIM_REPLAY_RECEIPTS_RESCAN_INCOMPLETE_BASELINE")
                 .is_some_and(|value| value == "1");
+        receipts
+    }
+
+    /// A store at `root` with explicit limits, reading nothing from the
+    /// environment.
+    // Used by `serve` once it boots from the configuration file (roadmap).
+    #[allow(dead_code)]
+    pub(crate) fn from_parts(
+        root: PathBuf,
+        limits: Limits,
+        rescan_incomplete_baseline: bool,
+    ) -> Self {
+        let mut receipts = Self::with_limits(root, limits);
+        receipts.rescan_incomplete_baseline = rescan_incomplete_baseline;
         receipts
     }
 
@@ -933,9 +993,15 @@ fn is_receipt_key(key: &str) -> bool {
     key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn configured_number(name: &str, default: u64, minimum: u64, maximum: u64) -> u64 {
-    std::env::var(name)
-        .ok()
+fn configured_number(
+    lookup: OsLookup<'_>,
+    name: &str,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> u64 {
+    lookup(name)
+        .and_then(|value| value.into_string().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value >= minimum && *value <= maximum)
         .unwrap_or(default)
@@ -1488,5 +1554,106 @@ mod tests {
         let file = File::create(oversized.legacy_path(&receipt_key)).unwrap();
         file.set_len(MAX_RECEIPT_BYTES + 1).unwrap();
         assert!(oversized.get("scope", "call", &json!("large")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod environment_contract {
+    //! Pins how the receipt-store variables are parsed, independently of the
+    //! process environment.
+    use super::*;
+    use std::ffi::OsString;
+
+    fn read(vars: &[(&str, &str)]) -> Receipts {
+        Receipts::from_lookup(&|key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| OsString::from(value))
+        })
+    }
+
+    #[test]
+    fn defaults_apply_when_unset() {
+        let receipts = read(&[]);
+        assert_eq!(receipts.limits.max_entries, DEFAULT_MAX_ENTRIES);
+        assert_eq!(receipts.limits.max_total_bytes, DEFAULT_MAX_TOTAL_BYTES);
+        assert_eq!(receipts.limits.ttl_secs, DEFAULT_TTL_SECS);
+        assert!(!receipts.rescan_incomplete_baseline);
+        assert!(receipts.root.ends_with("llmshim/replay-receipts"));
+    }
+
+    #[test]
+    fn variables_set_the_root_limits_and_rescan_flag() {
+        let receipts = read(&[
+            ("LLMSHIM_REPLAY_RECEIPTS_DIR", "/var/lib/receipts"),
+            ("LLMSHIM_REPLAY_RECEIPTS_MAX_ENTRIES", "50"),
+            ("LLMSHIM_REPLAY_RECEIPTS_MAX_BYTES", "8388608"),
+            ("LLMSHIM_REPLAY_RECEIPTS_TTL_SECS", "3600"),
+            ("LLMSHIM_REPLAY_RECEIPTS_RESCAN_INCOMPLETE_BASELINE", "1"),
+        ]);
+        assert_eq!(receipts.root, PathBuf::from("/var/lib/receipts"));
+        assert_eq!(receipts.limits.max_entries, 50);
+        assert_eq!(receipts.limits.max_total_bytes, 8_388_608);
+        assert_eq!(receipts.limits.ttl_secs, 3600);
+        assert!(receipts.rescan_incomplete_baseline);
+    }
+
+    #[test]
+    fn out_of_range_and_malformed_values_keep_the_default() {
+        for (name, bad) in [
+            ("LLMSHIM_REPLAY_RECEIPTS_MAX_ENTRIES", "0"),
+            ("LLMSHIM_REPLAY_RECEIPTS_MAX_ENTRIES", "100001"),
+            ("LLMSHIM_REPLAY_RECEIPTS_MAX_BYTES", "1"),
+            ("LLMSHIM_REPLAY_RECEIPTS_TTL_SECS", "59"),
+            ("LLMSHIM_REPLAY_RECEIPTS_TTL_SECS", "soon"),
+            ("LLMSHIM_REPLAY_RECEIPTS_TTL_SECS", " 3600"),
+        ] {
+            let receipts = read(&[(name, bad)]);
+            assert_eq!(
+                receipts.limits.max_entries, DEFAULT_MAX_ENTRIES,
+                "{name}={bad}"
+            );
+            assert_eq!(receipts.limits.max_total_bytes, DEFAULT_MAX_TOTAL_BYTES);
+            assert_eq!(receipts.limits.ttl_secs, DEFAULT_TTL_SECS);
+        }
+        // Only the exact string "1" turns the rescan on.
+        for value in ["0", "true", "yes", "01", " 1"] {
+            let receipts = read(&[("LLMSHIM_REPLAY_RECEIPTS_RESCAN_INCOMPLETE_BASELINE", value)]);
+            assert!(!receipts.rescan_incomplete_baseline, "{value}");
+        }
+    }
+
+    #[test]
+    fn explicit_limits_enforce_the_same_bounds_as_errors() {
+        assert!(Limits::new(1, MAX_RECEIPT_BYTES, 60).is_ok());
+        assert!(Limits::new(
+            MAX_CONFIGURED_ENTRIES,
+            MAX_CONFIGURED_TOTAL_BYTES,
+            MAX_CONFIGURED_TTL_SECS
+        )
+        .is_ok());
+        for (entries, bytes, ttl, field) in [
+            (0, MAX_RECEIPT_BYTES, 60, "max_entries"),
+            (
+                MAX_CONFIGURED_ENTRIES + 1,
+                MAX_RECEIPT_BYTES,
+                60,
+                "max_entries",
+            ),
+            (1, MAX_RECEIPT_BYTES - 1, 60, "max_total_bytes"),
+            (1, MAX_RECEIPT_BYTES, 59, "ttl_secs"),
+        ] {
+            let error = Limits::new(entries, bytes, ttl).unwrap_err();
+            assert!(error.contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn explicit_parts_build_a_store_without_the_environment() {
+        let limits = Limits::new(10, MAX_RECEIPT_BYTES, 120).unwrap();
+        let receipts = Receipts::from_parts(PathBuf::from("/srv/receipts"), limits, true);
+        assert_eq!(receipts.root, PathBuf::from("/srv/receipts"));
+        assert_eq!(receipts.limits.max_entries, 10);
+        assert!(receipts.rescan_incomplete_baseline);
     }
 }

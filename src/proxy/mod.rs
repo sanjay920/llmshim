@@ -95,7 +95,23 @@ fn app_with_origin_policy_and_deadlines(
     origin_policy: OriginPolicy,
     logical_deadlines: lifetime::LogicalRequestDeadlines,
 ) -> axum::Router {
-    let default_receipt_store = wire::DefaultReceiptStore::from_env();
+    app_with_parts(
+        state,
+        origin_policy,
+        logical_deadlines,
+        wire::DefaultReceiptStore::from_env(),
+    )
+}
+
+/// Build the application from every input it needs, reading nothing from the
+/// environment. The `app*` functions above are this with environment-derived
+/// values.
+pub(crate) fn app_with_parts(
+    state: Arc<AppState>,
+    origin_policy: OriginPolicy,
+    logical_deadlines: lifetime::LogicalRequestDeadlines,
+    default_receipt_store: wire::DefaultReceiptStore,
+) -> axum::Router {
     let preparation_state =
         lifetime::PreparationAdmissionState::new(state.backpressure.clone(), logical_deadlines);
     axum::Router::new()

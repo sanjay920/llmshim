@@ -28,30 +28,60 @@ pub(crate) struct LogicalRequestDeadlines {
 
 impl LogicalRequestDeadlines {
     pub(crate) fn from_env() -> Self {
-        Self {
-            unary: configured_duration(
-                "LLMSHIM_PROXY_UNARY_TIMEOUT_MS",
-                DEFAULT_UNARY_LOGICAL_LIFETIME,
-            ),
-            stream: configured_duration(
-                "LLMSHIM_PROXY_STREAM_TIMEOUT_MS",
-                DEFAULT_STREAM_LOGICAL_LIFETIME,
-            ),
-        }
+        Self::proxy_from_lookup(&|key| std::env::var(key).ok())
     }
 
     #[cfg(feature = "gateway")]
     pub(crate) fn gateway_from_env() -> Self {
+        Self::gateway_from_lookup(&|key| std::env::var(key).ok())
+    }
+
+    /// The proxy's two lifetimes, under their real variable names.
+    pub(crate) fn proxy_from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        Self::from_lookup(
+            lookup,
+            "LLMSHIM_PROXY_UNARY_TIMEOUT_MS",
+            "LLMSHIM_PROXY_STREAM_TIMEOUT_MS",
+        )
+    }
+
+    /// The gateway's two job deadlines, under their real variable names.
+    #[cfg(feature = "gateway")]
+    pub(crate) fn gateway_from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        Self::from_lookup(
+            lookup,
+            "LLMSHIM_GATEWAY_UNARY_JOB_TIMEOUT_MS",
+            "LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS",
+        )
+    }
+
+    /// Parse the two lifetimes from the variables named, through `lookup`. A
+    /// missing, unparsable, zero or unrepresentable value keeps the default.
+    pub(crate) fn from_lookup(
+        lookup: &dyn Fn(&str) -> Option<String>,
+        unary_variable: &str,
+        stream_variable: &str,
+    ) -> Self {
         Self {
-            unary: configured_duration(
-                "LLMSHIM_GATEWAY_UNARY_JOB_TIMEOUT_MS",
-                DEFAULT_UNARY_LOGICAL_LIFETIME,
-            ),
-            stream: configured_duration(
-                "LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS",
-                DEFAULT_STREAM_LOGICAL_LIFETIME,
-            ),
+            unary: configured_duration(lookup, unary_variable, DEFAULT_UNARY_LOGICAL_LIFETIME),
+            stream: configured_duration(lookup, stream_variable, DEFAULT_STREAM_LOGICAL_LIFETIME),
         }
+    }
+
+    /// Explicit lifetimes. Unlike the environment path, which falls back to a
+    /// default, a value that cannot be honoured is an error.
+    // Used by `serve` once it boots from the configuration file (roadmap).
+    #[allow(dead_code)]
+    pub(crate) fn from_durations(unary: Duration, stream: Duration) -> Result<Self, String> {
+        for (name, lifetime) in [("unary", unary), ("stream", stream)] {
+            if lifetime.is_zero() {
+                return Err(format!("the {name} lifetime must be greater than zero"));
+            }
+            if Instant::now().checked_add(lifetime).is_none() {
+                return Err(format!("the {name} lifetime is too large"));
+            }
+        }
+        Ok(Self { unary, stream })
     }
 
     #[cfg(test)]
@@ -62,9 +92,12 @@ impl LogicalRequestDeadlines {
     }
 }
 
-fn configured_duration(name: &str, default: Duration) -> Duration {
-    let Some(milliseconds) = std::env::var(name)
-        .ok()
+fn configured_duration(
+    lookup: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+    default: Duration,
+) -> Duration {
+    let Some(milliseconds) = lookup(name)
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
     else {
@@ -769,5 +802,91 @@ mod tests {
             .expect("body error")
             .expect_err("partial SSE must not receive an appended timeout event");
         assert!(error.to_string().contains("could not read upstream SSE"));
+    }
+}
+
+#[cfg(test)]
+mod environment_contract {
+    //! Pins how the lifetime variables are parsed, independently of the process
+    //! environment.
+    use super::*;
+
+    fn read(vars: &[(&str, &str)]) -> LogicalRequestDeadlines {
+        LogicalRequestDeadlines::from_lookup(
+            &|key| {
+                vars.iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.to_string())
+            },
+            "UNARY",
+            "STREAM",
+        )
+    }
+
+    #[test]
+    fn the_real_variable_names_map_to_the_right_lifetimes() {
+        // Swapping the proxy and gateway names, or unary and stream, would
+        // otherwise pass: the other tests use stand-in names.
+        let proxy = |key: &str| match key {
+            "LLMSHIM_PROXY_UNARY_TIMEOUT_MS" => Some("11".to_string()),
+            "LLMSHIM_PROXY_STREAM_TIMEOUT_MS" => Some("22".to_string()),
+            "LLMSHIM_GATEWAY_UNARY_JOB_TIMEOUT_MS" => Some("33".to_string()),
+            "LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS" => Some("44".to_string()),
+            _ => None,
+        };
+        let deadlines = LogicalRequestDeadlines::proxy_from_lookup(&proxy);
+        assert_eq!(deadlines.unary, Duration::from_millis(11));
+        assert_eq!(deadlines.stream, Duration::from_millis(22));
+        #[cfg(feature = "gateway")]
+        {
+            let deadlines = LogicalRequestDeadlines::gateway_from_lookup(&proxy);
+            assert_eq!(deadlines.unary, Duration::from_millis(33));
+            assert_eq!(deadlines.stream, Duration::from_millis(44));
+        }
+    }
+
+    #[test]
+    fn defaults_apply_when_unset() {
+        let deadlines = read(&[]);
+        assert_eq!(deadlines.unary, DEFAULT_UNARY_LOGICAL_LIFETIME);
+        assert_eq!(deadlines.stream, DEFAULT_STREAM_LOGICAL_LIFETIME);
+    }
+
+    #[test]
+    fn each_variable_sets_its_own_lifetime_in_milliseconds() {
+        let deadlines = read(&[("UNARY", "1500"), ("STREAM", "90000")]);
+        assert_eq!(deadlines.unary, Duration::from_millis(1500));
+        assert_eq!(deadlines.stream, Duration::from_millis(90_000));
+    }
+
+    #[test]
+    fn zero_unparsable_and_untrimmed_values_keep_the_default() {
+        // Whether a huge value is representable depends on the platform clock,
+        // so it is deliberately not pinned here.
+        for bad in ["0", "soon", " 5 ", "-1"] {
+            let deadlines = read(&[("UNARY", bad), ("STREAM", bad)]);
+            assert_eq!(deadlines.unary, DEFAULT_UNARY_LOGICAL_LIFETIME, "{bad}");
+            assert_eq!(deadlines.stream, DEFAULT_STREAM_LOGICAL_LIFETIME, "{bad}");
+        }
+    }
+
+    #[test]
+    fn explicit_durations_refuse_what_the_environment_path_replaces() {
+        let ok = LogicalRequestDeadlines::from_durations(
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .unwrap();
+        assert_eq!(ok.unary, Duration::from_secs(60));
+        assert!(
+            LogicalRequestDeadlines::from_durations(Duration::ZERO, Duration::from_secs(1))
+                .unwrap_err()
+                .contains("unary")
+        );
+        assert!(
+            LogicalRequestDeadlines::from_durations(Duration::from_secs(1), Duration::MAX)
+                .unwrap_err()
+                .contains("stream")
+        );
     }
 }
