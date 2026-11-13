@@ -529,16 +529,18 @@ impl GatewayConfig {
     /// `LLMSHIM_GATEWAY_QUEUE_DEPTH`, `LLMSHIM_GATEWAY_MAX_WAIT_MS`,
     /// `LLMSHIM_GATEWAY_MAX_CONCURRENCY`.
     pub fn from_env() -> Self {
+        Self::from_lookup(&|key| std::env::var(key).ok())
+    }
+
+    /// The same parsing as [`Self::from_env`], reading each variable through
+    /// `lookup` instead of the process environment. `from_env` is this function
+    /// applied to the environment, so the two cannot drift.
+    pub(crate) fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
         let d = Self::default();
-        let usize_env = |k: &str, fallback: usize| {
-            std::env::var(k)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(fallback)
-        };
+        let usize_env =
+            |k: &str, fallback: usize| lookup(k).and_then(|v| v.parse().ok()).unwrap_or(fallback);
         let duration_env = |key: &str, fallback: Duration| {
-            std::env::var(key)
-                .ok()
+            lookup(key)
                 .and_then(|value| value.parse::<u64>().ok())
                 .filter(|milliseconds| *milliseconds > 0)
                 .map(Duration::from_millis)
@@ -547,8 +549,7 @@ impl GatewayConfig {
         };
         Self {
             max_queue_depth: usize_env("LLMSHIM_GATEWAY_QUEUE_DEPTH", d.max_queue_depth),
-            max_wait: std::env::var("LLMSHIM_GATEWAY_MAX_WAIT_MS")
-                .ok()
+            max_wait: lookup("LLMSHIM_GATEWAY_MAX_WAIT_MS")
                 .and_then(|v| v.parse().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(d.max_wait),
@@ -565,27 +566,22 @@ impl GatewayConfig {
                 "LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS",
                 d.stream_job_timeout,
             ),
-            aging_step: std::env::var("LLMSHIM_GATEWAY_AGING_STEP_MS")
-                .ok()
+            aging_step: lookup("LLMSHIM_GATEWAY_AGING_STEP_MS")
                 .and_then(|v| v.parse().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(d.aging_step),
-            max_boost: std::env::var("LLMSHIM_GATEWAY_MAX_BOOST")
-                .ok()
+            max_boost: lookup("LLMSHIM_GATEWAY_MAX_BOOST")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.max_boost),
-            request_timeout: std::env::var("LLMSHIM_GATEWAY_REQUEST_TIMEOUT_MS")
-                .ok()
+            request_timeout: lookup("LLMSHIM_GATEWAY_REQUEST_TIMEOUT_MS")
                 .and_then(|v| v.parse().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(d.request_timeout),
-            lease_timeout: std::env::var("LLMSHIM_GATEWAY_LEASE_TIMEOUT_MS")
-                .ok()
+            lease_timeout: lookup("LLMSHIM_GATEWAY_LEASE_TIMEOUT_MS")
                 .and_then(|v| v.parse().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(d.lease_timeout),
-            max_attempts: std::env::var("LLMSHIM_GATEWAY_MAX_ATTEMPTS")
-                .ok()
+            max_attempts: lookup("LLMSHIM_GATEWAY_MAX_ATTEMPTS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.max_attempts),
         }
@@ -2176,5 +2172,102 @@ mod tests {
             unary_dispatches.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod environment_contract {
+    //! Pins how `LLMSHIM_GATEWAY_*` variables are parsed, independently of the
+    //! process environment, so the environment-driven path cannot change
+    //! unnoticed while configuration-file support is added beside it.
+    use super::GatewayConfig;
+    use std::time::Duration;
+
+    fn read(vars: &[(&str, &str)]) -> GatewayConfig {
+        GatewayConfig::from_lookup(&|key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn an_empty_environment_gives_the_defaults() {
+        let (read, default) = (read(&[]), GatewayConfig::default());
+        assert_eq!(read.max_queue_depth, default.max_queue_depth);
+        assert_eq!(read.max_wait, default.max_wait);
+        assert_eq!(read.overloaded_retry_after, default.overloaded_retry_after);
+        assert_eq!(
+            read.max_concurrency_per_provider,
+            default.max_concurrency_per_provider
+        );
+        assert_eq!(read.unary_job_timeout, default.unary_job_timeout);
+        assert_eq!(read.stream_job_timeout, default.stream_job_timeout);
+        assert_eq!(read.aging_step, default.aging_step);
+        assert_eq!(read.max_boost, default.max_boost);
+        assert_eq!(read.request_timeout, default.request_timeout);
+        assert_eq!(read.lease_timeout, default.lease_timeout);
+        assert_eq!(read.max_attempts, default.max_attempts);
+    }
+
+    #[test]
+    fn every_variable_sets_its_own_field() {
+        let config = read(&[
+            ("LLMSHIM_GATEWAY_QUEUE_DEPTH", "11"),
+            ("LLMSHIM_GATEWAY_MAX_WAIT_MS", "12"),
+            ("LLMSHIM_GATEWAY_MAX_CONCURRENCY", "13"),
+            ("LLMSHIM_GATEWAY_UNARY_JOB_TIMEOUT_MS", "14"),
+            ("LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS", "15"),
+            ("LLMSHIM_GATEWAY_AGING_STEP_MS", "16"),
+            ("LLMSHIM_GATEWAY_MAX_BOOST", "17"),
+            ("LLMSHIM_GATEWAY_REQUEST_TIMEOUT_MS", "18"),
+            ("LLMSHIM_GATEWAY_LEASE_TIMEOUT_MS", "19"),
+            ("LLMSHIM_GATEWAY_MAX_ATTEMPTS", "20"),
+        ]);
+        assert_eq!(config.max_queue_depth, 11);
+        assert_eq!(config.max_wait, Duration::from_millis(12));
+        assert_eq!(config.max_concurrency_per_provider, 13);
+        assert_eq!(config.unary_job_timeout, Duration::from_millis(14));
+        assert_eq!(config.stream_job_timeout, Duration::from_millis(15));
+        assert_eq!(config.aging_step, Duration::from_millis(16));
+        assert_eq!(config.max_boost, 17);
+        assert_eq!(config.request_timeout, Duration::from_millis(18));
+        assert_eq!(config.lease_timeout, Duration::from_millis(19));
+        assert_eq!(config.max_attempts, 20);
+        // Not configurable from the environment.
+        assert_eq!(
+            config.overloaded_retry_after,
+            GatewayConfig::default().overloaded_retry_after
+        );
+    }
+
+    #[test]
+    fn unparsable_values_fall_back_and_are_not_trimmed() {
+        let default = GatewayConfig::default();
+        let config = read(&[
+            ("LLMSHIM_GATEWAY_QUEUE_DEPTH", "many"),
+            ("LLMSHIM_GATEWAY_MAX_WAIT_MS", " 12 "),
+            ("LLMSHIM_GATEWAY_MAX_BOOST", "-1"),
+            ("LLMSHIM_GATEWAY_MAX_ATTEMPTS", ""),
+        ]);
+        assert_eq!(config.max_queue_depth, default.max_queue_depth);
+        assert_eq!(config.max_wait, default.max_wait);
+        assert_eq!(config.max_boost, default.max_boost);
+        assert_eq!(config.max_attempts, default.max_attempts);
+    }
+
+    #[test]
+    fn zero_is_refused_for_job_timeouts_but_accepted_elsewhere() {
+        let default = GatewayConfig::default();
+        let config = read(&[
+            ("LLMSHIM_GATEWAY_UNARY_JOB_TIMEOUT_MS", "0"),
+            ("LLMSHIM_GATEWAY_STREAM_JOB_TIMEOUT_MS", "0"),
+            ("LLMSHIM_GATEWAY_MAX_WAIT_MS", "0"),
+            ("LLMSHIM_GATEWAY_QUEUE_DEPTH", "0"),
+        ]);
+        assert_eq!(config.unary_job_timeout, default.unary_job_timeout);
+        assert_eq!(config.stream_job_timeout, default.stream_job_timeout);
+        assert_eq!(config.max_wait, Duration::ZERO);
+        assert_eq!(config.max_queue_depth, 0);
     }
 }

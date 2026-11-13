@@ -293,17 +293,24 @@ impl RateLimitConfig {
     /// - `LLMSHIM_<PROVIDER>_RPM` / `_TPM` — per-provider overrides
     ///   (`LLMSHIM_OPENAI_RPM`, `LLMSHIM_ANTHROPIC_TPM`, …).
     pub fn from_env() -> Self {
+        Self::from_lookup(&|key| std::env::var(key).ok())
+    }
+
+    /// The same parsing as [`Self::from_env`], reading each variable through
+    /// `lookup` instead of the process environment.
+    pub(crate) fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let number = |key: &str| -> Option<u32> { lookup(key)?.trim().parse().ok() };
         let global = ProviderLimit {
-            rpm: env_u32("LLMSHIM_RATE_LIMIT_RPM"),
-            tpm: env_u32("LLMSHIM_RATE_LIMIT_TPM"),
+            rpm: number("LLMSHIM_RATE_LIMIT_RPM"),
+            tpm: number("LLMSHIM_RATE_LIMIT_TPM"),
         };
 
         let mut per_provider = HashMap::new();
         for p in KNOWN_PROVIDERS {
             let up = p.to_uppercase();
             let limit = ProviderLimit {
-                rpm: env_u32(&format!("LLMSHIM_{up}_RPM")),
-                tpm: env_u32(&format!("LLMSHIM_{up}_TPM")),
+                rpm: number(&format!("LLMSHIM_{up}_RPM")),
+                tpm: number(&format!("LLMSHIM_{up}_TPM")),
             };
             if !limit.is_unlimited() {
                 per_provider.insert(p.to_string(), limit);
@@ -313,6 +320,22 @@ impl RateLimitConfig {
         Self {
             global,
             per_provider,
+        }
+    }
+
+    /// Config from explicit values: global defaults plus per-provider overrides
+    /// keyed by provider name. An override with neither limit set is dropped,
+    /// as it is when read from the environment.
+    pub fn with_limits(
+        global: ProviderLimit,
+        per_provider: impl IntoIterator<Item = (String, ProviderLimit)>,
+    ) -> Self {
+        Self {
+            global,
+            per_provider: per_provider
+                .into_iter()
+                .filter(|(_, limit)| !limit.is_unlimited())
+                .collect(),
         }
     }
 
@@ -1214,10 +1237,6 @@ pub fn build_limiter() -> Arc<dyn RateLimiter> {
 // ===========================================================================
 // Env helpers
 // ===========================================================================
-
-fn env_u32(key: &str) -> Option<u32> {
-    std::env::var(key).ok()?.trim().parse().ok()
-}
 
 fn env_u64(key: &str) -> Option<u64> {
     std::env::var(key).ok()?.trim().parse().ok()
@@ -2365,5 +2384,115 @@ mod tests {
         let key = RateKey::provider("openai");
         assert!(limiter.acquire(&key, 1).await.is_ok());
         limiter.penalize(&key, secs(1.0)).await; // no-op path, must not panic
+    }
+}
+
+#[cfg(test)]
+mod environment_contract {
+    //! Pins how the rate-limit variables are parsed, independently of the
+    //! process environment.
+    use super::{ProviderLimit, RateLimitConfig};
+
+    fn read(vars: &[(&str, &str)]) -> RateLimitConfig {
+        RateLimitConfig::from_lookup(&|key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn an_empty_environment_sets_no_limits() {
+        let config = read(&[]);
+        assert_eq!(config.resolve("openai"), ProviderLimit::default());
+    }
+
+    #[test]
+    fn provider_overrides_inherit_the_global_per_field() {
+        let config = read(&[
+            ("LLMSHIM_RATE_LIMIT_RPM", " 100 "),
+            ("LLMSHIM_RATE_LIMIT_TPM", "5000"),
+            ("LLMSHIM_OPENAI_RPM", "7"),
+            ("LLMSHIM_ANTHROPIC_TPM", "9"),
+        ]);
+        let limit = |rpm, tpm| ProviderLimit {
+            rpm: Some(rpm),
+            tpm: Some(tpm),
+        };
+        assert_eq!(config.resolve("openai"), limit(7, 5000));
+        assert_eq!(config.resolve("anthropic"), limit(100, 9));
+        assert_eq!(config.resolve("gemini"), limit(100, 5000));
+        assert_eq!(config.resolve("not-a-known-provider"), limit(100, 5000));
+    }
+
+    #[test]
+    fn unparsable_values_are_ignored() {
+        let config = read(&[
+            ("LLMSHIM_RATE_LIMIT_RPM", "fast"),
+            ("LLMSHIM_OPENAI_TPM", "-3"),
+        ]);
+        assert_eq!(config.resolve("openai"), ProviderLimit::default());
+    }
+
+    #[test]
+    fn explicit_limits_resolve_like_the_same_environment() {
+        let from_environment = read(&[
+            ("LLMSHIM_RATE_LIMIT_RPM", "100"),
+            ("LLMSHIM_OPENAI_RPM", "7"),
+            ("LLMSHIM_OPENAI_TPM", "8"),
+        ]);
+        let explicit = RateLimitConfig::with_limits(
+            ProviderLimit {
+                rpm: Some(100),
+                tpm: None,
+            },
+            [
+                (
+                    "openai".to_string(),
+                    ProviderLimit {
+                        rpm: Some(7),
+                        tpm: Some(8),
+                    },
+                ),
+                ("gemini".to_string(), ProviderLimit::default()),
+            ],
+        );
+        for provider in ["openai", "gemini", "anthropic"] {
+            assert_eq!(
+                explicit.resolve(provider),
+                from_environment.resolve(provider),
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_override_that_limits_nothing_is_dropped() {
+        // `resolve` falls back per field, so only `is_unlimited` shows whether
+        // the empty override was kept.
+        let none = RateLimitConfig::with_limits(
+            ProviderLimit::default(),
+            [("gemini".to_string(), ProviderLimit::default())],
+        );
+        assert!(none.is_unlimited());
+        let some = RateLimitConfig::with_limits(
+            ProviderLimit::default(),
+            [(
+                "gemini".to_string(),
+                ProviderLimit {
+                    rpm: Some(1),
+                    tpm: None,
+                },
+            )],
+        );
+        assert!(!some.is_unlimited());
+    }
+
+    #[test]
+    fn a_provider_outside_the_known_list_has_no_override_variable() {
+        // Pins KNOWN_PROVIDERS: adding a provider there is a deliberate change.
+        let config = read(&[("LLMSHIM_CEREBRAS_RPM", "5"), ("LLMSHIM_OPENAI_RPM", "6")]);
+        assert_eq!(config.resolve("cerebras"), ProviderLimit::default());
+        assert_eq!(config.resolve("openai").rpm, Some(6));
     }
 }
