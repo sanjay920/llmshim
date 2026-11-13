@@ -4,7 +4,7 @@
 #[path = "support/serve_harness.rs"]
 mod harness;
 
-use harness::{completion, config, start, tempdir, CALLER_KEY};
+use harness::{completion, config, run_with_args, start, tempdir, CALLER_KEY};
 use serde_json::json;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -177,6 +177,59 @@ async fn a_replacement_that_does_not_load_keeps_the_previous_certificate() {
     }
 }
 
+#[tokio::test]
+async fn each_listener_presents_only_its_own_certificate() {
+    let upstream = mockito::Server::new_async().await;
+    let main_certs = tempdir::Dir::new("tls-main");
+    let admin_certs = tempdir::Dir::new("tls-admin");
+    let (main_certificate, main_key) = certificate();
+    write_pair(&main_certs.0, &main_certificate, &main_key);
+    let (admin_certificate, admin_key) = certificate();
+    write_pair(&admin_certs.0, &admin_certificate, &admin_key);
+    let extra = format!(
+        "[admin]\nport = 0\ntoken = {{ env = \"SERVE_E2E_ADMIN_TOKEN\" }}\n\
+         [admin.tls]\ncert_file = \"{0}/tls.crt\"\nkey_file = \"{0}/tls.key\"\n",
+        admin_certs.0.display()
+    );
+    let server = start(
+        &tls_config(&upstream.url(), &main_certs.0, &extra),
+        "two-certificates",
+        &[],
+    );
+    let admin = server.admin.clone().expect("admin listener banner");
+    assert!(server.base.starts_with("https://"), "{}", server.base);
+    assert!(admin.starts_with("https://"), "{admin}");
+
+    let main_client = client_trusting(&main_certificate);
+    let admin_client = client_trusting(&admin_certificate);
+    // Each listener is trusted by its own certificate...
+    assert_eq!(
+        admin_client
+            .get(format!("{admin}/health"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert!(main_client
+        .get(format!("{}/health", server.base))
+        .send()
+        .await
+        .is_ok());
+    // ...and by no other: swapping the two configurations would fail here.
+    assert!(main_client
+        .get(format!("{admin}/health"))
+        .send()
+        .await
+        .is_err());
+    assert!(admin_client
+        .get(format!("{}/health", server.base))
+        .send()
+        .await
+        .is_err());
+}
+
 #[test]
 fn check_and_start_reject_a_key_that_does_not_match_the_certificate() {
     let directory = tempdir::Dir::new("tls-mismatch");
@@ -188,17 +241,17 @@ fn check_and_start_reject_a_key_that_does_not_match_the_certificate() {
         .replace("{DIR}", directory.0.to_str().unwrap());
     std::fs::write(&path, text).unwrap();
     for extra in [vec!["--check"], vec![]] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_llmshim"))
-            .args(["serve", "--config", path.to_str().unwrap()])
-            .args(&extra)
-            .env_clear()
-            .env("LLMSHIM_CATALOG_OFFLINE", "1")
-            .env("SERVE_E2E_CALLER_KEY", CALLER_KEY)
-            .env("SERVE_E2E_UPSTREAM_KEY", harness::UPSTREAM_KEY)
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(1), "{extra:?}: {stderr}");
+        // Bounded: a regression that started serving would otherwise hang CI.
+        let (code, stderr) = run_with_args(
+            &path,
+            &extra,
+            &[
+                ("LLMSHIM_CATALOG_OFFLINE", "1"),
+                ("SERVE_E2E_CALLER_KEY", CALLER_KEY),
+                ("SERVE_E2E_UPSTREAM_KEY", harness::UPSTREAM_KEY),
+            ],
+        );
+        assert_eq!(code, Some(1), "{extra:?}: {stderr}");
         assert!(
             stderr.contains("server.tls: cannot load the TLS certificate"),
             "{stderr}"

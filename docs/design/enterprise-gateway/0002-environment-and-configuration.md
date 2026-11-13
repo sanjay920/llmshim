@@ -56,16 +56,20 @@ environment):
 | Distributed timeouts and retention (`LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS`, `_WORKER_JOB_TIMEOUT_MS`, `_ORIGIN_LEASE_MS`, `_RETAINED_*`, `_UNARY/STREAM_TERMINAL_BYTES`) | `DistributedGateway` | `Tuning::from_lookup`; `distributed_from_parts(DistributedParts)` |
 | Application assembly | proxy and gateway `app*` | `app_with_parts(state, origin_policy, deadlines, receipt_store)` |
 | Caller keys | `KeyStore` | the hashed store in 0003 |
-| `LLMSHIM_TRUSTED_ORIGINS` | `OriginPolicy` | already had an env-free constructor, `from_csv`; `from_env` only handles the missing and non-Unicode cases |
+| `LLMSHIM_TRUSTED_ORIGINS` | `OriginPolicy` | already had an env-free constructor, `from_csv`; `from_env` only handles the missing and non-Unicode cases. `from_csv("")` is an error, so `serve` uses `OriginPolicy::default()` for an empty list |
 
 Still read from the environment, to convert before `serve` can boot:
 
 | Setting | Where | Notes |
 |---|---|---|
 | `LLMSHIM_PENALTY_SECS` | `penalty_duration()` | Read on each upstream 429. |
-| `LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS` | `configured_http_lock_timeout()` | Read per request. |
+| `LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS` | `ReceiptExecutor::new` | Read once, when the receipt store is constructed (not per request), so the store `serve` builds still obeys an ambient value until `DefaultReceiptStore` takes the timeout as an argument. |
+| `LLMSHIM_GATEWAY_IDEMPOTENCY_TTL_SECS` | `distributed_from_env` | Single-instance mode carries it in `LocalParts`; the distributed path still reads it from the environment. |
 | `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`, `LLMSHIM_UPSTREAM_*`, `LLMSHIM_HTTP_*` | shared HTTP client | Process-wide, initialized once. Needs a per-router client before it can come from a file. |
 | `LLMSHIM_MAX_CONCURRENCY`, `LLMSHIM_QUEUE_TIMEOUT_MS` | `Backpressure::from_env` | Proxy only; `Backpressure::new` already takes values. |
+| `LLMSHIM_HTTP_MAX_CONNECTIONS`, `LLMSHIM_HTTP_HEADER_TIMEOUT_MS` | `http_server` | Inbound listener limits; read by the proxy and gateway entry points. |
+| `LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS` | shared HTTP client deadlines | Process-wide, with the `LLMSHIM_UPSTREAM_*` timeouts above. |
+| `LLMSHIM_NO_STRICT`, `LLMSHIM_NO_SCHEMA_NORMALIZATION`, `LLMSHIM_NO_SCHEMA_CACHE` | schema normalization | Debugging bypasses; process-wide, read at use. A deployment that sets them changes what the server sends upstream, so `serve` documents them as unsupported settings. |
 
 ## Quirks found and preserved
 

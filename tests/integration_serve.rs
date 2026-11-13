@@ -5,9 +5,10 @@
 #[path = "support/serve_harness.rs"]
 mod harness;
 
-use harness::{chat, completion, config, start, tempdir, ADMIN_TOKEN, CALLER_KEY, UPSTREAM_KEY};
+use harness::{
+    chat, completion, config, run_to_exit, start, tempdir, ADMIN_TOKEN, CALLER_KEY, UPSTREAM_KEY,
+};
 use serde_json::{json, Value};
-use std::process::Command;
 
 #[tokio::test]
 async fn a_caller_with_a_key_reaches_the_upstream_with_the_upstream_key_only() {
@@ -118,13 +119,8 @@ fn a_configuration_problem_exits_one_without_binding_a_port() {
     let dir = tempdir::Dir::new("bad");
     let path = dir.0.join("bad.toml");
     std::fs::write(&path, "version = 1\n[server]\nhost = \"nope\"\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_llmshim"))
-        .args(["serve", "--config", path.to_str().unwrap()])
-        .env_clear()
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (code, stderr) = run_to_exit(&path, &[]);
+    assert_eq!(code, Some(1));
     assert!(stderr.contains("server.host"), "{stderr}");
     assert!(!stderr.contains("listening on"), "{stderr}");
 }
@@ -211,19 +207,21 @@ fn a_taken_admin_port_fails_the_start_cleanly() {
     let port = taken.local_addr().unwrap().port();
     let dir = tempdir::Dir::new("taken");
     let path = dir.0.join("gateway.toml");
-    let text = config("http://127.0.0.1:1", &format!("[admin]\nport = {port}"))
-        .replace("{DIR}", dir.0.to_str().unwrap());
+    let text = config(
+        "http://127.0.0.1:1",
+        &format!("[admin]\nport = {port}\nallow_unauthenticated = true"),
+    )
+    .replace("{DIR}", dir.0.to_str().unwrap());
     std::fs::write(&path, text).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_llmshim"))
-        .args(["serve", "--config", path.to_str().unwrap()])
-        .env_clear()
-        .env("LLMSHIM_CATALOG_OFFLINE", "1")
-        .env("SERVE_E2E_CALLER_KEY", CALLER_KEY)
-        .env("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (code, stderr) = run_to_exit(
+        &path,
+        &[
+            ("LLMSHIM_CATALOG_OFFLINE", "1"),
+            ("SERVE_E2E_CALLER_KEY", CALLER_KEY),
+            ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+        ],
+    );
+    assert_eq!(code, Some(1));
     assert!(
         stderr.contains("admin:") && stderr.contains("already in use"),
         "{stderr}"
@@ -232,6 +230,139 @@ fn a_taken_admin_port_fails_the_start_cleanly() {
         !stderr.contains("listening on"),
         "nothing is announced: {stderr}"
     );
+}
+
+#[test]
+fn a_failed_start_creates_nothing_on_disk() {
+    // A caller token that is too short is found while the application is
+    // assembled, after the receipts directory used to be created.
+    let dir = tempdir::Dir::new("nothing-created");
+    let path = dir.0.join("bad.toml");
+    let receipts = dir.0.join("receipts");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+            version = 1
+            [state]
+            receipts_dir = "{}"
+            [providers.inference]
+            kind = "openai-compatible"
+            base_url = "http://127.0.0.1:9/v1"
+            api_key = {{ env = "SERVE_E2E_UPSTREAM_KEY" }}
+            [[keys]]
+            name = "ci"
+            tenant = "platform"
+            secret = {{ env = "SERVE_E2E_CALLER_KEY" }}
+            "#,
+            receipts.display()
+        ),
+    )
+    .unwrap();
+    let (code, stderr) = run_to_exit(
+        &path,
+        &[
+            ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+            ("SERVE_E2E_CALLER_KEY", "short"),
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("keys[0].secret"), "{stderr}");
+    assert!(!receipts.exists(), "a failed start must not create files");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_receipts_directory_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let upstream = mockito::Server::new_async().await;
+    let server = start(&config(&upstream.url(), ""), "private-dir", &[]);
+    let mode = std::fs::metadata(server.dir.0.join("receipts"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+}
+
+#[test]
+fn a_caller_token_equal_to_an_upstream_key_is_refused_at_startup() {
+    // `check_references` runs in `serve --check`; assembly repeats it so that a
+    // caller of `build_app` cannot skip the rule.
+    let dir = tempdir::Dir::new("same-value");
+    let path = dir.0.join("bad.toml");
+    std::fs::write(
+        &path,
+        r#"
+        version = 1
+        [providers.inference]
+        kind = "openai-compatible"
+        base_url = "http://127.0.0.1:9/v1"
+        api_key = { env = "SERVE_E2E_UPSTREAM_KEY" }
+        [[keys]]
+        name = "ci"
+        tenant = "platform"
+        secret = { env = "SERVE_E2E_CALLER_KEY" }
+        "#,
+    )
+    .unwrap();
+    // Two different variables that hold the same value: only the values show it.
+    let (code, stderr) = run_to_exit(
+        &path,
+        &[
+            ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+            ("SERVE_E2E_CALLER_KEY", UPSTREAM_KEY),
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("same value as a provider"), "{stderr}");
+    assert!(!stderr.contains(UPSTREAM_KEY), "{stderr}");
+}
+
+#[test]
+fn an_admin_listener_without_a_token_must_be_opted_into() {
+    let dir = tempdir::Dir::new("tokenless-admin");
+    let path = dir.0.join("gateway.toml");
+    let text =
+        config("http://127.0.0.1:1", "[admin]\nport = 0").replace("{DIR}", dir.0.to_str().unwrap());
+    std::fs::write(&path, text).unwrap();
+    let (code, stderr) = run_to_exit(
+        &path,
+        &[
+            ("SERVE_E2E_CALLER_KEY", CALLER_KEY),
+            ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("admin.token"), "{stderr}");
+    assert!(stderr.contains("allow_unauthenticated"), "{stderr}");
+    assert!(!stderr.contains("listening on"), "{stderr}");
+}
+
+#[tokio::test]
+async fn an_opted_in_open_admin_listener_says_so_and_serves_without_a_token() {
+    let upstream = mockito::Server::new_async().await;
+    let extra = "[admin]\nport = 0\nallow_unauthenticated = true";
+    let server = start(&config(&upstream.url(), extra), "open-admin", &[]);
+    assert!(
+        server.admin_banner.contains("OPEN"),
+        "{}",
+        server.admin_banner
+    );
+    let admin = server.admin.clone().unwrap();
+    let response = reqwest::get(format!("{admin}/metrics")).await.unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+#[tokio::test]
+async fn a_protected_admin_listener_says_a_token_is_required() {
+    let upstream = mockito::Server::new_async().await;
+    let server = start(&admin_config(&upstream.url()), "protected-admin", &[]);
+    assert!(
+        server.admin_banner.contains("token required"),
+        "{}",
+        server.admin_banner
+    );
+    assert!(!server.admin_banner.contains("OPEN"));
 }
 
 #[tokio::test]

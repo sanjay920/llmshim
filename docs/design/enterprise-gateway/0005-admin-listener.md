@@ -20,8 +20,14 @@ own:
 [admin]
 host = "127.0.0.1"           # default
 port = 9090
-token = { env = "ADMIN_TOKEN" }   # optional
+token = { env = "ADMIN_TOKEN" }   # or: allow_unauthenticated = true
 ```
+
+An `[admin]` table must say how it is protected: set `token`, or set
+`allow_unauthenticated = true` to serve the endpoints without one. Neither, or
+both, is a configuration error, so an operational listener is never open by
+accident (the same rule the main listener follows). The startup banner prints
+which of the two is in force.
 
 - The admin listener serves exactly the four operational routes, with the same
   handlers as the main application (`gateway::http::admin_routes`).
@@ -33,13 +39,16 @@ token = { env = "ADMIN_TOKEN" }   # optional
   listener, including unknown paths, requires the token too, so a probe
   cannot be used to map the listener.
 - The token is compared as a SHA-256 digest in constant time. It follows the
-  caller-token rules (at least 16 characters, no whitespace), and it must be a
-  different secret from every provider key and caller key, by reference at load
-  time and by resolved value in `--check` and at startup.
+  caller-token rules (at least 16 characters, visible ASCII only), checked by
+  `--check` and at startup alike, and it must be a different secret from every
+  provider key and caller key, by reference at load time and by resolved value
+  (including a `sha256` caller key's digest) in `--check` and at startup.
 - Without `[admin]` nothing changes: the endpoints are on the main listener, as
   under `gateway`. The startup banner says so and points at `[admin]`.
 - Both listeners are bound before anything is announced, so a port conflict on
-  either leaves no half-started server. One SIGTERM or Ctrl-C drains both.
+  either leaves no half-started server. One SIGTERM or Ctrl-C drains both, and
+  if either listener stops on its own the other is stopped too, so a surviving
+  `/ready` cannot report a server whose other half is gone.
 
 ## Not done
 

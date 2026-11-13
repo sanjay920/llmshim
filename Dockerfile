@@ -1,8 +1,14 @@
 # Build stage
-FROM rust:1.86-slim AS builder
+# The builder and the runtime must share a glibc: bookworm here matches the
+# distroless debian12 runtime below. A newer builder image links a newer glibc
+# than the runtime has, and the binary fails to start.
+FROM rust:1.99-slim-bookworm AS builder
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+# The workspace has a second member, the model catalog, that the root crate
+# depends on by path.
+COPY crates/ crates/
 COPY src/ src/
 COPY api/ api/
 
@@ -18,7 +24,7 @@ RUN mkdir -p examples benchmarks && \
           benchmarks/bench.rs benchmarks/loadtest.rs benchmarks/gateway_loadtest.rs
 
 # Build with rustls (no OpenSSL needed) + strip binary
-RUN cargo build --release --features ${FEATURES} && \
+RUN cargo build --release --locked --features ${FEATURES} && \
     strip target/release/llmshim
 
 # Runtime stage — distroless (just glibc + CA certs, no shell)
