@@ -19,9 +19,15 @@ use crate::providers::{
 use crate::proxy::ratelimit::{InMemoryRateLimiter, ProviderLimit, RateLimitConfig};
 use crate::proxy::wire::{DefaultReceiptStore, Receipts};
 use crate::router::Router;
+use axum::extract::Request;
+use axum::http::{header, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 
 /// Idempotency answers are kept this long unless `state.idempotency_ttl_secs`
 /// says otherwise (the gateway's existing default).
@@ -31,6 +37,9 @@ const DEFAULT_IDEMPOTENCY_TTL_SECS: u64 = 300;
 pub struct Built {
     pub app: axum::Router,
     pub address: SocketAddr,
+    /// The operational endpoints on a listener of their own, when `[admin]` is
+    /// configured. The main application then answers 404 for those paths.
+    pub admin: Option<(axum::Router, SocketAddr)>,
     /// Provider names, for the startup banner.
     pub providers: Vec<String>,
     pub caller_keys: usize,
@@ -82,6 +91,47 @@ pub fn build_app(
         });
     }
 
+    let admin_token = match config.admin.as_ref().and_then(|admin| admin.token.as_ref()) {
+        Some(secret) => match read_secret(secret, env) {
+            Ok(token) if token.chars().any(char::is_whitespace) => {
+                issues.push(Issue {
+                    path: "admin.token".into(),
+                    message: "must not contain whitespace".into(),
+                });
+                None
+            }
+            Ok(token) if token.chars().count() < super::keys::MIN_TOKEN_LEN => {
+                issues.push(Issue {
+                    path: "admin.token".into(),
+                    message: format!("must be at least {} characters", super::keys::MIN_TOKEN_LEN),
+                });
+                None
+            }
+            Ok(token) => Some(Sha256::digest(token.as_bytes()).to_vec()),
+            Err(message) => {
+                issues.push(Issue {
+                    path: "admin.token".into(),
+                    message,
+                });
+                None
+            }
+        },
+        None => None,
+    };
+    let admin_address = match &config.admin {
+        Some(admin) => match parse_address(&admin.host, admin.port) {
+            Ok(address) => Some(address),
+            Err(message) => {
+                issues.push(Issue {
+                    path: "admin.host".into(),
+                    message,
+                });
+                None
+            }
+        },
+        None => None,
+    };
+
     let (Some(keystore), true) = (keystore, issues.is_empty()) else {
         return Err(issues);
     };
@@ -128,6 +178,7 @@ pub fn build_app(
         },
     );
 
+    let admin_state = state.clone();
     let app = app_with_parts(
         state,
         // No browser origin is trusted. Browsers are not callers of a gateway.
@@ -135,13 +186,72 @@ pub fn build_app(
         crate::proxy::lifetime::LogicalRequestDeadlines::from_lookup(&|_| None, "unused", "unused"),
         DefaultReceiptStore::at(receipts_root),
     );
+    let (app, admin) = match admin_address {
+        Some(admin_address) => {
+            let routes = crate::gateway::http::admin_routes(admin_state);
+            let routes = match admin_token {
+                Some(digest) => routes.layer(axum::middleware::from_fn(
+                    move |request: Request, next: Next| {
+                        let digest = digest.clone();
+                        async move { require_admin_token(&digest, request, next).await }
+                    },
+                )),
+                None => routes,
+            };
+            (
+                app.layer(axum::middleware::from_fn(hide_admin_paths)),
+                Some((routes, admin_address)),
+            )
+        }
+        None => (app, None),
+    };
     Ok(Built {
         app,
+        admin,
         address,
         providers,
         caller_keys: config.keys.len(),
         authenticated,
     })
+}
+
+/// The main listener does not serve operational endpoints once they have a
+/// listener of their own.
+async fn hide_admin_paths(request: Request, next: Next) -> Response {
+    if crate::gateway::http::ADMIN_PATHS.contains(&request.uri().path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    next.run(request).await
+}
+
+/// `/metrics` and `/v1/gateway/stats` need the admin token; probes stay open.
+async fn require_admin_token(expected: &[u8], request: Request, next: Next) -> Response {
+    if matches!(request.uri().path(), "/health" | "/ready") {
+        return next.run(request).await;
+    }
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let accepted = presented
+        .map(|token| bool::from(Sha256::digest(token.as_bytes()).as_slice().ct_eq(expected)))
+        .unwrap_or(false);
+    if accepted {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response()
+    }
 }
 
 fn parse_address(host: &str, port: u16) -> Result<SocketAddr, String> {

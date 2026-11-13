@@ -70,6 +70,10 @@ pub struct ServeConfig {
     pub limits: Limits,
     #[serde(default)]
     pub state: State,
+    /// A separate listener for operational endpoints. Without it they are
+    /// served on the main listener, as the gateway does.
+    #[serde(default)]
+    pub admin: Option<Admin>,
     #[serde(default)]
     pub keys: Vec<GatewayKey>,
     #[serde(default, deserialize_with = "unique_map")]
@@ -138,6 +142,25 @@ fn default_host() -> String {
 }
 fn default_port() -> u16 {
     3000
+}
+
+/// A second listener for operational endpoints: `/metrics`,
+/// `/v1/gateway/stats`, `/health` and `/ready`. When it is configured the main
+/// listener answers 404 for all four, so callers never reach them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Admin {
+    /// IP address to bind. Defaults to loopback.
+    #[serde(default = "default_host")]
+    pub host: String,
+    pub port: u16,
+    /// Bearer token required for `/metrics` and `/v1/gateway/stats`, by
+    /// reference. `/health` and `/ready` stay open so orchestrators can probe.
+    /// Without it the admin listener is open and must be protected by the
+    /// network.
+    #[serde(default)]
+    pub token: Option<SecretRef>,
 }
 
 /// Where the server keeps what it must remember between requests.
@@ -411,6 +434,7 @@ impl ServeConfig {
             return issues;
         }
         self.validate_server(&mut issues);
+        self.validate_admin(&mut issues);
         self.validate_providers(&mut issues);
         self.validate_limits(&mut issues);
         self.validate_state(&mut issues);
@@ -439,6 +463,45 @@ impl ServeConfig {
                 "server.allow_unauthenticated",
                 "cannot be true while [[keys]] are defined",
             ));
+        }
+    }
+
+    fn validate_admin(&self, issues: &mut Vec<Issue>) {
+        let Some(admin) = &self.admin else {
+            return;
+        };
+        let bare = admin
+            .host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&admin.host);
+        if bare.parse::<std::net::IpAddr>().is_err() {
+            issues.push(Issue::new("admin.host", "must be an IPv4 or IPv6 address"));
+        }
+        if admin.port != 0
+            && admin.port == self.server.port
+            && admin.host.trim_matches(['[', ']']) == self.server.host.trim_matches(['[', ']'])
+        {
+            issues.push(Issue::new(
+                "admin.port",
+                "must differ from server.port when both listen on the same address",
+            ));
+        }
+        if let Some(token) = &admin.token {
+            validate_secret(token, "admin.token", issues);
+            let reference = format!("{token:?}");
+            let shared = self
+                .providers
+                .values()
+                .filter_map(|p| p.api_key.as_ref())
+                .chain(self.keys.iter().filter_map(|k| k.secret.as_ref()))
+                .any(|other| format!("{other:?}") == reference);
+            if shared {
+                issues.push(Issue::new(
+                    "admin.token",
+                    "refers to a provider key or a caller key; use a separate secret",
+                ));
+            }
         }
     }
 
@@ -657,7 +720,12 @@ impl ServeConfig {
                 .as_ref()
                 .map(|secret| (format!("keys[{index}].secret"), secret))
         });
-        providers.chain(keys).collect()
+        let admin = self
+            .admin
+            .iter()
+            .filter_map(|admin| admin.token.as_ref())
+            .map(|secret| ("admin.token".to_string(), secret));
+        providers.chain(keys).chain(admin).collect()
     }
 
     /// Check that every referenced secret exists and is non-empty, without
@@ -688,6 +756,19 @@ impl ServeConfig {
             }
             if !callers.insert(value) {
                 issues.push(Issue::new(&at, "has the same value as another caller key"));
+            }
+        }
+        if let Some(value) = self
+            .admin
+            .as_ref()
+            .and_then(|admin| admin.token.as_ref())
+            .and_then(read)
+        {
+            if upstream.contains(&value) || callers.contains(&value) {
+                issues.push(Issue::new(
+                    "admin.token",
+                    "has the same value as a provider key or a caller key",
+                ));
             }
         }
         for (at, secret) in self.secret_refs() {
@@ -1070,6 +1151,47 @@ mod tests {
         let pasted = MINIMAL.replace("OPENAI_API_KEY", "sk_live_AbCdEf123");
         let found = issues(&pasted);
         assert!(has(&found, "providers.openai.api_key.env"), "{found:?}");
+    }
+
+    #[test]
+    fn the_admin_listener_is_validated() {
+        let ok = format!("{MINIMAL}\n[admin]\nport = 9090\ntoken = {{ env = \"ADMIN_TOKEN\" }}");
+        let config = ServeConfig::parse(&ok, Format::Toml).unwrap();
+        assert_eq!(config.admin.as_ref().unwrap().host, "127.0.0.1");
+        for (bad, path) in [
+            ("host = \"nope\"\nport = 9090", "admin.host"),
+            ("port = 3000", "admin.port"),
+            (
+                "port = 9090\ntoken = { env = \"OPENAI_API_KEY\" }",
+                "admin.token",
+            ),
+            (
+                "port = 9090\ntoken = { env = \"CI_GATEWAY_KEY\" }",
+                "admin.token",
+            ),
+            (
+                "port = 9090\ntoken = { env = \"lower\" }",
+                "admin.token.env",
+            ),
+        ] {
+            let found = issues(&format!("{MINIMAL}\n[admin]\n{bad}"));
+            assert!(has(&found, path), "{bad}: {found:?}");
+        }
+        // Port 0 means "pick one", so two zeros do not collide.
+        let zeros = format!("{MINIMAL}\n[server]\nport = 0\n[admin]\nport = 0");
+        assert!(ServeConfig::parse(&zeros, Format::Toml).is_ok());
+    }
+
+    #[test]
+    fn an_admin_token_cannot_share_a_value_with_other_secrets() {
+        let text = format!("{MINIMAL}\n[admin]\nport = 9090\ntoken = {{ env = \"ADMIN_TOKEN\" }}");
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        let all_same = |_: &str| Some("one-value-for-everything".to_string());
+        let found = config.check_references(&all_same);
+        assert!(found.iter().any(|i| i.path == "admin.token"), "{found:?}");
+        assert!(!found
+            .iter()
+            .any(|i| i.message.contains("one-value-for-everything")));
     }
 
     #[test]

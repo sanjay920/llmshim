@@ -54,9 +54,9 @@ server works.
 
 ## Known limits (each is a roadmap item)
 
-- `/metrics`, `/ready` and `/health` are unauthenticated, as they are under
-  `gateway`. Bind to an internal interface or restrict them at the network
-  layer until they are separately configurable.
+- Without an `[admin]` table, `/metrics`, `/ready`, `/health` and
+  `/v1/gateway/stats` are on the main listener and unauthenticated, as under
+  `gateway`. `[admin]` (0005) moves them to a listener of their own.
 - No TLS termination. Run behind a terminating proxy or service mesh.
 - No reload. A change needs a restart; the parsed configuration is immutable so
   a swap can be added without touching the data plane.

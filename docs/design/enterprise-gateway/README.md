@@ -38,6 +38,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0002: Environment variables and the configuration file](0002-environment-and-configuration.md)
 - [0003: Caller keys under serve](0003-caller-keys.md)
 - [0004: serve runs the gateway from a file](0004-serve-boot.md)
+- [0005: A separate listener for operational endpoints](0005-admin-listener.md)
 
 ## Roadmap
 
@@ -58,7 +59,8 @@ Phase 0: a production server mode
       feature is not compiled is a startup error naming the rebuild flag
 - [ ] Redis fleet mode under `serve`
 - [ ] Configuration reload without restart
-- [ ] Authenticated or separately bound `/metrics` and `/ready`; TLS termination
+- [x] Separately bound, optionally token-protected `/metrics`, stats and probes (0005)
+- [ ] TLS termination
 - [ ] OpenTelemetry traces and metrics
 - [ ] Helm chart, signed images, SBOM
 - [ ] Reproducible benchmark and an outage-survival test
