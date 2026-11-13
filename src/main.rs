@@ -782,10 +782,11 @@ async fn build_gateway_state(
     llmshim::gateway::http::GatewayState::from_env(router, logger)
 }
 
-/// Validate a server configuration file. Exit codes: 0 valid, 1 invalid,
-/// 2 valid but serving from a file is not built yet.
+/// Run the server described by a configuration file, or with `--check` only
+/// validate it. Exit codes: 0 valid (or clean shutdown), 1 invalid or failed
+/// to start, 2 usage error (reported before this runs).
 #[cfg(feature = "serve")]
-fn cmd_serve(options: &cli::ServeOptions) -> i32 {
+async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     let path = std::path::Path::new(options.config.as_deref().unwrap_or_default());
     let report = |issues: &[llmshim::serve::Issue]| {
         eprintln!("{}: {} problem(s)", path.display(), issues.len());
@@ -793,6 +794,7 @@ fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             eprintln!("  {issue}");
         }
     };
+    let env = |name: &str| std::env::var(name).ok();
     let config = match llmshim::serve::ServeConfig::load(path) {
         Ok(config) => config,
         Err(issues) => {
@@ -800,19 +802,19 @@ fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             return 1;
         }
     };
-    let missing = config.check_references(&|name| std::env::var(name).ok());
+    let missing = config.check_references(&env);
     if !missing.is_empty() {
         report(&missing);
         return 1;
     }
-    // Building the caller-key store is the stricter check: it also enforces
-    // token length and whitespace, which a reference check cannot.
-    if let Err(issues) = llmshim::serve::build_key_store(&config, &|name| std::env::var(name).ok())
-    {
-        report(&issues);
-        return 1;
-    }
     if options.check {
+        // Building the caller-key store is the stricter check: it also enforces
+        // token length and whitespace, which a reference check cannot. Nothing
+        // is created or started.
+        if let Err(issues) = llmshim::serve::build_key_store(&config, &env) {
+            report(&issues);
+            return 1;
+        }
         println!(
             "{}: valid (version {}, {} provider(s), {} key(s), {} route(s))",
             path.display(),
@@ -823,12 +825,41 @@ fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         );
         return 0;
     }
-    eprintln!(
-        "{} is valid, but serving from a configuration file is not available in this build yet. \
-         Use --check to validate, or run `llmshim gateway`.",
-        path.display()
-    );
-    2
+    let built = match llmshim::serve::build_app(&config, &env) {
+        Ok(built) => built,
+        Err(issues) => {
+            report(&issues);
+            return 1;
+        }
+    };
+    let listener = match cli::bind(built.address).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    let address = match listener.local_addr() {
+        Ok(address) => address,
+        Err(error) => {
+            eprintln!("cannot read listener address: {error}");
+            return 1;
+        }
+    };
+    eprintln!("llmshim serve listening on http://{address}");
+    eprintln!("  Providers: {:?}", built.providers);
+    if built.authenticated {
+        eprintln!("  Auth: ENFORCED ({} caller key(s))", built.caller_keys);
+    } else {
+        eprintln!("  Auth: OPEN (server.allow_unauthenticated = true)");
+    }
+    match http_server::serve(listener, built.app, shutdown_signal()).await {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
 }
 
 // ============================================================
@@ -845,7 +876,9 @@ fn print_global_usage() {
     eprintln!("  proxy                 Start HTTP proxy server (--host IP, --port PORT)");
     eprintln!("  gateway               Start priority-queue gateway (--host IP, --port PORT)");
     #[cfg(feature = "serve")]
-    eprintln!("  serve --config PATH   Validate a server configuration (--check); in development");
+    eprintln!(
+        "  serve --config PATH   Run a server from a configuration file (--check validates only)"
+    );
     eprintln!("  docker start          Start proxy in Docker");
     eprintln!("  docker stop           Stop Docker proxy");
     eprintln!("  docker status|logs    Container status and logs");
@@ -1195,7 +1228,7 @@ async fn main() {
             }
         }
         #[cfg(feature = "serve")]
-        "serve" => std::process::exit(cmd_serve(&options.serve)),
+        "serve" => std::process::exit(cmd_serve(&options.serve).await),
         "chat" => { /* fall through to chat */ }
         _ => {
             eprintln!("Unknown command: {}\n", cmd);

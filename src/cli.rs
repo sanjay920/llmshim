@@ -184,7 +184,7 @@ pub(crate) fn usage(command: &str) -> Option<&'static str> {
         "proxy"=>"Usage: llmshim proxy [--host <IP>] [--port <PORT>]\n\nCLI options override LLMSHIM_HOST/LLMSHIM_PORT and saved configuration.\n  -h, --help  Print help without starting the server",
         "gateway"=>"Usage: llmshim gateway [--host <IP>] [--port <PORT>]\n\nCLI options override LLMSHIM_HOST/LLMSHIM_PORT and saved configuration.\n  -h, --help  Print help without starting the server",
         #[cfg(feature = "serve")]
-        "serve"=>"Usage: llmshim serve --config <PATH> [--check]\n\nIn development. Reads a versioned .toml or .json server configuration.\n  --check     Validate the file and its secret references, then exit\n  -h, --help  Print help without starting the server",
+        "serve"=>"Usage: llmshim serve --config <PATH> [--check]\n\nIn development. Runs the gateway from a versioned .toml or .json server configuration.\nReads nothing from the environment except the variables the file names.\n  --check     Validate the file and its secret references, then exit\n  -h, --help  Print help without starting the server",
         "chat"=>"Usage: llmshim chat [--log <PATH>]",
         "models"=>"Usage: llmshim models [--all] [--json] [--refresh]",
         "get"=>"Usage: llmshim get <key>",

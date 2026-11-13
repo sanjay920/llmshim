@@ -672,9 +672,16 @@ The default-off `serve` feature (`serve = ["gateway"]`, implied by nothing) hold
 the config-file-driven server being built toward an enterprise gateway. Read
 `docs/design/enterprise-gateway/README.md` first: it has the working rules and
 the roadmap checklist, and each contract has a numbered design note there.
-Today only `llmshim serve --config <file> --check` exists (`src/serve/config.rs`):
-a versioned TOML/JSON file, unknown fields rejected, secrets by reference only
-and never echoed, unauthenticated serving explicit. The feature is **unstable
+Today `llmshim serve --config <file>` runs the single-instance gateway from a
+versioned TOML/JSON file (`src/serve/`: `config.rs` the contract, `keys.rs` the
+hashed caller-key store, `build.rs` the assembly), and `--check` validates it
+without starting anything. Unknown fields are rejected, secrets are references
+only and never echoed, unauthenticated serving is explicit, and the file is the
+source of every setting that belongs to the server (it reads the environment
+to resolve `{ env = ... }` references; the process-wide settings of the shared
+HTTP client and listener, and the standard `HTTP_PROXY`/`HTTPS_PROXY`/
+`ALL_PROXY` variables, still apply and are listed in 0002 and 0004). Fleet (Redis) mode, reload and TLS are not
+implemented. The feature is **unstable
 and outside the semver rule** until declared stable. Default, `proxy`,
 `gateway` and `gateway-redis` builds must not change; `tests/unit_serve_cli.rs`
 pins that a build without the feature does not know the command. Never drive

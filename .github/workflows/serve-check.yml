@@ -24,3 +24,4 @@ jobs:
         run: |
           cargo test --locked --features serve --lib serve::
           cargo test --locked --features serve --test unit_serve_cli
+          cargo test --locked --features serve --test integration_serve

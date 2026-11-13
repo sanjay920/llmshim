@@ -1,7 +1,7 @@
 # 0001: Server configuration file
 
 Status: implemented (parsing, validation, `--check`). Serving from the file is
-not implemented yet.
+described in 0004.
 
 ## Problem
 
@@ -45,6 +45,8 @@ drift from the code.
 | With no `[[keys]]`, the file is invalid unless `server.allow_unauthenticated = true`. Setting both is also invalid. | Unauthenticated serving is a deliberate choice, never a default. |
 | `server.host` defaults to `127.0.0.1`. | Listening on every interface is opt-in. |
 | A provider's table name is its routing prefix. `route` is reserved. | Matches the existing `provider/model` grammar and named routes. |
+| A hosted provider (`openai`, `anthropic`, `gemini`, `xai`, `cerebras`, `openrouter`) must be named for its kind, once. A self-hosted `openai-compatible` server may not use a hosted name. | Prices, limits and the catalog are looked up by provider name. Multiple credentials per provider is a later feature. |
+| `state.receipts_dir` is absolute; `state.idempotency_ttl_secs` is 1 to 604800. | Operators mount a volume for receipts; the bound keeps a typo from holding answers for years. |
 | `base_url` must be `http(s)://host[/path]` with no credentials, query or fragment. | Redirects are disabled in the client, so this must be the final endpoint; credentials belong in `api_key`. |
 | Routes carry their defaults in an explicit `settings` table, name their model as `<provider>/<model>` with a defined provider, and may not point at another route. | Keeps unknown-field checking on the route itself, and a route that could never resolve fails at `--check`, not at the first request. |
 | Budget bounds match the gateway ledger (0 to 9007199.254740992 USD, finite). | One definition of a representable cap. |
