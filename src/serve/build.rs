@@ -114,6 +114,24 @@ pub async fn build_app(
         });
     }
 
+    // The log is opened now so a path that cannot be written fails the start.
+    let access_log = match config
+        .logging
+        .access_log
+        .as_deref()
+        .map(super::access_log::AccessLog::open)
+    {
+        Some(Ok(log)) => Some(std::sync::Arc::new(log)),
+        Some(Err(message)) => {
+            issues.push(Issue {
+                path: "logging.access_log".into(),
+                message,
+            });
+            None
+        }
+        None => None,
+    };
+
     let admin_token = match config.admin.as_ref().and_then(|admin| admin.token.as_ref()) {
         Some(secret) => match read_secret(secret, env) {
             Ok(token) if token.chars().any(char::is_whitespace) => {
@@ -252,6 +270,23 @@ pub async fn build_app(
             )
         }
         None => (app, None),
+    };
+    // Outermost, so the log sees every outcome, including a request refused
+    // before it reaches a handler and the 404 for a hidden admin path. It
+    // resolves the caller with a store of its own built from the same file.
+    let app = match access_log {
+        Some(log) => match build_key_store(config, env) {
+            Ok(keys) => {
+                let keys = Arc::new(keys);
+                app.layer(axum::middleware::from_fn(
+                    move |request: Request, next: Next| {
+                        super::access_log::record_request(log.clone(), keys.clone(), request, next)
+                    },
+                ))
+            }
+            Err(issues) => return Err(issues),
+        },
+        None => app,
     };
     Ok(Built {
         app,

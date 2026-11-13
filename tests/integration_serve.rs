@@ -257,3 +257,117 @@ async fn without_fleet_mode_each_replica_counts_its_own_requests() {
     }
     mock.assert_async().await;
 }
+
+fn access_lines(path: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("each line is JSON"))
+        .collect()
+}
+
+/// The first eight hex characters of the SHA-256 of a token, as the log prints.
+fn fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(token.as_bytes()))[..8].to_string()
+}
+
+#[tokio::test]
+async fn the_access_log_attributes_each_request_without_recording_a_secret() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .expect(1)
+        .create_async()
+        .await;
+    let dir = tempdir::Dir::new("access-log");
+    let log_path = dir.0.join("access.jsonl");
+    let extra = format!("[logging]\naccess_log = \"{}\"", log_path.display());
+    let server = start(&config(&upstream.url(), &extra), "access", &[]);
+
+    // An accepted request, a request with a wrong key, and one with none.
+    let ok = chat(&server, Some(CALLER_KEY), "inference/test-model").await;
+    assert_eq!(ok.status(), 200);
+    let wrong = "a-wrong-token-0123456789";
+    assert_eq!(
+        chat(&server, Some(wrong), "inference/test-model")
+            .await
+            .status(),
+        401
+    );
+    assert_eq!(
+        chat(&server, None, "inference/test-model").await.status(),
+        401
+    );
+    // A query string must not reach the log.
+    let health = reqwest::Client::new()
+        .get(format!("{}/health?secret-in-query=hunter2", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+
+    let lines = access_lines(&log_path);
+    assert_eq!(lines.len(), 4, "{lines:#?}");
+
+    let accepted = &lines[0];
+    assert_eq!(accepted["status"], 200);
+    assert_eq!(accepted["method"], "POST");
+    assert_eq!(accepted["path"], "/v1/chat/completions");
+    assert_eq!(accepted["tenant"], "platform");
+    assert_eq!(accepted["credential"], fingerprint(CALLER_KEY));
+    assert!(accepted["request_id"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert!(accepted["latency_ms"].is_u64());
+    assert!(accepted["ts"].as_str().is_some_and(|ts| ts.ends_with('Z')));
+
+    let refused = &lines[1];
+    assert_eq!(refused["status"], 401);
+    assert!(refused["tenant"].is_null(), "an unknown key has no tenant");
+    assert_eq!(refused["credential"], fingerprint(wrong));
+    assert!(lines[2]["credential"].is_null() && lines[2]["tenant"].is_null());
+
+    assert_eq!(lines[3]["path"], "/health", "the query string is dropped");
+
+    // Nothing sensitive is anywhere in the file.
+    let raw = std::fs::read_to_string(&log_path).unwrap();
+    for secret in [CALLER_KEY, UPSTREAM_KEY, wrong, "hunter2", "ping", "pong"] {
+        assert!(!raw.contains(secret), "{secret} leaked into the access log");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&log_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "the log is owner-only");
+    }
+}
+
+#[test]
+fn an_unwritable_access_log_fails_the_start_with_the_setting_named() {
+    let dir = tempdir::Dir::new("access-bad");
+    let path = dir.0.join("gateway.toml");
+    let text = config(
+        "http://127.0.0.1:1",
+        "[logging]\naccess_log = \"/nonexistent-directory/access.jsonl\"",
+    )
+    .replace("{DIR}", dir.0.to_str().unwrap());
+    std::fs::write(&path, text).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args(["serve", "--config", path.to_str().unwrap()])
+        .env_clear()
+        .env("LLMSHIM_CATALOG_OFFLINE", "1")
+        .env("SERVE_E2E_CALLER_KEY", CALLER_KEY)
+        .env("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("logging.access_log: cannot open"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("listening on"), "{stderr}");
+}

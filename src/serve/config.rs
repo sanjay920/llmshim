@@ -70,6 +70,8 @@ pub struct ServeConfig {
     pub limits: Limits,
     #[serde(default)]
     pub state: State,
+    #[serde(default)]
+    pub logging: Logging,
     /// Run as one replica of a fleet sharing a Redis instance. Without it the
     /// server is a single instance with in-process state.
     #[serde(default)]
@@ -220,6 +222,21 @@ pub struct State {
     /// Defaults to 300.
     #[serde(default)]
     pub idempotency_ttl_secs: Option<u64>,
+}
+
+/// What the server records about the requests it handles.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Logging {
+    /// One JSON line per request on the main listener: when, request id, method,
+    /// path, status, latency to the response headers, the caller's tenant and a
+    /// short fingerprint of the credential. Never a token, a header or a body.
+    /// `"stdout"`, or an absolute file path (created with owner-only access and
+    /// appended to; rotate it with `copytruncate` or let the platform collect
+    /// stdout). Off when absent.
+    #[serde(default)]
+    pub access_log: Option<String>,
 }
 
 /// Which adapter a provider entry uses.
@@ -484,6 +501,7 @@ impl ServeConfig {
         self.validate_providers(&mut issues);
         self.validate_limits(&mut issues);
         self.validate_state(&mut issues);
+        self.validate_logging(&mut issues);
         self.validate_keys(&mut issues);
         self.validate_routes(&mut issues);
         issues
@@ -625,6 +643,24 @@ impl ServeConfig {
                     "is required for kind \"openai-compatible\"",
                 )),
                 None => {}
+            }
+        }
+    }
+
+    fn validate_logging(&self, issues: &mut Vec<Issue>) {
+        if let Some(target) = &self.logging.access_log {
+            let is_file = std::path::Path::new(target).has_root();
+            if target != "stdout" && !is_file {
+                issues.push(Issue::new(
+                    "logging.access_log",
+                    "must be \"stdout\" or an absolute file path",
+                ));
+            }
+            if is_file && target.ends_with('/') {
+                issues.push(Issue::new(
+                    "logging.access_log",
+                    "must name a file, not a directory",
+                ));
             }
         }
     }
@@ -1251,6 +1287,18 @@ mod tests {
         let pasted = MINIMAL.replace("OPENAI_API_KEY", "sk_live_AbCdEf123");
         let found = issues(&pasted);
         assert!(has(&found, "providers.openai.api_key.env"), "{found:?}");
+    }
+
+    #[test]
+    fn the_access_log_target_is_validated() {
+        for ok in ["stdout", "/var/log/llmshim/access.jsonl"] {
+            let text = format!("{MINIMAL}\n[logging]\naccess_log = \"{ok}\"");
+            assert!(ServeConfig::parse(&text, Format::Toml).is_ok(), "{ok}");
+        }
+        for bad in ["stderr", "access.jsonl", "", "/var/log/dir/"] {
+            let found = issues(&format!("{MINIMAL}\n[logging]\naccess_log = \"{bad}\""));
+            assert!(has(&found, "logging.access_log"), "{bad:?}: {found:?}");
+        }
     }
 
     #[test]

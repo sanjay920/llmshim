@@ -26,6 +26,11 @@ api_key = { file = "/run/secrets/anthropic-api-key" }
 kind = "openai-compatible"
 base_url = "http://inference.internal.example:8000/v1"
 
+# One JSON line per request: tenant, status, latency, request id, and a short
+# credential fingerprint. Never a token, query string or body.
+[logging]
+access_log = "stdout"
+
 [limits]
 max_concurrency = 256
 queue_timeout_ms = 5000
