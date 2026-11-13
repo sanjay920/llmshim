@@ -35,6 +35,7 @@ Each step must be correct, tested and reversible before the next begins.
 ## Design notes
 
 - [0001: Server configuration file](0001-server-config.md)
+- [0002: Environment variables and the configuration file](0002-environment-and-configuration.md)
 
 ## Roadmap
 
@@ -42,9 +43,11 @@ Phase 0: a production server mode
 
 - [x] `serve` feature flag and the versioned configuration contract, with
       `llmshim serve --config <file> --check` (0001)
-- [ ] Environment-free constructors for the proxy and gateway internals
-      (`from_env()` becomes `from_parts(Parts::from_env())`, behavior pinned by
-      existing tests); config-versus-environment precedence written down
+- [x] Environment-free constructors, first part: scheduler tuning, rate
+      limits and single-instance gateway assembly; precedence written down (0002)
+- [ ] Environment-free constructors, second part: the remaining rows of the
+      inventory in 0002 that `serve` needs (caller keys with hashed lookup and
+      returned errors, origin policy, deadlines, receipts, breaker)
 - [ ] `llmshim serve` boots the gateway backend from the file, including
       hashed caller keys
 - [ ] Bedrock, Vertex and Azure configurable from the file; a provider whose

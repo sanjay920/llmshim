@@ -203,33 +203,85 @@ pub struct GatewayState {
     overloaded_retry_after: Duration,
 }
 
+/// Everything the single-instance gateway state is built from. Grouping these
+/// lets a caller supply them from a configuration file instead of the
+/// environment, and makes the set of inputs explicit.
+pub(crate) struct LocalParts {
+    pub config: GatewayConfig,
+    pub breaker: Arc<crate::breaker::ProviderBreaker>,
+    /// Admission limiter for the scheduler's dispatch loop.
+    pub limiter: Arc<dyn crate::proxy::ratelimit::RateLimiter>,
+    /// Limits for the per-attempt coordinator (retries, repairs, fallbacks).
+    pub rate_limits: crate::proxy::ratelimit::RateLimitConfig,
+    pub keystore: crate::gateway::auth::KeyStore,
+    pub idempotency_ttl_secs: u64,
+}
+
+impl LocalParts {
+    /// The environment-driven parts, read in the order `from_env` always read
+    /// them (startup messages keep their order).
+    fn from_env() -> Self {
+        let config = GatewayConfig::from_env();
+        let breaker = crate::proxy::health::build_breaker();
+        let limiter = build_limiter();
+        let rate_limits = crate::proxy::ratelimit::RateLimitConfig::from_env();
+        let keystore = crate::gateway::auth::KeyStore::from_env();
+        Self {
+            config,
+            breaker,
+            limiter,
+            rate_limits,
+            keystore,
+            idempotency_ttl_secs: idem_ttl_secs(),
+        }
+    }
+}
+
 impl GatewayState {
     /// Build in-memory (single-instance) gateway state, reading the rate limiter
     /// and scheduler tuning from the environment (same rate-limit knobs as the
     /// proxy, plus `LLMSHIM_GATEWAY_*`).
     pub fn from_env(router: Router, logger: Option<Logger>) -> Arc<Self> {
-        let config = GatewayConfig::from_env();
+        Self::from_parts(router, logger, LocalParts::from_env())
+    }
+
+    /// Build in-memory (single-instance) gateway state from explicit parts,
+    /// reading nothing from the environment. [`Self::from_env`] is this
+    /// function applied to [`LocalParts::from_env`].
+    pub(crate) fn from_parts(
+        router: Router,
+        logger: Option<Logger>,
+        parts: LocalParts,
+    ) -> Arc<Self> {
+        let LocalParts {
+            config,
+            breaker,
+            limiter,
+            rate_limits,
+            keystore,
+            idempotency_ttl_secs,
+        } = parts;
         // Same fleet-wide provider health the proxy uses.
-        let router = Arc::new(router.with_breaker(crate::proxy::health::build_breaker()));
+        let router = Arc::new(router.with_breaker(breaker));
         let dispatch = Arc::new(RealDispatch {
             router: router.clone(),
             logger,
         });
-        let scheduler = Scheduler::new(config.clone(), build_limiter(), dispatch);
+        let scheduler = Scheduler::new(config.clone(), limiter, dispatch);
         let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local(
-            crate::proxy::ratelimit::RateLimitConfig::from_env(),
+            rate_limits,
             config.max_concurrency_per_provider,
             config.max_wait,
         );
         Arc::new(Self {
             router,
             backend: Backend::Local(scheduler),
-            keystore: crate::gateway::auth::KeyStore::from_env(),
+            keystore,
             attempt_coordinator,
             idempotency: crate::gateway::idempotency::IdempotencyCache::new(
-                std::time::Duration::from_secs(idem_ttl_secs()),
+                std::time::Duration::from_secs(idempotency_ttl_secs),
             ),
-            idempotency_ttl_secs: idem_ttl_secs(),
+            idempotency_ttl_secs,
             prequeue_backpressure: Backpressure::new(
                 config.max_concurrency_per_provider,
                 config.max_wait,
