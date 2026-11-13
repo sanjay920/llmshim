@@ -42,6 +42,11 @@ pub struct Built {
     pub admin: Option<(axum::Router, SocketAddr)>,
     /// Whether this replica shares state with a fleet through Redis.
     pub fleet: bool,
+    /// The fleet state whose queue workers are not running yet. They lease jobs
+    /// from peers, so they start only after both listeners are bound
+    /// ([`start_fleet_workers`]); until then a failure to start leaves nothing
+    /// leased.
+    pub unstarted_fleet: Option<Arc<GatewayState>>,
     /// Provider names, for the startup banner.
     pub providers: Vec<String>,
     pub caller_keys: usize,
@@ -69,6 +74,39 @@ pub fn admin_token_digest(
         return Err(issue(message));
     }
     Ok(Some(Sha256::digest(token.as_bytes()).to_vec()))
+}
+
+/// Start the queue workers of a fleet replica (`Built::unstarted_fleet`, taken
+/// out of the `Built`). Call once, after every listener is bound.
+pub fn start_fleet_workers(unstarted: Option<Arc<GatewayState>>) {
+    #[cfg(feature = "serve-redis")]
+    if let Some(state) = unstarted {
+        state.start_workers();
+    }
+    #[cfg(not(feature = "serve-redis"))]
+    drop(unstarted);
+}
+
+/// The fleet's Redis URL, if `[fleet]` is configured, after the check that it
+/// is a Redis URL. Shared by `build_app` and `serve --check`, so a URL that
+/// `--check` accepts is one the server can start with. The error never carries
+/// the URL.
+pub fn fleet_redis_url(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>, Issue> {
+    let Some(fleet) = &config.fleet else {
+        return Ok(None);
+    };
+    let issue = |message: String| Issue {
+        path: "fleet.redis_url".into(),
+        message,
+    };
+    let url = read_secret(&fleet.redis_url, env).map_err(issue)?;
+    if !super::config::is_redis_url(&url) {
+        return Err(issue("must start with redis:// or rediss://".into()));
+    }
+    Ok(Some(url))
 }
 
 /// Build the application. Must be called inside a Tokio runtime, because the
@@ -100,25 +138,12 @@ pub async fn build_app(
 
     let router = build_router(config, env, &mut issues);
 
-    let redis_url = match &config.fleet {
-        Some(fleet) => match read_secret(&fleet.redis_url, env) {
-            Ok(url) if super::config::is_redis_url(&url) => Some(url),
-            Ok(_) => {
-                issues.push(Issue {
-                    path: "fleet.redis_url".into(),
-                    message: "must start with redis:// or rediss://".into(),
-                });
-                None
-            }
-            Err(message) => {
-                issues.push(Issue {
-                    path: "fleet.redis_url".into(),
-                    message,
-                });
-                None
-            }
-        },
-        None => None,
+    let redis_url = match fleet_redis_url(config, env) {
+        Ok(url) => url,
+        Err(issue) => {
+            issues.push(issue);
+            None
+        }
     };
 
     let admin_token = match admin_token_digest(config, env) {
@@ -204,6 +229,7 @@ pub async fn build_app(
     let retained = crate::gateway::attempt::default_retained_accounting_attempts();
     let breaker_config = BreakerConfig::default();
     let fleet = redis_url.is_some();
+    let mut unstarted_fleet = None;
     let state = match redis_url {
         None => GatewayState::from_parts(
             router,
@@ -229,7 +255,10 @@ pub async fn build_app(
         )
         .await
         {
-            Ok(state) => state,
+            Ok(state) => {
+                unstarted_fleet = Some(state.clone());
+                state
+            }
             Err(message) => {
                 return Err(vec![Issue {
                     path: "fleet.redis_url".into(),
@@ -273,6 +302,7 @@ pub async fn build_app(
         address,
         providers,
         fleet,
+        unstarted_fleet,
         caller_keys: config.keys.len(),
         authenticated,
         admin_authenticated,
@@ -434,7 +464,7 @@ async fn fleet_state(
         idempotency_ttl_secs,
         max_retained_accounting_attempts,
     };
-    GatewayState::distributed_from_parts(router, None, url, parts)
+    GatewayState::distributed_unstarted(router, None, url, parts)
         .await
         .map_err(|error| format!("cannot start fleet mode: {}", redact(&error, url)))
 }
@@ -456,9 +486,11 @@ async fn fleet_state(
 #[cfg_attr(not(feature = "serve-redis"), allow(dead_code))]
 fn redact(message: &str, url: &str) -> String {
     let mut out = message.replace(url, "<redis_url>");
+    // Split at the LAST '@': a host never contains one, so everything before it
+    // is the user info even when the password holds an unescaped '@'.
     if let Some(password) = url
         .split_once("://")
-        .and_then(|(_, rest)| rest.split_once('@'))
+        .and_then(|(_, rest)| rest.rsplit_once('@'))
         .and_then(|(userinfo, _)| userinfo.split_once(':'))
         .map(|(_, password)| password)
         .filter(|password| !password.is_empty())
@@ -495,6 +527,14 @@ mod tests {
             "{out}"
         );
         assert_eq!(redact("Connection refused", url), "Connection refused");
+    }
+
+    #[test]
+    fn a_password_with_an_at_sign_is_removed_whole() {
+        let url = "redis://user:p@ss:word@cache.internal:6379/0";
+        let out = redact("bad auth p@ss:word and the rest p@ss", url);
+        assert!(!out.contains("p@ss"), "{out}");
+        assert!(!out.contains("word"), "{out}");
     }
 
     #[test]

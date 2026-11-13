@@ -824,6 +824,10 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             report(&[issue]);
             return 1;
         }
+        if let Err(issue) = llmshim::serve::fleet_redis_url(&config, &env) {
+            report(&[issue]);
+            return 1;
+        }
         println!(
             "{}: valid (version {}, {} provider(s), {} key(s), {} route(s))",
             path.display(),
@@ -834,13 +838,15 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         );
         return 0;
     }
-    let built = match llmshim::serve::build_app(&config, &env).await {
+    let mut built = match llmshim::serve::build_app(&config, &env).await {
         Ok(built) => built,
         Err(issues) => {
             report(&issues);
             return 1;
         }
     };
+    // Held back until every listener is bound (see below).
+    let unstarted_fleet = built.unstarted_fleet.take();
     let listener = match cli::bind(built.address).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -873,6 +879,9 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         },
         None => None,
     };
+    // Only now, with every listener bound, may a fleet replica start leasing
+    // peers' jobs: a failure above must leave nothing leased.
+    llmshim::serve::start_fleet_workers(unstarted_fleet);
     eprintln!("llmshim serve listening on http://{address}");
     eprintln!("  Providers: {:?}", built.providers);
     if built.fleet {

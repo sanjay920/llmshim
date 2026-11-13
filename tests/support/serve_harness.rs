@@ -75,6 +75,14 @@ pub fn start(config: &str, label: &str, extra_env: &[(&str, &str)]) -> Server {
         .env("LLMSHIM_GATEWAY_QUEUE_DEPTH", "0")
         .env("LLMSHIM_RATE_LIMIT_RPM", "0")
         .env("LLMSHIM_REDIS_URL", "redis://127.0.0.1:1")
+        // The fleet tuning variables: each would make a fleet replica unusable
+        // if `serve` read it (a 1 ms Redis deadline, a 1 ms job deadline and
+        // lease), so the fleet tests also prove they are not read.
+        .env("LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS", "1")
+        .env("LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS", "1")
+        .env("LLMSHIM_GATEWAY_ORIGIN_LEASE_MS", "1")
+        .env("LLMSHIM_GATEWAY_RETAINED_JOBS", "1")
+        .env("LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

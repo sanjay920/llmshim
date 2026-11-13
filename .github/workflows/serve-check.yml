@@ -49,5 +49,8 @@ jobs:
           LLMSHIM_TEST_REDIS_URL: redis://127.0.0.1:6379
         run: |
           cargo test --locked --features serve-redis --lib serve::
+          # The shared gateway code `serve` converted to take explicit parts:
+          # its regression tests are in the library, which no other PR job runs.
+          cargo test --locked --features serve-redis --lib gateway::
           cargo test --locked --features serve-redis --test integration_serve
           cargo test --locked --features serve-redis --test integration_serve_fleet -- --ignored
