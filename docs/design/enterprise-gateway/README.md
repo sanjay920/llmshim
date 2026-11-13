@@ -91,6 +91,80 @@ Later phases (each needs its own design note before work starts)
 - [ ] Config-registered providers; embeddings, images and audio on the server
 - [ ] Admin UI, SSO and SCIM (blocked on the licensing decision)
 
+## Review follow-ups
+
+Every PR in the first stack (0001 to 0012) was reviewed by an independent
+reviewer before it merged, and each real finding was fixed in the PR. These are
+the findings that were judged out of scope or a design decision, so that none is
+lost. They are not blockers; the ones that touch a contract are marked, because a
+contract is cheaper to change before the feature is declared stable.
+
+Contracts and decisions (change before stability)
+
+- **`--check` needs the secrets to be present**, so it cannot run in a CI job on
+  a machine that does not hold them, and it exits 1 for "a secret is missing"
+  as for "the file is wrong". A structure-only mode, or a distinct exit code, is
+  needed before anyone gates a pull request on it.
+- **`server.allow_unauthenticated` with a non-loopback host** is accepted.
+  Requiring loopback when unauthenticated is a tightening that is easier now than
+  after files exist.
+- **`routes.*.settings` is an open map**: a misspelled setting is accepted
+  silently. Define the accepted keys.
+- **`base_url`** accepts `http://:8000` and a port that is not a number, and is
+  accepted on hosted kinds where it has no defined meaning. Parse it with a URL
+  parser.
+- **Upper bounds** are missing for `budget_window_secs` and `queue_timeout_ms`
+  (the Redis ledger multiplies by 1000 and sets an expiry from them).
+- **`deny_unknown_fields` and "additive within v1"** conflict during a rolling
+  upgrade: a new field breaks the old binary. Say so in 0001, or tolerate unknown
+  fields with a warning.
+- **`#[non_exhaustive]`** on `SecretRef`, `Format` and `Issue`, which 0001 says
+  the Rust types are.
+- **Key names on usage records** (not only tenants), and **request ids** to join
+  a request's attempts. The request id `gw-<pid>-<n>` repeats across containers,
+  where the pid is 1: add an instance part.
+- **Redis keys carry no namespace** (0006): two fleets that share a Redis and a
+  provider name take each other's jobs. A `fleet.namespace` prefix.
+- **Optional client certificates and revocation** (0011), a CRL file watched like
+  the CA bundle.
+- **Tokens**: the length floor of 16 characters is below the 128 bits that 0003
+  advises; consider 32. A `sha256` caller key is compared with provider and admin
+  keys by digest in `check_references`, but `build_key_store` alone does not.
+
+Operability
+
+- **The CI jobs run `serve` only.** The default, `proxy`, `gateway` and
+  `gateway-redis` test suites run in the release gate, not on a pull request, so
+  a shared-code regression is found at tag time. A pull-request job that runs
+  `cargo test --features proxy --tests` and `--features gateway-redis` (with a
+  Redis service) closes that.
+- **Gemini thinking tokens are left out of the normalized completion count** on
+  the native path (`usage::normalize_native_usage`), while the non-streaming
+  response folds them in. The spend ledger, the cap and the usage records all use
+  the smaller figure. It is a fix to shared accounting, so it belongs in its own
+  change with its own tests.
+- **The log writer** (`jsonl.rs`) drops and counts lines when its queue is full;
+  a metric for the count (and for write failures) belongs with the
+  OpenTelemetry item.
+- **Shutdown**: a replica does not release leases it holds for peers' jobs on
+  SIGTERM (as `gateway`); they wait out the lease timeout.
+- **The Helm chart** has no `preStop` hook and a 60 s grace period that is
+  shorter than a long stream; the admin Service name can exceed 63 characters;
+  `appVersion` is not in the release checklist's lockstep.
+- **The Docker check** runs on pull requests only and does not cover a
+  `src/**` change or a moved base image tag; add a push and a weekly run.
+
+Tests worth adding
+
+- SIGTERM drains both listeners and exits 0; a taken main port exits 1;
+  `allow_unauthenticated` serving; stderr scanned for secrets after requests.
+- A fleet test that a replica which fails to bind leaves no lease on a peer's job
+  (the window is not deterministic today).
+- `Limits::new` takes three positional numbers (entries, bytes, ttl); a named
+  struct removes the transposition risk. `build_limiter_with` and
+  `build_breaker_with` are public in the `proxy` feature and could be
+  `pub(crate)`.
+
 ## Open decisions
 
 - **Licensing** of identity and audit-export features. Until this is decided,
