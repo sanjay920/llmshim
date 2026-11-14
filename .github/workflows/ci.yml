@@ -1,0 +1,114 @@
+name: CI
+
+# Pull requests used to run only the `serve` jobs. The default, `proxy`,
+# `gateway` and `gateway-redis` suites ran once, at tag time, so a change to
+# shared code (usage accounting, the HTTP client, the reasoning filter) reached
+# them only when a release was already being cut. The Redis-backed gateway
+# tests are ignored without a server and ran nowhere at all.
+#
+# This runs every build on each pull request, on each merge to main (stacked
+# merges can break what each pull request passed alone), and weekly (a new
+# stable toolchain's lints once stopped a release at tag time). The `serve`
+# builds keep their own jobs in serve-check.yml, and Windows its own in
+# windows-check.yml.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: never
+  LLMSHIM_CATALOG_OFFLINE: '1'
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: default, features: '' }
+          - { name: proxy, features: proxy }
+          - { name: gateway, features: gateway }
+          - { name: gateway-redis, features: gateway-redis }
+          - { name: cloud transports, features: 'bedrock,vertex,azure' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo clippy --locked --workspace --all-targets ${FEATURES:+--features "$FEATURES"} -- -D warnings
+
+  test:
+    name: tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: default, features: '' }
+          # What the release gate runs, here on every pull request.
+          - { name: proxy, features: proxy }
+          - { name: gateway, features: gateway }
+          - { name: gateway-redis, features: gateway-redis }
+          - { name: cloud transports, features: 'bedrock,vertex,azure' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tests
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo test --locked --workspace ${FEATURES:+--features "$FEATURES"} --tests
+
+  # The distributed queue, lease and spend-ledger tests are marked `ignore`
+  # because they need a Redis; without this job nothing runs them. They run one
+  # at a time: several simulate a crashed origin or a shutdown, which acts on
+  # the Redis-wide origin registry and accounting, so in parallel they take each
+  # other's gateways away ("response channel lost", "Capacity"). Each passes
+  # alone and all 63 pass serially in about fifteen seconds.
+  redis-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Gateway tests that need a Redis
+        env:
+          LLMSHIM_REDIS_URL: redis://127.0.0.1:6379
+        run: |
+          cargo test --locked --features gateway-redis --lib gateway:: -- --ignored --test-threads=1

@@ -134,15 +134,17 @@ Contracts and decisions (change before stability)
 
 Operability
 
-- **Pull requests run the `serve` jobs only.** The release gate runs just
-  `cargo test --workspace --features proxy --tests`, and only at tag time. The
-  `gateway` and `gateway-redis` suites under `tests/` (for example
-  `unit_gateway_key_diagnostics.rs` and `unit_redis_diagnostics.rs`) run
-  nowhere in CI; a pull request reaches the gateway code only through the
-  `gateway::` library tests that the `serve-redis` job runs. A shared-code
-  regression is therefore found late. A pull-request job that runs
-  `cargo test --features proxy --tests` and the same with `gateway-redis` (with
-  a Redis service) closes that.
+- **The Redis-backed gateway tests run one at a time.** `ci.yml` now runs every
+  build on each pull request, and the 63 `gateway::` library tests that need a
+  Redis (ignored without one, and run nowhere before) with `--test-threads=1`.
+  Several simulate a crashed origin or a shutdown, which acts on the Redis-wide
+  origin registry and accounting, so in parallel they take each other's
+  gateways away (13 of 63 failed that way; each passes alone). The namespace
+  setting above lets each test own its keys, and then they can run in parallel.
+- **The release gate is not tied to `ci.yml`.** A tag still runs only
+  `cargo test --workspace --features proxy --tests`; making the release wait for
+  a green `ci.yml` on the tagged commit, and adding the `serve` builds to it, is
+  a step toward declaring `serve` stable (0013).
 - **Gemini thinking tokens are left out of the normalized completion count** on
   the native path (`usage::normalize_native_usage`), while the non-streaming
   response folds them in. The spend ledger, the cap and the usage records all use

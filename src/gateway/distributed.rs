@@ -2818,7 +2818,10 @@ mod tests {
 
     // ---- integration (require a live Redis via LLMSHIM_REDIS_URL) -----------
     // Run: LLMSHIM_REDIS_URL=redis://127.0.0.1:6379 \
-    //        cargo test --features gateway-redis -- --ignored
+    //        cargo test --features gateway-redis --lib gateway:: -- --ignored --test-threads=1
+    // One at a time: tests that simulate a crashed origin or a shutdown act on
+    // the Redis-wide origin registry and accounting, so run in parallel they
+    // take each other's gateways away. Each passes alone.
 
     use super::super::DispatchError;
     use crate::proxy::ratelimit::{InMemoryRateLimiter, RateLimitConfig};
