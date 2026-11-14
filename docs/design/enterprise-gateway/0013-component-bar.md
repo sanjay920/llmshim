@@ -16,85 +16,119 @@ three things:
 
 This note fixes the bar so each roadmap step can be held to it, and says in what
 order to meet it. It names no consumer: llmshim learns nothing about the systems
-that use it (working rule 6).
+that use it (working rule 6, and the rule in `CLAUDE.md` that public documents
+carry no private consumer identities).
 
 ## Interfaces and what each promises
 
 | Interface | Contract | Status |
 | --- | --- | --- |
-| Rust library (`llmshim`) | semver; the protected files named in `CLAUDE.md` | stable |
-| Proxy and gateway HTTP API | `api/openapi.yaml`; the bundled clients in lockstep | stable |
+| Rust library (`llmshim`) | semver (0.x: a breaking change needs a minor bump); the protected files named in `CLAUDE.md` | stable |
+| Proxy HTTP API | `api/openapi.yaml`; the bundled clients in lockstep | stable |
+| Gateway HTTP API | the proxy contract plus the gateway's headers and endpoints, in the same document, marked experimental there | experimental |
 | `llmshim serve` configuration file | 0001; a JSON Schema checked in and compared by a test (planned) | unstable |
-| Operational endpoints (`/metrics`, `/ready`, stats, `/v1/serve/config`) | 0005, 0012; described in the OpenAPI document (planned) | unstable |
-| Access and usage logs | 0009, 0010; fields are added, never renamed or retyped | unstable |
+| Operational endpoints (`/health`, `/ready`, `/metrics`, stats, `/v1/serve/config`) | 0005, 0012; to be described in the OpenAPI document (planned) | unstable |
+| Access and usage logs | 0009, 0010 | unstable |
 
-A consumer pins to one of these. A change that cannot be made additively gets a
-new `version` of the file or a new path, never a silent edit.
+Once a row is declared stable, a change that cannot be made additively gets a
+new `version` of the file or a new path, and log fields are added, never renamed
+or retyped. Until then an unstable row may change in any release (0001), and the
+roadmap lists where "additive" is not yet safe: an older binary rejects a field
+it does not know.
 
 ## When `serve` is declared stable
 
-Every one of these, and then the semver rule applies to it:
+The maintainer declares it, as a commit to this note, when all of these hold.
+From then on the semver rule applies to `serve` and its file format.
 
-1. The configuration schema is emitted by the binary, checked in, and compared by
-   a test, so a change to it is a visible diff.
-2. Every operational endpoint is in the OpenAPI document and a test holds the
-   server to it.
-3. The failure-mode table (0014) exists and every row has a test that
+1. Every item under "Contracts and decisions" in the roadmap's review follow-ups
+   is done or has a written decision.
+2. The configuration schema is emitted by the binary (`--print-schema`), checked
+   in, and compared by a test, so a change to it is a visible diff.
+3. Every operational endpoint is in the OpenAPI document and a conformance test
+   holds the server to it.
+4. A request's tenant, key name, credential fingerprint and a request id that is
+   unique across instances appear in the access log, the usage record and the
+   trace, so one request can be joined across all three.
+5. The failure-mode table (0014) exists and every row has a test that
    deliberately breaks the dependency.
-4. A benchmark with a stated method and a dated result is published.
-5. Signed images and an SBOM are published.
-6. The release gate builds and tests `serve`, and a release has gone out with it.
+6. A benchmark is published with its method, hardware, build and date, reporting
+   added latency (p50 and p99), throughput and memory against a mock upstream.
+7. Images are signed (verifiable with `cosign verify`) and carry an SPDX SBOM.
+8. The release gate builds and tests `serve`, and refuses a tag whose commit
+   lacks a green `ci.yml`.
 
 ## The bar for each step
 
 1. **Every dependency has a failure row.** What happens when it is down, slow or
    wrong, written down and tested. A step that adds or changes a dependency adds
    or changes the row.
-2. **Identity and money fail closed; telemetry fails open.** A request whose
-   caller cannot be identified, or whose spend cannot be accounted for, is
-   refused. A failing log sink, metrics exporter or health probe never blocks or
-   fails a request; it is counted and reported.
-3. **Every rule has a test that fails without it.** For a security-relevant rule
-   the test is checked by deleting the rule and watching the test fail.
-4. **Every build, every pull request.** The default, `proxy`, `gateway`,
-   `gateway-redis`, `serve`, `serve-redis` and cloud-transport builds are linted
-   and tested on each pull request and on main (`ci.yml`, `serve-check.yml`),
-   including the Redis-backed tests that are ignored without a server.
-5. **Independent review before merge,** by a reviewer who did not write the
-   change. Findings that hold up are fixed in the same pull request or written to
-   "Review follow-ups" in the roadmap.
-6. **No secret in any output, and no consumer identity in the repository.**
+2. **On the request path, identity and money fail closed; telemetry fails
+   open.** Once serving, a request whose caller cannot be identified, or whose
+   spend cannot be settled against a cap, is refused (0006 for a Redis outage).
+   A failing log sink or metrics exporter never blocks or fails a request; it is
+   counted and reported. At startup the opposite holds: a log path that cannot
+   be written refuses to start (0009). A configuration change that cannot be
+   applied leaves the running one in force and says so (0012). The deliberate
+   exceptions are configuration, not accident, and are named where they are
+   granted: unauthenticated serving (0001), a key without a budget, and
+   `budget_allow_unpriced`.
+3. **Every rule gets a test that fails without it.** For a security-relevant rule
+   the test is checked by deleting the rule and watching it fail. A rule that has
+   no test yet is listed under "Tests worth adding" in the roadmap until it has
+   one.
+4. **Every build, on every pull request and on main.** The default, `proxy`,
+   `gateway`, `gateway-redis`, `serve`, `serve-redis` and cloud-transport
+   (`bedrock`, `vertex`, `azure`) builds are linted and tested, including the
+   Redis-backed tests that are ignored without a server. `ci.yml` and
+   `serve-check.yml` do this; a new feature gets a job in the change that adds it.
+5. **Review by someone who did not write the change,** who sees the diff and the
+   repository and not the author's reasoning, before it merges. Findings that
+   hold up are fixed in the same pull request or written to "Review follow-ups".
+6. **No credential value in any output** (a short fingerprint of a token is not
+   the token; 0009), **and no consumer identity in the repository.**
 
 ## Order of work
 
-Harden what exists before adding surface. Reviews of the first stack found a real
-defect in most pull requests; more surface on top of untested corners makes that
-worse, not better.
+Harden what exists before adding surface. Reviews of the first stack found real
+defects before merge: a secret echoed by a parse error, an admin listener that
+served without a token, fleet workers leasing jobs before the listeners had
+bound, TLS session resumption that outlived a certificate. More surface on top
+of untested corners makes that worse, not better.
 
-1. CI coverage for every build, including the Redis-backed tests.
+1. CI coverage for every build, including the Redis-backed tests (`ci.yml`, and
+   every `serve` test in `serve-check.yml`).
 2. Gemini thinking-token accounting in the shared usage normalization.
-3. The configuration-contract tightenings listed under "Review follow-ups", a
-   structure-only `--check` with its own exit code, and `--print-schema`.
-4. Outage-survival tests and the failure-mode table (0014).
-5. OpenTelemetry traces and metrics, with the log writer's drop counters.
-6. JWT/OIDC workload identity and IP allowlists (design note first).
-7. Published, signed images and an SBOM.
-8. Bedrock, Vertex and Azure from the file.
-9. Reload of everything beyond keys.
-10. The control plane (design note first).
+3. The configuration-contract tightenings under "Review follow-ups", the
+   remaining inventory rows of 0002, a structure-only `--check` with its own
+   exit code, `--print-schema`, and the operational endpoints in the OpenAPI
+   document with a conformance test.
+4. A request id that is unique across instances, and key names on usage
+   records.
+5. Outage-survival tests and the failure-mode table (0014).
+6. OpenTelemetry traces and metrics, with the log writer's drop counters.
+7. JWT/OIDC workload identity and IP allowlists (design note first).
+8. A reproducible benchmark.
+9. Published, signed images and an SBOM.
+10. The release gate builds and tests `serve` and waits for a green `ci.yml`.
+11. Bedrock, Vertex and Azure from the file.
+12. Reload of everything beyond keys.
+13. The control plane (design note first).
 
 ## Decisions taken with this note
 
-- **Control-plane database:** Postgres, with SQLite for a single node, and never
-  in the request path. The data plane keeps serving from signed policy snapshots
-  when the database is down.
-- **Images:** GHCR, signed keyless with the workflow's OIDC identity, with an
-  SBOM, from a publish job that does nothing until a repository variable enables
-  it. A tag never publishes an image by accident.
-- **Stability:** as above; until then `serve` stays unstable and default-off.
-- **Licensing** of SSO, SCIM, audit export and the admin UI is not decided here.
-  All of them follow the control plane, which does not exist yet, so nothing
-  waits on it. They are not started: this repository is public under
-  `MIT OR Apache-2.0`, published versions stay under those terms, and the
-  maintainer decides the repository's visibility and the license of future
-  versions before any of that code is committed.
+- **Control-plane database: Postgres, with SQLite for a single node, and never
+  in the request path.** Key lifecycle, budgets and audit need transactions and
+  queries that a file or Redis does not give; SQLite keeps a one-node deployment
+  free of infrastructure; and with the database off the request path the data
+  plane will keep serving from signed policy snapshots when it is down.
+- **Images: GHCR, signed keyless with the workflow's OIDC identity, with an SPDX
+  SBOM, from a publish job that will do nothing until a repository variable
+  enables it.** The registry sits beside the repository and its identity;
+  keyless signing leaves no long-lived signing key to guard or leak; and the
+  opt-in means a tag never publishes an image by accident.
+- **Stability:** as above. Until then `serve` stays unstable; afterwards it stays
+  behind its feature (working rule 1).
+- **Licensing** of SSO, SCIM, audit export and the admin UI is undecided, and
+  none of it is started. All of them follow the control plane, which does not
+  exist yet, so nothing in the order of work waits on it.

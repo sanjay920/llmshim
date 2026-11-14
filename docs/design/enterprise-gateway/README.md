@@ -95,7 +95,8 @@ Later phases (each needs its own design note before work starts)
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy
 - [ ] Secret-manager integrations
 - [ ] Config-registered providers; embeddings, images and audio on the server
-- [ ] Admin UI, SSO and SCIM (blocked on the licensing decision)
+- [ ] Admin UI, SSO and SCIM (not started: they follow the control plane and the
+      licensing decision)
 
 ## Review follow-ups
 
@@ -182,12 +183,11 @@ Taken 2026-11-14, with the reasons in 0013.
 
 - **Database** for the control plane: Postgres, SQLite for one node, never in the
   request path. The design note comes before the code.
-- **Images:** GHCR, signed keyless, with an SBOM, from an opt-in publish job.
+- **Images:** GHCR, signed keyless, with an SPDX SBOM, from an opt-in publish job.
 - **Stability:** `serve` stays unstable until the criteria in 0013 are met.
 
 ## Open decisions
 
 - **Licensing** of identity and audit-export features (SSO, SCIM, audit export,
-  the admin UI). Nothing waits on it, because all of them follow the control
-  plane. Until the maintainer has decided the repository's visibility and the
-  license of future versions, that code is not started in this repository.
+  the admin UI). None of that code is started. All of it follows the control
+  plane, so nothing in the order of work (0013) waits on the decision.
