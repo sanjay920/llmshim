@@ -4726,9 +4726,13 @@ mod tests {
             &redis_url,
             Arc::new(ProgressStreamDispatch),
             unlimited(),
+            // Five times the original 90 ms / 120 ms. The heartbeat runs at a
+            // third of the lease, so at 90 ms two late beats (60 ms) let the
+            // origin expire and the stream ended in "origin canceled" on a
+            // loaded runner instead of the timeout this test is about.
             GatewayConfig {
-                lease_timeout: Duration::from_millis(90),
-                request_timeout: Duration::from_millis(120),
+                lease_timeout: Duration::from_millis(450),
+                request_timeout: Duration::from_millis(600),
                 ..GatewayConfig::default()
             },
         )
@@ -4760,7 +4764,8 @@ mod tests {
             }
         }
         assert!(progress_chunks >= 3);
-        assert!(started.elapsed() < Duration::from_millis(500));
+        // The 600 ms request deadline, not the endless progress, ended it.
+        assert!(started.elapsed() < Duration::from_millis(2500));
         for worker in workers {
             worker.abort();
         }
