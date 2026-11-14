@@ -17,8 +17,10 @@ fn counter(usage: &Value, paths: &[&str]) -> u64 {
 /// `candidatesTokenCount`, and bills it as output. The normalized convention
 /// matches the OpenAI Responses and Anthropic wires: reasoning is a subset of
 /// `completion_tokens`, so the thoughts are folded in. The non-streaming
-/// response and the native accounting path (spend ledger, caps, usage records)
-/// both read it from here, so they cannot disagree about what a call cost.
+/// response, the stream's usage chunk and the native accounting path (spend
+/// ledger, caps, usage records) all take the completion count from here, so
+/// they agree on what a call output; the rest of each usage object is still
+/// built by its own code, and a test holds the two to the same result.
 pub(crate) fn google_completion_tokens(usage: &Value) -> (u64, u64) {
     let candidates = counter(usage, &["/candidatesTokenCount"]);
     let thoughts = counter(usage, &["/thoughtsTokenCount"]);
@@ -280,7 +282,7 @@ mod retention_tests {
         assert_eq!(seen.usage["completion_tokens"], 4);
         usage.ingest(&last.to_string()).expect("final usage");
         let terminal = usage.take_terminal_candidate().expect("terminal usage");
-        assert!(terminal.terminal);
+        assert!(terminal.counters_complete && !terminal.explicit_zero);
         assert_eq!(terminal.usage["completion_tokens"], 12);
         assert_eq!(terminal.usage["reasoning_tokens"], 7);
     }
@@ -291,6 +293,9 @@ mod retention_tests {
         // `usageMetadata`; they must not disagree about what the call cost.
         for metadata in [
             json!({"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}),
+            // An explicit zero is the same as none: no reasoning fields.
+            json!({"promptTokenCount":10,"candidatesTokenCount":5,
+                "thoughtsTokenCount":0,"totalTokenCount":15}),
             json!({"promptTokenCount":10,"candidatesTokenCount":5,
                 "thoughtsTokenCount":7,"totalTokenCount":22}),
             json!({"promptTokenCount":10,"thoughtsTokenCount":7,"totalTokenCount":17}),

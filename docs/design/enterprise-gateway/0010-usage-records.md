@@ -34,15 +34,14 @@ Token fields, for chargeback:
   report reasoning inside `completion_tokens_details`; both places are read.
 - **Gemini thinking tokens are output tokens.** Google reports thinking as
   `thoughtsTokenCount`, apart from `candidatesTokenCount`, and bills it as
-  output. The normalized `completion_tokens` folds the thoughts in and
-  `reasoning_tokens` carries them, exactly as the non-streaming response and the
-  stream's usage chunk already did. The record, the cost and the budget cap read
-  the same figure (`usage::google_completion_tokens` is the one definition).
-  Until this was fixed, the native accounting path counted only
-  `candidatesTokenCount`, so a Gemini thinking model was under-counted in all
-  three. A response that reports thoughts but no `candidatesTokenCount` (Google
-  omits a zero) still counts the thoughts as output, and its counters stay
-  marked incomplete: an absent counter is unknown, not zero.
+  output. The normalized `completion_tokens` folds the thoughts in, as in the
+  response and the stream's usage chunk, and `reasoning_tokens` reports them as
+  a subset of `completion_tokens`: do not add the two when totalling a chargeback.
+  The record, the cost and the budget cap read the same figure
+  (`usage::google_completion_tokens` is the one definition of the completion
+  count). A response that reports thoughts but no `candidatesTokenCount` (Google
+  omits a zero) counts the thoughts as output, and its counters stay marked
+  incomplete: an absent counter is unknown, not zero.
 
 ## Per attempt, not per request
 

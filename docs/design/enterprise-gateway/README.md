@@ -143,6 +143,18 @@ Operability
   regression is therefore found late. A pull-request job that runs
   `cargo test --features proxy --tests` and the same with `gateway-redis` (with
   a Redis service) closes that.
+- **A Gemini response with thoughts but no `candidatesTokenCount` settles as
+  incomplete.** Google omits a zero, so the absence there is the provider's
+  zero, yet the counters stay marked incomplete and, under catalog authority,
+  the ledger keeps the reservation instead of the observed figure. Treating the
+  missing count as zero when the response's own `totalTokenCount` reconciles
+  (prompt plus thoughts equals the total) is a separate change to shared
+  accounting with its own tests.
+- **A Gemini reservation is an upper bound only if Google's output cap covers
+  thinking.** The quote is the larger of the output cap (or the catalog's) and
+  the thinking budget; a request that sets only a thinking level declares no
+  budget. Settlement above the reserved liability raises it, so a quote that is
+  too low is corrected rather than missed, but nothing pins the assumption.
 - **The log writer** (`jsonl.rs`) drops and counts lines when its queue is full;
   a metric for the count (and for write failures) belongs with the
   OpenTelemetry item.
