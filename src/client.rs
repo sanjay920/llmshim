@@ -2884,19 +2884,23 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nx")
                 .await
                 .unwrap();
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
         });
+        // The total deadline also covers connecting and the response headers, so
+        // at 20 ms a loaded runner expired it before the headers arrived and
+        // `send` failed instead of returning. 300 ms is far past the headers and
+        // still far inside the 3 s the server holds the body open.
         let deadlines = AttemptDeadlines::default()
-            .with_unary_timeouts(Duration::from_millis(10), Duration::from_millis(20))
+            .with_unary_timeouts(Duration::from_millis(150), Duration::from_millis(300))
             .unwrap();
         let client = ShimClient::new().with_attempt_deadlines(deadlines).unwrap();
         let response = client
             .send(&raw_loopback_request(format!("http://{address}/raw")))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(450)).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(10), response.bytes())
+            tokio::time::timeout(Duration::from_millis(100), response.bytes())
                 .await
                 .is_err()
         );
@@ -2933,7 +2937,7 @@ mod tests {
             let _ = source_closed_sender.send(closed);
         });
         let deadlines = AttemptDeadlines::default()
-            .with_stream_timeouts(Duration::from_secs(1), Duration::from_millis(50))
+            .with_stream_timeouts(Duration::from_secs(1), Duration::from_millis(250))
             .unwrap();
         let client = ShimClient::new().with_attempt_deadlines(deadlines).unwrap();
         let provider = crate::providers::openai_compat::OpenAiCompatible::new(
@@ -2950,7 +2954,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), source_closed_receiver)
+            tokio::time::timeout(Duration::from_secs(3), source_closed_receiver)
                 .await
                 .unwrap()
                 .unwrap()
