@@ -46,6 +46,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0010: Usage and cost records per tenant](0010-usage-records.md)
 - [0011: Mutual TLS and certificate-derived identity](0011-mutual-tls.md)
 - [0012: Reloading caller keys without a restart](0012-key-reload.md)
+- [0013: llmshim as a component](0013-component-bar.md)
 
 ## Roadmap
 
@@ -76,7 +77,12 @@ Phase 0: a production server mode
 - [ ] OpenTelemetry traces and metrics
 - [x] Helm chart, validated by rendering and `serve --check` (0008)
 - [ ] Published, signed images and an SBOM
-- [ ] Reproducible benchmark and an outage-survival test
+- [ ] Reproducible benchmark and an outage-survival test, with the failure-mode
+      table (0014)
+- [ ] Configuration-contract tightenings, a structure-only `--check` and a
+      checked-in JSON Schema (see "Review follow-ups"; 0013)
+- [ ] Pull-request CI for every build, including the Redis-backed tests that are
+      ignored without a server (`ci.yml`; 0013)
 
 Later phases (each needs its own design note before work starts)
 
@@ -170,9 +176,18 @@ Tests worth adding
   `build_breaker_with` are public in the `proxy` feature and could be
   `pub(crate)`.
 
+## Decisions
+
+Taken 2026-11-14, with the reasons in 0013.
+
+- **Database** for the control plane: Postgres, SQLite for one node, never in the
+  request path. The design note comes before the code.
+- **Images:** GHCR, signed keyless, with an SBOM, from an opt-in publish job.
+- **Stability:** `serve` stays unstable until the criteria in 0013 are met.
+
 ## Open decisions
 
-- **Licensing** of identity and audit-export features. Until this is decided,
-  that code is not started in this repository.
-- **Database** for the control plane (proposal: Postgres, SQLite for one node,
-  never in the request path).
+- **Licensing** of identity and audit-export features (SSO, SCIM, audit export,
+  the admin UI). Nothing waits on it, because all of them follow the control
+  plane. Until the maintainer has decided the repository's visibility and the
+  license of future versions, that code is not started in this repository.
