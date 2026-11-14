@@ -143,11 +143,6 @@ Operability
   regression is therefore found late. A pull-request job that runs
   `cargo test --features proxy --tests` and the same with `gateway-redis` (with
   a Redis service) closes that.
-- **Gemini thinking tokens are left out of the normalized completion count** on
-  the native path (`usage::normalize_native_usage`), while the non-streaming
-  response folds them in. The spend ledger, the cap and the usage records all use
-  the smaller figure. It is a fix to shared accounting, so it belongs in its own
-  change with its own tests.
 - **The log writer** (`jsonl.rs`) drops and counts lines when its queue is full;
   a metric for the count (and for write failures) belongs with the
   OpenTelemetry item.

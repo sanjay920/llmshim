@@ -58,6 +58,10 @@ catalog_startup` measures construction against the first read.
 normalized responses and usage chunks, logs, and proxy usage. Native token
 fields remain readable. `src/usage.rs` owns extraction; the streaming client
 merges Anthropic's start/delta usage before normalizing terminal counts.
+Gemini's `thoughtsTokenCount` is output: `usage::google_completion_tokens`
+folds it into `completion_tokens` (and `reasoning_tokens`) for the response,
+the stream chunk and the native accounting path alike, so the spend ledger,
+caps and usage records price thinking.
 `usage.uncached_input_tokens` joins them: the providers disagree on whether
 their prompt total already includes the cache read (Anthropic's excludes it,
 OpenAI/Chat Completions/Gemini include it), and only the transport boundary

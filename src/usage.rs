@@ -11,6 +11,20 @@ fn counter(usage: &Value, paths: &[&str]) -> u64 {
         .unwrap_or(0)
 }
 
+/// `(completion_tokens, reasoning_tokens)` of a Google `usageMetadata` object.
+///
+/// Google reports thinking as `thoughtsTokenCount`, separate from
+/// `candidatesTokenCount`, and bills it as output. The normalized convention
+/// matches the OpenAI Responses and Anthropic wires: reasoning is a subset of
+/// `completion_tokens`, so the thoughts are folded in. The non-streaming
+/// response and the native accounting path (spend ledger, caps, usage records)
+/// both read it from here, so they cannot disagree about what a call cost.
+pub(crate) fn google_completion_tokens(usage: &Value) -> (u64, u64) {
+    let candidates = counter(usage, &["/candidatesTokenCount"]);
+    let thoughts = counter(usage, &["/thoughtsTokenCount"]);
+    (candidates.saturating_add(thoughts), thoughts)
+}
+
 #[cfg(test)]
 mod retention_tests {
     use super::*;
@@ -164,6 +178,7 @@ mod retention_tests {
                 9,
             ),
             (json!({"reasoning_tokens":10}), "/reasoning_tokens", 10),
+            (json!({"thoughtsTokenCount":13}), "/thoughtsTokenCount", 13),
             (
                 json!({"output_tokens_details":{"reasoning_tokens":11}}),
                 "/output_tokens_details/reasoning_tokens",
@@ -180,6 +195,130 @@ mod retention_tests {
                 compact.pointer(pointer).and_then(Value::as_u64),
                 Some(expected)
             );
+        }
+    }
+
+    fn google_target() -> ReplayTarget {
+        ReplayTarget::new("gemini", "gemini-test", WireFormat::GoogleGenerateContent)
+    }
+
+    #[test]
+    fn google_thinking_is_billed_as_output_on_the_native_path() {
+        let observation = normalize_native_response_usage_observation(
+            &google_target(),
+            &json!({"usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "thoughtsTokenCount": 7,
+                "totalTokenCount": 22
+            }}),
+        )
+        .expect("usage");
+        assert!(observation.counters_complete);
+        let usage = &observation.usage;
+        assert_eq!(usage["prompt_tokens"], 10);
+        assert_eq!(usage["completion_tokens"], 12, "thoughts are output tokens");
+        assert_eq!(usage["reasoning_tokens"], 7);
+        assert_eq!(usage["completion_tokens_details"]["reasoning_tokens"], 7);
+        assert_eq!(usage["total_tokens"], 22);
+    }
+
+    #[test]
+    fn google_without_thinking_is_unchanged() {
+        let observation = normalize_native_response_usage_observation(
+            &google_target(),
+            &json!({"usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15
+            }}),
+        )
+        .expect("usage");
+        let usage = &observation.usage;
+        assert_eq!(usage["completion_tokens"], 5);
+        assert!(usage.get("reasoning_tokens").is_none());
+        assert!(usage.get("completion_tokens_details").is_none());
+    }
+
+    #[test]
+    fn google_thinking_alone_counts_as_output_but_stays_incomplete() {
+        // Google omits a zero `candidatesTokenCount`. The output is then the
+        // thoughts, but an absent counter is unknown, not zero: the observation
+        // keeps saying its counters are incomplete, so a spend cap retains the
+        // liability instead of settling on a figure the provider did not state.
+        let observation = normalize_native_response_usage_observation(
+            &google_target(),
+            &json!({"usageMetadata": {
+                "promptTokenCount": 10,
+                "thoughtsTokenCount": 7,
+                "totalTokenCount": 17
+            }}),
+        )
+        .expect("usage");
+        assert_eq!(observation.usage["completion_tokens"], 7);
+        assert_eq!(observation.usage["reasoning_tokens"], 7);
+        assert!(!observation.counters_complete);
+    }
+
+    #[test]
+    fn google_stream_terminal_usage_includes_thinking() {
+        let mut usage = NativeStreamUsage::with_limits(
+            google_target(),
+            crate::stream_retention::StreamRetentionLimits::default(),
+        );
+        let early = json!({
+            "candidates":[{"index":0,"content":{"parts":[{"text":"a"}]}}],
+            "usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":1,
+                "thoughtsTokenCount":3,"totalTokenCount":14}
+        });
+        let last = json!({
+            "candidates":[{"index":0,"finishReason":"STOP","content":{"parts":[]}}],
+            "usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,
+                "thoughtsTokenCount":7,"totalTokenCount":22}
+        });
+        let seen = usage.ingest(&early.to_string()).expect("early usage");
+        assert_eq!(seen.usage["completion_tokens"], 4);
+        usage.ingest(&last.to_string()).expect("final usage");
+        let terminal = usage.take_terminal_candidate().expect("terminal usage");
+        assert!(terminal.terminal);
+        assert_eq!(terminal.usage["completion_tokens"], 12);
+        assert_eq!(terminal.usage["reasoning_tokens"], 7);
+    }
+
+    #[test]
+    fn google_native_accounting_agrees_with_the_response_a_caller_sees() {
+        // The non-streaming response and the spend ledger read the same
+        // `usageMetadata`; they must not disagree about what the call cost.
+        for metadata in [
+            json!({"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}),
+            json!({"promptTokenCount":10,"candidatesTokenCount":5,
+                "thoughtsTokenCount":7,"totalTokenCount":22}),
+            json!({"promptTokenCount":10,"thoughtsTokenCount":7,"totalTokenCount":17}),
+            json!({"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":7,
+                "cachedContentTokenCount":4,"totalTokenCount":22}),
+        ] {
+            let native = normalize_native_usage(
+                WireFormat::GoogleGenerateContent,
+                &compact_native_usage(WireFormat::GoogleGenerateContent, &metadata),
+            )
+            .expect("native usage");
+            let response = crate::providers::gemini::normalized_gemini_usage(&metadata);
+            for pointer in [
+                "/prompt_tokens",
+                "/completion_tokens",
+                "/total_tokens",
+                "/reasoning_tokens",
+                "/completion_tokens_details/reasoning_tokens",
+                "/cache_read_tokens",
+                "/cache_write_tokens",
+                "/uncached_input_tokens",
+            ] {
+                assert_eq!(
+                    native.pointer(pointer),
+                    response.pointer(pointer),
+                    "{pointer} differs for {metadata}"
+                );
+            }
         }
     }
 }
@@ -382,6 +521,7 @@ fn compact_native_usage(_wire: WireFormat, native_usage: &Value) -> Value {
         "completion_tokens",
         "promptTokenCount",
         "candidatesTokenCount",
+        "thoughtsTokenCount",
         "totalTokenCount",
         "cache_read_tokens",
         "cache_read_input_tokens",
@@ -464,18 +604,20 @@ fn normalize_native_usage(wire: WireFormat, native_usage: &Value) -> Option<Valu
                 .saturating_add(cache_write));
         }
         WireFormat::GoogleGenerateContent => {
+            let (completion, thoughts) = google_completion_tokens(native_usage);
             normalized["prompt_tokens"] = native_usage
                 .get("promptTokenCount")
                 .cloned()
                 .unwrap_or(json!(0));
-            normalized["completion_tokens"] = native_usage
-                .get("candidatesTokenCount")
-                .cloned()
-                .unwrap_or(json!(0));
+            normalized["completion_tokens"] = json!(completion);
             normalized["total_tokens"] = native_usage
                 .get("totalTokenCount")
                 .cloned()
                 .unwrap_or(json!(0));
+            if thoughts > 0 {
+                normalized["reasoning_tokens"] = json!(thoughts);
+                normalized["completion_tokens_details"] = json!({"reasoning_tokens": thoughts});
+            }
         }
         WireFormat::OpenAiChat => {}
     }
