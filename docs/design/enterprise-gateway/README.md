@@ -134,22 +134,27 @@ Contracts and decisions (change before stability)
 
 Operability
 
-- **The Redis-backed gateway tests run one at a time.** `ci.yml` now runs every
-  build on each pull request, and the 63 `gateway::` library tests that need a
-  Redis (ignored without one, and run nowhere before) with `--test-threads=1`.
-  Several simulate a crashed origin or a shutdown, which acts on the Redis-wide
-  origin registry and accounting, so in parallel they take each other's
-  gateways away (13 of 63 failed that way; each passes alone). The namespace
-  setting above lets each test own its keys, and then they can run in parallel.
-- **The release gate is not tied to `ci.yml`.** A tag still runs only
-  `cargo test --workspace --features proxy --tests`; making the release wait for
-  a green `ci.yml` on the tagged commit, and adding the `serve` builds to it, is
-  a step toward declaring `serve` stable (0013).
-- **Gemini thinking tokens are left out of the normalized completion count** on
-  the native path (`usage::normalize_native_usage`), while the non-streaming
-  response folds them in. The spend ledger, the cap and the usage records all use
-  the smaller figure. It is a fix to shared accounting, so it belongs in its own
-  change with its own tests.
+- **The Redis-backed tests run one at a time.** `ci.yml` runs every build on each
+  pull request and on main, and the 64 ignored tests that need a Redis (63 in
+  `gateway::`, one in `proxy::ratelimit::`; they ran nowhere before) with
+  `--test-threads=1` and a floor on how many ran. Run in parallel against one
+  Redis, 13 of the 63 failed: every gateway's reaper sweeps the origin-lease
+  index and the shared capacity counters of all the others, so tests that
+  simulate a crashed origin or a shutdown reap each other's gateways. Each
+  passes alone. A `fleet.namespace` (above) would give each test its own keys and
+  should let them run in parallel; that is expected, not yet shown.
+- **Timing-dependent tests flake on a loaded runner.** Two failed in the first
+  runs of `ci.yml` (a 90 ms lease against a 120 ms deadline, and a 10 ms
+  deadline against a 100 ms stall) and were given five-fold margins. Others in
+  `gateway/distributed.rs` use 20 to 90 ms margins: widen them, or use paused
+  time, as they fail.
+- **A tag is not tied to `ci.yml`.** The release workflow still runs only fmt,
+  clippy and `cargo test --workspace --features proxy --tests`, plus the Windows
+  check. Making it wait for a green `ci.yml` on the tagged commit, and adding
+  the `serve` builds, is a step toward declaring `serve` stable.
+- **Nothing forces a red check to be read.** `main` has no branch protection or
+  ruleset, so a failing check does not block a merge. Requiring `ci.yml` and
+  `serve-check.yml` is a repository setting for the maintainer.
 - **The log writer** (`jsonl.rs`) drops and counts lines when its queue is full;
   a metric for the count (and for write failures) belongs with the
   OpenTelemetry item.

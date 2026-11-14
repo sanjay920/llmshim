@@ -2819,9 +2819,10 @@ mod tests {
     // ---- integration (require a live Redis via LLMSHIM_REDIS_URL) -----------
     // Run: LLMSHIM_REDIS_URL=redis://127.0.0.1:6379 \
     //        cargo test --features gateway-redis --lib gateway:: -- --ignored --test-threads=1
-    // One at a time: tests that simulate a crashed origin or a shutdown act on
-    // the Redis-wide origin registry and accounting, so run in parallel they
-    // take each other's gateways away. Each passes alone.
+    // One at a time: every gateway's reaper sweeps the origin-lease index and
+    // the shared capacity counters of all the others, so tests that simulate a
+    // crashed origin or a shutdown, run in parallel, reap each other's gateways.
+    // Each passes alone.
 
     use super::super::DispatchError;
     use crate::proxy::ratelimit::{InMemoryRateLimiter, RateLimitConfig};
@@ -3037,14 +3038,19 @@ mod tests {
         ] {
             let _: Result<i64, _> = conn.del(k).await;
         }
-        DistributedGateway::connect(
-            &url,
-            Arc::new(EchoDispatch),
-            unlimited(),
-            GatewayConfig::default(),
+        // With the variable set the caller asked for a Redis run: a gateway that
+        // cannot connect fails the test instead of skipping it, so an outage
+        // cannot turn a CI job green with nothing exercised.
+        Some(
+            DistributedGateway::connect(
+                &url,
+                Arc::new(EchoDispatch),
+                unlimited(),
+                GatewayConfig::default(),
+            )
+            .await
+            .expect("LLMSHIM_REDIS_URL is set but a gateway could not connect to it"),
         )
-        .await
-        .ok()
     }
 
     async fn job_origin_token(connection: &mut ConnectionManager, id: &str) -> String {

@@ -16,13 +16,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: serve-${{ github.workflow }}-${{ github.ref }}
+  # See ci.yml: only a pull request's superseded run is cancelled; each merge
+  # to main keeps its own run.
+  group: serve-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   serve-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -38,7 +40,7 @@ jobs:
 
   serve-redis-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     services:
       redis:
         image: redis:7-alpine

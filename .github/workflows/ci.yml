@@ -1,10 +1,11 @@
 name: CI
 
-# Pull requests used to run only the `serve` jobs. The default, `proxy`,
-# `gateway` and `gateway-redis` suites ran once, at tag time, so a change to
-# shared code (usage accounting, the HTTP client, the reasoning filter) reached
-# them only when a release was already being cut. The Redis-backed gateway
-# tests are ignored without a server and ran nowhere at all.
+# Pull requests used to run only the `serve` jobs and the Windows, Docker and
+# Helm checks. The release gate ran just the `proxy` suite, at tag time, so a
+# change to shared code (usage accounting, the HTTP client, the reasoning
+# filter) reached the default, `gateway` and `gateway-redis` suites only after
+# a release was already being cut. The Redis-backed gateway tests are ignored
+# without a server and ran nowhere at all.
 #
 # This runs every build on each pull request, on each merge to main (stacked
 # merges can break what each pull request passed alone), and weekly (a new
@@ -23,7 +24,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # One run per pull request, and a new push cancels the superseded run. Every
+  # other trigger gets a group of its own: with a shared group, a burst of
+  # merges to main would keep only the newest pending run and skip the commits
+  # between.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -33,7 +38,7 @@ env:
 jobs:
   fmt:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,16 +50,18 @@ jobs:
   clippy:
     name: clippy (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: default, features: '' }
-          - { name: proxy, features: proxy }
-          - { name: gateway, features: gateway }
-          - { name: gateway-redis, features: gateway-redis }
-          - { name: cloud transports, features: 'bedrock,vertex,azure' }
+          - { name: default, args: '' }
+          - { name: no default features, args: '--no-default-features' }
+          - { name: proxy, args: '--features proxy' }
+          - { name: gateway, args: '--features gateway' }
+          - { name: gateway-redis, args: '--features gateway-redis' }
+          - { name: redis-coordination, args: '--features redis-coordination' }
+          - { name: cloud transports, args: '--features bedrock,vertex,azure' }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -62,40 +69,42 @@ jobs:
           components: clippy
       - name: Clippy
         env:
-          FEATURES: ${{ matrix.features }}
-        run: cargo clippy --locked --workspace --all-targets ${FEATURES:+--features "$FEATURES"} -- -D warnings
+          ARGS: ${{ matrix.args }}
+        # $ARGS is split into words on purpose.
+        run: cargo clippy --locked --workspace --all-targets $ARGS -- -D warnings
 
   test:
     name: tests (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: default, features: '' }
+          - { name: default, args: '' }
           # What the release gate runs, here on every pull request.
-          - { name: proxy, features: proxy }
-          - { name: gateway, features: gateway }
-          - { name: gateway-redis, features: gateway-redis }
-          - { name: cloud transports, features: 'bedrock,vertex,azure' }
+          - { name: proxy, args: '--features proxy' }
+          - { name: gateway, args: '--features gateway' }
+          - { name: gateway-redis, args: '--features gateway-redis' }
+          - { name: redis-coordination, args: '--features redis-coordination' }
+          - { name: cloud transports, args: '--features bedrock,vertex,azure' }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Tests
         env:
-          FEATURES: ${{ matrix.features }}
-        run: cargo test --locked --workspace ${FEATURES:+--features "$FEATURES"} --tests
+          ARGS: ${{ matrix.args }}
+        run: cargo test --locked --workspace $ARGS --tests
 
-  # The distributed queue, lease and spend-ledger tests are marked `ignore`
-  # because they need a Redis; without this job nothing runs them. They run one
-  # at a time: several simulate a crashed origin or a shutdown, which acts on
-  # the Redis-wide origin registry and accounting, so in parallel they take each
-  # other's gateways away ("response channel lost", "Capacity"). Each passes
-  # alone and all 63 pass serially in about fifteen seconds.
+  # The distributed queue, lease, spend-ledger and rate-limiter tests that need
+  # a Redis are marked `ignore`; without this job nothing runs them. They run
+  # one at a time: several simulate a crashed origin or a shutdown, and every
+  # gateway's reaper sweeps the origin-lease index and the shared capacity
+  # counters of all the others, so in parallel one test's gateways are
+  # reaped by another's ("response channel lost", "Capacity").
   redis-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     services:
       redis:
         image: redis:7-alpine
@@ -107,8 +116,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Gateway tests that need a Redis
+      - name: Tests that need a Redis
         env:
           LLMSHIM_REDIS_URL: redis://127.0.0.1:6379
+          # A filter that matches nothing, or a renamed module, would pass with
+          # zero tests. Fail if fewer ran than are known to need a Redis (63 in
+          # gateway::, 1 in proxy::ratelimit::); raise this when one is added.
+          MIN_TESTS: '64'
         run: |
-          cargo test --locked --features gateway-redis --lib gateway:: -- --ignored --test-threads=1
+          set -o pipefail
+          cargo test --locked --features gateway-redis --lib -- gateway:: proxy::ratelimit:: --ignored --test-threads=1 2>&1 | tee redis-tests.log
+          ran=$(awk '/^test result: ok\./ { n += $4 } END { print n + 0 }' redis-tests.log)
+          echo "Redis-backed tests that ran: $ran (at least $MIN_TESTS expected)"
+          test "$ran" -ge "$MIN_TESTS"
