@@ -26,7 +26,9 @@ token = { env = "ADMIN_TOKEN" }   # or: allow_unauthenticated = true
 An `[admin]` table must say how it is protected: set `token`, or set
 `allow_unauthenticated = true` to serve the endpoints without one. Neither, or
 both, is a configuration error, so an operational listener is never open by
-accident (the same rule the main listener follows). The startup banner prints
+accident (the main listener follows the same rule, but its opt-in also needs a
+loopback address; the admin listener's does not, because a metrics scrape across
+the cluster network is what it is for). The startup banner prints
 which of the two is in force.
 
 - The admin listener serves exactly the four operational routes, with the same

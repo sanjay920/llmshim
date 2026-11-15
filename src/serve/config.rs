@@ -28,8 +28,9 @@ pub const VERSION: u32 = 1;
 const MAX_BUDGET_USD: f64 = 9_007_199.254_740_992;
 
 /// Longest spend window: 366 days. The Redis ledger multiplies the window by 1000
-/// and sets an expiry from it, so an unbounded value is an overflow or an expiry
-/// no operator meant.
+/// and sets an expiry from it, so an unbounded value is an expiry beyond Redis's
+/// range (the script errors and admission is refused) or one no operator meant. A
+/// budget that never resets is not a window and is not offered.
 pub const MAX_BUDGET_WINDOW_SECS: u64 = 366 * 24 * 60 * 60;
 
 /// Longest a request may wait for provider capacity: one hour. A wait that long is
@@ -208,13 +209,15 @@ where
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Server {
-    /// IP address to bind. Defaults to loopback; a container sets `0.0.0.0`.
+    /// IP address to bind. Defaults to loopback; a container sets `0.0.0.0`,
+    /// which needs `[[keys]]` (serving without callers is loopback-only).
     #[serde(default = "default_host")]
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
     /// Serve callers with no key. Off by default: a file with no `[[keys]]`
-    /// is refused unless this is set.
+    /// is refused unless this is set, and then `host` must be a loopback
+    /// address. Cannot be set together with `[[keys]]`.
     #[serde(default)]
     pub allow_unauthenticated: bool,
     /// Terminate TLS on the main listener. Without it the listener is plain
@@ -658,8 +661,8 @@ impl ServeConfig {
                 issues.push(Issue::new(
                     "server.host",
                     "must be a loopback address (127.0.0.0/8 or ::1) while \
-                     server.allow_unauthenticated is true; define [[keys]] to \
-                     listen on a routable address",
+                     server.allow_unauthenticated is true; to listen on a routable \
+                     address, remove server.allow_unauthenticated and define [[keys]]",
                 ));
             }
             Ok(_) => {}
@@ -667,7 +670,8 @@ impl ServeConfig {
         if self.keys.is_empty() && !self.server.allow_unauthenticated {
             issues.push(Issue::new(
                 "keys",
-                "no caller keys are defined; add [[keys]] or set server.allow_unauthenticated = true",
+                "no caller keys are defined; add [[keys]], or set server.allow_unauthenticated = true \
+                 (which needs a loopback server.host)",
             ));
         }
         if !self.keys.is_empty() && self.server.allow_unauthenticated {
@@ -1417,6 +1421,18 @@ fn validate_base_url(url: &str) -> Result<(), &'static str> {
     if url.contains('?') || url.contains('#') {
         return Err("must not contain a query string or fragment");
     }
+    // The authority is read from the text, before the parser sees it: the parser
+    // discards extra slashes after the scheme, so `https:///v1` would otherwise
+    // become the host `v1` and the provider key would be sent there, and it drops
+    // an empty `@`, so `https://@host` would pass as credential-free.
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '\\']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err("must name a host");
+    }
+    if authority.contains('@') {
+        return Err("must not contain credentials; use api_key");
+    }
     // A real parser, not a split on '/': it refuses an empty host (`http://:8000`),
     // a port that is not a number or is out of range, and a malformed address.
     let parsed =
@@ -2122,8 +2138,17 @@ mod tests {
     fn base_urls_must_be_final_endpoints_without_credentials() {
         assert!(validate_base_url("https://llm.internal.example/v1").is_ok());
         assert!(validate_base_url("http://localhost:8000/v1").is_ok());
-        assert!(validate_base_url("https://[::1]:8000/v1").is_ok());
-        assert!(validate_base_url("http://127.0.0.1:8000").is_ok());
+        for ok in [
+            "https://[::1]:8000/v1",
+            "http://127.0.0.1:8000",
+            "http://localhost",
+            "https://example.com/v1/",
+            "https://EXAMPLE.com/v1",
+            "http://llm_server:8000/v1",
+            "http://llm.internal.example:80/v1",
+        ] {
+            assert!(validate_base_url(ok).is_ok(), "{ok}");
+        }
         for bad in [
             "llm.internal.example/v1",
             "ftp://example.com",
@@ -2138,6 +2163,13 @@ mod tests {
             "http://example.com:notaport/v1",
             "http://example.com:99999/v1",
             "http://[::1/v1",
+            // What the URL parser alone would let through: it discards extra
+            // slashes (so `https:///v1` becomes the host `v1`, and the provider
+            // key would be sent there) and an empty userinfo.
+            "https:///v1",
+            "http:////h/v1",
+            "https://@h/v1",
+            "https://:@h/v1",
             "https://:@/v1",
         ] {
             assert!(validate_base_url(bad).is_err(), "{bad}");
@@ -2159,14 +2191,33 @@ mod tests {
                 issues(&open(ok))
             );
         }
-        for routable in ["0.0.0.0", "::", "10.0.0.5", "192.168.1.9", "203.0.113.7"] {
+        // An IPv4-mapped IPv6 loopback is not accepted: fail closed, say 127.0.0.1.
+        for routable in [
+            "0.0.0.0",
+            "::",
+            "10.0.0.5",
+            "192.168.1.9",
+            "203.0.113.7",
+            "::ffff:127.0.0.1",
+        ] {
             let found = issues(&open(routable));
+            assert_eq!(
+                found.len(),
+                1,
+                "one problem, no duplicate: {routable}: {found:?}"
+            );
             assert!(has(&found, "server.host"), "{routable}: {found:?}");
             assert!(
                 found[0].contains("loopback"),
                 "the message says what to do: {found:?}"
             );
         }
+        // With no keys and no opt-in, a routable host does not add a second problem.
+        let neither = "version = 1\n[server]\nhost = \"0.0.0.0\"\n[providers.openai]\n\
+                       kind = \"openai\"\napi_key = { env = \"OPENAI_API_KEY\" }";
+        let found = issues(neither);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(has(&found, "keys"));
         // With caller keys any address is allowed: the keys decide.
         let keyed = format!("{MINIMAL}\n[server]\nhost = \"0.0.0.0\"");
         assert!(issues(&keyed).is_empty(), "{:?}", issues(&keyed));
@@ -2190,7 +2241,7 @@ mod tests {
             );
         }
         let queue = |ms: u64| format!("{MINIMAL}\n[limits]\nqueue_timeout_ms = {ms}");
-        assert!(issues(&queue(0)).is_empty(), "0 waits not at all");
+        assert!(issues(&queue(0)).is_empty());
         assert!(issues(&queue(MAX_QUEUE_TIMEOUT_MS)).is_empty());
         for bad in [MAX_QUEUE_TIMEOUT_MS + 1, i64::MAX as u64] {
             let found = issues(&queue(bad));

@@ -14,9 +14,9 @@ use std::collections::HashMap;
 
 /// Shortest caller token accepted, in characters. A configuration cannot choose
 /// a weaker one. 22 characters is 128 bits in the densest common encoding
-/// (base64url), so it is the shortest length that can hold the 128 bits the notes
-/// advise. Length is a floor, not a measure of randomness: generate tokens with
-/// a tool (`openssl rand -hex 32`), not by hand.
+/// (base64url), so it is the shortest length that can hold 128 bits of
+/// randomness. Length is a floor, not a measure of randomness: generate tokens
+/// with a tool (`openssl rand -hex 32`), not by hand.
 pub const MIN_TOKEN_LEN: usize = 22;
 
 /// Why `token` cannot serve as a bearer token, if it cannot. Shared by caller

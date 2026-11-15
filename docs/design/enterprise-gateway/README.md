@@ -108,8 +108,8 @@ Contracts and decisions (change before stability)
 - **`routes.*.settings` is an open map**: a misspelled setting is accepted
   silently (the adapters ignore a top-level key they do not read). Closing it
   needs one authoritative list of request keys, which the adapters do not keep in
-  one place: the request-field table in the docs is the nearest, and it omits
-  provider-specific top-level fields such as `store` and `cache_control`. A list
+  one place: the request-field table in the docs is the nearest, and it omits keys
+  the adapters read, such as `response_format` and `parallel_tool_calls`. A list
   that rejects a legitimate key is worse than an open map, so this waits for the
   list.
 - **Key names on usage records** (not only tenants), and **request ids** to join

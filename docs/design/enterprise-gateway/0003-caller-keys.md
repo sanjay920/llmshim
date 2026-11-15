@@ -48,7 +48,7 @@ visible ASCII, so a space, a control character, a non-ASCII character or a
 byte-order mark left by an editor could never match; refusing it at `--check`
 turns a silent lockout into an error naming the key. 22 characters is 128 bits
 in the densest common encoding (base64url), the shortest length that can hold
-the 128 bits this note advises, so a token from `openssl rand -hex 32` (64
+128 bits of randomness, so a token from `openssl rand -hex 32` (64
 characters) or `openssl rand -base64 24` (32) clears it and a hand-typed word
 does not. The floor is a guard against a typo, not a strength guarantee: length
 is not randomness, so generate tokens with a tool. A digest cannot be checked for
