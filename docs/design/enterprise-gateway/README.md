@@ -83,6 +83,13 @@ Phase 0: a production server mode
       checked-in JSON Schema (see "Review follow-ups"; 0013)
 - [x] Pull-request CI for every build, including the Redis-backed tests that are
       ignored without a server (`ci.yml`; 0013)
+- [ ] The operational endpoints in the OpenAPI document, with a conformance test
+      (0013)
+- [ ] A request id unique across instances, with the tenant, key name and
+      credential fingerprint joined across the access log, the usage records and
+      the trace (0013)
+- [ ] The release gate builds and tests `serve` and waits for a green `ci.yml`
+      (0013)
 
 Later phases (each needs its own design note before work starts)
 

@@ -27,8 +27,12 @@ carry no private consumer identities).
 | Proxy HTTP API | `api/openapi.yaml`; the bundled clients in lockstep | stable |
 | Gateway HTTP API | the proxy contract plus the gateway's headers and endpoints, in the same document, marked experimental there | experimental |
 | `llmshim serve` configuration file | 0001; a JSON Schema checked in and compared by a test (planned) | unstable |
-| Operational endpoints (`/health`, `/ready`, `/metrics`, stats, `/v1/serve/config`) | 0005, 0012; to be described in the OpenAPI document (planned) | unstable |
+| Operational endpoints (`/ready`, `/metrics`, stats, `/v1/serve/config`; `/health` is part of the proxy contract) | 0005, 0012; to be described in the OpenAPI document (planned) | unstable |
 | Access and usage logs | 0009, 0010 | unstable |
+
+**Stable:** a breaking change needs a version bump (a minor release while the
+crate is 0.x). **Experimental:** may change in a release, and the change is
+called out. **Unstable:** may change in any release.
 
 Once a row is declared stable, a change that cannot be made additively gets a
 new `version` of the file or a new path, and log fields are added, never renamed
@@ -39,7 +43,8 @@ it does not know.
 ## When `serve` is declared stable
 
 The maintainer declares it, as a commit to this note, when all of these hold.
-From then on the semver rule applies to `serve` and its file format.
+From then on the semver rule applies to `serve`, and the configuration file, the
+operational endpoints and the access and usage logs become stable with it.
 
 1. Every item under "Contracts and decisions" in the roadmap's review follow-ups
    is done or has a written decision.
@@ -56,23 +61,26 @@ From then on the semver rule applies to `serve` and its file format.
    added latency (p50 and p99), throughput and memory against a mock upstream.
 7. Images are signed (verifiable with `cosign verify`) and carry an SPDX SBOM.
 8. The release gate builds and tests `serve`, and refuses a tag whose commit
-   lacks a green `ci.yml`.
+   lacks a green `ci.yml`; and branch protection requires `ci.yml` and
+   `serve-check.yml` on main.
 
 ## The bar for each step
 
 1. **Every dependency has a failure row.** What happens when it is down, slow or
    wrong, written down and tested. A step that adds or changes a dependency adds
    or changes the row.
-2. **On the request path, identity and money fail closed; telemetry fails
+2. **On the inference path, identity and money fail closed; telemetry fails
    open.** Once serving, a request whose caller cannot be identified, or whose
-   spend cannot be settled against a cap, is refused (0006 for a Redis outage).
+   spend cannot be reserved against a cap, is refused (0006 for a Redis outage).
    A failing log sink or metrics exporter never blocks or fails a request; it is
    counted and reported. At startup the opposite holds: a log path that cannot
    be written refuses to start (0009). A configuration change that cannot be
    applied leaves the running one in force and says so (0012). The deliberate
    exceptions are configuration, not accident, and are named where they are
-   granted: unauthenticated serving (0001), a key without a budget, and
-   `budget_allow_unpriced`.
+   granted: unauthenticated serving (0001); `/health` and `/ready`, which stay
+   open under an admin token so orchestrators can probe, and every operational
+   endpoint when no `[admin]` table is configured (0005); and a key without a
+   budget or with `budget_allow_unpriced` (`docs/src/proxy/scaling.md`).
 3. **Every rule gets a test that fails without it.** For a security-relevant rule
    the test is checked by deleting the rule and watching it fail. A rule that has
    no test yet is listed under "Tests worth adding" in the roadmap until it has
@@ -103,8 +111,8 @@ of untested corners makes that worse, not better.
    remaining inventory rows of 0002, a structure-only `--check` with its own
    exit code, `--print-schema`, and the operational endpoints in the OpenAPI
    document with a conformance test.
-4. A request id that is unique across instances, and key names on usage
-   records.
+4. A request id that is unique across instances, and the tenant, key name and
+   credential fingerprint beside it in the access log and the usage records.
 5. Outage-survival tests and the failure-mode table (0014).
 6. OpenTelemetry traces and metrics, with the log writer's drop counters.
 7. JWT/OIDC workload identity and IP allowlists (design note first).
@@ -127,6 +135,8 @@ of untested corners makes that worse, not better.
   enables it.** The registry sits beside the repository and its identity;
   keyless signing leaves no long-lived signing key to guard or leak; and the
   opt-in means a tag never publishes an image by accident.
+- **The proxy HTTP API is stable:** `api/openapi.yaml` is its contract and the
+  bundled clients move with it. The gateway's additions to it are experimental.
 - **Stability:** as above. Until then `serve` stays unstable; afterwards it stays
   behind its feature (working rule 1).
 - **Licensing** of SSO, SCIM, audit export and the admin UI is undecided, and
