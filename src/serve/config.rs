@@ -457,13 +457,19 @@ impl JsonSchema for SecretRef {
             "oneOf": [
                 {
                     "type": "object",
-                    "properties": {"env": {"type": "string", "pattern": "^[A-Z0-9_]+$"}},
+                    "properties": {
+                        "env": {"type": "string", "pattern": "^[A-Z0-9_]+$"},
+                        "file": {"type": "null"}
+                    },
                     "required": ["env"],
                     "additionalProperties": false
                 },
                 {
                     "type": "object",
-                    "properties": {"file": {"type": "string"}},
+                    "properties": {
+                        "file": {"type": "string"},
+                        "env": {"type": "null"}
+                    },
                     "required": ["file"],
                     "additionalProperties": false
                 }
@@ -485,7 +491,13 @@ impl JsonSchema for SecretRef {
 /// most 366 days) are `serve --check`'s, not a schema's: a file the schema
 /// accepts can still fail `--check`, and one it refuses always does.
 pub fn schema() -> serde_json::Value {
-    serde_json::to_value(schemars::schema_for!(ServeConfig)).expect("a schema is JSON")
+    // `RestrictFormats` drops the non-standard `format` values schemars adds for
+    // Rust's integer and float types (`uint32`, `double`), which a strict
+    // consumer validator would reject; the numeric `minimum`/`maximum` stay.
+    let generator = schemars::generate::SchemaSettings::draft2020_12()
+        .with_transform(schemars::transform::RestrictFormats::default())
+        .into_generator();
+    serde_json::to_value(generator.into_root_schema_for::<ServeConfig>()).expect("a schema is JSON")
 }
 
 impl fmt::Debug for SecretRef {
@@ -1538,8 +1550,9 @@ mod tests {
         let validator = schema_validator();
         for (what, text) in [
             (
+                // Before any table, so it is a root key and not keys[0]'s.
                 "an unknown top-level field",
-                format!("{MINIMAL}\nsurprise = 1"),
+                format!("surprise = 1\n{MINIMAL}"),
             ),
             (
                 "an unknown nested field",
@@ -1582,6 +1595,79 @@ mod tests {
             assert!(
                 ServeConfig::parse(&text, Format::Toml).is_err(),
                 "the parser must refuse {what} too"
+            );
+        }
+    }
+
+    #[test]
+    fn every_file_the_parser_accepts_satisfies_the_schema() {
+        let validator = schema_validator();
+        for (what, extra) in [
+            (
+                "state",
+                "[state]\nreceipts_dir = \"/var/lib/llmshim\"\nidempotency_ttl_secs = 60",
+            ),
+            (
+                "logging",
+                "[logging]\naccess_log = \"stdout\"\nusage_log = \"/var/log/usage.jsonl\"",
+            ),
+            (
+                "limits",
+                "[limits]\nrpm = 100\nmax_concurrency = 4\n[limits.providers.openai]\nrpm = 10",
+            ),
+            ("reload", "[reload]\nwatch = false"),
+            (
+                "admin",
+                "[admin]\nport = 9090\ntoken = { env = \"ADMIN_TOKEN\" }",
+            ),
+            ("fleet", "[fleet]\nredis_url = { env = \"REDIS_URL\" }"),
+            (
+                "a route",
+                "[routes.cheap]\nmodel = \"openai/gpt-6-luna\"\n[routes.cheap.settings]\nreasoning_effort = \"low\"",
+            ),
+            (
+                "server tls",
+                "[server.tls]\ncert_file = \"/etc/tls/server.pem\"\nkey_file = \"/etc/tls/server.key\"",
+            ),
+        ] {
+            let text = format!("{MINIMAL}\n{extra}");
+            assert!(
+                ServeConfig::parse(&text, Format::Toml).is_ok(),
+                "the fixture for {what} is meant to parse: {:?}",
+                ServeConfig::parse(&text, Format::Toml).err()
+            );
+            let errors: Vec<String> = validator
+                .iter_errors(&toml_as_json(&text))
+                .map(|e| format!("{e} at {}", e.instance_path()))
+                .collect();
+            assert!(errors.is_empty(), "{what}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn a_secret_with_an_explicit_null_is_read_the_same_by_the_schema_and_the_parser() {
+        // A JSON generator emits `"file": null` for an absent key. Both accept it
+        // beside a value and both refuse it as the only content.
+        let validator = schema_validator();
+        let with = |secret: &str| {
+            format!(
+                r#"{{"version":1,"providers":{{"openai":{{"kind":"openai","api_key":{secret}}}}},
+                "keys":[{{"name":"ci","tenant":"platform","secret":{{"env":"CI_GATEWAY_KEY"}}}}]}}"#
+            )
+        };
+        for (secret, accepted) in [
+            (r#"{"env":"OPENAI_API_KEY","file":null}"#, true),
+            (r#"{"env":null,"file":"/run/key"}"#, true),
+            (r#"{"env":null,"file":null}"#, false),
+            (r#"{"env":"OPENAI_API_KEY","file":"/run/key"}"#, false),
+        ] {
+            let text = with(secret);
+            let instance: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(validator.is_valid(&instance), accepted, "schema: {secret}");
+            assert_eq!(
+                ServeConfig::parse(&text, Format::Json).is_ok(),
+                accepted,
+                "parser: {secret}"
             );
         }
     }

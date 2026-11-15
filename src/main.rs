@@ -827,9 +827,6 @@ async fn load_tls(config: &llmshim::serve::ServeConfig) -> Result<(LoadedTls, Lo
     Ok((main, admin))
 }
 
-/// Run the server described by a configuration file, or with `--check` only
-/// validate it. Exit codes: 0 valid (or clean shutdown), 1 invalid or failed
-/// to start, 2 usage error (reported before this runs).
 /// Reload the caller keys on `SIGHUP` and, when `poll` is set, on a timer. A
 /// reload that changes nothing is silent when the timer ran it; one a signal
 /// asked for always answers. A rejection is reported once per distinct failure,
@@ -921,6 +918,11 @@ const EXIT_INVALID: i32 = 1;
 #[cfg(feature = "serve")]
 const EXIT_UNAVAILABLE: i32 = 3;
 
+/// Run the server described by a configuration file, or with `--check` only
+/// validate it. Exit status: 0 valid (or a clean shutdown); 1 the file is wrong,
+/// a secret's value breaks a rule, or the server could not start; 3 a referenced
+/// secret is unset, blank or unreadable. (2, bad arguments, is reported before
+/// this runs.)
 #[cfg(feature = "serve")]
 async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     if options.print_schema {
@@ -978,21 +980,38 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         );
         return 0;
     }
-    // A rule broken by the values of the secrets (a caller token equal to an
-    // upstream key) is a defect in what was configured: status 1. A secret that
-    // is unset, blank or unreadable is a fact about this environment: status 3.
-    // Both are reported together; a defect outranks an absence.
-    let broken = config.check_same_values(&env);
+    // A rule broken by the value of a secret (a caller token too short, equal to
+    // an upstream key, a Redis URL that is not one) is a defect in what was
+    // configured: status 1. A secret that is unset, blank or unreadable is a fact
+    // about this environment: status 3. Both are reported together and a defect
+    // outranks an absence, so a secret that is missing never hides a rule broken
+    // by another one that is present: each rule is asked about on its own and the
+    // ones about an unavailable secret are dropped (its absence is reported).
     let absent = config.check_secrets_present(&env);
-    if !broken.is_empty() || !absent.is_empty() {
-        let status = if broken.is_empty() {
+    let unavailable: std::collections::BTreeSet<&str> =
+        absent.iter().map(|issue| issue.path.as_str()).collect();
+    let mut defects = config.check_same_values(&env);
+    if let Err(issues) = llmshim::serve::build_key_store(&config, &env) {
+        defects.extend(issues);
+    }
+    if let Err(issue) = llmshim::serve::admin_token_digest(&config, &env) {
+        defects.push(issue);
+    }
+    if let Err(issue) = llmshim::serve::fleet_redis_url(&config, &env) {
+        defects.push(issue);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    defects.retain(|issue| {
+        !unavailable.contains(issue.path.as_str()) && seen.insert(issue.to_string())
+    });
+    if !defects.is_empty() || !absent.is_empty() {
+        let status = if defects.is_empty() {
             EXIT_UNAVAILABLE
         } else {
             EXIT_INVALID
         };
-        let mut problems = broken;
-        problems.extend(absent);
-        report(&problems);
+        defects.extend(absent);
+        report(&defects);
         return status;
     }
     // Load the TLS material before anything is created or started, so a bad
@@ -1005,21 +1024,9 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         }
     };
     if options.check {
-        // Building the caller-key store is the stricter check: it also enforces
-        // token length and whitespace, which a reference check cannot. Nothing
-        // is created or started.
-        if let Err(issues) = llmshim::serve::build_key_store(&config, &env) {
-            report(&issues);
-            return 1;
-        }
-        if let Err(issue) = llmshim::serve::admin_token_digest(&config, &env) {
-            report(&[issue]);
-            return 1;
-        }
-        if let Err(issue) = llmshim::serve::fleet_redis_url(&config, &env) {
-            report(&[issue]);
-            return 1;
-        }
+        // Everything that can be checked without creating or starting anything
+        // has been: the shape, the secrets and the rules about their values (the
+        // caller-key store, the admin token, the Redis URL) and the TLS material.
         println!("{}: valid ({})", path.display(), summary());
         return 0;
     }

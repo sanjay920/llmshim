@@ -147,7 +147,16 @@ mod with_feature {
 
     #[test]
     fn structure_only_needs_no_secret_certificate_or_environment() {
-        let path = write("structure.toml", CONFIG);
+        // A certificate, a key and a secret file that do not exist here, and an
+        // environment that holds nothing: the machine of a pipeline that has been
+        // given no secret.
+        let config = format!(
+            "{CONFIG}\n[server.tls]\ncert_file = \"/nonexistent/server.pem\"\n\
+             key_file = \"/nonexistent/server.key\"\n\
+             [[keys]]\nname = \"later\"\ntenant = \"other\"\n\
+             secret = {{ file = \"/nonexistent/caller.key\" }}\n"
+        );
+        let path = write("structure.toml", &config);
         let output = no_secrets(&[
             "serve",
             "--config",
@@ -161,12 +170,14 @@ mod with_feature {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(output.status.code(), Some(0), "{text}");
-        assert!(text.contains("valid structure (version 1, 1 provider(s), 1 key(s), 0 route(s);"));
+        assert!(text.contains("valid structure (version 1, 1 provider(s), 2 key(s), 0 route(s);"));
         assert!(
             text.contains("not checked"),
             "it says what it did not check"
         );
-        // The same file, checked in full on the same machine, is not available.
+        // The same file, checked in full on the same machine: the secrets are not
+        // available (3). A missing certificate is a failure of its own (1), which
+        // is why a pipeline without them uses --structure-only.
         let full = no_secrets(&["serve", "--config", path.to_str().unwrap(), "--check"]);
         assert_eq!(full.status.code(), Some(3));
     }
@@ -191,25 +202,22 @@ surprise = true
             "--structure-only",
         ]);
         assert_eq!(output.status.code(), Some(1));
-        // A rule that needs no secret is applied: the loopback rule is one.
-        let open = write(
-            "structure-open.toml",
-            "version = 1\n[server]\nhost = \"0.0.0.0\"\nallow_unauthenticated = true\n\
-             [providers.openai]\nkind = \"openai\"\napi_key = { env = \"SERVE_TEST_PROVIDER_KEY\" }\n",
+        // A rule that needs no secret is applied too, not only parse errors: a
+        // host that is not an address passes the parser and fails validation.
+        let wrong_host = write(
+            "structure-host.toml",
+            &format!("{CONFIG}\n[server]\nhost = \"nope\"\n"),
         );
         let output = no_secrets(&[
             "serve",
             "--config",
-            open.to_str().unwrap(),
+            wrong_host.to_str().unwrap(),
             "--check",
             "--structure-only",
         ]);
-        // (Rule introduced by the contract tightening; before it this is valid.)
+        assert_eq!(output.status.code(), Some(1));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.code() == Some(0) || stderr.contains("server.host"),
-            "{stderr}"
-        );
+        assert!(stderr.contains("server.host:"), "{stderr}");
     }
 
     #[test]
@@ -239,6 +247,70 @@ surprise = true
     }
 
     #[test]
+    fn starting_without_check_has_the_same_statuses() {
+        // No server is started in any of these: the secrets are checked first.
+        let path = write("start.toml", CONFIG);
+        let missing = no_secrets(&["serve", "--config", path.to_str().unwrap()]);
+        assert_eq!(missing.status.code(), Some(3), "an unset secret");
+        let blank = run(
+            &["serve", "--config", path.to_str().unwrap()],
+            &[
+                ("SERVE_TEST_PROVIDER_KEY", "   "),
+                ("SERVE_TEST_CALLER_KEY", "a-caller-key-0123456789abc"),
+            ],
+        );
+        assert_eq!(blank.status.code(), Some(3), "a blank secret");
+        let unreadable = write(
+            "unreadable.toml",
+            &CONFIG.replace(
+                "{ env = \"SERVE_TEST_CALLER_KEY\" }",
+                "{ file = \"/nonexistent/caller.key\" }",
+            ),
+        );
+        let output = run(
+            &["serve", "--config", unreadable.to_str().unwrap()],
+            &[("SERVE_TEST_PROVIDER_KEY", "provider-key-0123456789abc")],
+        );
+        assert_eq!(output.status.code(), Some(3), "an unreadable secret file");
+        let weak = run(
+            &["serve", "--config", path.to_str().unwrap()],
+            &[
+                ("SERVE_TEST_PROVIDER_KEY", "provider-key-0123456789abc"),
+                ("SERVE_TEST_CALLER_KEY", "too-short"),
+            ],
+        );
+        assert_eq!(weak.status.code(), Some(1), "a secret that breaks a rule");
+    }
+
+    #[test]
+    fn a_secret_that_is_missing_does_not_hide_a_rule_broken_by_another() {
+        // keys[0] is present but too short; keys[1] is not provisioned. Both are
+        // reported and the status is the defect's, not the absence's.
+        let path = write(
+            "mixed.toml",
+            &format!(
+                "{CONFIG}\n[[keys]]\nname = \"later\"\ntenant = \"other\"\n\
+                 secret = {{ env = \"SERVE_TEST_NOT_PROVISIONED\" }}\n"
+            ),
+        );
+        let output = run(
+            &["serve", "--config", path.to_str().unwrap(), "--check"],
+            &[
+                ("SERVE_TEST_PROVIDER_KEY", "provider-key-0123456789abc"),
+                ("SERVE_TEST_CALLER_KEY", "too-short"),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("keys[0].secret: must be at least"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("SERVE_TEST_NOT_PROVISIONED"), "{stderr}");
+        assert!(!stderr.contains("too-short"), "never the value");
+    }
+
+    #[test]
     fn structure_only_is_a_mode_of_check() {
         let path = write("mode.toml", CONFIG);
         let output = no_secrets(&[
@@ -260,8 +332,11 @@ surprise = true
         assert!(
             printed == checked_in,
             "the configuration schema changed. If that is intended, regenerate it:\n  \
-             llmshim serve --print-schema > docs/design/enterprise-gateway/serve-config.schema.json\n\
-             and say in the pull request which field changed and why a consumer is unaffected."
+             cargo run --features serve -- serve --print-schema > \\\n  \
+             docs/design/enterprise-gateway/serve-config.schema.json\n\
+             and say in the pull request which field changed and why a consumer is unaffected. \
+             (A schemars update can change the output too: that is a reason to review it, \
+             not to skip the comparison.)"
         );
         let schema: serde_json::Value = serde_json::from_str(&printed).unwrap();
         assert_eq!(

@@ -75,7 +75,10 @@ prints a value.
 
 `--structure-only` exists so a pipeline that holds no secret (a pull-request job,
 a generator's test) can still gate on the file. It reads no environment variable,
-no secret file and no certificate, and it says what it did not check.
+no secret file and no certificate, and it says what it did not check. It still
+reports what this *binary* cannot serve (the `[fleet]` table in a build without
+`serve-redis`, say), because that is a fact about the binary a pipeline checking
+with the production binary wants to know.
 
 Exit status, for `--check` and for starting the server alike:
 
@@ -84,7 +87,7 @@ Exit status, for `--check` and for starting the server alike:
 | `0` | valid (or the server ran and stopped cleanly) |
 | `1` | the file is wrong, a secret's *value* breaks a rule (too short, equal to an upstream key), or the server could not start |
 | `2` | bad arguments |
-| `3` | a referenced secret is unset, blank or unreadable: this environment cannot check the file |
+| `3` | a referenced secret is unset, blank or unreadable: this environment cannot check the file. A missing certificate or key file is status `1`, not `3`: a pipeline given neither uses `--structure-only` |
 
 A pipeline can therefore treat `1` as a failure and `3` as "not provisioned
 here". When both apply the status is `1` and both are reported: a defect outranks
@@ -105,7 +108,10 @@ of `env` or `file`. A file the schema refuses always fails the parser, and a tes
 holds the two to that; a file the schema accepts can still fail `--check`,
 because the rules that compare values, read the environment or need two fields
 together are not a schema's to state. A consumer can validate its generated files
-against the schema in an editor or a pipeline with no llmshim binary at all.
+against the schema in an editor or a pipeline with no llmshim binary at all. A
+TOML file can name the schema for an editor with a `#:schema` directive comment
+at the top; a JSON file cannot carry a `$schema` key, because unknown fields are
+errors.
 
 ### What is deliberately not here yet
 

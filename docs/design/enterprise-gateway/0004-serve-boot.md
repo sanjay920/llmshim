@@ -15,7 +15,7 @@ dispatch, authentication or queue path: `serve` builds a `GatewayState` and an
 application through `app_with_parts`, the same constructors `gateway` uses.
 
 Exit codes: `0` clean shutdown, `1` invalid configuration or failure to start,
-`2` usage error. A configuration problem is reported with every issue and its
+`2` usage error, `3` a referenced secret is unset, blank or unreadable (0001). A configuration problem is reported with every issue and its
 path before any port is bound or directory is created.
 
 ## What the file controls

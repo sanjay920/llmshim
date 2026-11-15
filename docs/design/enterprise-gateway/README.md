@@ -101,6 +101,9 @@ contract is cheaper to change before the feature is declared stable.
 
 Contracts and decisions (change before stability)
 
+- **`server.allow_unauthenticated` with a non-loopback host** is accepted.
+  Requiring loopback when unauthenticated is a tightening that is easier now than
+  after files exist.
 - **`routes.*.settings` is an open map**: a misspelled setting is accepted
   silently. Define the accepted keys.
 - **`base_url`** accepts `http://:8000` and a port that is not a number, and is
@@ -122,7 +125,7 @@ Contracts and decisions (change before stability)
   the CA bundle.
 - **Tokens**: the length floor of 16 characters is below the 128 bits that 0003
   advises; consider 32. Caller keys are compared with provider and admin
-  keys by digest in `check_references`, which `--check` and startup run, but
+  keys by digest in `check_same_values`, which `--check` and startup run, but
   `build_key_store` alone does not.
 
 Operability

@@ -15,7 +15,6 @@
           "type": "string"
         },
         "port": {
-          "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
           "type": "integer"
@@ -74,7 +73,6 @@
         "budget_usd": {
           "default": null,
           "description": "USD spend cap per window.",
-          "format": "double",
           "type": [
             "number",
             "null"
@@ -82,7 +80,6 @@
         },
         "budget_window_secs": {
           "default": null,
-          "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
@@ -104,7 +101,6 @@
         "rpm": {
           "default": null,
           "description": "Per-tenant requests per minute. Zero denies every request.",
-          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -136,14 +132,12 @@
         "tier": {
           "default": 0,
           "description": "Queue priority; higher is served sooner.",
-          "format": "uint8",
           "maximum": 255,
           "minimum": 0,
           "type": "integer"
         },
         "tpm": {
           "default": null,
-          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -164,7 +158,6 @@
         "max_concurrency": {
           "default": null,
           "description": "In-flight upstream requests per provider, per instance.",
-          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -180,7 +173,6 @@
         "queue_timeout_ms": {
           "default": null,
           "description": "Longest a request may wait for capacity before a 503.",
-          "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
@@ -190,7 +182,6 @@
         "rpm": {
           "default": null,
           "description": "Requests per minute for every provider without its own entry.",
-          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -200,7 +191,6 @@
         "tpm": {
           "default": null,
           "description": "Tokens per minute for every provider without its own entry.",
-          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -289,7 +279,6 @@
       "properties": {
         "rpm": {
           "default": null,
-          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -298,7 +287,6 @@
         },
         "tpm": {
           "default": null,
-          "format": "uint32",
           "minimum": 0,
           "type": [
             "integer",
@@ -315,7 +303,6 @@
         "interval_secs": {
           "default": null,
           "description": "How often to look, in seconds. Defaults to 30.",
-          "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
@@ -358,6 +345,9 @@
             "env": {
               "pattern": "^[A-Z0-9_]+$",
               "type": "string"
+            },
+            "file": {
+              "type": "null"
             }
           },
           "required": [
@@ -368,6 +358,9 @@
         {
           "additionalProperties": false,
           "properties": {
+            "env": {
+              "type": "null"
+            },
             "file": {
               "type": "string"
             }
@@ -395,7 +388,6 @@
         },
         "port": {
           "default": 3000,
-          "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
           "type": "integer"
@@ -421,7 +413,6 @@
         "idempotency_ttl_secs": {
           "default": null,
           "description": "How long a completed idempotent request's answer is kept, in seconds.\nDefaults to 300.",
-          "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
@@ -462,7 +453,6 @@
         "reload_interval_secs": {
           "default": null,
           "description": "How often to look for changed files, in seconds. Defaults to 30.",
-          "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
@@ -539,7 +529,6 @@
     },
     "version": {
       "description": "The schema version. Only 1 exists; another is refused before anything else.",
-      "format": "uint32",
       "maximum": 1,
       "minimum": 1,
       "type": "integer"

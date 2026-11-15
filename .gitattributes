@@ -1,0 +1,2 @@
+# The checked-in schema is compared byte for byte with `serve --print-schema`.
+docs/design/enterprise-gateway/serve-config.schema.json text eol=lf
