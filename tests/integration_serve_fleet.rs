@@ -175,14 +175,19 @@ async fn usage_records_name_the_tenant_whichever_replica_dispatches() {
     let names = Names::new();
     let directory = harness::tempdir::Dir::new("fleet-usage");
     let log_for = |replica: &str| directory.0.join(format!("usage-{replica}.jsonl"));
+    // The two replicas name the same key differently, as a rollout in progress
+    // might: the name a record carries is the dispatching replica's own, and not
+    // one that travelled with the job.
     let text = |replica: &str| {
-        fleet_config(&upstream.url(), &names, "").replace(
-            "[state]",
-            &format!(
-                "[logging]\nusage_log = \"{}\"\n[state]",
-                log_for(replica).display()
-            ),
-        )
+        fleet_config(&upstream.url(), &names, "")
+            .replace(
+                "[state]",
+                &format!(
+                    "[logging]\nusage_log = \"{}\"\n[state]",
+                    log_for(replica).display()
+                ),
+            )
+            .replace("name = \"ci\"", &format!("name = \"ci-{replica}\""))
     };
     let a = start(&text("a"), "usage-a", &env);
     let b = start(&text("b"), "usage-b", &env);
@@ -198,10 +203,17 @@ async fn usage_records_name_the_tenant_whichever_replica_dispatches() {
     // Keep going until both have dispatched at least one, which they do within a
     // handful of requests (they split evenly in practice).
     let mut sent = 0;
+    let mut ids = Vec::new();
     let (mut from_a, mut from_b) = (Vec::new(), Vec::new());
     while sent < 40 && (from_a.is_empty() || from_b.is_empty()) {
         let response = chat(&a, Some(CALLER_KEY), &names.model()).await;
         assert_eq!(response.status(), 200);
+        ids.push(
+            response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
         sent += 1;
         (from_a, from_b) = (read("a"), read("b"));
     }
@@ -219,5 +231,23 @@ async fn usage_records_name_the_tenant_whichever_replica_dispatches() {
         assert_eq!(record["provider"], names.provider.as_str());
         assert_eq!(record["outcome"], "completed");
     }
+    // The key is named too, from each replica's own configuration: the job
+    // carried a prefix of the credential's digest through Redis, never the name.
+    for record in &from_a {
+        assert_eq!(record["key"], "ci-a", "{record}");
+    }
+    for record in &from_b {
+        assert_eq!(record["key"], "ci-b", "{record}");
+    }
+    // The id the caller saw on its response, on the record of the replica that
+    // dispatched it, whichever replica that was. Replica A minted every one.
+    let mut recorded: Vec<String> = from_a
+        .iter()
+        .chain(&from_b)
+        .map(|record| record["request_id"].as_str().unwrap().to_owned())
+        .collect();
+    recorded.sort();
+    ids.sort();
+    assert_eq!(recorded, ids);
     drop((a, b));
 }

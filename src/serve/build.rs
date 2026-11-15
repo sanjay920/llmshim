@@ -12,7 +12,7 @@ use super::reload::ReloadHandles;
 use crate::breaker::BreakerConfig;
 use crate::gateway::auth::{KeyStore, LiveKeys};
 use crate::gateway::http::{app_with_parts, GatewayState, LocalParts};
-use crate::gateway::usage::TenantNames;
+use crate::gateway::usage::{KeyNames, TenantNames};
 use crate::gateway::GatewayConfig;
 use crate::provider::Provider;
 use crate::providers::{
@@ -160,6 +160,7 @@ pub async fn build_app(
         }
     };
     let tenants = TenantNames::new(config.keys.iter().map(|key| key.tenant.clone()));
+    let key_names = KeyNames::new(super::keys::key_names(config, env));
 
     let router = build_router(config, env, &mut issues);
 
@@ -265,6 +266,7 @@ pub async fn build_app(
             Some(crate::gateway::usage::UsageSetup {
                 sink: Arc::new(UsageLog(log)),
                 tenants: tenants.clone(),
+                keys: key_names.clone(),
             })
         }
         Some(Err(message)) => {
@@ -358,7 +360,7 @@ pub async fn build_app(
 
     let admin_authenticated = admin_token.is_some();
     let admin_state = state.clone();
-    let reload = ReloadHandles::new(keys.clone(), tenants);
+    let reload = ReloadHandles::new(keys.clone(), tenants, key_names.clone());
     let reload_status = reload.status_handle();
     let app = app_with_parts(
         state,
@@ -402,9 +404,16 @@ pub async fn build_app(
     let app = match access_log {
         Some(log) => {
             let keys = Arc::new(KeyStore::Live(keys.clone()));
+            let names = key_names.clone();
             app.layer(axum::middleware::from_fn(
                 move |request: Request, next: Next| {
-                    super::access_log::record_request(log.clone(), keys.clone(), request, next)
+                    super::access_log::record_request(
+                        log.clone(),
+                        keys.clone(),
+                        names.clone(),
+                        request,
+                        next,
+                    )
                 },
             ))
         }

@@ -88,9 +88,9 @@ Phase 0: a production server mode
       ignored without a server (`ci.yml`; 0013)
 - [ ] The operational endpoints in the OpenAPI document, with a conformance test
       (0013)
-- [ ] A request id unique across instances, with the tenant, key name and
-      credential fingerprint joined across the access log, the usage records and
-      the trace (0013)
+- [ ] A request id unique across instances, with the tenant and key name joined
+      across the access log, the usage records and the trace (0013). The log and
+      the records are done; the trace joins with OpenTelemetry.
 - [ ] The release gate builds and tests `serve` and waits for a green `ci.yml`
       (0013)
 
@@ -125,9 +125,6 @@ Contracts and decisions (change before stability)
   the adapters read, such as `response_format` and `parallel_tool_calls`. A list
   that rejects a legitimate key is worse than an open map, so this waits for the
   list.
-- **Key names on usage records** (not only tenants), and **request ids** to join
-  a request's attempts. The request id `gw-<pid>-<n>` repeats across containers,
-  where the pid is 1: add an instance part.
 - **Redis keys carry no namespace** (0006): two fleets that share a Redis and a
   provider name take each other's jobs. A `fleet.namespace` prefix.
 - **Optional client certificates and revocation** (0011), a CRL file watched like
