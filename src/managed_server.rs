@@ -356,9 +356,20 @@ mod tests {
         let read = tokio::time::timeout(Duration::from_millis(500), tls.read(&mut byte))
             .await
             .unwrap();
+        // The server closed the connection after the header deadline. Whether the
+        // client sees an orderly end or a reset depends on whether the server had
+        // unread bytes (a TLS 1.3 ticket acknowledgement, say) when it closed, so
+        // both are the connection being closed rather than held open; a hang
+        // fails the 500 ms timeout above.
         match read {
             Ok(bytes_read) => assert_eq!(bytes_read, 0),
-            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ),
+                "the server should have closed the connection, not failed it: {error:?}"
+            ),
         }
         task.abort();
     }
