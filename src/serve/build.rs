@@ -35,6 +35,9 @@ use subtle::ConstantTimeEq;
 /// Idempotency answers are kept this long unless `state.idempotency_ttl_secs`
 /// says otherwise (the gateway's existing default).
 const DEFAULT_IDEMPOTENCY_TTL_SECS: u64 = 300;
+/// The back-off after an upstream 429 when the file sets none (the same 5 s the
+/// gateway defaults to).
+const DEFAULT_PENALTY_SECS: u64 = 5;
 
 /// A server ready to be bound to its listener.
 pub struct Built {
@@ -305,6 +308,10 @@ pub async fn build_app(
         .idempotency_ttl_secs
         .unwrap_or(DEFAULT_IDEMPOTENCY_TTL_SECS);
 
+    // Always set: `serve` never falls back to `LLMSHIM_PENALTY_SECS`.
+    let penalty = Some(Duration::from_secs(
+        config.limits.penalty_secs.unwrap_or(DEFAULT_PENALTY_SECS),
+    ));
     let authenticated = keystore.is_enforced();
     let providers = config.providers.keys().cloned().collect();
     let retained = crate::gateway::attempt::default_retained_accounting_attempts();
@@ -329,6 +336,7 @@ pub async fn build_app(
                 // agree on their limits, so no two of them can pull one bucket
                 // in different directions.
                 retune_tenant_limits: true,
+                penalty,
             },
         ),
         Some(url) => match fleet_state(
@@ -341,6 +349,7 @@ pub async fn build_app(
                 idempotency_ttl_secs,
                 max_retained_accounting_attempts: retained,
                 usage,
+                penalty,
             },
         )
         .await
@@ -588,6 +597,7 @@ struct FleetInputs {
     idempotency_ttl_secs: u64,
     max_retained_accounting_attempts: usize,
     usage: Option<crate::gateway::usage::UsageSetup>,
+    penalty: Option<Duration>,
 }
 
 /// Build the fleet (Redis-backed) state. Without the `serve-redis` feature this
@@ -611,6 +621,7 @@ async fn fleet_state(
         idempotency_ttl_secs: inputs.idempotency_ttl_secs,
         max_retained_accounting_attempts: inputs.max_retained_accounting_attempts,
         usage: inputs.usage,
+        penalty: inputs.penalty,
     };
     GatewayState::distributed_unstarted(router, None, url, parts)
         .await

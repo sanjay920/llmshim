@@ -34,6 +34,10 @@ const MAX_BUDGET_USD: f64 = 9_007_199.254_740_992;
 /// budget that never resets is not a window and is not offered.
 pub const MAX_BUDGET_WINDOW_SECS: u64 = 366 * 24 * 60 * 60;
 
+/// Longest rate-bucket back-off after an upstream 429: one hour. Longer is a
+/// mis-set unit; the provider's own `Retry-After` is honored separately.
+pub const MAX_PENALTY_SECS: u64 = 3600;
+
 /// Longest a request may wait for provider capacity: one hour. A wait that long is
 /// a mis-set unit (seconds written as milliseconds, or the reverse), not a policy.
 pub const MAX_QUEUE_TIMEOUT_MS: u64 = 60 * 60 * 1000;
@@ -539,6 +543,11 @@ pub struct Limits {
     /// Longest a request may wait for capacity before a 503.
     #[serde(default)]
     pub queue_timeout_ms: Option<u64>,
+    /// How long a provider's rate bucket backs off after an upstream 429 that
+    /// names no `Retry-After`, in seconds (1 to 3600). Defaults to 5. Replaces
+    /// the `LLMSHIM_PENALTY_SECS` variable, which `serve` does not read.
+    #[serde(default)]
+    pub penalty_secs: Option<u64>,
     /// Requests per minute for every provider without its own entry.
     #[serde(default)]
     pub rpm: Option<u32>,
@@ -943,6 +952,16 @@ impl ServeConfig {
     fn validate_limits(&self, issues: &mut Vec<Issue>) {
         if self.limits.max_concurrency == Some(0) {
             issues.push(Issue::new("limits.max_concurrency", "must be at least 1"));
+        }
+        if self
+            .limits
+            .penalty_secs
+            .is_some_and(|secs| !(1..=MAX_PENALTY_SECS).contains(&secs))
+        {
+            issues.push(Issue::new(
+                "limits.penalty_secs",
+                format!("must be between 1 and {MAX_PENALTY_SECS} (one hour)"),
+            ));
         }
         if self
             .limits
@@ -2492,6 +2511,13 @@ mod tests {
         for bad in [MAX_QUEUE_TIMEOUT_MS + 1, i64::MAX as u64] {
             let found = issues(&queue(bad));
             assert!(has(&found, "limits.queue_timeout_ms"), "{bad}: {found:?}");
+        }
+        let penalty = |secs: u64| format!("{MINIMAL}\n[limits]\npenalty_secs = {secs}");
+        assert!(issues(&penalty(1)).is_empty());
+        assert!(issues(&penalty(MAX_PENALTY_SECS)).is_empty());
+        for bad in [0, MAX_PENALTY_SECS + 1, i64::MAX as u64] {
+            let found = issues(&penalty(bad));
+            assert!(has(&found, "limits.penalty_secs"), "{bad}: {found:?}");
         }
     }
 

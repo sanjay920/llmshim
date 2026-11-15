@@ -52,6 +52,9 @@ use crate::router::Router;
 pub struct RealDispatch {
     router: Arc<Router>,
     logger: Option<Logger>,
+    /// The back-off after an upstream 429 that names no `Retry-After`, when the
+    /// file sets one; otherwise `LLMSHIM_PENALTY_SECS` (or 5 s).
+    penalty: Option<std::time::Duration>,
 }
 
 impl RealDispatch {
@@ -67,10 +70,16 @@ impl RealDispatch {
         value
     }
 
+    fn penalty(&self) -> std::time::Duration {
+        self.penalty.unwrap_or_else(penalty_duration)
+    }
+
     fn map_err(
+        &self,
         err: ShimError,
         refusal: Option<crate::policy::AttemptPolicyRefusal>,
     ) -> DispatchError {
+        let penalty = self.penalty();
         if refusal.is_some_and(|refusal| {
             refusal.kind() == crate::policy::AttemptPolicyRefusalKind::Unpriceable
         }) {
@@ -84,9 +93,9 @@ impl RealDispatch {
             } => DispatchError {
                 message: format!(
                     "llmshim-rate-limit:{}",
-                    retry_after.unwrap_or_else(penalty_duration).as_millis()
+                    retry_after.unwrap_or(penalty).as_millis()
                 ),
-                retry_after: Some(retry_after.unwrap_or_else(penalty_duration)),
+                retry_after: Some(retry_after.unwrap_or(penalty)),
             },
             ShimError::ProviderError {
                 status: 503,
@@ -110,7 +119,7 @@ impl Dispatch for RealDispatch {
         crate::completion_with_logger(self.router.as_ref(), &payload, self.logger.as_ref())
             .await
             .map(Self::with_response_identity)
-            .map_err(|error| Self::map_err(error, None))
+            .map_err(|error| self.map_err(error, None))
     }
 
     async fn dispatch_with_policy(
@@ -129,7 +138,7 @@ impl Dispatch for RealDispatch {
         let refusal = policy_context.take_last_refusal();
         result
             .map(Self::with_response_identity)
-            .map_err(|error| Self::map_err(error, refusal))
+            .map_err(|error| self.map_err(error, refusal))
     }
 
     async fn dispatch_stream(
@@ -140,7 +149,7 @@ impl Dispatch for RealDispatch {
         let upstream =
             crate::stream_with_logger(self.router.as_ref(), &payload, self.logger.as_ref())
                 .await
-                .map_err(|error| Self::map_err(error, None))?;
+                .map_err(|error| self.map_err(error, None))?;
         // Map raw ShimError chunks → GatewayError so the channel type is stable.
         let mapped = upstream.map(|item| item.map_err(|e| GatewayError::Upstream(e.to_string())));
         Ok(Box::pin(mapped))
@@ -160,7 +169,7 @@ impl Dispatch for RealDispatch {
         )
         .await;
         let refusal = policy_context.take_last_refusal();
-        let upstream = opened.map_err(|error| Self::map_err(error, refusal))?;
+        let upstream = opened.map_err(|error| self.map_err(error, refusal))?;
         let mapped = upstream.map(|item| item.map_err(|e| GatewayError::Upstream(e.to_string())));
         Ok(Box::pin(mapped))
     }
@@ -223,6 +232,9 @@ pub(crate) struct LocalParts {
     /// reloaded configuration re-limited it). The gateway's own construction
     /// leaves this off, so a tenant's bucket keeps the limit it began with.
     pub retune_tenant_limits: bool,
+    /// Back-off after an upstream 429 (`limits.penalty_secs`); `None` keeps the
+    /// environment's `LLMSHIM_PENALTY_SECS` (or 5 s).
+    pub penalty: Option<std::time::Duration>,
 }
 
 /// Everything the fleet (Redis-backed) gateway state is built from.
@@ -237,6 +249,8 @@ pub(crate) struct DistributedParts {
     pub idempotency_ttl_secs: u64,
     pub max_retained_accounting_attempts: usize,
     pub usage: Option<crate::gateway::usage::UsageSetup>,
+    /// See [`LocalParts::penalty`].
+    pub penalty: Option<std::time::Duration>,
 }
 
 impl LocalParts {
@@ -261,6 +275,7 @@ impl LocalParts {
                 }),
             usage: None,
             retune_tenant_limits: false,
+            penalty: None,
         }
     }
 }
@@ -293,12 +308,14 @@ impl GatewayState {
             max_retained_accounting_attempts,
             usage,
             retune_tenant_limits,
+            penalty,
         } = parts;
         // Same fleet-wide provider health the proxy uses.
         let router = Arc::new(router.with_breaker(breaker));
         let dispatch = Arc::new(RealDispatch {
             router: router.clone(),
             logger,
+            penalty,
         });
         let scheduler = Scheduler::new(config.clone(), limiter, dispatch);
         let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local_with_retention(
@@ -310,6 +327,9 @@ impl GatewayState {
         );
         if let Some(setup) = usage {
             attempt_coordinator.set_usage_sink(setup);
+        }
+        if let Some(penalty) = penalty {
+            attempt_coordinator.set_penalty(penalty);
         }
         Arc::new(Self {
             router,
@@ -361,6 +381,7 @@ impl GatewayState {
                         std::env::var(key).ok()
                     }),
                 usage: None,
+                penalty: None,
             },
         )
         .await
@@ -404,11 +425,13 @@ impl GatewayState {
             idempotency_ttl_secs,
             max_retained_accounting_attempts,
             usage,
+            penalty,
         } = parts;
         let router = Arc::new(router.with_breaker(breaker));
         let dispatch = Arc::new(RealDispatch {
             router: router.clone(),
             logger,
+            penalty,
         });
         let attempt_coordinator =
             crate::gateway::attempt::AttemptCoordinator::redis_with_retention(
@@ -421,6 +444,9 @@ impl GatewayState {
             .map_err(|error| error.to_string())?;
         if let Some(setup) = usage {
             attempt_coordinator.set_usage_sink(setup);
+        }
+        if let Some(penalty) = penalty {
+            attempt_coordinator.set_penalty(penalty);
         }
         let gateway = crate::gateway::distributed::DistributedGateway::connect_with_tuning(
             redis_url,
@@ -1495,6 +1521,7 @@ mod native_tests {
             Arc::new(RealDispatch {
                 router: router.clone(),
                 logger: None,
+                penalty: None,
             }),
         );
         let keys = std::collections::HashMap::from([
@@ -1537,6 +1564,7 @@ mod native_tests {
             Arc::new(RealDispatch {
                 router: router.clone(),
                 logger: None,
+                penalty: None,
             }),
         );
         let identity = crate::gateway::auth::Identity {
@@ -3817,6 +3845,7 @@ mod native_tests {
                 Arc::new(RealDispatch {
                     router: router.clone(),
                     logger: None,
+                    penalty: None,
                 }),
             );
             let identity = crate::gateway::auth::Identity {
@@ -4653,6 +4682,7 @@ mod native_tests {
                     )),
                 )),
                 logger: None,
+                penalty: None,
             };
             let response = dispatch
                 .dispatch(

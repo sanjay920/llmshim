@@ -55,6 +55,7 @@ drift from the code.
 | `base_url` must be `http(s)://host[/path]`, parsed as a URL (a host, and a port that is a number in range), with no credentials, query or fragment. | Redirects are disabled in the client, so this must be the final endpoint; credentials belong in `api_key`. |
 | Routes carry their defaults in an explicit `settings` table, name their model as `<provider>/<model>` with a defined provider, and may not point at another route. | Keeps unknown-field checking on the route itself, and a route that could never resolve fails at `--check`, not at the first request. |
 | Budget bounds match the gateway ledger (0 to 9007199.254740992 USD, finite). | One definition of a representable cap. |
+| `limits.penalty_secs` is 1 to 3600. | The rate-bucket back-off after an upstream 429 that names no `Retry-After`; longer is a mis-set unit. |
 | `budget_window_secs` is 1 to 31622400 (366 days); `limits.queue_timeout_ms` is at most 3600000 (one hour). | The Redis ledger multiplies the window by 1000 and sets an expiry from it, and an expiry beyond Redis's range makes the script error and admission refuse; a budget that never resets is not a window. A queue wait of hours is a mis-set unit, not a policy. |
 
 ### Errors

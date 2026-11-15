@@ -912,3 +912,34 @@ fn a_failed_start_does_not_create_the_access_log() {
     assert_eq!(code, Some(1), "{stderr}");
     assert!(!log.exists(), "a failed start must not create the log");
 }
+
+#[tokio::test]
+async fn the_back_off_after_a_429_comes_from_the_file_and_never_from_the_environment() {
+    // A provider that rate-limits without saying for how long. The caller is told
+    // how long to wait: the file's `penalty_secs` when set, else 5 s, and in both
+    // cases not the `LLMSHIM_PENALTY_SECS` the process was started with (9).
+    for (extra, expected) in [("[limits]\npenalty_secs = 7", "7"), ("", "5")] {
+        let mut upstream = mockito::Server::new_async().await;
+        let _mock = upstream
+            .mock("POST", "/chat/completions")
+            .with_status(429)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"message":"slow down"}}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let server = start(
+            &config(&upstream.url(), extra),
+            "penalty",
+            &[("LLMSHIM_PENALTY_SECS", "9")],
+        );
+        let response = chat(&server, Some(CALLER_KEY), "inference/test-model").await;
+        assert_eq!(response.status(), 429, "{extra:?}");
+        assert_eq!(
+            response.headers()["retry-after"],
+            expected,
+            "{extra:?}: {:?}",
+            response.headers()
+        );
+    }
+}
