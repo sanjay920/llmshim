@@ -89,6 +89,7 @@ fn mtls_config(upstream: &str, directory: &Path) -> String {
         r#"
         [logging]
         access_log = "{log}"
+        usage_log = "{usage}"
 
         [[keys]]
         name = "checkout"
@@ -100,7 +101,8 @@ fn mtls_config(upstream: &str, directory: &Path) -> String {
         tenant = "analytics"
         client_san = "uri:{BATCH}"
         "#,
-        log = directory.join("access.jsonl").display()
+        log = directory.join("access.jsonl").display(),
+        usage = directory.join("usage.jsonl").display()
     );
     config(upstream, &extra).replace("[state]", &format!("{tls}[state]"))
 }
@@ -130,11 +132,20 @@ async fn chat_as(
 /// moment longer and reads again so that an unexpected extra line fails the
 /// comparison instead of arriving afterwards.
 fn tenants(path: &Path, expected: usize) -> Vec<Value> {
+    lines(path, expected)
+        .into_iter()
+        .map(|line| line["tenant"].clone())
+        .collect()
+}
+
+/// The JSON lines of a log, once `expected` of them have been written (see
+/// [`tenants`]).
+fn lines(path: &Path, expected: usize) -> Vec<Value> {
     let read = || -> Vec<Value> {
         std::fs::read_to_string(path)
             .unwrap_or_default()
             .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap()["tenant"].clone())
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect()
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -176,6 +187,20 @@ async fn a_workload_is_identified_by_its_certificate_alone() {
         tenants(&directory.0.join("access.jsonl"), 2),
         vec![json!("payments"), json!("analytics")]
     );
+    // And to the workload's key, in the access log and the usage log, with one
+    // request id joining each request's two lines. A certificate workload has no
+    // bearer token, so its access line has no credential fingerprint.
+    let access = lines(&directory.0.join("access.jsonl"), 2);
+    let usage = lines(&directory.0.join("usage.jsonl"), 2);
+    assert_eq!(access[0]["key"], "checkout");
+    assert_eq!(access[1]["key"], "batch");
+    assert!(access[0]["credential"].is_null());
+    assert_eq!(usage[0]["key"], "checkout", "{usage:#?}");
+    assert_eq!(usage[1]["key"], "batch", "{usage:#?}");
+    for index in 0..2 {
+        assert!(access[index]["request_id"].is_string());
+        assert_eq!(access[index]["request_id"], usage[index]["request_id"]);
+    }
 }
 
 #[tokio::test]

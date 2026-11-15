@@ -50,6 +50,16 @@ pub struct UsageRecord {
     /// The caller's tenant. `None` when this replica's configuration does not
     /// name the tenant the job belongs to.
     pub tenant: Option<String>,
+    /// The name (`keys[].name`) of the caller key the request authenticated
+    /// with. `None` when this replica's configuration does not name the
+    /// credential the job carries, or the caller had none.
+    pub key: Option<String>,
+    /// The request's id: the caller's `x-request-id` when it sent a well-formed
+    /// one, otherwise the id the gateway minted. It is the `request_id` of the
+    /// request's access-log line, so every attempt of a request (a retry, a
+    /// fallback) joins to it and to the caller's own logs. `None` for a job that
+    /// carries none.
+    pub request_id: Option<String>,
     pub provider: String,
     pub model: String,
     /// `"completion"` or `"stream"`.
@@ -88,7 +98,7 @@ pub trait UsageSink: Send + Sync {
     fn record(&self, record: &UsageRecord);
 }
 
-/// A sink and the tenants it can name.
+/// A sink, and the tenants and keys it can name.
 ///
 /// The policy scope that travels with a job (through Redis, in a fleet) holds
 /// only a hash of the tenant, on purpose: tenant names are not put in shared
@@ -98,6 +108,7 @@ pub trait UsageSink: Send + Sync {
 pub struct UsageSetup {
     pub sink: Arc<dyn UsageSink>,
     pub tenants: TenantNames,
+    pub keys: KeyNames,
 }
 
 /// Tenant names by the hash a policy scope carries.
@@ -134,6 +145,62 @@ impl TenantNames {
     }
 }
 
+/// How many hex digits of a credential's scope digest a policy scope carries.
+/// 16 (64 bits) tells keys apart, which is all a log line needs, and is not the
+/// digest an operator may hold in a `sha256` field, so it cannot stand in for the
+/// token's verifier.
+pub(crate) const CREDENTIAL_PREFIX_LEN: usize = 16;
+
+/// The prefix of a credential scope that identifies a key in a policy scope and
+/// in [`KeyNames`].
+pub(crate) fn credential_prefix(credential_scope: &str) -> &str {
+    credential_scope
+        .get(..CREDENTIAL_PREFIX_LEN)
+        .unwrap_or(credential_scope)
+}
+
+/// Caller-key names by credential.
+///
+/// A job's policy scope carries the first 16 hex digits of the digest that scopes
+/// the credential (the SHA-256 of its token, or of `mtls:<name>` for a
+/// certificate workload), never the key's name; a replica names the key from its
+/// own configuration, as it names the tenant. Like [`TenantNames`], clones share
+/// one table, it only grows, and a name is a label, not a permission. A key that
+/// is renamed keeps resolving, to its newest name.
+///
+/// Callers pass a whole scope digest or the prefix a policy scope carries; the
+/// table is keyed by the prefix either way.
+#[derive(Clone, Default)]
+pub struct KeyNames(Arc<std::sync::RwLock<HashMap<String, String>>>);
+
+impl KeyNames {
+    /// `(credential scope, key name)` pairs.
+    pub fn new(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        let names = Self::default();
+        names.add(pairs);
+        names
+    }
+
+    /// Make more keys resolvable. A credential already known keeps resolving; a
+    /// renamed one resolves to its newest name.
+    pub fn add(&self, pairs: impl IntoIterator<Item = (String, String)>) {
+        let mut table = self.0.write().unwrap_or_else(|p| p.into_inner());
+        table.extend(
+            pairs
+                .into_iter()
+                .map(|(credential, name)| (credential_prefix(&credential).to_owned(), name)),
+        );
+    }
+
+    pub(crate) fn name(&self, credential: &str) -> Option<String> {
+        self.0
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(credential_prefix(credential))
+            .cloned()
+    }
+}
+
 impl UsageSetup {
     /// The hash that identifies a tenant in a policy scope.
     pub(crate) fn tenant_key(tenant: &str) -> String {
@@ -144,6 +211,8 @@ impl UsageSetup {
 
 struct Open {
     tenant: Option<String>,
+    key: Option<String>,
+    request_id: Option<String>,
     provider: String,
     model: String,
     kind: &'static str,
@@ -162,6 +231,7 @@ struct Open {
 pub(crate) struct UsageRecorder {
     sink: Arc<dyn UsageSink>,
     tenants: TenantNames,
+    keys: KeyNames,
     open: Mutex<HashMap<uuid::Uuid, Open>>,
 }
 
@@ -170,15 +240,24 @@ impl UsageRecorder {
         Self {
             sink: setup.sink,
             tenants: setup.tenants,
+            keys: setup.keys,
             open: Mutex::new(HashMap::new()),
         }
     }
 
-    /// An attempt was admitted and is about to be sent. `tenant_key` is the hash
-    /// from the policy scope.
-    pub(crate) fn begin(&self, identity: &AttemptIdentity, tenant_key: &str) {
+    /// An attempt was admitted and is about to be sent. `tenant_key`,
+    /// `credential` and `request_id` come from the policy scope.
+    pub(crate) fn begin(
+        &self,
+        identity: &AttemptIdentity,
+        tenant_key: &str,
+        credential: Option<&str>,
+        request_id: Option<&str>,
+    ) {
         let open = Open {
             tenant: self.tenants.name(tenant_key),
+            key: credential.and_then(|credential| self.keys.name(credential)),
+            request_id: request_id.map(str::to_owned),
             provider: identity.provider_name().to_owned(),
             model: identity.native_model().to_owned(),
             kind: kind_name(identity.kind()),
@@ -302,6 +381,8 @@ fn build(id: uuid::Uuid, open: Open, outcome: AttemptOutcome) -> UsageRecord {
         ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         attempt_id: id.to_string(),
         tenant: open.tenant,
+        key: open.key,
+        request_id: open.request_id,
         provider: open.provider,
         model: open.model,
         kind: open.kind,

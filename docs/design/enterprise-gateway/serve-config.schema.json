@@ -95,7 +95,7 @@
           ]
         },
         "name": {
-          "description": "Operator-facing label; never sent on the wire.",
+          "description": "Operator-facing label. It names the key in the access log and the usage\nrecords (`key`); it is never sent to a provider.",
           "type": "string"
         },
         "rpm": {
@@ -206,7 +206,7 @@
       "properties": {
         "access_log": {
           "default": null,
-          "description": "One JSON line per request on the main listener: when, request id, method,\npath, status, latency to the response headers, the caller's tenant and a\nshort fingerprint of the credential. Never a token, a header or a body.\n`\"stdout\"`, or an absolute file path (created with owner-only access and\nappended to; rotate it with `copytruncate` or let the platform collect\nstdout). Off when absent.",
+          "description": "One JSON line per request on the main listener: when, request id, method,\npath, status, latency to the response headers, the caller's tenant and\nkey name, and a short fingerprint of the credential. Never a token, a\nheader or a body.\n`\"stdout\"`, or an absolute file path (created with owner-only access and\nappended to; rotate it with `copytruncate` or let the platform collect\nstdout). Off when absent.",
           "type": [
             "string",
             "null"
@@ -214,7 +214,7 @@
         },
         "usage_log": {
           "default": null,
-          "description": "One JSON line per provider attempt when it ends: tenant, provider, model,\noutcome, tokens and USD cost. Per attempt, not per request: a retry or a\nfallback is a separate charge. For showback and chargeback; sum `cost_usd`\nper tenant, treating `null` as unknown. Same targets as `access_log`.",
+          "description": "One JSON line per provider attempt when it ends: tenant, key name, the\nrequest id (the one in the access log), provider, model, outcome, tokens\nand USD cost. Per attempt, not per request: a retry or a fallback is a\nseparate charge, and the attempts of a request share its id. For showback\nand chargeback; sum `cost_usd` per tenant or key, treating `null` as\nunknown. Same targets as `access_log`.",
           "type": [
             "string",
             "null"

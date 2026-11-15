@@ -702,11 +702,17 @@ terminate TLS with the PEM files watched for renewal, `client_ca_file`
 requires client certificates and a `[[keys]] client_san` authenticates a
 workload by certificate (the internal `x-llmshim-peer-san` header is stripped
 from every request and set only from the handshake; a mutation test pins that),
-and `[logging] access_log` writes a tenant-attributed JSON line per request (never a token,
+and `[logging] access_log` writes a tenant- and key-attributed JSON line per request (never a token,
 query or body); `[logging] usage_log` writes one per provider attempt with
-tokens and USD cost (`null` cost = unknown, never free). The fleet job scope
-carries only a hash of the tenant, and a test pins that names stay out of Redis;
-each replica names tenants from its own config. `deploy/helm/llmshim` deploys it
+tokens and USD cost (`null` cost = unknown, never free), and both carry the
+request id: a caller's own well-formed `x-request-id` (1 to 128 visible ASCII) is
+kept, otherwise `serve` mints `gw-<instance>-<n>` (12 random hex digits per
+process, so replicas and restarts do not repeat; a build without `serve` keeps
+`gw-<pid>-<n>`; the access-log layer settles the id outermost, so every line has one, and an id in the `gw-` form is never taken from a caller). The fleet job scope carries only hashes (the tenant's; under `serve`, and only
+when a usage log is configured, the first 16 hex digits of the credential's
+digest) and the request id, never a name, and a test pins that names stay out of
+Redis; each replica names tenants and keys from
+its own config (grow-only tables, updated on a keys reload). `deploy/helm/llmshim` deploys it
 (`deploy/helm/validate.sh` checks the chart and feeds each rendered config back
 through `serve --check`). Only `[[keys]]` reload without a restart (`SIGHUP`,
 plus a watched file; design note 0012): the reload is all-or-nothing, refuses a

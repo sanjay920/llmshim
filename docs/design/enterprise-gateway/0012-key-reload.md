@@ -103,8 +103,11 @@ receipts are not touched. A reload is not a limit reset.
 
 ## Usage records during a reload
 
-A usage record names its tenant from a table of tenant names that only grows. A
-reload adds the names of new tenants and forgets none, so an attempt admitted
+A usage record names its tenant, and the access log and the usage record name
+the key, from tables that only grow. A valid reload adds the names of new tenants
+and keys (and the new name of a key that was only renamed: the keys are unchanged,
+so nothing is swapped, but the logs say the new name from then on) and forgets
+none, so an attempt admitted
 under a tenant that a reload then removed, or one a fleet replica dispatches
 before that replica has reloaded, still resolves where the replica knows the
 name; where it does not (a tenant a replica has not yet heard of) the record's

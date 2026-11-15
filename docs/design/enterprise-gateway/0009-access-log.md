@@ -12,20 +12,21 @@ access_log = "stdout"                      # or an absolute file path
 One JSON line per request on the main listener:
 
 ```json
-{"ts":"2026-11-13T10:15:30.412Z","request_id":"gw-4127-12","method":"POST",
+{"ts":"2026-11-13T10:15:30.412Z","request_id":"gw-3f9a1c0b7e42-12","method":"POST",
  "path":"/v1/chat/completions","status":200,"latency_ms":842,
- "tenant":"payments","credential":"0a1b2c3d"}
+ "tenant":"payments","key":"checkout","credential":"0a1b2c3d"}
 ```
 
 | Field | Meaning |
 |---|---|
 | `ts` | UTC, when the response headers were ready |
-| `request_id` | the `x-request-id` the gateway put on the response, so a line joins to a caller's own logs and to the gateway's stats. A caller may send its own, and it is echoed; otherwise the gateway mints `gw-<pid>-<n>`, which is unique within one process only (in containers the pid is often 1, so two replicas, or a restart, can repeat an id: join on `ts` and the replica's own identity as well) |
+| `request_id` | the id of the request, also on the response as `x-request-id`, so a line joins to a caller's own logs, to the gateway's stats and to the request's usage records (0010). The log's layer is outermost and settles the id before anything else sees the request, so **every line has one**: a request refused by a layer outside the gateway's own, or dropped before any response, included. A caller's own is kept when it is well formed, 1 to 128 visible ASCII characters (a run id, a UUID, a trace id) and not in the gateway's own `gw-` form: the caller keeps its own ids unique. Anything else (longer, with a space or a control character, non-ASCII, empty, or `gw-…`) is replaced and never echoed. A request that sent none gets `gw-<instance>-<n>`: `<instance>` is 12 random hex digits drawn once when the process starts and `<n>` a counter, so ids do not repeat across replicas or restarts. A build without `serve` (the `llmshim gateway` command of such a build) keeps `gw-<pid>-<n>`, unique within one process only: in a container the pid is often 1 |
 | `method`, `path` | the request line **without its query string**; `path` is cut to 256 characters |
 | `status` | the HTTP status sent in the response headers, including refusals (401, 429, 404, 503); `null` when the request was abandoned (the client went away, a deadline cancelled it) before a response existed. A stream that fails after its headers is still logged with the status it began with |
 | `latency_ms` | until the response headers (or the abandonment); a stream's duration is not included |
 | `tenant` | the caller's tenant; `null` when the credential was missing or not recognised. The credential is read as the gateway reads it, so on the native routes (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`, Gemini `generateContent`) an `x-api-key` or `x-goog-api-key` counts |
-| `credential` | first eight hex characters of the SHA-256 of the bearer token (or of that header's key); `null` without one |
+| `key` | the name (`keys[].name`) of the caller key the credential belongs to, so a line says *which* key as well as which tenant; `null` when the credential was missing or not recognised. For a client-certificate workload it is that key's name |
+| `credential` | first eight hex characters of the SHA-256 of the bearer token (or of that header's key); `null` without one (a certificate workload has none) |
 
 ## Why these fields
 

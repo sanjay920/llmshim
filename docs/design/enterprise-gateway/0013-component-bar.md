@@ -52,9 +52,10 @@ operational endpoints and the access and usage logs become stable with it.
    in, and compared by a test, so a change to it is a visible diff.
 3. Every operational endpoint is in the OpenAPI document and a conformance test
    holds the server to it.
-4. A request's tenant, key name, credential fingerprint and a request id that is
-   unique across instances appear in the access log, the usage record and the
-   trace, so one request can be joined across all three.
+4. A request's tenant, key name and a request id that is unique across instances
+   appear in the access log, the usage record and the trace, so one request can
+   be joined across all three. (The credential fingerprint stays in the access
+   log, where a credential nobody recognises has no key name to log.)
 5. The failure-mode table (0014) exists and every row has a test that
    deliberately breaks the dependency.
 6. A benchmark is published with its method, hardware, build and date, reporting
@@ -111,8 +112,9 @@ of untested corners makes that worse, not better.
    remaining inventory rows of 0002, a structure-only `--check` with its own
    exit code, `--print-schema`, and the operational endpoints in the OpenAPI
    document with a conformance test.
-4. A request id that is unique across instances, and the tenant, key name and
-   credential fingerprint beside it in the access log and the usage records.
+4. A request id that is unique across instances, and the tenant and key name
+   beside it in the access log and the usage records. Done; the trace joins in
+   step 6.
 5. Outage-survival tests and the failure-mode table (0014).
 6. OpenTelemetry traces and metrics, with the log writer's drop counters.
 7. JWT/OIDC workload identity and IP allowlists (design note first).
