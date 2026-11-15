@@ -547,6 +547,7 @@ pub struct Limits {
     /// names no `Retry-After`, in seconds (1 to 3600). Defaults to 5. Replaces
     /// the `LLMSHIM_PENALTY_SECS` variable, which `serve` does not read.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 3600))]
     pub penalty_secs: Option<u64>,
     /// Requests per minute for every provider without its own entry.
     #[serde(default)]

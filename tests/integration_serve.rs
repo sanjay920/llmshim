@@ -931,7 +931,12 @@ async fn the_back_off_after_a_429_comes_from_the_file_and_never_from_the_environ
         let server = start(
             &config(&upstream.url(), extra),
             "penalty",
-            &[("LLMSHIM_PENALTY_SECS", "9")],
+            &[
+                ("LLMSHIM_PENALTY_SECS", "9"),
+                // The shared client's retries are process-wide; keep them short.
+                ("LLMSHIM_MAX_RETRIES", "1"),
+                ("LLMSHIM_MAX_BACKOFF_SECS", "1"),
+            ],
         );
         let response = chat(&server, Some(CALLER_KEY), "inference/test-model").await;
         assert_eq!(response.status(), 429, "{extra:?}");

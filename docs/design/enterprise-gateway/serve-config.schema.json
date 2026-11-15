@@ -167,7 +167,8 @@
         "penalty_secs": {
           "default": null,
           "description": "How long a provider's rate bucket backs off after an upstream 429 that\nnames no `Retry-After`, in seconds (1 to 3600). Defaults to 5. Replaces\nthe `LLMSHIM_PENALTY_SECS` variable, which `serve` does not read.",
-          "minimum": 0,
+          "maximum": 3600,
+          "minimum": 1,
           "type": [
             "integer",
             "null"
