@@ -684,7 +684,12 @@ the roadmap checklist, and each contract has a numbered design note there.
 Today `llmshim serve --config <file>` runs the single-instance gateway from a
 versioned TOML/JSON file (`src/serve/`: `config.rs` the contract, `keys.rs` the
 hashed caller-key store, `build.rs` the assembly), and `--check` validates it
-without starting anything. Unknown fields are rejected, secrets are references
+without starting anything (`--check --structure-only` checks the shape and the
+rules that need no secret and reads nothing else; exit status 1 is a wrong file
+or secret value, 2 bad arguments, 3 a referenced secret that is unavailable;
+`serve --print-schema` prints the JSON Schema derived with schemars, checked in at
+`docs/design/enterprise-gateway/serve-config.schema.json` and compared by
+`tests/unit_serve_cli.rs`, so a contract change shows up as a diff there). Unknown fields are rejected, secrets are references
 only and never echoed, unauthenticated serving is explicit, and the file is the
 source of every setting that belongs to the server (it reads the environment
 to resolve `{ env = ... }` references; the process-wide settings of the shared

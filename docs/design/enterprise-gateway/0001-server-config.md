@@ -65,8 +65,47 @@ is reported alone, since nothing after it can be trusted.
 empty or unreadable, naming the setting and the variable or file. It never
 prints a value.
 
-Exit codes: `0` valid, `1` invalid, `2` usage error or (for now) a valid file
-without `--check`.
+### Checking a file
+
+| Command | Reads | Answers |
+| --- | --- | --- |
+| `serve --config F --check --structure-only` | the file only | is the shape right, and is every rule that needs no secret met |
+| `serve --config F --check` | the file, each referenced secret, the TLS files | the above, plus every secret is available and meets the token rules, and the TLS material loads |
+| `serve --print-schema` | nothing | prints the JSON Schema of the file |
+
+`--structure-only` exists so a pipeline that holds no secret (a pull-request job,
+a generator's test) can still gate on the file. It reads no environment variable,
+no secret file and no certificate, and it says what it did not check.
+
+Exit status, for `--check` and for starting the server alike:
+
+| Status | Meaning |
+| --- | --- |
+| `0` | valid (or the server ran and stopped cleanly) |
+| `1` | the file is wrong, a secret's *value* breaks a rule (too short, equal to an upstream key), or the server could not start |
+| `2` | bad arguments |
+| `3` | a referenced secret is unset, blank or unreadable: this environment cannot check the file |
+
+A pipeline can therefore treat `1` as a failure and `3` as "not provisioned
+here". When both apply the status is `1` and both are reported: a defect outranks
+an absence.
+
+### The schema
+
+`llmshim serve --print-schema` prints the file's JSON Schema (draft 2020-12),
+derived with `schemars` from the same types the parser reads, so the two cannot
+drift. A copy is checked in as `serve-config.schema.json` and a test compares it
+with the binary's output: a change to the contract is a visible diff, and the
+pull request that makes it says why a consumer is unaffected. Regenerate it with
+`llmshim serve --print-schema > docs/design/enterprise-gateway/serve-config.schema.json`.
+
+The schema describes shape: field names, which are required, types and each
+type's own range, closed objects, the single version, and a secret as exactly one
+of `env` or `file`. A file the schema refuses always fails the parser, and a test
+holds the two to that; a file the schema accepts can still fail `--check`,
+because the rules that compare values, read the environment or need two fields
+together are not a schema's to state. A consumer can validate its generated files
+against the schema in an editor or a pipeline with no llmshim binary at all.
 
 ### What is deliberately not here yet
 

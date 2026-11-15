@@ -101,13 +101,6 @@ contract is cheaper to change before the feature is declared stable.
 
 Contracts and decisions (change before stability)
 
-- **`--check` needs the secrets to be present**, so it cannot run in a CI job on
-  a machine that does not hold them, and it exits 1 for "a secret is missing"
-  as for "the file is wrong". A structure-only mode, or a distinct exit code, is
-  needed before anyone gates a pull request on it.
-- **`server.allow_unauthenticated` with a non-loopback host** is accepted.
-  Requiring loopback when unauthenticated is a tightening that is easier now than
-  after files exist.
 - **`routes.*.settings` is an open map**: a misspelled setting is accepted
   silently. Define the accepted keys.
 - **`base_url`** accepts `http://:8000` and a port that is not a number, and is
