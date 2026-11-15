@@ -63,3 +63,4 @@ jobs:
         run: |
           cargo test --locked --features serve-redis --tests
           cargo test --locked --features serve-redis --test integration_serve_fleet -- --ignored
+          cargo test --locked --features serve-redis --test integration_serve_outage -- --ignored

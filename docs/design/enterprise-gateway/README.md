@@ -47,6 +47,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0011: Mutual TLS and certificate-derived identity](0011-mutual-tls.md)
 - [0012: Reloading caller keys without a restart](0012-key-reload.md)
 - [0013: llmshim as a component](0013-component-bar.md)
+- [0014: What happens when a dependency fails](0014-failure-modes.md)
 
 ## Roadmap
 
@@ -77,8 +78,10 @@ Phase 0: a production server mode
 - [ ] OpenTelemetry traces and metrics
 - [x] Helm chart, validated by rendering and `serve --check` (0008)
 - [ ] Published, signed images and an SBOM
-- [ ] Reproducible benchmark and an outage-survival test, with the failure-mode
-      table (0014)
+- [x] The failure-mode table (0014), with outage-survival tests for losing Redis
+      (before and during a request) and for `SIGTERM`; its "Not yet tested" list
+      is what remains
+- [ ] Reproducible benchmark
 - [x] Configuration-contract tightenings, a structure-only `--check` and a
       checked-in JSON Schema (see "Review follow-ups"; 0013)
 - [x] Pull-request CI for every build, including the Redis-backed tests that are

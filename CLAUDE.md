@@ -706,7 +706,7 @@ and `[logging] access_log` writes a tenant-attributed JSON line per request (nev
 query or body); `[logging] usage_log` writes one per provider attempt with
 tokens and USD cost (`null` cost = unknown, never free). The fleet job scope
 carries only a hash of the tenant, and a test pins that names stay out of Redis;
-each replica names tenants from its own config. `deploy/helm/llmshim` deploys it
+each replica names tenants from its own config. `docs/design/enterprise-gateway/0014-failure-modes.md` records what a replica does when each dependency fails and the test behind each row (Redis lost before and during a request, `SIGTERM`, ...), with an honest "not yet tested" list; `tests/integration_serve_outage.rs` cuts Redis with a TCP proxy and runs in the serve-redis CI job. `deploy/helm/llmshim` deploys it
 (`deploy/helm/validate.sh` checks the chart and feeds each rendered config back
 through `serve --check`). Only `[[keys]]` reload without a restart (`SIGHUP`,
 plus a watched file; design note 0012): the reload is all-or-nothing, refuses a
