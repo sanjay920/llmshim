@@ -2818,7 +2818,11 @@ mod tests {
 
     // ---- integration (require a live Redis via LLMSHIM_REDIS_URL) -----------
     // Run: LLMSHIM_REDIS_URL=redis://127.0.0.1:6379 \
-    //        cargo test --features gateway-redis -- --ignored
+    //        cargo test --features gateway-redis --lib gateway:: -- --ignored --test-threads=1
+    // One at a time: every gateway's reaper sweeps the origin-lease index and
+    // the shared capacity counters of all the others, so tests that simulate a
+    // crashed origin or a shutdown, run in parallel, reap each other's gateways.
+    // Each passes alone.
 
     use super::super::DispatchError;
     use crate::proxy::ratelimit::{InMemoryRateLimiter, RateLimitConfig};
@@ -3034,14 +3038,20 @@ mod tests {
         ] {
             let _: Result<i64, _> = conn.del(k).await;
         }
-        DistributedGateway::connect(
-            &url,
-            Arc::new(EchoDispatch),
-            unlimited(),
-            GatewayConfig::default(),
+        // With the variable set the caller asked for a Redis run: a gateway that
+        // is refused fails the test instead of skipping it, so a Redis that is
+        // up but unusable cannot turn a CI job green with nothing exercised.
+        // (An unreachable Redis already failed at the connection manager above.)
+        Some(
+            DistributedGateway::connect(
+                &url,
+                Arc::new(EchoDispatch),
+                unlimited(),
+                GatewayConfig::default(),
+            )
+            .await
+            .expect("LLMSHIM_REDIS_URL is set but a gateway could not connect to it"),
         )
-        .await
-        .ok()
     }
 
     async fn job_origin_token(connection: &mut ConnectionManager, id: &str) -> String {
@@ -4723,9 +4733,16 @@ mod tests {
             &redis_url,
             Arc::new(ProgressStreamDispatch),
             unlimited(),
+            // The heartbeat ticks at a third of the lease (150 ms: 150, 300, 450,
+            // 600, 750 ...). The original 90 ms / 120 ms put the deadline on a
+            // tick (4 x 30 ms), and scaling both five-fold kept it there: a
+            // heartbeat that fires at the deadline finds the origin expired and
+            // ends the stream as "origin canceled" instead of the timeout. 675 ms
+            // sits halfway between two ticks. (Which error a stream gets when a
+            // tick and the deadline coincide is a roadmap follow-up.)
             GatewayConfig {
-                lease_timeout: Duration::from_millis(90),
-                request_timeout: Duration::from_millis(120),
+                lease_timeout: Duration::from_millis(450),
+                request_timeout: Duration::from_millis(675),
                 ..GatewayConfig::default()
             },
         )
@@ -4757,7 +4774,8 @@ mod tests {
             }
         }
         assert!(progress_chunks >= 3);
-        assert!(started.elapsed() < Duration::from_millis(500));
+        // The 675 ms request deadline, not the endless progress, ended it.
+        assert!(started.elapsed() < Duration::from_millis(2500));
         for worker in workers {
             worker.abort();
         }

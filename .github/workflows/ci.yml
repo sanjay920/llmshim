@@ -1,0 +1,131 @@
+name: CI
+
+# Pull requests used to run only the `serve` jobs and the Windows, Docker and
+# Helm checks. The release gate ran just the `proxy` suite, at tag time, so a
+# change to shared code (usage accounting, the HTTP client, the reasoning
+# filter) reached the default, `gateway` and `gateway-redis` suites only after
+# a release was already being cut. The Redis-backed gateway tests are ignored
+# without a server and ran nowhere at all.
+#
+# This runs every build on each pull request, on each merge to main (stacked
+# merges can break what each pull request passed alone), and weekly (a new
+# stable toolchain's lints once stopped a release at tag time). The `serve`
+# builds keep their own jobs in serve-check.yml, and Windows its own in
+# windows-check.yml.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per pull request, and a new push cancels the superseded run. Every
+  # other trigger gets a group of its own: with a shared group, a burst of
+  # merges to main would keep only the newest pending run and skip the commits
+  # between.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: never
+  LLMSHIM_CATALOG_OFFLINE: '1'
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: default, args: '' }
+          - { name: no default features, args: '--no-default-features' }
+          - { name: proxy, args: '--features proxy' }
+          - { name: gateway, args: '--features gateway' }
+          - { name: gateway-redis, args: '--features gateway-redis' }
+          - { name: redis-coordination, args: '--features redis-coordination' }
+          - { name: cloud transports, args: '--features bedrock,vertex,azure' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        env:
+          ARGS: ${{ matrix.args }}
+        # $ARGS is split into words on purpose.
+        run: cargo clippy --locked --workspace --all-targets $ARGS -- -D warnings
+
+  test:
+    name: tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: default, args: '' }
+          # What the release gate runs, here on every pull request.
+          - { name: proxy, args: '--features proxy' }
+          - { name: gateway, args: '--features gateway' }
+          - { name: gateway-redis, args: '--features gateway-redis' }
+          - { name: redis-coordination, args: '--features redis-coordination' }
+          - { name: cloud transports, args: '--features bedrock,vertex,azure' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tests
+        env:
+          ARGS: ${{ matrix.args }}
+        run: cargo test --locked --workspace $ARGS --tests
+
+  # The distributed queue, lease, spend-ledger and rate-limiter tests that need
+  # a Redis are marked `ignore`; without this job nothing runs them. They run
+  # one at a time: several simulate a crashed origin or a shutdown, and every
+  # gateway's reaper sweeps the origin-lease index and the shared capacity
+  # counters of all the others, so in parallel one test's gateways are
+  # reaped by another's ("response channel lost", "Capacity").
+  redis-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tests that need a Redis
+        env:
+          LLMSHIM_REDIS_URL: redis://127.0.0.1:6379
+          # A filter that matches nothing, or a renamed module, would pass with
+          # zero tests. Fail if fewer ran than are known to need a Redis (63 in
+          # gateway::, 1 in proxy::ratelimit::); raise this when one is added.
+          MIN_TESTS: '64'
+        run: |
+          set -o pipefail
+          cargo test --locked --features gateway-redis --lib -- gateway:: proxy::ratelimit:: --ignored --test-threads=1 2>&1 | tee redis-tests.log
+          ran=$(awk '/^test result: ok\./ { n += $4 } END { print n + 0 }' redis-tests.log)
+          echo "Redis-backed tests that ran: $ran (at least $MIN_TESTS expected)"
+          test "$ran" -ge "$MIN_TESTS"
