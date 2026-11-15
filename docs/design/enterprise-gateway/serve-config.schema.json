@@ -450,6 +450,45 @@
       },
       "type": "object"
     },
+    "Telemetry": {
+      "additionalProperties": false,
+      "description": "Where to send traces. Fixed at start: a change is refused by a reload.",
+      "properties": {
+        "headers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/SecretRef"
+          },
+          "description": "Extra request headers for the collector (an authorization token, say), by\nsecret reference: the value is never written in the file.",
+          "type": "object"
+        },
+        "otlp_endpoint": {
+          "description": "The collector's OTLP/HTTP address, `http://` or `https://` (plain http is\nallowed: a collector on a private network or a sidecar often has no TLS).",
+          "type": "string"
+        },
+        "sample_ratio": {
+          "default": null,
+          "description": "The fraction of new traces to record, 0 to 1, applied parent-based so a\ncaller's own decision is respected. Defaults to 1.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "service_name": {
+          "default": null,
+          "description": "The `service.name` resource attribute. Defaults to `llmshim`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "otlp_endpoint"
+      ],
+      "type": "object"
+    },
     "Tls": {
       "additionalProperties": false,
       "description": "Server certificate and key, as PEM files. The files are watched: when either\nchanges (a certificate manager renewed it) new connections use the new\nmaterial without a restart. A replacement that does not load is ignored and\nthe previous certificate stays in service.",
@@ -546,6 +585,17 @@
     },
     "state": {
       "$ref": "#/$defs/State"
+    },
+    "telemetry": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Telemetry"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Export traces to an OpenTelemetry collector (0016). **Not implemented\nyet**: the table is part of the contract and validated, and a file that\nsets it is refused at startup until the exporter exists. It will need a\nbinary built with `--features serve-otel`."
     },
     "version": {
       "description": "The schema version. Only 1 exists; another is refused before anything else.",

@@ -27,6 +27,10 @@ serve = ["gateway", "dep:x509-parser", "dep:tokio-rustls", "dep:schemars"]
 # `serve` with fleet mode: a shared Redis queue, rate limits, spend ledger and
 # provider health across replicas. Needed for the `[fleet]` configuration table.
 serve-redis = ["serve", "gateway-redis"]
+# `serve` with OpenTelemetry trace export (0016). Needed for the `[telemetry]`
+# configuration table. The exporter's dependencies join this feature when it
+# is implemented; today it only unlocks the table.
+serve-otel = ["serve"]
 
 # Cloud transport dependencies are opt-in for library consumers and bundled binaries.
 bedrock = [
