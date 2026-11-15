@@ -94,17 +94,20 @@ A test replays the ledger's own sequence (80, 80, then 15) against the record.
   crosses Redis in a fleet carries only a SHA-256 of the tenant, and the
   gateway's tests assert that a tenant's name never appears in a job descriptor:
   names are kept out of shared storage on purpose. The key is handled the same
-  way: `serve` adds two optional fields to the scope, the credential's digest
-  (the SHA-256 of its token, or of `mtls:<name>` for a certificate workload,
-  which already scopes that credential's state in Redis) and the request id, and
-  never the key's name. A replica names the key from a table of its own
-  configuration, keyed by that digest. Both fields are skipped when absent, so
-  a build that does not set them writes the scope it always wrote, and a job
-  queued by an older replica records `key: null` and `request_id: null`.
-  Usage records therefore get the names locally. Each replica hashes the tenants in its own configuration
+  way: `serve` adds two optional fields to the scope, the first 16 hex digits
+  (64 bits) of the credential's digest (the SHA-256 of its token, or of
+  `mtls:<name>` for a certificate workload) and the request id, and never the
+  key's name. Only a prefix: the whole digest is what an operator may hold as a
+  `sha256` verifier, so it does not go into queued job payloads, and 64 bits tell
+  keys apart, which is all a log line needs. The fields are set only when a usage
+  log is configured. A replica names the key from a table of its own
+  configuration, keyed by that prefix. Both fields are skipped when absent, so
+  a build that does not set them writes the scope it always wrote, a replica
+  that predates them ignores them, and a job queued by such a replica records
+  `key: null` and `request_id: null`. Usage records therefore get the names
+  locally. Each replica hashes the tenants in its own configuration
   and looks the scope's hash up. Replicas of one fleet share a configuration, so
-  they agree, and nothing in the job format changes, so a fleet upgrades in
-  place with no compatibility window. A tenant a replica's configuration does
+  they agree, and a fleet upgrades in place with no compatibility window. A tenant a replica's configuration does
   not name (a key removed from this replica's file during a rollout) is recorded
   with `tenant: null`. A server running with `allow_unauthenticated` attributes
   every request to the tenant `anonymous`, which no key names, so that tenant is
@@ -146,9 +149,10 @@ malformed one that was replaced.
 
 ## Not done
 
-- **The access-log line of an abandoned request has no `request_id`** (the
-  request is dropped before the middleware that sets it has answered), though the
-  usage record of an attempt that was admitted does.
+- **A caller's own id is the caller's to keep unique.** The gateway refuses ids
+  in its own `gw-` form, so a caller cannot take another request's, but two
+  requests that send the same id share it. Group by `(key or tenant,
+  request_id)`.
 - **The trace.** The request id joins the response, the access log and the usage
   records; the trace joins with OpenTelemetry.
 - **Delivery guarantees.** A record is queued and written best effort. A crash

@@ -5,7 +5,8 @@
 //! before they reach a handler. A line holds:
 //!
 //! - `ts`: RFC 3339 time the response headers were ready, UTC;
-//! - `request_id`: the `x-request-id` the gateway put on the response;
+//! - `request_id`: the request's id, settled here (outermost) and put on the
+//!   response, so every line has one;
 //! - `method`, `path`: the request line without its query string;
 //! - `status`: the HTTP status sent in the response headers, `null` when the
 //!   client went away (or the request was cancelled) before a response existed.
@@ -16,13 +17,15 @@
 //! - `tenant`: the caller's tenant, `null` when the credential was missing or
 //!   not recognised. The credential is read as the gateway reads it, so on the
 //!   native routes an `x-api-key` or `x-goog-api-key` counts;
+//! - `key`: the name (`keys[].name`) of the caller key the credential belongs
+//!   to, `null` when it was missing or not recognised;
 //! - `credential`: the first eight hex characters of the SHA-256 of the bearer
 //!   token, `null` without one. It tells repeated use of one credential apart
 //!   without revealing it, including a wrong one being tried again and again.
 //!
-//! `path` and `request_id` come from the caller, so each is cut to 256
-//! characters. No token, header value, query string, body or model output is
-//! ever written.
+//! `path` comes from the caller, so it is cut to 256 characters (a caller's own
+//! `request_id` is at most 128 by the rule that settles it). No token, header
+//! value, query string, body or model output is ever written.
 
 use super::jsonl::JsonLines;
 use crate::gateway::auth::KeyStore;
@@ -78,6 +81,7 @@ fn bounded(text: &str) -> String {
 struct Pending {
     log: Arc<JsonLines>,
     started: std::time::Instant,
+    request_id: Option<String>,
     method: String,
     path: String,
     tenant: Option<String>,
@@ -87,12 +91,12 @@ struct Pending {
 }
 
 impl Pending {
-    fn write(&mut self, status: Option<u16>, request_id: Option<String>) {
+    fn write(&mut self, status: Option<u16>) {
         self.written = true;
         self.log.write(&Record {
             event: "access",
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            request_id,
+            request_id: self.request_id.take(),
             method: std::mem::take(&mut self.method),
             path: std::mem::take(&mut self.path),
             status,
@@ -107,7 +111,7 @@ impl Pending {
 impl Drop for Pending {
     fn drop(&mut self) {
         if !self.written {
-            self.write(None, None);
+            self.write(None);
         }
     }
 }
@@ -116,10 +120,20 @@ pub(crate) async fn record_request(
     log: Arc<JsonLines>,
     keys: Arc<KeyStore>,
     names: crate::gateway::usage::KeyNames,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
+    // Settle the request's id here, outermost, so its line carries one whatever
+    // becomes of the request: refused by a layer outside the gateway's own,
+    // dropped before any response. The gateway's layer keeps this one.
+    let id = crate::gateway::http::settle_request_id(request.headers());
+    if let Ok(value) = axum::http::HeaderValue::from_str(&id) {
+        request.headers_mut().insert("x-request-id", value);
+    }
+    request
+        .extensions_mut()
+        .insert(crate::gateway::http::SettledRequestId(id.clone()));
     // Resolve the caller before the request is consumed, from the headers as the
     // gateway reads them: on the native routes an `x-api-key` or
     // `x-goog-api-key` is the credential. The same store the gateway
@@ -132,6 +146,7 @@ pub(crate) async fn record_request(
     let mut pending = Pending {
         log,
         started: std::time::Instant::now(),
+        request_id: Some(id.clone()),
         method: request.method().to_string(),
         path: bounded(&path),
         tenant: caller.as_ref().map(|caller| caller.identity.tenant.clone()),
@@ -141,13 +156,15 @@ pub(crate) async fn record_request(
         credential: fingerprint(&headers),
         written: false,
     };
-    let response = next.run(request).await;
-    let request_id = response
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(bounded);
-    pending.write(Some(response.status().as_u16()), request_id);
+    let mut response = next.run(request).await;
+    // A response made by a layer outside the gateway's own (the origin check, the
+    // hidden admin path) carries no id yet; the caller gets the one the log has.
+    if !response.headers().contains_key("x-request-id") {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&id) {
+            response.headers_mut().insert("x-request-id", value);
+        }
+    }
+    pending.write(Some(response.status().as_u16()));
     response
 }
 
@@ -342,6 +359,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_line_has_the_id_the_caller_is_given_even_from_an_outer_layer() {
+        // This app has no request-id layer inside the log, like a response made by
+        // a layer outside the gateway's own (the origin check, a hidden admin
+        // path). The log settles the id itself and puts it on the response.
+        use tower::ServiceExt;
+        let out = Shared::default();
+        let log = Arc::new(JsonLines::to_writer(Box::new(out.clone())));
+        let app = app(log.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/other")
+                    .header("x-request-id", "run-9.step-1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["x-request-id"], "run-9.step-1");
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/other")
+                    .header("x-request-id", "gw-0123456789ab-1")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let minted = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            minted.starts_with("gw-") && minted != "gw-0123456789ab-1",
+            "{minted}"
+        );
+        log.sync();
+        let lines = out.lines();
+        assert_eq!(lines[0]["request_id"], "run-9.step-1");
+        assert_eq!(lines[1]["request_id"], minted.as_str());
+    }
+
+    #[tokio::test]
     async fn a_request_cancelled_before_its_response_still_gets_a_line() {
         let out = Shared::default();
         let log = Arc::new(JsonLines::to_writer(Box::new(out.clone())));
@@ -359,6 +423,14 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0]["status"].is_null(), "{lines:?}");
         assert_eq!(lines[0]["path"], "/slow");
+        // The abandoned request still has its id, so it joins to the usage record
+        // of any attempt it had already started.
+        assert!(
+            lines[0]["request_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("gw-")),
+            "{lines:?}"
+        );
         // A finished request writes exactly one line, not two.
         send(&app, "POST", "/v1/other", None).await;
         log.sync();

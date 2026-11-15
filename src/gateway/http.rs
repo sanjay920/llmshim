@@ -882,7 +882,9 @@ async fn chat(
         .await
         .map_err(|error| gateway_err_to_api(&state, error))?;
     #[cfg(feature = "serve")]
-    policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
+    if state.attempt_coordinator.records_usage() {
+        policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
+    }
     let prepared_submission = state
         .prepare_submission(gw, policy_scope, false)
         .map_err(|error| gateway_err_to_api(&state, error))?;
@@ -976,7 +978,9 @@ async fn chat_stream_inner(
         Err(error) => return gateway_err_to_api(&state, error).into_response(),
     };
     #[cfg(feature = "serve")]
-    policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
+    if state.attempt_coordinator.records_usage() {
+        policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
+    }
     let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {
         Ok(prepared) => prepared,
         Err(error) => return gateway_err_to_api(&state, error).into_response(),
@@ -1083,7 +1087,7 @@ async fn stats(State(state): State<Arc<GatewayState>>) -> Json<Value> {
 /// The id a request that sent none gets. Under `serve` it is
 /// `gw-<instance>-<n>`: `<instance>` is 12 random hex digits drawn once per
 /// process and `<n>` a per-process counter, so ids do not repeat across replicas
-/// or restarts. (`llmshim gateway` keeps `gw-<pid>-<n>`, which is unique within
+/// or restarts. (A build without `serve` keeps `gw-<pid>-<n>`, which is unique within
 /// one process only: in a container the pid is often 1.)
 fn minted_request_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1091,14 +1095,19 @@ fn minted_request_id() -> String {
     #[cfg(feature = "serve")]
     {
         static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        let instance =
-            INSTANCE.get_or_init(|| uuid::Uuid::new_v4().simple().to_string()[..12].into());
+        let instance = INSTANCE.get_or_init(new_instance_id);
         format!("gw-{instance}-{n}")
     }
     #[cfg(not(feature = "serve"))]
     {
         format!("gw-{}-{n}", std::process::id())
     }
+}
+
+/// 12 random hex digits, drawn once per process.
+#[cfg(feature = "serve")]
+fn new_instance_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..12].into()
 }
 
 /// The request's id as the middleware settled it, for handlers.
@@ -1108,24 +1117,50 @@ fn request_id_of(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Whether a caller's own `x-request-id` is kept: 1 to 128 visible ASCII
-/// characters. Anything else is replaced by a minted id, never echoed. (Only
-/// under `serve`; `llmshim gateway` keeps whatever header it was sent.)
+/// characters, and not in the gateway's own `gw-` form (a caller cannot take the
+/// id of another request, minted or future). Anything else is replaced by a
+/// minted id, never echoed. (Only under `serve`; a build without it keeps whatever
+/// header it was sent.)
 #[cfg(feature = "serve")]
 fn well_formed_request_id(id: &str) -> bool {
-    (1..=128).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_graphic())
+    (1..=128).contains(&id.len())
+        && id.bytes().all(|byte| byte.is_ascii_graphic())
+        && !id.starts_with("gw-")
+}
+
+/// The id a request has already settled on, put in its extensions by the
+/// outermost layer (the access log) so the gateway's own layer keeps it.
+#[cfg(feature = "serve")]
+#[derive(Clone)]
+pub(crate) struct SettledRequestId(pub(crate) String);
+
+/// Settle a request's id: the caller's own if it is well formed, else a minted one.
+#[cfg(feature = "serve")]
+pub(crate) fn settle_request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|id| well_formed_request_id(id))
+        .map(str::to_string)
+        .unwrap_or_else(minted_request_id)
 }
 
 /// Ensure every request/response carries an `x-request-id` for correlation
 /// (honoring an incoming one, else minting a unique id).
 async fn request_id(mut req: Request, next: Next) -> Response {
-    let supplied = req
+    #[cfg(feature = "serve")]
+    let id = req
+        .extensions()
+        .get::<SettledRequestId>()
+        .map(|settled| settled.0.clone())
+        .unwrap_or_else(|| settle_request_id(req.headers()));
+    #[cfg(not(feature = "serve"))]
+    let id = req
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    #[cfg(feature = "serve")]
-    let supplied = supplied.filter(|id| well_formed_request_id(id));
-    let id = supplied.unwrap_or_else(minted_request_id);
+        .map(str::to_string)
+        .unwrap_or_else(minted_request_id);
     if let Ok(hv) = HeaderValue::from_str(&id) {
         req.headers_mut().insert("x-request-id", hv.clone());
         let mut resp = next.run(req).await;
@@ -4698,8 +4733,73 @@ mod request_id_tests {
         );
         assert_eq!(instance_a, instance_b, "one process, one instance part");
         assert!(b > a, "the counter advances: {first} then {second}");
-        // The pid is exactly what repeats across containers (it is often 1).
-        assert_ne!(instance_a, std::process::id().to_string());
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn each_process_draws_its_own_instance_part() {
+        // The part that makes ids unique across replicas and restarts is drawn at
+        // random, not derived from the pid (which is often 1 in a container).
+        let drawn: std::collections::BTreeSet<String> =
+            (0..64).map(|_| new_instance_id()).collect();
+        assert_eq!(drawn.len(), 64, "64 draws, 64 different instance parts");
+        assert!(drawn
+            .iter()
+            .all(|id| id.len() == 12 && id.bytes().all(|byte| byte.is_ascii_hexdigit())));
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn a_caller_cannot_take_an_id_in_the_gateways_own_form() {
+        // The instance part is on every response and the counter is sequential,
+        // so a caller could otherwise send the id of another request, or of one
+        // not yet made, and pollute that request's totals.
+        for taken in ["gw-3f9a1c0b7e42-12", "gw-anything", "gw-"] {
+            let (on_response, seen) = through(Some(taken.as_bytes())).await;
+            assert_ne!(on_response, taken, "{taken} is the gateway's to mint");
+            assert!(on_response.starts_with("gw-"));
+            assert_eq!(on_response, seen);
+        }
+        // Only the prefix is reserved.
+        let (kept, _) = through(Some(b"my-gw-run-1")).await;
+        assert_eq!(kept, "my-gw-run-1");
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn an_id_settled_by_an_outer_layer_is_kept_by_the_gateways_own() {
+        // The access log settles the id outermost and records it in the request's
+        // extensions; the gateway's layer must keep that id (a `gw-` id would
+        // otherwise be refused as a caller's own) and the response must carry it.
+        let app = axum::Router::new()
+            .route(
+                "/",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned()
+                }),
+            )
+            .layer(axum::middleware::from_fn(request_id))
+            .layer(axum::middleware::from_fn(
+                |mut req: Request, next: Next| async move {
+                    req.extensions_mut()
+                        .insert(SettledRequestId("gw-0123456789ab-7".to_owned()));
+                    next.run(req).await
+                },
+            ));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["x-request-id"], "gw-0123456789ab-7");
     }
 
     #[cfg(feature = "serve")]
@@ -4729,7 +4829,7 @@ mod request_id_tests {
         }
     }
 
-    /// `llmshim gateway` is unchanged: the process-id form, and whatever header
+    /// A build without `serve` is unchanged: the process-id form, and whatever header
     /// it was sent.
     #[cfg(not(feature = "serve"))]
     #[tokio::test]

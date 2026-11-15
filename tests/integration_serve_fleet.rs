@@ -175,14 +175,19 @@ async fn usage_records_name_the_tenant_whichever_replica_dispatches() {
     let names = Names::new();
     let directory = harness::tempdir::Dir::new("fleet-usage");
     let log_for = |replica: &str| directory.0.join(format!("usage-{replica}.jsonl"));
+    // The two replicas name the same key differently, as a rollout in progress
+    // might: the name a record carries is the dispatching replica's own, and not
+    // one that travelled with the job.
     let text = |replica: &str| {
-        fleet_config(&upstream.url(), &names, "").replace(
-            "[state]",
-            &format!(
-                "[logging]\nusage_log = \"{}\"\n[state]",
-                log_for(replica).display()
-            ),
-        )
+        fleet_config(&upstream.url(), &names, "")
+            .replace(
+                "[state]",
+                &format!(
+                    "[logging]\nusage_log = \"{}\"\n[state]",
+                    log_for(replica).display()
+                ),
+            )
+            .replace("name = \"ci\"", &format!("name = \"ci-{replica}\""))
     };
     let a = start(&text("a"), "usage-a", &env);
     let b = start(&text("b"), "usage-b", &env);
@@ -223,11 +228,16 @@ async fn usage_records_name_the_tenant_whichever_replica_dispatches() {
     assert_eq!(from_a.len() + from_b.len(), sent);
     for record in from_a.iter().chain(&from_b) {
         assert_eq!(record["tenant"], names.tenant.as_str(), "{record}");
-        // The key is named too, from each replica's own configuration: the job
-        // carried the credential's digest through Redis, never the name.
-        assert_eq!(record["key"], "ci", "{record}");
         assert_eq!(record["provider"], names.provider.as_str());
         assert_eq!(record["outcome"], "completed");
+    }
+    // The key is named too, from each replica's own configuration: the job
+    // carried a prefix of the credential's digest through Redis, never the name.
+    for record in &from_a {
+        assert_eq!(record["key"], "ci-a", "{record}");
+    }
+    for record in &from_b {
+        assert_eq!(record["key"], "ci-b", "{record}");
     }
     // The id the caller saw on its response, on the record of the replica that
     // dispatched it, whichever replica that was. Replica A minted every one.

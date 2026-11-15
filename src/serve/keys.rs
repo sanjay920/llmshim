@@ -361,6 +361,25 @@ mod tests {
             names.name(&by_certificate.credential_scope).as_deref(),
             Some("checkout-workload")
         );
+        // A DNS name is matched case-insensitively (RFC 4343): the table must
+        // find the key under the canonical form the store uses.
+        let mixed = text.replace(
+            "uri:spiffe://corp/payments/checkout",
+            "dns:Checkout.Corp.Example",
+        );
+        let mixed_config = ServeConfig::parse(&mixed, Format::Toml).unwrap();
+        let mixed_store = build_key_store(&mixed_config, &env).unwrap();
+        let mixed_names = crate::gateway::usage::KeyNames::new(key_names(&mixed_config, &env));
+        let mut dns = HeaderMap::new();
+        dns.insert(
+            crate::gateway::auth::PEER_SAN_HEADER,
+            HeaderValue::from_static("dns:checkout.corp.example"),
+        );
+        let by_dns = mixed_store.identify_caller(&dns).unwrap();
+        assert_eq!(
+            mixed_names.name(&by_dns.credential_scope).as_deref(),
+            Some("checkout-workload")
+        );
         // Three keys, three scopes, and an unknown credential names nothing.
         assert_eq!(key_names(&config, &env).len(), 3);
         assert_eq!(names.name("not-a-credential-scope"), None);

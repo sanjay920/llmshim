@@ -333,17 +333,20 @@ pub struct State {
 #[non_exhaustive]
 pub struct Logging {
     /// One JSON line per request on the main listener: when, request id, method,
-    /// path, status, latency to the response headers, the caller's tenant and a
-    /// short fingerprint of the credential. Never a token, a header or a body.
+    /// path, status, latency to the response headers, the caller's tenant and
+    /// key name, and a short fingerprint of the credential. Never a token, a
+    /// header or a body.
     /// `"stdout"`, or an absolute file path (created with owner-only access and
     /// appended to; rotate it with `copytruncate` or let the platform collect
     /// stdout). Off when absent.
     #[serde(default)]
     pub access_log: Option<String>,
-    /// One JSON line per provider attempt when it ends: tenant, provider, model,
-    /// outcome, tokens and USD cost. Per attempt, not per request: a retry or a
-    /// fallback is a separate charge. For showback and chargeback; sum `cost_usd`
-    /// per tenant, treating `null` as unknown. Same targets as `access_log`.
+    /// One JSON line per provider attempt when it ends: tenant, key name, the
+    /// request id (the one in the access log), provider, model, outcome, tokens
+    /// and USD cost. Per attempt, not per request: a retry or a fallback is a
+    /// separate charge, and the attempts of a request share its id. For showback
+    /// and chargeback; sum `cost_usd` per tenant or key, treating `null` as
+    /// unknown. Same targets as `access_log`.
     #[serde(default)]
     pub usage_log: Option<String>,
 }
@@ -561,7 +564,8 @@ pub struct ProviderLimits {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct GatewayKey {
-    /// Operator-facing label; never sent on the wire.
+    /// Operator-facing label. It names the key in the access log and the usage
+    /// records (`key`); it is never sent to a provider.
     pub name: String,
     /// The bearer token, by reference. Mutually exclusive with `sha256`.
     #[serde(default)]

@@ -11,7 +11,9 @@
 //!    compared as parsed documents, and each difference is refused **by path**;
 //! 3. only then is the new key set swapped in, in one step, for every holder of
 //!    the key store (the gateway, the access log and the client-certificate
-//!    binding), and new tenant names are made resolvable for the usage log.
+//!    binding), and new tenant and key names are made resolvable for the logs.
+//!    (Names are added for any valid file, even one that changes no key: a rename
+//!    is not a change to who may call.)
 //!
 //! A rejected reload changes nothing: the previous keys keep serving, so a typo
 //! in a file never locks callers out and never silently keeps a revoked key
@@ -346,6 +348,17 @@ impl Reloader {
         }
 
         active.last_rejection = None;
+        // Labels first, and whether or not anything else changed: a request
+        // admitted under new keys must find its tenant's and its key's name
+        // already resolvable, and a rename is not a change to who may call (the
+        // fingerprint ignores names) yet the logs should say the new name.
+        // Adding is idempotent, and a name is a label, never a permission.
+        self.handles
+            .tenants
+            .add(loaded.config.keys.iter().map(|key| key.tenant.clone()));
+        self.handles
+            .key_names
+            .add(super::keys::key_names(&loaded.config, env));
         let fingerprint = store.fingerprint();
         if fingerprint == active.fingerprint {
             active.pending = None;
@@ -360,14 +373,6 @@ impl Reloader {
         }
         active.pending = None;
         let credentials = store.credential_count();
-        // Names first: a request admitted under the new keys must find its
-        // tenant's and its key's name already resolvable.
-        self.handles
-            .tenants
-            .add(loaded.config.keys.iter().map(|key| key.tenant.clone()));
-        self.handles
-            .key_names
-            .add(super::keys::key_names(&loaded.config, env));
         self.handles.keys.replace(store);
         active.fingerprint = fingerprint;
         let generation = self.handles.status.snapshot().generation + 1;
@@ -875,6 +880,21 @@ mod tests {
         // key the reload revoked is still named, for attempts already in flight.
         assert_eq!(names.name(&new_scope).as_deref(), Some("b"));
         assert_eq!(names.name(&old_scope).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_rename_alone_updates_the_names_the_logs_use() {
+        // Same token, same tenant, new key name: nothing about who may call has
+        // changed, so the reload is a no-op for authentication, but the logs must
+        // say the new name from now on (0012: "rename a key freely").
+        let initial = text("", &key("a", "acme", OLD, ""));
+        let fixture = Fixture::new(&initial);
+        let names = fixture.reloader.handles.key_names.clone();
+        let scope = digest(OLD);
+        assert_eq!(names.name(&scope).as_deref(), Some("a"));
+        fixture.write(&text("", &key("renamed", "acme", OLD, "")));
+        assert!(matches!(fixture.reload(), Outcome::Unchanged));
+        assert_eq!(names.name(&scope).as_deref(), Some("renamed"));
     }
 
     #[test]

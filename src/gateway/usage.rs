@@ -98,7 +98,7 @@ pub trait UsageSink: Send + Sync {
     fn record(&self, record: &UsageRecord);
 }
 
-/// A sink and the tenants it can name.
+/// A sink, and the tenants and keys it can name.
 ///
 /// The policy scope that travels with a job (through Redis, in a fleet) holds
 /// only a hash of the tenant, on purpose: tenant names are not put in shared
@@ -145,13 +145,31 @@ impl TenantNames {
     }
 }
 
-/// Caller-key names by the credential scope a policy scope carries.
+/// How many hex digits of a credential's scope digest a policy scope carries.
+/// 16 (64 bits) tells keys apart, which is all a log line needs, and is not the
+/// digest an operator may hold in a `sha256` field, so it cannot stand in for the
+/// token's verifier.
+pub(crate) const CREDENTIAL_PREFIX_LEN: usize = 16;
+
+/// The prefix of a credential scope that identifies a key in a policy scope and
+/// in [`KeyNames`].
+pub(crate) fn credential_prefix(credential_scope: &str) -> &str {
+    credential_scope
+        .get(..CREDENTIAL_PREFIX_LEN)
+        .unwrap_or(credential_scope)
+}
+
+/// Caller-key names by credential.
 ///
-/// The scope that travels with a job holds the digest that scopes the
-/// credential's state (the SHA-256 of its token, or of `mtls:<name>` for a
+/// A job's policy scope carries the first 16 hex digits of the digest that scopes
+/// the credential (the SHA-256 of its token, or of `mtls:<name>` for a
 /// certificate workload), never the key's name; a replica names the key from its
 /// own configuration, as it names the tenant. Like [`TenantNames`], clones share
-/// one table, it only grows, and a name is a label, not a permission.
+/// one table, it only grows, and a name is a label, not a permission. A key that
+/// is renamed keeps resolving, to its newest name.
+///
+/// Callers pass a whole scope digest or the prefix a policy scope carries; the
+/// table is keyed by the prefix either way.
 #[derive(Clone, Default)]
 pub struct KeyNames(Arc<std::sync::RwLock<HashMap<String, String>>>);
 
@@ -163,17 +181,22 @@ impl KeyNames {
         names
     }
 
-    /// Make more keys resolvable. A credential already known keeps resolving.
+    /// Make more keys resolvable. A credential already known keeps resolving; a
+    /// renamed one resolves to its newest name.
     pub fn add(&self, pairs: impl IntoIterator<Item = (String, String)>) {
         let mut table = self.0.write().unwrap_or_else(|p| p.into_inner());
-        table.extend(pairs);
+        table.extend(
+            pairs
+                .into_iter()
+                .map(|(credential, name)| (credential_prefix(&credential).to_owned(), name)),
+        );
     }
 
     pub(crate) fn name(&self, credential: &str) -> Option<String> {
         self.0
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .get(credential)
+            .get(credential_prefix(credential))
             .cloned()
     }
 }

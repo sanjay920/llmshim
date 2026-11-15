@@ -52,10 +52,11 @@ pub(crate) struct TrustedPolicyScope {
     budget: Option<crate::gateway::budget::BudgetPolicySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_spend_floor: Option<LegacySpendFloor>,
-    /// The credential the request authenticated with, as the digest that scopes
-    /// its state. It lets the replica that dispatches the job name the key from
-    /// its own configuration; the name itself is never in the scope. Set only by
-    /// `serve`.
+    /// The credential the request authenticated with: the first 16 hex digits of
+    /// the digest that scopes its state (not the whole digest). It lets the
+    /// replica that dispatches the job name the key from its own configuration;
+    /// the name itself is never in the scope. Set only by `serve`, and only when
+    /// it records usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credential: Option<String>,
     /// The request's id, for the usage record. Set only by `serve`.
@@ -85,8 +86,9 @@ impl TrustedPolicyScope {
 
     /// Record who made the request and under which id, for the usage record.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
-    pub(crate) fn attribute(&mut self, credential: &str, request_id: Option<&str>) {
-        self.credential = Some(credential.to_owned());
+    pub(crate) fn attribute(&mut self, credential_scope: &str, request_id: Option<&str>) {
+        self.credential =
+            Some(crate::gateway::usage::credential_prefix(credential_scope).to_owned());
         self.request_id = request_id.map(str::to_owned);
     }
 
@@ -1009,6 +1011,13 @@ impl AttemptCoordinator {
 
     /// Record every attempt that ends from now on. Takes effect once; a second
     /// call is ignored.
+    /// Whether a usage sink is installed: attribution (the key and request id in a
+    /// job's scope) is only worth carrying when something records it.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn records_usage(&self) -> bool {
+        self.usage.get().is_some()
+    }
+
     pub(crate) fn set_usage_sink(&self, setup: crate::gateway::usage::UsageSetup) {
         let _ = self
             .usage
@@ -4651,14 +4660,21 @@ mod usage_records {
         let old: TrustedPolicyScope =
             serde_json::from_value(json!({"tenant_key": "h", "rpm": 1, "tpm": 10})).unwrap();
         assert!(old.credential.is_none() && old.request_id.is_none());
-        // Attributed: the digest and the id travel, and the key's name does not.
+        // Attributed: a prefix of the credential's digest and the id travel; the
+        // whole digest (which an operator may hold as a `sha256` verifier) and the
+        // key's name do not.
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let mut attributed = scope(Some("payments"), None);
-        attributed.attribute("known-credential", Some("req-1"));
+        attributed.attribute(digest, Some("req-1"));
         let text = serde_json::to_string(&attributed).unwrap();
-        assert!(text.contains("known-credential") && text.contains("req-1"));
+        assert!(text.contains(&digest[..16]) && text.contains("req-1"));
+        assert!(
+            !text.contains(&digest[..17]),
+            "only the first 16 hex digits of the digest travel"
+        );
         assert!(!text.contains("checkout"), "names stay out of the scope");
         let back: TrustedPolicyScope = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.credential.as_deref(), Some("known-credential"));
+        assert_eq!(back.credential.as_deref(), Some(&digest[..16]));
         assert_eq!(back.request_id.as_deref(), Some("req-1"));
     }
 

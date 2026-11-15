@@ -721,6 +721,67 @@ async fn one_request_id_joins_the_response_the_access_line_and_the_usage_record(
 }
 
 #[tokio::test]
+async fn a_streamed_request_is_attributed_and_joined_like_any_other() {
+    let chunk = |delta: &str, finish: &str, usage: &str| {
+        format!(
+            r#"data: {{"id":"c1","object":"chat.completion.chunk","created":1,"model":"test-model","choices":[{{"index":0,"delta":{delta},"finish_reason":{finish}}}]{usage}}}"#
+        )
+    };
+    let body = [
+        chunk(r#"{"role":"assistant","content":"po"}"#, "null", ""),
+        chunk(
+            r#"{"content":"ng"}"#,
+            r#""stop""#,
+            r#","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}"#,
+        ),
+        "data: [DONE]".to_string(),
+    ]
+    .join("\n\n")
+        + "\n\n";
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let dir = tempdir::Dir::new("stream-attribution");
+    let access_path = dir.0.join("access.jsonl");
+    let usage_path = dir.0.join("usage.jsonl");
+    let extra = format!(
+        "[logging]\naccess_log = \"{}\"\nusage_log = \"{}\"",
+        access_path.display(),
+        usage_path.display()
+    );
+    let server = start(&config(&upstream.url(), &extra), "stream-attribution", &[]);
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", server.base))
+        .bearer_auth(CALLER_KEY)
+        .header("x-request-id", "stream-run-1")
+        .json(&json!({"model": "inference/test-model", "stream": true,
+            "messages": [{"role": "user", "content": "ping"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-request-id"], "stream-run-1");
+    let text = response.text().await.unwrap();
+    assert!(text.contains("po") && text.contains("ng"), "{text}");
+
+    let access = access_lines(&access_path, 1);
+    let usage = access_lines(&usage_path, 1);
+    assert_eq!(access[0]["request_id"], "stream-run-1", "{access:#?}");
+    assert_eq!(access[0]["key"], "ci");
+    assert_eq!(usage.len(), 1, "{usage:#?}");
+    assert_eq!(usage[0]["kind"], "stream");
+    assert_eq!(usage[0]["outcome"], "completed");
+    assert_eq!(usage[0]["key"], "ci");
+    assert_eq!(usage[0]["request_id"], "stream-run-1");
+}
+
+#[tokio::test]
 async fn an_open_server_attributes_usage_to_the_anonymous_tenant() {
     // With allow_unauthenticated no key names a tenant, but every request is
     // attributed to "anonymous"; the record must say so, not `null`, which is
