@@ -378,8 +378,160 @@ paths:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
 
+  # --- Operational endpoints (gateway and `llmshim serve`; experimental/unstable) ---
+  # Each carries `x-llmshim-operational: true`; tests/integration_serve_openapi.rs
+  # starts a real `serve` and holds the server to exactly this list and these shapes.
+  /ready:
+    get:
+      operationId: readiness
+      summary: Readiness probe
+      description: |
+        200 when the replica can do work, 503 when a dependency it needs (Redis,
+        in fleet mode) is unreachable. Never needs a token, even on the admin
+        listener, so an orchestrator can probe it. Unlike `/health` it reports
+        the dependency, not just that the process is up.
+      x-llmshim-operational: true
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            text/plain:
+              schema: {type: string, const: "ready\n"}
+        '503':
+          description: Not ready
+          content:
+            text/plain:
+              schema: {type: string, const: "not ready\n"}
+
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Prometheus text exposition: request, dispatch and rejection counters,
+        in-flight and queue-depth gauges, queue-wait and upstream-latency
+        histograms.
+      x-llmshim-operational: true
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Metrics in the Prometheus text format
+          content:
+            text/plain:
+              schema: {type: string}
+        '401':
+          $ref: '#/components/responses/AdminUnauthorized'
+
+  /v1/gateway/stats:
+    get:
+      operationId: gatewayStats
+      summary: Queue depths and mode
+      x-llmshim-operational: true
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Current queue state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayStats'
+        '401':
+          $ref: '#/components/responses/AdminUnauthorized'
+
+  /v1/serve/config:
+    get:
+      operationId: serveConfigStatus
+      summary: Key-reload status (`llmshim serve` only)
+      description: |
+        What the running server's keys are and what the last reload did, so a
+        failed reload that nobody read cannot leave a revoked key live. Served
+        only on the admin listener, never on the main one. Alert on
+        `in_sync == false`. Paths and messages only, never a value.
+      x-llmshim-operational: true
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Reload status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServeConfigStatus'
+        '401':
+          $ref: '#/components/responses/AdminUnauthorized'
+
 components:
+  securitySchemes:
+    adminToken:
+      type: http
+      scheme: bearer
+      description: |
+        The `[admin] token` of `llmshim serve`. Required only when the admin
+        listener is configured with one; with `allow_unauthenticated` (or no
+        `[admin]` table, where these paths share the main listener) they are open.
+        `llmshim gateway` and the proxy have no admin token at all: there they
+        are open on the main listener.
+  responses:
+    AdminUnauthorized:
+      description: Missing or wrong admin token
+      headers:
+        WWW-Authenticate:
+          schema: {type: string, const: Bearer}
   schemas:
+    GatewayStats:
+      type: object
+      required: [mode, auth_enforced, providers, lanes]
+      additionalProperties: false
+      properties:
+        mode: {type: string, enum: [in-memory, distributed]}
+        auth_enforced: {type: boolean}
+        providers:
+          type: array
+          items: {type: string}
+        lanes:
+          type: array
+          items:
+            type: object
+            required: [provider, queue_depth]
+            additionalProperties: false
+            properties:
+              provider: {type: string}
+              queue_depth: {type: integer, minimum: 0}
+              dead_letter: {type: integer, minimum: 0, description: Distributed mode only}
+    ServeConfigStatus:
+      type: object
+      required: [generation, config_sha256, credentials, loaded_at_epoch_secs, last_check_epoch_secs, in_sync, last_reload]
+      additionalProperties: false
+      properties:
+        generation: {type: integer, minimum: 0, description: 0 for the configuration the process started with}
+        config_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        credentials: {type: integer, minimum: 0}
+        loaded_at_epoch_secs: {type: integer, minimum: 0}
+        last_check_epoch_secs: {type: [integer, 'null']}
+        in_sync: {type: boolean}
+        last_reload:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ReloadAttempt'
+    ReloadAttempt:
+      type: object
+      required: [at_epoch_secs, outcome, issues]
+      additionalProperties: false
+      properties:
+        at_epoch_secs: {type: integer, minimum: 0}
+        outcome: {type: string, enum: [applied, rejected]}
+        issues:
+          type: array
+          items:
+            type: object
+            required: [path, message]
+            additionalProperties: false
+            properties:
+              path: {type: string}
+              message: {type: string}
     NativeChatRequest:
       type: object
       required: [model, messages]

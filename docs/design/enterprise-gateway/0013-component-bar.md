@@ -27,7 +27,7 @@ carry no private consumer identities).
 | Proxy HTTP API | `api/openapi.yaml`; the bundled clients in lockstep | stable |
 | Gateway HTTP API | the proxy contract plus the gateway's headers and endpoints, in the same document, marked experimental there | experimental |
 | `llmshim serve` configuration file | 0001; a JSON Schema checked in and compared by a test (planned) | unstable |
-| Operational endpoints (`/ready`, `/metrics`, stats, `/v1/serve/config`; `/health` is part of the proxy contract) | 0005, 0012; to be described in the OpenAPI document (planned) | unstable |
+| Operational endpoints (`/ready`, `/metrics`, stats, `/v1/serve/config`; `/health` is part of the proxy contract) | 0005, 0012; described in the OpenAPI document and held to it by a conformance test (0015) | unstable |
 | Access and usage logs | 0009, 0010 | unstable |
 
 **Stable:** a breaking change needs a version bump (a minor release while the
@@ -111,7 +111,7 @@ of untested corners makes that worse, not better.
 3. The configuration-contract tightenings under "Review follow-ups", the
    remaining inventory rows of 0002, a structure-only `--check` with its own
    exit code, `--print-schema`, and the operational endpoints in the OpenAPI
-   document with a conformance test.
+   document with a conformance test. Done except the 0002 rows.
 4. A request id that is unique across instances, and the tenant and key name
    beside it in the access log and the usage records. Done; the trace joins in
    step 6.
