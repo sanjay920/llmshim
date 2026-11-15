@@ -54,7 +54,9 @@ impl RedisConnectionManagerCache {
         result
     }
 
-    #[cfg(test)]
+    // Only the gateway's tests take a raw connection; with `redis-coordination`
+    // alone (the rate limiter) nothing calls it and clippy rejects it as dead.
+    #[cfg(all(test, feature = "gateway"))]
     pub(crate) async fn connection_for_test(&self) -> redis::RedisResult<ConnectionManager> {
         Ok(self.generation().await?.manager.clone())
     }

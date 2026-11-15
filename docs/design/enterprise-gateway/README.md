@@ -134,20 +134,50 @@ Contracts and decisions (change before stability)
 
 Operability
 
-- **Pull requests run the `serve` jobs only.** The release gate runs just
-  `cargo test --workspace --features proxy --tests`, and only at tag time. The
-  `gateway` and `gateway-redis` suites under `tests/` (for example
-  `unit_gateway_key_diagnostics.rs` and `unit_redis_diagnostics.rs`) run
-  nowhere in CI; a pull request reaches the gateway code only through the
-  `gateway::` library tests that the `serve-redis` job runs. A shared-code
-  regression is therefore found late. A pull-request job that runs
-  `cargo test --features proxy --tests` and the same with `gateway-redis` (with
-  a Redis service) closes that.
+- **The Redis-backed tests run one at a time.** `ci.yml` runs every build on each
+  pull request and on main, and the 64 ignored tests that need a Redis (63 in
+  `gateway::`, one in `proxy::ratelimit::`; they ran nowhere before) with
+  `--test-threads=1` and a floor on how many ran. Run in parallel against one
+  Redis on a development machine, 13 of the 63 failed: every gateway's reaper
+  sweeps the origin-lease index and the shared capacity counters of all the
+  others, so tests that simulate a crashed origin or a shutdown reap each
+  other's gateways. Each passed alone. A `fleet.namespace` (above) would give
+  each test its own keys and should let them run in parallel; that is expected,
+  not yet shown.
+- **Timing-dependent tests flake on a loaded runner.** The first dozen runs of
+  `ci.yml` and `serve-check.yml` failed on nine tests, each a different race: a
+  heartbeat tick on a stream's total deadline; 10, 20 and 50 ms client
+  deadlines that also cover connecting; a 50 ms server head deadline; a TLS
+  close that arrives as a reset rather than an end of file; a test that read an
+  asynchronous log before its writer had written; one that searched a status
+  document for digits that its config hash and timestamps also contain; and
+  one dead helper under a feature nobody built. Each is fixed with margins or
+  a looser, still-meaningful assertion. Others keep short margins and will need
+  the same if they fail: `fallback.rs` (a 20 ms header timeout against live
+  providers), the rest of the 90 ms-lease tests in `gateway/distributed.rs` and
+  `gateway/http.rs`, `http_server.rs` and `managed_server.rs` (50 ms head
+  deadline, a TLS handshake inside 50 ms), and `proxy/mod.rs` (a first response
+  inside 50 ms). Local load does not find them (four runs under twice the core
+  count of busy loops passed): burn-in on the CI runners does.
+- **A stream whose heartbeat tick coincides with its total deadline can end as
+  `origin canceled` instead of a timeout.** The origin lease expires at the
+  deadline, so a tick that lands on it finds the origin gone. Both are errors at
+  the deadline, in different classes: a timeout is reported as overload (with
+  `Retry-After`), `origin canceled` as a provider error. The test avoids the
+  coincidence; reporting a timeout when the deadline has passed is a separate
+  change to gateway code.
 - **Gemini thinking tokens are left out of the normalized completion count** on
   the native path (`usage::normalize_native_usage`), while the non-streaming
   response folds them in. The spend ledger, the cap and the usage records all use
   the smaller figure. It is a fix to shared accounting, so it belongs in its own
   change with its own tests.
+- **A tag is not tied to `ci.yml`.** The release workflow still runs only fmt,
+  clippy and `cargo test --workspace --features proxy --tests`, plus the Windows
+  check. Making it wait for a green `ci.yml` on the tagged commit, and adding
+  the `serve` builds, is a step toward declaring `serve` stable.
+- **Nothing forces a red check to be read.** `main` has no branch protection or
+  ruleset, so a failing check does not block a merge. Requiring `ci.yml` and
+  `serve-check.yml` is a repository setting for the maintainer.
 - **The log writer** (`jsonl.rs`) drops and counts lines when its queue is full;
   a metric for the count (and for write failures) belongs with the
   OpenTelemetry item.

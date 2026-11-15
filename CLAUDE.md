@@ -34,6 +34,8 @@ cargo run                                            # interactive CLI chat
 cargo run --features proxy -- proxy                  # proxy server on :3000
 ```
 
+CI (`.github/workflows/ci.yml`) runs on every pull request, every push to main and weekly: `cargo fmt`; clippy with `-D warnings` for default, `--no-default-features`, `proxy`, `gateway`, `gateway-redis`, `redis-coordination` and the three cloud transports (`bedrock,vertex,azure`); the `--tests` suites for the same builds except `--no-default-features`; and the 64 Redis-backed tests that are `#[ignore]`d without a server (`LLMSHIM_REDIS_URL=… cargo test --features gateway-redis --lib -- gateway:: proxy::ratelimit:: --ignored --test-threads=1`; serial because every gateway's reaper sweeps the origin-lease index and shared capacity counters of all the others). `serve-check.yml` runs every `serve` and `serve-redis` test, and the fleet tests against a Redis, on the same triggers; `windows-check.yml` runs Windows. A change that touches shared code should pass all of them locally, including the Redis tests against a throwaway `redis:7-alpine`. A test that fails on CI and passes locally usually has a deadline under about 100 ms: widen it rather than rerun it.
+
 API keys: `~/.llmshim/config.toml` (via `llmshim configure`) or env vars `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `CEREBRAS_API_KEY`. Precedence: env vars > config file. Self-hosted servers are configured by **base URL** instead of a key: `VLLM_BASE_URL` / `SGLANG_BASE_URL` (each with an optional `VLLM_API_KEY` / `SGLANG_API_KEY`); the provider registers only when its base URL is set. Local vs remote is just the URL value.
 
 ## Architecture
