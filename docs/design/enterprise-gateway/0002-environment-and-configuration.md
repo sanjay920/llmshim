@@ -56,13 +56,13 @@ environment):
 | Distributed timeouts and retention (`LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS`, `_WORKER_JOB_TIMEOUT_MS`, `_ORIGIN_LEASE_MS`, `_RETAINED_*`, `_UNARY/STREAM_TERMINAL_BYTES`) | `DistributedGateway` | `Tuning::from_lookup`; `distributed_from_parts(DistributedParts)` |
 | Application assembly | proxy and gateway `app*` | `app_with_parts(state, origin_policy, deadlines, receipt_store)` |
 | Caller keys | `KeyStore` | the hashed store in 0003 |
+| `LLMSHIM_PENALTY_SECS` | `penalty_duration()` | `serve` sets `limits.penalty_secs` (default 5, 1 to 3600) on the gateway's `RealDispatch` and attempt coordinator, so it never falls back to the variable. The gateway and proxy still read it per upstream 429, unchanged. |
 | `LLMSHIM_TRUSTED_ORIGINS` | `OriginPolicy` | already had an env-free constructor, `from_csv`; `from_env` only handles the missing and non-Unicode cases. `from_csv("")` is an error, so `serve` uses `OriginPolicy::default()` for an empty list |
 
 Still read from the environment, to convert before `serve` can boot:
 
 | Setting | Where | Notes |
 |---|---|---|
-| `LLMSHIM_PENALTY_SECS` | `penalty_duration()` | Read on each upstream 429. |
 | `LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS` | `ReceiptExecutor::new` | Read once, when the receipt store is constructed (not per request), so the store `serve` builds still obeys an ambient value until `DefaultReceiptStore` takes the timeout as an argument. |
 | `LLMSHIM_GATEWAY_IDEMPOTENCY_TTL_SECS` | `distributed_from_env` | Single-instance mode carries it in `LocalParts`; the distributed path still reads it from the environment. |
 | `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`, `LLMSHIM_UPSTREAM_*`, `LLMSHIM_HTTP_*` | shared HTTP client | Process-wide, initialized once. Needs a per-router client before it can come from a file. |

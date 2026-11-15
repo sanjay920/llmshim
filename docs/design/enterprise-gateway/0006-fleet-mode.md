@@ -27,7 +27,7 @@ variables: every serve test starts the server with the gateway, rate-limit and
 fleet tuning variables set to values that would break it (a 1 ms Redis deadline,
 a 1 ms job deadline and lease, one retained job), and the fleet tests pass. The
 process-wide settings listed in 0002 (the shared HTTP client, the listener's
-limits, the penalty after a 429) are the exceptions, as for single-instance
+limits) are the exceptions, as for single-instance
 `serve`.
 
 **Start order.** The queue workers lease jobs from peers, so they start only

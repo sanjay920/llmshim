@@ -789,6 +789,9 @@ pub(crate) struct AttemptCoordinator {
     active_permits: Mutex<HashMap<uuid::Uuid, OwnedSemaphorePermit>>,
     /// Set at most once, before the first request.
     usage: std::sync::OnceLock<crate::gateway::usage::UsageRecorder>,
+    /// How long a bucket backs off after an upstream 429, when the file says.
+    /// Unset, `LLMSHIM_PENALTY_SECS` (or 5 s) applies, as it always has.
+    penalty: std::sync::OnceLock<Duration>,
 }
 
 impl AttemptCoordinator {
@@ -829,6 +832,7 @@ impl AttemptCoordinator {
             semaphores: Mutex::new(HashMap::new()),
             active_permits: Mutex::new(HashMap::new()),
             usage: std::sync::OnceLock::new(),
+            penalty: std::sync::OnceLock::new(),
         })
     }
 
@@ -869,6 +873,7 @@ impl AttemptCoordinator {
             semaphores: Mutex::new(HashMap::new()),
             active_permits: Mutex::new(HashMap::new()),
             usage: std::sync::OnceLock::new(),
+            penalty: std::sync::OnceLock::new(),
         }))
     }
 
@@ -905,6 +910,7 @@ impl AttemptCoordinator {
             semaphores: Mutex::new(HashMap::new()),
             active_permits: Mutex::new(HashMap::new()),
             usage: std::sync::OnceLock::new(),
+            penalty: std::sync::OnceLock::new(),
         })
     }
 
@@ -1018,6 +1024,17 @@ impl AttemptCoordinator {
         self.usage.get().is_some()
     }
 
+    /// Back buckets off for `penalty` after an upstream 429, in place of the
+    /// environment's value. Takes effect once.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn set_penalty(&self, penalty: Duration) {
+        let _ = self.penalty.set(penalty);
+    }
+
+    fn penalty(&self) -> Duration {
+        self.penalty.get().copied().unwrap_or_else(penalty_duration)
+    }
+
     pub(crate) fn set_usage_sink(&self, setup: crate::gateway::usage::UsageSetup) {
         let _ = self
             .usage
@@ -1109,7 +1126,7 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
                 AttemptEvent::ResponseHeaders { status: 429 } => self
                     .coordinator
                     .rates
-                    .penalize(attempt.provider_name(), penalty_duration())
+                    .penalize(attempt.provider_name(), self.coordinator.penalty())
                     .await
                     .map_err(|_| {
                         AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
@@ -1943,6 +1960,7 @@ mod tests {
             semaphores: Mutex::new(HashMap::new()),
             active_permits: Mutex::new(HashMap::new()),
             usage: std::sync::OnceLock::new(),
+            penalty: std::sync::OnceLock::new(),
         });
         let context = coordinator.context(scope("finish-timeout", None, None));
         let target = crate::reasoning::ReplayTarget::new(
