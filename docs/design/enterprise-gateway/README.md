@@ -160,13 +160,15 @@ Operability
   deadline, a TLS handshake inside 50 ms), and `proxy/mod.rs` (a first response
   inside 50 ms). Local load does not find them (four runs under twice the core
   count of busy loops passed): burn-in on the CI runners does.
-- **A stream whose heartbeat tick coincides with its total deadline can end as
-  `origin canceled` instead of a timeout.** The origin lease expires at the
-  deadline, so a tick that lands on it finds the origin gone. Both are errors at
+- **A stream that reaches its total deadline can end as `origin canceled`
+  instead of a timeout.** The origin lease expires at the deadline, so the
+  stream's own timer and the notice that the origin is gone race, and either can
+  win (a heartbeat tick on the deadline was one way to lose, not the only one:
+  moving the test's deadline off the tick still failed in CI). Both are errors at
   the deadline, in different classes: a timeout is reported as overload (with
-  `Retry-After`), `origin canceled` as a provider error. The test avoids the
-  coincidence; reporting a timeout when the deadline has passed is a separate
-  change to gateway code.
+  `Retry-After`), `origin canceled` as a provider error. The test accepts either;
+  reporting a timeout whenever the deadline has passed is a separate change to
+  gateway code.
 - **A Gemini response with thoughts but no `candidatesTokenCount` settles as
   incomplete.** Google omits a zero, so the absence there is the provider's
   zero, yet the counters stay marked incomplete and, under catalog authority,
