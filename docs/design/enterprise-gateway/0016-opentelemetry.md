@@ -132,9 +132,12 @@ is a later slice with its own transition note.
 
 ## Slices
 
-1. This note.
+1. This note. Done.
 2. `[telemetry]` in the config contract and `serve-otel` feature gating:
-   validation, the schema, `feature_issues`, `--check`; no exporter yet.
+   validation, the schema, `feature_issues`, `--check`; no exporter yet. Done:
+   until slice 3 the table is valid but refused at startup in every build (with
+   `serve-otel` the message says it is not implemented yet), so a file cannot say
+   traces leave when none do.
 3. The request span and propagation; the exporter; the bounded processor; the
    drop and failure counters in `/metrics`; an end-to-end test against a local
    OTLP/HTTP receiver, including a collector that is down and one that stalls.

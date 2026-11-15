@@ -125,6 +125,32 @@ pub struct ServeConfig {
     /// How a running server picks up changes to `keys`.
     #[serde(default)]
     pub reload: Reload,
+    /// Export traces to an OpenTelemetry collector (0016). Needs a binary built
+    /// with `--features serve-otel`.
+    #[serde(default)]
+    pub telemetry: Option<Telemetry>,
+}
+
+/// Where to send traces. Fixed at start: a change is refused by a reload.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Telemetry {
+    /// The collector's OTLP/HTTP address, `http://` or `https://` (plain http is
+    /// allowed: a collector on a private network or a sidecar often has no TLS).
+    pub otlp_endpoint: String,
+    /// The `service.name` resource attribute. Defaults to `llmshim`.
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// The fraction of new traces to record, 0 to 1, applied parent-based so a
+    /// caller's own decision is respected. Defaults to 1.
+    #[serde(default)]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub sample_ratio: Option<f64>,
+    /// Extra request headers for the collector (an authorization token, say), by
+    /// secret reference: the value is never written in the file.
+    #[serde(default, deserialize_with = "unique_map")]
+    pub headers: BTreeMap<String, SecretRef>,
 }
 
 /// Reloading `[[keys]]` without a restart.
@@ -717,6 +743,7 @@ impl ServeConfig {
         self.validate_limits(&mut issues);
         self.validate_state(&mut issues);
         self.validate_logging(&mut issues);
+        self.validate_telemetry(&mut issues);
         self.validate_keys(&mut issues);
         self.validate_tenant_limits(&mut issues);
         self.validate_routes(&mut issues);
@@ -938,6 +965,48 @@ impl ServeConfig {
                     "must differ from logging.access_log; two logs cannot share a file",
                 ));
             }
+        }
+    }
+
+    fn validate_telemetry(&self, issues: &mut Vec<Issue>) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        if let Err(reason) = validate_base_url(&telemetry.otlp_endpoint) {
+            issues.push(Issue::new("telemetry.otlp_endpoint", reason));
+        }
+        if let Some(name) = &telemetry.service_name {
+            if name.is_empty()
+                || name.len() > 128
+                || !name.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                issues.push(Issue::new(
+                    "telemetry.service_name",
+                    "must be 1 to 128 visible ASCII characters",
+                ));
+            }
+        }
+        if let Some(ratio) = telemetry.sample_ratio {
+            if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+                issues.push(Issue::new(
+                    "telemetry.sample_ratio",
+                    "must be a number from 0 to 1",
+                ));
+            }
+        }
+        for (name, secret) in &telemetry.headers {
+            let at = format!("telemetry.headers.{name}");
+            let token = !name.is_empty()
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte)
+                });
+            if !token {
+                issues.push(Issue::new(
+                    &at,
+                    "a header name is lower-case letters, digits, '-' or '_'",
+                ));
+            }
+            validate_secret(secret, &at, issues);
         }
     }
 
@@ -1216,7 +1285,18 @@ impl ServeConfig {
             .fleet
             .iter()
             .map(|fleet| ("fleet.redis_url".to_string(), &fleet.redis_url));
-        providers.chain(keys).chain(admin).chain(fleet).collect()
+        let telemetry = self.telemetry.iter().flat_map(|telemetry| {
+            telemetry
+                .headers
+                .iter()
+                .map(|(name, secret)| (format!("telemetry.headers.{name}"), secret))
+        });
+        providers
+            .chain(keys)
+            .chain(admin)
+            .chain(fleet)
+            .chain(telemetry)
+            .collect()
     }
 
     /// Settings this build cannot honour because a Cargo feature is off. Reported
@@ -1227,6 +1307,21 @@ impl ServeConfig {
             issues.push(Issue::new(
                 "fleet",
                 "fleet mode needs a binary built with --features serve-redis",
+            ));
+        }
+        if self.telemetry.is_some() {
+            // Until the exporter exists (0016, slice 3) the table is accepted by
+            // the contract but refused at startup, in either build: a setting
+            // that is parsed and then ignored would say traces are leaving when
+            // none are.
+            issues.push(Issue::new(
+                "telemetry",
+                if cfg!(feature = "serve-otel") {
+                    "trace export is designed (0016) but not implemented yet; remove [telemetry]"
+                } else {
+                    "trace export needs a binary built with --features serve-otel \
+                     (and is not implemented yet, 0016)"
+                },
             ));
         }
         issues
@@ -1714,6 +1809,11 @@ mod tests {
             ),
             ("reload", "[reload]\nwatch = false"),
             (
+                "telemetry",
+                "[telemetry]\notlp_endpoint = \"http://127.0.0.1:4318\"\nsample_ratio = 0.5\n\
+                 [telemetry.headers]\nauthorization = { file = \"/run/otlp\" }",
+            ),
+            (
                 "admin",
                 "[admin]\nport = 9090\ntoken = { env = \"ADMIN_TOKEN\" }",
             ),
@@ -1787,10 +1887,11 @@ mod tests {
             "keys",
             "routes",
             "reload",
+            "telemetry",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 11, "a new table needs a line here");
+        assert_eq!(properties.len(), 12, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
     }
 
@@ -2510,6 +2611,84 @@ mod tests {
         // With caller keys any address is allowed: the keys decide.
         let keyed = format!("{MINIMAL}\n[server]\nhost = \"0.0.0.0\"");
         assert!(issues(&keyed).is_empty(), "{:?}", issues(&keyed));
+    }
+
+    fn with_telemetry(extra: &str) -> String {
+        format!(
+            "{MINIMAL}\n[telemetry]\notlp_endpoint = \"https://collector.internal:4318\"\n{extra}"
+        )
+    }
+
+    #[test]
+    fn the_telemetry_table_is_validated_and_secrets_stay_references() {
+        let good = ServeConfig::parse(
+            &with_telemetry(
+                "service_name = \"edge\"\nsample_ratio = 0.25\n\
+                 [telemetry.headers]\nauthorization = { env = \"OTLP_AUTHORIZATION\" }",
+            ),
+            Format::Toml,
+        )
+        .unwrap();
+        let telemetry = good.telemetry.as_ref().unwrap();
+        assert_eq!(telemetry.sample_ratio, Some(0.25));
+        // The header is a secret reference like every other: checked for presence.
+        let missing = good.check_secrets_present(&|_| None);
+        assert!(
+            missing
+                .iter()
+                .any(|issue| issue.path == "telemetry.headers.authorization"),
+            "{missing:?}"
+        );
+        let present =
+            good.check_secrets_present(&|name| (name == "OTLP_AUTHORIZATION").then(|| "x".into()));
+        assert!(
+            !present
+                .iter()
+                .any(|issue| issue.path == "telemetry.headers.authorization"),
+            "{present:?}"
+        );
+        // Bad values name their setting.
+        for (bad, path) in [
+            ("sample_ratio = 1.5", "telemetry.sample_ratio"),
+            ("sample_ratio = -0.1", "telemetry.sample_ratio"),
+            ("service_name = \"\"", "telemetry.service_name"),
+            ("service_name = \"has space\"", "telemetry.service_name"),
+            (
+                "[telemetry.headers]\nAuthorization = { env = \"X\" }",
+                "telemetry.headers.Authorization",
+            ),
+            (
+                "[telemetry.headers]\nauthorization = \"Bearer pasted-inline\"",
+                "(file)",
+            ),
+            ("surprise = true", "(file)"),
+        ] {
+            let found = issues(&with_telemetry(bad));
+            assert!(has(&found, path), "{bad}: {found:?}");
+            assert!(
+                !found.iter().any(|line| line.contains("pasted-inline")),
+                "never echoed: {found:?}"
+            );
+        }
+        let bad_endpoint =
+            MINIMAL.to_string() + "\n[telemetry]\notlp_endpoint = \"collector:4318\"";
+        assert!(has(&issues(&bad_endpoint), "telemetry.otlp_endpoint"));
+        let missing_endpoint = MINIMAL.to_string() + "\n[telemetry]\nservice_name = \"x\"";
+        assert!(!issues(&missing_endpoint).is_empty());
+    }
+
+    #[test]
+    fn telemetry_is_refused_at_startup_until_the_exporter_exists() {
+        let config = ServeConfig::parse(&with_telemetry(""), Format::Toml).unwrap();
+        let found = config.feature_issues();
+        assert!(
+            found.iter().any(|issue| issue.path == "telemetry"),
+            "{found:?}"
+        );
+        assert!(ServeConfig::parse(MINIMAL, Format::Toml)
+            .unwrap()
+            .feature_issues()
+            .is_empty());
     }
 
     #[test]

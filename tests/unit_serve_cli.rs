@@ -311,6 +311,31 @@ surprise = true
     }
 
     #[test]
+    fn a_telemetry_table_is_refused_until_the_exporter_exists() {
+        // Accepted by the contract (the schema has it), refused at startup in every
+        // build, so a file cannot say traces leave when none do (0016).
+        let path = write(
+            "telemetry.toml",
+            &format!(
+                "{CONFIG}\n[telemetry]\notlp_endpoint = \"https://collector.internal:4318\"\n"
+            ),
+        );
+        for args in [
+            &["--check", "--structure-only"][..],
+            &["--check"][..],
+            &[][..],
+        ] {
+            let mut command = vec!["serve", "--config", path.to_str().unwrap()];
+            command.extend_from_slice(args);
+            let output = run(&command, &SECRETS);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(stderr.contains("telemetry:"), "{args:?}: {stderr}");
+            assert!(!stderr.contains("listening on"), "{args:?}: {stderr}");
+        }
+    }
+
+    #[test]
     fn structure_only_is_a_mode_of_check() {
         let path = write("mode.toml", CONFIG);
         let output = no_secrets(&[
