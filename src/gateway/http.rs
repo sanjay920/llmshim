@@ -876,10 +876,13 @@ async fn chat(
             &gw.payload,
         )
     });
-    let policy_scope = state
+    #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
+    let mut policy_scope = state
         .trusted_policy_scope(identity)
         .await
         .map_err(|error| gateway_err_to_api(&state, error))?;
+    #[cfg(feature = "serve")]
+    policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
     let prepared_submission = state
         .prepare_submission(gw, policy_scope, false)
         .map_err(|error| gateway_err_to_api(&state, error))?;
@@ -967,10 +970,13 @@ async fn chat_stream_inner(
             Err(e) => return e.into_response(),
         };
     let identity = identified_caller.identity;
-    let policy_scope = match state.trusted_policy_scope(&identity).await {
+    #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
+    let mut policy_scope = match state.trusted_policy_scope(&identity).await {
         Ok(scope) => scope,
         Err(error) => return gateway_err_to_api(&state, error).into_response(),
     };
+    #[cfg(feature = "serve")]
+    policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
     let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {
         Ok(prepared) => prepared,
         Err(error) => return gateway_err_to_api(&state, error).into_response(),
@@ -1074,22 +1080,52 @@ async fn stats(State(state): State<Arc<GatewayState>>) -> Json<Value> {
     Json(state.stats().await)
 }
 
-/// Ensure every request/response carries an `x-request-id` for correlation
-/// (honoring an incoming one, else minting a monotonic id).
-async fn request_id(mut req: Request, next: Next) -> Response {
+/// The id a request that sent none gets. Under `serve` it is
+/// `gw-<instance>-<n>`: `<instance>` is 12 random hex digits drawn once per
+/// process and `<n>` a per-process counter, so ids do not repeat across replicas
+/// or restarts. (`llmshim gateway` keeps `gw-<pid>-<n>`, which is unique within
+/// one process only: in a container the pid is often 1.)
+fn minted_request_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = req
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "serve")]
+    {
+        static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let instance =
+            INSTANCE.get_or_init(|| uuid::Uuid::new_v4().simple().to_string()[..12].into());
+        format!("gw-{instance}-{n}")
+    }
+    #[cfg(not(feature = "serve"))]
+    {
+        format!("gw-{}-{n}", std::process::id())
+    }
+}
+
+/// The request's id as the middleware settled it, for handlers.
+#[cfg(feature = "serve")]
+fn request_id_of(headers: &HeaderMap) -> Option<&str> {
+    headers.get("x-request-id").and_then(|v| v.to_str().ok())
+}
+
+/// Whether a caller's own `x-request-id` is kept: 1 to 128 visible ASCII
+/// characters. Anything else is replaced by a minted id, never echoed. (Only
+/// under `serve`; `llmshim gateway` keeps whatever header it was sent.)
+#[cfg(feature = "serve")]
+fn well_formed_request_id(id: &str) -> bool {
+    (1..=128).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+/// Ensure every request/response carries an `x-request-id` for correlation
+/// (honoring an incoming one, else minting a unique id).
+async fn request_id(mut req: Request, next: Next) -> Response {
+    let supplied = req
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            format!(
-                "gw-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            )
-        });
+        .map(str::to_string);
+    #[cfg(feature = "serve")]
+    let supplied = supplied.filter(|id| well_formed_request_id(id));
+    let id = supplied.unwrap_or_else(minted_request_id);
     if let Ok(hv) = HeaderValue::from_str(&id) {
         req.headers_mut().insert("x-request-id", hv.clone());
         let mut resp = next.run(req).await;
@@ -4600,5 +4636,108 @@ mod native_tests {
             }
             upstream.assert_async().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod request_id_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    /// Send one request through the request-id middleware and return the id on
+    /// the response and the id the handler saw.
+    async fn through(sent: Option<&[u8]>) -> (String, String) {
+        let app = axum::Router::new()
+            .route(
+                "/",
+                get(|headers: HeaderMap| async move {
+                    headers
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_owned()
+                }),
+            )
+            .layer(axum::middleware::from_fn(request_id));
+        let mut request = axum::http::Request::builder().uri("/");
+        if let Some(bytes) = sent {
+            request = request.header("x-request-id", HeaderValue::from_bytes(bytes).unwrap());
+        }
+        let response = app
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let on_response = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (on_response, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// `(instance, counter)` of `gw-<instance>-<counter>`.
+    #[cfg(feature = "serve")]
+    fn parts(id: &str) -> (String, u64) {
+        let (instance, counter) = id.strip_prefix("gw-").unwrap().split_once('-').unwrap();
+        (instance.to_owned(), counter.parse().unwrap())
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn minted_ids_carry_an_instance_so_replicas_and_restarts_do_not_repeat_them() {
+        let (first, seen) = through(None).await;
+        assert_eq!(first, seen, "the handler sees the id the response carries");
+        let (second, _) = through(None).await;
+        let ((instance_a, a), (instance_b, b)) = (parts(&first), parts(&second));
+        assert_eq!(instance_a.len(), 12, "{first}");
+        assert!(
+            instance_a.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{first}"
+        );
+        assert_eq!(instance_a, instance_b, "one process, one instance part");
+        assert!(b > a, "the counter advances: {first} then {second}");
+        // The pid is exactly what repeats across containers (it is often 1).
+        assert_ne!(instance_a, std::process::id().to_string());
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn a_callers_id_is_kept_only_when_it_is_well_formed() {
+        let long_enough = "a".repeat(128);
+        for kept in ["run-42.step-3:attempt-1", "x", long_enough.as_str()] {
+            let (on_response, seen) = through(Some(kept.as_bytes())).await;
+            assert_eq!(on_response, kept);
+            assert_eq!(seen, kept);
+        }
+        let too_long = "a".repeat(129);
+        for dropped in [
+            too_long.as_bytes(),
+            b"has a space",
+            b"has\ttab",
+            b"",
+            b"caf\xe9",
+        ] {
+            let (on_response, seen) = through(Some(dropped)).await;
+            assert!(
+                on_response.starts_with("gw-"),
+                "{dropped:?} -> {on_response}"
+            );
+            assert_eq!(on_response, seen);
+            assert_ne!(on_response.as_bytes(), dropped, "never echoed");
+        }
+    }
+
+    /// `llmshim gateway` is unchanged: the process-id form, and whatever header
+    /// it was sent.
+    #[cfg(not(feature = "serve"))]
+    #[tokio::test]
+    async fn the_gateway_keeps_its_process_id_form_and_honors_any_header() {
+        let (minted, _) = through(None).await;
+        let prefix = format!("gw-{}-", std::process::id());
+        assert!(minted.starts_with(&prefix), "{minted}");
+        let (kept, _) = through(Some(b"has a space")).await;
+        assert_eq!(kept, "has a space");
     }
 }

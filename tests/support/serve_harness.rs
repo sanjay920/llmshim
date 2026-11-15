@@ -169,6 +169,25 @@ pub async fn chat(server: &Server, key: Option<&str>, model: &str) -> reqwest::R
     request.send().await.unwrap()
 }
 
+/// A chat request that sends its own `x-request-id` (or none).
+pub async fn chat_with_request_id(
+    server: &Server,
+    key: Option<&str>,
+    model: &str,
+    request_id: Option<&str>,
+) -> reqwest::Response {
+    let mut request = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", server.base))
+        .json(&json!({"model": model, "messages": [{"role": "user", "content": "ping"}]}));
+    if let Some(key) = key {
+        request = request.bearer_auth(key);
+    }
+    if let Some(id) = request_id {
+        request = request.header("x-request-id", id);
+    }
+    request.send().await.unwrap()
+}
+
 /// Ask the server to reload its configuration, as an operator's `kill -HUP` does.
 #[cfg(unix)]
 pub fn hangup(server: &Server) {

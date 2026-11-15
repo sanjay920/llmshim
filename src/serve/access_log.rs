@@ -45,6 +45,9 @@ pub(crate) struct Record {
     pub status: Option<u16>,
     pub latency_ms: u64,
     pub tenant: Option<String>,
+    /// The name (`keys[].name`) of the caller key the credential belongs to.
+    /// `null` when the caller sent none or an unknown one.
+    pub key: Option<String>,
     pub credential: Option<String>,
 }
 
@@ -78,6 +81,7 @@ struct Pending {
     method: String,
     path: String,
     tenant: Option<String>,
+    key: Option<String>,
     credential: Option<String>,
     written: bool,
 }
@@ -94,6 +98,7 @@ impl Pending {
             status,
             latency_ms: self.started.elapsed().as_millis() as u64,
             tenant: self.tenant.take(),
+            key: self.key.take(),
             credential: self.credential.take(),
         });
     }
@@ -110,6 +115,7 @@ impl Drop for Pending {
 pub(crate) async fn record_request(
     log: Arc<JsonLines>,
     keys: Arc<KeyStore>,
+    names: crate::gateway::usage::KeyNames,
     request: Request,
     next: Next,
 ) -> Response {
@@ -122,12 +128,16 @@ pub(crate) async fn record_request(
     if crate::proxy::wire::native_route(&path).is_some() {
         crate::proxy::wire::normalize_auth(&mut headers);
     }
+    let caller = keys.identify_caller(&headers).ok();
     let mut pending = Pending {
         log,
         started: std::time::Instant::now(),
         method: request.method().to_string(),
         path: bounded(&path),
-        tenant: keys.identify(&headers).ok().map(|identity| identity.tenant),
+        tenant: caller.as_ref().map(|caller| caller.identity.tenant.clone()),
+        key: caller
+            .as_ref()
+            .and_then(|caller| names.name(&caller.credential_scope)),
         credential: fingerprint(&headers),
         written: false,
     };
@@ -190,12 +200,14 @@ mod tests {
             status: Some(401),
             latency_ms: 3,
             tenant: None,
+            key: None,
             credential: Some("0a1b2c3d".into()),
         };
         let line = serde_json::to_string(&record).unwrap();
         assert!(!line.contains('\n'));
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert!(value["tenant"].is_null() && value["request_id"].is_null());
+        assert!(value["key"].is_null());
         assert_eq!(value["status"], 401);
         assert_eq!(value["credential"], "0a1b2c3d");
     }
@@ -242,6 +254,15 @@ mod tests {
         )])))
     }
 
+    /// What the replica's configuration names: the one key, by its credential
+    /// scope (the digest of its token).
+    fn names() -> crate::gateway::usage::KeyNames {
+        crate::gateway::usage::KeyNames::new([(
+            format!("{:x}", Sha256::digest(TOKEN.as_bytes())),
+            "checkout-service".to_string(),
+        )])
+    }
+
     fn app(log: Arc<JsonLines>) -> axum::Router {
         use axum::routing::{get, post};
         let keys = store();
@@ -257,7 +278,8 @@ mod tests {
             .layer(axum::middleware::from_fn(move |request, next| {
                 let log = log.clone();
                 let keys = keys.clone();
-                async move { record_request(log, keys, request, next).await }
+                let names = names();
+                async move { record_request(log, keys, names, request, next).await }
             }))
     }
 
@@ -312,6 +334,11 @@ mod tests {
         assert_eq!(lines[1]["tenant"], "payments", "{lines:?}");
         assert!(lines[2]["tenant"].is_null() && lines[2]["credential"].is_string());
         assert!(lines[3]["tenant"].is_null() && lines[3]["credential"].is_null());
+        // The key is named beside the tenant; an unknown or absent credential
+        // names no key.
+        assert_eq!(lines[0]["key"], "checkout-service", "{lines:?}");
+        assert_eq!(lines[1]["key"], "checkout-service", "{lines:?}");
+        assert!(lines[2]["key"].is_null() && lines[3]["key"].is_null());
     }
 
     #[tokio::test]

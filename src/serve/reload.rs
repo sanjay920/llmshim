@@ -23,7 +23,7 @@
 use super::config::{Format, Issue, ServeConfig};
 use super::keys::build_key_store;
 use crate::gateway::auth::LiveKeys;
-use crate::gateway::usage::TenantNames;
+use crate::gateway::usage::{KeyNames, TenantNames};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -38,14 +38,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct ReloadHandles {
     pub(crate) keys: LiveKeys,
     pub(crate) tenants: TenantNames,
+    pub(crate) key_names: KeyNames,
     pub(crate) status: StatusHandle,
 }
 
 impl ReloadHandles {
-    pub(crate) fn new(keys: LiveKeys, tenants: TenantNames) -> Self {
+    pub(crate) fn new(keys: LiveKeys, tenants: TenantNames, key_names: KeyNames) -> Self {
         Self {
             keys,
             tenants,
+            key_names,
             status: StatusHandle::default(),
         }
     }
@@ -359,10 +361,13 @@ impl Reloader {
         active.pending = None;
         let credentials = store.credential_count();
         // Names first: a request admitted under the new keys must find its
-        // tenant's name already resolvable.
+        // tenant's and its key's name already resolvable.
         self.handles
             .tenants
             .add(loaded.config.keys.iter().map(|key| key.tenant.clone()));
+        self.handles
+            .key_names
+            .add(super::keys::key_names(&loaded.config, env));
         self.handles.keys.replace(store);
         active.fingerprint = fingerprint;
         let generation = self.handles.status.snapshot().generation + 1;
@@ -506,11 +511,12 @@ mod tests {
             let store = build_key_store(&loaded.config, &env).unwrap();
             let keys = LiveKeys::new(store);
             let tenants = TenantNames::new(loaded.config.keys.iter().map(|k| k.tenant.clone()));
+            let key_names = KeyNames::new(crate::serve::keys::key_names(&loaded.config, &env));
             let reloader = Reloader::new(
                 &file,
                 &loaded.text,
                 loaded.format,
-                ReloadHandles::new(keys.clone(), tenants),
+                ReloadHandles::new(keys.clone(), tenants, key_names),
             )
             .unwrap();
             Self {
@@ -853,6 +859,22 @@ mod tests {
         assert_eq!(tenants.name(&hash("globex")).as_deref(), Some("globex"));
         // The tenant the reload removed is still named, for attempts in flight.
         assert_eq!(tenants.name(&hash("acme")).as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn a_reload_makes_new_keys_nameable_and_forgets_none() {
+        let initial = text("", &key("a", "acme", OLD, ""));
+        let fixture = Fixture::new(&initial);
+        let names = fixture.reloader.handles.key_names.clone();
+        let (old_scope, new_scope) = (digest(OLD), digest(NEW));
+        assert_eq!(names.name(&old_scope).as_deref(), Some("a"));
+        assert!(names.name(&new_scope).is_none());
+        fixture.write(&text("", &key("b", "globex", NEW, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        // The new key is named before a request under it can be logged, and the
+        // key the reload revoked is still named, for attempts already in flight.
+        assert_eq!(names.name(&new_scope).as_deref(), Some("b"));
+        assert_eq!(names.name(&old_scope).as_deref(), Some("a"));
     }
 
     #[test]

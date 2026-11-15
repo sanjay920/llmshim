@@ -13,7 +13,7 @@ One JSON line per provider **attempt**, when the attempt ends:
 
 ```json
 {"event":"usage","ts":"2026-11-13T10:15:30.870Z","attempt_id":"6f1c…","tenant":"payments",
- "provider":"openai","model":"gpt-6-luna","kind":"completion","outcome":"completed",
+ "key":"checkout","request_id":"gw-3f9a1c0b7e42-12","provider":"openai","model":"gpt-6-luna","kind":"completion","outcome":"completed",
  "http_status":null,"duration_ms":812,"input_tokens":1000,"output_tokens":500,
  "reasoning_tokens":null,"uncached_input_tokens":1000,"cache_read_tokens":0,
  "cache_write_tokens":0,"cost_usd":0.00035,"cost_source":"catalog","usage_reported":true}
@@ -21,6 +21,17 @@ One JSON line per provider **attempt**, when the attempt ends:
 
 `outcome` is `completed`, `http_failure` (with `http_status`),
 `transport_failure`, `invalid_response`, `stream_failure` or `abandoned`.
+
+Who and which request:
+
+- `tenant` and `key` name the caller: the tenant it belongs to and the key
+  (`keys[].name`) it authenticated with, for per-key chargeback. Either is `null`
+  when this replica's configuration does not name it.
+- `request_id` is the request's id: the `request_id` of its line in the access
+  log (0009), whether the caller sent its own or the gateway minted one. Every
+  attempt of a request (a retry, a repair, a fallback) carries the same id, so
+  the attempts of one request group by it, and a caller that sends its own id per
+  run can total the cost of that run. `null` for a job that carries none.
 
 Token fields, for chargeback:
 
@@ -49,8 +60,7 @@ The gateway already meters every provider send to enforce spend caps, and the
 unit of that metering is the attempt. A retry, a schema repair and a fallback
 are each a separate send, so each is a separate record. Summing `cost_usd` per
 tenant gives what the tenant caused the gateway to spend, including the part
-that failed over. A request's attempts share a tenant and are close in time;
-they are not yet joined by request id (see below).
+that failed over. A request's attempts share a `request_id`, so they group by it.
 
 `cost_usd` follows the gateway's accounting rule everywhere: **`null` is
 unknown, never free**. A failed attempt that reported no usage has a `null`
@@ -80,11 +90,18 @@ A test replays the ledger's own sequence (80, 80, then 15) against the record.
   refused attempt was never sent, costs nothing and produces no record. A
   finish followed by a drop notification produces one record, not two. At most
   the latest snapshot of each attempt in flight is held.
-- **The tenant's name does not travel with the job.** The policy scope that
+- **Names do not travel with the job.** The policy scope that
   crosses Redis in a fleet carries only a SHA-256 of the tenant, and the
   gateway's tests assert that a tenant's name never appears in a job descriptor:
-  names are kept out of shared storage on purpose. Usage records therefore get
-  the name locally. Each replica hashes the tenants in its own configuration
+  names are kept out of shared storage on purpose. The key is handled the same
+  way: `serve` adds two optional fields to the scope, the credential's digest
+  (the SHA-256 of its token, or of `mtls:<name>` for a certificate workload,
+  which already scopes that credential's state in Redis) and the request id, and
+  never the key's name. A replica names the key from a table of its own
+  configuration, keyed by that digest. Both fields are skipped when absent, so
+  a build that does not set them writes the scope it always wrote, and a job
+  queued by an older replica records `key: null` and `request_id: null`.
+  Usage records therefore get the names locally. Each replica hashes the tenants in its own configuration
   and looks the scope's hash up. Replicas of one fleet share a configuration, so
   they agree, and nothing in the job format changes, so a fleet upgrades in
   place with no compatibility window. A tenant a replica's configuration does
@@ -122,17 +139,18 @@ catalog, attributed to the key's tenant, with no secret, prompt or completion in
 the file; an upstream that always fails yields one `http_failure` record per
 send (a retry is two), each with a null cost; and in fleet mode, with every
 request entering replica A, both replicas dispatch work and **every record names
-the tenant**, including those written by replica B.
+the tenant and the key**, and carries the id the caller saw on its response,
+including those written by replica B; and one request id joins a response, its
+access-log line and its usage record, for a caller's own id, a minted one, and a
+malformed one that was replaced.
 
 ## Not done
 
-- **Joining a request's attempts by request id.** The scope is built from the
-  caller's identity; carrying a request id would extend the job format. It is a
-  small follow-up if grouping the attempts of one request matters more than
-  per-tenant totals.
-- **The API key's name** (not just the tenant) on a record, for per-key
-  chargeback. The same local resolution would work, keyed by the credential's
-  digest, if the scope carried it.
+- **The access-log line of an abandoned request has no `request_id`** (the
+  request is dropped before the middleware that sets it has answered), though the
+  usage record of an attempt that was admitted does.
+- **The trace.** The request id joins the response, the access log and the usage
+  records; the trace joins with OpenTelemetry.
 - **Delivery guarantees.** A record is queued and written best effort. A crash
   between the provider's response and the write loses it, a closed pipe or a
   full queue drops it (counted, not silent). Exact billing reconciliation should use the provider's invoice; this

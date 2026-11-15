@@ -6,7 +6,8 @@
 mod harness;
 
 use harness::{
-    chat, completion, config, run_to_exit, start, tempdir, ADMIN_TOKEN, CALLER_KEY, UPSTREAM_KEY,
+    chat, chat_with_request_id, completion, config, run_to_exit, start, tempdir, ADMIN_TOKEN,
+    CALLER_KEY, UPSTREAM_KEY,
 };
 use serde_json::{json, Value};
 
@@ -462,6 +463,7 @@ async fn the_access_log_attributes_each_request_without_recording_a_secret() {
     assert_eq!(accepted["method"], "POST");
     assert_eq!(accepted["path"], "/v1/chat/completions");
     assert_eq!(accepted["tenant"], "platform");
+    assert_eq!(accepted["key"], "ci", "the key is named beside the tenant");
     assert_eq!(accepted["credential"], fingerprint(CALLER_KEY));
     assert!(accepted["request_id"]
         .as_str()
@@ -472,6 +474,7 @@ async fn the_access_log_attributes_each_request_without_recording_a_secret() {
     let refused = &lines[1];
     assert_eq!(refused["status"], 401);
     assert!(refused["tenant"].is_null(), "an unknown key has no tenant");
+    assert!(refused["key"].is_null(), "and names no key");
     assert_eq!(refused["credential"], fingerprint(wrong));
     assert!(lines[2]["credential"].is_null() && lines[2]["tenant"].is_null());
 
@@ -642,6 +645,78 @@ async fn the_usage_log_attributes_tokens_and_cost_to_the_tenant() {
     let raw = std::fs::read_to_string(&usage_path).unwrap();
     for secret in [CALLER_KEY, UPSTREAM_KEY, "ping", "pong"] {
         assert!(!raw.contains(secret), "{secret} leaked into the usage log");
+    }
+}
+
+/// `(instance, counter)` of an id the gateway minted: `gw-<12 hex>-<n>`.
+fn minted(id: &str) -> Option<(&str, u64)> {
+    let (instance, counter) = id.strip_prefix("gw-")?.split_once('-')?;
+    (instance.len() == 12 && instance.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(())?;
+    Some((instance, counter.parse().ok()?))
+}
+
+#[tokio::test]
+async fn one_request_id_joins_the_response_the_access_line_and_the_usage_record() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/responses")
+        .with_header("content-type", "application/json")
+        .with_body(responses_body("pong", 10, 5))
+        .expect(3)
+        .create_async()
+        .await;
+    let dir = tempdir::Dir::new("request-id");
+    let access_path = dir.0.join("access.jsonl");
+    let usage_path = dir.0.join("usage.jsonl");
+    let extra = format!(
+        "[logging]\naccess_log = \"{}\"\nusage_log = \"{}\"",
+        access_path.display(),
+        usage_path.display()
+    );
+    let server = start(&priced_config(&upstream.url(), &extra), "request-id", &[]);
+
+    // A caller's own well-formed id, none at all, and one that is not well formed
+    // (it has a space in it).
+    let supplied = "run-42.step-3:attempt-1";
+    let mut ids = Vec::new();
+    for sent in [Some(supplied), None, Some("not well formed")] {
+        let response =
+            chat_with_request_id(&server, Some(CALLER_KEY), "openai/gpt-6-luna", sent).await;
+        assert_eq!(response.status(), 200);
+        ids.push(
+            response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    assert_eq!(ids[0], supplied, "a well-formed id is the caller's own");
+    assert!(
+        minted(&ids[1]).is_some(),
+        "none sent: minted, got {}",
+        ids[1]
+    );
+    assert!(
+        minted(&ids[2]).is_some(),
+        "a malformed id is replaced, never echoed: {}",
+        ids[2]
+    );
+    let (first, second) = (minted(&ids[1]).unwrap(), minted(&ids[2]).unwrap());
+    assert_eq!(first.0, second.0, "one process, one instance part");
+    assert_ne!(first.1, second.1, "and a different counter");
+
+    // The same id in the access line and in the request's usage record, and the
+    // key's name in both.
+    let access = access_lines(&access_path, 3);
+    let usage = access_lines(&usage_path, 3);
+    assert_eq!(access.len(), 3, "{access:#?}");
+    assert_eq!(usage.len(), 3, "{usage:#?}");
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(access[index]["request_id"], id.as_str(), "access {index}");
+        assert_eq!(usage[index]["request_id"], id.as_str(), "usage {index}");
+        assert_eq!(access[index]["key"], "ci");
+        assert_eq!(usage[index]["key"], "ci");
+        assert_eq!(usage[index]["tenant"], "platform");
     }
 }
 

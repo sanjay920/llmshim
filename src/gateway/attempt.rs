@@ -52,6 +52,15 @@ pub(crate) struct TrustedPolicyScope {
     budget: Option<crate::gateway::budget::BudgetPolicySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_spend_floor: Option<LegacySpendFloor>,
+    /// The credential the request authenticated with, as the digest that scopes
+    /// its state. It lets the replica that dispatches the job name the key from
+    /// its own configuration; the name itself is never in the scope. Set only by
+    /// `serve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential: Option<String>,
+    /// The request's id, for the usage record. Set only by `serve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -69,7 +78,16 @@ impl TrustedPolicyScope {
             tpm: identity.tpm,
             budget: crate::gateway::budget::BudgetPolicySnapshot::from_identity(identity),
             legacy_spend_floor: None,
+            credential: None,
+            request_id: None,
         }
+    }
+
+    /// Record who made the request and under which id, for the usage record.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn attribute(&mut self, credential: &str, request_id: Option<&str>) {
+        self.credential = Some(credential.to_owned());
+        self.request_id = request_id.map(str::to_owned);
     }
 
     #[cfg(feature = "redis-coordination")]
@@ -957,7 +975,12 @@ impl AttemptCoordinator {
                     .unwrap()
                     .insert(attempt.identity().id(), permit);
                 if let Some(recorder) = self.usage.get() {
-                    recorder.begin(attempt.identity(), &scope.tenant_key);
+                    recorder.begin(
+                        attempt.identity(),
+                        &scope.tenant_key,
+                        scope.credential.as_deref(),
+                        scope.request_id.as_deref(),
+                    );
                 }
                 Ok(())
             }
@@ -1897,6 +1920,8 @@ mod tests {
             tpm,
             budget: None,
             legacy_spend_floor: None,
+            credential: None,
+            request_id: None,
         }
     }
 
@@ -1951,6 +1976,8 @@ mod tests {
                 valid: true,
             }),
             legacy_spend_floor: None,
+            credential: None,
+            request_id: None,
         }
     }
 
@@ -4481,6 +4508,10 @@ mod usage_records {
             tenants: crate::gateway::usage::TenantNames::new(
                 KNOWN.iter().map(|tenant| tenant.to_string()),
             ),
+            keys: crate::gateway::usage::KeyNames::new([(
+                "known-credential".to_string(),
+                "checkout".to_string(),
+            )]),
         });
         (coordinator, collected)
     }
@@ -4496,6 +4527,8 @@ mod usage_records {
             tpm: None,
             budget: None,
             legacy_spend_floor: None,
+            credential: None,
+            request_id: None,
         }
     }
 
@@ -4574,6 +4607,59 @@ mod usage_records {
         assert_eq!(record.cost_source.as_deref(), Some("catalog"));
         assert!(record.usage_reported);
         assert_eq!(coordinator.usage.get().unwrap().in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_record_names_the_key_and_carries_the_request_id_from_the_scope() {
+        let (coordinator, collected) = coordinator();
+        // A credential this replica's configuration names, one it does not
+        // (another replica's key, or a reload not seen yet), and a job with no
+        // attribution at all (an older replica queued it).
+        for (credential, request_id, key) in [
+            (
+                Some("known-credential"),
+                Some("run-7.step-2"),
+                Some("checkout"),
+            ),
+            (Some("not-in-this-replicas-config"), Some("req-8"), None),
+            (None, None, None),
+        ] {
+            let mut scope = scope(Some("payments"), None);
+            if let Some(credential) = credential {
+                scope.attribute(credential, request_id);
+            }
+            let mut tracker = admit(&coordinator, scope, AttemptKind::Completion)
+                .await
+                .unwrap();
+            tracker.finish(done()).await.unwrap();
+            drop(tracker);
+            let records = collected.0.lock().unwrap();
+            let record = records.last().unwrap();
+            assert_eq!(record.key.as_deref(), key, "{credential:?}");
+            assert_eq!(record.request_id.as_deref(), request_id, "{credential:?}");
+            assert_eq!(record.tenant.as_deref(), Some("payments"));
+        }
+    }
+
+    #[test]
+    fn the_scope_gains_attribution_without_changing_what_other_builds_send() {
+        // Nothing attributed: neither field is written, so a job queued by a
+        // build that never attributes is byte-for-byte what it always was, and a
+        // scope written before the fields existed still reads.
+        let plain = serde_json::to_value(scope(Some("payments"), None)).unwrap();
+        assert!(plain.get("credential").is_none() && plain.get("request_id").is_none());
+        let old: TrustedPolicyScope =
+            serde_json::from_value(json!({"tenant_key": "h", "rpm": 1, "tpm": 10})).unwrap();
+        assert!(old.credential.is_none() && old.request_id.is_none());
+        // Attributed: the digest and the id travel, and the key's name does not.
+        let mut attributed = scope(Some("payments"), None);
+        attributed.attribute("known-credential", Some("req-1"));
+        let text = serde_json::to_string(&attributed).unwrap();
+        assert!(text.contains("known-credential") && text.contains("req-1"));
+        assert!(!text.contains("checkout"), "names stay out of the scope");
+        let back: TrustedPolicyScope = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.credential.as_deref(), Some("known-credential"));
+        assert_eq!(back.request_id.as_deref(), Some("req-1"));
     }
 
     /// The usage a provider that reports its own charge would send.

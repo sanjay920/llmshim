@@ -198,10 +198,17 @@ async fn usage_records_name_the_tenant_whichever_replica_dispatches() {
     // Keep going until both have dispatched at least one, which they do within a
     // handful of requests (they split evenly in practice).
     let mut sent = 0;
+    let mut ids = Vec::new();
     let (mut from_a, mut from_b) = (Vec::new(), Vec::new());
     while sent < 40 && (from_a.is_empty() || from_b.is_empty()) {
         let response = chat(&a, Some(CALLER_KEY), &names.model()).await;
         assert_eq!(response.status(), 200);
+        ids.push(
+            response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
         sent += 1;
         (from_a, from_b) = (read("a"), read("b"));
     }
@@ -216,8 +223,21 @@ async fn usage_records_name_the_tenant_whichever_replica_dispatches() {
     assert_eq!(from_a.len() + from_b.len(), sent);
     for record in from_a.iter().chain(&from_b) {
         assert_eq!(record["tenant"], names.tenant.as_str(), "{record}");
+        // The key is named too, from each replica's own configuration: the job
+        // carried the credential's digest through Redis, never the name.
+        assert_eq!(record["key"], "ci", "{record}");
         assert_eq!(record["provider"], names.provider.as_str());
         assert_eq!(record["outcome"], "completed");
     }
+    // The id the caller saw on its response, on the record of the replica that
+    // dispatched it, whichever replica that was. Replica A minted every one.
+    let mut recorded: Vec<String> = from_a
+        .iter()
+        .chain(&from_b)
+        .map(|record| record["request_id"].as_str().unwrap().to_owned())
+        .collect();
+    recorded.sort();
+    ids.sort();
+    assert_eq!(recorded, ids);
     drop((a, b));
 }

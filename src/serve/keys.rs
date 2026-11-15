@@ -143,6 +143,42 @@ pub fn build_key_store(
     }
 }
 
+/// The credential scope of each configured key, with the key's name: what a
+/// policy scope carries (the digest that scopes the credential's state) and what
+/// a replica needs to name the key in a log line. A token key's scope is the
+/// SHA-256 of its token; a certificate workload's is the SHA-256 of
+/// `mtls:<name>`, in a space tokens cannot reach (see `KeyStore::identify_caller`).
+///
+/// Best effort: a key whose secret cannot be read is left out here, because
+/// `build_key_store` reports it. The names are labels, never permissions.
+pub fn key_names(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    config
+        .keys
+        .iter()
+        .filter_map(|key| {
+            let scope = if let Some(san) = &key.client_san {
+                format!(
+                    "{:x}",
+                    Sha256::digest(format!("mtls:{}", super::config::canonical_san(san)))
+                )
+            } else {
+                match (&key.secret, &key.sha256) {
+                    (Some(secret), None) => {
+                        let token = read_secret(secret, env).ok()?;
+                        format!("{:x}", Sha256::digest(token.as_bytes()))
+                    }
+                    (None, Some(digest)) => digest.clone(),
+                    _ => return None,
+                }
+            };
+            Some((scope, key.name.clone()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +302,75 @@ mod tests {
         assert!(build_key_store(&config(""), &env_with(twenty_one)).is_err());
         let store = build_key_store(&config(""), &env_with(twenty_two)).unwrap();
         assert!(store.identify(&bearer(twenty_two)).is_ok());
+    }
+
+    #[test]
+    fn the_names_table_resolves_what_the_store_reports_for_every_kind_of_key() {
+        // A token key, a key held only as a digest, and a certificate workload:
+        // each name must be found under the credential scope the store itself
+        // reports for that caller, or a log line would name the wrong key or none.
+        let digest = format!("{:x}", Sha256::digest(b"batch-token-0123456789"));
+        let text = format!(
+            r#"
+            version = 1
+            [server.tls]
+            cert_file = "/etc/tls/server.pem"
+            key_file = "/etc/tls/server.key"
+            client_ca_file = "/etc/tls/clients.pem"
+            [providers.openai]
+            kind = "openai"
+            api_key = {{ env = "UPSTREAM_KEY" }}
+            [[keys]]
+            name = "ci"
+            tenant = "platform"
+            secret = {{ env = "CI_KEY" }}
+            [[keys]]
+            name = "batch"
+            tenant = "analytics"
+            sha256 = "{digest}"
+            [[keys]]
+            name = "checkout-workload"
+            tenant = "payments"
+            client_san = "uri:spiffe://corp/payments/checkout"
+            "#
+        );
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        let env = env_with(TOKEN);
+        let store = build_key_store(&config, &env).unwrap();
+        let names = crate::gateway::usage::KeyNames::new(key_names(&config, &env));
+
+        let by_token = store.identify_caller(&bearer(TOKEN)).unwrap();
+        assert_eq!(
+            names.name(&by_token.credential_scope).as_deref(),
+            Some("ci")
+        );
+        let by_digest = store
+            .identify_caller(&bearer("batch-token-0123456789"))
+            .unwrap();
+        assert_eq!(
+            names.name(&by_digest.credential_scope).as_deref(),
+            Some("batch")
+        );
+        let mut peer = HeaderMap::new();
+        peer.insert(
+            crate::gateway::auth::PEER_SAN_HEADER,
+            HeaderValue::from_static("uri:spiffe://corp/payments/checkout"),
+        );
+        let by_certificate = store.identify_caller(&peer).unwrap();
+        assert_eq!(
+            names.name(&by_certificate.credential_scope).as_deref(),
+            Some("checkout-workload")
+        );
+        // Three keys, three scopes, and an unknown credential names nothing.
+        assert_eq!(key_names(&config, &env).len(), 3);
+        assert_eq!(names.name("not-a-credential-scope"), None);
+    }
+
+    #[test]
+    fn a_key_whose_secret_cannot_be_read_is_left_out_of_the_names() {
+        // build_key_store reports it; the table is best effort.
+        let config = config("");
+        assert!(key_names(&config, &|_| None).is_empty());
     }
 
     #[test]
