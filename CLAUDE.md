@@ -65,6 +65,13 @@ their prompt total already includes the cache read (Anthropic's excludes it,
 OpenAI/Chat Completions/Gemini include it), and only the transport boundary
 still knows which convention the body used. The convention is read off the
 cache-read field that actually matched, never a provider-name table.
+Gemini's `thoughtsTokenCount` is output: `usage::google_completion_tokens`
+folds it into `completion_tokens` for the response, the stream chunk and the
+native accounting path alike, and it is also reported as `reasoning_tokens`, a
+subset of `completion_tokens` that is never added to it, so the spend ledger,
+caps and usage records price thinking once. Vertex's Gemini transport shares the
+wire and changes with it; an `AttemptPolicy::observe_usage` implementation that
+added `thoughtsTokenCount` itself would now count it twice.
 
 ### USD cost accounting
 

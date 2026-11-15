@@ -287,23 +287,15 @@ fn translate_tool_choice(tc: &Value) -> Option<Value> {
 
 // -- Response transformation helpers --
 
-fn normalized_gemini_usage(usage: &Value) -> Value {
-    // Google reports thinking as `thoughtsTokenCount`, separate from
-    // `candidatesTokenCount`, and bills it as output. The normalized convention
-    // here matches the OpenAI Responses and Anthropic wires: reasoning is a
-    // subset of `completion_tokens`, so fold the thoughts in and expose them as
-    // reasoning tokens too. `totalTokenCount` already includes them.
-    let candidates = usage
-        .get("candidatesTokenCount")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let thoughts = usage
-        .get("thoughtsTokenCount")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+pub(crate) fn normalized_gemini_usage(usage: &Value) -> Value {
+    // The thoughts are folded into the completion count and also exposed as
+    // reasoning tokens; `usage::google_completion_tokens` defines that once for
+    // this response and for the native accounting path. `totalTokenCount`
+    // already includes them.
+    let (completion, thoughts) = crate::usage::google_completion_tokens(usage);
     let mut result = json!({
         "prompt_tokens": usage.get("promptTokenCount").cloned().unwrap_or(json!(0)),
-        "completion_tokens": candidates.saturating_add(thoughts),
+        "completion_tokens": completion,
         "total_tokens": usage.get("totalTokenCount").cloned().unwrap_or(json!(0)),
     });
     if thoughts > 0 {

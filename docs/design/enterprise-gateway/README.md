@@ -166,11 +166,18 @@ Operability
   `Retry-After`), `origin canceled` as a provider error. The test avoids the
   coincidence; reporting a timeout when the deadline has passed is a separate
   change to gateway code.
-- **Gemini thinking tokens are left out of the normalized completion count** on
-  the native path (`usage::normalize_native_usage`), while the non-streaming
-  response folds them in. The spend ledger, the cap and the usage records all use
-  the smaller figure. It is a fix to shared accounting, so it belongs in its own
-  change with its own tests.
+- **A Gemini response with thoughts but no `candidatesTokenCount` settles as
+  incomplete.** Google omits a zero, so the absence there is the provider's
+  zero, yet the counters stay marked incomplete and, under catalog authority,
+  the ledger keeps the reservation instead of the observed figure. Treating the
+  missing count as zero when the response's own `totalTokenCount` reconciles
+  (prompt plus thoughts equals the total) is a separate change to shared
+  accounting with its own tests.
+- **A Gemini reservation is an upper bound only if Google's output cap covers
+  thinking.** The quote is the larger of the output cap (or the catalog's) and
+  the thinking budget; a request that sets only a thinking level declares no
+  budget. Settlement above the reserved liability raises it, so a quote that is
+  too low is corrected rather than missed, but nothing pins the assumption.
 - **A tag is not tied to `ci.yml`.** The release workflow still runs only fmt,
   clippy and `cargo test --workspace --features proxy --tests`, plus the Windows
   check. Making it wait for a green `ci.yml` on the tagged commit, and adding

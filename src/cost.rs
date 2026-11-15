@@ -344,6 +344,29 @@ mod tests {
     }
 
     #[test]
+    fn gemini_thinking_is_priced_as_output_on_the_native_path() {
+        // 1M prompt tokens, 100k answer tokens and 400k thinking tokens. Google
+        // bills the thinking as output, so 500k output tokens are charged:
+        // 1M × $3 + 500k × $15 = $10.50. Counting only the answer gave $4.50.
+        let target = crate::reasoning::ReplayTarget::new(
+            "gemini",
+            "gemini-test",
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+        );
+        let observation = crate::usage::normalize_native_response_usage_observation(
+            &target,
+            &json!({"usageMetadata": {
+                "promptTokenCount": 1_000_000,
+                "candidatesTokenCount": 100_000,
+                "thoughtsTokenCount": 400_000,
+                "totalTokenCount": 1_500_000
+            }}),
+        )
+        .expect("usage");
+        close(price(&observation.usage, &priced()), 10.5);
+    }
+
+    #[test]
     fn an_unreported_usage_object_is_unknown_not_free() {
         // A provider that reported nothing leaves every counter at zero. That
         // is missing data, not a free response.

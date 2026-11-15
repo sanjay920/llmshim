@@ -457,6 +457,50 @@ async fn record_gemini_stream(events: Vec<Value>) -> Vec<RecordedEvent> {
 }
 
 #[tokio::test]
+async fn gemini_thinking_is_output_in_the_terminal_usage_a_policy_and_the_ledger_read() {
+    // 1M prompt tokens, 100k answer tokens and 400k thinking tokens. Google bills
+    // the thinking as output, so 500k output tokens are what the ledger settles.
+    let events = record_gemini_stream(vec![json!({
+        "candidates": [{"index": 0, "finishReason": "STOP", "content": {"parts": []}}],
+        "usageMetadata": {
+            "promptTokenCount": 1_000_000,
+            "candidatesTokenCount": 100_000,
+            "thoughtsTokenCount": 400_000,
+            "totalTokenCount": 1_500_000
+        }
+    })])
+    .await;
+    let (usage, counters_complete, explicit_zero) = events
+        .iter()
+        .find_map(|event| match event {
+            RecordedEvent::Usage {
+                usage,
+                terminal: true,
+                counters_complete,
+                explicit_zero,
+                ..
+            } => Some((usage.clone(), *counters_complete, *explicit_zero)),
+            _ => None,
+        })
+        .expect("a terminal usage event");
+    assert_eq!(usage["completion_tokens"], 500_000, "{usage}");
+    assert_eq!(usage["reasoning_tokens"], 400_000, "{usage}");
+    assert_eq!(usage["prompt_tokens"], 1_000_000, "{usage}");
+    assert!(counters_complete && !explicit_zero);
+
+    // The cost stamped on that usage is for the 500k output tokens, not the
+    // 100k that were counted before thinking was folded in.
+    let rates = llmshim::cost::for_target("gemini", "gemini-3.8-flash")
+        .expect("gemini-3.8-flash is priced in the catalog");
+    let expected = rates.input.expect("input rate") + 0.5 * rates.output.expect("output rate");
+    let stamped = usage["cost_usd"].as_f64().expect("a stamped cost");
+    assert!(
+        (stamped - expected).abs() < 1e-9,
+        "expected {expected}, stamped {stamped}"
+    );
+}
+
+#[tokio::test]
 async fn retained_state_failure_observes_current_usage_before_stream_failure() {
     let mut server = mockito::Server::new_async().await;
     let body = format!(
