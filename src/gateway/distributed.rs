@@ -3039,8 +3039,9 @@ mod tests {
             let _: Result<i64, _> = conn.del(k).await;
         }
         // With the variable set the caller asked for a Redis run: a gateway that
-        // cannot connect fails the test instead of skipping it, so an outage
-        // cannot turn a CI job green with nothing exercised.
+        // is refused fails the test instead of skipping it, so a Redis that is
+        // up but unusable cannot turn a CI job green with nothing exercised.
+        // (An unreachable Redis already failed at the connection manager above.)
         Some(
             DistributedGateway::connect(
                 &url,
@@ -4732,13 +4733,16 @@ mod tests {
             &redis_url,
             Arc::new(ProgressStreamDispatch),
             unlimited(),
-            // Five times the original 90 ms / 120 ms. The heartbeat runs at a
-            // third of the lease, so at 90 ms two late beats (60 ms) let the
-            // origin expire and the stream ended in "origin canceled" on a
-            // loaded runner instead of the timeout this test is about.
+            // The heartbeat ticks at a third of the lease (150 ms: 150, 300, 450,
+            // 600, 750 ...). The original 90 ms / 120 ms put the deadline on a
+            // tick (4 x 30 ms), and scaling both five-fold kept it there: a
+            // heartbeat that fires at the deadline finds the origin expired and
+            // ends the stream as "origin canceled" instead of the timeout. 675 ms
+            // sits halfway between two ticks. (Which error a stream gets when a
+            // tick and the deadline coincide is a roadmap follow-up.)
             GatewayConfig {
                 lease_timeout: Duration::from_millis(450),
-                request_timeout: Duration::from_millis(600),
+                request_timeout: Duration::from_millis(675),
                 ..GatewayConfig::default()
             },
         )
@@ -4770,7 +4774,7 @@ mod tests {
             }
         }
         assert!(progress_chunks >= 3);
-        // The 600 ms request deadline, not the endless progress, ended it.
+        // The 675 ms request deadline, not the endless progress, ended it.
         assert!(started.elapsed() < Duration::from_millis(2500));
         for worker in workers {
             worker.abort();

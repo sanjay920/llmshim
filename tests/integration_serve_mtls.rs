@@ -124,12 +124,25 @@ async fn chat_as(
     request.send().await.map(|response| response.status())
 }
 
-fn tenants(path: &Path) -> Vec<Value> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap()["tenant"].clone())
-        .collect()
+/// The tenant of each access-log line, once `expected` of them have been
+/// written. The server queues lines for a writer thread, so a line is not on
+/// disk the instant its response returns: this waits for them, then waits a
+/// moment longer and reads again so that an unexpected extra line fails the
+/// comparison instead of arriving afterwards.
+fn tenants(path: &Path, expected: usize) -> Vec<Value> {
+    let read = || -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["tenant"].clone())
+            .collect()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while read().len() < expected && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    read()
 }
 
 #[tokio::test]
@@ -160,7 +173,7 @@ async fn a_workload_is_identified_by_its_certificate_alone() {
     // The access log, which resolves callers with the key store the gateway uses,
     // attributes each request to the workload's tenant.
     assert_eq!(
-        tenants(&directory.0.join("access.jsonl")),
+        tenants(&directory.0.join("access.jsonl"), 2),
         vec![json!("payments"), json!("analytics")]
     );
 }
@@ -197,7 +210,7 @@ async fn connections_without_an_accepted_certificate_never_get_a_response() {
         assert!(attempt.is_err(), "{label} must not complete a request");
     }
     // Even a valid bearer token does not substitute for the certificate.
-    assert!(tenants(&directory.0.join("access.jsonl")).is_empty());
+    assert!(tenants(&directory.0.join("access.jsonl"), 0).is_empty());
 }
 
 #[tokio::test]
@@ -251,7 +264,7 @@ async fn an_unknown_workload_and_a_forged_header_both_fail_closed() {
         200
     );
     assert_eq!(
-        tenants(&directory.0.join("access.jsonl")).last(),
+        tenants(&directory.0.join("access.jsonl"), 3).last(),
         Some(&json!("payments"))
     );
 }
@@ -295,7 +308,7 @@ async fn a_bearer_token_decides_alone_and_a_certificate_never_rescues_a_wrong_on
         200
     );
     assert_eq!(
-        tenants(&directory.0.join("access.jsonl")),
+        tenants(&directory.0.join("access.jsonl"), 2),
         vec![json!(null), json!("platform")]
     );
 }
