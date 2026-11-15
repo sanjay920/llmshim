@@ -53,15 +53,21 @@ impl DefaultReceiptStore {
         Self::new(Arc::new(Receipts::from_env()))
     }
 
-    /// A store at `root` with the default retention limits, reading nothing from
-    /// the environment.
+    /// A store at `root` with the default retention limits and `lock_timeout` as
+    /// the longest an HTTP request waits for the receipt directory's lock,
+    /// reading nothing from the environment.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
-    pub(crate) fn at(root: std::path::PathBuf) -> Self {
-        Self::new(Arc::new(Receipts::from_parts(
-            root,
-            receipts::Limits::default(),
-            false,
-        )))
+    pub(crate) fn at(root: std::path::PathBuf, lock_timeout: std::time::Duration) -> Self {
+        Self {
+            receipts: Arc::new(Receipts::from_parts(
+                root,
+                receipts::Limits::default(),
+                false,
+            )),
+            executor: ReceiptExecutor::with_lock_timeout(lock_timeout),
+            restoration_limits: receipts::RestorationLimits::default(),
+            canonical_maximum_bytes: receipts::REQUEST_MAX_SERIALIZED_BYTES,
+        }
     }
 
     pub(crate) fn new(receipts: Arc<Receipts>) -> Self {
@@ -201,12 +207,16 @@ impl Drop for CancelReceiptWork {
 
 impl ReceiptExecutor {
     fn new() -> Self {
+        Self::with_lock_timeout(receipts::configured_http_lock_timeout())
+    }
+
+    fn with_lock_timeout(lock_timeout: std::time::Duration) -> Self {
         Self {
             workers: Arc::new(Semaphore::new(RECEIPT_WORKERS)),
             ingress_worker: Arc::new(Semaphore::new(1)),
             ingress_capacity: Arc::new(Semaphore::new(RECEIPT_INGRESS_CAPACITY)),
             egress_capacity: Arc::new(Semaphore::new(RECEIPT_EGRESS_CAPACITY)),
-            lock_timeout: receipts::configured_http_lock_timeout(),
+            lock_timeout,
         }
     }
 
@@ -2095,6 +2105,17 @@ mod async_receipt_tests {
             executed.load(Ordering::Relaxed),
             RECEIPT_INGRESS_CAPACITY - 1
         );
+    }
+
+    #[test]
+    fn a_store_built_with_a_timeout_uses_exactly_that_timeout() {
+        // `at` takes the timeout from its caller (serve passes the file's value)
+        // and reads no variable, so whatever the process was started with is moot.
+        let root = tempfile::tempdir().unwrap();
+        for ms in [1, 1234, 30_000] {
+            let store = DefaultReceiptStore::at(root.path().to_owned(), Duration::from_millis(ms));
+            assert_eq!(store.executor.lock_timeout, Duration::from_millis(ms));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

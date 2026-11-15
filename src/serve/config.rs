@@ -329,6 +329,13 @@ pub struct State {
     /// Defaults to 300.
     #[serde(default)]
     pub idempotency_ttl_secs: Option<u64>,
+    /// How long a request waits for the receipt directory's lock, in
+    /// milliseconds (1 to 30000). Defaults to 2000. Replaces the
+    /// `LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS` variable, which `serve` does not
+    /// read. Several replicas sharing one receipts volume contend for this lock.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 30000))]
+    pub receipt_lock_timeout_ms: Option<u64>,
 }
 
 /// What the server records about the requests it handles.
@@ -945,6 +952,14 @@ impl ServeConfig {
                 issues.push(Issue::new(
                     "state.idempotency_ttl_secs",
                     "must be between 1 and 604800 (seven days)",
+                ));
+            }
+        }
+        if let Some(ms) = self.state.receipt_lock_timeout_ms {
+            if !(1..=30_000).contains(&ms) {
+                issues.push(Issue::new(
+                    "state.receipt_lock_timeout_ms",
+                    "must be between 1 and 30000 (thirty seconds)",
                 ));
             }
         }
@@ -2387,14 +2402,22 @@ mod tests {
         );
         let config = ServeConfig::parse(&ok, Format::Toml).unwrap();
         assert_eq!(config.state.idempotency_ttl_secs, Some(600));
+        for good in [1, 2000, 30_000] {
+            let text = format!("{MINIMAL}\n[state]\nreceipt_lock_timeout_ms = {good}");
+            assert!(issues(&text).is_empty(), "{good}");
+        }
         for bad in [
             "receipts_dir = \"relative/dir\"",
             "idempotency_ttl_secs = 0",
             "idempotency_ttl_secs = 604801",
+            "receipt_lock_timeout_ms = 0",
+            "receipt_lock_timeout_ms = 30001",
         ] {
             let found = issues(&format!("{MINIMAL}\n[state]\n{bad}"));
             assert!(
-                has(&found, "state.receipts_dir") || has(&found, "state.idempotency_ttl_secs"),
+                has(&found, "state.receipts_dir")
+                    || has(&found, "state.idempotency_ttl_secs")
+                    || has(&found, "state.receipt_lock_timeout_ms"),
                 "{bad}: {found:?}"
             );
         }
