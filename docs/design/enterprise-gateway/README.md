@@ -47,6 +47,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0011: Mutual TLS and certificate-derived identity](0011-mutual-tls.md)
 - [0012: Reloading caller keys without a restart](0012-key-reload.md)
 - [0013: llmshim as a component](0013-component-bar.md)
+- [0014: What happens when a dependency fails](0014-failure-modes.md)
 
 ## Roadmap
 
@@ -77,8 +78,10 @@ Phase 0: a production server mode
 - [ ] OpenTelemetry traces and metrics
 - [x] Helm chart, validated by rendering and `serve --check` (0008)
 - [ ] Published, signed images and an SBOM
-- [ ] Reproducible benchmark and an outage-survival test, with the failure-mode
-      table (0014)
+- [x] The failure-mode table (0014), with outage-survival tests for losing Redis
+      (before and during a request) and for `SIGTERM`; its "Not yet tested" list
+      is what remains
+- [ ] Reproducible benchmark
 - [x] Configuration-contract tightenings, a structure-only `--check` and a
       checked-in JSON Schema (see "Review follow-ups"; 0013)
 - [x] Pull-request CI for every build, including the Redis-backed tests that are
@@ -185,6 +188,15 @@ Operability
 - **Nothing forces a red check to be read.** `main` has no branch protection or
   ruleset, so a failing check does not block a merge. Requiring `ci.yml` and
   `serve-check.yml` is a repository setting for the maintainer.
+- **A caller whose request loses Redis mid-flight is told `gateway shutting
+  down`** (a 503, from `GatewayError::Shutdown`, which the unary wait also
+  returns when the origin's deadline passes). The status is the right one to retry
+  on; the words are wrong. 0014 records it.
+- **0006 and the code disagree about failing closed.** 0006 says spend and rate
+  coordination fail closed when Redis is lost; the shared rate limiter
+  (`RedisRateLimiter`) and the older per-tenant `SpendStore` are documented in
+  the code as failing open. Establish which of them `serve` can reach, test it,
+  or correct 0006 (0014, "Not yet tested").
 - **The log writer** (`jsonl.rs`) drops and counts lines when its queue is full;
   a metric for the count (and for write failures) belongs with the
   OpenTelemetry item.
@@ -198,8 +210,9 @@ Operability
 
 Tests worth adding
 
-- SIGTERM drains both listeners and exits 0; a taken main port exits 1;
-  `allow_unauthenticated` serving; stderr scanned for secrets after requests.
+- A taken main port exits 1 (the admin port's is tested); `allow_unauthenticated`
+  serving; stderr scanned for secrets after requests. (`SIGTERM` draining both
+  listeners and exiting 0 is tested for one replica, 0014.)
 - A fleet test that a replica which fails to bind leaves no lease on a peer's job
   (the window is not deterministic today).
 - `Limits::new` takes three positional numbers (entries, bytes, ttl); a named

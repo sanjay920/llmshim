@@ -712,7 +712,7 @@ process, so replicas and restarts do not repeat; a build without `serve` keeps
 when a usage log is configured, the first 16 hex digits of the credential's
 digest) and the request id, never a name, and a test pins that names stay out of
 Redis; each replica names tenants and keys from
-its own config (grow-only tables, updated on a keys reload). `deploy/helm/llmshim` deploys it
+its own config (grow-only tables, updated on a keys reload). `docs/design/enterprise-gateway/0014-failure-modes.md` records what a replica does when each dependency fails and the test behind each row (Redis lost before and during a request, `SIGTERM`, ...), with an honest "not yet tested" list; `tests/integration_serve_outage.rs` cuts Redis with a TCP proxy and runs in the serve-redis CI job. `deploy/helm/llmshim` deploys it
 (`deploy/helm/validate.sh` checks the chart and feeds each rendered config back
 through `serve --check`). Only `[[keys]]` reload without a restart (`SIGHUP`,
 plus a watched file; design note 0012): the reload is all-or-nothing, refuses a

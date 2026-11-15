@@ -63,3 +63,5 @@ jobs:
         run: |
           cargo test --locked --features serve-redis --tests
           cargo test --locked --features serve-redis --test integration_serve_fleet -- --ignored
+          # One at a time: an abandoned replica leaves a lease the others would sweep.
+          cargo test --locked --features serve-redis --test integration_serve_outage -- --ignored --test-threads=1

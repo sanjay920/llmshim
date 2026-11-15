@@ -14,6 +14,12 @@ pub const ADMIN_TOKEN: &str = "admin-token-0123456789abcdef";
 
 pub struct Server {
     pub child: Child,
+    /// Every line the server has written to stderr so far, kept after the start
+    /// so a test can look for a panic or a leaked secret once it is done.
+    pub stderr: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The thread filling `stderr`; joined by [`Server::finished_stderr`] once the
+    /// process has exited, so the last lines (a panic at shutdown) are not missed.
+    reader: Option<std::thread::JoinHandle<()>>,
     pub base: String,
     /// The admin listener's address, when the configuration has `[admin]`.
     pub admin: Option<String>,
@@ -92,6 +98,8 @@ pub fn start(config: &str, label: &str, extra_env: &[(&str, &str)]) -> Server {
     let wants_admin = config.contains("[admin]");
     let mut server = Server {
         child,
+        stderr: Default::default(),
+        reader: None,
         base: String::new(),
         admin: None,
         admin_banner: String::new(),
@@ -99,11 +107,13 @@ pub fn start(config: &str, label: &str, extra_env: &[(&str, &str)]) -> Server {
     };
     let stderr = server.child.stderr.take().unwrap();
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
+    let kept = server.stderr.clone();
+    server.reader = Some(std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            kept.lock().unwrap().push(line.clone());
             let _ = sender.send(line);
         }
-    });
+    }));
     let mut seen = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -167,6 +177,45 @@ pub async fn chat(server: &Server, key: Option<&str>, model: &str) -> reqwest::R
         request = request.bearer_auth(key);
     }
     request.send().await.unwrap()
+}
+
+/// Ask the server to shut down, as an orchestrator's `SIGTERM` does.
+#[cfg(unix)]
+pub fn terminate(server: &Server) {
+    let status = Command::new("kill")
+        .args(["-TERM", &server.child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+impl Server {
+    /// Every line the server wrote to stderr, once its process has exited: the
+    /// reader is joined first, so the last lines are included.
+    pub fn finished_stderr(&mut self) -> Vec<String> {
+        if let Some(reader) = self.reader.take() {
+            reader.join().unwrap();
+        }
+        self.stderr.lock().unwrap().clone()
+    }
+}
+
+/// Wait up to `limit` for the server process to exit and return how it exited
+/// (`None` if it is still running).
+pub async fn exit_status_within(
+    server: &mut Server,
+    limit: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// A chat request that sends its own `x-request-id` (or none).
