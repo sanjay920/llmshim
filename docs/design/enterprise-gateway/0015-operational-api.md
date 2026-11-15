@@ -44,6 +44,13 @@ each fail it.
 
 ## Not done
 
+- **Responses the test does not provoke:** `/ready` 503 (it needs a dead Redis;
+  0014's outage test shows it, the schema is not applied), the `distributed`
+  stats mode with `dead_letter`, and an `applied` reload attempt.
+- **Plain `llmshim gateway` and the proxy have no admin token**: there
+  `/metrics` and the stats are open on the main listener, which the document's
+  `adminToken` describes only for `serve`. On the main listener of `serve` (no
+  `[admin]` table) caller-key auth does not guard them either.
 - **The Prometheus metric names and labels** are not described: the body is
   `text/plain`, and the test checks its form, not its families. A metric an
   operator alerts on should be in the document before the feature is stable.

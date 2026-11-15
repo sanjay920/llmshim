@@ -6,12 +6,12 @@
 //! satisfies the schema the document gives. A path added to the document that the
 //! server does not serve, or a field the server adds that the schema forbids,
 //! fails here.
-#![cfg(feature = "serve")]
+#![cfg(all(feature = "serve", unix))]
 
 #[path = "support/serve_harness.rs"]
 mod harness;
 
-use harness::{config, hangup, rewrite, start, ADMIN_TOKEN, CALLER_KEY};
+use harness::{config, hangup, rewrite, start, ADMIN_TOKEN};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -109,7 +109,13 @@ async fn the_server_serves_exactly_the_operational_paths_the_document_describes(
         let without = get(&client, &admin, path, None).await;
         if secured {
             assert_eq!(without.status(), 401, "{path} needs the admin token");
-            assert_eq!(without.headers()["www-authenticate"], "Bearer", "{path}");
+            let declared = &document["components"]["responses"]["AdminUnauthorized"]["headers"]
+                ["WWW-Authenticate"]["schema"]["const"];
+            assert_eq!(
+                &without.headers()["www-authenticate"],
+                declared.as_str().unwrap(),
+                "{path}"
+            );
             let wrong = get(
                 &client,
                 &admin,
@@ -119,7 +125,7 @@ async fn the_server_serves_exactly_the_operational_paths_the_document_describes(
             .await;
             assert_eq!(wrong.status(), 401, "{path} with a wrong token");
         } else {
-            assert_ne!(without.status(), 401, "{path} stays open for probes");
+            assert_eq!(without.status(), 200, "{path} stays open for probes");
         }
         let with = get(&client, &admin, path, Some(ADMIN_TOKEN)).await;
         assert_eq!(with.status(), 200, "{path}");
@@ -226,10 +232,13 @@ async fn a_rejected_reload_still_satisfies_the_status_schema() {
     };
     assert_eq!(status["last_reload"]["outcome"], "rejected", "{status}");
     assert_eq!(status["in_sync"], false);
+    assert_eq!(
+        status["last_reload"]["issues"][0]["path"], "limits",
+        "rejected by path, not by a parse error: {status}"
+    );
     assert!(
         errors(&schema, &status).is_empty(),
         "{:?} in {status}",
         errors(&schema, &status)
     );
-    let _ = CALLER_KEY;
 }

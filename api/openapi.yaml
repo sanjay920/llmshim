@@ -472,6 +472,8 @@ components:
         The `[admin] token` of `llmshim serve`. Required only when the admin
         listener is configured with one; with `allow_unauthenticated` (or no
         `[admin]` table, where these paths share the main listener) they are open.
+        `llmshim gateway` and the proxy have no admin token at all: there they
+        are open on the main listener.
   responses:
     AdminUnauthorized:
       description: Missing or wrong admin token
