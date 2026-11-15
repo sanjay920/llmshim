@@ -61,8 +61,9 @@ Phase 0: a production server mode
 - [x] Caller keys: hashed key store built from the file, errors returned (0003)
 - [x] Environment-free constructors for origin policy, deadlines, receipts,
       breaker, limiter and application assembly (0002)
-- [ ] Remaining inventory rows in 0002 (per-router HTTP client settings; the
-      accounting retention, penalty and receipt lock timeout are done)
+- [ ] Remaining inventory row in 0002: the per-router HTTP client settings
+      (the other rows, including accounting retention, the penalty and the
+      receipt lock timeout, are converted)
 - [x] `llmshim serve` boots the single-instance gateway from the file, including
       hashed caller keys (0004)
 - [ ] Bedrock, Vertex and Azure configurable from the file; a provider whose

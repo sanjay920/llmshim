@@ -58,13 +58,16 @@ impl DefaultReceiptStore {
     /// reading nothing from the environment.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub(crate) fn at(root: std::path::PathBuf, lock_timeout: std::time::Duration) -> Self {
-        let mut store = Self::new(Arc::new(Receipts::from_parts(
-            root,
-            receipts::Limits::default(),
-            false,
-        )));
-        store.executor = ReceiptExecutor::with_lock_timeout(lock_timeout);
-        store
+        Self {
+            receipts: Arc::new(Receipts::from_parts(
+                root,
+                receipts::Limits::default(),
+                false,
+            )),
+            executor: ReceiptExecutor::with_lock_timeout(lock_timeout),
+            restoration_limits: receipts::RestorationLimits::default(),
+            canonical_maximum_bytes: receipts::REQUEST_MAX_SERIALIZED_BYTES,
+        }
     }
 
     pub(crate) fn new(receipts: Arc<Receipts>) -> Self {
