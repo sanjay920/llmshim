@@ -117,7 +117,7 @@ of untested corners makes that worse, not better.
    step 6.
 5. Outage-survival tests and the failure-mode table (0014). Started: the table
    and its first tests exist; its "Not yet tested" list is what remains.
-6. OpenTelemetry traces and metrics, with the log writer's drop counters.
+6. OpenTelemetry traces (0016, proposed), with the log writer's drop counters.
 7. JWT/OIDC workload identity and IP allowlists (design note first).
 8. A reproducible benchmark.
 9. Published, signed images and an SBOM.
