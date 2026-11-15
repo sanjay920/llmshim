@@ -39,7 +39,7 @@ which of the two is in force.
   listener, including unknown paths, requires the token too, so a probe
   cannot be used to map the listener.
 - The token is compared as a SHA-256 digest in constant time. It follows the
-  caller-token rules (at least 16 characters, visible ASCII only), checked by
+  caller-token rules (at least 22 characters, visible ASCII only), checked by
   `--check` and at startup alike, and it must be a different secret from every
   provider key and caller key, by reference at load time and by resolved value
   (including a `sha256` caller key's digest) in `--check` and at startup.
