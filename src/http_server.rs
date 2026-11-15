@@ -405,7 +405,7 @@ mod tests {
                 .route(
                     "/slow",
                     axum::routing::get(|| async {
-                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        tokio::time::sleep(Duration::from_millis(1000)).await;
                         "finished"
                     }),
                 )
@@ -570,7 +570,11 @@ mod tests {
 
     #[tokio::test]
     async fn http1_and_http2_responses_can_outlast_the_header_deadline() {
-        let server = TestServer::start(2, Duration::from_millis(50)).await;
+        // The header deadline covers reading the request head, so at 50 ms a
+        // loaded runner that merely scheduled the client late closed the
+        // connection and `send` failed. 400 ms is far past the head and still
+        // far inside the 1 s the response takes.
+        let server = TestServer::start(2, Duration::from_millis(400)).await;
         for http2 in [false, true] {
             let builder = reqwest::Client::builder()
                 .no_proxy()
@@ -584,7 +588,7 @@ mod tests {
             .unwrap();
             let response = client
                 .get(format!("http://{}/slow", server.address))
-                .timeout(Duration::from_secs(1))
+                .timeout(Duration::from_secs(5))
                 .send()
                 .await
                 .unwrap();

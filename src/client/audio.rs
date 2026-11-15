@@ -349,15 +349,20 @@ mod tests {
         for format in ["json", "text"] {
             for idle in [true, false] {
                 let mut client = ShimClient::new();
+                // The stalled body sleeps 600 ms. The deadline under test is
+                // 150 ms and the other is far beyond it. The total deadline
+                // also covers connecting and the response headers, so at 10 ms a
+                // slow runner expired it before the body began, which is a
+                // retried failure: two requests, not the one this expects.
                 client.deadlines.unary_body_idle = if idle {
-                    Duration::from_millis(10)
+                    Duration::from_millis(150)
                 } else {
-                    Duration::from_secs(1)
+                    Duration::from_secs(5)
                 };
                 client.deadlines.unary_attempt_total = if idle {
-                    Duration::from_secs(1)
+                    Duration::from_secs(5)
                 } else {
-                    Duration::from_millis(10)
+                    Duration::from_millis(150)
                 };
                 let mock = server
                     .mock("POST", "/audio/transcriptions")
@@ -372,7 +377,7 @@ mod tests {
                     .with_chunked_body(move |writer| {
                         writer.write_all(if format == "json" { b"{ " } else { b"he" })?;
                         writer.flush()?;
-                        std::thread::sleep(Duration::from_millis(100));
+                        std::thread::sleep(Duration::from_millis(600));
                         writer.write_all(if format == "json" {
                             b"\"text\":\"hello\"}"
                         } else {

@@ -32,14 +32,16 @@ Token fields, for chargeback:
 - `reasoning_tokens` and `uncached_input_tokens` are `null` when the provider
   reported no such count, which is not the same as zero. Chat-wire providers
   report reasoning inside `completion_tokens_details`; both places are read.
-- **Known undercount, shared with the spend ledger:** on the Gemini native path
-  the gateway's normalized `completion_tokens` is Google's
-  `candidatesTokenCount`, which excludes thinking tokens (`thoughtsTokenCount`),
-  while Google bills them as output. The record, the cost and the budget cap all
-  use that figure, so a Gemini thinking model is under-counted in all three
-  until the shared normalization folds the thoughts in, as the non-streaming
-  response already does. It is a separate fix to shared accounting, outside
-  this log.
+- **Gemini thinking tokens are output tokens.** Google reports thinking as
+  `thoughtsTokenCount`, apart from `candidatesTokenCount`, and bills it as
+  output. The normalized `completion_tokens` folds the thoughts in, as in the
+  response and the stream's usage chunk, and `reasoning_tokens` reports them as
+  a subset of `completion_tokens`: do not add the two when totalling a chargeback.
+  The record, the cost and the budget cap read the same figure
+  (`usage::google_completion_tokens` is the one definition of the completion
+  count). A response that reports thoughts but no `candidatesTokenCount` (Google
+  omits a zero) counts the thoughts as output, and its counters stay marked
+  incomplete: an absent counter is unknown, not zero.
 
 ## Per attempt, not per request
 

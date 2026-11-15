@@ -215,12 +215,16 @@ async fn a_change_outside_the_keys_is_refused_by_path_and_takes_nothing_with_it(
     assert_eq!(status["generation"], 0);
     let issues = status["last_reload"]["issues"].as_array().unwrap();
     assert_eq!(issues.len(), 1, "{status}");
-    assert_eq!(issues[0]["path"], "limits");
-    assert!(issues[0]["message"]
-        .as_str()
-        .unwrap()
-        .contains("restart to apply"));
-    assert!(!status.to_string().contains("600"), "no value is reported");
+    // The whole issue, so a value cannot ride along. (Searching the status for
+    // the new limit's digits also matched the config hash or an epoch
+    // timestamp now and then, and failed a CI run on that alone.)
+    assert_eq!(
+        issues[0],
+        serde_json::json!({
+            "path": "limits",
+            "message": "cannot change while the server is running; restart to apply"
+        })
+    );
     assert_eq!(chat(&server, Some(THIRD), MODEL).await.status(), 401);
     assert_eq!(chat(&server, Some(SECOND), MODEL).await.status(), 200);
 }
