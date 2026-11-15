@@ -54,7 +54,7 @@ mod with_feature {
 
     const SECRETS: [(&str, &str); 2] = [
         ("SERVE_TEST_PROVIDER_KEY", "provider-secret-value"),
-        ("SERVE_TEST_CALLER_KEY", "caller-secret-value"),
+        ("SERVE_TEST_CALLER_KEY", "caller-secret-value-0123"),
     ];
 
     #[test]
@@ -102,7 +102,7 @@ mod with_feature {
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1));
-        assert!(stderr.contains("keys[0].secret: must be at least 16 characters"));
+        assert!(stderr.contains("keys[0].secret: must be at least 22 characters"));
         assert!(!stderr.contains("short-weak"));
     }
 

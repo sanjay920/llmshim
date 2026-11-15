@@ -27,8 +27,18 @@ pub const VERSION: u32 = 1;
 /// integer), matching the gateway's own bound.
 const MAX_BUDGET_USD: f64 = 9_007_199.254_740_992;
 
+/// Longest spend window: 366 days. The Redis ledger multiplies the window by 1000
+/// and sets an expiry from it, so an unbounded value is an overflow or an expiry
+/// no operator meant.
+pub const MAX_BUDGET_WINDOW_SECS: u64 = 366 * 24 * 60 * 60;
+
+/// Longest a request may wait for provider capacity: one hour. A wait that long is
+/// a mis-set unit (seconds written as milliseconds, or the reverse), not a policy.
+pub const MAX_QUEUE_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+
 /// One problem with a configuration file.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Issue {
     /// Dotted path of the offending setting, e.g. `providers.openai.api_key`.
     pub path: String,
@@ -70,6 +80,7 @@ impl fmt::Display for Issue {
 
 /// Text encodings a configuration file may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Format {
     Toml,
     Json,
@@ -394,6 +405,7 @@ pub struct Provider {
 /// Where a secret lives. Exactly one field is set; the value never appears in
 /// the file, in `Debug` output, or in an [`Issue`].
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SecretRef {
     pub env: Option<String>,
     pub file: Option<PathBuf>,
@@ -634,8 +646,23 @@ impl ServeConfig {
             .strip_prefix('[')
             .and_then(|h| h.strip_suffix(']'))
             .unwrap_or(host);
-        if bare.parse::<std::net::IpAddr>().is_err() {
-            issues.push(Issue::new("server.host", "must be an IPv4 or IPv6 address"));
+        match bare.parse::<std::net::IpAddr>() {
+            Err(_) => {
+                issues.push(Issue::new("server.host", "must be an IPv4 or IPv6 address"));
+            }
+            // Serving with no caller identity on a routable interface hands the
+            // upstream keys' spend to anyone who can reach the port, so it is
+            // limited to loopback (a sidecar, a local developer). A deployment that
+            // listens on a routable address defines [[keys]].
+            Ok(address) if self.server.allow_unauthenticated && !address.is_loopback() => {
+                issues.push(Issue::new(
+                    "server.host",
+                    "must be a loopback address (127.0.0.0/8 or ::1) while \
+                     server.allow_unauthenticated is true; define [[keys]] to \
+                     listen on a routable address",
+                ));
+            }
+            Ok(_) => {}
         }
         if self.keys.is_empty() && !self.server.allow_unauthenticated {
             issues.push(Issue::new(
@@ -850,6 +877,16 @@ impl ServeConfig {
         if self.limits.max_concurrency == Some(0) {
             issues.push(Issue::new("limits.max_concurrency", "must be at least 1"));
         }
+        if self
+            .limits
+            .queue_timeout_ms
+            .is_some_and(|ms| ms > MAX_QUEUE_TIMEOUT_MS)
+        {
+            issues.push(Issue::new(
+                "limits.queue_timeout_ms",
+                format!("must be at most {MAX_QUEUE_TIMEOUT_MS} (one hour)"),
+            ));
+        }
         for name in self.limits.providers.keys() {
             if !self.providers.contains_key(name) {
                 issues.push(Issue::new(
@@ -991,10 +1028,13 @@ impl ServeConfig {
                     ));
                 }
             }
-            if key.budget_window_secs == Some(0) {
+            if key
+                .budget_window_secs
+                .is_some_and(|secs| !(1..=MAX_BUDGET_WINDOW_SECS).contains(&secs))
+            {
                 issues.push(Issue::new(
                     format!("{at}.budget_window_secs"),
-                    "must be at least 1",
+                    format!("must be between 1 and {MAX_BUDGET_WINDOW_SECS} (366 days)"),
                 ));
             }
             if key.budget_usd.is_none()
@@ -1368,21 +1408,23 @@ fn validate_secret(secret: &SecretRef, at: &str, issues: &mut Vec<Issue>) {
 /// already be the final endpoint, and it must not smuggle credentials or a
 /// query string.
 fn validate_base_url(url: &str) -> Result<(), &'static str> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .ok_or("must start with https:// or http://")?;
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("must start with https:// or http://");
+    }
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err("must not contain whitespace");
     }
-    if rest.contains('?') || rest.contains('#') {
+    if url.contains('?') || url.contains('#') {
         return Err("must not contain a query string or fragment");
     }
-    let authority = rest.split('/').next().unwrap_or_default();
-    if authority.is_empty() {
+    // A real parser, not a split on '/': it refuses an empty host (`http://:8000`),
+    // a port that is not a number or is out of range, and a malformed address.
+    let parsed =
+        reqwest::Url::parse(url).map_err(|_| "is not a valid URL (check the host and port)")?;
+    if parsed.host_str().is_none_or(str::is_empty) {
         return Err("must name a host");
     }
-    if authority.contains('@') {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("must not contain credentials; use api_key");
     }
     Ok(())
@@ -2080,6 +2122,8 @@ mod tests {
     fn base_urls_must_be_final_endpoints_without_credentials() {
         assert!(validate_base_url("https://llm.internal.example/v1").is_ok());
         assert!(validate_base_url("http://localhost:8000/v1").is_ok());
+        assert!(validate_base_url("https://[::1]:8000/v1").is_ok());
+        assert!(validate_base_url("http://127.0.0.1:8000").is_ok());
         for bad in [
             "llm.internal.example/v1",
             "ftp://example.com",
@@ -2088,8 +2132,69 @@ mod tests {
             "https://example.com/v1?key=1",
             "https://example.com/v1#frag",
             "https://exa mple.com",
+            // What a split on '/' let through: no host, a port that is not a
+            // number or does not fit, an unterminated address.
+            "http://:8000/v1",
+            "http://example.com:notaport/v1",
+            "http://example.com:99999/v1",
+            "http://[::1/v1",
+            "https://:@/v1",
         ] {
             assert!(validate_base_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn serving_without_keys_is_limited_to_loopback() {
+        let open = |host: &str| {
+            format!(
+                "version = 1\n[server]\nhost = \"{host}\"\nallow_unauthenticated = true\n\
+                 [providers.openai]\nkind = \"openai\"\napi_key = {{ env = \"OPENAI_API_KEY\" }}"
+            )
+        };
+        for ok in ["127.0.0.1", "127.8.9.10", "::1", "[::1]"] {
+            assert!(
+                issues(&open(ok)).is_empty(),
+                "{ok}: {:?}",
+                issues(&open(ok))
+            );
+        }
+        for routable in ["0.0.0.0", "::", "10.0.0.5", "192.168.1.9", "203.0.113.7"] {
+            let found = issues(&open(routable));
+            assert!(has(&found, "server.host"), "{routable}: {found:?}");
+            assert!(
+                found[0].contains("loopback"),
+                "the message says what to do: {found:?}"
+            );
+        }
+        // With caller keys any address is allowed: the keys decide.
+        let keyed = format!("{MINIMAL}\n[server]\nhost = \"0.0.0.0\"");
+        assert!(issues(&keyed).is_empty(), "{:?}", issues(&keyed));
+    }
+
+    #[test]
+    fn spend_windows_and_queue_waits_have_upper_bounds() {
+        let window = |secs: u64| {
+            format!(
+                "{MINIMAL}\n[[keys]]\nname = \"b\"\ntenant = \"other\"\n\
+                 secret = {{ env = \"OTHER_KEY\" }}\nbudget_usd = 5.0\nbudget_window_secs = {secs}"
+            )
+        };
+        assert!(issues(&window(MAX_BUDGET_WINDOW_SECS)).is_empty());
+        // (TOML integers are signed 64-bit, so i64::MAX is the largest it can say.)
+        for bad in [0, MAX_BUDGET_WINDOW_SECS + 1, i64::MAX as u64] {
+            let found = issues(&window(bad));
+            assert!(
+                has(&found, "keys[1].budget_window_secs"),
+                "{bad}: {found:?}"
+            );
+        }
+        let queue = |ms: u64| format!("{MINIMAL}\n[limits]\nqueue_timeout_ms = {ms}");
+        assert!(issues(&queue(0)).is_empty(), "0 waits not at all");
+        assert!(issues(&queue(MAX_QUEUE_TIMEOUT_MS)).is_empty());
+        for bad in [MAX_QUEUE_TIMEOUT_MS + 1, i64::MAX as u64] {
+            let found = issues(&queue(bad));
+            assert!(has(&found, "limits.queue_timeout_ms"), "{bad}: {found:?}");
         }
     }
 

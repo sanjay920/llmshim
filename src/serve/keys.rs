@@ -13,8 +13,11 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 /// Shortest caller token accepted, in characters. A configuration cannot choose
-/// a weaker one; generate tokens with at least 128 bits of randomness.
-pub const MIN_TOKEN_LEN: usize = 16;
+/// a weaker one. 22 characters is 128 bits in the densest common encoding
+/// (base64url), so it is the shortest length that can hold the 128 bits the notes
+/// advise. Length is a floor, not a measure of randomness: generate tokens with
+/// a tool (`openssl rand -hex 32`), not by hand.
+pub const MIN_TOKEN_LEN: usize = 22;
 
 /// Why `token` cannot serve as a bearer token, if it cannot. Shared by caller
 /// keys and the admin token so the two rules cannot drift apart.
@@ -237,7 +240,7 @@ mod tests {
         assert_eq!(unset[0].path, "keys[0].secret");
         assert!(unset[0].message.contains("CI_KEY is not set"));
         for (value, expected) in [
-            ("short-token", "at least 16 characters"),
+            ("short-token", "at least 22 characters"),
             ("has a space inside it 0123", "visible ASCII"),
             // A byte-order mark survives `trim` and is not whitespace.
             ("\u{feff}ci-token-0123456789abcdef", "visible ASCII"),
@@ -253,13 +256,16 @@ mod tests {
     }
 
     #[test]
-    fn the_length_floor_is_exactly_sixteen_characters() {
-        let fifteen = "abcdefghijklmno";
-        let sixteen = "abcdefghijklmnop";
-        assert_eq!(fifteen.chars().count(), 15);
-        assert!(build_key_store(&config(""), &env_with(fifteen)).is_err());
-        let store = build_key_store(&config(""), &env_with(sixteen)).unwrap();
-        assert!(store.identify(&bearer(sixteen)).is_ok());
+    fn the_length_floor_is_exactly_twenty_two_characters() {
+        // 22 characters is 128 bits in base64url, the shortest that can hold what
+        // the notes advise; `openssl rand -hex 32` (64) clears it easily.
+        let twenty_one = "abcdefghijklmnopqrstu";
+        let twenty_two = "abcdefghijklmnopqrstuv";
+        assert_eq!(twenty_one.chars().count(), 21);
+        assert_eq!(twenty_two.chars().count(), 22);
+        assert!(build_key_store(&config(""), &env_with(twenty_one)).is_err());
+        let store = build_key_store(&config(""), &env_with(twenty_two)).unwrap();
+        assert!(store.identify(&bearer(twenty_two)).is_ok());
     }
 
     #[test]

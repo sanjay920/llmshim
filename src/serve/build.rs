@@ -687,7 +687,7 @@ mod tests {
         let admin = "[admin]\nport = 9090\ntoken = { env = \"ADMIN\" }";
         let config = config(admin);
         for (value, expected) in [
-            ("short", "at least 16 characters"),
+            ("short", "at least 22 characters"),
             ("has a space inside it 0123", "visible ASCII"),
             ("\u{feff}admin-token-0123456789", "visible ASCII"),
         ] {

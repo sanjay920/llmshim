@@ -105,21 +105,13 @@ Contracts and decisions (change before stability)
   a machine that does not hold them, and it exits 1 for "a secret is missing"
   as for "the file is wrong". A structure-only mode, or a distinct exit code, is
   needed before anyone gates a pull request on it.
-- **`server.allow_unauthenticated` with a non-loopback host** is accepted.
-  Requiring loopback when unauthenticated is a tightening that is easier now than
-  after files exist.
 - **`routes.*.settings` is an open map**: a misspelled setting is accepted
-  silently. Define the accepted keys.
-- **`base_url`** accepts `http://:8000` and a port that is not a number, and is
-  accepted on hosted kinds where it has no defined meaning. Parse it with a URL
-  parser.
-- **Upper bounds** are missing for `budget_window_secs` and `queue_timeout_ms`
-  (the Redis ledger multiplies by 1000 and sets an expiry from them).
-- **`deny_unknown_fields` and "additive within v1"** conflict during a rolling
-  upgrade: a new field breaks the old binary. Say so in 0001, or tolerate unknown
-  fields with a warning.
-- **`#[non_exhaustive]`** on `SecretRef`, `Format` and `Issue`, which 0001 says
-  the Rust types are.
+  silently (the adapters ignore a top-level key they do not read). Closing it
+  needs one authoritative list of request keys, which the adapters do not keep in
+  one place: the request-field table in the docs is the nearest, and it omits
+  provider-specific top-level fields such as `store` and `cache_control`. A list
+  that rejects a legitimate key is worse than an open map, so this waits for the
+  list.
 - **Key names on usage records** (not only tenants), and **request ids** to join
   a request's attempts. The request id `gw-<pid>-<n>` repeats across containers,
   where the pid is 1: add an instance part.
@@ -127,10 +119,9 @@ Contracts and decisions (change before stability)
   provider name take each other's jobs. A `fleet.namespace` prefix.
 - **Optional client certificates and revocation** (0011), a CRL file watched like
   the CA bundle.
-- **Tokens**: the length floor of 16 characters is below the 128 bits that 0003
-  advises; consider 32. Caller keys are compared with provider and admin
-  keys by digest in `check_references`, which `--check` and startup run, but
-  `build_key_store` alone does not.
+- **Tokens**: caller keys are compared with provider and admin keys by digest in
+  `check_references`, which `--check` and startup run, but `build_key_store`
+  alone does not.
 
 Operability
 
