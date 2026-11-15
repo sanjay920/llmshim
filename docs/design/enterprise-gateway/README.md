@@ -48,6 +48,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0012: Reloading caller keys without a restart](0012-key-reload.md)
 - [0013: llmshim as a component](0013-component-bar.md)
 - [0014: What happens when a dependency fails](0014-failure-modes.md)
+- [0015: The operational endpoints are in the OpenAPI document](0015-operational-api.md)
 
 ## Roadmap
 
@@ -86,8 +87,8 @@ Phase 0: a production server mode
       checked-in JSON Schema (see "Review follow-ups"; 0013)
 - [x] Pull-request CI for every build, including the Redis-backed tests that are
       ignored without a server (`ci.yml`; 0013)
-- [ ] The operational endpoints in the OpenAPI document, with a conformance test
-      (0013)
+- [x] The operational endpoints in the OpenAPI document, with a conformance test
+      (0015)
 - [ ] A request id unique across instances, with the tenant and key name joined
       across the access log, the usage records and the trace (0013). The log and
       the records are done; the trace joins with OpenTelemetry.
