@@ -46,6 +46,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0010: Usage and cost records per tenant](0010-usage-records.md)
 - [0011: Mutual TLS and certificate-derived identity](0011-mutual-tls.md)
 - [0012: Reloading caller keys without a restart](0012-key-reload.md)
+- [0013: llmshim as a component](0013-component-bar.md)
 
 ## Roadmap
 
@@ -76,7 +77,19 @@ Phase 0: a production server mode
 - [ ] OpenTelemetry traces and metrics
 - [x] Helm chart, validated by rendering and `serve --check` (0008)
 - [ ] Published, signed images and an SBOM
-- [ ] Reproducible benchmark and an outage-survival test
+- [ ] Reproducible benchmark and an outage-survival test, with the failure-mode
+      table (0014)
+- [x] Configuration-contract tightenings, a structure-only `--check` and a
+      checked-in JSON Schema (see "Review follow-ups"; 0013)
+- [x] Pull-request CI for every build, including the Redis-backed tests that are
+      ignored without a server (`ci.yml`; 0013)
+- [ ] The operational endpoints in the OpenAPI document, with a conformance test
+      (0013)
+- [ ] A request id unique across instances, with the tenant, key name and
+      credential fingerprint joined across the access log, the usage records and
+      the trace (0013)
+- [ ] The release gate builds and tests `serve` and waits for a green `ci.yml`
+      (0013)
 
 Later phases (each needs its own design note before work starts)
 
@@ -89,7 +102,8 @@ Later phases (each needs its own design note before work starts)
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy
 - [ ] Secret-manager integrations
 - [ ] Config-registered providers; embeddings, images and audio on the server
-- [ ] Admin UI, SSO and SCIM (blocked on the licensing decision)
+- [ ] Admin UI, SSO and SCIM (not started: they follow the control plane and the
+      licensing decision)
 
 ## Review follow-ups
 
@@ -101,21 +115,13 @@ contract is cheaper to change before the feature is declared stable.
 
 Contracts and decisions (change before stability)
 
-- **`server.allow_unauthenticated` with a non-loopback host** is accepted.
-  Requiring loopback when unauthenticated is a tightening that is easier now than
-  after files exist.
 - **`routes.*.settings` is an open map**: a misspelled setting is accepted
-  silently. Define the accepted keys.
-- **`base_url`** accepts `http://:8000` and a port that is not a number, and is
-  accepted on hosted kinds where it has no defined meaning. Parse it with a URL
-  parser.
-- **Upper bounds** are missing for `budget_window_secs` and `queue_timeout_ms`
-  (the Redis ledger multiplies by 1000 and sets an expiry from them).
-- **`deny_unknown_fields` and "additive within v1"** conflict during a rolling
-  upgrade: a new field breaks the old binary. Say so in 0001, or tolerate unknown
-  fields with a warning.
-- **`#[non_exhaustive]`** on `SecretRef`, `Format` and `Issue`, which 0001 says
-  the Rust types are.
+  silently (the adapters ignore a top-level key they do not read). Closing it
+  needs one authoritative list of request keys, which the adapters do not keep in
+  one place: the request-field table in the docs is the nearest, and it omits keys
+  the adapters read, such as `response_format` and `parallel_tool_calls`. A list
+  that rejects a legitimate key is worse than an open map, so this waits for the
+  list.
 - **Key names on usage records** (not only tenants), and **request ids** to join
   a request's attempts. The request id `gw-<pid>-<n>` repeats across containers,
   where the pid is 1: add an instance part.
@@ -123,10 +129,9 @@ Contracts and decisions (change before stability)
   provider name take each other's jobs. A `fleet.namespace` prefix.
 - **Optional client certificates and revocation** (0011), a CRL file watched like
   the CA bundle.
-- **Tokens**: the length floor of 16 characters is below the 128 bits that 0003
-  advises; consider 32. Caller keys are compared with provider and admin
-  keys by digest in `check_same_values`, which `--check` and startup run, but
-  `build_key_store` alone does not.
+- **Tokens**: caller keys are compared with provider and admin keys by digest in
+  `check_same_values`, which `--check` and startup run, but `build_key_store`
+  alone does not.
 
 Operability
 
@@ -203,9 +208,17 @@ Tests worth adding
   `build_breaker_with` are public in the `proxy` feature and could be
   `pub(crate)`.
 
+## Decisions
+
+Taken 2026-11-14, with the reasons in 0013.
+
+- **Database** for the control plane: Postgres, SQLite for one node, never in the
+  request path. The design note comes before the code.
+- **Images:** GHCR, signed keyless, with an SPDX SBOM, from an opt-in publish job.
+- **Stability:** `serve` stays unstable until the criteria in 0013 are met.
+
 ## Open decisions
 
-- **Licensing** of identity and audit-export features. Until this is decided,
-  that code is not started in this repository.
-- **Database** for the control plane (proposal: Postgres, SQLite for one node,
-  never in the request path).
+- **Licensing** of identity and audit-export features (SSO, SCIM, audit export,
+  the admin UI). None of that code is started. All of it follows the control
+  plane, so nothing in the order of work (0013) waits on the decision.

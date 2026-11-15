@@ -378,12 +378,12 @@
       "properties": {
         "allow_unauthenticated": {
           "default": false,
-          "description": "Serve callers with no key. Off by default: a file with no `[[keys]]`\nis refused unless this is set.",
+          "description": "Serve callers with no key. Off by default: a file with no `[[keys]]`\nis refused unless this is set, and then `host` must be a loopback\naddress. Cannot be set together with `[[keys]]`.",
           "type": "boolean"
         },
         "host": {
           "default": "127.0.0.1",
-          "description": "IP address to bind. Defaults to loopback; a container sets `0.0.0.0`.",
+          "description": "IP address to bind. Defaults to loopback; a container sets `0.0.0.0`,\nwhich needs `[[keys]]` (serving without callers is loopback-only).",
           "type": "string"
         },
         "port": {
