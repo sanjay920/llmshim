@@ -595,7 +595,7 @@
           "type": "null"
         }
       ],
-      "description": "Export traces to an OpenTelemetry collector (0016). Needs a binary built\nwith `--features serve-otel`."
+      "description": "Export traces to an OpenTelemetry collector (0016). **Not implemented\nyet**: the table is part of the contract and validated, and a file that\nsets it is refused at startup until the exporter exists. It will need a\nbinary built with `--features serve-otel`."
     },
     "version": {
       "description": "The schema version. Only 1 exists; another is refused before anything else.",

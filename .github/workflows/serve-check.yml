@@ -37,6 +37,10 @@ jobs:
           LLMSHIM_CATALOG_OFFLINE: '1'
         run: |
           cargo test --locked --features serve --tests
+          # The declared-but-empty serve-otel feature must keep compiling and
+          # keep refusing a [telemetry] table (0016).
+          cargo clippy --locked --all-targets --features serve-otel -- -D warnings
+          cargo test --locked --features serve-otel --test unit_serve_cli
 
   serve-redis-check:
     runs-on: ubuntu-latest

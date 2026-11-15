@@ -125,8 +125,10 @@ pub struct ServeConfig {
     /// How a running server picks up changes to `keys`.
     #[serde(default)]
     pub reload: Reload,
-    /// Export traces to an OpenTelemetry collector (0016). Needs a binary built
-    /// with `--features serve-otel`.
+    /// Export traces to an OpenTelemetry collector (0016). **Not implemented
+    /// yet**: the table is part of the contract and validated, and a file that
+    /// sets it is refused at startup until the exporter exists. It will need a
+    /// binary built with `--features serve-otel`.
     #[serde(default)]
     pub telemetry: Option<Telemetry>,
 }
