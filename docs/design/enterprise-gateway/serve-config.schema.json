@@ -429,6 +429,16 @@
             "null"
           ]
         },
+        "receipt_lock_timeout_ms": {
+          "default": null,
+          "description": "How long a request waits for the receipt directory's lock, in\nmilliseconds (1 to 30000). Defaults to 2000. Replaces the\n`LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS` variable, which `serve` does not\nread. Several replicas sharing one receipts volume contend for this lock.",
+          "maximum": 30000,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "receipts_dir": {
           "default": null,
           "description": "Directory for replay receipts (signed reasoning and tool-call identity a\nclient replays later). Defaults to the platform's local data directory.\nMount a persistent volume here to keep receipts across restarts.",

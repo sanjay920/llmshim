@@ -38,6 +38,9 @@ const DEFAULT_IDEMPOTENCY_TTL_SECS: u64 = 300;
 /// The back-off after an upstream 429 when the file sets none (the same 5 s the
 /// gateway defaults to).
 const DEFAULT_PENALTY_SECS: u64 = 5;
+/// How long a request waits for the receipt directory's lock when the file sets
+/// none (the gateway's own default).
+const DEFAULT_RECEIPT_LOCK_TIMEOUT_MS: u64 = 2000;
 
 /// A server ready to be bound to its listener.
 pub struct Built {
@@ -376,7 +379,15 @@ pub async fn build_app(
         // No browser origin is trusted. Browsers are not callers of a gateway.
         crate::proxy::origin::OriginPolicy::default(),
         crate::proxy::lifetime::LogicalRequestDeadlines::from_lookup(&|_| None, "unused", "unused"),
-        DefaultReceiptStore::at(receipts_root),
+        DefaultReceiptStore::at(
+            receipts_root,
+            Duration::from_millis(
+                config
+                    .state
+                    .receipt_lock_timeout_ms
+                    .unwrap_or(DEFAULT_RECEIPT_LOCK_TIMEOUT_MS),
+            ),
+        ),
     );
     let (app, admin) = match admin_address {
         Some(admin_address) => {

@@ -88,6 +88,7 @@ pub fn start(config: &str, label: &str, extra_env: &[(&str, &str)]) -> Server {
         .env("LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS", "1")
         .env("LLMSHIM_GATEWAY_ORIGIN_LEASE_MS", "1")
         .env("LLMSHIM_GATEWAY_RETAINED_JOBS", "1")
+        .env("LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS", "1")
         .env("LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
