@@ -97,8 +97,8 @@ bound, TLS session resumption that outlived a certificate. More surface on top
 of untested corners makes that worse, not better.
 
 1. CI coverage for every build, including the Redis-backed tests (`ci.yml`, and
-   every `serve` test in `serve-check.yml`).
-2. Gemini thinking-token accounting in the shared usage normalization.
+   every `serve` test in `serve-check.yml`). Done.
+2. Gemini thinking-token accounting in the shared usage normalization. Done.
 3. The configuration-contract tightenings under "Review follow-ups", the
    remaining inventory rows of 0002, a structure-only `--check` with its own
    exit code, `--print-schema`, and the operational endpoints in the OpenAPI

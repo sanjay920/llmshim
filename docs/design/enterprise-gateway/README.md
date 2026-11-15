@@ -81,7 +81,7 @@ Phase 0: a production server mode
       table (0014)
 - [ ] Configuration-contract tightenings, a structure-only `--check` and a
       checked-in JSON Schema (see "Review follow-ups"; 0013)
-- [ ] Pull-request CI for every build, including the Redis-backed tests that are
+- [x] Pull-request CI for every build, including the Redis-backed tests that are
       ignored without a server (`ci.yml`; 0013)
 
 Later phases (each needs its own design note before work starts)
