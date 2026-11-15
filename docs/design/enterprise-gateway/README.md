@@ -79,7 +79,7 @@ Phase 0: a production server mode
 - [ ] Published, signed images and an SBOM
 - [ ] Reproducible benchmark and an outage-survival test, with the failure-mode
       table (0014)
-- [ ] Configuration-contract tightenings, a structure-only `--check` and a
+- [x] Configuration-contract tightenings, a structure-only `--check` and a
       checked-in JSON Schema (see "Review follow-ups"; 0013)
 - [x] Pull-request CI for every build, including the Redis-backed tests that are
       ignored without a server (`ci.yml`; 0013)
@@ -115,10 +115,6 @@ contract is cheaper to change before the feature is declared stable.
 
 Contracts and decisions (change before stability)
 
-- **`--check` needs the secrets to be present**, so it cannot run in a CI job on
-  a machine that does not hold them, and it exits 1 for "a secret is missing"
-  as for "the file is wrong". A structure-only mode, or a distinct exit code, is
-  needed before anyone gates a pull request on it.
 - **`routes.*.settings` is an open map**: a misspelled setting is accepted
   silently (the adapters ignore a top-level key they do not read). Closing it
   needs one authoritative list of request keys, which the adapters do not keep in
@@ -134,7 +130,7 @@ Contracts and decisions (change before stability)
 - **Optional client certificates and revocation** (0011), a CRL file watched like
   the CA bundle.
 - **Tokens**: caller keys are compared with provider and admin keys by digest in
-  `check_references`, which `--check` and startup run, but `build_key_store`
+  `check_same_values`, which `--check` and startup run, but `build_key_store`
   alone does not.
 
 Operability
@@ -164,13 +160,15 @@ Operability
   deadline, a TLS handshake inside 50 ms), and `proxy/mod.rs` (a first response
   inside 50 ms). Local load does not find them (four runs under twice the core
   count of busy loops passed): burn-in on the CI runners does.
-- **A stream whose heartbeat tick coincides with its total deadline can end as
-  `origin canceled` instead of a timeout.** The origin lease expires at the
-  deadline, so a tick that lands on it finds the origin gone. Both are errors at
+- **A stream that reaches its total deadline can end as `origin canceled`
+  instead of a timeout.** The origin lease expires at the deadline, so the
+  stream's own timer and the notice that the origin is gone race, and either can
+  win (a heartbeat tick on the deadline was one way to lose, not the only one:
+  moving the test's deadline off the tick still failed in CI). Both are errors at
   the deadline, in different classes: a timeout is reported as overload (with
-  `Retry-After`), `origin canceled` as a provider error. The test avoids the
-  coincidence; reporting a timeout when the deadline has passed is a separate
-  change to gateway code.
+  `Retry-After`), `origin canceled` as a provider error. The test accepts either;
+  reporting a timeout whenever the deadline has passed is a separate change to
+  gateway code.
 - **A Gemini response with thoughts but no `candidatesTokenCount` settles as
   incomplete.** Google omits a zero, so the absence there is the provider's
   zero, yet the counters stay marked incomplete and, under catalog authority,

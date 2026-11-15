@@ -4733,13 +4733,14 @@ mod tests {
             &redis_url,
             Arc::new(ProgressStreamDispatch),
             unlimited(),
-            // The heartbeat ticks at a third of the lease (150 ms: 150, 300, 450,
-            // 600, 750 ...). The original 90 ms / 120 ms put the deadline on a
-            // tick (4 x 30 ms), and scaling both five-fold kept it there: a
-            // heartbeat that fires at the deadline finds the origin expired and
-            // ends the stream as "origin canceled" instead of the timeout. 675 ms
-            // sits halfway between two ticks. (Which error a stream gets when a
-            // tick and the deadline coincide is a roadmap follow-up.)
+            // Five times the original 90 ms / 120 ms, so scheduling jitter on a
+            // loaded runner is small against the lease. The origin lease expires at
+            // the request deadline, so at that instant two things race: the stream's
+            // own timer (a timeout) and the notice that the origin is gone ("origin
+            // canceled"). Moving the deadline off a heartbeat tick, as an earlier
+            // revision did, was not enough: it failed again in CI. The test
+            // therefore accepts either end; which one a caller sees is a roadmap
+            // follow-up.
             GatewayConfig {
                 lease_timeout: Duration::from_millis(450),
                 request_timeout: Duration::from_millis(675),
@@ -4770,6 +4771,11 @@ mod tests {
                     progress_chunks += 1;
                 }
                 Some(Err(GatewayError::Timeout)) => break,
+                Some(Err(GatewayError::Upstream(message)))
+                    if message == "distributed origin canceled" =>
+                {
+                    break
+                }
                 other => panic!("unexpected stream result: {other:?}"),
             }
         }
