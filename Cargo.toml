@@ -23,7 +23,7 @@ gateway-redis = ["gateway", "redis-coordination"]
 redis-coordination = ["proxy", "dep:redis"]
 # In development: a config-file-driven server (`llmshim serve`). Off by default
 # and implied by no other feature; see docs/design/enterprise-gateway.
-serve = ["gateway", "dep:x509-parser", "dep:tokio-rustls"]
+serve = ["gateway", "dep:x509-parser", "dep:tokio-rustls", "dep:schemars"]
 # `serve` with fleet mode: a shared Redis queue, rate limits, spend ledger and
 # provider health across replicas. Needed for the `[fleet]` configuration table.
 serve-redis = ["serve", "gateway-redis"]
@@ -75,6 +75,9 @@ tower-http = { version = "0.6", features = ["cors"], optional = true }
 # certificate, and name the TLS stream type the acceptor returns.
 x509-parser = { version = "0.18", default-features = false, optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+# The `serve` configuration contract as a JSON Schema (`serve --print-schema`),
+# derived from the same types the parser reads so the two cannot drift.
+schemars = { version = "1", optional = true }
 async-stream = { version = "0.3", optional = true }
 async-trait = { version = "0.1", optional = true }
 

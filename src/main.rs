@@ -913,8 +913,28 @@ async fn reload_loop(
     }
 }
 
+/// `llmshim serve` exit statuses. 0 is success, 2 is bad arguments (reported
+/// before this function runs). The two below let a pipeline tell "the file is
+/// wrong" from "this environment cannot check it".
+#[cfg(feature = "serve")]
+const EXIT_INVALID: i32 = 1;
+#[cfg(feature = "serve")]
+const EXIT_UNAVAILABLE: i32 = 3;
+
 #[cfg(feature = "serve")]
 async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
+    if options.print_schema {
+        match serde_json::to_string_pretty(&llmshim::serve::config_schema()) {
+            Ok(schema) => {
+                println!("{schema}");
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("cannot render the schema: {error}");
+                return EXIT_INVALID;
+            }
+        }
+    }
     let path = std::path::Path::new(options.config.as_deref().unwrap_or_default());
     let report = |issues: &[llmshim::serve::Issue]| {
         eprintln!("{}: {} problem(s)", path.display(), issues.len());
@@ -939,10 +959,41 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         report(&unsupported);
         return 1;
     }
-    let missing = config.check_references(&env);
-    if !missing.is_empty() {
-        report(&missing);
-        return 1;
+    let summary = || {
+        format!(
+            "version {}, {} provider(s), {} key(s), {} route(s)",
+            config.version,
+            config.providers.len(),
+            config.keys.len(),
+            config.routes.len()
+        )
+    };
+    if options.structure_only {
+        // The shape and the rules that need no input but the file. No secret,
+        // certificate or environment variable is read.
+        println!(
+            "{}: valid structure ({}; secrets, certificates and the environment not checked)",
+            path.display(),
+            summary()
+        );
+        return 0;
+    }
+    // A rule broken by the values of the secrets (a caller token equal to an
+    // upstream key) is a defect in what was configured: status 1. A secret that
+    // is unset, blank or unreadable is a fact about this environment: status 3.
+    // Both are reported together; a defect outranks an absence.
+    let broken = config.check_same_values(&env);
+    let absent = config.check_secrets_present(&env);
+    if !broken.is_empty() || !absent.is_empty() {
+        let status = if broken.is_empty() {
+            EXIT_UNAVAILABLE
+        } else {
+            EXIT_INVALID
+        };
+        let mut problems = broken;
+        problems.extend(absent);
+        report(&problems);
+        return status;
     }
     // Load the TLS material before anything is created or started, so a bad
     // certificate, or a key that does not match it, stops the start cleanly.
@@ -969,14 +1020,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             report(&[issue]);
             return 1;
         }
-        println!(
-            "{}: valid (version {}, {} provider(s), {} key(s), {} route(s))",
-            path.display(),
-            config.version,
-            config.providers.len(),
-            config.keys.len(),
-            config.routes.len()
-        );
+        println!("{}: valid ({})", path.display(), summary());
         return 0;
     }
     // Registered before anything is built or bound, so a SIGHUP that arrives

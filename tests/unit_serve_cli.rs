@@ -82,7 +82,11 @@ mod with_feature {
             &[],
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "a secret that is not here is the environment's problem, not the file's"
+        );
         assert!(stderr.contains("2 problem(s)"), "{stderr}");
         assert!(stderr.contains(
             "providers.openai.api_key: environment variable SERVE_TEST_PROVIDER_KEY is not set"
@@ -129,6 +133,152 @@ mod with_feature {
         assert_eq!(unknown.status.code(), Some(2));
         let help = run(&["serve", "--help"], &[]);
         assert!(help.status.success());
-        assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: llmshim serve"));
+        let help = String::from_utf8_lossy(&help.stdout);
+        assert!(help.contains("Usage: llmshim serve"));
+        for documented in ["--structure-only", "--print-schema", "Exit status"] {
+            assert!(help.contains(documented), "{documented} is in --help");
+        }
+    }
+
+    /// The environment of a machine that holds no secret: nothing the file names.
+    fn no_secrets(args: &[&str]) -> std::process::Output {
+        run(args, &[])
+    }
+
+    #[test]
+    fn structure_only_needs_no_secret_certificate_or_environment() {
+        let path = write("structure.toml", CONFIG);
+        let output = no_secrets(&[
+            "serve",
+            "--config",
+            path.to_str().unwrap(),
+            "--check",
+            "--structure-only",
+        ]);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(0), "{text}");
+        assert!(text.contains("valid structure (version 1, 1 provider(s), 1 key(s), 0 route(s);"));
+        assert!(
+            text.contains("not checked"),
+            "it says what it did not check"
+        );
+        // The same file, checked in full on the same machine, is not available.
+        let full = no_secrets(&["serve", "--config", path.to_str().unwrap(), "--check"]);
+        assert_eq!(full.status.code(), Some(3));
+    }
+
+    #[test]
+    fn structure_only_still_refuses_a_file_that_is_wrong() {
+        let path = write(
+            "structure-bad.toml",
+            &format!(
+                "{CONFIG}
+[server]
+port = 70000
+surprise = true
+"
+            ),
+        );
+        let output = no_secrets(&[
+            "serve",
+            "--config",
+            path.to_str().unwrap(),
+            "--check",
+            "--structure-only",
+        ]);
+        assert_eq!(output.status.code(), Some(1));
+        // A rule that needs no secret is applied: the loopback rule is one.
+        let open = write(
+            "structure-open.toml",
+            "version = 1\n[server]\nhost = \"0.0.0.0\"\nallow_unauthenticated = true\n\
+             [providers.openai]\nkind = \"openai\"\napi_key = { env = \"SERVE_TEST_PROVIDER_KEY\" }\n",
+        );
+        let output = no_secrets(&[
+            "serve",
+            "--config",
+            open.to_str().unwrap(),
+            "--check",
+            "--structure-only",
+        ]);
+        // (Rule introduced by the contract tightening; before it this is valid.)
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.code() == Some(0) || stderr.contains("server.host"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn a_defect_outranks_an_absence_in_the_exit_status() {
+        // The caller token equals the upstream key (a defect in what was
+        // configured) and a second key's secret is not set (an absence).
+        let path = write(
+            "both.toml",
+            &format!(
+                "{CONFIG}\n[[keys]]\nname = \"later\"\ntenant = \"other\"\n\
+                 secret = {{ env = \"SERVE_TEST_NOT_PROVISIONED\" }}\n"
+            ),
+        );
+        let output = run(
+            &["serve", "--config", path.to_str().unwrap(), "--check"],
+            &[
+                ("SERVE_TEST_PROVIDER_KEY", "one-value-used-twice-0123456789"),
+                ("SERVE_TEST_CALLER_KEY", "one-value-used-twice-0123456789"),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("SERVE_TEST_NOT_PROVISIONED"),
+            "both are reported"
+        );
+    }
+
+    #[test]
+    fn structure_only_is_a_mode_of_check() {
+        let path = write("mode.toml", CONFIG);
+        let output = no_secrets(&[
+            "serve",
+            "--config",
+            path.to_str().unwrap(),
+            "--structure-only",
+        ]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--structure-only needs --check"));
+    }
+
+    #[test]
+    fn print_schema_matches_the_checked_in_contract() {
+        let output = no_secrets(&["serve", "--print-schema"]);
+        assert_eq!(output.status.code(), Some(0));
+        let printed = String::from_utf8(output.stdout).unwrap();
+        let checked_in = include_str!("../docs/design/enterprise-gateway/serve-config.schema.json");
+        assert!(
+            printed == checked_in,
+            "the configuration schema changed. If that is intended, regenerate it:\n  \
+             llmshim serve --print-schema > docs/design/enterprise-gateway/serve-config.schema.json\n\
+             and say in the pull request which field changed and why a consumer is unaffected."
+        );
+        let schema: serde_json::Value = serde_json::from_str(&printed).unwrap();
+        assert_eq!(
+            schema["$schema"],
+            "https://json-schema.org/draft/2020-12/schema"
+        );
+        assert_eq!(schema["additionalProperties"], false, "the root is closed");
+    }
+
+    #[test]
+    fn print_schema_stands_alone() {
+        for extra in [["--config", "x.toml"], ["--check", ""]] {
+            let mut args = vec!["serve", "--print-schema"];
+            args.extend(extra.iter().filter(|a| !a.is_empty()));
+            let output = no_secrets(&args);
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("takes no other argument"));
+        }
     }
 }

@@ -12,6 +12,11 @@ pub(crate) struct Options {
 pub(crate) struct ServeOptions {
     pub config: Option<String>,
     pub check: bool,
+    /// With `--check`: validate the file's shape and rules only. Reads no secret,
+    /// certificate or environment variable, so it runs where none is provisioned.
+    pub structure_only: bool,
+    /// Print the configuration's JSON Schema and exit.
+    pub print_schema: bool,
 }
 #[derive(Debug, Default)]
 pub(crate) struct ServerOptions {
@@ -99,6 +104,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, String> {
                 match arg {
                     "--help" | "-h" => options.help = true,
                     "--check" => options.serve.check = true,
+                    "--structure-only" => options.serve.structure_only = true,
+                    "--print-schema" => options.serve.print_schema = true,
                     "--config" | "-c" => {
                         options.serve.config = Some(value(tail, &mut at, arg)?.into())
                     }
@@ -109,8 +116,20 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, String> {
                 }
                 at += 1;
             }
-            if !options.help && options.serve.config.is_none() {
-                return Err("serve requires --config <PATH>".into());
+            if !options.help && options.serve.print_schema {
+                if options.serve.config.is_some()
+                    || options.serve.check
+                    || options.serve.structure_only
+                {
+                    return Err("--print-schema takes no other argument".into());
+                }
+            } else if !options.help {
+                if options.serve.config.is_none() {
+                    return Err("serve requires --config <PATH>".into());
+                }
+                if options.serve.structure_only && !options.serve.check {
+                    return Err("--structure-only needs --check".into());
+                }
             }
         }
         "chat" => {
@@ -184,7 +203,7 @@ pub(crate) fn usage(command: &str) -> Option<&'static str> {
         "proxy"=>"Usage: llmshim proxy [--host <IP>] [--port <PORT>]\n\nCLI options override LLMSHIM_HOST/LLMSHIM_PORT and saved configuration.\n  -h, --help  Print help without starting the server",
         "gateway"=>"Usage: llmshim gateway [--host <IP>] [--port <PORT>]\n\nCLI options override LLMSHIM_HOST/LLMSHIM_PORT and saved configuration.\n  -h, --help  Print help without starting the server",
         #[cfg(feature = "serve")]
-        "serve"=>"Usage: llmshim serve --config <PATH> [--check]\n\nIn development. Runs the gateway from a versioned .toml or .json server configuration.\nReads nothing from the environment except the variables the file names.\n  --check     Validate the file and its secret references, then exit\n  -h, --help  Print help without starting the server",
+        "serve"=>"Usage: llmshim serve --config <PATH> [--check [--structure-only]]\n       llmshim serve --print-schema\n\nIn development. Runs the gateway from a versioned .toml or .json server configuration.\nReads nothing from the environment except the variables the file names.\n  --check           Validate the file and its secret references, then exit\n  --structure-only  With --check: validate the file's shape and rules only; reads no\n                    secret, certificate or environment variable\n  --print-schema    Print the configuration's JSON Schema, then exit\n  -h, --help        Print help without starting the server\n\nExit status: 0 valid or started and stopped cleanly; 1 the file or a secret's value is\ninvalid, or the server could not start; 2 bad arguments; 3 a referenced secret is not\navailable (unset, empty or unreadable), so the file could not be fully checked here.",
         "chat"=>"Usage: llmshim chat [--log <PATH>]",
         "models"=>"Usage: llmshim models [--all] [--json] [--refresh]",
         "get"=>"Usage: llmshim get <key>",

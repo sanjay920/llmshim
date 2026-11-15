@@ -14,6 +14,7 @@
 //!
 //! Design notes: `docs/design/enterprise-gateway/0001-server-config.md`.
 
+use schemars::JsonSchema;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,10 +77,12 @@ pub enum Format {
 }
 
 /// The whole file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ServeConfig {
+    /// The schema version. Only 1 exists; another is refused before anything else.
+    #[schemars(range(min = 1, max = 1))]
     pub version: u32,
     #[serde(default)]
     pub server: Server,
@@ -115,7 +118,7 @@ pub struct ServeConfig {
 /// must pass the checks `--check` applies, or none of it is used. `SIGHUP`
 /// always triggers a reload (on platforms that have it); this table controls
 /// whether the file is also polled.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Reload {
@@ -193,7 +196,7 @@ where
 }
 
 /// Listener and authentication posture.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Server {
@@ -227,7 +230,7 @@ impl Default for Server {
 /// changes (a certificate manager renewed it) new connections use the new
 /// material without a restart. A replacement that does not load is ignored and
 /// the previous certificate stays in service.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Tls {
@@ -259,7 +262,7 @@ fn default_port() -> u16 {
 }
 
 /// Fleet mode. Requires a binary built with `--features serve-redis`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Fleet {
@@ -271,7 +274,7 @@ pub struct Fleet {
 /// A second listener for operational endpoints: `/metrics`,
 /// `/v1/gateway/stats`, `/health` and `/ready`. When it is configured the main
 /// listener answers 404 for all four, so callers never reach them.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Admin {
@@ -295,7 +298,7 @@ pub struct Admin {
 }
 
 /// Where the server keeps what it must remember between requests.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct State {
@@ -311,7 +314,7 @@ pub struct State {
 }
 
 /// What the server records about the requests it handles.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Logging {
@@ -332,7 +335,7 @@ pub struct Logging {
 }
 
 /// Which adapter a provider entry uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum ProviderKind {
@@ -380,7 +383,7 @@ impl ProviderKind {
 }
 
 /// One upstream. Its table name is the routing prefix (`<name>/<model>`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Provider {
@@ -441,6 +444,50 @@ impl<'de> Deserialize<'de> for SecretRef {
     }
 }
 
+/// The schema of the reference, written by hand because the reader above is: a
+/// derived schema would describe the two optional fields, not "exactly one".
+impl JsonSchema for SecretRef {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SecretRef".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "A secret by reference, never inline: exactly one of `env` (the name of an environment variable) or `file` (the path of a file holding the value).",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"env": {"type": "string", "pattern": "^[A-Z0-9_]+$"}},
+                    "required": ["env"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {"file": {"type": "string"}},
+                    "required": ["file"],
+                    "additionalProperties": false
+                }
+            ]
+        })
+    }
+}
+
+/// The configuration contract as a JSON Schema (draft 2020-12), derived from the
+/// types the parser reads so the two cannot drift. `llmshim serve --print-schema`
+/// prints it; a copy is checked in and compared by a test, so a change to the
+/// contract is a visible diff.
+///
+/// The schema describes shape: field names, which are required, types and each
+/// type's own range (a port is 0 to 65535), closed objects, the one version.
+/// The rules that compare values, read the environment or need two fields
+/// together (a caller token must differ from an upstream key; a path must be
+/// absolute; the admin port must differ from the main one; a spend window is at
+/// most 366 days) are `serve --check`'s, not a schema's: a file the schema
+/// accepts can still fail `--check`, and one it refuses always does.
+pub fn schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(ServeConfig)).expect("a schema is JSON")
+}
+
 impl fmt::Debug for SecretRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (&self.env, &self.file) {
@@ -452,7 +499,7 @@ impl fmt::Debug for SecretRef {
 }
 
 /// Provider-side admission limits.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Limits {
@@ -472,7 +519,7 @@ pub struct Limits {
     pub providers: BTreeMap<String, ProviderLimits>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ProviderLimits {
@@ -483,7 +530,7 @@ pub struct ProviderLimits {
 }
 
 /// A caller credential and the identity it carries.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct GatewayKey {
@@ -524,7 +571,7 @@ pub struct GatewayKey {
 }
 
 /// A named route: `route/<name>` resolves to `model` with default settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Route {
@@ -1095,6 +1142,17 @@ impl ServeConfig {
     /// caller (or a test) decides what the environment is.
     pub fn check_references(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<Issue> {
         let mut issues = self.check_same_values(env);
+        issues.extend(self.check_secrets_present(env));
+        issues
+    }
+
+    /// Whether every referenced secret is available: the environment variable is
+    /// set and not blank, or the file can be read and is not blank. These are
+    /// facts about the environment the check runs in, not about the file, so
+    /// `serve` reports them with their own exit status; a pipeline that holds no
+    /// secrets can skip them with `--structure-only`.
+    pub fn check_secrets_present(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<Issue> {
+        let mut issues = Vec::new();
         for (at, secret) in self.secret_refs() {
             if let Some(name) = &secret.env {
                 match env(name) {
@@ -1453,6 +1511,104 @@ mod tests {
         let config = ServeConfig::parse(example, Format::Toml).unwrap();
         assert_eq!(config.providers.len(), 3);
         assert_eq!(config.keys.len(), 3);
+    }
+
+    fn schema_validator() -> jsonschema::Validator {
+        jsonschema::validator_for(&schema()).expect("the schema compiles")
+    }
+
+    fn toml_as_json(text: &str) -> serde_json::Value {
+        let value: toml::Value = toml::from_str(text).expect("valid TOML");
+        serde_json::to_value(value).expect("TOML is JSON-shaped")
+    }
+
+    #[test]
+    fn the_documented_example_satisfies_the_schema() {
+        let example = include_str!("../../docs/design/enterprise-gateway/example.toml");
+        let errors: Vec<String> = schema_validator()
+            .iter_errors(&toml_as_json(example))
+            .map(|error| format!("{} at {}", error, error.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert!(schema_validator().is_valid(&toml_as_json(MINIMAL)));
+    }
+
+    #[test]
+    fn the_schema_refuses_what_the_parser_refuses_by_shape() {
+        let validator = schema_validator();
+        for (what, text) in [
+            (
+                "an unknown top-level field",
+                format!("{MINIMAL}\nsurprise = 1"),
+            ),
+            (
+                "an unknown nested field",
+                format!("{MINIMAL}\n[server]\ncolour = \"red\""),
+            ),
+            (
+                "another version",
+                MINIMAL.replace("version = 1", "version = 2"),
+            ),
+            ("no version", MINIMAL.replace("version = 1", "")),
+            (
+                "an inline secret",
+                MINIMAL.replace("{ env = \"OPENAI_API_KEY\" }", "\"sk-pasted-inline\""),
+            ),
+            (
+                "a secret naming both an env var and a file",
+                MINIMAL.replace(
+                    "{ env = \"OPENAI_API_KEY\" }",
+                    "{ env = \"OPENAI_API_KEY\", file = \"/run/key\" }",
+                ),
+            ),
+            (
+                "a port that does not fit",
+                format!("{MINIMAL}\n[server]\nport = 70000"),
+            ),
+            (
+                "a provider kind that does not exist",
+                MINIMAL.replace("kind = \"openai\"", "kind = \"nope\""),
+            ),
+            (
+                "a key with no tenant",
+                MINIMAL.replace("tenant = \"platform\"", ""),
+            ),
+        ] {
+            assert!(
+                !validator.is_valid(&toml_as_json(&text)),
+                "the schema must refuse {what}"
+            );
+            // And the parser agrees: no file the schema refuses parses.
+            assert!(
+                ServeConfig::parse(&text, Format::Toml).is_err(),
+                "the parser must refuse {what} too"
+            );
+        }
+    }
+
+    #[test]
+    fn every_documented_top_level_table_is_in_the_schema() {
+        // A table added to ServeConfig and left out of the schema would be
+        // invisible to a consumer validating its files.
+        let schema = schema();
+        let properties = schema["properties"].as_object().unwrap();
+        for table in [
+            "version",
+            "server",
+            "providers",
+            "limits",
+            "state",
+            "logging",
+            "fleet",
+            "admin",
+            "keys",
+            "routes",
+            "reload",
+        ] {
+            assert!(properties.contains_key(table), "{table}");
+        }
+        assert_eq!(properties.len(), 11, "a new table needs a line here");
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]

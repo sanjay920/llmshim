@@ -1,0 +1,553 @@
+{
+  "$defs": {
+    "Admin": {
+      "additionalProperties": false,
+      "description": "A second listener for operational endpoints: `/metrics`,\n`/v1/gateway/stats`, `/health` and `/ready`. When it is configured the main\nlistener answers 404 for all four, so callers never reach them.",
+      "properties": {
+        "allow_unauthenticated": {
+          "default": false,
+          "description": "Serve the operational endpoints without a token. Without this, an\n`[admin]` table must set `token`: like the main listener, the admin\nlistener is never open by accident.",
+          "type": "boolean"
+        },
+        "host": {
+          "default": "127.0.0.1",
+          "description": "IP address to bind. Defaults to loopback.",
+          "type": "string"
+        },
+        "port": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tls": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tls"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Terminate TLS on the admin listener as well."
+        },
+        "token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bearer token required for `/metrics` and `/v1/gateway/stats`, by\nreference. `/health` and `/ready` stay open so orchestrators can probe.\nSet this or `allow_unauthenticated`; neither is an error."
+        }
+      },
+      "required": [
+        "port"
+      ],
+      "type": "object"
+    },
+    "Fleet": {
+      "additionalProperties": false,
+      "description": "Fleet mode. Requires a binary built with `--features serve-redis`.",
+      "properties": {
+        "redis_url": {
+          "$ref": "#/$defs/SecretRef",
+          "description": "The Redis URL (`redis://` or `rediss://`), by reference because it can\ncarry a password."
+        }
+      },
+      "required": [
+        "redis_url"
+      ],
+      "type": "object"
+    },
+    "GatewayKey": {
+      "additionalProperties": false,
+      "description": "A caller credential and the identity it carries.",
+      "properties": {
+        "budget_allow_unpriced": {
+          "default": false,
+          "description": "Admit requests whose cost cannot be bounded before sending.",
+          "type": "boolean"
+        },
+        "budget_usd": {
+          "default": null,
+          "description": "USD spend cap per window.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "budget_window_secs": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "client_san": {
+          "default": null,
+          "description": "Authenticate by client certificate instead of a bearer token: the\nsubject alternative name to match, written `dns:<name>` or\n`uri:<uri>` (for example `uri:spiffe://corp/payments/checkout`). Needs\n`server.tls.client_ca_file`. A certificate is renewed far more often than\na token, so this names the workload, not one certificate. A request that\nalso sends a bearer token is authenticated by the token alone.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Operator-facing label; never sent on the wire.",
+          "type": "string"
+        },
+        "rpm": {
+          "default": null,
+          "description": "Per-tenant requests per minute. Zero denies every request.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "secret": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The bearer token, by reference. Mutually exclusive with `sha256`."
+        },
+        "sha256": {
+          "default": null,
+          "description": "Lower-case hex SHA-256 of the bearer token, so the deployment holds no\ncaller secret at all. Mutually exclusive with `secret`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "tier": {
+          "default": 0,
+          "description": "Queue priority; higher is served sooner.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tpm": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "tenant"
+      ],
+      "type": "object"
+    },
+    "Limits": {
+      "additionalProperties": false,
+      "description": "Provider-side admission limits.",
+      "properties": {
+        "max_concurrency": {
+          "default": null,
+          "description": "In-flight upstream requests per provider, per instance.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "providers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ProviderLimits"
+          },
+          "type": "object"
+        },
+        "queue_timeout_ms": {
+          "default": null,
+          "description": "Longest a request may wait for capacity before a 503.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpm": {
+          "default": null,
+          "description": "Requests per minute for every provider without its own entry.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tpm": {
+          "default": null,
+          "description": "Tokens per minute for every provider without its own entry.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Logging": {
+      "additionalProperties": false,
+      "description": "What the server records about the requests it handles.",
+      "properties": {
+        "access_log": {
+          "default": null,
+          "description": "One JSON line per request on the main listener: when, request id, method,\npath, status, latency to the response headers, the caller's tenant and a\nshort fingerprint of the credential. Never a token, a header or a body.\n`\"stdout\"`, or an absolute file path (created with owner-only access and\nappended to; rotate it with `copytruncate` or let the platform collect\nstdout). Off when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "usage_log": {
+          "default": null,
+          "description": "One JSON line per provider attempt when it ends: tenant, provider, model,\noutcome, tokens and USD cost. Per attempt, not per request: a retry or a\nfallback is a separate charge. For showback and chargeback; sum `cost_usd`\nper tenant, treating `null` as unknown. Same targets as `access_log`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Provider": {
+      "additionalProperties": false,
+      "description": "One upstream. Its table name is the routing prefix (`<name>/<model>`).",
+      "properties": {
+        "api_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "base_url": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ProviderKind"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ProviderKind": {
+      "description": "Which adapter a provider entry uses.",
+      "oneOf": [
+        {
+          "enum": [
+            "openai",
+            "anthropic",
+            "gemini",
+            "xai",
+            "cerebras",
+            "openrouter"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "openai-compatible",
+          "description": "Any OpenAI Chat Completions-compatible server at `base_url`.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProviderLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "rpm": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tpm": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Reload": {
+      "additionalProperties": false,
+      "description": "Reloading `[[keys]]` without a restart.\n\nOnly the caller keys can change while the server runs; a change to anything\nelse in the file is refused by path and needs a restart. The whole new file\nmust pass the checks `--check` applies, or none of it is used. `SIGHUP`\nalways triggers a reload (on platforms that have it); this table controls\nwhether the file is also polled.",
+      "properties": {
+        "interval_secs": {
+          "default": null,
+          "description": "How often to look, in seconds. Defaults to 30.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "watch": {
+          "default": true,
+          "description": "Look for a changed file (and changed secret files) on a timer. Defaults\nto true.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Route": {
+      "additionalProperties": false,
+      "description": "A named route: `route/<name>` resolves to `model` with default settings.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "settings": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "Request settings applied when the request does not set them itself.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
+    "SecretRef": {
+      "description": "A secret by reference, never inline: exactly one of `env` (the name of an environment variable) or `file` (the path of a file holding the value).",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "env": {
+              "pattern": "^[A-Z0-9_]+$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "env"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "file": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "file"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Server": {
+      "additionalProperties": false,
+      "description": "Listener and authentication posture.",
+      "properties": {
+        "allow_unauthenticated": {
+          "default": false,
+          "description": "Serve callers with no key. Off by default: a file with no `[[keys]]`\nis refused unless this is set.",
+          "type": "boolean"
+        },
+        "host": {
+          "default": "127.0.0.1",
+          "description": "IP address to bind. Defaults to loopback; a container sets `0.0.0.0`.",
+          "type": "string"
+        },
+        "port": {
+          "default": 3000,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tls": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tls"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Terminate TLS on the main listener. Without it the listener is plain\nHTTP and belongs behind a terminating proxy or service mesh."
+        }
+      },
+      "type": "object"
+    },
+    "State": {
+      "additionalProperties": false,
+      "description": "Where the server keeps what it must remember between requests.",
+      "properties": {
+        "idempotency_ttl_secs": {
+          "default": null,
+          "description": "How long a completed idempotent request's answer is kept, in seconds.\nDefaults to 300.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "receipts_dir": {
+          "default": null,
+          "description": "Directory for replay receipts (signed reasoning and tool-call identity a\nclient replays later). Defaults to the platform's local data directory.\nMount a persistent volume here to keep receipts across restarts.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Tls": {
+      "additionalProperties": false,
+      "description": "Server certificate and key, as PEM files. The files are watched: when either\nchanges (a certificate manager renewed it) new connections use the new\nmaterial without a restart. A replacement that does not load is ignored and\nthe previous certificate stays in service.",
+      "properties": {
+        "cert_file": {
+          "description": "PEM certificate chain, leaf first.",
+          "type": "string"
+        },
+        "client_ca_file": {
+          "default": null,
+          "description": "PEM bundle of the certificate authorities whose client certificates are\naccepted. When set, **every** connection to this listener must present a\ncertificate signed by one of them, or the handshake fails; a key with\n`client_san` then authenticates by that certificate alone. Main listener\nonly. The file is watched with the certificate and key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key_file": {
+          "description": "PEM private key (PKCS#8, PKCS#1 or SEC1).",
+          "type": "string"
+        },
+        "reload_interval_secs": {
+          "default": null,
+          "description": "How often to look for changed files, in seconds. Defaults to 30.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cert_file",
+        "key_file"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The whole file.",
+  "properties": {
+    "admin": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Admin"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "A separate listener for operational endpoints. Without it they are\nserved on the main listener, as the gateway does."
+    },
+    "fleet": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Fleet"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Run as one replica of a fleet sharing a Redis instance. Without it the\nserver is a single instance with in-process state."
+    },
+    "keys": {
+      "items": {
+        "$ref": "#/$defs/GatewayKey"
+      },
+      "type": "array"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits"
+    },
+    "logging": {
+      "$ref": "#/$defs/Logging"
+    },
+    "providers": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Provider"
+      },
+      "type": "object"
+    },
+    "reload": {
+      "$ref": "#/$defs/Reload",
+      "description": "How a running server picks up changes to `keys`."
+    },
+    "routes": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Route"
+      },
+      "type": "object"
+    },
+    "server": {
+      "$ref": "#/$defs/Server"
+    },
+    "state": {
+      "$ref": "#/$defs/State"
+    },
+    "version": {
+      "description": "The schema version. Only 1 exists; another is refused before anything else.",
+      "format": "uint32",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version"
+  ],
+  "title": "ServeConfig",
+  "type": "object"
+}
