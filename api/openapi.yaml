@@ -554,7 +554,7 @@ components:
                 description: The class of the last failed refresh (`network`, `status`, `too_large`, `malformed`, `no_usable_keys`).
     PolicySnapshotStatus:
       type: object
-      required: [org, generation, signer, applied_at_epoch_secs, max_age_secs, stale, signer_untrusted]
+      required: [org, generation, signer, applied_at_epoch_secs, max_age_secs, stale, signer_untrusted, last_pull_ok_at_epoch_secs, last_pull_error]
       additionalProperties: false
       properties:
         org: {type: string}
@@ -568,6 +568,8 @@ components:
         signer_untrusted:
           type: boolean
           description: The signer of the snapshot in force is no longer in `verify_keys`; it keeps serving until a trusted signer's snapshot replaces it
+        last_pull_ok_at_epoch_secs: {type: [integer, 'null'], description: With `source`, when the control plane last answered usefully (a snapshot or not modified)}
+        last_pull_error: {type: [string, 'null'], description: With `source`, why the last poll did not (fixed text, never a token or a body)}
     ReloadAttempt:
       type: object
       required: [at_epoch_secs, outcome, issues, changes]

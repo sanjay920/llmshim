@@ -139,6 +139,16 @@ impl Refusal {
     }
 }
 
+/// Verify a fetched envelope for the cache: signed by a trusted key, of this organization, a
+/// payload this build reads. Returns the generation. The floor is judged later, when it loads.
+pub fn verify_for_cache(bytes: &[u8], verify_keys: &[String], org: &str) -> Result<u64, String> {
+    let (payload, _, _) = verify_envelope(bytes, verify_keys).map_err(|r| r.message())?;
+    if payload.org != org {
+        return Err(Refusal::WrongOrg.message());
+    }
+    Ok(payload.generation)
+}
+
 /// A verified snapshot, turned into what the server reads.
 #[derive(Debug)]
 pub struct Snapshot {
@@ -336,9 +346,22 @@ pub fn load(
     floor: Option<&Floor>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Snapshot, Vec<Issue>> {
+    let path = control_plane
+        .snapshot_file
+        .clone()
+        .ok_or_else(|| vec![Refusal::Unreadable.issue()])?;
+    load_from(&path, control_plane, floor, now)
+}
+
+/// [`load`] from `path` (a pulled snapshot is kept in `state.policy_dir`).
+pub fn load_from(
+    path: &Path,
+    control_plane: &ControlPlane,
+    floor: Option<&Floor>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Snapshot, Vec<Issue>> {
     let refuse = |refusal: Refusal| vec![refusal.issue()];
-    let bytes =
-        std::fs::read(&control_plane.snapshot_file).map_err(|_| refuse(Refusal::Unreadable))?;
+    let bytes = std::fs::read(path).map_err(|_| refuse(Refusal::Unreadable))?;
     let (payload, payload_sha256, signer) =
         verify_envelope(&bytes, &control_plane.verify_keys).map_err(refuse)?;
     if payload.org != control_plane.org {
@@ -404,6 +427,8 @@ struct ClockInner {
 }
 
 struct ClockState {
+    last_pull_ok: Option<u64>,
+    last_pull_error: Option<String>,
     generation: u64,
     signer: String,
     applied_at: u64,
@@ -425,6 +450,10 @@ pub struct SnapshotStatus {
     /// The signer of the snapshot in force is no longer in `verify_keys`: it keeps
     /// serving until a snapshot from a trusted key replaces it.
     pub signer_untrusted: bool,
+    /// With `source`: when the control plane last answered usefully (a snapshot or "not
+    /// modified"), and why the last poll did not, as fixed text. Both `null` for a file.
+    pub last_pull_ok_at_epoch_secs: Option<u64>,
+    pub last_pull_error: Option<String>,
 }
 
 pub fn epoch_secs() -> u64 {
@@ -441,6 +470,8 @@ impl SnapshotClock {
             max_age_secs: control_plane.max_age_secs,
             refuse_when_stale: control_plane.refuse_when_stale,
             state: std::sync::Mutex::new(ClockState {
+                last_pull_ok: None,
+                last_pull_error: None,
                 generation: 0,
                 signer: String::new(),
                 applied_at: epoch_secs(),
@@ -470,6 +501,18 @@ impl SnapshotClock {
         state.signer = signer.to_owned();
     }
 
+    /// A poll of the control plane ended: `Ok` or a fixed reason.
+    pub fn pulled(&self, result: Result<(), String>) {
+        let mut state = self.state();
+        match result {
+            Ok(()) => {
+                state.last_pull_ok = Some(epoch_secs());
+                state.last_pull_error = None;
+            }
+            Err(reason) => state.last_pull_error = Some(reason),
+        }
+    }
+
     pub fn set_signer_untrusted(&self, untrusted: bool) {
         self.state().signer_untrusted = untrusted;
     }
@@ -495,6 +538,8 @@ impl SnapshotClock {
             max_age_secs: self.0.max_age_secs,
             stale: self.stale_at(&state, epoch_secs()),
             signer_untrusted: state.signer_untrusted,
+            last_pull_ok_at_epoch_secs: state.last_pull_ok,
+            last_pull_error: state.last_pull_error.clone(),
         }
     }
 }

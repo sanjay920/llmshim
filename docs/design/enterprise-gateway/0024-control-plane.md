@@ -311,6 +311,47 @@ crate with `features = ["serve"]` for the snapshot signer and loader, so the two
   `cargo update -p llmshim -p llmshim-catalog` in `crates/llmshim-control` (noted in CLAUDE.md).
 - Slice 3b added the HTTP API (0026), `openapi.yaml` (compared with the router's route table in both directions by a test) and the `llmshim-control serve` binary. Postgres is slice 4.
 
+## Slice 5 as built (the data plane pulls)
+
+`[control_plane.source]` (`url`, `token`, `poll_interval_secs`, `allow_insecure_http`) replaces
+`snapshot_file` (exactly one of the two). The replica polls `GET {url}/v1/orgs/{org}/snapshot` (0026)
+with the bearer token and `If-None-Match: "<generation>"`.
+
+- **Nothing is trusted until it verifies.** The body is verified against `verify_keys` and checked for the
+  organization (`snapshot::verify_for_cache`) and only a **newer** generation is written, atomically, to
+  `state.policy_dir/snapshot.json`; then the reload a signal would run applies it at once, through the same
+  all-or-nothing path as a file (the floor, the key rules, the in-memory generation). A body that does not
+  verify, a lower generation, a 401, a 404, a 5xx, an unreachable host, a body over 8 MiB: the cache and what
+  serves are unchanged, and the status says why in fixed text (`snapshot.last_pull_error`; never the token
+  or the body). `snapshot.last_pull_ok_at_epoch_secs` is the last useful answer (a snapshot or "not modified").
+- **The token** is read from its reference at each poll (a rotated file applies with no restart), is sent
+  only to `url`, redirects are not followed (they would carry it elsewhere), and the url is just a
+  scheme and host: no credentials, path or query. Plain `http://` needs `allow_insecure_http`.
+- **Start.** One pull before the keys are read. With a verified snapshot already cached a control plane that
+  is down is not a reason to refuse to start (it logs and serves the cache); with none it is
+  (exit 1: no caller could be identified). `--check` and `--structure-only` fetch nothing.
+- The age (`max_age_secs`, `stale`) counts from when a **new generation** applied, as for a file: a control
+  plane that is up but re-issues nothing is stale by the rule stated in 2b, and one that is down is stale the
+  same way; the replica keeps serving the cache either way unless `refuse_when_stale`.
+- The control plane's `ETag` is the generation; the replica uses its own verified cache generation, not the header.
+- **Judged exactly as a load would judge it, before it can replace the cache.** A pulled body is written
+  to a temporary file (`create_new`, synced, never following a link) and checked with the **same** function a
+  load uses (`check_snapshot_candidate`: signature, organization, floor, `min_generation`, content, the key
+  rules) against the configuration **as it is now**; only then is it renamed over `snapshot.json` (and the
+  directory synced). A snapshot that is signed but that this configuration would refuse therefore never
+  replaces the last good one, so a restart cannot find a cache it cannot load.
+- **The configuration is re-read at every poll**, so `verify_keys` added or removed by a reload are the list
+  the poller judges by; the poller and the loader cannot disagree about who may sign.
+- **The body is bounded as it arrives** (8 MiB, no `Content-Length` needed) and the client asks for no
+  compression, so a small compressed body cannot inflate past the cap. Redirects are not followed. The
+  standard proxy variables apply to the client (a plain `http://` url with `HTTP_PROXY` sends the token to the
+  proxy: another reason `allow_insecure_http` is a choice).
+- **The organization is a path segment**: with a source it may hold only letters, digits, `.`, `_` and `-`,
+  starting with a letter or digit, and the url must be a scheme, a host and an optional port (parsed, no
+  backslash, no port 0).
+- A reload that refuses a snapshot just cached (another change in the same file) is logged and shown in
+  `last_pull_error`, not swallowed.
+
 ## Slices
 
 1. This note.
@@ -325,5 +366,4 @@ crate with `features = ["serve"]` for the snapshot signer and loader, so the two
 3. The `llmshim-control` crate: **3a done** (SQLite store, the model above, key lifecycle, snapshot
    publication as a library); 3b done (the HTTP API of 0026, its OpenAPI document and the `llmshim-control` binary).
 4. Postgres.
-5. The pull delivery and the data plane's poller (after 3: the endpoint is its first
-   network surface).
+5. **Done:** the pull delivery and the data plane's poller (above).
