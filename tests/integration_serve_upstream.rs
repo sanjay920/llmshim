@@ -69,18 +69,35 @@ async fn a_configured_header_deadline_closes_a_connection_that_says_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_connection_limit_is_the_files_and_a_second_connection_waits_for_the_first() {
-    let upstream = mockito::Server::new_async().await;
+async fn the_connection_limit_is_the_files_not_the_environments() {
+    // The harness's canary variable says one connection; the file says two. Two
+    // connections must be served, so the file wins, and a third waits.
+    let mut upstream = mockito::Server::new_async().await;
+    let _ok = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .create_async()
+        .await;
     let text = render(
         &upstream.url(),
-        "max_connections = 1\nheader_timeout_ms = 60000",
+        "max_connections = 2\nheader_timeout_ms = 60000",
         "",
     );
     let server = start(&text, "upstream-connections", &[]);
     let address = server.base.trim_start_matches("http://").to_owned();
-    // The first connection takes the only slot and says nothing.
+    // One idle connection holds a slot; a request on a second one is served
+    // (with a limit of one, as the canary says, it would wait).
     let first = tokio::net::TcpStream::connect(&address).await.unwrap();
-    // A request that needs a second connection is not served while it is held.
+    let served = tokio::time::timeout(
+        Duration::from_secs(10),
+        chat(&server, Some(CALLER_KEY), "inference/test-model"),
+    )
+    .await
+    .expect("a second connection is served while one is held");
+    assert_eq!(served.status(), 200);
+    // Two idle connections fill the limit: a third request waits behind them...
+    let second = tokio::net::TcpStream::connect(&address).await.unwrap();
     let waiting = tokio::time::timeout(
         Duration::from_millis(1500),
         chat(&server, Some(CALLER_KEY), "inference/test-model"),
@@ -88,7 +105,15 @@ async fn the_connection_limit_is_the_files_and_a_second_connection_waits_for_the
     .await;
     assert!(
         waiting.is_err(),
-        "the second connection had to wait: {waiting:?}"
+        "the third connection had to wait: {waiting:?}"
     );
-    drop(first);
+    // ...and is served once a slot is free again.
+    drop((first, second));
+    let after = tokio::time::timeout(
+        Duration::from_secs(10),
+        chat(&server, Some(CALLER_KEY), "inference/test-model"),
+    )
+    .await
+    .expect("the server is not wedged once the connections close");
+    assert_eq!(after.status(), 200);
 }

@@ -86,8 +86,9 @@ the other keys are this note's.
   connections cost little and the idle timeout reaps them, so the pool should be at
   least the most requests in flight to one host. When `pool_max_idle_per_host` is
   not set it is the larger of 256 (the default concurrency per provider,
-  `GatewayConfig::max_concurrency_per_provider`) and the largest `max_concurrency`
-  the file sets for any provider, capped at 4096; a value the file sets is used
+  `GatewayConfig::max_concurrency_per_provider`) and `limits.max_concurrency` (one
+  value for every provider; there is no per-provider concurrency key), capped at 4096;
+  a value the file sets is used
   as written, and the note in the file's schema says it should not be below the
   largest per-host total (several providers can share a host). The library's own
   default stays 4, because changing what every embedding application does is a

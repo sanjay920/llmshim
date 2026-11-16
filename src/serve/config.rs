@@ -260,39 +260,39 @@ pub struct Upstream {
     pub ambient_proxy: Option<bool>,
     /// Defaults to 30000.
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1i64, max = 31536000000i64))]
     pub connect_timeout_ms: Option<u64>,
     /// Defaults to 600000.
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1i64, max = 31536000000i64))]
     pub response_header_timeout_ms: Option<u64>,
     /// Defaults to 10000.
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1i64, max = 31536000000i64))]
     pub policy_callback_timeout_ms: Option<u64>,
     /// Defaults to 10000.
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1i64, max = 31536000000i64))]
     pub error_body_idle_timeout_ms: Option<u64>,
     /// Defaults to 30000.
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1i64, max = 31536000000i64))]
     pub error_body_total_timeout_ms: Option<u64>,
     /// Defaults to 300000.
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1i64, max = 31536000000i64))]
     pub unary_idle_timeout_ms: Option<u64>,
     /// Defaults to 1800000.
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1i64, max = 31536000000i64))]
     pub unary_attempt_timeout_ms: Option<u64>,
     /// Defaults to 300000.
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1i64, max = 31536000000i64))]
     pub stream_idle_timeout_ms: Option<u64>,
     /// Defaults to 7200000.
     #[serde(default)]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1i64, max = 31536000000i64))]
     pub stream_attempt_timeout_ms: Option<u64>,
 }
 
@@ -1559,47 +1559,65 @@ impl ServeConfig {
             }
         };
         // Each deadline may not exceed the one that bounds it, or it could never
-        // fire. The values are the effective ones, defaults included.
+        // fire. The values are the effective ones, defaults included; the issue is
+        // reported at the key the file set (the one written is the one to change).
         let d = settings.deadlines;
         let ms = |value: std::time::Duration| value.as_millis();
-        let attempts = ms(d.unary_attempt_total).min(ms(d.stream_attempt_total));
-        for (key, value, limit, bounded_by) in [
-            (
-                "connect_timeout_ms",
-                ms(d.connect),
-                attempts,
-                "the attempt timeouts",
-            ),
+        let set = |key: &str| match key {
+            "connect_timeout_ms" => u.connect_timeout_ms.is_some(),
+            "response_header_timeout_ms" => u.response_header_timeout_ms.is_some(),
+            "unary_idle_timeout_ms" => u.unary_idle_timeout_ms.is_some(),
+            "unary_attempt_timeout_ms" => u.unary_attempt_timeout_ms.is_some(),
+            "stream_idle_timeout_ms" => u.stream_idle_timeout_ms.is_some(),
+            "stream_attempt_timeout_ms" => u.stream_attempt_timeout_ms.is_some(),
+            "error_body_idle_timeout_ms" => u.error_body_idle_timeout_ms.is_some(),
+            "error_body_total_timeout_ms" => u.error_body_total_timeout_ms.is_some(),
+            _ => false,
+        };
+        let attempts = [
+            ("unary_attempt_timeout_ms", ms(d.unary_attempt_total)),
+            ("stream_attempt_timeout_ms", ms(d.stream_attempt_total)),
+        ];
+        for (key, value, limits) in [
+            ("connect_timeout_ms", ms(d.connect), attempts.to_vec()),
             (
                 "response_header_timeout_ms",
                 ms(d.response_headers),
-                attempts,
-                "the attempt timeouts",
+                attempts.to_vec(),
             ),
             (
                 "unary_idle_timeout_ms",
                 ms(d.unary_body_idle),
-                ms(d.unary_attempt_total),
-                "unary_attempt_timeout_ms",
+                vec![("unary_attempt_timeout_ms", ms(d.unary_attempt_total))],
             ),
             (
                 "stream_idle_timeout_ms",
                 ms(d.stream_semantic_idle),
-                ms(d.stream_attempt_total),
-                "stream_attempt_timeout_ms",
+                vec![("stream_attempt_timeout_ms", ms(d.stream_attempt_total))],
             ),
             (
                 "error_body_idle_timeout_ms",
                 ms(d.error_body_idle),
-                ms(d.error_body_total),
-                "error_body_total_timeout_ms",
+                vec![("error_body_total_timeout_ms", ms(d.error_body_total))],
             ),
         ] {
-            if value > limit {
-                issues.push(Issue::new(
-                    format!("upstream.{key}"),
-                    format!("may not exceed {bounded_by} (it could never fire)"),
-                ));
+            for (limit_key, limit) in limits {
+                if value <= limit {
+                    continue;
+                }
+                if set(key) {
+                    issues.push(Issue::new(
+                        format!("upstream.{key}"),
+                        format!("may not exceed {limit_key} ({limit} ms): it could never fire"),
+                    ));
+                } else if set(limit_key) {
+                    issues.push(Issue::new(
+                        format!("upstream.{limit_key}"),
+                        format!(
+                            "may not be shorter than {key} ({value} ms): that one could never fire"
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -3623,12 +3641,17 @@ mod tests {
         assert!(!issues(&with("unknown_key = 1", "")).is_empty());
         // The ordering uses the effective values, defaults included: shortening
         // the attempt below the default header deadline is the same mistake.
+        // and the issue lands on the key the file wrote, not on a default.
         let text = with("unary_attempt_timeout_ms = 1000", "");
+        let found = issues(&text);
         assert!(
-            has(&issues(&text), "upstream.response_header_timeout_ms")
-                || has(&issues(&text), "upstream.connect_timeout_ms"),
-            "{:?}",
-            issues(&text)
+            has(&found, "upstream.unary_attempt_timeout_ms"),
+            "{found:?}"
+        );
+        assert!(!has(&found, "upstream.connect_timeout_ms"), "{found:?}");
+        assert!(
+            !has(&found, "upstream.response_header_timeout_ms"),
+            "{found:?}"
         );
     }
 

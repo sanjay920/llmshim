@@ -230,6 +230,40 @@ async fn a_change_outside_the_keys_is_refused_by_path_and_takes_nothing_with_it(
 }
 
 #[tokio::test]
+async fn the_upstream_client_and_the_listener_limits_are_fixed_at_start() {
+    // 0021: these are outside the keys, so a reload that changes one is refused by
+    // path and the previous settings keep serving.
+    let (upstream, _mock) = mock_upstream(1).await;
+    let url = upstream.url();
+    let keys = key("second", "second", SECOND, "");
+    let server = start(&render(&url, "", &keys), "reload-upstream", &[]);
+    for (generation, text, path) in [
+        (
+            0,
+            render(&url, "[upstream]\nmax_retries = 2", &keys),
+            "upstream",
+        ),
+        (
+            0,
+            render(&url, "", &keys).replacen("port = 0\n", "port = 0\nmax_connections = 5\n", 1),
+            "server.max_connections",
+        ),
+    ] {
+        rewrite(&server, &text);
+        hangup(&server);
+        let status = wait_for_reload(&server, "a rejection", |status| {
+            status["last_reload"]["issues"]
+                .as_array()
+                .is_some_and(|issues| issues.iter().any(|issue| issue["path"] == path))
+        })
+        .await;
+        assert_eq!(status["generation"], generation, "{status}");
+        assert_eq!(status["last_reload"]["outcome"], "rejected", "{status}");
+    }
+    assert_eq!(chat(&server, Some(SECOND), MODEL).await.status(), 200);
+}
+
+#[tokio::test]
 async fn a_reload_is_not_a_limit_reset_and_a_changed_limit_reaches_the_existing_bucket() {
     let (upstream, _mock) = mock_upstream(2).await;
     let url = upstream.url();

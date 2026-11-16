@@ -314,6 +314,38 @@ surprise = true
     const BEDROCK_TABLE: &str =
         "\n[providers.bedrock]\nkind = \"bedrock\"\nprofile = \"prod\"\nregion = \"us-east-1\"\n";
 
+    #[test]
+    fn an_invalid_upstream_or_listener_value_is_refused_by_path_in_every_mode() {
+        // 0021: the bounds and the deadline ordering, as `--check` reports them.
+        for (name, table, path) in [
+            (
+                "up-retries.toml",
+                "[upstream]\nmax_retries = 11\n",
+                "upstream.max_retries",
+            ),
+            (
+                "up-order.toml",
+                "[upstream]\nunary_idle_timeout_ms = 2000000\n",
+                "upstream.unary_idle_timeout_ms",
+            ),
+            (
+                "up-conn.toml",
+                "[server]\nmax_connections = 0\n",
+                "server.max_connections",
+            ),
+        ] {
+            let path_ = write(name, &format!("{CONFIG}\n{table}"));
+            for args in [&["--check", "--structure-only"][..], &["--check"][..]] {
+                let mut command = vec!["serve", "--config", path_.to_str().unwrap()];
+                command.extend_from_slice(args);
+                let output = run(&command, &SECRETS);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert_eq!(output.status.code(), Some(1), "{name} {args:?}: {stderr}");
+                assert!(stderr.contains(path), "{name} {args:?}: {stderr}");
+            }
+        }
+    }
+
     #[cfg(not(feature = "serve-cloud"))]
     #[test]
     fn a_cloud_provider_is_refused_without_the_serve_cloud_build() {

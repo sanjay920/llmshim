@@ -794,6 +794,7 @@
         "connect_timeout_ms": {
           "default": null,
           "description": "Defaults to 30000.",
+          "maximum": 31536000000,
           "minimum": 1,
           "type": [
             "integer",
@@ -803,6 +804,7 @@
         "error_body_idle_timeout_ms": {
           "default": null,
           "description": "Defaults to 10000.",
+          "maximum": 31536000000,
           "minimum": 1,
           "type": [
             "integer",
@@ -812,6 +814,7 @@
         "error_body_total_timeout_ms": {
           "default": null,
           "description": "Defaults to 30000.",
+          "maximum": 31536000000,
           "minimum": 1,
           "type": [
             "integer",
@@ -841,6 +844,7 @@
         "policy_callback_timeout_ms": {
           "default": null,
           "description": "Defaults to 10000.",
+          "maximum": 31536000000,
           "minimum": 1,
           "type": [
             "integer",
@@ -870,6 +874,7 @@
         "response_header_timeout_ms": {
           "default": null,
           "description": "Defaults to 600000.",
+          "maximum": 31536000000,
           "minimum": 1,
           "type": [
             "integer",
@@ -879,6 +884,7 @@
         "stream_attempt_timeout_ms": {
           "default": null,
           "description": "Defaults to 7200000.",
+          "maximum": 31536000000,
           "minimum": 1,
           "type": [
             "integer",
@@ -888,6 +894,7 @@
         "stream_idle_timeout_ms": {
           "default": null,
           "description": "Defaults to 300000.",
+          "maximum": 31536000000,
           "minimum": 1,
           "type": [
             "integer",
@@ -897,6 +904,7 @@
         "unary_attempt_timeout_ms": {
           "default": null,
           "description": "Defaults to 1800000.",
+          "maximum": 31536000000,
           "minimum": 1,
           "type": [
             "integer",
@@ -906,6 +914,7 @@
         "unary_idle_timeout_ms": {
           "default": null,
           "description": "Defaults to 300000.",
+          "maximum": 31536000000,
           "minimum": 1,
           "type": [
             "integer",
