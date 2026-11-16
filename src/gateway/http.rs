@@ -108,6 +108,15 @@ impl RealDispatch {
                 },
                 None => DispatchError::new("llmshim-coordinator-unavailable"),
             },
+            // A replica whose router does not know the provider (a roll-out in
+            // progress, or a removal, 0022): a local condition, not an upstream
+            // failure. It happens before any attempt exists, so nothing was sent,
+            // no spend was reserved and the breaker never sees it.
+            #[cfg(feature = "serve")]
+            ShimError::UnknownProvider(_) => DispatchError {
+                message: format!("llmshim-provider-unavailable:{}", penalty.as_millis()),
+                retry_after: Some(penalty),
+            },
             other => DispatchError::new(other.to_string()),
         }
     }
@@ -501,7 +510,24 @@ impl GatewayState {
                 .into_iter()
                 .map(String::from)
                 .collect();
-            gateway.spawn_workers(providers);
+            gateway.start_managed_workers(providers);
+        }
+    }
+
+    /// Make the fleet's workers follow the router's provider set after a reload
+    /// (0022). A no-op for a single instance, whose lanes are made on demand.
+    #[cfg(feature = "serve")]
+    pub(crate) fn sync_fleet_workers(&self) {
+        #[cfg(feature = "redis-coordination")]
+        if let Backend::Distributed(gateway) = &self.backend {
+            let providers: Vec<String> = self
+                .router
+                .current()
+                .provider_keys()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            gateway.sync_workers(providers);
         }
     }
 
@@ -877,6 +903,16 @@ fn gateway_err_to_api(state: &GatewayState, err: GatewayError) -> ApiError {
                     retry_after: None,
                 })
             }),
+        #[cfg(feature = "serve")]
+        GatewayError::Upstream(message) if message.starts_with("llmshim-provider-unavailable:") => {
+            ApiError::ProviderUnavailable(
+                message
+                    .strip_prefix("llmshim-provider-unavailable:")
+                    .and_then(|milliseconds| milliseconds.parse::<u64>().ok())
+                    .map(Duration::from_millis)
+                    .unwrap_or(state.overloaded_retry_after),
+            )
+        }
         GatewayError::Upstream(message) if message == "llmshim-coordinator-unavailable" => {
             ApiError::from(ShimError::ProviderError {
                 status: 503,
@@ -4874,6 +4910,37 @@ mod native_tests {
         }
         slow_a.assert_async().await;
         on_b.assert_async().await;
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn a_replica_without_the_provider_answers_503_provider_unavailable() {
+        // 0022: a fleet job reaches a replica whose router does not know the
+        // provider (a roll-out, or a removal). That is local, not an upstream
+        // failure: 503 with Retry-After, never 502, and it fails before any
+        // attempt exists, so nothing was sent and no spend was reserved.
+        let dispatch = RealDispatch {
+            router: RouterHandle::new(Router::new()),
+            logger: None,
+            penalty: Some(Duration::from_secs(7)),
+        };
+        let error = dispatch
+            .dispatch("gone", chat_payload_for("gone/m"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "llmshim-provider-unavailable:7000");
+        let state = configured_state_with_router(Router::new());
+        let response =
+            gateway_err_to_api(&state, GatewayError::Upstream(error.message)).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "7");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("provider_unavailable"));
+    }
+
+    #[cfg(feature = "serve")]
+    fn chat_payload_for(model: &str) -> Value {
+        json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
     }
 
     #[test]

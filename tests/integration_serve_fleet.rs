@@ -8,7 +8,7 @@
 #[path = "support/serve_harness.rs"]
 mod harness;
 
-use harness::{chat, completion, config, start, CALLER_KEY};
+use harness::{chat, completion, config, hangup, rewrite, start, wait_for_reload, CALLER_KEY};
 use serde_json::Value;
 
 fn redis_url() -> String {
@@ -250,4 +250,47 @@ async fn usage_records_name_the_tenant_whichever_replica_dispatches() {
     ids.sort();
     assert_eq!(recorded, ids);
     drop((a, b));
+}
+
+#[tokio::test]
+#[ignore = "needs Redis: set LLMSHIM_TEST_REDIS_URL"]
+async fn a_provider_added_by_a_reload_is_served_by_the_replica_from_then_on() {
+    // 0022: the fleet's workers follow the provider set. Before the reload this
+    // replica has no worker for the new provider (its job would wait in Redis);
+    // after it, the replica leases the provider's jobs and answers.
+    let mut upstream = mockito::Server::new_async().await;
+    let mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .expect(1)
+        .create_async()
+        .await;
+    let url = redis_url();
+    let env = [("SERVE_E2E_REDIS_URL", url.as_str())];
+    let names = Names::new();
+    let added = format!("added-{}", uuid::Uuid::new_v4().simple());
+    let admin = "\n[admin]\nport = 0\ntoken = { env = \"SERVE_E2E_ADMIN_TOKEN\" }\n";
+    let before = format!("{}{admin}", fleet_config(&upstream.url(), &names, ""));
+    let server = start(&before, "fleet-reload-provider", &env);
+    let provider = format!(
+        "\n[providers.{added}]\nkind = \"openai-compatible\"\nbase_url = \"{}\"\n\
+         api_key = {{ env = \"SERVE_E2E_UPSTREAM_KEY\" }}\n",
+        upstream.url()
+    );
+    rewrite(&server, &format!("{before}{provider}"));
+    hangup(&server);
+    let status = wait_for_reload(&server, "the added provider", |status| {
+        status["router_generation"] == 1
+    })
+    .await;
+    assert_eq!(status["last_reload"]["outcome"], "applied", "{status}");
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        chat(&server, Some(CALLER_KEY), &format!("{added}/test-model")),
+    )
+    .await
+    .expect("the replica's worker for the added provider leases its job");
+    assert_eq!(response.status(), 200);
+    mock.assert_async().await;
 }

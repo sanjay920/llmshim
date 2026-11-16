@@ -637,6 +637,21 @@ pub(crate) struct LifecycleReference {
     generation: String,
 }
 
+/// The workers a replica runs for the providers it serves, and the providers its
+/// reaper visits (0022). A removed provider's workers stop leasing: closing the
+/// semaphore they take a preparation permit from ends their loop, and what they
+/// already hold finishes, because each leased job runs in its own task holding
+/// its own permit.
+#[derive(Default)]
+struct ManagedWorkers {
+    started: bool,
+    capacity: std::collections::HashMap<String, Arc<Semaphore>>,
+    /// Every provider this replica has served. A removed one stays: its queue
+    /// may still hold expired leases that need redelivering, and any replica can
+    /// do that.
+    reaped: Arc<std::sync::RwLock<Vec<String>>>,
+}
+
 /// A Redis-backed distributed gateway. One per instance; runs the origin side
 /// (`submit` / `submit_stream`) and the worker + reaper side.
 pub struct DistributedGateway {
@@ -664,6 +679,9 @@ pub struct DistributedGateway {
     lifecycle_limits: lifecycle::Limits,
     origin_lease_timeout: Duration,
     origin_cancel_sender: mpsc::Sender<OriginCancelCommand>,
+    /// The workers started for the provider set in force (0022): a reload that
+    /// adds or removes a provider changes them through [`Self::sync_workers`].
+    managed_workers: std::sync::Mutex<ManagedWorkers>,
     #[cfg(test)]
     terminal_operation_delay: Duration,
     #[cfg(test)]
@@ -810,6 +828,7 @@ impl DistributedGateway {
             lifecycle_limits,
             origin_lease_timeout,
             origin_cancel_sender,
+            managed_workers: std::sync::Mutex::new(ManagedWorkers::default()),
             #[cfg(test)]
             terminal_operation_delay: Duration::ZERO,
             #[cfg(test)]
@@ -1690,6 +1709,89 @@ impl DistributedGateway {
     }
 
     /// Spawn one worker loop per provider plus a reaper for redelivery.
+    /// Start the workers and the reaper for `providers`, once; later calls follow
+    /// the provider set through [`Self::sync_workers`]. A call before this one is
+    /// a no-op, because the start reads the provider set when it happens.
+    pub(crate) fn start_managed_workers(self: &Arc<Self>, providers: Vec<String>) {
+        let reaped = {
+            let mut managed = self
+                .managed_workers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if managed.started {
+                return;
+            }
+            managed.started = true;
+            *managed.reaped.write().unwrap_or_else(|e| e.into_inner()) = providers.clone();
+            for provider in &providers {
+                let capacity = Arc::new(Semaphore::new(
+                    self.config.max_concurrency_per_provider.max(1),
+                ));
+                managed.capacity.insert(provider.clone(), capacity.clone());
+                self.spawn_provider_workers(provider, capacity);
+            }
+            managed.reaped.clone()
+        };
+        let me = self.clone();
+        tokio::spawn(async move { me.reaper_over(reaped).await });
+    }
+
+    /// Make the workers follow `providers`: start them for an added provider and
+    /// let a removed provider's workers finish what they hold and stop.
+    #[cfg(feature = "serve")]
+    pub(crate) fn sync_workers(self: &Arc<Self>, providers: Vec<String>) {
+        let mut managed = self
+            .managed_workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !managed.started {
+            return;
+        }
+        for provider in &providers {
+            if managed.capacity.contains_key(provider) {
+                continue;
+            }
+            let capacity = Arc::new(Semaphore::new(
+                self.config.max_concurrency_per_provider.max(1),
+            ));
+            managed.capacity.insert(provider.clone(), capacity.clone());
+            let mut reaped = managed.reaped.write().unwrap_or_else(|e| e.into_inner());
+            if !reaped.contains(provider) {
+                reaped.push(provider.clone());
+            }
+            drop(reaped);
+            self.spawn_provider_workers(provider, capacity);
+        }
+        let removed: Vec<String> = managed
+            .capacity
+            .keys()
+            .filter(|provider| !providers.contains(provider))
+            .cloned()
+            .collect();
+        for provider in removed {
+            if let Some(capacity) = managed.capacity.remove(&provider) {
+                capacity.close();
+            }
+        }
+    }
+
+    fn spawn_provider_workers(
+        self: &Arc<Self>,
+        provider: &str,
+        preparation_capacity: Arc<Semaphore>,
+    ) -> Vec<JoinHandle<()>> {
+        let mut handles = Vec::with_capacity(2);
+        for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
+            let me = self.clone();
+            let provider = provider.to_owned();
+            let preparation_capacity = preparation_capacity.clone();
+            handles.push(tokio::spawn(async move {
+                me.worker(provider, protocol, preparation_capacity).await
+            }));
+        }
+        handles
+    }
+
     pub fn spawn_workers(self: &Arc<Self>, providers: Vec<String>) -> Vec<JoinHandle<()>> {
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(providers.len() * 2 + 1);
         for provider in &providers {
@@ -2354,6 +2456,12 @@ impl DistributedGateway {
     /// Run the reaper loop: periodically requeue leases whose visibility deadline
     /// has passed (a crashed or stuck worker).
     async fn reaper(self: Arc<Self>, providers: Vec<String>) {
+        let providers = Arc::new(std::sync::RwLock::new(providers));
+        self.reaper_over(providers).await
+    }
+
+    /// The reaper over a provider list that may grow while it runs (0022).
+    async fn reaper_over(self: Arc<Self>, providers: Arc<std::sync::RwLock<Vec<String>>>) {
         let interval = (self.config.lease_timeout / 3)
             .min(self.origin_lease_timeout / 3)
             .max(Duration::from_millis(1));
@@ -2375,7 +2483,8 @@ impl DistributedGateway {
                     lifecycle::cleanup_caches(&mut connection, 128).await
                 })
                 .await;
-            for provider in &providers {
+            let visiting = providers.read().unwrap_or_else(|e| e.into_inner()).clone();
+            for provider in &visiting {
                 for protocol in [QueueProtocol::LegacyUnscoped, QueueProtocol::ScopedV1] {
                     let reaped = self.reap_once_protocol(protocol, provider).await;
                     if reaped > 0 {
@@ -3761,6 +3870,52 @@ mod tests {
         ] {
             let _: i64 = connection.del(key).await.unwrap();
         }
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn synced_workers_serve_an_added_provider_and_stop_leasing_for_a_removed_one() {
+        let kept = format!("itest-sync-a-{}", uuid::Uuid::new_v4().simple());
+        let added = format!("itest-sync-b-{}", uuid::Uuid::new_v4().simple());
+        let Some(gw) = test_gateway(&kept).await else {
+            return;
+        };
+        let request = |provider: &str| GatewayRequest {
+            provider: provider.to_string(),
+            tier: 0,
+            permits: 1,
+            payload: serde_json::json!({ "hello": "world" }),
+        };
+        // Before the workers start, a reload's sync is a no-op (the start reads
+        // the provider set when it happens).
+        gw.sync_workers(vec![kept.clone(), added.clone()]);
+        gw.start_managed_workers(vec![kept.clone()]);
+        gw.start_managed_workers(vec!["ignored-second-start".into()]);
+        assert!(gw.submit(request(&kept)).await.is_ok());
+        // Nothing serves `added` yet.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), gw.submit(request(&added)))
+                .await
+                .is_err()
+        );
+        // A reload adds it: this replica leases its jobs from here on.
+        gw.sync_workers(vec![kept.clone(), added.clone()]);
+        let answer = tokio::time::timeout(Duration::from_secs(10), gw.submit(request(&added)))
+            .await
+            .expect("an added provider's worker starts")
+            .expect("round trip");
+        assert_eq!(answer["echo"]["hello"], "world");
+        // A reload removes it: the workers stop leasing for it, the other's keep going.
+        gw.sync_workers(vec![kept.clone()]);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), gw.submit(request(&added)))
+                .await
+                .is_err(),
+            "a removed provider's workers stopped"
+        );
+        assert!(gw.submit(request(&kept)).await.is_ok());
     }
 
     #[tokio::test]
