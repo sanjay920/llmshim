@@ -310,6 +310,76 @@ surprise = true
         assert!(!stderr.contains("too-short"), "never the value");
     }
 
+    #[cfg(not(feature = "serve-cloud"))]
+    const BEDROCK_TABLE: &str =
+        "\n[providers.bedrock]\nkind = \"bedrock\"\nprofile = \"prod\"\nregion = \"us-east-1\"\n";
+
+    #[cfg(not(feature = "serve-cloud"))]
+    #[test]
+    fn a_cloud_provider_is_refused_without_the_serve_cloud_build() {
+        // The file contract has them (0020); a build without the transports says
+        // which flag to rebuild with, in every mode, and never starts.
+        let path = write("cloud-refused.toml", &format!("{CONFIG}{BEDROCK_TABLE}"));
+        for args in [
+            &["--check", "--structure-only"][..],
+            &["--check"][..],
+            &[][..],
+        ] {
+            let mut command = vec!["serve", "--config", path.to_str().unwrap()];
+            command.extend_from_slice(args);
+            let output = run(&command, &SECRETS);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(stderr.contains("providers.bedrock"), "{args:?}: {stderr}");
+            assert!(
+                stderr.contains("--features serve-cloud"),
+                "{args:?}: {stderr}"
+            );
+            assert!(!stderr.contains("listening on"), "{args:?}: {stderr}");
+        }
+    }
+
+    #[cfg(feature = "serve-cloud")]
+    #[test]
+    fn a_vertex_service_account_is_status_3_when_absent_and_status_1_when_malformed() {
+        let vertex = |file: &std::path::Path| {
+            format!(
+                "{CONFIG}\n[providers.vertex-gemini]\nkind = \"vertex-gemini\"\nproject = \"p\"\n\
+                 region = \"us-central1\"\nbinding = \"v\"\nservice_account_file = \"{}\"\n",
+                file.display()
+            )
+        };
+        let dir = std::env::temp_dir().join(format!("llmshim-serve-cli-sa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let check = |file: &std::path::Path, name: &str| {
+            let path = write(name, &vertex(file));
+            run(
+                &["serve", "--config", path.to_str().unwrap(), "--check"],
+                &SECRETS,
+            )
+        };
+        let absent = check(&dir.join("nope.json"), "sa-absent.toml");
+        let stderr = String::from_utf8_lossy(&absent.stderr);
+        assert_eq!(absent.status.code(), Some(3), "{stderr}");
+        assert!(
+            stderr.contains("providers.vertex-gemini.service_account_file"),
+            "{stderr}"
+        );
+        let junk = dir.join("junk.json");
+        std::fs::write(&junk, "{\"private_key\": \"-----BEGIN PRIVATE KEY-----\"}").unwrap();
+        let malformed = check(&junk, "sa-malformed.toml");
+        let stderr = String::from_utf8_lossy(&malformed.stderr);
+        assert_eq!(malformed.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("providers.vertex-gemini.service_account_file"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("BEGIN PRIVATE KEY"),
+            "never the content: {stderr}"
+        );
+    }
+
     #[cfg(not(feature = "serve-otel"))]
     #[test]
     fn a_telemetry_table_is_refused_without_the_serve_otel_build() {

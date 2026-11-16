@@ -29,6 +29,9 @@ serve = ["gateway", "dep:ring", "dep:x509-parser", "dep:tokio-rustls", "dep:sche
 serve-redis = ["serve", "gateway-redis"]
 # `serve` with OpenTelemetry trace export (0016). Needed for the `[telemetry]`
 # configuration table; the exporter is our own (see the dependencies below).
+# `serve` with the Bedrock, Vertex and Azure transports, for the cloud provider
+# kinds of the configuration file (0020).
+serve-cloud = ["serve", "bedrock", "vertex", "azure"]
 serve-otel = ["serve", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-proto", "dep:prost"]
 
 # Cloud transport dependencies are opt-in for library consumers and bundled binaries.

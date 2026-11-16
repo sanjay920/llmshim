@@ -6,6 +6,7 @@ pub mod anthropic_signature;
 pub mod bedrock;
 pub mod cerebras;
 pub mod chatgpt;
+pub(crate) mod cloud_rules;
 pub mod gemini;
 pub mod openai;
 mod openai_audio;

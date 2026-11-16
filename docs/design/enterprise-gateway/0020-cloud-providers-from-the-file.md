@@ -1,7 +1,12 @@
 # 0020: Bedrock, Vertex and Azure from the file
 
-Status: design only. A contract note, written before any code (README working
-rule 3). Nothing here is implemented; the slices are listed at the end.
+Status: slice 2 implemented (the feature, the configuration, its validation and the
+`--check` rules); the providers are not yet built from the file (slice 3).
+Until then a build with `serve-cloud` accepts such a file at `--check` and refuses
+it at start ("not wired into the server yet"), so nothing is silently left out. A
+contract note, written before any code (README working rule 3); the slices are at
+the end. `--check`'s exit codes for the service-account file are exercised by a
+process test that runs in the `serve-cloud` build, which CI gains in slice 4.
 
 ## What an operator needs
 
@@ -62,10 +67,11 @@ log work as for any provider, keyed by the provider name.
   `deployments`.
 - **Validation calls the transports' own checks.** Their constructors do not
   validate (`AwsProfile::new`, `GoogleIdentity::service_account` cannot fail); the
-  rules live in private functions that build the endpoints, so slice 2 exposes
-  those as crate-internal functions and the file calls them, with a test that pins
-  the file's verdict to the transport's. So a value that would fail every request
-  fails `--check` instead:
+  rules live in private functions that build the endpoints, so they now live in one
+  module (`providers::cloud_rules`, with no dependency on a transport feature) that
+  the transports **and** the file both call: the file cannot disagree with a
+  transport because they are the same function. So a value that would fail every
+  request fails `--check` instead:
   - Bedrock `region`: lower-case letters, digits and hyphens, and a partition the
     transport supports (`aws`, `aws-us-gov`, `aws-cn`); the isolated partitions are
     refused. `profile` is bounded visible ASCII.
@@ -168,8 +174,8 @@ the Dockerfile, so it does not rot.
 ## Slices
 
 1. This note.
-2. The feature, the config types and their validation (the transports' own checks
-   exposed crate-internally and pinned by tests), the schema, the feature refusal,
+2. Done: the feature, the config types and their validation (the transports' own
+   checks moved into `cloud_rules`, which both call), the schema, the feature refusal,
    the reserved names, and the service-account check at `--check`. Tests:
    validation by path, one kind's field on another kind, the shared-Vertex-identity
    rule, the missing-feature refusal, the secret-file checks (exit 3 and 1), the

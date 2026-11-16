@@ -96,7 +96,7 @@ impl TokenSource for ServiceAccount {
                 .read_to_end(&mut bytes)
                 .await
                 .map_err(|_| CredentialError::FileUnavailable)?;
-            if bytes.len() > 1024 * 1024 {
+            if crate::providers::cloud_rules::service_account_problem(&bytes).is_some() {
                 return Err(CredentialError::InvalidServiceAccount);
             }
             let account: Account = serde_json::from_slice(&bytes)
