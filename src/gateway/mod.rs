@@ -605,6 +605,12 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Follow a new set of limits (0022).
+    #[cfg(feature = "serve")]
+    pub(crate) fn retune_limits(&self, config: crate::proxy::ratelimit::RateLimitConfig) {
+        self.limiter.retune(config);
+    }
+
     /// Build a scheduler over an injected rate limiter and dispatcher.
     pub fn new(
         config: GatewayConfig,

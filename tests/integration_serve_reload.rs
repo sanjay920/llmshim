@@ -194,12 +194,12 @@ async fn a_change_outside_the_keys_is_refused_by_path_and_takes_nothing_with_it(
     let good = render(&url, "", &key("second", "second", SECOND, ""));
     let server = start(&good, "reload-restart-only", &[]);
 
-    // A limits change and a new key in one edit: the key must not slip through.
+    // A restart-only limits change and a new key in one edit: the key must not slip through.
     rewrite(
         &server,
         &render(
             &url,
-            "[limits]\nrpm = 600",
+            "[limits]\nqueue_timeout_ms = 6000",
             &format!(
                 "{}{}",
                 key("second", "second", SECOND, ""),
@@ -512,4 +512,30 @@ async fn a_rotated_provider_key_file_is_used_by_the_next_request() {
     );
     one.assert_async().await;
     two.assert_async().await;
+}
+
+#[tokio::test]
+async fn a_lowered_provider_limit_applies_to_the_next_request_and_keeps_the_tokens() {
+    // 0022: the limits are retuned in the holders a request meets, and a reload is
+    // not a reset: the bucket had 99 tokens left of 100, the new limit clamps it to
+    // 1, so exactly one more request is admitted.
+    let (upstream, _mock) = mock_upstream(2).await;
+    let url = upstream.url();
+    let limited = |rpm: u32| {
+        render(
+            &url,
+            &format!("[limits.providers.inference]\nrpm = {rpm}"),
+            "",
+        )
+    };
+    let server = start(&limited(100), "reload-limit-lowered", &[]);
+    assert_eq!(chat(&server, Some(CALLER_KEY), MODEL).await.status(), 200);
+    rewrite(&server, &limited(1));
+    hangup(&server);
+    let status = applied(&server, 1).await;
+    assert_eq!(status["limits_generation"], 1, "{status}");
+    assert_eq!(status["router_generation"], 0, "{status}");
+    assert_eq!(status["last_reload"]["changes"], json!(["limits"]));
+    assert_eq!(chat(&server, Some(CALLER_KEY), MODEL).await.status(), 200);
+    assert_eq!(chat(&server, Some(CALLER_KEY), MODEL).await.status(), 429);
 }

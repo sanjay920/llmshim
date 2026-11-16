@@ -4,7 +4,7 @@ use crate::policy::{
     AttemptPolicyErrorKind, AttemptPolicyFuture, AttemptPolicyRefusal, AttemptPolicyRefusalKind,
     AttemptUsageObservation, DispatchPolicyContext, PreparedAttempt,
 };
-use crate::proxy::ratelimit::{penalty_duration, RateLimitConfig};
+use crate::proxy::ratelimit::{penalty_duration, LiveLimits, RateLimitConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -162,6 +162,10 @@ trait AttemptRates: Send + Sync {
 
     async fn penalize(&self, provider: &str, duration: Duration) -> Result<(), ()>;
 
+    /// Follow a new set of provider limits (0022). Buckets keep their tokens.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    fn retune(&self, _config: RateLimitConfig) {}
+
     async fn observe_usage(
         &self,
         scope: &TrustedPolicyScope,
@@ -291,7 +295,7 @@ struct AttemptLiability {
 }
 
 struct LocalAttemptRates {
-    config: RateLimitConfig,
+    config: LiveLimits,
     /// Follow a tenant's limit when a later request carries a different one.
     /// Off, a tenant's bucket keeps the limit it was made with, as it always
     /// has under `gateway`. `serve` turns it on because a configuration reload
@@ -330,7 +334,7 @@ impl LocalAttemptRates {
         retention_secs: u64,
     ) -> Self {
         Self {
-            config,
+            config: LiveLimits::new(config),
             retune_tenant_limits: false,
             max_retained_attempts,
             retention_secs,
@@ -377,7 +381,7 @@ impl LocalAttemptRates {
                 global_limit.rpm,
                 1.0,
                 now,
-                false,
+                self.retune_tenant_limits,
             ),
             check_dimension(
                 &mut state.global.tpm,
@@ -385,7 +389,7 @@ impl LocalAttemptRates {
                 global_limit.tpm,
                 permits.max(1) as f64,
                 now,
-                false,
+                self.retune_tenant_limits,
             ),
         ]
         .into_iter()
@@ -568,7 +572,13 @@ fn check_dimension(
     now: Instant,
     retune: bool,
 ) -> Option<Duration> {
-    let limit = limit?;
+    let Some(limit) = limit else {
+        // A limit that is gone takes its bucket with it, where limits can change.
+        if retune {
+            buckets.remove(key);
+        }
+        return None;
+    };
     if limit == 0 {
         return Some(ZERO_LIMIT_RETRY_AFTER);
     }
@@ -614,22 +624,32 @@ impl AttemptRates for LocalAttemptRates {
         let now = Instant::now();
         let mut state = self.state.lock().await;
         if let Some(rpm) = limit.rpm.filter(|limit| *limit > 0) {
-            state
+            let bucket = state
                 .global
                 .rpm
                 .entry(provider.to_owned())
-                .or_insert_with(|| Bucket::new(rpm, now))
-                .penalize(duration, now);
+                .or_insert_with(|| Bucket::new(rpm, now));
+            if self.retune_tenant_limits {
+                bucket.retune(rpm, now);
+            }
+            bucket.penalize(duration, now);
         }
         if let Some(tpm) = limit.tpm.filter(|limit| *limit > 0) {
-            state
+            let bucket = state
                 .global
                 .tpm
                 .entry(provider.to_owned())
-                .or_insert_with(|| Bucket::new(tpm, now))
-                .penalize(duration, now);
+                .or_insert_with(|| Bucket::new(tpm, now));
+            if self.retune_tenant_limits {
+                bucket.retune(tpm, now);
+            }
+            bucket.penalize(duration, now);
         }
         Ok(())
+    }
+
+    fn retune(&self, config: RateLimitConfig) {
+        self.config.replace(config);
     }
 
     async fn observe_usage(
@@ -885,6 +905,13 @@ impl AttemptCoordinator {
             usage: std::sync::OnceLock::new(),
             penalty: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Follow a new set of provider limits (0022): what admits retries, repairs
+    /// and fallbacks as well as a first attempt. Buckets keep their tokens.
+    #[cfg(feature = "serve")]
+    pub(crate) fn retune_limits(&self, config: RateLimitConfig) {
+        self.rates.retune(config);
     }
 
     pub(crate) fn context(self: &Arc<Self>, scope: TrustedPolicyScope) -> DispatchPolicyContext {
@@ -1569,7 +1596,7 @@ mod redis_rates {
 
     pub(super) struct RedisAttemptRates {
         connections: crate::redis_operation::RedisConnectionManagerCache,
-        config: RateLimitConfig,
+        config: LiveLimits,
         max_retained_attempts: usize,
         retention_secs: u64,
         accounting_index_key: String,
@@ -1609,7 +1636,7 @@ mod redis_rates {
             let client = redis::Client::open(url)?;
             Ok(Self {
                 connections: crate::redis_operation::RedisConnectionManagerCache::new(client),
-                config,
+                config: LiveLimits::new(config),
                 max_retained_attempts,
                 retention_secs,
                 accounting_index_key,
@@ -1841,6 +1868,10 @@ mod redis_rates {
                     wait_ms.max(0) as u64
                 )))
             }
+        }
+
+        fn retune(&self, config: RateLimitConfig) {
+            self.config.replace(config);
         }
 
         async fn penalize(&self, provider: &str, duration: Duration) -> Result<(), ()> {
@@ -3060,6 +3091,69 @@ mod tests {
             )
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_retune_applies_to_the_next_attempt_and_keeps_the_tokens() {
+        // Retries, repairs and fallbacks are admitted by this holder, not by the
+        // scheduler's limiter (0022).
+        let rates = LocalAttemptRates::new(RateLimitConfig::with_global(Some(10), None))
+            .with_tenant_retuning();
+        async fn admit(rates: &LocalAttemptRates) -> Result<(), RateRefusal> {
+            rates
+                .acquire(
+                    "provider",
+                    &scope("t", None, None),
+                    1,
+                    uuid::Uuid::new_v4(),
+                    None,
+                )
+                .await
+        }
+        for _ in 0..8 {
+            admit(&rates).await.unwrap();
+        }
+        // Two tokens are left; the new limit of 1 clamps them.
+        rates.retune(RateLimitConfig::with_global(Some(1), None));
+        assert!(admit(&rates).await.is_ok());
+        assert!(matches!(admit(&rates).await, Err(RateRefusal::Provider(_))));
+        // A removed limit removes the bucket; a limit that returns starts fresh.
+        rates.retune(RateLimitConfig::default());
+        for _ in 0..5 {
+            admit(&rates).await.unwrap();
+        }
+        rates.retune(RateLimitConfig::with_global(Some(3), None));
+        for _ in 0..3 {
+            admit(&rates).await.unwrap();
+        }
+        assert!(admit(&rates).await.is_err());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_attempt_rates_present_the_retuned_limit() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-retune-{}", uuid::Uuid::new_v4().simple());
+        let rates =
+            RedisAttemptRates::new(&redis_url, RateLimitConfig::with_global(Some(100), None))
+                .unwrap();
+        let admit = || async {
+            let tenant = scope("t", None, None);
+            rates
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), None)
+                .await
+        };
+        for _ in 0..4 {
+            admit().await.unwrap();
+        }
+        // The shared bucket keeps its tokens and is clamped to the new capacity.
+        rates.retune(RateLimitConfig::with_global(Some(2), None));
+        assert!(admit().await.is_ok());
+        assert!(admit().await.is_ok());
+        assert!(matches!(admit().await, Err(RateRefusal::Provider(_))));
     }
 
     #[cfg(feature = "redis-coordination")]

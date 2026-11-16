@@ -1,10 +1,11 @@
 # 0022: Reloading providers, routes and rate limits
 
-Status: slices 2 and 3 implemented. Slice 2: the gateway holds its router behind a
+Status: slices 2, 3 and 4 implemented. Slice 2: the gateway holds its router behind a
 replaceable handle and admission pins a snapshot that rides the request to its
 dispatch. Slice 3: a reload rebuilds and swaps providers and routes in a single
-instance (a fleet replica refuses the change by path, see below). Slices 4 and 5
-(rate limits; the 0014 rows and the roadmap) are not. A contract note, written before
+instance (a fleet replica refuses the change by path, see below). Slice 4: a reload
+retunes the provider rate limits in all four holders, on a fleet replica too. Slice 5
+(the 0014 rows and the roadmap) and the fleet part of slice 3 (3b) are not. A contract note, written before
 any code (README working rule 3). It extends 0012, which reloads `[[keys]]` and
 nothing else.
 
@@ -186,6 +187,23 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
   provider's token cache is also dropped (one extra token exchange). A changed or added
   Vertex provider whose service-account file is missing, empty or malformed rejects
   the reload.
+- **Slice 4 as built.** `RateLimiter::retune` and `AttemptRates::retune` are defaulted
+  methods (so no implementor breaks); each of the four holders keeps its limits behind
+  a small read-mostly lock (`LiveLimits`) and reads them on every call. A bucket follows
+  a changed limit at its next use: time so far is credited at the old rate and the
+  balance is clamped to the new capacity (a lowered limit bites at once, a raised one
+  refills from what is there); a limit that is removed drops its bucket and one that
+  returns starts fresh; an unchanged limit is not touched, so a reload that does not
+  change the limits (or does not change a provider's) is not a reset. The Redis holders
+  present this replica's rate and capacity on every call, and their script clamps a
+  lowered capacity and keeps the tokens. Limits are applied before the router. They are
+  in the fingerprint and debounce with everything else, apply on a fleet replica (each
+  replica presents its own file's rate), and have their own `limits_generation` beside
+  `router_generation`. `[limits]` keeps `max_concurrency`, `queue_timeout_ms` and
+  `penalty_secs` fixed at start, refused by path as before. In `serve`, the coordinator's
+  limiter (not the scheduler's) is the one that admits every attempt, the first
+  included (a policy-gated job skips the scheduler's), so the process test covers a
+  first attempt and the unit tests the other holders.
 - **The status** gains `router_generation`, `env_secret_providers` and, on a
   reload, `changes` (`providers.added: x`, `providers.removed: x`,
   `providers.changed: x`, `routes`).
@@ -212,7 +230,7 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
    env-form secret is flagged; the fleet 503 `provider_unavailable` and its
    classification (no breaker observation, reservation released); an added provider's
    worker starts.
-4. **Rate limits.** The four holders become retunable; the reload applies the limits
+4. **Done: rate limits.** The four holders become retunable; the reload applies the limits
    before the router. Tests: a lowered rate applies to the next request, including
    retries, repairs and fallbacks, and keeps the tokens; a removed limit removes the
    bucket; a reload is not a reset; Redis presents the new rate.

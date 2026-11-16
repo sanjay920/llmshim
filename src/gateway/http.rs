@@ -509,6 +509,19 @@ impl GatewayState {
     /// replica. A fleet job is run by whichever replica leases it, on that
     /// replica's router (0022), so there the snapshot would only be held for
     /// nothing.
+    /// Retune every holder of the provider limits (0022): the scheduler's limiter
+    /// (or the fleet's), and the coordinator that admits retries, repairs and
+    /// fallbacks, whose limiter (local or Redis) is the other.
+    #[cfg(feature = "serve")]
+    pub(crate) fn apply_limits(&self, config: crate::proxy::ratelimit::RateLimitConfig) {
+        match &self.backend {
+            Backend::Local(scheduler) => scheduler.retune_limits(config.clone()),
+            #[cfg(feature = "redis-coordination")]
+            Backend::Distributed(gateway) => gateway.retune_limits(config.clone()),
+        }
+        self.attempt_coordinator.retune_limits(config);
+    }
+
     /// The handle a reload replaces the router through (0022).
     #[cfg(feature = "serve")]
     pub(crate) fn router_handle(&self) -> RouterHandle {

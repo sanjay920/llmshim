@@ -503,7 +503,7 @@ components:
               dead_letter: {type: integer, minimum: 0, description: Distributed mode only}
     ServeConfigStatus:
       type: object
-      required: [generation, config_sha256, credentials, loaded_at_epoch_secs, last_check_epoch_secs, in_sync, last_reload, router_generation, env_secret_providers]
+      required: [generation, config_sha256, credentials, loaded_at_epoch_secs, last_check_epoch_secs, in_sync, last_reload, router_generation, limits_generation, env_secret_providers]
       additionalProperties: false
       properties:
         generation: {type: integer, minimum: 0, description: 0 for the configuration the process started with}
@@ -516,6 +516,10 @@ components:
           type: integer
           minimum: 0
           description: 0 until a reload replaces the providers or routes (0022)
+        limits_generation:
+          type: integer
+          minimum: 0
+          description: 0 until a reload changes the rate limits (0022); separate from `router_generation`
         env_secret_providers:
           type: array
           items: {type: string}
@@ -555,7 +559,7 @@ components:
           description: |
             What an applied reload replaced in the providers and routes, by name
             (`providers.added: x`, `providers.removed: x`, `providers.changed: x`,
-            `routes`); empty for a keys-only reload or a rejection. Never a value.
+            `routes`) and the rate limits (`limits`); empty for a keys-only reload or a rejection. Never a value.
         issues:
           type: array
           items:
