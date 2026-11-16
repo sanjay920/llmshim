@@ -1,6 +1,6 @@
 # 0023: Native requests and answers that need no replay receipt
 
-Status: design. A contract note, written before any code (README working rule 3).
+Status: slice 2 implemented (the tripwire, `run_free_first` and its use on every native conversion; the benchmark re-run is slice 3). A contract note, written before any code (README working rule 3).
 The change is behavioural, not a new setting: nothing in the configuration file,
 the HTTP API or the receipt store's on-disk format changes.
 
@@ -146,6 +146,6 @@ keys to keep in step with the conversion.
 ## Slices
 
 1. This note.
-2. The tripwire, `run_free_first`, its use on the chat, Messages and Gemini
-   paths, and the tests above.
+2. **Done:** the tripwire, `run_free_first`, its use on every native conversion, the
+   inline `replay_metadata`, and the tests above.
 3. The benchmark re-run recorded in 0018, and the roadmap line.

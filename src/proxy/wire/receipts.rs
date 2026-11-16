@@ -312,6 +312,8 @@ pub struct Receipts {
     rescan_incomplete_baseline: bool,
     rescan_attempted: AtomicBool,
     lock_timeout: Option<Duration>,
+    /// Set only on a [`Self::tripwire`] store: whether it was asked for anything.
+    tripwire: Option<AtomicBool>,
     #[cfg(test)]
     full_reloads: std::sync::atomic::AtomicUsize,
 }
@@ -329,6 +331,7 @@ impl Receipts {
             rescan_incomplete_baseline: false,
             rescan_attempted: AtomicBool::new(false),
             lock_timeout: None,
+            tripwire: None,
             #[cfg(test)]
             full_reloads: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -336,6 +339,37 @@ impl Receipts {
 
     pub fn from_env() -> Self {
         Self::from_lookup(&|key| std::env::var_os(key))
+    }
+
+    /// A store with no root that refuses every `get` and `put` before touching
+    /// anything, and remembers that it was asked (0023). A conversion run against
+    /// it tells whether it needs a receipt at all: if it never reaches the store the
+    /// result is final, and if it does, the same conversion runs again against the
+    /// real one. It never answers `Ok(None)`: that would read as an expired receipt
+    /// (the Responses restore drops the item) or a legacy id (the Chat import passes
+    /// the call through), each a silent wrong success.
+    pub(super) fn tripwire() -> Self {
+        let mut receipts = Self::with_limits(PathBuf::new(), Limits::default());
+        receipts.tripwire = Some(AtomicBool::new(false));
+        receipts
+    }
+
+    /// Whether this tripwire store was asked for a receipt.
+    pub(super) fn tripwire_hit(&self) -> bool {
+        self.tripwire
+            .as_ref()
+            .is_some_and(|hit| hit.load(Ordering::Acquire))
+    }
+
+    /// The early return of every store operation on a tripwire store.
+    fn refuse_if_tripwire(&self) -> Result<(), String> {
+        match &self.tripwire {
+            Some(hit) => {
+                hit.store(true, Ordering::Release);
+                Err("a receipt was needed".to_string())
+            }
+            None => Ok(()),
+        }
     }
 
     /// The same parsing as [`Self::from_env`], reading each variable through
@@ -399,6 +433,7 @@ impl Receipts {
     }
 
     pub fn put(&self, scope: &str, kind: &str, key: &Value, value: &Value) -> Result<(), String> {
+        self.refuse_if_tripwire()?;
         let serialized_value = serde_json::to_vec(value).map_err(|_| error())?;
         if serialized_value.len() as u64 > MAX_RECEIPT_BYTES {
             return Err(error());
@@ -497,6 +532,7 @@ impl Receipts {
         key: &Value,
         mut budget: Option<&mut RestorationBudget>,
     ) -> Result<Option<Value>, String> {
+        self.refuse_if_tripwire()?;
         self.prepare_directories()?;
         let lock_file = self.lock_file()?;
         self.acquire_lock(&lock_file)?;
