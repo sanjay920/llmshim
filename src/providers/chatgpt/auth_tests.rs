@@ -32,7 +32,10 @@ async fn pending_device_authorization_waits_and_times_out() {
         user_code: "test".into(),
         device_auth_id: "device".into(),
         interval: Duration::from_secs(5),
-        deadline: Instant::now() + Duration::from_secs(1),
+        // The first poll must reach the mock before this passes. One second was
+        // too little for a loaded CI runner (the mock saw no request, 0 of 1);
+        // the interval is longer than the deadline, so the wait is the deadline.
+        deadline: Instant::now() + Duration::from_secs(4),
     };
     let err = auth.finish_login(code).await.unwrap_err();
     assert!(matches!(err, ShimError::ProviderError { status: 408, .. }));

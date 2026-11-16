@@ -565,6 +565,16 @@ publisher waits behind `release-inputs`, which needs it. Only runs from a push t
 so a tag must name a commit that reached `main` and finished CI there. GitHub keeps run records,
 but if one is ever gone a re-run of an old release is refused: roll the tag forward instead.
 
+## Upstream client from settings (note 0021)
+
+`ShimClient::from_settings(ClientSettings)` builds the upstream HTTP client from explicit values
+and **never reads the environment** (`LLMSHIM_MAX_RETRIES`, `LLMSHIM_UPSTREAM_*` and the rest
+only drive `ShimClient::new()`); `Router::with_http_client` makes a router use it, and
+`bound_client` refuses a scoped router (`without_ambient_proxy`) paired with a client that honours
+ambient proxies. The client's pool settings also reach the scoped transport the cloud providers
+use. These are additive public APIs (a minor bump at the next release); `serve` will take its
+settings from `[upstream]` in slice 3, and the default pool for the shared client stays 4.
+
 ## Signed images (note 0019)
 
 `.github/workflows/images.yml` builds `serve-redis,serve-otel` on a `v*.*.*` tag, pushes

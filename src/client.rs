@@ -96,12 +96,33 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok()?.trim().parse().ok()
 }
 
-fn http_client_builder(connect_timeout: Duration, ambient_proxy: bool) -> reqwest::ClientBuilder {
+/// How connections to an upstream host are kept. The shared client's values are
+/// the constants below; [`ClientSettings`] chooses its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pool {
+    max_idle_per_host: usize,
+    idle_timeout: Duration,
+}
+
+impl Default for Pool {
+    fn default() -> Self {
+        Self {
+            max_idle_per_host: 4,
+            idle_timeout: Duration::from_secs(90),
+        }
+    }
+}
+
+fn http_client_builder(
+    connect_timeout: Duration,
+    pool: Pool,
+    ambient_proxy: bool,
+) -> reqwest::ClientBuilder {
     let builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(pool.idle_timeout)
+        .pool_max_idle_per_host(pool.max_idle_per_host)
         .tcp_keepalive(Duration::from_secs(30))
         .tcp_nodelay(true);
     if ambient_proxy {
@@ -205,6 +226,7 @@ pub struct ShimClient {
     http: Client,
     scoped_http: Arc<tokio::sync::OnceCell<Client>>,
     ambient_proxy: bool,
+    pool: Pool,
     retry: RetryConfig,
     deadlines: AttemptDeadlines,
     response_body_limits: body::ResponseBodyLimits,
@@ -220,7 +242,110 @@ impl Default for ShimClient {
     }
 }
 
+/// Every setting of the upstream HTTP client, given explicitly. A client built
+/// from it ([`ShimClient::from_settings`]) never reads the environment, so a
+/// server configured from a file is not changed by variables a host happens to
+/// export (0021). `Default` is what the environment-driven client uses when no
+/// variable is set, except that nothing is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClientSettings {
+    /// Retries after the first attempt of a transport error or a 429/5xx.
+    pub max_retries: u32,
+    /// The cap of one retry wait, whether computed or dictated by the server.
+    pub max_backoff: Duration,
+    /// Idle connections kept per upstream host. HTTP/1.1 upstreams need one per
+    /// request in flight to avoid opening a connection per request; an HTTP/2
+    /// upstream multiplexes and needs few.
+    pub pool_max_idle_per_host: usize,
+    /// How long an idle connection is kept.
+    pub pool_idle_timeout: Duration,
+    /// Honour the host's `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`.
+    pub ambient_proxy: bool,
+    pub deadlines: AttemptDeadlines,
+}
+
+impl Default for ClientSettings {
+    fn default() -> Self {
+        let retry = RetryConfig::default();
+        let pool = Pool::default();
+        Self {
+            max_retries: retry.max_retries,
+            max_backoff: retry.cap,
+            pool_max_idle_per_host: pool.max_idle_per_host,
+            pool_idle_timeout: pool.idle_timeout,
+            ambient_proxy: true,
+            deadlines: AttemptDeadlines::default(),
+        }
+    }
+}
+
+impl ClientSettings {
+    /// The bounds a constructor enforces: at most 10 retries, a backoff cap of 1
+    /// to 300 seconds, 1 to 4096 idle connections kept for 1 to 3600 seconds, and
+    /// deadlines that are positive and finite.
+    pub fn validate(&self) -> std::result::Result<(), &'static str> {
+        if self.max_retries > 10 {
+            return Err("max_retries must be at most 10");
+        }
+        if !(Duration::from_secs(1)..=Duration::from_secs(300)).contains(&self.max_backoff) {
+            return Err("max_backoff must be between 1 and 300 seconds");
+        }
+        if !(1..=4096).contains(&self.pool_max_idle_per_host) {
+            return Err("pool_max_idle_per_host must be between 1 and 4096");
+        }
+        if !(Duration::from_secs(1)..=Duration::from_secs(3600)).contains(&self.pool_idle_timeout) {
+            return Err("pool_idle_timeout must be between 1 and 3600 seconds");
+        }
+        self.deadlines.validate().map(|_| ())
+    }
+}
+
 impl ShimClient {
+    /// A client built only from `settings`: no environment variable is read.
+    pub fn from_settings(settings: ClientSettings) -> std::result::Result<Self, &'static str> {
+        settings.validate()?;
+        let pool = Pool {
+            max_idle_per_host: settings.pool_max_idle_per_host,
+            idle_timeout: settings.pool_idle_timeout,
+        };
+        Ok(Self {
+            http: http_client_builder(settings.deadlines.connect, pool, settings.ambient_proxy)
+                .build()
+                .map_err(|_| "HTTP client could not be initialized with these settings")?,
+            scoped_http: Arc::new(tokio::sync::OnceCell::new()),
+            ambient_proxy: settings.ambient_proxy,
+            pool,
+            retry: RetryConfig {
+                max_retries: settings.max_retries,
+                base: RetryConfig::default().base,
+                cap: settings.max_backoff,
+            },
+            deadlines: settings.deadlines,
+            response_body_limits: body::ResponseBodyLimits::default(),
+            stream_retention_limits: crate::streaming::StreamRetentionLimits::default(),
+            breaker: None,
+        })
+    }
+
+    /// The settings this client runs with, whether it was built from them or from
+    /// the environment.
+    pub fn settings(&self) -> ClientSettings {
+        ClientSettings {
+            max_retries: self.retry.max_retries,
+            max_backoff: self.retry.cap,
+            pool_max_idle_per_host: self.pool.max_idle_per_host,
+            pool_idle_timeout: self.pool.idle_timeout,
+            ambient_proxy: self.ambient_proxy,
+            deadlines: self.deadlines,
+        }
+    }
+
+    /// Whether this client honours the host's proxy variables.
+    pub fn ambient_proxy(&self) -> bool {
+        self.ambient_proxy
+    }
+
     pub fn new() -> Self {
         Self::with_proxy_policy(true).expect("failed to build HTTP client")
     }
@@ -233,9 +358,10 @@ impl ShimClient {
     fn with_proxy_policy(ambient_proxy: bool) -> Result<Self> {
         let deadlines = AttemptDeadlines::from_env();
         Ok(Self {
-            http: http_client_builder(deadlines.connect, ambient_proxy).build()?,
+            http: http_client_builder(deadlines.connect, Pool::default(), ambient_proxy).build()?,
             scoped_http: Arc::new(tokio::sync::OnceCell::new()),
             ambient_proxy,
+            pool: Pool::default(),
             retry: RetryConfig::from_env(),
             deadlines,
             response_body_limits: body::ResponseBodyLimits::default(),
@@ -246,7 +372,7 @@ impl ShimClient {
 
     /// A scoped credential cannot be forwarded through a proxy chosen by the host environment.
     pub fn without_ambient_proxy(mut self) -> Result<Self> {
-        self.http = http_client_builder(self.deadlines.connect, false).build()?;
+        self.http = http_client_builder(self.deadlines.connect, self.pool, false).build()?;
         self.ambient_proxy = false;
         Ok(self)
     }
@@ -257,7 +383,7 @@ impl ShimClient {
     ) -> std::result::Result<Self, &'static str> {
         self.deadlines = deadlines.validate()?;
         self.scoped_http = Arc::new(tokio::sync::OnceCell::new());
-        self.http = http_client_builder(self.deadlines.connect, self.ambient_proxy)
+        self.http = http_client_builder(self.deadlines.connect, self.pool, self.ambient_proxy)
             .build()
             .map_err(|_| "HTTP client could not be initialized with these deadlines")?;
         Ok(self)
@@ -452,7 +578,7 @@ impl ShimClient {
         {
             self.scoped_http
                 .get_or_try_init(|| async {
-                    http_client_builder(self.deadlines.connect, false).build()
+                    http_client_builder(self.deadlines.connect, self.pool, false).build()
                 })
                 .await
                 .map_err(|error| DispatchFailure::Local(error.into()))?

@@ -1,7 +1,9 @@
 # 0021: The upstream HTTP client and listener limits from the file
 
-Status: design only. A contract note, written before any code (README working
-rule 3). Nothing here is implemented; the slices are listed at the end.
+Status: slice 2 implemented (the library: `ClientSettings`, `ShimClient::from_settings`,
+`Router::with_http_client`, `bound_client` using it); the file's keys, the listener
+limits and the benchmark re-run are slices 3 and 4. A contract note, written before
+any code (README working rule 3).
 
 ## Why
 
@@ -131,10 +133,11 @@ the other keys are this note's.
 ## Slices
 
 1. This note.
-2. The library: explicit `ClientSettings` and the `ShimClient` constructor that
+2. Done: the library: explicit `ClientSettings` and the `ShimClient` constructor that
    never reads the environment, `Router::with_http_client`, `bound_client` using
-   it (and refusing a scoped router with an ambient client), the scoped transport
-   taking the same settings, and the listener taking its limits as arguments. Tests:
+   it (and refusing a scoped router with an ambient client), and the scoped
+   transport taking the same settings. (The listener taking its limits as arguments
+   is part of slice 3: it is in the binary, not the library.) Tests:
    a settings value builds the client it describes (pool, deadlines, retry, on both
    the shared and the scoped transport); a client built from
    settings ignores every `LLMSHIM_*` canary in the environment; a router without a
