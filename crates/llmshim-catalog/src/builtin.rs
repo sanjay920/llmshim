@@ -143,8 +143,9 @@ pub const CHATGPT_MODELS: &[BuiltinModelInfo] = &[
         family: Some(ModelFamily::Gpt),
         name: "gpt-6.1-sol",
         label: "GPT-6.1 Sol (ChatGPT)",
-        // Subscription entitlements and limits are account-dependent.
-        context_window_tokens: None,
+        // Codex and ChatGPT Work default, verified 2026-11-16.
+        // https://learn.chatgpt.com/docs/models
+        context_window_tokens: Some(500_000),
         max_output_tokens: None,
         capabilities: ModelCapabilities {
             tools: Support::Supported,
