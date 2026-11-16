@@ -16,6 +16,7 @@ pub mod allowlist;
 pub mod build;
 pub mod config;
 mod jsonl;
+pub mod jwks;
 pub mod jwt;
 pub mod keys;
 pub mod mtls;
