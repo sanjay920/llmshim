@@ -556,6 +556,14 @@ Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: an fmt+clippy+test 
 - **First publish of a new npm package** is manual once (npm's Trusted Publisher UI requires the package to exist first); PyPI/RubyGems support pre-configured "pending" publishers. Each package needs a Trusted Publisher pointing at workflow `release.yml`, environment `release`.
 - **CI environment quirks handled in the workflow**: OIDC npm publish needs npm ≥ 11.5.1 (upgrade npm in-job — the bundled one is too old); `mkdir -p bin` before copying binaries into platform packages (git doesn't track empty dirs); install `webrick` explicitly for the Ruby test; the root npm job uses `npm install --omit=optional` (not `npm ci`) because the platform packages publish in the same run.
 
+## Signed images (note 0019)
+
+`.github/workflows/images.yml` builds `serve-redis,serve-otel` on a `v*.*.*` tag, pushes
+`ghcr.io/<owner>/llmshim:<version>`, signs the digest keyless with cosign, and attaches an
+SPDX SBOM as a signed attestation, then verifies both. It does nothing unless the repository
+variable `PUBLISH_IMAGE` is `true`; setting it, and the first push to GHCR, are the owner's.
+`docker-check.yml` builds the same feature set on pull requests that touch the Dockerfile.
+
 ## Detailed reference
 
 Scoped rules in `.claude/rules/` load automatically when working in relevant files.
