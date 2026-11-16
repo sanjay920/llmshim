@@ -59,6 +59,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0023: Native requests and answers that need no replay receipt](0023-receipt-free-native-requests.md)
 - [0024: The control plane](0024-control-plane.md)
 - [0025: No receipt lookup for an assistant turn that cannot have one](0025-no-lookup-without-a-receipt.md)
+- [0026: The control plane's HTTP API](0026-control-plane-api.md)
 
 ## Roadmap
 
