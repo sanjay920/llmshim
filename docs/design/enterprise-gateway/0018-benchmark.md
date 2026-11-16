@@ -355,3 +355,43 @@ earlier runs sent (a single user message); the second carries two earlier turns.
    lookup for an assistant message that carries no reasoning and no tool calls (the
    wire writes a reasoning receipt only for those), or give the executor a bounded
    wait and more workers. Each changes what a replay can find, so it needs its own note.
+
+## Fourth run (2026-11-16, commit 926149f plus 0025): history without a lookup
+
+The same host, method and harness as the third run; the binary is `926149f` with the change
+of 0025 (the report's "working tree not clean"). Only the case that failed is repeated,
+`--history 2` (two earlier user/assistant text turns):
+
+| connections | path | requests | failed | req/s | p50 | p99 | added p50 | added p99 | peak RSS | upstream connections |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | mock directly | 362135 | 0 | 24141 | 0.04 ms | 0.06 ms | | | | 1 |
+| 1 | /v1/chat/completions | 85338 | 0 | 5689 | 0.17 ms | 0.21 ms | +0.13 ms | +0.15 ms | 92.3 MiB | 1 |
+| 1 | /v1/chat | 90371 | 0 | 6024 | 0.16 ms | 0.21 ms | +0.12 ms | +0.15 ms | 92.3 MiB | 0 |
+| 8 | mock directly | 1356186 | 0 | 90406 | 0.09 ms | 0.15 ms | | | | 8 |
+| 8 | /v1/chat/completions | 323383 | 0 | 21558 | 0.37 ms | 0.51 ms | +0.28 ms | +0.37 ms | 94.0 MiB | 7 |
+| 8 | /v1/chat | 350544 | 0 | 23368 | 0.34 ms | 0.49 ms | +0.25 ms | +0.34 ms | 94.0 MiB | 0 |
+| 32 | mock directly | 1750220 | 0 | 116674 | 0.27 ms | 0.43 ms | | | | 33 |
+| 32 | /v1/chat/completions | 547732 | 0 | 36513 | 0.87 ms | 1.18 ms | +0.60 ms | +0.75 ms | 100.7 MiB | 20 |
+| 32 | /v1/chat | 527257 | 0 | 35148 | 0.90 ms | 1.25 ms | +0.63 ms | +0.82 ms | 100.7 MiB | 1 |
+| 64 | mock directly | 1654180 | 0 | 110272 | 0.57 ms | 0.92 ms | | | | 65 |
+| 64 | /v1/chat/completions | 533228 | 0 | 35546 | 1.79 ms | 2.33 ms | +1.22 ms | +1.41 ms | 104.6 MiB | 24 |
+| 64 | /v1/chat | 542473 | 0 | 36163 | 1.76 ms | 2.29 ms | +1.19 ms | +1.38 ms | 105.4 MiB | 10 |
+
+**Memory (resident set of the serve process):** 11.1 MiB idle before any load, 105.4 MiB after the last phase.
+
+The native `/v1/chat/completions` wire now answers every request at 32 and 64 concurrent
+with history (0 failed of about 550,000 and 530,000), at 36,500 and 35,500 req/s, within
+about 3 % of the gateway's own `/v1/chat` (35,100 and 36,200 req/s in the same run) and
+with +0.60 ms and +1.22 ms of added latency at p50. In the third run the same request was
+refused about 91 % of the time at 32 and 64 and ran at 3,500 req/s at one connection; it
+now runs at 5,700. Memory is 105 MiB after the last phase, as before.
+
+**Not measured:** a history whose assistant turns carry reasoning or tool calls. Those
+still look the store up and still need the executor, so a caller replaying such history is
+not helped (0025).
+
+### Status of the findings
+
+2. *The replay-receipt executor refuses work when its slots are taken*: **resolved for
+   requests that carry no receipt-bearing history** (0023, 0025). **Open** for requests
+   that replay reasoning or tool calls.

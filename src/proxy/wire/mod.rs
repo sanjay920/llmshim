@@ -638,13 +638,17 @@ fn request_to_chat_with_limits(
                         .ok_or("message must be an object")?
                         .remove("reasoning");
                 }
-                if let Some(reasoning) = receipts.get_bounded(
-                    scope,
-                    "reasoning",
-                    &message_key(&key_source),
-                    &mut restoration_budget,
-                )? {
-                    canonical["reasoning"] = reasoning;
+                // A reasoning receipt is stored under a key whose `reasoning_details`
+                // is the exported array (`response.rs`, its only writer), so a message
+                // without one has no receipt to find: the lookup would take the store's
+                // lock to learn nothing (0025).
+                let key = message_key(&key_source);
+                if !key["reasoning_details"].is_null() {
+                    if let Some(reasoning) =
+                        receipts.get_bounded(scope, "reasoning", &key, &mut restoration_budget)?
+                    {
+                        canonical["reasoning"] = reasoning;
+                    }
                 }
                 if let Some(calls) = message.get("tool_calls") {
                     canonical["tool_calls"] = Value::Array(
@@ -2183,15 +2187,28 @@ mod async_receipt_tests {
             send(application(false), first_turn.clone()).await,
             StatusCode::OK
         );
-        let replayed = json!([
+        // A history of plain text turns needs no lookup either (0025).
+        let replayed_text = json!([
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "earlier"},
             {"role": "user", "content": "again"}
         ]);
         assert_eq!(
-            send(application(false), replayed).await,
+            send(application(false), replayed_text).await,
+            StatusCode::OK,
+            "a text assistant turn has no receipt to find"
+        );
+        // An assistant turn that carries reasoning can have one: it needs a slot.
+        let replayed_reasoning = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "earlier",
+             "reasoning_details": [{"kind": "text", "text": "t"}]},
+            {"role": "user", "content": "again"}
+        ]);
+        assert_eq!(
+            send(application(false), replayed_reasoning).await,
             StatusCode::SERVICE_UNAVAILABLE,
-            "an assistant turn is looked up, so it needs a slot"
+            "reasoning is looked up, so it needs a slot"
         );
         assert_eq!(
             send(application(true), first_turn).await,
@@ -2242,6 +2259,41 @@ mod async_receipt_tests {
             .unwrap()
             .status();
         assert!(status.is_client_error(), "{status}");
+    }
+
+    #[test]
+    fn a_chat_assistant_turn_is_looked_up_only_when_a_receipt_can_exist() {
+        // 0025: the only writer of a reasoning receipt keys it by a message whose
+        // `reasoning_details` is the exported array, so a message without one needs
+        // no lookup, and every message that could match still does one.
+        let converts = |assistant: Value| -> bool {
+            let store = Receipts::tripwire();
+            let request = json!({"model": "m", "messages": [
+                {"role": "user", "content": "hi"}, assistant,
+                {"role": "user", "content": "again"}]});
+            let _ = request_to_chat(&request, Wire::Chat, &store, "scope");
+            store.tripwire_hit()
+        };
+        assert!(!converts(json!({"role": "assistant", "content": "plain"})));
+        assert!(!converts(json!({"role": "assistant", "content": null})));
+        assert!(!converts(
+            json!({"role": "assistant", "content": "x", "reasoning_details": null})
+        ));
+        let details = json!([{"kind": "text", "text": "t"}]);
+        assert!(converts(
+            json!({"role": "assistant", "content": "x", "reasoning_details": details})
+        ));
+        // A message exported before `reasoning_details` existed carries the array
+        // under `reasoning`; it is aliased and looked up.
+        assert!(converts(
+            json!({"role": "assistant", "content": "x", "reasoning": details})
+        ));
+        // A tool call in history is still looked up (a receipt can exist for it).
+        assert!(converts(
+            json!({"role": "assistant", "content": null, "tool_calls": [{
+            "id": "call_ls_x", "type": "function",
+            "function": {"name": "read", "arguments": "{}"}}]})
+        ));
     }
 
     #[tokio::test]
