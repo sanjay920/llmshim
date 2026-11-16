@@ -58,6 +58,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0022: Reloading providers, routes and rate limits](0022-reload-providers-routes-limits.md)
 - [0023: Native requests and answers that need no replay receipt](0023-receipt-free-native-requests.md)
 - [0024: The control plane](0024-control-plane.md)
+- [0025: No receipt lookup for an assistant turn that cannot have one](0025-no-lookup-without-a-receipt.md)
 
 ## Roadmap
 
@@ -103,7 +104,7 @@ Phase 0: a production server mode
 - [x] Reproducible benchmark (0018). It found two limits: the upstream connection
       pool (resolved for `serve` by 0021, re-measured) and the replay-receipt
       executor (8 ingress and 4 egress slots): resolved for requests that need no receipt
-      (0023, third run), still open for a caller that replays history
+      (0023, 0025, fourth run), still open for a caller that replays reasoning or tool calls
 - [x] Configuration-contract tightenings, a structure-only `--check` and a
       checked-in JSON Schema (see "Review follow-ups"; 0013)
 - [x] Pull-request CI for every build, including the Redis-backed tests that are
