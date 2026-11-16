@@ -972,6 +972,11 @@ pub struct GatewayKey {
     /// it for no restriction; an empty list is refused.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// When this key stops working, as an RFC 3339 time (`2026-12-31T00:00:00Z`). A request
+    /// authenticated as it at or after that moment is refused with 401, checked at request
+    /// time against this process's clock: no reload is needed for it to take effect (0024).
+    #[serde(default)]
+    pub expires_at: Option<String>,
     pub tenant: String,
     /// Queue priority; higher is served sooner.
     #[serde(default)]
@@ -2048,6 +2053,14 @@ impl ServeConfig {
             }
             if !valid_tenant(&key.tenant) {
                 issues.push(Issue::new(format!("{at}.tenant"), TENANT_RULE));
+            }
+            if let Some(expires) = &key.expires_at {
+                if chrono::DateTime::parse_from_rfc3339(expires).is_err() {
+                    issues.push(Issue::new(
+                        format!("{at}.expires_at"),
+                        "must be an RFC 3339 time such as 2026-12-31T00:00:00Z",
+                    ));
+                }
             }
             if let Some(cidrs) = &key.allowed_cidrs {
                 if cidrs.is_empty() {

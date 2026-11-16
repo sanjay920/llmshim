@@ -131,7 +131,16 @@ pub fn client_address(
     None
 }
 
-type Table = HashMap<String, Arc<[Cidr]>>;
+/// What is checked for a credential after it authenticates: where it may be used from and
+/// until when (0017, 0024). Either may be absent.
+#[derive(Clone)]
+pub struct Rule {
+    pub nets: Option<Arc<[Cidr]>>,
+    /// Epoch seconds from which the credential is refused.
+    pub expires_at: Option<i64>,
+}
+
+type Table = HashMap<String, Rule>;
 
 /// The allowlists in force, by credential scope (the digest that scopes a key's
 /// state: a token's SHA-256, a certificate workload's `mtls:<name>`). Replaced as
@@ -160,14 +169,17 @@ impl AllowTable {
     pub(crate) fn fingerprint_of(table: &Table) -> String {
         let mut lines: Vec<String> = table
             .iter()
-            .map(|(scope, nets)| {
+            .map(|(scope, rule)| {
                 format!(
-                    "{:x}|{}",
+                    "{:x}|{}|{:?}",
                     Sha256::digest(scope.as_bytes()),
-                    nets.iter()
+                    rule.nets
+                        .iter()
+                        .flat_map(|nets| nets.iter())
                         .map(|n| format!("{}/{}/{}", n.network, n.prefix, n.v6))
                         .collect::<Vec<_>>()
-                        .join(",")
+                        .join(","),
+                    rule.expires_at
                 )
             })
             .collect();
@@ -205,7 +217,27 @@ pub(crate) async fn enforce(
     let Some(scope) = crate::gateway::auth::credential_scope_of(&headers) else {
         return next.run(request).await;
     };
-    let Some(allowed) = current.get(&scope) else {
+    let Some(rule) = current.get(&scope) else {
+        return next.run(request).await;
+    };
+    // Expiry first: an expired key is refused wherever it is used from.
+    if rule
+        .expires_at
+        .is_some_and(|at| chrono::Utc::now().timestamp() >= at)
+    {
+        let message = "This key has expired";
+        return match native {
+            Some(wire) => crate::proxy::wire::fail(wire, StatusCode::UNAUTHORIZED, message),
+            None => (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(
+                    serde_json::json!({"error": {"code": "key_expired", "message": message}}),
+                ),
+            )
+                .into_response(),
+        };
+    }
+    let Some(allowed) = rule.nets.as_ref() else {
         return next.run(request).await;
     };
     let peer = request

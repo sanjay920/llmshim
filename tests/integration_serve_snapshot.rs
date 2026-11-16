@@ -722,3 +722,90 @@ async fn a_restart_does_not_make_an_old_snapshot_fresh_again() {
     let again = start(&config, "snapshot-restart-age-2", &[]);
     assert_eq!(snapshot_status(&again).await["stale"], true);
 }
+
+fn in_secs(seconds: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339()
+}
+
+#[tokio::test]
+async fn a_key_stops_working_at_its_expiry_without_a_reload_and_a_new_snapshot_can_extend_it() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-expiry");
+    let mut soon = key("alpha", ALPHA, "active");
+    soon["expires_at"] = json!(in_secs(10));
+    plane.write(&payload(1, vec![soon, key("bravo", BRAVO, "active")]));
+    let server = start(&plane.config(&upstream.url(), ""), "snapshot-expiry", &[]);
+    assert_eq!(status_of(&server, ALPHA).await, 200, "before it expires");
+    // No reload happens: the data plane's own clock decides. Polled, not slept for.
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    while status_of(&server, ALPHA).await != 401 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the key never expired"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        status_of(&server, BRAVO).await,
+        200,
+        "a key without an expiry is untouched"
+    );
+    // A later generation extends it: expiry is part of what a reload applies.
+    let mut extended = key("alpha", ALPHA, "active");
+    extended["expires_at"] = json!(in_secs(3600));
+    plane.write(&payload(2, vec![extended, key("bravo", BRAVO, "active")]));
+    hangup(&server);
+    wait_for_reload(&server, "the extension", |s| {
+        s["snapshot"]["generation"] == 2
+    })
+    .await;
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+}
+
+#[test]
+fn a_file_key_takes_an_rfc3339_expiry_and_refuses_anything_else() {
+    let dir = tempdir::Dir::new("expiry-config");
+    let path = dir.0.join("gateway.toml");
+    let env = [
+        ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+        ("SERVE_E2E_ADMIN_TOKEN", ADMIN_TOKEN),
+        ("SERVE_E2E_CALLER_KEY", ALPHA),
+    ];
+    let base =
+        harness::config("http://127.0.0.1:1/v1", "").replace("{DIR}", dir.0.to_str().unwrap());
+    let with = |expires: &str| {
+        base.replacen(
+            "name = \"ci\"",
+            &format!("name = \"ci\"\n        expires_at = \"{expires}\""),
+            1,
+        )
+    };
+    std::fs::write(&path, with("2999-01-01T00:00:00Z")).unwrap();
+    let (code, stderr) = run_with_args(&path, &["--check", "--structure-only"], &env);
+    assert_eq!(code, Some(0), "{stderr}");
+    std::fs::write(&path, with("next tuesday")).unwrap();
+    let (code, stderr) = run_with_args(&path, &["--check", "--structure-only"], &env);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("keys[0].expires_at"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_key_in_the_file_expires_at_request_time_too() {
+    let (upstream, _mock) = mock(1).await;
+    let expiry = in_secs(10);
+    let text = harness::config(&upstream.url(), "").replacen(
+        "name = \"ci\"",
+        &format!("name = \"ci\"\n        expires_at = \"{expiry}\""),
+        1,
+    );
+    let server = start(&text, "file-key-expiry", &[]);
+    assert_eq!(status_of(&server, harness::CALLER_KEY).await, 200);
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    while status_of(&server, harness::CALLER_KEY).await != 401 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the key never expired"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
