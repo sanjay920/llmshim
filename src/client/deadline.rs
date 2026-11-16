@@ -10,7 +10,7 @@ const DEFAULT_UNARY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_STREAM_SEMANTIC_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_STREAM_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttemptDeadlines {
     pub(crate) connect: Duration,
     pub(crate) response_headers: Duration,

@@ -295,10 +295,19 @@ async fn stream_resolved(
 /// A client reporting to this router's breaker. Ambient routers share the pool
 /// by clone; scoped routers build a fallible transport without host proxies.
 pub(crate) fn bound_client(router: &Router) -> Result<ShimClient> {
-    let client = if router.ambient_proxy() {
-        SHARED_CLIENT.clone()
-    } else {
-        ShimClient::new_scoped()?
+    let client = match router.http_client() {
+        // The router's own client. A router that forbids ambient proxies never
+        // forwards its credentials through one, so a client that honours them is
+        // an error here, not a quiet downgrade.
+        Some(client) if !router.ambient_proxy() && client.ambient_proxy() => {
+            return Err(error::provider_error(
+                400,
+                "this router refuses ambient proxies but its HTTP client honours them",
+            ));
+        }
+        Some(client) => client.clone(),
+        None if router.ambient_proxy() => SHARED_CLIENT.clone(),
+        None => ShimClient::new_scoped()?,
     };
     Ok(client.with_breaker(router.breaker().clone()))
 }
@@ -366,4 +375,57 @@ pub async fn transcription(
     bound_client(router)?
         .transcription(provider, &model, request)
         .await
+}
+
+#[cfg(test)]
+mod bound_client_tests {
+    use super::*;
+    use crate::client::ClientSettings;
+
+    fn client(ambient: bool, retries: u32) -> ShimClient {
+        ShimClient::from_settings(ClientSettings {
+            ambient_proxy: ambient,
+            max_retries: retries,
+            ..ClientSettings::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_router_without_a_client_uses_the_shared_one_as_before() {
+        let bound = bound_client(&Router::new()).unwrap();
+        assert_eq!(bound.settings(), SHARED_CLIENT.settings());
+        // Scoped, without a client of its own: a scoped client, as before.
+        let scoped = bound_client(&Router::new().without_ambient_proxy()).unwrap();
+        assert!(!scoped.ambient_proxy());
+    }
+
+    #[test]
+    fn a_routers_own_client_is_the_one_its_calls_use() {
+        let router = Router::new().with_http_client(client(true, 7));
+        assert_eq!(bound_client(&router).unwrap().settings().max_retries, 7);
+        let scoped = Router::new()
+            .without_ambient_proxy()
+            .with_http_client(client(false, 5));
+        let bound = bound_client(&scoped).unwrap();
+        assert_eq!(bound.settings().max_retries, 5);
+        assert!(!bound.ambient_proxy());
+    }
+
+    #[test]
+    fn a_scoped_router_refuses_a_client_that_honours_ambient_proxies_in_either_order() {
+        let ambient = client(true, 3);
+        let one = Router::new()
+            .without_ambient_proxy()
+            .with_http_client(ambient.clone());
+        let other = Router::new()
+            .with_http_client(ambient)
+            .without_ambient_proxy();
+        for router in [one, other] {
+            let error = bound_client(&router)
+                .err()
+                .expect("refused, not downgraded");
+            assert!(error.to_string().contains("ambient"), "{error}");
+        }
+    }
 }

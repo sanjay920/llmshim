@@ -65,6 +65,9 @@ pub struct Router {
     /// Provider health. Separate from rate-limit backoff: see `crate::breaker`.
     breaker: Arc<ProviderBreaker>,
     ambient_proxy: bool,
+    /// The HTTP client this router's calls use, when it owns one (0021). Without
+    /// it the process-wide shared client does.
+    http_client: Option<crate::client::ShimClient>,
 }
 
 impl Default for Router {
@@ -124,7 +127,22 @@ impl Router {
             routes: BTreeMap::new(),
             breaker: Arc::new(ProviderBreaker::from_env()),
             ambient_proxy: true,
+            http_client: None,
         }
+    }
+
+    /// Give this router an HTTP client of its own, built from explicit settings
+    /// ([`crate::client::ShimClient::from_settings`]) instead of the process-wide
+    /// one built from the environment. A router that refuses ambient proxies
+    /// (`without_ambient_proxy`) refuses a client that honours them when it is used,
+    /// whichever order the two were set in.
+    pub fn with_http_client(mut self, client: crate::client::ShimClient) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
+    pub(crate) fn http_client(&self) -> Option<&crate::client::ShimClient> {
+        self.http_client.as_ref()
     }
 
     /// Refuse proxy configuration from the host environment for scoped credentials.
