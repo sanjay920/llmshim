@@ -26,6 +26,7 @@ One JSON line per request on the main listener:
 | `latency_ms` | until the response headers (or the abandonment); a stream's duration is not included |
 | `tenant` | the caller's tenant; `null` when the credential was missing or not recognised. The credential is read as the gateway reads it, so on the native routes (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`, Gemini `generateContent`) an `x-api-key` or `x-goog-api-key` counts |
 | `key` | the name (`keys[].name`) of the caller key the credential belongs to, so a line says *which* key as well as which tenant; `null` when the credential was missing or not recognised. For a client-certificate workload it is that key's name |
+| `auth_reason` | `null`, or why a token was refused before the gateway saw the request: `jwt_invalid`, `jwt_unknown_key`, `jwt_unknown_subject` or `jwks_unavailable` (0017). A class, never the token or the claim that failed |
 | `credential` | first eight hex characters of the SHA-256 of the bearer token (or of that header's key); `null` without one (a certificate workload has none) |
 
 ## Why these fields

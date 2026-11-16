@@ -47,6 +47,20 @@
       ],
       "type": "object"
     },
+    "Auth": {
+      "additionalProperties": false,
+      "description": "Caller authentication beyond bearer keys and client certificates.",
+      "properties": {
+        "jwt": {
+          "description": "Trusted token issuers. A `[[keys]]` entry binds to one by `jwt.table`.",
+          "items": {
+            "$ref": "#/$defs/JwtIssuer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "Fleet": {
       "additionalProperties": false,
       "description": "Fleet mode. Requires a binary built with `--features serve-redis`.",
@@ -105,6 +119,17 @@
             "null"
           ]
         },
+        "jwt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JwtBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Authenticate by a workload token from an `[[auth.jwt]]` issuer instead:\nthe issuer's table and the token's exact `sub` (0017). Only one of\n`secret`, `sha256`, `client_san` and `jwt` is set. A request that sends a\ntoken-shaped bearer value is authenticated as a token, never as a key."
+        },
         "name": {
           "description": "Operator-facing label. It names the key in the access log and the usage\nrecords (`key`); it is never sent to a provider.",
           "type": "string"
@@ -159,6 +184,104 @@
       "required": [
         "name",
         "tenant"
+      ],
+      "type": "object"
+    },
+    "JwtBinding": {
+      "additionalProperties": false,
+      "description": "A key that authenticates by a verified workload token.",
+      "properties": {
+        "subject": {
+          "description": "The exact `sub` claim.",
+          "type": "string"
+        },
+        "table": {
+          "description": "The `name` of an `[[auth.jwt]]` table (not its `issuer` URL).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "table",
+        "subject"
+      ],
+      "type": "object"
+    },
+    "JwtIssuer": {
+      "additionalProperties": false,
+      "description": "One trusted JWT issuer (0017): who signs workload tokens, where its keys are,\nand what a token must say. Every identity still maps to a configured key.",
+      "properties": {
+        "algorithms": {
+          "description": "The signature algorithms accepted from this issuer: `RS256`, `ES256` or\n`EdDSA`. Never taken from the token.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "audience": {
+          "description": "`aud` must contain this.",
+          "type": "string"
+        },
+        "ca_file": {
+          "default": null,
+          "description": "A PEM bundle that is the only trust anchor for fetching the JWKS (a private\nissuer's CA). Without it the platform's roots apply.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clock_skew_secs": {
+          "default": null,
+          "description": "Tolerance for clock difference, in seconds. Defaults to 30, at most 300.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "headers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/SecretRef"
+          },
+          "description": "Extra request headers for the JWKS fetch (an authorization token, say), by\nsecret reference.",
+          "type": "object"
+        },
+        "issuer": {
+          "description": "The exact `iss` a token must carry.",
+          "type": "string"
+        },
+        "jwks_max_stale_secs": {
+          "default": null,
+          "description": "How long keys already fetched keep verifying when a refresh fails, in\nseconds. Defaults to 3600; 0 means never. Together with the refresh\ninterval this is how long a revoked key can verify while the issuer is\nunreachable.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "jwks_refresh_secs": {
+          "default": null,
+          "description": "How long fetched keys are fresh, in seconds. Defaults to 300, at least 30.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "jwks_url": {
+          "description": "Where the issuer's JWKS is, `https://` (or `http://` to a loopback address\nliteral). No credentials in the address, no redirects followed, no\ndiscovery: a token never chooses where its key comes from.",
+          "type": "string"
+        },
+        "name": {
+          "description": "What a key's `jwt.table` names, and how the issuer is labelled in metrics\nand `/v1/serve/config`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "issuer",
+        "jwks_url",
+        "audience",
+        "algorithms"
       ],
       "type": "object"
     },
@@ -559,6 +682,10 @@
         }
       ],
       "description": "A separate listener for operational endpoints. Without it they are\nserved on the main listener, as the gateway does."
+    },
+    "auth": {
+      "$ref": "#/$defs/Auth",
+      "description": "Other ways a caller proves who it is (0017). Fixed at start: a change is\nrefused by a reload, though a key's `jwt` binding reloads with the key."
     },
     "fleet": {
       "anyOf": [

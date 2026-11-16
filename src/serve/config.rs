@@ -130,6 +130,73 @@ pub struct ServeConfig {
     /// refused at startup.
     #[serde(default)]
     pub telemetry: Option<Telemetry>,
+    /// Other ways a caller proves who it is (0017). Fixed at start: a change is
+    /// refused by a reload, though a key's `jwt` binding reloads with the key.
+    #[serde(default)]
+    pub auth: Auth,
+}
+
+/// Caller authentication beyond bearer keys and client certificates.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Auth {
+    /// Trusted token issuers. A `[[keys]]` entry binds to one by `jwt.table`.
+    #[serde(default)]
+    pub jwt: Vec<JwtIssuer>,
+}
+
+/// One trusted JWT issuer (0017): who signs workload tokens, where its keys are,
+/// and what a token must say. Every identity still maps to a configured key.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct JwtIssuer {
+    /// What a key's `jwt.table` names, and how the issuer is labelled in metrics
+    /// and `/v1/serve/config`.
+    pub name: String,
+    /// The exact `iss` a token must carry.
+    pub issuer: String,
+    /// Where the issuer's JWKS is, `https://` (or `http://` to a loopback address
+    /// literal). No credentials in the address, no redirects followed, no
+    /// discovery: a token never chooses where its key comes from.
+    pub jwks_url: String,
+    /// A PEM bundle that is the only trust anchor for fetching the JWKS (a private
+    /// issuer's CA). Without it the platform's roots apply.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// Extra request headers for the JWKS fetch (an authorization token, say), by
+    /// secret reference.
+    #[serde(default, deserialize_with = "unique_map")]
+    pub headers: BTreeMap<String, SecretRef>,
+    /// `aud` must contain this.
+    pub audience: String,
+    /// The signature algorithms accepted from this issuer: `RS256`, `ES256` or
+    /// `EdDSA`. Never taken from the token.
+    pub algorithms: Vec<String>,
+    /// Tolerance for clock difference, in seconds. Defaults to 30, at most 300.
+    #[serde(default)]
+    pub clock_skew_secs: Option<u64>,
+    /// How long fetched keys are fresh, in seconds. Defaults to 300, at least 30.
+    #[serde(default)]
+    pub jwks_refresh_secs: Option<u64>,
+    /// How long keys already fetched keep verifying when a refresh fails, in
+    /// seconds. Defaults to 3600; 0 means never. Together with the refresh
+    /// interval this is how long a revoked key can verify while the issuer is
+    /// unreachable.
+    #[serde(default)]
+    pub jwks_max_stale_secs: Option<u64>,
+}
+
+/// A key that authenticates by a verified workload token.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct JwtBinding {
+    /// The `name` of an `[[auth.jwt]]` table (not its `issuer` URL).
+    pub table: String,
+    /// The exact `sub` claim.
+    pub subject: String,
 }
 
 /// Where to send traces. Fixed at start: a change is refused by a reload.
@@ -634,6 +701,12 @@ pub struct GatewayKey {
     /// also sends a bearer token is authenticated by the token alone.
     #[serde(default)]
     pub client_san: Option<String>,
+    /// Authenticate by a workload token from an `[[auth.jwt]]` issuer instead:
+    /// the issuer's table and the token's exact `sub` (0017). Only one of
+    /// `secret`, `sha256`, `client_san` and `jwt` is set. A request that sends a
+    /// token-shaped bearer value is authenticated as a token, never as a key.
+    #[serde(default)]
+    pub jwt: Option<JwtBinding>,
     /// Networks this key may be used from, as CIDRs (`10.0.0.0/8`, `2001:db8::/32`,
     /// a bare address for one host). A request authenticated as this key from
     /// anywhere else is refused with 403 before it reaches the queue or a
@@ -761,6 +834,7 @@ impl ServeConfig {
         self.validate_state(&mut issues);
         self.validate_logging(&mut issues);
         self.validate_telemetry(&mut issues);
+        self.validate_auth(&mut issues);
         self.validate_keys(&mut issues);
         self.validate_tenant_limits(&mut issues);
         self.validate_routes(&mut issues);
@@ -990,6 +1064,111 @@ impl ServeConfig {
         }
     }
 
+    fn validate_auth(&self, issues: &mut Vec<Issue>) {
+        let mut names = BTreeSet::new();
+        let mut issuers = BTreeSet::new();
+        for (index, table) in self.auth.jwt.iter().enumerate() {
+            let at = format!("auth.jwt[{index}]");
+            if !valid_name(&table.name) {
+                issues.push(Issue::new(format!("{at}.name"), NAME_RULE));
+            } else if !names.insert(table.name.as_str()) {
+                issues.push(Issue::new(
+                    format!("{at}.name"),
+                    "duplicates another issuer's name",
+                ));
+            }
+            if table.issuer.is_empty()
+                || table.issuer.len() > 512
+                || !table.issuer.bytes().all(|b| b.is_ascii_graphic())
+            {
+                issues.push(Issue::new(
+                    format!("{at}.issuer"),
+                    "must be 1 to 512 visible ASCII characters",
+                ));
+            } else if !issuers.insert(table.issuer.as_str()) {
+                issues.push(Issue::new(
+                    format!("{at}.issuer"),
+                    "duplicates another table's issuer, so the table would depend on order",
+                ));
+            }
+            if let Some(problem) = super::jwks::url_problem(&table.jwks_url) {
+                issues.push(Issue::new(format!("{at}.jwks_url"), problem));
+            }
+            if let Some(path) = &table.ca_file {
+                if !path.has_root() {
+                    issues.push(Issue::new(
+                        format!("{at}.ca_file"),
+                        "must be an absolute path",
+                    ));
+                }
+            }
+            if table.audience.is_empty()
+                || table.audience.len() > 256
+                || !table.audience.bytes().all(|b| b.is_ascii_graphic())
+            {
+                issues.push(Issue::new(
+                    format!("{at}.audience"),
+                    "must be 1 to 256 visible ASCII characters",
+                ));
+            }
+            if table.algorithms.is_empty() {
+                issues.push(Issue::new(
+                    format!("{at}.algorithms"),
+                    "must list at least one of RS256, ES256 and EdDSA",
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            for (n, name) in table.algorithms.iter().enumerate() {
+                if let Err(message) = super::jwt::Alg::parse(name) {
+                    issues.push(Issue::new(format!("{at}.algorithms[{n}]"), message));
+                } else if !seen.insert(name.as_str()) {
+                    issues.push(Issue::new(
+                        format!("{at}.algorithms[{n}]"),
+                        "is listed twice",
+                    ));
+                }
+            }
+            let bound =
+                |value: Option<u64>, lo: u64, hi: u64, name: &str, issues: &mut Vec<Issue>| {
+                    if value.is_some_and(|v| !(lo..=hi).contains(&v)) {
+                        issues.push(Issue::new(
+                            format!("{at}.{name}"),
+                            format!("must be between {lo} and {hi}"),
+                        ));
+                    }
+                };
+            bound(table.clock_skew_secs, 0, 300, "clock_skew_secs", issues);
+            bound(
+                table.jwks_refresh_secs,
+                30,
+                86_400,
+                "jwks_refresh_secs",
+                issues,
+            );
+            bound(
+                table.jwks_max_stale_secs,
+                0,
+                604_800,
+                "jwks_max_stale_secs",
+                issues,
+            );
+            for (name, secret) in &table.headers {
+                let header = format!("{at}.headers.{name}");
+                let token = !name.is_empty()
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte)
+                    });
+                if !token {
+                    issues.push(Issue::new(
+                        &header,
+                        "a header name is lower-case letters, digits, '-' or '_'",
+                    ));
+                }
+                validate_secret(secret, &header, issues);
+            }
+        }
+    }
+
     fn validate_telemetry(&self, issues: &mut Vec<Issue>) {
         let Some(telemetry) = &self.telemetry else {
             return;
@@ -1121,6 +1300,7 @@ impl ServeConfig {
         let mut digests = BTreeSet::new();
         let mut references = BTreeSet::new();
         let mut client_sans = BTreeSet::new();
+        let mut jwt_bindings = BTreeSet::new();
         let upstream: BTreeSet<String> = self
             .providers
             .values()
@@ -1153,7 +1333,39 @@ impl ServeConfig {
                     }
                 }
             }
-            if let Some(san) = &key.client_san {
+            if let Some(binding) = &key.jwt {
+                if key.secret.is_some() || key.sha256.is_some() || key.client_san.is_some() {
+                    issues.push(Issue::new(
+                        &at,
+                        "set jwt, or one of secret, sha256 and client_san, not several",
+                    ));
+                }
+                if !self
+                    .auth
+                    .jwt
+                    .iter()
+                    .any(|table| table.name == binding.table)
+                {
+                    issues.push(Issue::new(
+                        format!("{at}.jwt.table"),
+                        "names no [[auth.jwt]] table",
+                    ));
+                }
+                if binding.subject.is_empty()
+                    || binding.subject.len() > super::jwt::MAX_SUBJECT_BYTES
+                    || !binding.subject.bytes().all(|b| b.is_ascii_graphic())
+                {
+                    issues.push(Issue::new(
+                        format!("{at}.jwt.subject"),
+                        "must be 1 to 512 visible ASCII characters",
+                    ));
+                } else if !jwt_bindings.insert((binding.table.clone(), binding.subject.clone())) {
+                    issues.push(Issue::new(
+                        format!("{at}.jwt"),
+                        "duplicates another key's table and subject",
+                    ));
+                }
+            } else if let Some(san) = &key.client_san {
                 if key.secret.is_some() || key.sha256.is_some() {
                     issues.push(Issue::new(
                         &at,
@@ -1190,7 +1402,7 @@ impl ServeConfig {
                         issues.push(Issue::new(&at, "set either secret or sha256, not both"))
                     }
                     (None, None) => {
-                        issues.push(Issue::new(&at, "set secret, sha256 or client_san"))
+                        issues.push(Issue::new(&at, "set secret, sha256, client_san or jwt"))
                     }
                     (Some(secret), None) => {
                         validate_secret(secret, &format!("{at}.secret"), issues);
@@ -1326,11 +1538,18 @@ impl ServeConfig {
                 .iter()
                 .map(|(name, secret)| (format!("telemetry.headers.{name}"), secret))
         });
+        let jwks = self.auth.jwt.iter().enumerate().flat_map(|(index, table)| {
+            table
+                .headers
+                .iter()
+                .map(move |(name, secret)| (format!("auth.jwt[{index}].headers.{name}"), secret))
+        });
         providers
             .chain(keys)
             .chain(admin)
             .chain(fleet)
             .chain(telemetry)
+            .chain(jwks)
             .collect()
     }
 
@@ -1429,7 +1648,18 @@ impl ServeConfig {
         for (index, key) in self.keys.iter().enumerate() {
             let (at, caller) = match (&key.secret, &key.sha256) {
                 (Some(secret), None) => match read(secret) {
-                    Some(value) => (format!("keys[{index}].secret"), digest(&value)),
+                    Some(value) => {
+                        // With a token issuer configured, a token-shaped bearer
+                        // value is only ever verified as a token (0017), so a
+                        // key written like one could never authenticate.
+                        if !self.auth.jwt.is_empty() && super::jwt::is_jwt_shaped(value.trim()) {
+                            issues.push(Issue::new(
+                                format!("keys[{index}].secret"),
+                                "looks like a JWT; with [[auth.jwt]] configured a token-shaped bearer value is verified as a token and never looked up as a key",
+                            ));
+                        }
+                        (format!("keys[{index}].secret"), digest(&value))
+                    }
                     None => continue,
                 },
                 (None, Some(sha256)) => (format!("keys[{index}].sha256"), sha256.clone()),
@@ -1916,10 +2146,11 @@ mod tests {
             "routes",
             "reload",
             "telemetry",
+            "auth",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 12, "a new table needs a line here");
+        assert_eq!(properties.len(), 13, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
     }
 
@@ -2246,6 +2477,112 @@ mod tests {
             &issues(&proxies("[\"bad\"]")),
             "server.trusted_proxies[0]"
         ));
+    }
+
+    #[test]
+    fn jwt_issuers_and_bindings_are_validated_by_path() {
+        let table = |extra: &str| {
+            format!(
+                "[[auth.jwt]]\nname = \"idp\"\nissuer = \"https://idp.example\"\n\
+                 jwks_url = \"https://idp.example/keys\"\naudience = \"llmshim\"\n\
+                 algorithms = [\"RS256\", \"EdDSA\"]\n{extra}\n"
+            )
+        };
+        let bound = "[[keys]]\nname = \"wl\"\ntenant = \"t\"\n\
+                     jwt = { table = \"idp\", subject = \"svc:a\" }\n";
+        let ok = format!("{MINIMAL}\n{}\n{bound}", table(""));
+        assert!(
+            ServeConfig::parse(&ok, Format::Toml).is_ok(),
+            "{:?}",
+            issues(&ok)
+        );
+        for (text, path) in [
+            (
+                table("clock_skew_secs = 301"),
+                "auth.jwt[0].clock_skew_secs",
+            ),
+            (
+                table("jwks_refresh_secs = 5"),
+                "auth.jwt[0].jwks_refresh_secs",
+            ),
+            (
+                table("jwks_max_stale_secs = 999999999"),
+                "auth.jwt[0].jwks_max_stale_secs",
+            ),
+            (table("ca_file = \"relative.pem\""), "auth.jwt[0].ca_file"),
+            (
+                table("").replace("\"RS256\", \"EdDSA\"", "\"HS256\""),
+                "auth.jwt[0].algorithms[0]",
+            ),
+            (
+                table("").replace("\"RS256\", \"EdDSA\"", "\"RS256\", \"RS256\""),
+                "auth.jwt[0].algorithms[1]",
+            ),
+            (
+                table("").replace("\"RS256\", \"EdDSA\"", ""),
+                "auth.jwt[0].algorithms",
+            ),
+            (
+                table("").replace("https://idp.example/keys", "http://idp.example/keys"),
+                "auth.jwt[0].jwks_url",
+            ),
+            (
+                table("") + &table("").replace("name = \"idp\"", "name = \"idp2\""),
+                "auth.jwt[1].issuer",
+            ),
+            (
+                table("")
+                    + &table("").replace("issuer = \"https://idp.example\"", "issuer = \"x\""),
+                "auth.jwt[1].name",
+            ),
+        ] {
+            let text = format!("{MINIMAL}\n{text}\n{bound}");
+            assert!(has(&issues(&text), path), "{path}: {:?}", issues(&text));
+        }
+        // Bindings: an unknown table, a duplicate, both a secret and a binding.
+        let unknown = format!(
+            "{MINIMAL}\n{}\n{}",
+            table(""),
+            bound.replace("\"idp\"", "\"nope\"")
+        );
+        assert!(has(&issues(&unknown), "keys[1].jwt.table"));
+        let twice = format!(
+            "{MINIMAL}\n{}\n{bound}\n{}",
+            table(""),
+            bound.replace("\"wl\"", "\"wl2\"")
+        );
+        assert!(has(&issues(&twice), "keys[2].jwt"), "{:?}", issues(&twice));
+        let both = format!(
+            "{MINIMAL}\n{}\n{}sha256 = \"{}\"\n",
+            table(""),
+            bound,
+            "0".repeat(64)
+        );
+        assert!(has(&issues(&both), "keys[1]"), "{:?}", issues(&both));
+    }
+
+    #[test]
+    fn a_token_shaped_secret_is_refused_only_when_an_issuer_exists() {
+        use base64::Engine as _;
+        let enc = |text: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+        let shaped = format!("{}.{}.c2ln", enc("{\"alg\":\"EdDSA\"}"), enc("{}"));
+        let env = |name: &str| (name == "CI_GATEWAY_KEY").then(|| shaped.clone());
+        let plain = ServeConfig::parse(MINIMAL, Format::Toml).unwrap();
+        assert!(
+            plain.check_same_values(&env).is_empty(),
+            "no issuer, no rule"
+        );
+        let with = format!(
+            "{MINIMAL}\n[[auth.jwt]]\nname = \"idp\"\nissuer = \"i\"\n\
+             jwks_url = \"https://idp.example/keys\"\naudience = \"a\"\nalgorithms = [\"EdDSA\"]\n"
+        );
+        let config = ServeConfig::parse(&with, Format::Toml).unwrap();
+        let found: Vec<String> = config
+            .check_same_values(&env)
+            .iter()
+            .map(Issue::to_string)
+            .collect();
+        assert!(has(&found, "keys[0].secret"), "{found:?}");
     }
 
     #[test]

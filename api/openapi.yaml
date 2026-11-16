@@ -516,6 +516,22 @@ components:
           oneOf:
             - type: 'null'
             - $ref: '#/components/schemas/ReloadAttempt'
+        jwks:
+          type: object
+          description: |
+            Present only when `[[auth.jwt]]` issuers are configured: each issuer's
+            key state by table name (0017).
+          additionalProperties:
+            type: object
+            required: [loaded, keys, age_secs, last_error]
+            additionalProperties: false
+            properties:
+              loaded: {type: boolean}
+              keys: {type: integer, minimum: 0}
+              age_secs: {type: [integer, 'null']}
+              last_error:
+                type: [string, 'null']
+                description: The class of the last failed refresh (`network`, `status`, `too_large`, `malformed`, `no_usable_keys`).
     ReloadAttempt:
       type: object
       required: [at_epoch_secs, outcome, issues]
