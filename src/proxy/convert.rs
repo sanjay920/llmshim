@@ -607,9 +607,16 @@ fn released_at(id: &str) -> i64 {
 
 /// Build the shared `GET /v1/models` body: the OpenAI list envelope plus
 /// llmshim's own array. Proxy and gateway serve the identical shape.
-pub(crate) fn models_response(provider_keys: &[&str]) -> super::types::ModelsResponse {
+///
+/// `served` is what registered providers add beyond the curated list
+/// ([`crate::router::Router::served_models`]); empty for every provider today
+/// except a cloud deployment list, so the body is unchanged without one.
+pub(crate) fn models_response(
+    provider_keys: &[&str],
+    served: &[(String, String)],
+) -> super::types::ModelsResponse {
     let available = crate::models::available_models(provider_keys);
-    super::types::ModelsResponse {
+    let mut response = super::types::ModelsResponse {
         object: "list",
         data: available
             .iter()
@@ -628,7 +635,25 @@ pub(crate) fn models_response(provider_keys: &[&str]) -> super::types::ModelsRes
                 name: m.name.to_string(),
             })
             .collect(),
+    };
+    for (provider, model) in served {
+        let id = format!("{provider}/{model}");
+        if response.models.iter().any(|entry| entry.id == id) {
+            continue;
+        }
+        response.data.push(super::types::ModelObject {
+            id: id.clone(),
+            object: "model",
+            created: 0,
+            owned_by: provider.clone(),
+        });
+        response.models.push(super::types::ModelEntry {
+            id,
+            provider: provider.clone(),
+            name: model.clone(),
+        });
     }
+    response
 }
 
 /// Convert the OpenAI-format Value response from lib.rs into our ChatResponse.
@@ -674,6 +699,50 @@ pub fn value_to_response(v: &Value, provider: &str, latency_ms: u64) -> ChatResp
         usage,
         latency_ms,
     }
+}
+
+#[cfg(test)]
+#[test]
+fn models_a_provider_serves_are_listed_once_beside_the_curated_ones() {
+    let none = models_response(&["openai"], &[]);
+    let served = [
+        ("azure".to_string(), "chat-prod".to_string()),
+        ("azure".to_string(), "chat-prod".to_string()),
+        ("openai".to_string(), "gpt-6-luna".to_string()),
+    ];
+    let with = models_response(&["openai", "azure"], &served);
+    // Nothing served: the curated body, unchanged.
+    assert_eq!(
+        none.models.len(),
+        models_response(&["openai"], &[]).models.len()
+    );
+    let ids: Vec<&str> = with.models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids.iter().filter(|id| **id == "azure/chat-prod").count(),
+        1,
+        "{ids:?}"
+    );
+    // A model the curated list already names is not listed twice.
+    let luna = ids.iter().filter(|id| id.ends_with("gpt-6-luna")).count();
+    assert_eq!(luna, 1, "{ids:?}");
+    let entry = with
+        .models
+        .iter()
+        .find(|m| m.id == "azure/chat-prod")
+        .unwrap();
+    assert_eq!(
+        (entry.provider.as_str(), entry.name.as_str()),
+        ("azure", "chat-prod")
+    );
+    let object = with
+        .data
+        .iter()
+        .find(|m| m.id == "azure/chat-prod")
+        .unwrap();
+    assert_eq!(
+        (object.object, object.owned_by.as_str()),
+        ("model", "azure")
+    );
 }
 
 #[cfg(test)]

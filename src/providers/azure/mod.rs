@@ -60,6 +60,9 @@ impl Azure {
     }
 }
 impl Provider for Azure {
+    fn served_models(&self) -> Vec<String> {
+        self.deployments.keys().cloned().collect()
+    }
     fn name(&self) -> &str {
         "azure"
     }

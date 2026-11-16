@@ -1079,6 +1079,7 @@ fn stream_event_type(event: &StreamEvent) -> &'static str {
 async fn list_models(State(state): State<Arc<GatewayState>>) -> Json<ModelsResponse> {
     Json(crate::proxy::convert::models_response(
         &state.router.provider_keys(),
+        &state.router.served_models(),
     ))
 }
 

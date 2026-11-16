@@ -158,6 +158,14 @@ pub trait Provider: Send + Sync {
         ))
     }
 
+    /// Models this provider serves that no catalog row names, as the part after
+    /// its routing prefix (an Azure deployment, say). `/v1/models` lists each as
+    /// `<provider>/<model>`. Most providers serve what the curated list says and
+    /// return none.
+    fn served_models(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The transcription models this provider documents, keyed by its own
     /// name. A provider without transcription lists none.
     /// [`crate::transcription_models`] re-keys them by router registration.
