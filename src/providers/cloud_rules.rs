@@ -7,21 +7,13 @@
 //! the transports still validates a file that names them (and then refuses to
 //! start, naming the feature to rebuild with).
 
-// Used by the transports when their features are on and by the `serve`
-// configuration; a default build uses neither.
-#![cfg_attr(
-    not(any(
-        feature = "serve",
-        feature = "bedrock",
-        feature = "vertex",
-        feature = "azure"
-    )),
-    allow(dead_code)
-)]
+// Each rule exists in the builds that use it: its transport's feature, or `serve`
+// (which validates a file naming any of them). A default build has none.
 
 /// Why a Bedrock region cannot be used, if it cannot: lower-case letters, digits
 /// and hyphens, and a partition the transport supports. The isolated partitions
 /// (and the European Sovereign Cloud) are not supported.
+#[cfg(any(feature = "serve", feature = "bedrock"))]
 pub(crate) fn bedrock_region(region: &str) -> Result<(), &'static str> {
     if region.is_empty()
         || !region
@@ -45,6 +37,7 @@ pub(crate) fn bedrock_region(region: &str) -> Result<(), &'static str> {
 }
 
 /// A Vertex project or location: 1 to 128 lower-case letters, digits and hyphens.
+#[cfg(any(feature = "serve", feature = "vertex"))]
 pub(crate) fn vertex_label(label: &str) -> bool {
     !label.is_empty()
         && label.len() <= 128
@@ -56,6 +49,7 @@ pub(crate) fn vertex_label(label: &str) -> bool {
 /// The root an Azure endpoint resolves to (`<origin>/openai/v1`), or `None` when
 /// the endpoint is not an https resource origin or its `/openai/v1` base without
 /// credentials, query or fragment.
+#[cfg(any(feature = "serve", feature = "azure"))]
 pub(crate) fn azure_root(endpoint: &str) -> Option<String> {
     let url = reqwest::Url::parse(endpoint).ok()?;
     if url.scheme() != "https"
@@ -77,6 +71,7 @@ pub(crate) fn azure_root(endpoint: &str) -> Option<String> {
 }
 
 /// An Azure deployment name and the catalog model it serves.
+#[cfg(any(feature = "serve", feature = "azure"))]
 pub(crate) fn azure_deployment(deployment: &str, model: &str) -> bool {
     !deployment.is_empty()
         && deployment.len() <= 256
@@ -87,8 +82,10 @@ pub(crate) fn azure_deployment(deployment: &str, model: &str) -> bool {
 }
 
 /// The most a service-account file may hold.
+#[cfg(any(feature = "serve", feature = "vertex"))]
 pub(crate) const SERVICE_ACCOUNT_MAX_BYTES: usize = 1024 * 1024;
 /// The only token endpoint a service account may name.
+#[cfg(any(feature = "serve", feature = "vertex"))]
 pub(crate) const GOOGLE_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 
 /// Why a service-account file's content cannot be used, if it cannot: the type,
@@ -131,4 +128,21 @@ pub(crate) fn service_account_problem(bytes: &[u8]) -> Option<&'static str> {
         })
         .and_then(|der| ring::signature::RsaKeyPair::from_pkcs8(&der).ok());
     key.is_none().then_some("has no usable private key")
+}
+
+/// Read a service-account file without trusting the path: it must be a regular
+/// file (a FIFO would block `open` forever, a device would never end), and no more
+/// than the limit plus one byte is read, so an oversized file is reported by
+/// [`service_account_problem`] rather than held in memory.
+#[cfg(feature = "serve")]
+pub(crate) fn read_service_account(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(SERVICE_ACCOUNT_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }

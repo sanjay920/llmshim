@@ -2,8 +2,11 @@
 
 Status: slice 2 implemented (the feature, the configuration, its validation and the
 `--check` rules); the providers are not yet built from the file (slice 3).
-A contract note, written before any code (README working
-rule 3). Nothing here is implemented; the slices are listed at the end.
+Until then a build with `serve-cloud` accepts such a file at `--check` and refuses
+it at start ("not wired into the server yet"), so nothing is silently left out. A
+contract note, written before any code (README working rule 3); the slices are at
+the end. `--check`'s exit codes for the service-account file are exercised by a
+process test that runs in the `serve-cloud` build, which CI gains in slice 4.
 
 ## What an operator needs
 

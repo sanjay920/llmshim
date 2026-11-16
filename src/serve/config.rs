@@ -1895,7 +1895,7 @@ impl ServeConfig {
         for (name, provider) in &self.providers {
             if let Some(path) = &provider.service_account_file {
                 let at = format!("providers.{name}.service_account_file");
-                match std::fs::read(path) {
+                match crate::providers::cloud_rules::read_service_account(path) {
                     Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => {
                         issues.push(Issue::new(
                             at,
@@ -1957,7 +1957,7 @@ impl ServeConfig {
             let Some(path) = &provider.service_account_file else {
                 continue;
             };
-            let Ok(bytes) = std::fs::read(path) else {
+            let Ok(bytes) = crate::providers::cloud_rules::read_service_account(path) else {
                 continue;
             };
             if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -2361,6 +2361,28 @@ mod tests {
                 "another version",
                 MINIMAL.replace("version = 1", "version = 2"),
             ),
+            (
+                "deployments as a list",
+                format!(
+                    "{MINIMAL}\n{}",
+                    AZURE.replace("{ \"chat-prod\" = \"gpt-6-sol\" }", "[\"chat-prod\"]")
+                ),
+            ),
+            (
+                "a region that is a number",
+                format!("{MINIMAL}\n{}", BEDROCK.replace("\"us-east-1\"", "7")),
+            ),
+            (
+                "an unknown provider kind",
+                format!(
+                    "{MINIMAL}\n{}",
+                    BEDROCK.replace("\"bedrock\"\nprofile", "\"bedrock2\"\nprofile")
+                ),
+            ),
+            (
+                "an unknown cloud field",
+                format!("{MINIMAL}\n{BEDROCK}access_key = \"x\"\n"),
+            ),
             ("no version", MINIMAL.replace("version = 1", "")),
             (
                 "an inline secret",
@@ -2433,6 +2455,14 @@ mod tests {
                 "server tls",
                 "[server.tls]\ncert_file = \"/etc/tls/server.pem\"\nkey_file = \"/etc/tls/server.key\"",
             ),
+            ("an Azure provider", AZURE),
+            ("a Bedrock provider", BEDROCK),
+            (
+                "a Bedrock provider with profile files",
+                "[providers.bedrock]\nkind = \"bedrock\"\nprofile = \"p\"\nregion = \"eu-west-1\"\n\
+                 config_file = \"/etc/aws/config\"\ncredentials_file = \"/etc/aws/credentials\"",
+            ),
+            ("a Vertex provider", VERTEX),
         ] {
             let text = format!("{MINIMAL}\n{extra}");
             assert!(
@@ -3008,6 +3038,107 @@ mod tests {
             "{:?}",
             issues(&split)
         );
+    }
+
+    #[test]
+    fn more_cloud_rules_hold_by_path() {
+        let second = |change: &dyn Fn(&str) -> String| {
+            cloud(&format!(
+                "{VERTEX}{}",
+                change(&VERTEX.replace("vertex-gemini", "vertex-anthropic"))
+            ))
+        };
+        for (field, text) in [
+            (
+                "service_account_file",
+                second(&|v| v.replace("/etc/sa.json", "/etc/other.json")),
+            ),
+            (
+                "project",
+                second(&|v| v.replace("my-project", "other-project")),
+            ),
+            (
+                "region",
+                second(&|v| v.replace("us-central1", "europe-west4")),
+            ),
+        ] {
+            assert!(
+                has(
+                    &issues(&text),
+                    &format!("providers.vertex-anthropic.{field}")
+                ),
+                "{field}: {:?}",
+                issues(&text)
+            );
+        }
+        // Relative profile files, and one file without the other.
+        let relative = BEDROCK.to_string()
+            + "config_file = \"aws/config\"\ncredentials_file = \"aws/credentials\"\n";
+        assert!(has(
+            &issues(&cloud(&relative)),
+            "providers.bedrock.config_file"
+        ));
+        assert!(has(
+            &issues(&cloud(&relative)),
+            "providers.bedrock.credentials_file"
+        ));
+        // The Vertex locations the transport maps to their own hosts.
+        for region in ["global", "us", "eu", "europe-west4"] {
+            let text = cloud(&VERTEX.replace("us-central1", region));
+            assert!(
+                ServeConfig::parse(&text, Format::Toml).is_ok(),
+                "{region}: {:?}",
+                issues(&text)
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_account_path_that_is_not_a_plain_small_file_is_never_read_whole() {
+        let dir = std::env::temp_dir().join(format!("llmshim-sa-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = |path: &std::path::Path| {
+            ServeConfig::parse(
+                &cloud(&VERTEX.replace("/etc/sa.json", path.to_str().unwrap())),
+                Format::Toml,
+            )
+            .unwrap()
+        };
+        // Over a megabyte is a defect, and is read only as far as the limit.
+        let big = dir.join("big.json");
+        std::fs::write(&big, vec![b'x'; 2 * 1024 * 1024 + 7]).unwrap();
+        let found = config(&big).check_credential_files();
+        assert!(
+            found.iter().any(|i| i.to_string().contains("larger")),
+            "{found:?}"
+        );
+        // A directory is not a file, and does not hang or read.
+        let absent: Vec<String> = config(&dir)
+            .check_secrets_present(&|_| None)
+            .iter()
+            .map(Issue::to_string)
+            .filter(|i| i.contains("service_account_file"))
+            .collect();
+        assert_eq!(absent.len(), 1, "{absent:?}");
+        // A FIFO with no writer would block `open` forever: the check must return.
+        #[cfg(unix)]
+        {
+            let fifo = dir.join("fifo.json");
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let probe = config(&fifo);
+            std::thread::spawn(move || {
+                let _ = sender.send(probe.check_secrets_present(&|_| None));
+            });
+            let answer = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a FIFO must not hang the check");
+            assert!(answer
+                .iter()
+                .any(|i| i.to_string().contains("service_account_file")));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
