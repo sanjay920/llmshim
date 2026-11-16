@@ -52,6 +52,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0016: OpenTelemetry traces](0016-opentelemetry.md)
 - [0017: Workload JWT authentication and IP allowlists](0017-workload-jwt-and-ip-allowlists.md)
 - [0018: Benchmark](0018-benchmark.md)
+- [0019: Published, signed images and an SBOM](0019-signed-images.md)
 
 ## Roadmap
 
@@ -88,7 +89,9 @@ Phase 0: a production server mode
       writers' counters in `/metrics`; linking a fleet attempt to a request on
       another replica is a later slice
 - [x] Helm chart, validated by rendering and `serve --check` (0008)
-- [ ] Published, signed images and an SBOM
+- [x] Published, signed images and an SBOM (0019): the workflow exists and the
+      feature set is built on every Dockerfile pull request; publishing is **off**
+      until the owner sets the repository variable `PUBLISH_IMAGE` to `true`
 - [x] The failure-mode table (0014), with outage-survival tests for losing Redis
       (before and during a request) and for `SIGTERM`; its "Not yet tested" list
       is what remains
