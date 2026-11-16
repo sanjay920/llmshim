@@ -164,6 +164,11 @@ the job. A deployment that needs no cloud provider can build the smaller image w
 `--build-arg FEATURES=serve-redis,serve-otel`; `docker-check.yml` builds both
 combinations on every pull request that touches the Dockerfile, so neither rots.
 
+The image is distroless: it has no shell and no default `~/.aws`, so a Bedrock profile
+that uses `credential_process` (an external command) cannot run in it, and the profile
+files must be mounted (`config_file`, `credentials_file`). The HTTP credential sources
+(ECS, EC2 instance metadata) need nothing in the image.
+
 ## Not decided here
 
 - Entra (managed identity, workload identity federation) for Azure, and token
