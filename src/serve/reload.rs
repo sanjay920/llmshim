@@ -1422,6 +1422,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
+    #[cfg(feature = "serve-cloud")]
     #[test]
     fn a_service_account_file_that_is_missing_or_empty_rejects_the_reload() {
         let directory =
