@@ -258,6 +258,13 @@ pub struct Server {
     /// HTTP and belongs behind a terminating proxy or service mesh.
     #[serde(default)]
     pub tls: Option<Tls>,
+    /// Networks whose connections are load balancers or proxies that set
+    /// `X-Forwarded-For`. Only a connection from inside them has its client
+    /// address read from that header (the right-most entry that is not itself
+    /// one of them); from anywhere else the header is ignored. Needed only for a
+    /// key's `allowed_cidrs`. Empty by default. A change needs a restart.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for Server {
@@ -267,6 +274,7 @@ impl Default for Server {
             port: default_port(),
             allow_unauthenticated: false,
             tls: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -626,6 +634,14 @@ pub struct GatewayKey {
     /// also sends a bearer token is authenticated by the token alone.
     #[serde(default)]
     pub client_san: Option<String>,
+    /// Networks this key may be used from, as CIDRs (`10.0.0.0/8`, `2001:db8::/32`,
+    /// a bare address for one host). A request authenticated as this key from
+    /// anywhere else is refused with 403 before it reaches the queue or a
+    /// budget. Applies to every kind of credential. Behind a proxy, list the
+    /// proxy in `server.trusted_proxies` so the caller's address is known. Omit
+    /// it for no restriction; an empty list is refused.
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
     pub tenant: String,
     /// Queue priority; higher is served sooner.
     #[serde(default)]
@@ -752,6 +768,11 @@ impl ServeConfig {
     }
 
     fn validate_server(&self, issues: &mut Vec<Issue>) {
+        for (n, cidr) in self.server.trusted_proxies.iter().enumerate() {
+            if let Err(message) = super::allowlist::Cidr::parse(cidr) {
+                issues.push(Issue::new(format!("server.trusted_proxies[{n}]"), message));
+            }
+        }
         let host = self.server.host.as_str();
         let bare = host
             .strip_prefix('[')
@@ -1118,6 +1139,19 @@ impl ServeConfig {
             }
             if !valid_tenant(&key.tenant) {
                 issues.push(Issue::new(format!("{at}.tenant"), TENANT_RULE));
+            }
+            if let Some(cidrs) = &key.allowed_cidrs {
+                if cidrs.is_empty() {
+                    issues.push(Issue::new(
+                        format!("{at}.allowed_cidrs"),
+                        "is empty, which would refuse every request; omit it for no restriction",
+                    ));
+                }
+                for (n, cidr) in cidrs.iter().enumerate() {
+                    if let Err(message) = super::allowlist::Cidr::parse(cidr) {
+                        issues.push(Issue::new(format!("{at}.allowed_cidrs[{n}]"), message));
+                    }
+                }
             }
             if let Some(san) = &key.client_san {
                 if key.secret.is_some() || key.sha256.is_some() {
@@ -2167,6 +2201,51 @@ mod tests {
             found[0].message.contains("duplicate name `openai`"),
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn allowed_cidrs_and_trusted_proxies_are_validated_by_path() {
+        let key = |extra: &str| {
+            format!(
+                "{MINIMAL}\n[[keys]]\nname = \"net\"\ntenant = \"t\"\nsha256 = \"{}\"\n{extra}",
+                "0".repeat(64)
+            )
+        };
+        let ok = key("allowed_cidrs = [\"10.0.0.0/8\", \"2001:db8::/32\", \"192.0.2.7\"]");
+        assert!(ServeConfig::parse(&ok, Format::Toml).is_ok());
+        for (extra, path) in [
+            ("allowed_cidrs = []", "keys[1].allowed_cidrs"),
+            (
+                "allowed_cidrs = [\"10.1.2.3/8\"]",
+                "keys[1].allowed_cidrs[0]",
+            ),
+            (
+                "allowed_cidrs = [\"10.0.0.0/8\", \"nope\"]",
+                "keys[1].allowed_cidrs[1]",
+            ),
+            (
+                "allowed_cidrs = [\"::ffff:10.0.0.0/104\"]",
+                "keys[1].allowed_cidrs[0]",
+            ),
+        ] {
+            assert!(
+                has(&issues(&key(extra)), path),
+                "{extra}: {:?}",
+                issues(&key(extra))
+            );
+        }
+        let proxies = |list: &str| {
+            MINIMAL.replacen(
+                "[providers.openai]",
+                &format!("[server]\ntrusted_proxies = {list}\n[providers.openai]"),
+                1,
+            )
+        };
+        assert!(ServeConfig::parse(&proxies("[\"10.0.0.0/8\"]"), Format::Toml).is_ok());
+        assert!(has(
+            &issues(&proxies("[\"bad\"]")),
+            "server.trusted_proxies[0]"
+        ));
     }
 
     #[test]

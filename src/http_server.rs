@@ -166,20 +166,26 @@ impl AsyncWrite for LimitedStream {
 }
 
 #[derive(Clone)]
-struct FirstHeadersReceived(Arc<AtomicBool>);
+// The peer address is read only by `serve`, for a key's network allowlist.
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+struct FirstHeadersReceived(Arc<AtomicBool>, SocketAddr);
 
 impl Connected<ConnectionAddress> for FirstHeadersReceived {
     fn connect_info(address: ConnectionAddress) -> Self {
-        Self(address.first_headers_received)
+        Self(address.first_headers_received, address.socket_address)
     }
 }
 
 async fn mark_first_headers(
     ConnectInfo(first_headers_received): ConnectInfo<FirstHeadersReceived>,
-    request: Request,
+    #[cfg_attr(not(feature = "serve"), allow(unused_mut))] mut request: Request,
     next: Next,
 ) -> Response {
     first_headers_received.0.store(true, Ordering::Release);
+    // The TCP peer, for a key's network allowlist. Set here, from the socket,
+    // so nothing a caller sends can supply it.
+    #[cfg(feature = "serve")]
+    request.extensions_mut().insert(first_headers_received.1);
     next.run(request).await
 }
 

@@ -65,6 +65,17 @@
       "additionalProperties": false,
       "description": "A caller credential and the identity it carries.",
       "properties": {
+        "allowed_cidrs": {
+          "default": null,
+          "description": "Networks this key may be used from, as CIDRs (`10.0.0.0/8`, `2001:db8::/32`,\na bare address for one host). A request authenticated as this key from\nanywhere else is refused with 403 before it reaches the queue or a\nbudget. Applies to every kind of credential. Behind a proxy, list the\nproxy in `server.trusted_proxies` so the caller's address is known. Omit\nit for no restriction; an empty list is refused.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "budget_allow_unpriced": {
           "default": false,
           "description": "Admit requests whose cost cannot be bounded before sending.",
@@ -412,6 +423,14 @@
             }
           ],
           "description": "Terminate TLS on the main listener. Without it the listener is plain\nHTTP and belongs behind a terminating proxy or service mesh."
+        },
+        "trusted_proxies": {
+          "default": [],
+          "description": "Networks whose connections are load balancers or proxies that set\n`X-Forwarded-For`. Only a connection from inside them has its client\naddress read from that header (the right-most entry that is not itself\none of them); from anywhere else the header is ignored. Needed only for a\nkey's `allowed_cidrs`. Empty by default. A change needs a restart.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
