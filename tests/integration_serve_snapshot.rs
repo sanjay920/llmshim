@@ -277,7 +277,7 @@ async fn a_running_replica_never_goes_behind_what_it_applied_even_if_the_floor_f
 }
 
 #[tokio::test]
-async fn another_organizations_snapshot_and_a_changed_trust_setting_are_refused() {
+async fn another_organizations_snapshot_and_a_trust_list_that_drops_the_signer_are_refused() {
     let (upstream, _mock) = mock(1).await;
     let plane = Plane::new("snapshot-org");
     plane.write(&payload(1, vec![key("alpha", ALPHA, "active")]));
@@ -293,9 +293,8 @@ async fn another_organizations_snapshot_and_a_changed_trust_setting_are_refused(
     })
     .await;
     assert_eq!(status_of(&server, BRAVO).await, 401);
-    // Trusting a different key is a change outside what reloads (slice 2b): the
-    // snapshot on disk no longer verifies against the new setting, so the whole
-    // reload is refused and the keys in force keep serving.
+    // A trust list that no longer names the signer: the snapshot on disk no longer
+    // verifies against it, so the reload is refused and the keys in force keep serving.
     let (_, other_public) = snapshot::keygen().unwrap();
     let edited = plane
         .config(&upstream.url(), "")
@@ -529,4 +528,197 @@ fn the_snapshot_command_makes_signs_and_verifies() {
     assert_eq!(code, Some(1));
     // Missing arguments are a usage error.
     assert_eq!(run(&["snapshot", "sign"]).0, Some(2));
+}
+
+fn two_signers(plane: &Plane, other_public: &str) -> String {
+    format!("[\"{}\", \"{other_public}\"]", plane.public)
+}
+
+fn with_verify_keys(plane: &Plane, text: &str, list: &str) -> String {
+    text.replace(&format!("[\"{}\"]", plane.public), list)
+}
+
+async fn snapshot_status(server: &Server) -> Value {
+    harness::reload_status(server).await["snapshot"].clone()
+}
+
+#[tokio::test]
+async fn verify_keys_reload_and_a_removed_signer_is_reported_not_obeyed() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-signers");
+    plane.write(&payload(1, vec![key("alpha", ALPHA, "active")]));
+    let config = plane.config(&upstream.url(), "");
+    let server = start(&config, "snapshot-signers", &[]);
+    let status = snapshot_status(&server).await;
+    assert_eq!(status["generation"], 1);
+    assert_eq!(status["signer"], plane.public);
+    assert_eq!(status["signer_untrusted"], false);
+    assert_eq!(status["stale"], false);
+
+    // A second signer is trusted and signs generation 2: no restart.
+    let (other_seed, other_public) = snapshot::keygen().unwrap();
+    let both = with_verify_keys(&plane, &config, &two_signers(&plane, &other_public))
+        .replace("{DIR}", server.dir.0.to_str().unwrap());
+    std::fs::write(server.dir.0.join("gateway.toml"), &both).unwrap();
+    std::fs::write(
+        plane.snapshot_file(),
+        snapshot::sign(
+            &payload(2, vec![key("bravo", BRAVO, "active")]),
+            &other_seed,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    hangup(&server);
+    wait_for_reload(&server, "the new signer's generation", |s| {
+        s["generation"] == 1
+    })
+    .await;
+    assert_eq!(snapshot_status(&server).await["signer"], other_public);
+    assert_eq!(status_of(&server, BRAVO).await, 200);
+    assert_eq!(status_of(&server, ALPHA).await, 401);
+
+    // The second signer is removed from the list: what it signed no longer verifies,
+    // so the reload is refused, the keys in force keep serving, and the status says
+    // the signer in force is untrusted.
+    let only_first = config.replace("{DIR}", server.dir.0.to_str().unwrap());
+    std::fs::write(server.dir.0.join("gateway.toml"), only_first).unwrap();
+    hangup(&server);
+    wait_for_reload(&server, "the untrusted signer", |s| {
+        s["snapshot"]["signer_untrusted"] == true
+    })
+    .await;
+    assert_eq!(
+        status_of(&server, BRAVO).await,
+        200,
+        "still serving what applied"
+    );
+    // A snapshot from a trusted signer replaces it, and the alert clears.
+    plane.write(&payload(3, vec![key("alpha", ALPHA, "active")]));
+    hangup(&server);
+    wait_for_reload(&server, "the replacement", |s| {
+        s["snapshot"]["generation"] == 3 && s["snapshot"]["signer_untrusted"] == false
+    })
+    .await;
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+}
+
+#[tokio::test]
+async fn a_stale_snapshot_is_reported_and_with_refuse_when_stale_inference_is_refused() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-stale");
+    plane.write(&payload(1, vec![key("alpha", ALPHA, "active")]));
+    let config = plane.config(
+        &upstream.url(),
+        "max_age_secs = 8\nrefuse_when_stale = true",
+    );
+    let server = start(&config, "snapshot-stale", &[]);
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+    assert_eq!(snapshot_status(&server).await["stale"], false);
+    wait_for_reload(&server, "staleness", |s| s["snapshot"]["stale"] == true).await;
+    let refused = chat(&server, Some(ALPHA), MODEL).await;
+    assert_eq!(refused.status().as_u16(), 503);
+    assert_eq!(refused.headers()["retry-after"], "30");
+    let body: Value = refused.json().await.unwrap();
+    // The native Chat wire answers in its own error shape; the message names the cause.
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("policy snapshot"),
+        "{body}"
+    );
+    // The gateway's own path answers in the gateway's shape, with a code.
+    let own = reqwest::Client::new()
+        .post(format!("{}/v1/chat", server.base))
+        .bearer_auth(ALPHA)
+        .json(&json!({"model": MODEL, "messages": [{"role": "user", "content": "ping"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(own.status().as_u16(), 503);
+    let own: Value = own.json().await.unwrap();
+    assert_eq!(own["error"]["code"], "policy_snapshot_stale", "{own}");
+    // Model discovery is not inference either.
+    let models = reqwest::Client::new()
+        .get(format!("{}/v1/models", server.base))
+        .bearer_auth(ALPHA)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(models.status().as_u16(), 200);
+    // Not inference: the probes and the operational endpoints keep answering.
+    let admin = server.admin.clone().unwrap();
+    for path in ["/health", "/ready"] {
+        let probe = reqwest::get(format!("{admin}{path}")).await.unwrap();
+        assert_eq!(probe.status().as_u16(), 200, "{path}");
+    }
+    // A new generation applies, the age restarts, and inference resumes.
+    plane.write(&payload(2, vec![key("alpha", ALPHA, "active")]));
+    hangup(&server);
+    wait_for_reload(&server, "the new generation", |s| {
+        s["snapshot"]["generation"] == 2 && s["snapshot"]["stale"] == false
+    })
+    .await;
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+}
+
+#[tokio::test]
+async fn a_stale_snapshot_without_refuse_when_stale_only_alerts() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-alert");
+    plane.write(&payload(1, vec![key("alpha", ALPHA, "active")]));
+    let server = start(
+        &plane.config(&upstream.url(), "max_age_secs = 8"),
+        "snapshot-alert",
+        &[],
+    );
+    wait_for_reload(&server, "staleness", |s| s["snapshot"]["stale"] == true).await;
+    assert_eq!(
+        status_of(&server, ALPHA).await,
+        200,
+        "an alert, not an outage"
+    );
+}
+
+#[test]
+fn refuse_when_stale_needs_a_max_age() {
+    let plane = Plane::new("snapshot-stale-rule");
+    let path = plane.dir.0.join("gateway.toml");
+    std::fs::write(
+        &path,
+        plane
+            .config("http://127.0.0.1:1/v1", "refuse_when_stale = true")
+            .replace("{DIR}", plane.dir.0.to_str().unwrap()),
+    )
+    .unwrap();
+    let env = [
+        ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+        ("SERVE_E2E_ADMIN_TOKEN", ADMIN_TOKEN),
+    ];
+    let (code, stderr) = run_with_args(&path, &["--check", "--structure-only"], &env);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("control_plane.refuse_when_stale"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_does_not_make_an_old_snapshot_fresh_again() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-restart-age");
+    plane.write(&payload(1, vec![key("alpha", ALPHA, "active")]));
+    let config = plane.config(&upstream.url(), "max_age_secs = 6");
+    let mut server = start(&config, "snapshot-restart-age-1", &[]);
+    wait_for_reload(&server, "staleness", |s| s["snapshot"]["stale"] == true).await;
+    terminate(&server);
+    assert!(
+        harness::exit_status_within(&mut server, Duration::from_secs(20))
+            .await
+            .is_some()
+    );
+    // The same generation, the same file: the age counts from when it first applied.
+    let again = start(&config, "snapshot-restart-age-2", &[]);
+    assert_eq!(snapshot_status(&again).await["stale"], true);
 }

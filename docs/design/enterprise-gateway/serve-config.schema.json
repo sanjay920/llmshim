@@ -65,6 +65,16 @@
       "additionalProperties": false,
       "description": "A signed snapshot as the source of caller keys (0024). Needs `state.policy_dir`.",
       "properties": {
+        "max_age_secs": {
+          "default": null,
+          "description": "Report the snapshot in force as `stale` once it is older than this many seconds,\ncounted from when its generation was applied (a distributor that wants silence to\ncount as fresh re-issues). An alert only, unless `refuse_when_stale`.",
+          "maximum": 31536000,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "min_generation": {
           "default": null,
           "description": "A floor for the snapshot's generation, so a replica with no record of what it\napplied (a first boot) still refuses a snapshot older than this. Defaults to 0.",
@@ -77,6 +87,11 @@
         "org": {
           "description": "The organization whose snapshots this replica takes (the payload's `org`). A\nsnapshot for another organization is refused even if a trusted key signed it.",
           "type": "string"
+        },
+        "refuse_when_stale": {
+          "default": false,
+          "description": "With `max_age_secs`: refuse new inference requests with 503 while the snapshot is\nstale. `/health`, `/ready` and the operational endpoints keep answering. Off by\ndefault: a control plane that is down must not take inference down (0024).",
+          "type": "boolean"
         },
         "snapshot_file": {
           "description": "The snapshot file (an absolute path), written by whatever distributes it\nand watched like the keys of a file.",

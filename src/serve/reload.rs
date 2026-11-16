@@ -53,10 +53,14 @@ pub struct ReloadHandles {
     /// router is replaced, so workers start for an added provider and a removed
     /// provider's stop. `None` for a single instance, whose lanes are made on demand.
     pub(crate) workers: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// How old the snapshot in force is, with `[control_plane]` (0024).
+    pub(crate) clock: Option<super::snapshot::SnapshotClock>,
     pub(crate) status: StatusHandle,
 }
 
 impl ReloadHandles {
+    // One handle per thing a reload replaces: the list grows with what reloads.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         keys: LiveKeys,
         tenants: TenantNames,
@@ -65,6 +69,7 @@ impl ReloadHandles {
         router: crate::router::RouterHandle,
         limits: Arc<dyn Fn(crate::proxy::ratelimit::RateLimitConfig) + Send + Sync>,
         workers: Option<Arc<dyn Fn() + Send + Sync>>,
+        clock: Option<super::snapshot::SnapshotClock>,
     ) -> Self {
         Self {
             keys,
@@ -74,13 +79,16 @@ impl ReloadHandles {
             router,
             limits,
             workers,
+            clock,
             status: StatusHandle::default(),
         }
     }
 
     /// What the admin listener reports.
     pub fn status(&self) -> ReloadStatus {
-        self.status.snapshot()
+        let mut status = self.status.snapshot();
+        status.snapshot = self.clock.as_ref().map(|clock| clock.status());
+        status
     }
 
     pub(crate) fn status_handle(&self) -> StatusHandle {
@@ -147,6 +155,8 @@ pub struct ReloadStatus {
     /// environment cannot change while it runs, so a reload cannot rotate these:
     /// only a `{ file }` secret can be rotated (0022).
     pub env_secret_providers: Vec<String>,
+    /// The policy snapshot in force, with `[control_plane]` (0024); `null` otherwise.
+    pub snapshot: Option<super::snapshot::SnapshotStatus>,
 }
 
 /// Shared, so the admin listener can report what the reloader did.
@@ -251,8 +261,25 @@ impl Reloader {
                 org: snapshot.org.clone(),
                 generation: snapshot.generation,
                 payload_sha256: snapshot.payload_sha256.clone(),
+                applied_at_epoch_secs: super::snapshot::epoch_secs(),
             }),
         };
+        if let (Some(clock), Some(snapshot)) = (&handles.clock, snapshot) {
+            // The floor of an earlier run says when this same snapshot first applied:
+            // a restart does not make an old snapshot fresh (0024).
+            let known = config
+                .state
+                .policy_dir
+                .as_ref()
+                .and_then(|dir| super::snapshot::read_floor(dir).ok().flatten())
+                .filter(|floor| {
+                    floor.org == snapshot.org
+                        && floor.generation == snapshot.generation
+                        && floor.payload_sha256 == snapshot.payload_sha256
+                })
+                .map(|floor| floor.applied_at_epoch_secs);
+            clock.applied(snapshot.generation, &snapshot.signer, known);
+        }
         let credentials = current.credential_count();
         let config_sha256 = sha256_hex(text.as_bytes());
         handles.status.update(|status| {
@@ -267,6 +294,7 @@ impl Reloader {
                 router_generation: 0,
                 limits_generation: 0,
                 env_secret_providers: active.router.env_form(),
+                snapshot: None,
             };
         });
         Ok(Self {
@@ -364,6 +392,29 @@ impl Reloader {
         }
     }
 
+    /// The snapshot just recorded is the one in force: its age restarts if it is a new
+    /// generation.
+    fn note_applied(&self, loaded: &super::config::Loaded) {
+        if let (Some(clock), Some(snapshot)) = (&self.handles.clock, &loaded.snapshot) {
+            clock.applied(snapshot.generation, &snapshot.signer, None);
+            self.mark_signer(Some(&loaded.config));
+        }
+    }
+
+    /// Whether the signer of the snapshot in force is still trusted by `config`.
+    fn mark_signer(&self, config: Option<&ServeConfig>) {
+        let (Some(clock), Some(control_plane)) = (
+            &self.handles.clock,
+            config.and_then(|config| config.control_plane.as_ref()),
+        ) else {
+            return;
+        };
+        let signer = clock.status().signer;
+        clock.set_signer_untrusted(
+            !signer.is_empty() && !control_plane.verify_keys.contains(&signer),
+        );
+    }
+
     fn attempt(
         &self,
         active: &mut Active,
@@ -371,8 +422,21 @@ impl Reloader {
         debounce: bool,
     ) -> Step {
         let loaded = match ServeConfig::load_with_text(&self.path) {
-            Ok(loaded) => loaded,
-            Err(issues) => return reject(active, "", issues),
+            Ok(loaded) => {
+                self.mark_signer(Some(&loaded.config));
+                loaded
+            }
+            Err(issues) => {
+                // The file may name fewer trusted keys than the signer of what is
+                // serving: say so even though the reload is refused.
+                self.mark_signer(
+                    ServeConfig::load_with_text_resolving(&self.path, false)
+                        .ok()
+                        .as_ref()
+                        .map(|loaded| &loaded.config),
+                );
+                return reject(active, "", issues);
+            }
         };
         let config_sha256 = sha256_hex(loaded.text.as_bytes());
         let reject_now = |active: &mut Active, issues| reject(active, &config_sha256, issues);
@@ -504,6 +568,7 @@ impl Reloader {
             if let Err(issue) = record_snapshot(&loaded, &mut active.applied) {
                 return reject_now(active, vec![issue]);
             }
+            self.note_applied(&loaded);
             return Step::Unchanged { config_sha256 };
         }
         if debounce {
@@ -517,6 +582,7 @@ impl Reloader {
         if let Err(issue) = record_snapshot(&loaded, &mut active.applied) {
             return reject_now(active, vec![issue]);
         }
+        self.note_applied(&loaded);
         let credentials = store.credential_count();
         // The allowlists first, and keyed by credential rather than by asking the
         // store (see `allowlist::enforce`): a key that is new in this reload and
@@ -581,6 +647,7 @@ fn record_snapshot(
             org: snapshot.org.clone(),
             generation: snapshot.generation,
             payload_sha256: snapshot.payload_sha256.clone(),
+            applied_at_epoch_secs: super::snapshot::epoch_secs(),
         };
         super::snapshot::write_floor(dir, &floor)?;
         *applied = Some(floor);
@@ -620,6 +687,11 @@ fn document_without_reloadable(text: &str, format: Format) -> Result<Value, Stri
     if let Value::Object(table) = &mut document {
         for name in ["keys", "providers", "routes"] {
             table.remove(name);
+        }
+        // A verify key can be added or removed without a restart (0024): the next
+        // load verifies against the new list. The rest of `[control_plane]` is fixed.
+        if let Some(Value::Object(control_plane)) = table.get_mut("control_plane") {
+            control_plane.remove("verify_keys");
         }
         // The rate limits reload too; the rest of `[limits]` does not. An emptied
         // table is dropped so that a file with only limits and one with no
@@ -910,6 +982,11 @@ mod tests {
                             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }) as Arc<dyn Fn() + Send + Sync>
                     }),
+                    loaded
+                        .config
+                        .control_plane
+                        .as_ref()
+                        .map(crate::serve::snapshot::SnapshotClock::new),
                 ),
             )
             .unwrap();
