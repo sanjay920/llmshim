@@ -1,8 +1,8 @@
 # 0017: Workload JWT authentication and IP allowlists
 
-Status: IP allowlists (slice 2) and the JWT verifier as a unit (slice 3, `src/serve/jwt.rs`,
-not yet wired to anything) are implemented; the JWKS client and the wiring are not
-(slices 4 and 5).
+Status: IP allowlists (slice 2), the JWT verifier (slice 3, `src/serve/jwt.rs`) and the
+JWKS client (slice 4, `src/serve/jwks.rs`) are implemented as units, the last two not
+yet wired to anything; the wiring is not (slice 5).
 A contract note, written before any code (README working rule 3). Single
 sign-on for people, SCIM and an admin UI are not part of this note and are not
 started.
@@ -114,7 +114,11 @@ limits, budget) applies unchanged: the token only proves **which key**.
   literal, as a validation rule, so a test issuer works and production does not
   fall to plain text. Keys are cached for `jwks_refresh_secs`. An unknown `kid` triggers one
   refresh, at most once per 30 seconds per issuer, so a flood of random `kid`s
-  cannot turn the gateway into a request amplifier against the issuer.
+  cannot turn the gateway into a request amplifier against the issuer. An attempt is
+  stamped when it starts, so a caller that goes away mid-fetch does not reset the
+  floor. A key the issuer rotates in just after a load is therefore unknown for up
+  to 30 seconds: the consumer treats an unknown `kid` inside that window as a
+  retryable 401 (`Retry-After`), not a permanent verdict.
 - **JWKS failures fail closed, with stale keys served for a bounded, configured
   time.** If a refresh fails the cached keys keep verifying for up to
   `jwks_max_stale_secs` (default 1 hour) past their refresh time, so an issuer
@@ -206,6 +210,8 @@ stale serving and refresh refusals.
    fixed test vectors and a local JWKS server (the confusion attacks: `alg: none`,
    `HS256` with the public key, wrong `kty`, missing `exp`, audience mismatch,
    skew edges, oversize token), with no wiring.
-4. The JWKS client: fetch, cache, bounded refresh, stale-then-503, `/ready`.
+4. Done: the JWKS client: fetch, cache, bounded refresh, stale-then-503. (A `ca_file`, when set, is the only trust anchor for the fetch; the
+   fetch ignores the ambient proxy. `/ready` does not depend on a JWKS, as decided
+   above, so nothing changes there.)
 5. Wiring: the `jwt` key binding, the bearer-shape rule, access-log reasons,
    `--check`, reload by path, the schema, an end-to-end test with a local issuer.
