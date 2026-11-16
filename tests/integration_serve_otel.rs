@@ -23,7 +23,7 @@ const OTLP_TOKEN: &str = "otlp-collector-token-0123456789";
 /// The only attribute keys a request span may carry (0016, decision 6).
 const CLOSED_ATTRIBUTES: &[&str] = &[
     "http.request.method",
-    "http.route",
+    "url.path",
     "http.response.status_code",
     "llmshim.request_id",
     "llmshim.tenant",
@@ -216,7 +216,7 @@ async fn a_request_span_is_exported_with_a_closed_attribute_set_and_no_secret() 
         Some("200")
     );
     assert_eq!(
-        attribute(ok, "http.route").as_deref(),
+        attribute(ok, "url.path").as_deref(),
         Some("/v1/chat/completions")
     );
 

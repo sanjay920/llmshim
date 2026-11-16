@@ -712,7 +712,14 @@ process, so replicas and restarts do not repeat; a build without `serve` keeps
 when a usage log is configured, the first 16 hex digits of the credential's
 digest) and the request id, never a name, and a test pins that names stay out of
 Redis; each replica names tenants and keys from
-its own config (grow-only tables, updated on a keys reload). `docs/design/enterprise-gateway/0014-failure-modes.md` records what a replica does when each dependency fails and the test behind each row (Redis lost before and during a request, `SIGTERM`, ...), with an honest "not yet tested" list; `tests/integration_serve_outage.rs` cuts Redis with a TCP proxy and runs in the serve-redis CI job. `deploy/helm/llmshim` deploys it
+its own config (grow-only tables, updated on a keys reload). With `--features serve-otel` a
+`[telemetry]` table exports one request span per request over OTLP/HTTP
+(`src/serve/telemetry.rs`, note 0016): a closed attribute set pinned by
+`tests/integration_serve_otel.rs`, an inbound `traceparent` honored only from an
+authenticated caller and never forwarded to providers, and a fail-open bounded
+queue whose drops and failures are `/metrics` series. The exporter is our own
+(the OTLP crate needs reqwest 0.13, whose rustls brings aws-lc-rs); a build without
+the feature refuses a file that sets the table. `docs/design/enterprise-gateway/0014-failure-modes.md` records what a replica does when each dependency fails and the test behind each row (Redis lost before and during a request, `SIGTERM`, ...), with an honest "not yet tested" list; `tests/integration_serve_outage.rs` cuts Redis with a TCP proxy and runs in the serve-redis CI job. `deploy/helm/llmshim` deploys it
 (`deploy/helm/validate.sh` checks the chart and feeds each rendered config back
 through `serve --check`). Only `[[keys]]` reload without a restart (`SIGHUP`,
 plus a watched file; design note 0012): the reload is all-or-nothing, refuses a

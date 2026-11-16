@@ -100,7 +100,7 @@ mod real {
     const SCHEDULE: Duration = Duration::from_secs(5);
     /// One export request's whole deadline (connect included).
     const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
-    /// How long shutdown waits for what is queued.
+    /// How long shutdown waits for what is queued, whole (a full queue included).
     const SHUTDOWN: Duration = Duration::from_secs(5);
 
     pub const SPANS_DROPPED: &str = "llmshim_telemetry_spans_dropped_total";
@@ -155,7 +155,8 @@ mod real {
                 headers: map,
                 resource: (&resource).into(),
             };
-            let processor = Queue::start(exporter, QUEUE, BATCH, SCHEDULE);
+            let processor = Queue::start(exporter, QUEUE, BATCH, SCHEDULE)
+                .map_err(|message| issue("telemetry", message))?;
             let ratio = config.sample_ratio.unwrap_or(1.0);
             let provider = SdkTracerProvider::builder()
                 .with_span_processor(processor)
@@ -187,8 +188,8 @@ mod real {
                 None => Context::new(),
             };
             let mut attributes = vec![
-                KeyValue::new("http.request.method", method.to_owned()),
-                KeyValue::new("http.route", route.to_owned()),
+                KeyValue::new("http.request.method", bounded_text(method)),
+                KeyValue::new("url.path", bounded_text(route)),
                 KeyValue::new("llmshim.request_id", request_id.to_owned()),
             ];
             if let Some(tenant) = &caller.tenant {
@@ -229,6 +230,11 @@ mod real {
             }
             self.0.end();
         }
+    }
+
+    /// At most 256 characters of a caller-controlled value.
+    fn bounded_text(text: &str) -> String {
+        text.chars().take(256).collect()
     }
 
     struct HeaderExtractor<'a>(&'a HeaderMap);
@@ -309,23 +315,46 @@ mod real {
     }
 
     impl Queue {
-        fn start(exporter: Exporter, capacity: usize, batch: usize, schedule: Duration) -> Self {
+        fn start(
+            exporter: Exporter,
+            capacity: usize,
+            batch: usize,
+            schedule: Duration,
+        ) -> Result<Self, String> {
             let (sender, receiver) = mpsc::sync_channel::<Message>(capacity);
             std::thread::Builder::new()
                 .name("llmshim-otlp".into())
                 .spawn(move || worker(exporter, receiver, batch, schedule))
-                .expect("the telemetry worker thread starts");
-            Self {
+                .map_err(|_| "cannot start the export worker thread".to_owned())?;
+            Ok(Self {
                 sender,
                 dropped: Arc::new(AtomicU64::new(0)),
                 reported_drop: AtomicBool::new(false),
-            }
+            })
         }
 
-        fn ask(&self, message: impl FnOnce(mpsc::SyncSender<()>) -> Message, wait: Duration) {
+        /// Ask the worker to flush or stop, and wait for it, within `wait` in all.
+        /// A full queue (a stalled collector) is retried until the deadline and
+        /// then given up on: shutdown never waits for a free slot unbounded.
+        fn ask(&self, message: impl Fn(mpsc::SyncSender<()>) -> Message, wait: Duration) {
+            let deadline = std::time::Instant::now() + wait;
             let (done, wait_for) = mpsc::sync_channel(1);
-            if self.sender.send(message(done)).is_ok() {
-                let _ = wait_for.recv_timeout(wait);
+            loop {
+                match self.sender.try_send(message(done.clone())) {
+                    Ok(()) => {
+                        let _ = wait_for.recv_timeout(
+                            deadline.saturating_duration_since(std::time::Instant::now()),
+                        );
+                        return;
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => return,
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        if std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
             }
         }
     }
@@ -337,13 +366,16 @@ mod real {
             if !span.span_context.is_sampled() {
                 return;
             }
-            if self.sender.try_send(Message::Span(Box::new(span))).is_err() {
+            if let Err(error) = self.sender.try_send(Message::Span(Box::new(span))) {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 crate::gateway::metrics::incr(SPANS_DROPPED, &[]);
                 if !self.reported_drop.swap(true, Ordering::Relaxed) {
+                    let why = match error {
+                        mpsc::TrySendError::Full(_) => "the span queue is full",
+                        mpsc::TrySendError::Disconnected(_) => "the export worker has stopped",
+                    };
                     eprintln!(
-                        "telemetry: the span queue is full; spans are being dropped \
-                         (counted in {SPANS_DROPPED})"
+                        "telemetry: {why}; spans are being dropped (counted in {SPANS_DROPPED})"
                     );
                 }
             }
@@ -374,7 +406,10 @@ mod real {
             .build()
         {
             Ok(runtime) => runtime,
-            Err(_) => return,
+            Err(_) => {
+                eprintln!("telemetry: cannot start the export runtime; spans will be dropped");
+                return;
+            }
         };
         let failed = AtomicBool::new(false);
         let mut pending: Vec<SpanData> = Vec::new();
@@ -449,7 +484,7 @@ mod real {
             };
             // Capacity 1 and a batch of 1: the worker takes the first span and
             // stalls inside the export, the queue holds one more, the rest drop.
-            let queue = Queue::start(exporter, 1, 1, Duration::from_secs(60));
+            let queue = Queue::start(exporter, 1, 1, Duration::from_secs(60)).unwrap();
             let dropped = queue.dropped.clone();
             let provider = SdkTracerProvider::builder()
                 .with_span_processor(queue)

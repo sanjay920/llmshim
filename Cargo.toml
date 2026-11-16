@@ -28,8 +28,7 @@ serve = ["gateway", "dep:x509-parser", "dep:tokio-rustls", "dep:schemars"]
 # provider health across replicas. Needed for the `[fleet]` configuration table.
 serve-redis = ["serve", "gateway-redis"]
 # `serve` with OpenTelemetry trace export (0016). Needed for the `[telemetry]`
-# configuration table. The exporter's dependencies join this feature when it
-# is implemented; today it only unlocks the table.
+# configuration table; the exporter is our own (see the dependencies below).
 serve-otel = ["serve", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-proto", "dep:prost"]
 
 # Cloud transport dependencies are opt-in for library consumers and bundled binaries.
@@ -86,7 +85,7 @@ schemars = { version = "1", optional = true }
 # whose rustls feature brings aws-lc-rs, so the exporter is ours, over the reqwest
 # this crate already has; only the SDK and the OTLP protobuf messages are shared.
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"], optional = true }
-opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "rt-tokio"], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"], optional = true }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["trace", "gen-tonic-messages"], optional = true }
 prost = { version = "0.14", optional = true }
 async-stream = { version = "0.3", optional = true }

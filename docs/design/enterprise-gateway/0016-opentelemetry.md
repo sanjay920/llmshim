@@ -86,6 +86,11 @@ are another organization's endpoint, and a trace id there would let them correla
 requests we sent on behalf of different callers. `x-request-id` is already
 settled by the outermost layer (0009) and the span carries it.
 
+(`http.route` in the first sketch became **`url.path`**: it is the raw path, not a
+route template, so the honest name is the path's. A caller who authenticates can
+force sampling with the `sampled` flag of its own `traceparent`; that is the
+point of honoring it.)
+
 **8. Telemetry fails open.** The rule of 0013 bar item 2 applies: a collector
 that is down, slow or wrong never blocks or fails a request. Spans go to a bounded
 batch processor on its own thread; when the queue is full a span is dropped and
