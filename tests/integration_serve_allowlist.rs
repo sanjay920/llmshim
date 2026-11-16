@@ -213,3 +213,37 @@ async fn a_reload_that_changes_only_an_allowlist_applies() {
     wait_for_reload(&server, "generation 2", |status| status["generation"] == 2).await;
     assert_eq!(chat_status(&server.base, &[]).await, 403);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_gemini_wire_credential_is_bound_and_the_refusal_is_logged_with_the_key() {
+    let (up, mock) = upstream(0).await;
+    let dir = harness::tempdir::Dir::new("allow-log");
+    let log = dir.0.join("access.jsonl");
+    let text = render(&up.url(), r#"["10.0.0.0/8"]"#, None)
+        + &format!("\n[logging]\naccess_log = \"{}\"\n", log.display());
+    let server = start(&text, "allow-log", &env());
+    let response = call(
+        &server.base,
+        "/v1beta/models/gemini-4-argon:generateContent",
+        &[],
+        ("x-goog-api-key", CALLER_KEY),
+    )
+    .await;
+    assert_eq!(response.status(), 403);
+    mock.assert_async().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let line = loop {
+        let found: Option<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .find(|l: &serde_json::Value| l["status"] == 403);
+        if let Some(found) = found {
+            break found;
+        }
+        assert!(std::time::Instant::now() < deadline, "no 403 line");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(line["key"], "ci");
+    assert_eq!(line["tenant"], "platform");
+}

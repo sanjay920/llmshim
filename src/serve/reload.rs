@@ -387,8 +387,9 @@ impl Reloader {
         }
         active.pending = None;
         let credentials = store.credential_count();
-        // The allowlists first: a key that gains a restriction is bound the moment
-        // it is in force, and one that loses a key is refused by the store.
+        // The allowlists first, and keyed by credential rather than by asking the
+        // store (see `allowlist::enforce`): a key that is new in this reload and
+        // restricted is already bound when the store starts to know it.
         self.handles.allow.replace(allowlists);
         self.handles.keys.replace(store);
         active.fingerprint = fingerprint;

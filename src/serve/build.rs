@@ -425,17 +425,10 @@ pub async fn build_app(
     );
     // Inside the access log (which then records the 403 with the key's name) and
     // outside the gateway, so a refused caller reaches no cached replay, receipt,
-    // queue or budget. It asks the same live store as the gateway.
-    let allow_keys = Arc::new(KeyStore::Live(keys.clone()));
+    // queue or budget.
     let app = app.layer(axum::middleware::from_fn(
         move |request: Request, next: Next| {
-            super::allowlist::enforce(
-                allow.clone(),
-                allow_keys.clone(),
-                trusted.clone(),
-                request,
-                next,
-            )
+            super::allowlist::enforce(allow.clone(), trusted.clone(), request, next)
         },
     ));
     let (app, admin) = match admin_address {

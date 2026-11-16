@@ -12,7 +12,6 @@
 //! effect. A trusted peer that gives no usable address fails closed: the proxy's
 //! own address never stands in for the client.
 
-use crate::gateway::auth::KeyStore;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -186,7 +185,6 @@ impl AllowTable {
 /// answers it (401), and it has no key to be bound.
 pub(crate) async fn enforce(
     table: AllowTable,
-    keys: Arc<KeyStore>,
     trusted: Arc<[Cidr]>,
     request: Request,
     next: Next,
@@ -200,10 +198,14 @@ pub(crate) async fn enforce(
     if native.is_some() {
         crate::proxy::wire::normalize_auth(&mut headers);
     }
-    let Ok(caller) = keys.identify_caller(&headers) else {
+    // Keyed by the credential itself, not by asking the key store: the store can
+    // be swapped by a reload between this check and the gateway's own, and a
+    // check that needed it to identify the caller would pass an unknown one
+    // through to a store that then knows it.
+    let Some(scope) = crate::gateway::auth::credential_scope_of(&headers) else {
         return next.run(request).await;
     };
-    let Some(allowed) = current.get(&caller.credential_scope) else {
+    let Some(allowed) = current.get(&scope) else {
         return next.run(request).await;
     };
     let peer = request
@@ -260,6 +262,19 @@ mod tests {
         assert!(net("0.0.0.0/0").contains(ip("203.0.113.9")));
         assert!(!net("0.0.0.0/0").contains(ip("::1")), "families stay apart");
         assert!(net("::/0").contains(ip("::1")));
+    }
+
+    #[test]
+    fn prefix_edges_hold_in_both_families() {
+        assert!(net("10.1.2.3/32").contains(ip("10.1.2.3")));
+        assert!(!net("10.1.2.3/32").contains(ip("10.1.2.2")));
+        assert!(net("2001:db8::1/128").contains(ip("2001:db8::1")));
+        assert!(!net("2001:db8::1/128").contains(ip("2001:db8::2")));
+        assert!(
+            net("0.0.0.0/0").contains(ip("::ffff:1.2.3.4")),
+            "mapped is v4"
+        );
+        assert!(!net("::/0").contains(ip("::ffff:1.2.3.4")), "and not v6");
     }
 
     #[test]

@@ -366,6 +366,23 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// The credential scope the request's credential would have, from the headers
+/// alone, without consulting any key store: a bearer token's SHA-256, or, with no
+/// bearer token, the `mtls:` digest of the bound certificate name. The same rule
+/// as [`KeyStore::identify_caller`] (a bearer token decides alone), so a decision
+/// keyed by scope cannot disagree with the store about which credential this is,
+/// and a reload swapping the store cannot open a gap between the two.
+#[cfg(feature = "serve")]
+pub(crate) fn credential_scope_of(headers: &HeaderMap) -> Option<String> {
+    match bearer_token(headers) {
+        Some(key) => Some(format!("{:x}", Sha256::digest(key.as_bytes()))),
+        None => {
+            let name = headers.get(PEER_SAN_HEADER)?.to_str().ok()?;
+            Some(format!("{:x}", Sha256::digest(format!("mtls:{name}"))))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +397,50 @@ mod tests {
             );
         }
         h
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn the_scope_from_headers_is_the_scope_the_store_assigns() {
+        let store = KeyStore::mutual(
+            HashMap::from([(
+                format!("{:x}", Sha256::digest(b"token-0123456789abcdef-xyz")),
+                Identity {
+                    tenant: "t".into(),
+                    tier: 0,
+                    rpm: None,
+                    tpm: None,
+                    budget_usd: None,
+                    budget_window_secs: None,
+                    budget_allow_unpriced: false,
+                },
+            )]),
+            HashMap::from([(
+                "uri:spiffe://corp/a".to_string(),
+                Identity {
+                    tenant: "t".into(),
+                    tier: 0,
+                    rpm: None,
+                    tpm: None,
+                    budget_usd: None,
+                    budget_window_secs: None,
+                    budget_allow_unpriced: false,
+                },
+            )]),
+        );
+        let bearer = hdrs(&[("authorization", "Bearer token-0123456789abcdef-xyz")]);
+        let cert = hdrs(&[(PEER_SAN_HEADER, "uri:spiffe://corp/a")]);
+        let both = hdrs(&[
+            ("authorization", "Bearer token-0123456789abcdef-xyz"),
+            (PEER_SAN_HEADER, "uri:spiffe://corp/a"),
+        ]);
+        for headers in [&bearer, &cert, &both] {
+            assert_eq!(
+                credential_scope_of(headers),
+                Some(store.identify_caller(headers).unwrap().credential_scope)
+            );
+        }
+        assert_eq!(credential_scope_of(&HeaderMap::new()), None);
     }
 
     #[test]
