@@ -230,6 +230,10 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
   chain (`fallback.rs` records it and continues). The new `ApiError::ProviderUnavailable`
   variant and the dispatch mapping exist only in a `serve` build: `llmshim gateway` keeps
   its 502.
+- The start reads the provider list under the registry's lock, so a reload that lands
+  during startup syncs after it. The 503 covers a provider the router does not resolve;
+  a route the replica does not yet have fails route expansion and an all-unknown
+  fallback chain ends as `all_failed`, neither a 503 (a roll-out gap, stated here).
 - Process test (`integration_serve_fleet`): a provider added by a reload is served by
   the replica from then on; unit test against Redis: workers start for an added provider
   and stop leasing for a removed one.

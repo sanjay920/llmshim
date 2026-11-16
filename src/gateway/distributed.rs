@@ -1712,7 +1712,7 @@ impl DistributedGateway {
     /// Start the workers and the reaper for `providers`, once; later calls follow
     /// the provider set through [`Self::sync_workers`]. A call before this one is
     /// a no-op, because the start reads the provider set when it happens.
-    pub(crate) fn start_managed_workers(self: &Arc<Self>, providers: Vec<String>) {
+    pub(crate) fn start_managed_workers(self: &Arc<Self>, providers: impl FnOnce() -> Vec<String>) {
         let reaped = {
             let mut managed = self
                 .managed_workers
@@ -1722,6 +1722,9 @@ impl DistributedGateway {
                 return;
             }
             managed.started = true;
+            // Read under the lock: a reload that lands now finds `started` and
+            // syncs after this, instead of being a no-op against a stale list.
+            let providers = providers();
             *managed.reaped.write().unwrap_or_else(|e| e.into_inner()) = providers.clone();
             for provider in &providers {
                 let capacity = Arc::new(Semaphore::new(
@@ -3890,8 +3893,8 @@ mod tests {
         // Before the workers start, a reload's sync is a no-op (the start reads
         // the provider set when it happens).
         gw.sync_workers(vec![kept.clone(), added.clone()]);
-        gw.start_managed_workers(vec![kept.clone()]);
-        gw.start_managed_workers(vec!["ignored-second-start".into()]);
+        gw.start_managed_workers(|| vec![kept.clone()]);
+        gw.start_managed_workers(|| vec!["ignored-second-start".into()]);
         assert!(gw.submit(request(&kept)).await.is_ok());
         // Nothing serves `added` yet.
         assert!(

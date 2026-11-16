@@ -504,13 +504,14 @@ impl GatewayState {
     #[cfg(feature = "redis-coordination")]
     pub(crate) fn start_workers(&self) {
         if let Backend::Distributed(gateway) = &self.backend {
-            let router = self.router.current();
-            let providers: Vec<String> = router
-                .provider_keys()
-                .into_iter()
-                .map(String::from)
-                .collect();
-            gateway.start_managed_workers(providers);
+            gateway.start_managed_workers(|| {
+                self.router
+                    .current()
+                    .provider_keys()
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            });
         }
     }
 
