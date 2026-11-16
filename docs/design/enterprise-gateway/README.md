@@ -77,7 +77,7 @@ Phase 0: a production server mode
       hashed caller keys (0004)
 - [x] Bedrock, Vertex and Azure configurable from the file (0020), behind
       `serve-cloud`; a provider whose feature is not compiled is a startup error
-      naming the rebuild flag. Not in the published image (about 5 MB more, `docker image ls` on arm64; the owner's call)
+      naming the rebuild flag. In the published image's feature set (about 5 MB more, `docker image ls` on arm64; the owner's decision of 2026-11-16)
 - [x] Redis fleet mode under `serve`, behind `serve-redis` (0006)
 - [x] Caller keys reload without a restart: SIGHUP and a watched file (0012)
 - [x] Reload of providers, routes and provider rate limits, single instance and fleet (0022). Provider secrets rotate only as `{ file }` references; `[server]`, `[admin]`, `[fleet]`, `[state]`, `[logging]`, `[telemetry]`, `[reload]`, `[upstream]`, `[auth.jwt]` and `limits.max_concurrency`, `queue_timeout_ms`, `penalty_secs` stay fixed at start

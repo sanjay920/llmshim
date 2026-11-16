@@ -578,7 +578,7 @@ with a pool default that follows `limits.max_concurrency` (at least 256); the sh
 
 ## Signed images (note 0019)
 
-`.github/workflows/images.yml` builds `serve-redis,serve-otel` on a `v*.*.*` tag, pushes
+`.github/workflows/images.yml` builds `serve-redis,serve-otel,serve-cloud` on a `v*.*.*` tag, pushes
 `ghcr.io/<owner>/llmshim:<version>`, signs the digest keyless with cosign, and attaches an
 SPDX SBOM as a signed attestation, then verifies both. It does nothing unless the repository
 variable `PUBLISH_IMAGE` is `true`; setting it, and the first push to GHCR, are the owner's.

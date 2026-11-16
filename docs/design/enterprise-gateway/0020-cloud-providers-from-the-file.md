@@ -152,18 +152,17 @@ log work as for any provider, keyed by the provider name.
   refused unless `budget_allow_unpriced` is set; that is the existing budget rule,
   stated here so it is not a surprise.
 
-## What is not in the published image yet
+## The published image
 
 `serve-cloud` adds the AWS SDK and the Google and Azure paths to the binary. The
-published image (0019) keeps `serve-redis,serve-otel` until the owner decides. The
+published image (0019) includes it since the owner's decision of 2026-11-16. The
 cost, as `docker image ls` reports it for the image built from the Dockerfile on
 an arm64 laptop: about 58 MB without and 63 MB with `serve-cloud` (roughly 5 MB, 9 %).
 The pull-request job prints both sizes for its own build as a job summary; it runs on
 amd64, so its figures will differ from these, and the added build time is visible in
-the job. A deployment that needs these providers builds the image with
-`--build-arg FEATURES=serve-redis,serve-otel,serve-cloud`, and `docker-check.yml`
-builds that combination on every pull request that touches the Dockerfile, so it
-does not rot.
+the job. A deployment that needs no cloud provider can build the smaller image with
+`--build-arg FEATURES=serve-redis,serve-otel`; `docker-check.yml` builds both
+combinations on every pull request that touches the Dockerfile, so neither rots.
 
 ## Not decided here
 

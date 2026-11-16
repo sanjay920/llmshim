@@ -13,8 +13,10 @@ set a deployment of `llmshim serve` needs:
 ghcr.io/<owner>/llmshim:<X.Y.Z>        # one immutable tag per release, no "latest"
 ```
 
-- **Features:** `serve-redis,serve-otel`, so one image runs a single instance, a
-  fleet (a `[fleet]` table) or with traces (a `[telemetry]` table), selected by the
+- **Features:** `serve-redis,serve-otel,serve-cloud` (the cloud transports were added by
+  the owner's decision of 2026-11-16, see 0020), so one image runs a single instance, a
+  fleet (a `[fleet]` table), with traces (a `[telemetry]` table) or against Bedrock,
+  Vertex and Azure (the matching `[providers.*]` kinds), selected by the
   configuration file and not by the image. `llmshim proxy` and `llmshim gateway`
   are in it too.
 - **Platform:** `linux/amd64`. An `arm64` image needs a native builder (building
