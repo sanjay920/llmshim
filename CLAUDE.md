@@ -768,7 +768,7 @@ queue whose drops and failures are `/metrics` series. The exporter is our own
 (the OTLP crate needs reqwest 0.13, whose rustls brings aws-lc-rs); a build without
 the feature refuses a file that sets the table. `docs/design/enterprise-gateway/0014-failure-modes.md` records what a replica does when each dependency fails and the test behind each row (Redis lost before and during a request, `SIGTERM`, ...), with an honest "not yet tested" list; `tests/integration_serve_outage.rs` cuts Redis with a TCP proxy and runs in the serve-redis CI job. `deploy/helm/llmshim` deploys it
 (`deploy/helm/validate.sh` checks the chart and feeds each rendered config back
-through `serve --check`). Only `[[keys]]` reload without a restart (`SIGHUP`,
+through `serve --check`). `[[keys]]`, `[providers.*]`, `[routes.*]` and the provider rate limits (`[limits] rpm`, `tpm`, `[limits.providers.*]`) reload without a restart (`SIGHUP`,
 plus a watched file; design note 0012): the reload is all-or-nothing, refuses a
 change to anything else by path, swaps one `LiveKeys` handle that the gateway,
 the access log and the client-certificate binding share, and reports its outcome
@@ -781,6 +781,18 @@ pins that a build without the feature does not know the command. Never drive
 `from_env` constructors by setting environment variables, and never call
 `process::exit` below `main` on this path. The `Serve feature` CI job builds and
 tests it on every PR; the release gate does not.
+
+## Reloading providers, routes and limits (note 0022)
+
+The gateway holds its router behind a `RouterHandle`; a reload builds a whole new router
+(sharing the running client and breaker) and swaps it, and an admitted request carries its
+snapshot (`AdmittedRouter` extension, `DispatchPolicyContext::router_snapshot`, local backend
+only, never through Redis). Limits are retuned first, in all four holders, through the
+defaulted `RateLimiter::retune` / `AttemptRates::retune`; buckets keep their tokens. Provider
+secrets are fingerprinted by digest, so only `{ file }` references rotate (the status lists the
+`{ env }` ones). A fleet replica starts and stops workers through `DistributedGateway::
+sync_workers`, and a job whose provider the replica lacks answers 503 `provider_unavailable`
+(`serve` builds only). `--features serve-cloud` is needed for the Vertex credential-file test.
 
 ## Cloud transports from the `serve` file (note 0020)
 
