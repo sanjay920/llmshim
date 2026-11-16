@@ -1159,6 +1159,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
                 org: snapshot.org.clone(),
                 generation: snapshot.generation,
                 payload_sha256: snapshot.payload_sha256.clone(),
+                applied_at_epoch_secs: llmshim::serve::snapshot::epoch_secs(),
             },
         ) {
             report(&[issue]);

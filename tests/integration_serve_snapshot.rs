@@ -277,7 +277,7 @@ async fn a_running_replica_never_goes_behind_what_it_applied_even_if_the_floor_f
 }
 
 #[tokio::test]
-async fn another_organizations_snapshot_and_a_changed_trust_setting_are_refused() {
+async fn another_organizations_snapshot_and_a_trust_list_that_drops_the_signer_are_refused() {
     let (upstream, _mock) = mock(1).await;
     let plane = Plane::new("snapshot-org");
     plane.write(&payload(1, vec![key("alpha", ALPHA, "active")]));
@@ -293,9 +293,8 @@ async fn another_organizations_snapshot_and_a_changed_trust_setting_are_refused(
     })
     .await;
     assert_eq!(status_of(&server, BRAVO).await, 401);
-    // Trusting a different key is a change outside what reloads (slice 2b): the
-    // snapshot on disk no longer verifies against the new setting, so the whole
-    // reload is refused and the keys in force keep serving.
+    // A trust list that no longer names the signer: the snapshot on disk no longer
+    // verifies against it, so the reload is refused and the keys in force keep serving.
     let (_, other_public) = snapshot::keygen().unwrap();
     let edited = plane
         .config(&upstream.url(), "")
@@ -611,7 +610,7 @@ async fn a_stale_snapshot_is_reported_and_with_refuse_when_stale_inference_is_re
     plane.write(&payload(1, vec![key("alpha", ALPHA, "active")]));
     let config = plane.config(
         &upstream.url(),
-        "max_age_secs = 5\nrefuse_when_stale = true",
+        "max_age_secs = 8\nrefuse_when_stale = true",
     );
     let server = start(&config, "snapshot-stale", &[]);
     assert_eq!(status_of(&server, ALPHA).await, 200);
@@ -640,6 +639,14 @@ async fn a_stale_snapshot_is_reported_and_with_refuse_when_stale_inference_is_re
     assert_eq!(own.status().as_u16(), 503);
     let own: Value = own.json().await.unwrap();
     assert_eq!(own["error"]["code"], "policy_snapshot_stale", "{own}");
+    // Model discovery is not inference either.
+    let models = reqwest::Client::new()
+        .get(format!("{}/v1/models", server.base))
+        .bearer_auth(ALPHA)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(models.status().as_u16(), 200);
     // Not inference: the probes and the operational endpoints keep answering.
     let admin = server.admin.clone().unwrap();
     for path in ["/health", "/ready"] {
@@ -662,7 +669,7 @@ async fn a_stale_snapshot_without_refuse_when_stale_only_alerts() {
     let plane = Plane::new("snapshot-alert");
     plane.write(&payload(1, vec![key("alpha", ALPHA, "active")]));
     let server = start(
-        &plane.config(&upstream.url(), "max_age_secs = 5"),
+        &plane.config(&upstream.url(), "max_age_secs = 8"),
         "snapshot-alert",
         &[],
     );
@@ -695,4 +702,23 @@ fn refuse_when_stale_needs_a_max_age() {
         stderr.contains("control_plane.refuse_when_stale"),
         "{stderr}"
     );
+}
+
+#[tokio::test]
+async fn a_restart_does_not_make_an_old_snapshot_fresh_again() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-restart-age");
+    plane.write(&payload(1, vec![key("alpha", ALPHA, "active")]));
+    let config = plane.config(&upstream.url(), "max_age_secs = 6");
+    let mut server = start(&config, "snapshot-restart-age-1", &[]);
+    wait_for_reload(&server, "staleness", |s| s["snapshot"]["stale"] == true).await;
+    terminate(&server);
+    assert!(
+        harness::exit_status_within(&mut server, Duration::from_secs(20))
+            .await
+            .is_some()
+    );
+    // The same generation, the same file: the age counts from when it first applied.
+    let again = start(&config, "snapshot-restart-age-2", &[]);
+    assert_eq!(snapshot_status(&again).await["stale"], true);
 }

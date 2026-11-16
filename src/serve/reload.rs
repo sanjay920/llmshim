@@ -261,10 +261,24 @@ impl Reloader {
                 org: snapshot.org.clone(),
                 generation: snapshot.generation,
                 payload_sha256: snapshot.payload_sha256.clone(),
+                applied_at_epoch_secs: super::snapshot::epoch_secs(),
             }),
         };
         if let (Some(clock), Some(snapshot)) = (&handles.clock, snapshot) {
-            clock.applied(snapshot.generation, &snapshot.signer);
+            // The floor of an earlier run says when this same snapshot first applied:
+            // a restart does not make an old snapshot fresh (0024).
+            let known = config
+                .state
+                .policy_dir
+                .as_ref()
+                .and_then(|dir| super::snapshot::read_floor(dir).ok().flatten())
+                .filter(|floor| {
+                    floor.org == snapshot.org
+                        && floor.generation == snapshot.generation
+                        && floor.payload_sha256 == snapshot.payload_sha256
+                })
+                .map(|floor| floor.applied_at_epoch_secs);
+            clock.applied(snapshot.generation, &snapshot.signer, known);
         }
         let credentials = current.credential_count();
         let config_sha256 = sha256_hex(text.as_bytes());
@@ -382,7 +396,7 @@ impl Reloader {
     /// generation.
     fn note_applied(&self, loaded: &super::config::Loaded) {
         if let (Some(clock), Some(snapshot)) = (&self.handles.clock, &loaded.snapshot) {
-            clock.applied(snapshot.generation, &snapshot.signer);
+            clock.applied(snapshot.generation, &snapshot.signer, None);
             self.mark_signer(Some(&loaded.config));
         }
     }
@@ -633,6 +647,7 @@ fn record_snapshot(
             org: snapshot.org.clone(),
             generation: snapshot.generation,
             payload_sha256: snapshot.payload_sha256.clone(),
+            applied_at_epoch_secs: super::snapshot::epoch_secs(),
         };
         super::snapshot::write_floor(dir, &floor)?;
         *applied = Some(floor);

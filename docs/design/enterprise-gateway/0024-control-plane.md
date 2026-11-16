@@ -258,6 +258,13 @@ The data-plane half that needs no control plane exists: `src/serve/snapshot.rs`,
   removed from `verify_keys` while its snapshot is in force is reported (`signer_untrusted`) and keeps
   serving until a trusted signer's snapshot replaces it; the reload that would apply anything from it
   is refused because the file no longer verifies.
+- **The age survives a restart.** The floor records when the generation was first applied
+  (`applied_at_epoch_secs`); a restart into the same snapshot counts from then, so a crash loop or an
+  old file does not make it fresh again (a floor from slice 2a has no time and counts from the
+  start). Age is wall-clock (this process's), so a forward step of the clock makes a snapshot stale
+  early and a backward step fresh. `GET /v1/models` is not gated (discovery is not inference).
+  The stale gate sits before authentication, so an unauthenticated caller also gets the 503; it
+  names no key and no tenant.
 - **Not yet (slice 2b-2):** `expires_at` enforced at
   request time (2a drops a key already expired when the snapshot is read, and a snapshot that
   outlives a key's expiry keeps serving it until the next reload), and the snapshot's `tenants`

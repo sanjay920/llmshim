@@ -583,16 +583,17 @@ pub async fn build_app(
     })
 }
 
-/// The main listener does not serve operational endpoints once they have a
-/// listener of their own.
 /// Refuse a new inference request while the policy snapshot is stale and the file says to
-/// (0024). The operational endpoints are not inference.
+/// (0024). The operational endpoints and model discovery are not inference.
 async fn stale_gate(
     clock: super::snapshot::SnapshotClock,
     request: Request,
     next: Next,
 ) -> Response {
-    if !clock.refusing() || crate::gateway::http::ADMIN_PATHS.contains(&request.uri().path()) {
+    if !clock.refusing()
+        || crate::gateway::http::ADMIN_PATHS.contains(&request.uri().path())
+        || request.uri().path() == "/v1/models"
+    {
         return next.run(request).await;
     }
     let message =
@@ -617,6 +618,8 @@ async fn stale_gate(
     response
 }
 
+/// The main listener does not serve operational endpoints once they have a
+/// listener of their own.
 async fn hide_admin_paths(request: Request, next: Next) -> Response {
     if crate::gateway::http::ADMIN_PATHS.contains(&request.uri().path()) {
         return StatusCode::NOT_FOUND.into_response();

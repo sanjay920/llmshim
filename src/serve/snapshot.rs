@@ -155,12 +155,17 @@ pub struct Snapshot {
 }
 
 /// What a replica remembers of the snapshot it last applied.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Floor {
     /// The organization the snapshot belongs to.
     pub org: String,
     pub generation: u64,
     pub payload_sha256: String,
+    /// When this generation was first applied (epoch seconds), so the snapshot's age
+    /// survives a restart (a replica that restarts often, or into an old snapshot file, is
+    /// not made fresh again). 0 in a record written before this field: unknown.
+    #[serde(default)]
+    pub applied_at_epoch_secs: u64,
 }
 
 /// A public key as written in `verify_keys`: `ed25519:<base64 of 32 bytes>`.
@@ -292,13 +297,22 @@ pub fn write_floor(dir: &Path, floor: &Floor) -> Result<(), Issue> {
         )
     };
     std::fs::create_dir_all(dir).map_err(fail)?;
+    let mut floor = floor.clone();
     if let Some(existing) = read_floor(dir)? {
         if existing.org == floor.org && existing.generation > floor.generation {
             return Ok(());
         }
+        // The same snapshot again keeps the time it was first applied.
+        if existing.org == floor.org
+            && existing.generation == floor.generation
+            && existing.payload_sha256 == floor.payload_sha256
+            && existing.applied_at_epoch_secs != 0
+        {
+            floor.applied_at_epoch_secs = existing.applied_at_epoch_secs;
+        }
     }
     let temp = dir.join(format!(".applied-snapshot.{}.tmp", std::process::id()));
-    let body = serde_json::to_vec(floor).map_err(|e| fail(e.into()))?;
+    let body = serde_json::to_vec(&floor).map_err(|e| fail(e.into()))?;
     {
         use std::io::Write;
         let mut file = std::fs::File::create(&temp).map_err(fail)?;
@@ -412,7 +426,7 @@ pub struct SnapshotStatus {
     pub signer_untrusted: bool,
 }
 
-fn epoch_secs() -> u64 {
+pub fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -441,11 +455,15 @@ impl SnapshotClock {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A snapshot was applied. The age restarts only when the generation is new.
-    pub fn applied(&self, generation: u64, signer: &str) {
+    /// A snapshot was applied. The age restarts only when the generation is new; at
+    /// start `known_applied_at` is when the recorded floor first applied this same
+    /// snapshot, so a restart does not make an old one fresh.
+    pub fn applied(&self, generation: u64, signer: &str, known_applied_at: Option<u64>) {
         let mut state = self.state();
         if state.generation != generation || state.signer.is_empty() {
-            state.applied_at = epoch_secs();
+            state.applied_at = known_applied_at
+                .filter(|at| *at != 0)
+                .unwrap_or_else(epoch_secs);
         }
         state.generation = generation;
         state.signer = signer.to_owned();
@@ -742,6 +760,7 @@ mod tests {
             org: "org_test".into(),
             generation: first.generation,
             payload_sha256: first.payload_sha256.clone(),
+            applied_at_epoch_secs: 0,
         };
         // The same file again is the same snapshot: fine (a reload, a restart).
         assert!(fixture.load(Some(&floor)).is_ok());
@@ -781,6 +800,7 @@ mod tests {
             org: "org_other".into(),
             generation: 1,
             payload_sha256: "00".repeat(32),
+            applied_at_epoch_secs: 0,
         };
         assert!(refused(fixture.load(Some(&foreign))).contains("another organization"));
     }
@@ -866,6 +886,7 @@ mod tests {
             org: "org_test".into(),
             generation: 9,
             payload_sha256: "ab".repeat(32),
+            applied_at_epoch_secs: 1000,
         };
         write_floor(&dir, &floor).unwrap();
         assert_eq!(read_floor(&dir).unwrap(), Some(floor));
@@ -876,6 +897,7 @@ mod tests {
                 org: "org_test".into(),
                 generation: 4,
                 payload_sha256: "cd".repeat(32),
+                applied_at_epoch_secs: 2000,
             },
         )
         .unwrap();
@@ -883,6 +905,81 @@ mod tests {
         std::fs::write(dir.join("applied-snapshot.json"), "not json").unwrap();
         let issue = read_floor(&dir).unwrap_err();
         assert_eq!(issue.path, "state.policy_dir");
+    }
+
+    fn clock(max_age: Option<u64>, refuse: bool) -> SnapshotClock {
+        let mut cp = Fixture::new().control_plane();
+        cp.max_age_secs = max_age;
+        cp.refuse_when_stale = refuse;
+        SnapshotClock::new(&cp)
+    }
+
+    #[test]
+    fn the_age_restarts_only_for_a_new_generation_and_survives_a_known_start() {
+        let clock = clock(Some(100), true);
+        let now = epoch_secs();
+        // A restart into a snapshot the floor says was applied long ago is stale already.
+        clock.applied(3, "ed25519:s", Some(now - 500));
+        assert!(clock.status().stale);
+        assert!(clock.refusing());
+        // The same generation again (an unchanged reload) does not make it fresh.
+        clock.applied(3, "ed25519:s", None);
+        assert!(clock.status().stale);
+        // A new generation does.
+        clock.applied(4, "ed25519:s", None);
+        assert!(!clock.status().stale);
+        assert!(!clock.refusing());
+    }
+
+    #[test]
+    fn stale_never_refuses_without_the_setting_and_never_exists_without_a_max_age() {
+        let alert = clock(Some(1), false);
+        alert.applied(1, "ed25519:s", Some(epoch_secs() - 50));
+        assert!(alert.status().stale);
+        assert!(!alert.refusing(), "an alert is not a refusal");
+        let none = clock(None, false);
+        none.applied(1, "ed25519:s", Some(epoch_secs() - 99999));
+        assert!(!none.status().stale);
+    }
+
+    #[test]
+    fn the_floor_keeps_the_time_a_snapshot_was_first_applied() {
+        let fixture = Fixture::new();
+        let dir = fixture.dir.join("policy");
+        let first = Floor {
+            org: "org_test".into(),
+            generation: 5,
+            payload_sha256: "ab".repeat(32),
+            applied_at_epoch_secs: 1000,
+        };
+        write_floor(&dir, &first).unwrap();
+        // The same snapshot written again later keeps the first time.
+        write_floor(
+            &dir,
+            &Floor {
+                applied_at_epoch_secs: 9000,
+                ..first.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_floor(&dir).unwrap().unwrap().applied_at_epoch_secs,
+            1000
+        );
+        // A new generation takes its own.
+        write_floor(
+            &dir,
+            &Floor {
+                generation: 6,
+                applied_at_epoch_secs: 9000,
+                ..first
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_floor(&dir).unwrap().unwrap().applied_at_epoch_secs,
+            9000
+        );
     }
 
     #[test]
