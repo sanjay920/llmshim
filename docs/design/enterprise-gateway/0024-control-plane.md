@@ -334,6 +334,23 @@ with the bearer token and `If-None-Match: "<generation>"`.
   plane that is up but re-issues nothing is stale by the rule stated in 2b, and one that is down is stale the
   same way; the replica keeps serving the cache either way unless `refuse_when_stale`.
 - The control plane's `ETag` is the generation; the replica uses its own verified cache generation, not the header.
+- **Judged exactly as a load would judge it, before it can replace the cache.** A pulled body is written
+  to a temporary file (`create_new`, synced, never following a link) and checked with the **same** function a
+  load uses (`check_snapshot_candidate`: signature, organization, floor, `min_generation`, content, the key
+  rules) against the configuration **as it is now**; only then is it renamed over `snapshot.json` (and the
+  directory synced). A snapshot that is signed but that this configuration would refuse therefore never
+  replaces the last good one, so a restart cannot find a cache it cannot load.
+- **The configuration is re-read at every poll**, so `verify_keys` added or removed by a reload are the list
+  the poller judges by; the poller and the loader cannot disagree about who may sign.
+- **The body is bounded as it arrives** (8 MiB, no `Content-Length` needed) and the client asks for no
+  compression, so a small compressed body cannot inflate past the cap. Redirects are not followed. The
+  standard proxy variables apply to the client (a plain `http://` url with `HTTP_PROXY` sends the token to the
+  proxy: another reason `allow_insecure_http` is a choice).
+- **The organization is a path segment**: with a source it may hold only letters, digits, `.`, `_` and `-`,
+  starting with a letter or digit, and the url must be a scheme, a host and an optional port (parsed, no
+  backslash, no port 0).
+- A reload that refuses a snapshot just cached (another change in the same file) is logged and shown in
+  `last_pull_error`, not swallowed.
 
 ## Slices
 

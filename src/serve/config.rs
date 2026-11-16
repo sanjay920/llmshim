@@ -1130,6 +1130,27 @@ impl ServeConfig {
     /// check them by the rules file keys are checked by (0024). Reads files; records
     /// nothing (the caller records the generation once the snapshot is applied).
     fn apply_snapshot(&mut self) -> Result<Option<super::snapshot::Snapshot>, Vec<Issue>> {
+        let Some(control_plane) = self.control_plane.as_ref() else {
+            return Ok(None);
+        };
+        let path = control_plane
+            .snapshot_path(self.state.policy_dir.as_deref())
+            .ok_or_else(|| vec![Issue::new("control_plane", "has no snapshot to read")])?;
+        self.apply_snapshot_from(&path)
+    }
+
+    /// Whether the snapshot at `path` would be accepted by this configuration exactly as a
+    /// load would accept it (signature, organization, floor, content, the key rules), without
+    /// changing anything: a pulled snapshot is judged this way before it replaces the cache
+    /// (0024), so a signed but unusable one never overwrites the last good.
+    pub fn check_snapshot_candidate(&self, path: &Path) -> Result<(), Vec<Issue>> {
+        self.clone().apply_snapshot_from(path).map(|_| ())
+    }
+
+    fn apply_snapshot_from(
+        &mut self,
+        path: &Path,
+    ) -> Result<Option<super::snapshot::Snapshot>, Vec<Issue>> {
         let Some(control_plane) = self.control_plane.clone() else {
             return Ok(None);
         };
@@ -1137,11 +1158,8 @@ impl ServeConfig {
             Some(dir) => super::snapshot::read_floor(dir).map_err(|issue| vec![issue])?,
             None => None,
         };
-        let path = control_plane
-            .snapshot_path(self.state.policy_dir.as_deref())
-            .ok_or_else(|| vec![Issue::new("control_plane", "has no snapshot to read")])?;
         let snapshot =
-            super::snapshot::load_from(&path, &control_plane, floor.as_ref(), chrono::Utc::now())?;
+            super::snapshot::load_from(path, &control_plane, floor.as_ref(), chrono::Utc::now())?;
         if snapshot.keys.is_empty() {
             return Err(vec![Issue::new(
                 "control_plane.snapshot_file",
@@ -1194,6 +1212,44 @@ impl ServeConfig {
                     "must be just a scheme and host (and port): no credentials, path or query",
                 ));
             }
+        }
+        // A backslash is a slash to a URL parser; the host must be real and the path empty.
+        if !source.url.contains('\\') {
+            match reqwest::Url::parse(&source.url) {
+                Ok(url)
+                    if url.host_str().is_some_and(|h| !h.is_empty())
+                        && url.path() == "/"
+                        && url.port() != Some(0)
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none() => {}
+                _ => issues.push(Issue::new(
+                    format!("{at}.url"),
+                    "must be a scheme, a host and an optional port, nothing else",
+                )),
+            }
+        } else {
+            issues.push(Issue::new(
+                format!("{at}.url"),
+                "must not contain a backslash",
+            ));
+        }
+        if !self.control_plane.as_ref().is_some_and(|cp| {
+            // Not a dot segment: `..` would climb out of /v1/orgs/.
+            cp.org
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric())
+                && cp
+                    .org
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        }) {
+            issues.push(Issue::new(
+                "control_plane.org",
+                "with a source, use only letters, digits, '.', '_' and '-' (it is a path segment)",
+            ));
         }
         validate_secret(&source.token, &format!("{at}.token"), issues);
         if source
@@ -2963,6 +3019,19 @@ mod tests {
             "https://control.example:8443/"
         ))
         .is_empty());
+        // The organization is a path segment: nothing that could change the request target.
+        for bad in ["a/b", "a?b", "a#b", "..", "a b", "a\\b"] {
+            let text = PULLED.replace("org = \"org_test\"", &format!("org = \"{bad}\""));
+            assert!(has(&issues(&text), "control_plane.org"), "{bad}");
+        }
+        for bad in [
+            "https://control.example\\\\.evil.example",
+            "https://:443",
+            "https://host:0",
+        ] {
+            let text = PULLED.replace("https://control.internal.example", bad);
+            assert!(has(&issues(&text), "control_plane.source.url"), "{bad}");
+        }
         let slow = format!("{PULLED}\n        poll_interval_secs = 0");
         assert!(has(
             &issues(&slow),

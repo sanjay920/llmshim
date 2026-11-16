@@ -1063,3 +1063,133 @@ async fn start_without_a_cache_needs_the_control_plane_and_with_one_it_does_not(
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("no snapshot is cached"), "{stderr}");
 }
+
+#[tokio::test]
+async fn an_oversized_a_redirected_and_a_compressed_answer_are_refused_without_being_trusted() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("pull-hostile");
+    let (mut control, first) = control_plane(&plane, 1, vec![key("alpha", ALPHA, "active")]).await;
+    let server = start(
+        &plane.pulled_config(&upstream.url(), &control.url(), ""),
+        "pull-hostile",
+        &PULL_ENV,
+    );
+    let cache = plane.dir.0.join("policy").join("snapshot.json");
+    let before = std::fs::read(&cache).unwrap();
+    first.remove_async().await;
+    let reported = |wanted: &'static str| {
+        let server = &server;
+        async move {
+            wait_for_reload(server, wanted, |s| {
+                s["snapshot"]["last_pull_error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains(wanted))
+            })
+            .await;
+        }
+    };
+    // Bigger than the 8 MiB cap, with no Content-Length to check first.
+    let _big = control
+        .mock("GET", "/v1/orgs/org_test/snapshot")
+        .with_chunked_body(|writer| {
+            let block = vec![b'x'; 1024 * 1024];
+            for _ in 0..10 {
+                std::io::Write::write_all(writer, &block)?;
+            }
+            Ok(())
+        })
+        .create_async()
+        .await;
+    reported("larger than 8 MiB").await;
+    assert_eq!(std::fs::read(&cache).unwrap(), before);
+    drop(_big);
+    // A redirect would carry the token elsewhere: it is not followed.
+    let _redirect = control
+        .mock("GET", "/v1/orgs/org_test/snapshot")
+        .with_status(302)
+        .with_header("location", "http://127.0.0.1:1/elsewhere")
+        .create_async()
+        .await;
+    reported("answered 302").await;
+    assert_eq!(std::fs::read(&cache).unwrap(), before);
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+}
+
+#[tokio::test]
+async fn a_snapshot_that_is_signed_but_unusable_never_replaces_the_last_good_cache() {
+    let (upstream, _mock) = mock(2).await;
+    let plane = Plane::new("pull-unusable");
+    let (mut control, first) = control_plane(&plane, 1, vec![key("alpha", ALPHA, "active")]).await;
+    let config = plane.pulled_config(&upstream.url(), &control.url(), "");
+    let server = start(&config, "pull-unusable-1", &PULL_ENV);
+    let cache = plane.dir.0.join("policy").join("snapshot.json");
+    let good = std::fs::read(&cache).unwrap();
+    first.remove_async().await;
+    // Validly signed, higher generation, but this key is one the data plane refuses.
+    let mut bad = key("bravo", BRAVO, "active");
+    bad["allowed_cidrs"] = json!(["not-a-network"]);
+    let _bad = serve_generation(&mut control, &plane, 2, vec![bad]).await;
+    wait_for_reload(&server, "the refusal", |s| {
+        s["snapshot"]["last_pull_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("refused"))
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(&cache).unwrap(),
+        good,
+        "the last good cache is untouched"
+    );
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+    // And a restart, which reads that cache, still comes up.
+    drop(server);
+    let server = start(&config, "pull-unusable-2", &PULL_ENV);
+    assert_eq!(
+        status_of(&server, ALPHA).await,
+        200,
+        "the restart served the good cache"
+    );
+}
+
+#[tokio::test]
+async fn a_signer_added_to_verify_keys_is_trusted_by_the_next_pull_without_a_restart() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("pull-rotate");
+    let (mut control, first) = control_plane(&plane, 1, vec![key("alpha", ALPHA, "active")]).await;
+    let config = plane.pulled_config(&upstream.url(), &control.url(), "");
+    let server = start(&config, "pull-rotate", &PULL_ENV);
+    first.remove_async().await;
+    // Generation 2 is signed by a key this replica does not yet trust: refused.
+    let (other_seed, other_public) = snapshot::keygen().unwrap();
+    let signed = snapshot::sign(
+        &payload(2, vec![key("bravo", BRAVO, "active")]),
+        &other_seed,
+    )
+    .unwrap();
+    let _second = control
+        .mock("GET", "/v1/orgs/org_test/snapshot")
+        .with_body(signed)
+        .create_async()
+        .await;
+    wait_for_reload(&server, "the refusal", |s| {
+        s["snapshot"]["last_pull_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("not in verify_keys"))
+    })
+    .await;
+    assert_eq!(status_of(&server, BRAVO).await, 401);
+    // The operator adds the new public key and reloads; the poller judges by the list in force.
+    let both = with_verify_keys(&plane, &config, &two_signers(&plane, &other_public))
+        .replace("{DIR}", server.dir.0.to_str().unwrap());
+    std::fs::write(server.dir.0.join("gateway.toml"), both).unwrap();
+    hangup(&server);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while status_of(&server, BRAVO).await != 200 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the added signer was never trusted"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(status_of(&server, ALPHA).await, 401);
+}

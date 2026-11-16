@@ -924,25 +924,23 @@ async fn startup_pull(
     let Ok(loaded) = llmshim::serve::ServeConfig::load_with_text_resolving(path, false) else {
         return Ok(false);
     };
-    let (Some(control_plane), Some(dir)) = (
-        loaded
-            .config
-            .control_plane
-            .as_ref()
-            .filter(|c| c.source.is_some()),
-        loaded.config.state.policy_dir.as_ref(),
-    ) else {
+    let config = &loaded.config;
+    if !config
+        .control_plane
+        .as_ref()
+        .is_some_and(|c| c.source.is_some())
+    {
         return Ok(false);
-    };
-    let mut puller = match Puller::new(control_plane, dir) {
+    }
+    let mut puller = match Puller::new(config) {
         Ok(puller) => puller,
         Err(reason) => {
             eprintln!("{reason}");
             return Err(1);
         }
     };
-    let pulled = match puller.token(env) {
-        Ok(token) => puller.pull(token).await,
+    let pulled = match Puller::token(config, env) {
+        Ok(token) => puller.pull(config, token).await,
         Err(reason) => Err(reason),
     };
     match pulled {
@@ -950,15 +948,22 @@ async fn startup_pull(
             eprintln!("control plane: pulled snapshot generation {generation}");
             Ok(true)
         }
-        Ok(Pulled::NotModified) => Ok(true),
+        Ok(Pulled::NotModified) if puller.has_cache() => Ok(true),
+        Ok(Pulled::NotModified) => {
+            eprintln!("control plane: it reported nothing newer, and no snapshot is cached");
+            Err(1)
+        }
         Err(reason) if puller.has_cache() => {
             eprintln!("control plane: {reason}; serving the cached snapshot");
             Ok(false)
         }
         Err(reason) => {
-            eprintln!(
-                "control plane: {reason}, and no snapshot is cached: no caller could be identified"
-            );
+            let why = if puller.cache_file_exists() {
+                "the cached snapshot does not verify or load"
+            } else {
+                "no snapshot is cached"
+            };
+            eprintln!("control plane: {reason}, and {why}: no caller could be identified");
             Err(1)
         }
     }
@@ -970,13 +975,15 @@ async fn startup_pull(
 #[cfg(feature = "serve")]
 async fn pull_loop(
     mut puller: llmshim::serve::snapshot_pull::Puller,
+    path: std::path::PathBuf,
+    interval: std::time::Duration,
     reloader: std::sync::Arc<llmshim::serve::Reloader>,
     clock: Option<llmshim::serve::snapshot::SnapshotClock>,
     mut stopped: tokio::sync::watch::Receiver<bool>,
 ) {
-    use llmshim::serve::snapshot_pull::Pulled;
+    use llmshim::serve::snapshot_pull::{Pulled, Puller};
     let env = |name: &str| std::env::var(name).ok();
-    let mut ticker = tokio::time::interval(puller.poll_interval());
+    let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The start just pulled.
     ticker.tick().await;
@@ -986,8 +993,24 @@ async fn pull_loop(
             _ = stopped.wait_for(|stop| *stop) => return,
             _ = ticker.tick() => {}
         }
-        let pulled = match puller.token(&env) {
-            Ok(token) => puller.pull(token).await,
+        // The configuration as it is now: `verify_keys` reload, and a pull must judge by the
+        // list in force, not the one the process started with.
+        let config = match llmshim::serve::ServeConfig::load_with_text_resolving(&path, false) {
+            Ok(loaded) => loaded.config,
+            Err(_) => {
+                let reason = "the configuration file cannot be read; polling waits".to_string();
+                if let Some(clock) = &clock {
+                    clock.pulled(Err(reason.clone()));
+                }
+                if last_error.as_deref() != Some(reason.as_str()) {
+                    eprintln!("control plane: {reason}");
+                    last_error = Some(reason);
+                }
+                continue;
+            }
+        };
+        let pulled = match Puller::token(&config, &env) {
+            Ok(token) => puller.pull(&config, token).await,
             Err(reason) => Err(reason),
         };
         match pulled {
@@ -999,11 +1022,35 @@ async fn pull_loop(
                 if let Pulled::Updated(generation) = result {
                     eprintln!("control plane: pulled snapshot generation {generation}");
                     let current = reloader.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let outcome = tokio::task::spawn_blocking(move || {
                         let env = |name: &str| std::env::var(name).ok();
                         current.reload(&env)
                     })
                     .await;
+                    match outcome {
+                        Ok(llmshim::serve::Outcome::Applied {
+                            generation,
+                            credentials,
+                        }) => {
+                            eprintln!(
+                                "reload: applied (generation {generation}, {credentials} caller credential(s))"
+                            );
+                        }
+                        Ok(llmshim::serve::Outcome::Rejected { issues, .. }) => {
+                            // Cached and judged acceptable, yet the reload refused it (another
+                            // change in the same file, say): said, not swallowed.
+                            let reason = "a pulled snapshot was cached but the reload refused it"
+                                .to_string();
+                            if let Some(clock) = &clock {
+                                clock.pulled(Err(reason.clone()));
+                            }
+                            eprintln!("control plane: {reason} ({} problem(s))", issues.len());
+                            for issue in &issues {
+                                eprintln!("  {issue}");
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Err(reason) => {
@@ -1291,11 +1338,19 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         );
     }
     // With `[control_plane.source]`: the poller that keeps the cached snapshot current.
-    let control_puller = config.control_plane.as_ref().and_then(|control_plane| {
-        let dir = config.state.policy_dir.as_ref()?;
-        control_plane.source.as_ref()?;
-        llmshim::serve::snapshot_pull::Puller::new(control_plane, dir).ok()
-    });
+    let control_puller = config
+        .control_plane
+        .as_ref()
+        .filter(|control_plane| control_plane.source.is_some())
+        .and_then(
+            |_| match llmshim::serve::snapshot_pull::Puller::new(&config) {
+                Ok(puller) => Some(puller),
+                Err(reason) => {
+                    eprintln!("control plane: polling is off: {reason}");
+                    None
+                }
+            },
+        );
     let listener = match cli::bind(built.address).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -1406,6 +1461,8 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     if let Some(puller) = control_puller {
         tokio::spawn(pull_loop(
             puller,
+            path.to_path_buf(),
+            llmshim::serve::snapshot_pull::Puller::poll_interval(&config),
             reloader.clone(),
             built.reload.snapshot_clock(),
             stopped.clone(),
