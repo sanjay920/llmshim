@@ -14,6 +14,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+pub mod api;
+
 const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]
@@ -503,6 +505,46 @@ impl Store {
         found
             .map(|_| ())
             .ok_or_else(|| Error::NotFound(format!("{table} {id}")))
+    }
+
+    pub fn orgs(&self) -> Result<Vec<Org>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id, name, created_at FROM orgs ORDER BY rowid")?;
+        let rows = statement.query_map([], |row| {
+            Ok(Org {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn projects(&self, team_id: &str) -> Result<Vec<Project>> {
+        require_in(&self.conn, "teams", team_id)?;
+        let mut statement = self.conn.prepare(
+            "SELECT id, team_id, name, created_at FROM projects WHERE team_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([team_id], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                team_id: row.get(1)?,
+                name: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn teams_checked(&self, org_id: &str) -> Result<Vec<Team>> {
+        require_in(&self.conn, "orgs", org_id)?;
+        teams_of(&self.conn, org_id)
+    }
+
+    pub fn keys_checked(&self, org_id: &str) -> Result<Vec<KeyRecord>> {
+        require_in(&self.conn, "orgs", org_id)?;
+        keys_of(&self.conn, org_id)
     }
 
     pub fn teams(&self, org_id: &str) -> Result<Vec<Team>> {

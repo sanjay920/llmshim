@@ -1,0 +1,258 @@
+openapi: 3.1.0
+info:
+  title: llmshim control plane
+  version: 0.1.0
+  description: |
+    The control plane's API (design note 0026): organizations, teams, projects, key lifecycle
+    and signed policy snapshots. Every route needs `Authorization: Bearer <token>`. The actor
+    recorded in the change history is the `x-llmshim-actor` header (a label the caller asserts).
+    A secret appears only in the answers to key creation and rotation.
+servers:
+  - url: http://127.0.0.1:3100
+security:
+  - bearer: []
+paths:
+  /v1/orgs:
+    post:
+      operationId: createOrg
+      requestBody: {$ref: '#/components/requestBodies/Name'}
+      responses:
+        '201': {description: The organization, content: {application/json: {schema: {$ref: '#/components/schemas/Org'}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    get:
+      operationId: listOrgs
+      responses:
+        '200': {description: Organizations}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/orgs/{org}/teams:
+    parameters: [{$ref: '#/components/parameters/org'}]
+    post:
+      operationId: createTeam
+      requestBody: {$ref: '#/components/requestBodies/Name'}
+      responses:
+        '201': {description: The team}
+        '404': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    get:
+      operationId: listTeams
+      responses:
+        '200': {description: Teams}
+        '404': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/teams/{team}/projects:
+    parameters: [{name: team, in: path, required: true, schema: {type: string}}]
+    post:
+      operationId: createProject
+      requestBody: {$ref: '#/components/requestBodies/Name'}
+      responses:
+        '201': {description: The project}
+        '404': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    get:
+      operationId: listProjects
+      responses:
+        '200': {description: Projects}
+        '404': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/projects/{project}/keys:
+    parameters: [{name: project, in: path, required: true, schema: {type: string}}]
+    post:
+      operationId: createKey
+      description: "Creates a key. A secret key's secret is in this answer and nowhere else, ever (`Cache-Control: no-store`)."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NewKey'}
+      responses:
+        '201': {description: 'The key and, for a secret key, its secret', content: {application/json: {schema: {$ref: '#/components/schemas/CreatedKey'}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/orgs/{org}/keys:
+    parameters: [{$ref: '#/components/parameters/org'}]
+    get:
+      operationId: listKeys
+      responses:
+        '200': {description: Keys}
+        '404': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/keys/{key}:
+    parameters: [{$ref: '#/components/parameters/key'}]
+    get:
+      operationId: getKey
+      responses:
+        '200': {description: The key, content: {application/json: {schema: {$ref: '#/components/schemas/Key'}}}}
+        '404': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/keys/{key}/revoke:
+    parameters: [{$ref: '#/components/parameters/key'}]
+    post:
+      operationId: revokeKey
+      description: Terminal.
+      responses:
+        '200': {description: The revoked key}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/keys/{key}/rotate:
+    parameters: [{$ref: '#/components/parameters/key'}]
+    post:
+      operationId: rotateKey
+      description: Creates a successor under a new name; the old key stays active until it is revoked.
+      requestBody: {$ref: '#/components/requestBodies/Name'}
+      responses:
+        '201': {description: The successor and its secret, content: {application/json: {schema: {$ref: '#/components/schemas/CreatedKey'}}}}
+        '400': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/keys/{key}/limits:
+    parameters: [{$ref: '#/components/parameters/key'}]
+    patch:
+      operationId: updateLimits
+      description: A whole-limits update, not a merge - a field left out is cleared.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Limits'}
+      responses:
+        '200': {description: The key}
+        '400': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/history:
+    get:
+      operationId: history
+      parameters:
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 1000, default: 100}}
+      responses:
+        '200': {description: Newest first}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/orgs/{org}/snapshots:
+    parameters: [{$ref: '#/components/parameters/org'}]
+    post:
+      operationId: publishSnapshot
+      description: Builds, signs and stores the next generation. 503 without a signing key file.
+      responses:
+        '201': {description: The generation}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '500': {$ref: '#/components/responses/Error'}
+        '503': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/orgs/{org}/snapshot:
+    parameters: [{$ref: '#/components/parameters/org'}]
+    get:
+      operationId: latestSnapshot
+      description: The latest signed envelope, as a data plane's `snapshot_file` holds it. ETag is the generation.
+      responses:
+        '200': {description: The signed envelope}
+        '304': {description: Not modified}
+        '404': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer}
+  parameters:
+    org: {name: org, in: path, required: true, schema: {type: string}}
+    key: {name: key, in: path, required: true, schema: {type: string}}
+  requestBodies:
+    Name:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name]
+            additionalProperties: false
+            properties: {name: {type: string}}
+  responses:
+    Error:
+      description: An error
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unauthorized:
+      description: Missing or wrong token
+      headers:
+        WWW-Authenticate: {schema: {type: string, const: Bearer}}
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string, enum: [invalid_request, not_found, conflict, internal, signing_key_unconfigured, no_such_route]}
+            message: {type: string}
+    Org:
+      type: object
+      required: [id, name, created_at]
+      properties: {id: {type: string}, name: {type: string}, created_at: {type: string}}
+    Key:
+      type: object
+      description: A key. Its secret and its hash are never in it.
+      required: [id, org_id, project_id, team_id, name, kind, state, tier, budget_allow_unpriced, created_at]
+      properties:
+        id: {type: string}
+        org_id: {type: string}
+        project_id: {type: string}
+        team_id: {type: string}
+        name: {type: string}
+        kind: {type: string, enum: [secret, client_san, jwt]}
+        state: {type: string, enum: [active, revoked]}
+        client_san: {type: [string, 'null']}
+        jwt_table: {type: [string, 'null']}
+        jwt_subject: {type: [string, 'null']}
+        expires_at: {type: [string, 'null']}
+        tier: {type: integer}
+        rpm: {type: [integer, 'null']}
+        tpm: {type: [integer, 'null']}
+        budget_usd: {type: [number, 'null']}
+        budget_window_secs: {type: [integer, 'null']}
+        budget_allow_unpriced: {type: boolean}
+        allowed_cidrs: {type: [array, 'null'], items: {type: string}}
+        created_at: {type: string}
+        revoked_at: {type: [string, 'null']}
+    CreatedKey:
+      type: object
+      required: [key, secret]
+      properties:
+        key: {$ref: '#/components/schemas/Key'}
+        secret: {type: [string, 'null'], description: Shown once; null for a certificate or token identity}
+    NewKey:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name: {type: string}
+        credential:
+          oneOf:
+            - {type: object, required: [type], additionalProperties: false, properties: {type: {const: secret}}}
+            - {type: object, required: [type, san], additionalProperties: false, properties: {type: {const: client_san}, san: {type: string}}}
+            - {type: object, required: [type, table, subject], additionalProperties: false, properties: {type: {const: jwt}, table: {type: string}, subject: {type: string}}}
+        tier: {type: integer, minimum: 0, maximum: 255}
+        rpm: {type: integer, minimum: 0}
+        tpm: {type: integer, minimum: 0}
+        budget_usd: {type: number}
+        budget_window_secs: {type: integer}
+        budget_allow_unpriced: {type: boolean}
+        allowed_cidrs: {type: array, items: {type: string}}
+        expires_at: {type: string, format: date-time}
+    Limits:
+      type: object
+      additionalProperties: false
+      properties:
+        rpm: {type: integer, minimum: 0}
+        tpm: {type: integer, minimum: 0}
+        budget_usd: {type: number}
+        budget_window_secs: {type: integer}
+        expires_at: {type: string, format: date-time}

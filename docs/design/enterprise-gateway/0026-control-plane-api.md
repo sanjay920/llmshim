@@ -1,7 +1,8 @@
 # 0026: The control plane's HTTP API
 
-Status: design, then implemented in the same slice (0024 slice 3b); the note is its own
-commit, written before the code (README working rule 3). It fixes the surface of the
+Status: implemented (0024 slice 3b: `crates/llmshim-control`, `src/api.rs`, `src/main.rs`, `openapi.yaml`); the note was its own
+commit, written before the code (README working rule 3). Bodies are read by hand so that every malformed
+or unexpected one is the API's own 400 `invalid_request` (axum's extractor answers 422 for some). It fixes the surface of the
 `llmshim-control` server so that the OpenAPI document and the server cannot drift.
 
 ## What it is
