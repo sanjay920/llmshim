@@ -110,8 +110,12 @@ impl JsonLines {
     }
 
     #[cfg(test)]
-    fn to_writer_with_capacity(writer: Box<dyn Write + Send>, capacity: usize) -> Self {
-        Self::spawn("log".to_owned(), "test", writer, capacity)
+    fn to_writer_with_capacity(
+        writer: Box<dyn Write + Send>,
+        capacity: usize,
+        log: &'static str,
+    ) -> Self {
+        Self::spawn("log".to_owned(), log, writer, capacity)
     }
 
     fn spawn(
@@ -121,6 +125,10 @@ impl JsonLines {
         capacity: usize,
     ) -> Self {
         let (sender, receiver) = sync_channel::<Message>(capacity);
+        // Present from the start at zero, so a rate or an absent-series alert
+        // works before the first drop.
+        crate::gateway::metrics::add(LINES_DROPPED, &[("log", log)], 0);
+        crate::gateway::metrics::add(WRITE_FAILURES, &[("log", log)], 0);
         let failed = Arc::new(AtomicU64::new(0));
         let (worker_failed, worker_name) = (failed.clone(), name.clone());
         let worker = std::thread::Builder::new()
@@ -348,6 +356,7 @@ mod tests {
                 out: out.clone(),
             }),
             4,
+            "test_overflow",
         );
         let started = Instant::now();
         for n in 0..200 {
@@ -368,17 +377,17 @@ mod tests {
         log.sync();
         let delivered = out.text().lines().count() as u64;
         assert_eq!(delivered + log.dropped(), 200);
-        // The same drops are a /metrics series, by log (this test's label is
-        // "test"; the series is global, so only a lower bound is asserted). After
+        // The same drops are a /metrics series, by log (this test has a label of
+        // its own, so the count is exact even though the registry is global). After
         // the gate is open: a failing assertion above this point would leave the
         // writer stalled and the test hanging on its drop instead of failing.
         let text = crate::gateway::metrics::render();
         let series = text
             .lines()
-            .find(|line| line.starts_with("llmshim_log_lines_dropped_total{log=\"test\"}"))
+            .find(|line| line.starts_with("llmshim_log_lines_dropped_total{log=\"test_overflow\"}"))
             .unwrap_or_else(|| panic!("no dropped series in {text}"));
         let counted: u64 = series.rsplit(' ').next().unwrap().parse().unwrap();
-        assert!(counted >= log.dropped(), "{series}");
+        assert_eq!(counted, log.dropped(), "{series}");
 
         assert!(out
             .text()
@@ -397,7 +406,7 @@ mod tests {
                 Ok(())
             }
         }
-        let log = JsonLines::to_writer(Box::new(Broken));
+        let log = JsonLines::to_writer_with_capacity(Box::new(Broken), QUEUE_LINES, "test_broken");
         for n in 0..5 {
             log.write(&serde_json::json!({"n": n}));
         }
@@ -406,9 +415,9 @@ mod tests {
         let text = crate::gateway::metrics::render();
         let series = text
             .lines()
-            .find(|line| line.starts_with("llmshim_log_write_failures_total{log=\"test\"}"))
+            .find(|line| line.starts_with("llmshim_log_write_failures_total{log=\"test_broken\"}"))
             .unwrap_or_else(|| panic!("no failure series in {text}"));
         let counted: u64 = series.rsplit(' ').next().unwrap().parse().unwrap();
-        assert!(counted >= 5, "{series}");
+        assert_eq!(counted, 5, "{series}");
     }
 }

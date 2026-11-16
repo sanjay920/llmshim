@@ -1,7 +1,7 @@
 # 0016: OpenTelemetry traces
 
-Status: slices 1 to 3 implemented (the request span and the exporter); the
-attempt span remains. A contract note, written
+Status: slices 1 to 3 and 5 implemented (the request span, the exporter and the
+log writers' counters); the attempt span (slice 4) remains. A contract note, written
 before any code (README working rule 3).
 
 ## What an operator needs
