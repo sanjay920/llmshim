@@ -57,6 +57,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0021: The upstream HTTP client and listener limits from the file](0021-upstream-client-from-the-file.md)
 - [0022: Reloading providers, routes and rate limits](0022-reload-providers-routes-limits.md)
 - [0023: Native requests and answers that need no replay receipt](0023-receipt-free-native-requests.md)
+- [0024: The control plane](0024-control-plane.md)
 
 ## Roadmap
 
