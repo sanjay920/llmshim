@@ -23,9 +23,18 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: The tag must be this version
+      - name: The tag must be this version, on main
         run: |
+          # Anyone who can push a tag could otherwise publish any commit: the tagged
+          # commit must already be part of main's reviewed history.
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "the tagged commit is not on main"
+            exit 1
+          fi
           version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
           if [ "${GITHUB_REF_TYPE}" != "tag" ] || [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
             echo "tag ${GITHUB_REF_NAME} is not v${version}"
@@ -42,6 +51,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: A published version is never overwritten
+        run: |
+          if docker buildx imagetools inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "${IMAGE}:${VERSION} is already published; cut a new version instead"
+            exit 1
+          fi
 
       - name: Build and push
         id: build
@@ -69,6 +85,8 @@ jobs:
           format: spdx-json
           output-file: sbom.spdx.json
           upload-artifact: true
+          # Nothing is written to a GitHub release from here.
+          upload-release-assets: false
 
       - name: Attach the SBOM as a signed attestation
         run: |

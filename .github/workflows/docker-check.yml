@@ -39,9 +39,12 @@ jobs:
           docker logs "$id"
           docker rm -f "$id" >/dev/null || true
           exit 1
-      - name: The published feature set builds and boots
+      - name: The published feature set builds and prints its schema
         run: |
           # The release workflow (images.yml, note 0019) builds this feature set;
           # a release must not be the first time it meets the distroless runtime.
           docker build --build-arg FEATURES=serve-redis,serve-otel --tag llmshim-ci-serve .
-          docker run --rm llmshim-ci-serve serve --print-schema | head -c 200
+          # Captured, not piped: a pipe would report the exit status of the last
+          # command and hide a binary that dies at exec.
+          schema=$(docker run --rm llmshim-ci-serve serve --print-schema)
+          grep -q '"properties"' <<<"$schema"

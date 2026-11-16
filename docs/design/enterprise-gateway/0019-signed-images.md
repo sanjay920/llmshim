@@ -51,17 +51,28 @@ branch, a fork or another workflow does not verify.
 - **Only a release tag.** The workflow triggers on `v*.*.*` tags and on nothing
   else (a manual dispatch would sign with a branch identity, which the verification
   above would rightly refuse); it refuses a tag whose name is not
-  `v<Cargo.toml version>`, so an image cannot be published from a stale tag.
+  `v<Cargo.toml version>`, and a tag whose commit is not an ancestor of `main`. A
+  signature therefore says "this workflow ran on a commit in main's history at a
+  release tag", which is as strong as who may push tags to `main`'s history: the
+  right to push a release tag is part of the trust boundary, and a tag protection
+  ruleset restricting it is recommended (a repository setting, the owner's). A
+  prerelease tag such as `v0.32.0-rc1` matches the trigger and fails the version
+  check; prereleases are not published.
+- **A version is published once.** Before it builds, the job refuses a version whose
+  tag already exists in the registry, so a re-run cannot move a tag to a new digest.
 - **Least privilege.** The job has `contents: read`, `packages: write` (to push to
   GHCR with the run's own token) and `id-token: write` (for keyless signing), and
   nothing else. No long-lived registry credential exists.
-- **Verified before it counts.** After signing, the job runs the two `cosign verify`
-  commands above against the digest it just pushed, with the workflow's own
-  identity; a signature that does not verify fails the job.
+- **Verified, loudly.** After signing, the job runs the two `cosign verify` commands
+  above against the digest it just pushed, with the workflow's own identity; a
+  signature that does not verify fails the job. It does not retract the push (the
+  image is already in the registry), so a failed run leaves an unsigned tag for the
+  owner to delete and the version to be re-cut.
 - **The feature set builds on every pull request** that touches the Dockerfile, the
   manifests or this workflow (`docker-check.yml`): the image is built with the same
-  `FEATURES` and `serve --print-schema` is run inside it, so a release is not the
-  first time the published feature set meets the distroless runtime.
+  `FEATURES` and `serve --print-schema` is run inside it (its output is captured
+  and checked, so a binary that dies at start fails the step), so a release is not
+  the first time the published feature set meets the distroless runtime.
 - **Reproducibility is not claimed.** The build pins the toolchain image by tag;
   digest-pinned base images and a reproducible-build claim are separate work.
 - **Third-party actions are pinned by major tag**, as the rest of the repository's
