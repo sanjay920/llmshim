@@ -145,11 +145,7 @@ impl ChatGptAuth {
             }))
             .send()
             .await?;
-        let value = oauth_json(
-            response,
-            "token refresh failed; run `llmshim login chatgpt` if the session was revoked",
-        )
-        .await?;
+        let value = refresh_json(response).await?;
         let tokens = Tokens::from_response(value, Some(&old))?;
         self.save(&tokens, self.read_document()?)?;
         Ok(tokens)
@@ -260,11 +256,46 @@ impl ChatGptAuth {
     }
 }
 
+async fn refresh_json(response: reqwest::Response) -> Result<Value> {
+    let status = response.status().as_u16();
+    let sign_in = "authentication required. Run `llmshim login chatgpt`.";
+    if status == 400 {
+        // Inspect only known codes. OAuth descriptions can contain rotating credentials.
+        let value = oauth_body(response).await.unwrap_or(Value::Null);
+        let error = &value["error"];
+        let code = error.as_str().or_else(|| error["code"].as_str());
+        let message = if matches!(
+            code,
+            Some(
+                "invalid_grant"
+                    | "refresh_token_expired"
+                    | "refresh_token_reused"
+                    | "refresh_token_invalidated"
+            )
+        ) {
+            sign_in
+        } else {
+            "token refresh failed"
+        };
+        return Err(auth_error(status, message));
+    }
+    let message = match status {
+        401 => sign_in,
+        403 => "account access denied. Check your account's subscription and access.",
+        _ => "token refresh failed",
+    };
+    oauth_json(response, message).await
+}
+
 async fn oauth_json(response: reqwest::Response, message: &str) -> Result<Value> {
     if !response.status().is_success() {
         // OAuth bodies can echo credentials. Return only status + fixed context.
         return Err(auth_error(response.status().as_u16(), message));
     }
+    oauth_body(response).await
+}
+
+async fn oauth_body(response: reqwest::Response) -> Result<Value> {
     use futures::StreamExt;
     let mut chunks = response.bytes_stream();
     let mut bytes = Vec::new();

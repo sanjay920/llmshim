@@ -369,31 +369,127 @@ async fn refresh_without_rotation_preserves_refresh_token() {
 
 #[tokio::test]
 async fn revoked_refresh_returns_redacted_error_without_starting_login() {
-    let mut server = Server::new_async().await;
+    let sign_in = "ChatGPT: authentication required. Run `llmshim login chatgpt`.";
+    let generic = "ChatGPT: token refresh failed";
+    for (status, code, expected) in [
+        (400, "invalid_grant", sign_in),
+        (400, "refresh_token_expired", sign_in),
+        (400, "refresh_token_reused", sign_in),
+        (400, "refresh_token_invalidated", sign_in),
+        (401, "unknown-CANARY", sign_in),
+        (400, "invalid_request", generic),
+        (400, "unknown-CANARY", generic),
+        (429, "invalid_grant", generic),
+        (503, "refresh_token_expired", generic),
+        (
+            403,
+            "invalid_grant",
+            "ChatGPT: account access denied. Check your account's subscription and access.",
+        ),
+    ] {
+        for body in [
+            json!({"error": code, "error_description": "secret-CANARY"}),
+            json!({"error": {"code": code, "message": "secret-CANARY"}}),
+        ] {
+            let mut server = Server::new_async().await;
+            let (_dir, auth) = auth_fixture(token_record(true));
+            let auth = auth.with_auth_base(server.url());
+            let before = std::fs::read(auth.auth_path()).unwrap();
+            let refresh = server
+                .mock("POST", "/oauth/token")
+                .with_status(status)
+                .with_body(body.to_string())
+                .expect(1)
+                .create_async()
+                .await;
+            let login = server
+                .mock("POST", "/api/accounts/deviceauth/usercode")
+                .expect(0)
+                .create_async()
+                .await;
+            let error = ChatGpt::new(auth.clone())
+                .prepare_request("gpt-6-astra", &request())
+                .await
+                .err()
+                .unwrap();
+            match &error {
+                llmshim::error::ShimError::ProviderError {
+                    status: actual,
+                    body,
+                    retry_after,
+                } => {
+                    assert_eq!(usize::from(*actual), status);
+                    assert_eq!(body, expected, "status {status}, code {code}");
+                    assert_eq!(*retry_after, None);
+                }
+                other => panic!("unexpected refresh error: {other}"),
+            }
+            assert!(!error.to_string().contains("CANARY"));
+            assert_eq!(std::fs::read(auth.auth_path()).unwrap(), before);
+            refresh.assert_async().await;
+            login.assert_async().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_refresh_replies_preserve_status_and_original_credentials() {
+    for status in [400, 200] {
+        for body in [
+            "{broken-CANARY".to_string(),
+            "x".repeat(1024 * 1024 + 1),
+            format!("{}\"CANARY\"{}", "[".repeat(256), "]".repeat(256)),
+        ] {
+            let mut server = Server::new_async().await;
+            let (_dir, auth) = auth_fixture(token_record(true));
+            let auth = auth.with_auth_base(server.url());
+            let before = std::fs::read(auth.auth_path()).unwrap();
+            let refresh = server
+                .mock("POST", "/oauth/token")
+                .with_status(status)
+                .with_body(body)
+                .expect(1)
+                .create_async()
+                .await;
+            let error = ChatGpt::new(auth.clone())
+                .prepare_request("gpt-6-astra", &request())
+                .await
+                .err()
+                .unwrap();
+            match &error {
+                llmshim::error::ShimError::ProviderError {
+                    status: actual,
+                    body,
+                    ..
+                } => {
+                    assert_eq!(*actual, if status == 400 { 400 } else { 502 });
+                    assert!(!body.contains("authentication"));
+                }
+                other => panic!("unexpected refresh error: {other}"),
+            }
+            assert!(!error.to_string().contains("CANARY"));
+            assert_eq!(std::fs::read(auth.auth_path()).unwrap(), before);
+            refresh.assert_async().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn refresh_transport_failure_preserves_credentials_without_a_sign_in_diagnosis() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
     let (_dir, auth) = auth_fixture(token_record(true));
-    let auth = auth.with_auth_base(server.url());
+    let auth = auth.with_auth_base(format!("http://{address}"));
     let before = std::fs::read(auth.auth_path()).unwrap();
-    let refresh = server
-        .mock("POST", "/oauth/token")
-        .with_status(401)
-        .with_body("sensitive-refresh-token")
-        .create_async()
-        .await;
-    let login = server
-        .mock("POST", "/api/accounts/deviceauth/usercode")
-        .expect(0)
-        .create_async()
-        .await;
     let error = ChatGpt::new(auth.clone())
         .prepare_request("gpt-6-astra", &request())
         .await
         .err()
         .unwrap();
-    assert!(!error.to_string().contains("sensitive-refresh-token"));
-    assert!(error.to_string().contains("llmshim login chatgpt"));
+    assert!(matches!(error, llmshim::error::ShimError::Http(_)));
+    assert!(!error.to_string().contains("login chatgpt"));
     assert_eq!(std::fs::read(auth.auth_path()).unwrap(), before);
-    refresh.assert_async().await;
-    login.assert_async().await;
 }
 
 #[tokio::test]
