@@ -50,6 +50,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0014: What happens when a dependency fails](0014-failure-modes.md)
 - [0015: The operational endpoints are in the OpenAPI document](0015-operational-api.md)
 - [0016: OpenTelemetry traces](0016-opentelemetry.md)
+- [0017: Workload JWT authentication and IP allowlists](0017-workload-jwt-and-ip-allowlists.md)
 
 ## Roadmap
 
