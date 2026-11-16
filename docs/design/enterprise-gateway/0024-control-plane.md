@@ -10,10 +10,10 @@ audit export (their licensing is undecided, and all of them follow this).
 Today the file is the source of truth for who may call (`[[keys]]`, 0001, reloaded by
 0012), with what limits, and from where (0017). That is right for one team that owns
 its file. It does not serve an organization with many teams: someone must create a key
-for a team, rotate it, revoke it, set the team's budget and see what changed, without
-editing a file on every replica. The control plane is the place that state lives and
-changes. It is **not** in the request path, and the data plane never depends on it
-being up.
+for a team, rotate it, revoke it, set its limits and budget and see what changed,
+without editing a file on every replica. The control plane is the place that state
+lives and changes. It is **not** in the request path, and the data plane never depends
+on it being up.
 
 ## Decisions already taken (0013)
 
@@ -27,31 +27,49 @@ being up.
 Entities, each with a stable opaque id (`org_…`, `team_…`, `proj_…`, `key_…`) that never
 changes and is never reused. Names are labels and may change.
 
-- **Organization**: the root; owns teams and the signing keys of its snapshots.
-- **Team** and **project**: the grouping a budget or a limit attaches to. A project
-  belongs to one team. (Hierarchical budgets are a later note; this one only fixes that
-  every key belongs to exactly one project, so a budget has somewhere to attach.)
-- **Key**: a caller credential: `key_id`, project, a label, the **SHA-256 of the secret**
-  (the secret is shown once at creation and never stored), optional `expires_at`,
-  optional `allowed_cidrs` (0017), optional `jwt` binding (0017), limits (`rpm`, `tpm`,
-  `tier`), a state, and timestamps.
+- **Organization**: the root; owns teams.
+- **Team** and **project**: the grouping a limit or budget attaches to. A project belongs
+  to one team. Every key belongs to exactly one project. (Budgets above the key, and
+  hierarchies, are a later note; this one fixes only where they will attach.)
+- **Key**: a caller credential of one kind: a **secret** (its SHA-256 is stored; the secret
+  is shown once at creation and never stored), a **client certificate** identity
+  (`client_san`, 0011) or a **workload token** binding (`jwt`, 0017). It carries a label,
+  optional `expires_at`, `allowed_cidrs` (0017), `tier`, `rpm`, `tpm`, the budget fields a
+  `[[keys]]` entry has today (`budget_usd`, `budget_window_secs`, `budget_allow_unpriced`,
+  0010), a state and timestamps.
 - **Key states**: `active` → `revoked` (terminal) and `active` → `expired` (by time). A
   rotation creates a **second** key and revokes the first after an operator-chosen
-  overlap; there is no "replace in place", so an incident can name exactly which
-  credential did what. A revoked key's hash stays in the table so a snapshot can say it is
-  revoked, and a reused secret cannot be minted again.
-- **Change history**: every mutation appends one row (who, what, when, before and after
-  by id, never a secret). It exists so a snapshot's content can be explained. Exporting
-  it is the audit-export feature and is not part of this note.
+  overlap; there is no "replace in place", so an incident can name exactly which credential
+  did what. A revoked key's hash stays so a snapshot can say it is revoked and a reused
+  secret cannot be minted again.
+- **Change history**: every mutation appends one row (who, what, when, ids, never a
+  secret). It exists so a snapshot's content can be explained. Exporting it is the
+  audit-export feature and is not part of this note.
 
-Provider credentials (upstream API keys) are **not** control-plane data: they stay in
-the file or a secret store referenced from it (0001, 0022). A snapshot carries policy
-about callers, never a secret an upstream accepts.
+Provider credentials (upstream API keys) are **not** control-plane data: they stay in the
+file or a secret store referenced from it (0001, 0022). A snapshot carries policy about
+callers, never a secret an upstream accepts.
 
 ## The signed policy snapshot
 
-One JSON document, canonical (sorted keys, no insignificant whitespace, UTF-8), signed
-with **Ed25519** (`ring`, already a dependency for JWT, 0017):
+### Envelope (one file)
+
+```json
+{
+  "format": "llmshim-policy-snapshot/1",
+  "key_id": "ed25519:…",
+  "payload": "<base64 of the canonical payload bytes>",
+  "signature": "<base64 Ed25519 signature over exactly those bytes>"
+}
+```
+
+The payload is base64 so the signed bytes are exactly the bytes verified: no
+re-serialization step can change what was signed. An unknown `format`, a missing field, a
+`key_id` that is not in `verify_keys`, a bad signature and a malformed payload are each
+refused whole, by the rules of a rejected reload (0012: all-or-nothing, by path, no secret
+and no part of the document in the message).
+
+### Payload (canonical JSON: sorted keys, no insignificant whitespace, UTF-8)
 
 ```json
 {
@@ -60,76 +78,102 @@ with **Ed25519** (`ring`, already a dependency for JWT, 0017):
   "generation": 42,
   "issued_at": "2026-11-16T12:00:00Z",
   "tenants": [{"id": "team_…", "name": "platform"}],
-  "keys": [{"id": "key_…", "tenant": "team_…", "sha256": "…hex…", "state": "active",
-            "expires_at": null, "tier": 1, "rpm": 600, "tpm": 100000,
-            "allowed_cidrs": ["10.0.0.0/8"], "jwt": null}]
+  "keys": [{"id": "key_…", "name": "ci", "tenant": "team_…", "state": "active",
+            "sha256": "…hex…", "expires_at": null, "tier": 1, "rpm": 600, "tpm": 100000,
+            "budget_usd": 50.0, "budget_window_secs": 86400, "budget_allow_unpriced": false,
+            "allowed_cidrs": ["10.0.0.0/8"]}]
 }
 ```
 
-and a detached signature over those exact bytes, with the id of the signing key.
+(One credential kind per key: `sha256`, or `client_san`, or `jwt: {table, subject}`.)
 
-- **It is exactly what `[[keys]]` and `[[tenants]]` are today**, in a verifiable
-  envelope. The data plane builds the same `KeyStore`, `AllowTable` and tenant names from
-  it that it builds from the file, so everything downstream (admission, limits, access
-  and usage logs, 0009/0010/0012/0017) is unchanged. The snapshot is a **keys source**, not
-  a new authentication path.
-- **`generation` is monotonic.** A data plane never applies a snapshot whose generation
-  is not greater than the one in force (so a captured old snapshot cannot un-revoke a key),
-  and a replica that restarts reads the generation it last applied from its state
-  directory.
-- **Verification keys are configuration** (`[control_plane] verify_keys`, a list, so a
-  signing key rotates by adding the new public key first). An unsigned snapshot, a wrong
-  signature, an unknown key id, an unknown `version` and a malformed document are each
-  refused whole, with the previous snapshot still serving, by the same rules as a rejected
-  reload (0012: all-or-nothing, by path, no secret in the message).
-- **Revoked keys are in it** (state `revoked`) rather than absent, so the data plane can
-  say why a credential is refused in its log, and the document can be diffed.
+- **It is what `[[keys]]` is today, in a verifiable envelope.** There is no `[[tenants]]`
+  table today: a tenant is the string a key carries, and its name for the logs is that
+  string. In a snapshot the key's `tenant` is the **team id** (opaque, what the fleet and
+  the spend ledger key by) and the snapshot's `tenants` gives the name the logs print
+  (feeding `TenantNames`/`KeyNames`, 0010). `name` is the key's label, as today.
+- The data plane builds the same `KeyStore`, `AllowTable` and name tables from it that it
+  builds from the file, so admission, limits, budgets, the logs and 0012/0017 are
+  unchanged. **The snapshot is a keys source, not a new authentication path.**
+- **Budgets stay per credential**, as today (distinct keys of one tenant have separate
+  allowances, `gateway/auth.rs`); a budget set on a team or project is a later note.
+- **The same rules apply to snapshot keys as to file keys**, by the same functions: a
+  caller digest must not equal an upstream secret's digest; `allowed_cidrs` need
+  `server.trusted_proxies` where a file key would; a `jwt` binding needs the matching
+  `[[auth.jwt]]` issuer; a snapshot that names a table the file lacks is refused whole,
+  by path. Otherwise the snapshot would be a way around `--check`.
+- **`expires_at` is enforced by the data plane at request time, against its own clock**
+  (the key store learns an expiry in slice 2; the file's `[[keys]]` gains the same optional
+  field). Expiry therefore does not depend on a snapshot being regenerated, and a skewed
+  clock moves expiry by the skew, which the note states rather than hides.
+- **Revoked keys are in the snapshot** (state `revoked`) rather than absent, so the log can
+  say why a credential is refused and the document can be diffed.
+
+### Order, rollback and keys
+
+- **`generation` decides order, not time.** A data plane never applies a snapshot whose
+  generation is not greater than the one in force, so a captured old snapshot cannot
+  un-revoke a key. `issued_at` is informational.
+- **A floor survives restart.** The applied generation is written to a file under
+  `[state] policy_dir` (default beside the receipts directory) and read at start; if the
+  directory cannot be written the replica does not start (exit 1, naming the setting),
+  because a replica that cannot remember its floor can be rolled back. A deployment with
+  a read-only or ephemeral volume sets `policy_dir` to a writable one.
+- **First boot has no floor.** A fresh replica (or one whose file is lost) would accept any
+  validly signed snapshot, including an old one. The limit is stated, and bounded by
+  `[control_plane] min_generation` (default 0), which an operator raises as a floor in the
+  file that bootstraps the replica. The status reports the generation in force and the
+  signing key id, so skew across a fleet is visible, not silent.
+- **Generation is global across signing keys.** A new signing key continues the sequence.
+  `verify_keys` is a list so a key rotates by adding the new public key first. A
+  compromised key is removed from the list; a snapshot it signed that is already applied
+  stays in force until a higher generation signed by a trusted key replaces it, and the
+  status says `signer_untrusted: true` (an alert) while that is the case.
+- **Key encodings.** `verify_keys` entries are `ed25519:<base64 of the 32-byte public
+  key>`; a signing key is a file holding the base64 of its 32-byte seed. Verification is in
+  the data plane (`ring`, as for JWT, 0017). Signing is needed in the root crate only for
+  the `snapshot sign` subcommand (slice 2), and in the control crate (slice 3), which takes
+  its own `ring` dependency.
 
 ## How the data plane gets it
 
 `[control_plane]` is a new table, **mutually exclusive with `[[keys]]`** (a file with both
-is refused: two sources of truth for who may call is a defect, not a feature).
+is refused: two sources of truth for who may call is a defect, not a feature; switching
+between them needs a restart).
 
 ```toml
 [control_plane]
-verify_keys = ["ed25519:…"]        # public keys; any may have signed
-snapshot_file = "/var/lib/llmshim/snapshot.json"   # slice 2: a watched file
+verify_keys = ["ed25519:…"]                         # reloadable with the snapshot
+snapshot_file = "/var/lib/llmshim/snapshot.json"    # slice 2: a watched file
+min_generation = 0
+max_age_secs = 86400            # measured from when it was applied; alert, never refuse
+refuse_when_stale = false
 # source = { url = "https://cp.internal/v1/snapshot", token = { file = "…" } }  # slice 5
-max_age_secs = 86400               # report (alert), never refuse, by default
 ```
 
 - **Slice 2 is a file**: the control plane (or an operator, or a pipeline) writes the
-  signed snapshot to a path and the data plane watches it with the machinery 0012 already
-  has (two-poll debounce, `SIGHUP`, all-or-nothing, a status on `/v1/serve/config`). No
-  network, no database: the data-plane half ships and is testable before a control plane
-  exists.
-- **Slice 5 is a pull**: `GET /v1/snapshot` with `If-None-Match: <generation>`; the data
-  plane polls (default 15 s), verifies, and applies through the same code. It is a pull
-  so that a control plane that is down costs only freshness.
-- **Stale is served, and said.** With no new snapshot, the last good one keeps serving
-  indefinitely; `max_age_secs` only turns the status field `stale: true` and a metric on.
-  The 0013 rule (identity and money fail closed) holds because a caller is still
-  identified from the snapshot in force. An operator who wants a hard stop sets
-  `max_age_secs` with `refuse_when_stale = true` (off by default), which refuses new
-  requests with 503 once the snapshot is older than that.
-- **Revocation latency is the snapshot interval** (file watch or pull), stated, not hidden.
-  A control plane that must revoke faster can also write the file (a signal reloads at once).
-
-## Spend allowance during a Redis outage
-
-With a fleet (0006) a Redis outage today refuses every request (0014): safe, not
-available. A deployment may prefer to keep serving a bounded amount. The design:
-
-- While Redis is healthy, each replica holds a **lease** of each tenant's budget (a
-  slice of the window's remaining allowance, refreshed in the existing Redis spend
-  window). During an outage a replica admits against its lease **only**, and refuses
-  when it is spent. Overspend is therefore bounded by the sum of outstanding leases, a number
-  the operator sets (`[fleet] outage_allowance_percent`, default 0 = today's behaviour).
-- When Redis returns, spent leases are reconciled into the shared window and unspent
-  ones are returned. A request admitted on a lease is recorded as such in the usage log.
-- It is off by default, applies only to budgeted tenants, and needs its own measured test
-  (cut Redis with the TCP proxy of `integration_serve_outage`, spend past the lease, expect
-  refusals at the bound). It is slice 6 and independent of the snapshot work.
+  signed snapshot to the path and the data plane watches it. No network and no database,
+  so the data-plane half ships and is testable before a control plane exists. The reload
+  is a second source in the 0012 machinery (two-poll debounce, `SIGHUP`, all-or-nothing, the
+  status on `/v1/serve/config`); `verify_keys` joins what a reload may change, and the rest
+  of `[control_plane]` stays fixed at start, refused by path.
+- **Slice 5 is a pull** (`GET /v1/snapshot`, `If-None-Match: <generation>`, polled, default
+  15 s), verified and applied through the same code. It is a pull so that a control plane
+  that is down costs only freshness.
+- **Stale is served, and said: a named exception to 0013.** 0013 says identity and money
+  fail closed on the inference path; a caller is still identified from the snapshot in
+  force, and "a change that cannot be applied leaves the running one in force and says so"
+  (0012) is the same rule, but indefinite serving of a snapshot that may omit a revocation
+  is an identity decision and is recorded as such. `max_age_secs` turns the status field
+  `stale: true` and a metric on. `refuse_when_stale = true` (off by default) refuses new
+  inference requests with 503 once the snapshot is older than that; `/health`, `/ready`
+  and the admin listener keep answering.
+- **Revocation latency** is the poll interval or the file's write, per replica. A fleet has
+  one file per replica (a shared volume, or whatever writes each copy) and a pull converges
+  fleet-wide only eventually: the generation in each replica's status shows where it is.
+- **The control plane is a dependency with failure rows.** Slice 2 adds the rows to 0014
+  and a process test for each (a snapshot that does not verify keeps the previous one; a
+  stale snapshot is reported and, with `refuse_when_stale`, refused).
 
 ## The control plane's own API
 
@@ -137,21 +181,30 @@ A separate binary and crate (`llmshim-control`, working rule 2: a published crat
 depend on an unpublished one), added only when slice 3 starts. HTTP+JSON, an OpenAPI
 document, bearer-token callers (identity for operators beyond a token is SSO: not started).
 Operations: create/list/get org, team, project; create key (returns the secret once);
-revoke key; rotate key (creates the successor); set limits and expiry; read the change
-history; `POST /v1/snapshots` (build, sign and store the next generation) and
-`GET /v1/snapshot` (slice 5). The signing key is a file or a secret-manager reference
-(never in the database).
+revoke key; rotate key (creates the successor); set limits, budget and expiry; read the
+change history; `POST /v1/snapshots` (build, sign and store the next generation) and
+`GET /v1/snapshot` (slice 5). The signing key is a file or a secret-manager reference,
+never in the database.
 
 ## What must stay true
 
 - A data plane with no control plane behaves exactly as today. Default, proxy, gateway
   and gateway-redis builds do not change; the snapshot source is `serve` only.
-- No secret in a snapshot, the change history, a log line or a status.
+- No secret in a snapshot, the change history, a log line or a status; a refused snapshot
+  reports a reason and a path, never its content.
 - A snapshot that does not verify, or does not advance, never changes what is serving.
 - The control plane's database holds hashes of caller keys, never the keys.
 
 ## Not decided here
 
+- **Bounded admission during a Redis outage** (a local spend allowance), which the
+  roadmap pairs with this. It is **not** designed here: a fleet request cannot be admitted
+  without the Redis queue (0014), so it is a second admission path with its own rate and
+  concurrency rules, not only a spend question; the bound it can offer is on admitted
+  reservations, not spend (unpriced and underestimated reservations settle later, 0010);
+  a replica that dies strands its lease; leases cross window boundaries; and a usage-log
+  field for lease-admitted requests is a 0010 contract change. It needs its own note,
+  after the snapshot work, with 0006 and 0014.
 - Hierarchical budgets, model allowlists, tags, alerts and cost exports (the next roadmap
   item; they attach to the project and team of this note and to the snapshot as new
   versioned fields).
@@ -162,13 +215,15 @@ history; `POST /v1/snapshots` (build, sign and store the next generation) and
 ## Slices
 
 1. This note.
-2. The snapshot format, canonical encoding, Ed25519 signing and verification, and
-   `[control_plane] snapshot_file` as a keys source reloaded by the 0012 machinery, with
-   a small `snapshot` subcommand set (`sign`, `verify`) so a pipeline can produce one
-   before a control plane exists. Tests: signature, tamper, wrong key, unknown version,
-   non-advancing generation, mutual exclusion with `[[keys]]`, stale status, revocation
-   effect on the next request.
+2. The snapshot envelope and canonical payload, Ed25519 verification and the `snapshot
+   sign`/`verify` subcommands, `[control_plane]` with `snapshot_file` as a keys source in
+   the 0012 machinery, `expires_at` in the key store (and `[[keys]]`), the persisted
+   floor, the 0014 rows, and the regenerated JSON Schema (`tests/unit_serve_cli.rs`
+   compares it). Tests: signature, tamper, wrong key, unknown format/version,
+   non-advancing generation, the floor across restart, `min_generation`, mutual exclusion
+   with `[[keys]]`, the `--check` rules on snapshot keys, stale status and refusal,
+   revocation and expiry effect on the next request, a removed signer.
 3. The `llmshim-control` crate: SQLite store, the model above, key lifecycle API.
 4. Postgres.
-5. The pull delivery and the data plane's poller.
-6. The outage spend allowance.
+5. The pull delivery and the data plane's poller (after 3: the endpoint is its first
+   network surface).
