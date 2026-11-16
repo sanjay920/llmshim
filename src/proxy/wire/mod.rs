@@ -2078,6 +2078,12 @@ mod async_receipt_tests {
         let store = Receipts::tripwire();
         assert!(store.put("s", "call", &key, &json!({})).is_err());
         assert!(store.tripwire_hit(), "the write was noticed");
+        let store = Receipts::tripwire();
+        let mut budget = receipts::RestorationBudget::new(receipts::RestorationLimits::default());
+        assert!(store
+            .get_bounded("s", "reasoning", &key, &mut budget)
+            .is_err());
+        assert!(store.tripwire_hit(), "the bounded read was noticed");
     }
 
     #[tokio::test]
@@ -2193,6 +2199,49 @@ mod async_receipt_tests {
             "a tool-call answer is stored, so it needs a slot"
         );
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn an_owned_call_id_without_a_receipt_still_fails_closed_through_the_free_first_path() {
+        // The inline attempt reaches the store (the tripwire), the real run finds no
+        // receipt and the request errors: it is never served as if the id were a
+        // legacy one. A free-first path that treated the tripwire's refusal as
+        // "nothing to restore" would answer 200 here.
+        let directory = tempfile::tempdir().unwrap();
+        let store = DefaultReceiptStore::new(Arc::new(Receipts::new(directory.path().to_owned())));
+        let application = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|| async { Json(json!({"id": "i", "model": "m", "message": {"role": "assistant", "content": "x"}, "finish_reason": "stop", "usage": {}})) }),
+            )
+            .layer(axum::middleware::from_fn(translate))
+            .layer(axum::middleware::from_fn(bound_inference_request_json))
+            .layer(axum::middleware::from_fn_with_state(
+                store,
+                install_default_receipt_store,
+            ));
+        let status = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "local/test", "messages": [
+                            {"role": "user", "content": "hi"},
+                            {"role": "assistant", "content": null, "tool_calls": [{
+                                "id": "call_ls_never_issued", "type": "function",
+                                "function": {"name": "read", "arguments": "{}"}}]},
+                            {"role": "tool", "tool_call_id": "call_ls_never_issued", "content": "ok"}
+                        ]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_client_error(), "{status}");
     }
 
     #[tokio::test]

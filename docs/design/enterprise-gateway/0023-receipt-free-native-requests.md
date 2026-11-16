@@ -114,6 +114,10 @@ keys to keep in step with the conversion.
   the executor. The tripwire never locks, so it is not needed inline. **Invariant:**
   a real store is never used inline, because its lock acquisition would fall back to
   a blocking `lock_exclusive` on an async worker.
+- **A store that cannot be used (unwritable, corrupt) no longer fails a request that needs
+  no receipt**; it surfaces only for a request or answer that does (for a tool-call or
+  reasoning answer that is at egress, after the provider has been billed, as it already
+  was for those). An invalid request under executor saturation now gets its 400, not a 503.
 - **A receipt-free request no longer creates the store directory or its lock file**
   (`get` created them); a test asserting that the root exists after any request
   changes.
@@ -129,9 +133,12 @@ keys to keep in step with the conversion.
   reasoning handle, and an answer with a tool call or reasoning block still go
   through the executor, are refused when it is saturated, and produce the same
   bytes as before (a corpus replayed both ways).
-- Mutation checks: a tripwire that returns `Ok(None)` must fail **both** the "tool
-  result with an owned id still errors" test and the "reasoning handle is not
-  silently dropped" test.
+- Mutation checks: `run_free_first` that does not read the tripwire's flag must fail
+  the executor tests and `unit_wire` (done: 6 lib tests and `unit_wire` fail); an owned
+  call id without a receipt still fails closed through the free-first path (a wire
+  test). The flag, not the refusal's error text or value, is what forces the rerun, so
+  even a tripwire that answered `Ok(None)` could not produce a success; that is why it
+  must never do so and why the flag is tested, not the value.
 - A conversion that panics returns the executor's fixed failure, inline too.
 - The benchmark is re-run (0018's method), recording the first-turn case it sends
   and, new, a multi-turn case so the gain is not overstated.
