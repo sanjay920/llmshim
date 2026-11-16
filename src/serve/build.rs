@@ -269,7 +269,7 @@ pub async fn build_app(
     // Opened with the access log, after the configuration is accepted. Tenants
     // are named from this configuration, because the policy scope that crosses
     // Redis in a fleet carries only a hash of the tenant.
-    let usage = match config
+    let usage_log = match config
         .logging
         .usage_log
         .as_deref()
@@ -277,16 +277,7 @@ pub async fn build_app(
     {
         Some(Ok(log)) => {
             logs.push(log.clone());
-            // An open server (`allow_unauthenticated`) attributes every request to
-            // the tenant "anonymous", which no key names.
-            if !keystore.is_enforced() {
-                tenants.add(["anonymous".to_owned()]);
-            }
-            Some(crate::gateway::usage::UsageSetup {
-                sink: Arc::new(UsageLog(log)),
-                tenants: tenants.clone(),
-                keys: key_names.clone(),
-            })
+            Some(log)
         }
         Some(Err(message)) => {
             return Err(vec![Issue {
@@ -295,6 +286,28 @@ pub async fn build_app(
             }]);
         }
         None => None,
+    };
+    // Attempt spans ride the usage recorder, so it exists when either is wanted.
+    let usage = if usage_log.is_some() || telemetry.is_some() {
+        // An open server (`allow_unauthenticated`) attributes every request to
+        // the tenant "anonymous", which no key names.
+        if !keystore.is_enforced() {
+            tenants.add(["anonymous".to_owned()]);
+        }
+        let sink: Arc<dyn crate::gateway::usage::UsageSink> = match usage_log {
+            Some(log) => Arc::new(UsageLog(log)),
+            None => Arc::new(NoUsageLog),
+        };
+        Some(crate::gateway::usage::UsageSetup {
+            sink,
+            tenants: tenants.clone(),
+            keys: key_names.clone(),
+            spans: telemetry
+                .clone()
+                .map(|t| t as Arc<dyn crate::gateway::usage::AttemptSpans>),
+        })
+    } else {
+        None
     };
 
     let mut gateway = GatewayConfig::default();
@@ -663,6 +676,13 @@ async fn fleet_state(
 }
 
 /// Writes each usage record as a JSON line.
+/// Attempt spans without a usage log: records are built, and go nowhere.
+struct NoUsageLog;
+
+impl crate::gateway::usage::UsageSink for NoUsageLog {
+    fn record(&self, _record: &crate::gateway::usage::UsageRecord) {}
+}
+
 struct UsageLog(super::jsonl::JsonLines);
 
 impl crate::gateway::usage::UsageSink for UsageLog {

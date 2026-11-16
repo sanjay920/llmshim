@@ -78,9 +78,10 @@ Phase 0: a production server mode
 - [ ] JWT/OIDC workload identity; optional client certificates; revocation
 - [x] Access log with tenant attribution and credential fingerprints (0009)
 - [x] Token and cost attribution per tenant and attempt (0010)
-- [ ] OpenTelemetry traces (design note 0016; metrics stay on `/metrics`): the
-      request span and the exporter are done (`serve-otel`), as are the log
-      writers' counters in `/metrics`; the attempt span remains
+- [x] OpenTelemetry traces (design note 0016; metrics stay on `/metrics`): the
+      request span, the attempt span and the exporter (`serve-otel`), and the log
+      writers' counters in `/metrics`; linking a fleet attempt to a request on
+      another replica is a later slice
 - [x] Helm chart, validated by rendering and `serve --check` (0008)
 - [ ] Published, signed images and an SBOM
 - [x] The failure-mode table (0014), with outage-survival tests for losing Redis
@@ -93,9 +94,8 @@ Phase 0: a production server mode
       ignored without a server (`ci.yml`; 0013)
 - [x] The operational endpoints in the OpenAPI document, with a conformance test
       (0015)
-- [ ] A request id unique across instances, with the tenant and key name joined
-      across the access log, the usage records and the trace (0013). The log and
-      the records are done; the trace joins with OpenTelemetry.
+- [x] A request id unique across instances, with the tenant and key name joined
+      across the access log, the usage records and the trace (0013)
 - [ ] The release gate builds and tests `serve` and waits for a green `ci.yml`
       (0013)
 

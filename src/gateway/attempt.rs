@@ -4539,6 +4539,7 @@ mod usage_records {
                 "known-credential".to_string(),
                 "checkout".to_string(),
             )]),
+            spans: None,
         });
         (coordinator, collected)
     }

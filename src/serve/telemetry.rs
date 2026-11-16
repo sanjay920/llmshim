@@ -11,6 +11,7 @@
 
 use super::config::Telemetry as TelemetryConfig;
 use super::config::{read_secret, Issue};
+use crate::gateway::usage::{AttemptBegun, AttemptSpan, AttemptSpans, UsageRecord};
 use axum::http::HeaderMap;
 use std::sync::Arc;
 
@@ -76,12 +77,26 @@ mod stub {
     impl RequestSpan {
         pub fn end(self, _status: Option<u16>) {}
     }
+
+    struct NoAttemptSpan;
+
+    impl AttemptSpans for Telemetry {
+        fn start(&self, _begun: &AttemptBegun<'_>) -> Box<dyn AttemptSpan> {
+            Box::new(NoAttemptSpan)
+        }
+    }
+
+    impl AttemptSpan for NoAttemptSpan {
+        fn end(self: Box<Self>, _record: &UsageRecord) {}
+    }
 }
 
 #[cfg(feature = "serve-otel")]
 mod real {
     use super::*;
-    use opentelemetry::trace::{Span as _, SpanKind, Status, Tracer as _, TracerProvider as _};
+    use opentelemetry::trace::{
+        Span as _, SpanKind, Status, TraceContextExt as _, Tracer as _, TracerProvider as _,
+    };
     use opentelemetry::{Context, KeyValue};
     use opentelemetry_sdk::propagation::TraceContextPropagator;
     use opentelemetry_sdk::trace::{
@@ -106,12 +121,133 @@ mod real {
     pub const SPANS_DROPPED: &str = "llmshim_telemetry_spans_dropped_total";
     pub const EXPORT_FAILURES: &str = "llmshim_telemetry_export_failures_total";
 
+    /// Live request contexts an attempt may still be parented to.
+    const REGISTRY: usize = 8192;
+    /// How long the context of a request that has had no attempt yet stays after
+    /// its span ended: a streamed answer may be dispatched after the response
+    /// head went out. A request that has had attempts is dropped as soon as the
+    /// last one ends.
+    const LINGER: Duration = Duration::from_secs(60);
+
     pub struct Telemetry {
         tracer: SdkTracer,
         provider: SdkTracerProvider,
+        requests: Arc<Requests>,
     }
 
-    pub struct RequestSpan(SdkSpan);
+    /// The span contexts of requests in flight, by request id, so an attempt,
+    /// which the gateway knows only by that id, joins its request's trace.
+    /// Only authenticated callers' requests are registered (an unauthenticated
+    /// caller chooses its id and must not be able to take another's), the first
+    /// registration of an id wins, and the table is bounded: when full, a new
+    /// request is not registered and its attempts start their own traces.
+    #[derive(Default)]
+    struct Requests(std::sync::Mutex<Registry>);
+
+    #[derive(Default)]
+    struct Registry {
+        map: std::collections::HashMap<String, Entry>,
+        /// Ended requests that had no attempt, oldest first, with the entry's
+        /// generation so a reused id is not removed by a stale item.
+        lingering: std::collections::VecDeque<(std::time::Instant, String, u64)>,
+        generation: u64,
+    }
+
+    struct Entry {
+        context: opentelemetry::trace::SpanContext,
+        generation: u64,
+        ended: bool,
+        open: usize,
+        seen: bool,
+    }
+
+    impl Registry {
+        fn prune(&mut self) {
+            while let Some((at, _, _)) = self.lingering.front() {
+                if at.elapsed() < LINGER {
+                    break;
+                }
+                let (_, id, generation) = self.lingering.pop_front().expect("front exists");
+                if self
+                    .map
+                    .get(&id)
+                    .is_some_and(|e| e.generation == generation && e.ended && e.open == 0)
+                {
+                    self.map.remove(&id);
+                }
+            }
+        }
+    }
+
+    impl Requests {
+        /// Whether this request now owns the id's entry.
+        fn register(&self, id: &str, context: opentelemetry::trace::SpanContext) -> bool {
+            let Ok(mut reg) = self.0.lock() else {
+                return false;
+            };
+            reg.prune();
+            if reg.map.len() >= REGISTRY || reg.map.contains_key(id) {
+                return false;
+            }
+            reg.generation += 1;
+            let generation = reg.generation;
+            reg.map.insert(
+                id.to_owned(),
+                Entry {
+                    context,
+                    generation,
+                    ended: false,
+                    open: 0,
+                    seen: false,
+                },
+            );
+            true
+        }
+
+        fn ended(&self, id: &str) {
+            let Ok(mut reg) = self.0.lock() else { return };
+            let Some(entry) = reg.map.get_mut(id) else {
+                return;
+            };
+            entry.ended = true;
+            let (open, seen, generation) = (entry.open, entry.seen, entry.generation);
+            if open == 0 {
+                if seen {
+                    reg.map.remove(id);
+                } else {
+                    reg.lingering
+                        .push_back((std::time::Instant::now(), id.to_owned(), generation));
+                }
+            }
+        }
+
+        /// The request's context, counting an attempt that now holds it.
+        fn begin_attempt(&self, id: &str) -> Option<opentelemetry::trace::SpanContext> {
+            let mut reg = self.0.lock().ok()?;
+            let entry = reg.map.get_mut(id)?;
+            entry.open += 1;
+            entry.seen = true;
+            Some(entry.context.clone())
+        }
+
+        fn end_attempt(&self, id: &str) {
+            let Ok(mut reg) = self.0.lock() else { return };
+            let Some(entry) = reg.map.get_mut(id) else {
+                return;
+            };
+            entry.open = entry.open.saturating_sub(1);
+            if entry.ended && entry.open == 0 {
+                reg.map.remove(id);
+            }
+        }
+    }
+
+    pub struct RequestSpan {
+        span: SdkSpan,
+        /// The id this span owns in the registry, if it does.
+        id: Option<String>,
+        requests: Arc<Requests>,
+    }
 
     impl Telemetry {
         pub(super) fn start(
@@ -166,7 +302,11 @@ mod real {
                 ))))
                 .build();
             let tracer = provider.tracer("llmshim");
-            Ok(Some(Self { tracer, provider }))
+            Ok(Some(Self {
+                tracer,
+                provider,
+                requests: Arc::default(),
+            }))
         }
 
         /// Start the span of one request. `inbound` is the request's headers when
@@ -204,7 +344,15 @@ mod real {
                 .with_kind(SpanKind::Server)
                 .with_attributes(attributes)
                 .start_with_context(&self.tracer, &parent);
-            RequestSpan(span)
+            let registered = inbound.is_some()
+                && self
+                    .requests
+                    .register(request_id, span.span_context().clone());
+            RequestSpan {
+                span,
+                id: registered.then(|| request_id.to_owned()),
+                requests: self.requests.clone(),
+            }
         }
 
         /// Send what is queued and stop the worker, within a bound. Call once,
@@ -220,15 +368,107 @@ mod real {
         pub fn end(mut self, status: Option<u16>) {
             match status {
                 Some(code) => {
-                    self.0
+                    self.span
                         .set_attribute(KeyValue::new("http.response.status_code", i64::from(code)));
                     if code >= 500 {
-                        self.0.set_status(Status::error(format!("HTTP {code}")));
+                        self.span.set_status(Status::error(format!("HTTP {code}")));
                     }
                 }
-                None => self.0.set_status(Status::error("abandoned")),
+                None => self.span.set_status(Status::error("abandoned")),
             }
-            self.0.end();
+            self.span.end();
+            if let Some(id) = &self.id {
+                self.requests.ended(id);
+            }
+        }
+    }
+
+    /// One `llmshim.attempt` client span per admitted provider attempt, a child
+    /// of its request's span when this replica holds it.
+    struct Attempt {
+        span: SdkSpan,
+        /// The request whose registry entry this attempt holds open.
+        held: Option<(String, Arc<Requests>)>,
+    }
+
+    impl Drop for Attempt {
+        fn drop(&mut self) {
+            if let Some((id, requests)) = self.held.take() {
+                requests.end_attempt(&id);
+            }
+        }
+    }
+
+    impl AttemptSpans for Telemetry {
+        fn start(&self, begun: &AttemptBegun<'_>) -> Box<dyn AttemptSpan> {
+            let linked = begun
+                .request_id
+                .and_then(|id| self.requests.begin_attempt(id).map(|sc| (id, sc)));
+            let held = linked
+                .as_ref()
+                .map(|(id, _)| ((*id).to_owned(), self.requests.clone()));
+            let parent = linked.map_or_else(Context::new, |(_, sc)| {
+                Context::new().with_remote_span_context(sc)
+            });
+            let mut attributes = vec![
+                KeyValue::new("llmshim.provider", bounded_text(begun.provider)),
+                KeyValue::new("llmshim.model", bounded_text(begun.model)),
+                KeyValue::new("llmshim.attempt.kind", begun.kind),
+            ];
+            if let Some(id) = begun.request_id {
+                attributes.push(KeyValue::new("llmshim.request_id", id.to_owned()));
+            }
+            let span = self
+                .tracer
+                .span_builder("llmshim.attempt")
+                .with_kind(SpanKind::Client)
+                .with_attributes(attributes)
+                .start_with_context(&self.tracer, &parent);
+            Box::new(Attempt { span, held })
+        }
+    }
+
+    impl AttemptSpan for Attempt {
+        fn end(mut self: Box<Self>, record: &UsageRecord) {
+            let span = &mut self.span;
+            span.set_attribute(KeyValue::new("llmshim.attempt.outcome", record.outcome));
+            if let Some(status) = record.http_status {
+                span.set_attribute(KeyValue::new(
+                    "llmshim.upstream.status_code",
+                    i64::from(status),
+                ));
+            }
+            let count = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+            if record.usage_reported {
+                span.set_attribute(KeyValue::new(
+                    "llmshim.usage.input_tokens",
+                    count(record.input_tokens),
+                ));
+                span.set_attribute(KeyValue::new(
+                    "llmshim.usage.output_tokens",
+                    count(record.output_tokens),
+                ));
+                if let Some(n) = record.reasoning_tokens {
+                    span.set_attribute(KeyValue::new("llmshim.usage.reasoning_tokens", count(n)));
+                }
+                span.set_attribute(KeyValue::new(
+                    "llmshim.usage.cache_read_tokens",
+                    count(record.cache_read_tokens),
+                ));
+                span.set_attribute(KeyValue::new(
+                    "llmshim.usage.cache_write_tokens",
+                    count(record.cache_write_tokens),
+                ));
+            }
+            // Unknown is absent, never zero.
+            if let (Some(usd), Some(source)) = (record.cost_usd, &record.cost_source) {
+                span.set_attribute(KeyValue::new("llmshim.cost_usd", usd));
+                span.set_attribute(KeyValue::new("llmshim.cost_source", source.clone()));
+            }
+            if record.outcome != "completed" {
+                span.set_status(Status::error(record.outcome));
+            }
+            span.end();
         }
     }
 
@@ -457,6 +697,66 @@ mod real {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn context(span: u64) -> opentelemetry::trace::SpanContext {
+            use opentelemetry::trace::{SpanId, TraceFlags, TraceId, TraceState};
+            opentelemetry::trace::SpanContext::new(
+                TraceId::from(1u128),
+                SpanId::from(span),
+                TraceFlags::SAMPLED,
+                false,
+                TraceState::default(),
+            )
+        }
+
+        #[test]
+        fn the_first_registration_of_an_id_wins_and_a_loser_cannot_end_it() {
+            let requests = Requests::default();
+            assert!(requests.register("a", context(1)));
+            assert!(
+                !requests.register("a", context(2)),
+                "a duplicate is refused"
+            );
+            let held = requests.begin_attempt("a").unwrap();
+            assert_eq!(held.span_id(), context(1).span_id());
+        }
+
+        #[test]
+        fn an_entry_goes_when_its_last_attempt_ends_after_the_request() {
+            let requests = Requests::default();
+            requests.register("a", context(1));
+            requests.begin_attempt("a").unwrap();
+            requests.begin_attempt("a").unwrap();
+            requests.ended("a");
+            requests.end_attempt("a");
+            assert!(requests.0.lock().unwrap().map.contains_key("a"));
+            requests.end_attempt("a");
+            assert!(requests.0.lock().unwrap().map.is_empty());
+        }
+
+        #[test]
+        fn a_request_that_had_attempts_leaves_when_it_ends_and_one_without_waits() {
+            let requests = Requests::default();
+            requests.register("served", context(1));
+            requests.begin_attempt("served").unwrap();
+            requests.end_attempt("served");
+            requests.ended("served");
+            requests.register("refused", context(2));
+            requests.ended("refused");
+            let reg = requests.0.lock().unwrap();
+            assert!(!reg.map.contains_key("served"));
+            assert!(reg.map.contains_key("refused"), "kept for a late stream");
+            assert_eq!(reg.lingering.len(), 1);
+        }
+
+        #[test]
+        fn the_registry_is_bounded() {
+            let requests = Requests::default();
+            for n in 0..REGISTRY {
+                assert!(requests.register(&format!("r{n}"), context(1)));
+            }
+            assert!(!requests.register("one-more", context(1)));
+        }
         /// A collector that accepts connections and never answers.
         fn stalled_collector() -> String {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
