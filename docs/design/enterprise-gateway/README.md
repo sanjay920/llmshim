@@ -94,7 +94,7 @@ Phase 0: a production server mode
       is what remains
 - [x] Reproducible benchmark (0018). It found two limits that are open items:
       the upstream connection pool (4 idle per host, shared client) and the
-      replay-receipt executor (twelve operations); neither is changed yet
+      replay-receipt executor (8 ingress and 4 egress slots); neither is changed yet
 - [x] Configuration-contract tightenings, a structure-only `--check` and a
       checked-in JSON Schema (see "Review follow-ups"; 0013)
 - [x] Pull-request CI for every build, including the Redis-backed tests that are

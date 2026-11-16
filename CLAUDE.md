@@ -726,8 +726,8 @@ same internal header as a client certificate. `cargo run --release --features se
 --example serve_bench` (note 0018) measures added latency, throughput and memory of a
 real `serve` process against a mock upstream; its first run found that the shared client
 keeps only 4 idle upstream connections per host and that the replay-receipt executor
-admits twelve operations, so throughput measured above one connection is not yet the
-gateway's own. With `--features serve-otel` a
+refuses a ninth ingress or fifth egress operation at once, so throughput measured
+above one connection is not yet the gateway's own. With `--features serve-otel` a
 `[telemetry]` table exports one request span per request, and one child `llmshim.attempt` span per
 admitted provider attempt (driven by the usage recorder, joined by request id
 through a bounded registry that outlives a streamed response), over OTLP/HTTP
