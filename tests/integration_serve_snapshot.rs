@@ -732,13 +732,19 @@ async fn a_key_stops_working_at_its_expiry_without_a_reload_and_a_new_snapshot_c
     let (upstream, _mock) = mock(1).await;
     let plane = Plane::new("snapshot-expiry");
     let mut soon = key("alpha", ALPHA, "active");
-    soon["expires_at"] = json!(in_secs(4));
+    soon["expires_at"] = json!(in_secs(10));
     plane.write(&payload(1, vec![soon, key("bravo", BRAVO, "active")]));
     let server = start(&plane.config(&upstream.url(), ""), "snapshot-expiry", &[]);
     assert_eq!(status_of(&server, ALPHA).await, 200, "before it expires");
-    tokio::time::sleep(Duration::from_secs(6)).await;
-    // No reload happened: the data plane's own clock decided.
-    assert_eq!(status_of(&server, ALPHA).await, 401, "expired");
+    // No reload happens: the data plane's own clock decides. Polled, not slept for.
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    while status_of(&server, ALPHA).await != 401 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the key never expired"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     assert_eq!(
         status_of(&server, BRAVO).await,
         200,
@@ -781,4 +787,25 @@ fn a_file_key_takes_an_rfc3339_expiry_and_refuses_anything_else() {
     let (code, stderr) = run_with_args(&path, &["--check", "--structure-only"], &env);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("keys[0].expires_at"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_key_in_the_file_expires_at_request_time_too() {
+    let (upstream, _mock) = mock(1).await;
+    let expiry = in_secs(10);
+    let text = harness::config(&upstream.url(), "").replacen(
+        "name = \"ci\"",
+        &format!("name = \"ci\"\n        expires_at = \"{expiry}\""),
+        1,
+    );
+    let server = start(&text, "file-key-expiry", &[]);
+    assert_eq!(status_of(&server, harness::CALLER_KEY).await, 200);
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    while status_of(&server, harness::CALLER_KEY).await != 401 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the key never expired"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }

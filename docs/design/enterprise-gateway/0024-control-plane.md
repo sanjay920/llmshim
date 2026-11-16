@@ -270,6 +270,7 @@ The data-plane half that needs no control plane exists: `src/serve/snapshot.rs`,
   (`key_expired` in the gateway shape) wherever it is used from, with no reload; a key already expired
   when a snapshot is read is not loaded; a reload that changes only an expiry is a change (it is in the
   fingerprint). The earlier text of this bullet on the 2a limit no longer applies.
+- Expiry uses the wall clock: a backward step of it revives an expired key, stated like the stale age. A request already past the check (queued, or streaming) is not cut off at its key's expiry.
 - **The snapshot's `tenants` are not used for the logs**: a key's `tenant` is the team id and the logs
   print it (a name is for the operator's tools; mapping ids to names in a usage record is a log contract
   change, 0010, not made here).

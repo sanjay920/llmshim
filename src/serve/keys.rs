@@ -238,11 +238,11 @@ pub fn allowlists(
                         .collect::<Vec<_>>()
                         .into()
                 });
-            let expires_at = key
-                .expires_at
-                .as_ref()
-                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-                .map(|at| at.timestamp());
+            let expires_at = key.expires_at.as_ref().map(|text| {
+                // Validated already; a value that somehow is not a time fails closed
+                // (expired), never open.
+                chrono::DateTime::parse_from_rfc3339(text).map_or(i64::MIN, |at| at.timestamp())
+            });
             if nets.is_none() && expires_at.is_none() {
                 return None;
             }
