@@ -611,6 +611,19 @@ fn build_router(
             },
             None => None,
         };
+        if provider.kind.is_cloud() {
+            // The file is valid and the feature is on, but building the transport
+            // from it is the next slice of 0020; until then it is refused rather
+            // than left out.
+            issues.push(Issue {
+                path: at,
+                message: format!(
+                    "kind \"{}\" is not wired into the server yet (0020, slice 3)",
+                    provider.kind.hosted_name().unwrap_or("cloud")
+                ),
+            });
+            continue;
+        }
         let base_url = provider.base_url.clone();
         let built: Box<dyn Provider> = match (provider.kind, key) {
             (ProviderKind::OpenaiCompatible, key) => Box::new(OpenAiCompatible::new(
@@ -654,7 +667,11 @@ fn hosted(kind: ProviderKind, key: String, base_url: Option<String>) -> Box<dyn 
         ProviderKind::Cerebras => on_base!(Cerebras::new(key)),
         ProviderKind::Openrouter => on_base!(OpenRouter::new(key)),
         // Handled by the caller; kept total so a new kind cannot be forgotten.
-        ProviderKind::OpenaiCompatible => unreachable!("self-hosted servers are built by name"),
+        ProviderKind::OpenaiCompatible
+        | ProviderKind::Bedrock
+        | ProviderKind::VertexGemini
+        | ProviderKind::VertexAnthropic
+        | ProviderKind::Azure => unreachable!("built by the caller"),
     }
 }
 

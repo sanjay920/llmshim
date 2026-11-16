@@ -27,24 +27,8 @@ pub struct Azure {
 impl Azure {
     /// Accept an HTTPS resource origin or its `/openai/v1` base. No credentials are resolved.
     pub fn new(endpoint: &str, identity: AzureIdentity) -> Result<Self> {
-        let url = reqwest::Url::parse(endpoint)
-            .map_err(|_| AzureError::service(400, "InvalidEndpoint").into_shim(None))?;
-        if url.scheme() != "https"
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || !matches!(url.path().trim_end_matches('/'), "" | "/openai/v1")
-        {
-            return Err(AzureError::service(400, "InvalidEndpoint").into_shim(None));
-        }
-        let root = format!(
-            "{}/openai/v1",
-            url.as_str()
-                .trim_end_matches('/')
-                .trim_end_matches("/openai/v1")
-        );
+        let root = crate::providers::cloud_rules::azure_root(endpoint)
+            .ok_or_else(|| AzureError::service(400, "InvalidEndpoint").into_shim(None))?;
         Ok(Self {
             root,
             identity,
@@ -55,13 +39,7 @@ impl Azure {
     /// Deployment is the wire model. The mapped model supplies catalog family metadata
     /// and Azure pricing information.
     pub fn with_deployment(mut self, deployment: &str, model: &str) -> Result<Self> {
-        if deployment.is_empty()
-            || deployment.len() > 256
-            || model.trim().is_empty()
-            || !deployment
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        {
+        if !crate::providers::cloud_rules::azure_deployment(deployment, model) {
             return Err(AzureError::service(400, "InvalidDeployment").into_shim(None));
         }
         Arc::make_mut(&mut self.deployments).insert(deployment.into(), model.into());

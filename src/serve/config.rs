@@ -477,17 +477,33 @@ pub enum ProviderKind {
     Openrouter,
     /// Any OpenAI Chat Completions-compatible server at `base_url`.
     OpenaiCompatible,
+    /// Amazon Bedrock Converse, through an AWS SDK profile (0020). Needs a binary
+    /// built with `--features serve-cloud`.
+    Bedrock,
+    /// Gemini on Vertex AI, through a service-account file (0020). Needs
+    /// `--features serve-cloud`.
+    VertexGemini,
+    /// Anthropic models on Vertex AI, through a service-account file (0020).
+    /// Needs `--features serve-cloud`.
+    VertexAnthropic,
+    /// Azure OpenAI / Foundry v1, through a key and named deployments (0020).
+    /// Needs `--features serve-cloud`.
+    Azure,
 }
 
 /// The names of the hosted providers. A hosted provider is registered under its
 /// own name, because the catalog, rate limits and prices are looked up by it.
-const HOSTED_NAMES: [&str; 6] = [
+const HOSTED_NAMES: [&str; 10] = [
     "openai",
     "anthropic",
     "gemini",
     "xai",
     "cerebras",
     "openrouter",
+    "bedrock",
+    "vertex-gemini",
+    "vertex-anthropic",
+    "azure",
 ];
 
 impl ProviderKind {
@@ -500,15 +516,38 @@ impl ProviderKind {
             Self::Xai => "xai",
             Self::Cerebras => "cerebras",
             Self::Openrouter => "openrouter",
+            Self::Bedrock => "bedrock",
+            Self::VertexGemini => "vertex-gemini",
+            Self::VertexAnthropic => "vertex-anthropic",
+            Self::Azure => "azure",
             Self::OpenaiCompatible => return None,
         })
+    }
+
+    /// One of the cloud transports (0020), which a `serve` binary has only when
+    /// built with `--features serve-cloud`.
+    pub fn is_cloud(self) -> bool {
+        matches!(
+            self,
+            Self::Bedrock | Self::VertexGemini | Self::VertexAnthropic | Self::Azure
+        )
+    }
+
+    fn kind_name(self) -> &'static str {
+        match self {
+            Self::OpenaiCompatible => "openai-compatible",
+            other => other.hosted_name().unwrap_or("provider"),
+        }
     }
 
     fn requires_base_url(self) -> bool {
         matches!(self, Self::OpenaiCompatible)
     }
     fn requires_api_key(self) -> bool {
-        !matches!(self, Self::OpenaiCompatible)
+        !matches!(
+            self,
+            Self::OpenaiCompatible | Self::Bedrock | Self::VertexGemini | Self::VertexAnthropic
+        )
     }
 }
 
@@ -522,6 +561,39 @@ pub struct Provider {
     pub api_key: Option<SecretRef>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Bedrock: the AWS SDK profile to use. The profile file is trusted operator
+    /// input (0020): it may select a role, SSO, a credential source or a
+    /// `credential_process`.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Bedrock and Vertex: the cloud region (Vertex also takes `global`, `us`,
+    /// `eu`).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Bedrock: the AWS config file, with `credentials_file` (both or neither),
+    /// replacing the SDK's default locations. Absolute paths.
+    #[serde(default)]
+    pub config_file: Option<PathBuf>,
+    /// Bedrock: see `config_file`.
+    #[serde(default)]
+    pub credentials_file: Option<PathBuf>,
+    /// Vertex: the Google Cloud project.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Vertex and Azure: a stable, non-secret name for this identity. It is part
+    /// of the replay boundary: change it when the identity changes.
+    #[serde(default)]
+    pub binding: Option<String>,
+    /// Vertex: the service-account JSON file (an absolute path). Never
+    /// application-default credentials.
+    #[serde(default)]
+    pub service_account_file: Option<PathBuf>,
+    /// Azure: the resource endpoint, `https://<resource>.openai.azure.com`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Azure: deployment name to the catalog model it serves. At least one.
+    #[serde(default, deserialize_with = "unique_map")]
+    pub deployments: BTreeMap<String, String>,
 }
 
 /// Where a secret lives. Exactly one field is set; the value never appears in
@@ -1031,6 +1103,222 @@ impl ServeConfig {
                     "is required for kind \"openai-compatible\"",
                 )),
                 None => {}
+            }
+            self.validate_cloud_fields(name, provider, issues);
+        }
+        self.validate_shared_vertex_identity(issues);
+    }
+
+    /// The fields only a cloud kind takes, and the rules of the transports
+    /// themselves (0020), so a value that would fail every request fails here.
+    fn validate_cloud_fields(&self, name: &str, provider: &Provider, issues: &mut Vec<Issue>) {
+        use super::config::ProviderKind as K;
+        use crate::providers::cloud_rules as rules;
+        let at = format!("providers.{name}");
+        let kind = provider.kind;
+        let owners: [(&str, bool, &[K]); 9] = [
+            ("profile", provider.profile.is_some(), &[K::Bedrock]),
+            (
+                "region",
+                provider.region.is_some(),
+                &[K::Bedrock, K::VertexGemini, K::VertexAnthropic],
+            ),
+            ("config_file", provider.config_file.is_some(), &[K::Bedrock]),
+            (
+                "credentials_file",
+                provider.credentials_file.is_some(),
+                &[K::Bedrock],
+            ),
+            (
+                "project",
+                provider.project.is_some(),
+                &[K::VertexGemini, K::VertexAnthropic],
+            ),
+            (
+                "binding",
+                provider.binding.is_some(),
+                &[K::VertexGemini, K::VertexAnthropic, K::Azure],
+            ),
+            (
+                "service_account_file",
+                provider.service_account_file.is_some(),
+                &[K::VertexGemini, K::VertexAnthropic],
+            ),
+            ("endpoint", provider.endpoint.is_some(), &[K::Azure]),
+            ("deployments", !provider.deployments.is_empty(), &[K::Azure]),
+        ];
+        for (field, set, allowed) in owners {
+            if set && !allowed.contains(&kind) {
+                let kinds: Vec<&str> = allowed.iter().map(|k| k.kind_name()).collect();
+                issues.push(Issue::new(
+                    format!("{at}.{field}"),
+                    format!("applies to kind {} only", kinds.join(" or ")),
+                ));
+            }
+        }
+        if provider.api_key.is_some() && !matches!(kind, K::Azure) && kind.is_cloud() {
+            issues.push(Issue::new(
+                format!("{at}.api_key"),
+                format!("is not used by kind \"{}\"", kind.kind_name()),
+            ));
+        }
+        if provider.base_url.is_some() && kind.is_cloud() {
+            issues.push(Issue::new(
+                format!("{at}.base_url"),
+                format!(
+                    "is not used by kind \"{}\" (the endpoint follows from the region)",
+                    kind.kind_name()
+                ),
+            ));
+        }
+        let need = |field: &str, present: bool, issues: &mut Vec<Issue>| {
+            if !present {
+                issues.push(Issue::new(
+                    format!("{at}.{field}"),
+                    format!("is required for kind \"{}\"", kind.kind_name()),
+                ));
+            }
+        };
+        let binding_ok = |binding: &str| valid_name(binding);
+        match kind {
+            K::Bedrock => {
+                need("profile", provider.profile.is_some(), issues);
+                need("region", provider.region.is_some(), issues);
+                if let Some(profile) = &provider.profile {
+                    if profile.is_empty()
+                        || profile.len() > 128
+                        || !profile.bytes().all(|b| b.is_ascii_graphic())
+                    {
+                        issues.push(Issue::new(
+                            format!("{at}.profile"),
+                            "must be 1 to 128 visible ASCII characters",
+                        ));
+                    }
+                }
+                if let Some(region) = &provider.region {
+                    if let Err(reason) = rules::bedrock_region(region) {
+                        issues.push(Issue::new(format!("{at}.region"), reason));
+                    }
+                }
+                if provider.config_file.is_some() != provider.credentials_file.is_some() {
+                    issues.push(Issue::new(
+                        &at,
+                        "set config_file and credentials_file together, or neither",
+                    ));
+                }
+                for (field, path) in [
+                    ("config_file", &provider.config_file),
+                    ("credentials_file", &provider.credentials_file),
+                ] {
+                    if path.as_ref().is_some_and(|p| !p.has_root()) {
+                        issues.push(Issue::new(
+                            format!("{at}.{field}"),
+                            "must be an absolute path",
+                        ));
+                    }
+                }
+            }
+            K::VertexGemini | K::VertexAnthropic => {
+                need("project", provider.project.is_some(), issues);
+                need("region", provider.region.is_some(), issues);
+                need("binding", provider.binding.is_some(), issues);
+                need(
+                    "service_account_file",
+                    provider.service_account_file.is_some(),
+                    issues,
+                );
+                if provider
+                    .project
+                    .as_deref()
+                    .is_some_and(|p| !rules::vertex_label(p))
+                {
+                    issues.push(Issue::new(
+                        format!("{at}.project"),
+                        "must be 1 to 128 lower-case letters, digits or hyphens",
+                    ));
+                }
+                if provider.region.as_deref().is_some_and(|region| {
+                    // The transport also maps `global`, `us` and `eu` to their own hosts.
+                    !rules::vertex_label(region)
+                }) {
+                    issues.push(Issue::new(
+                        format!("{at}.region"),
+                        "must be 1 to 128 lower-case letters, digits or hyphens",
+                    ));
+                }
+                if provider.binding.as_deref().is_some_and(|b| !binding_ok(b)) {
+                    issues.push(Issue::new(format!("{at}.binding"), NAME_RULE));
+                }
+                if provider
+                    .service_account_file
+                    .as_ref()
+                    .is_some_and(|p| !p.has_root())
+                {
+                    issues.push(Issue::new(
+                        format!("{at}.service_account_file"),
+                        "must be an absolute path",
+                    ));
+                }
+            }
+            K::Azure => {
+                need("endpoint", provider.endpoint.is_some(), issues);
+                need("binding", provider.binding.is_some(), issues);
+                need("api_key", provider.api_key.is_some(), issues);
+                if provider
+                    .endpoint
+                    .as_deref()
+                    .is_some_and(|e| rules::azure_root(e).is_none())
+                {
+                    issues.push(Issue::new(
+                        format!("{at}.endpoint"),
+                        "must be an https resource origin (or its /openai/v1 base) without credentials, query or fragment",
+                    ));
+                }
+                if provider.binding.as_deref().is_some_and(|b| !binding_ok(b)) {
+                    issues.push(Issue::new(format!("{at}.binding"), NAME_RULE));
+                }
+                if provider.deployments.is_empty() {
+                    issues.push(Issue::new(
+                        format!("{at}.deployments"),
+                        "is required: an Azure provider with no deployment could serve nothing",
+                    ));
+                }
+                for (deployment, model) in &provider.deployments {
+                    if !rules::azure_deployment(deployment, model) {
+                        issues.push(Issue::new(
+                            format!("{at}.deployments.{deployment}"),
+                            "a deployment name is 1 to 256 letters, digits, '-', '_' or '.', and its model is not empty",
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The two Vertex kinds share one identity and one token cache, so when both
+    /// are configured they must name the same one.
+    fn validate_shared_vertex_identity(&self, issues: &mut Vec<Issue>) {
+        let (Some(gemini), Some(anthropic)) = (
+            self.providers.get("vertex-gemini"),
+            self.providers.get("vertex-anthropic"),
+        ) else {
+            return;
+        };
+        for (field, same) in [
+            ("project", gemini.project == anthropic.project),
+            ("region", gemini.region == anthropic.region),
+            ("binding", gemini.binding == anthropic.binding),
+            (
+                "service_account_file",
+                gemini.service_account_file == anthropic.service_account_file,
+            ),
+        ] {
+            if !same {
+                issues.push(Issue::new(
+                    format!("providers.vertex-anthropic.{field}"),
+                    "must equal providers.vertex-gemini's: the two share one identity",
+                ));
             }
         }
     }
@@ -1563,6 +1851,18 @@ impl ServeConfig {
                 "fleet mode needs a binary built with --features serve-redis",
             ));
         }
+        if !cfg!(feature = "serve-cloud") {
+            for (name, provider) in &self.providers {
+                if provider.kind.is_cloud() {
+                    issues.push(Issue::new(
+                        format!("providers.{name}"),
+                        "kind \"".to_string()
+                            + provider.kind.kind_name()
+                            + "\" needs a binary built with --features serve-cloud",
+                    ));
+                }
+            }
+        }
         if self.telemetry.is_some() && !cfg!(feature = "serve-otel") {
             // A setting that is parsed and then ignored would say traces are
             // leaving when none are.
@@ -1590,6 +1890,30 @@ impl ServeConfig {
     /// secrets can skip them with `--structure-only`.
     pub fn check_secrets_present(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<Issue> {
         let mut issues = Vec::new();
+        // A service-account file is a credential: missing or empty is the same
+        // kind of absence as an unset secret.
+        for (name, provider) in &self.providers {
+            if let Some(path) = &provider.service_account_file {
+                let at = format!("providers.{name}.service_account_file");
+                match std::fs::read(path) {
+                    Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => {
+                        issues.push(Issue::new(
+                            at,
+                            format!("service-account file {} is empty", path.display()),
+                        ))
+                    }
+                    Ok(_) => {}
+                    Err(error) => issues.push(Issue::new(
+                        at,
+                        format!(
+                            "cannot read service-account file {}: {}",
+                            path.display(),
+                            error.kind()
+                        ),
+                    )),
+                }
+            }
+        }
         for (at, secret) in self.secret_refs() {
             if let Some(name) = &secret.env {
                 match env(name) {
@@ -1619,6 +1943,31 @@ impl ServeConfig {
                         ),
                     )),
                 }
+            }
+        }
+        issues
+    }
+
+    /// What is wrong with a service-account file that can be read: the transport's
+    /// own rules (type, token endpoint, a usable key), by path, never the content.
+    /// A file that cannot be read is [`Self::check_secrets_present`]'s to report.
+    pub fn check_credential_files(&self) -> Vec<Issue> {
+        let mut issues = Vec::new();
+        for (name, provider) in &self.providers {
+            let Some(path) = &provider.service_account_file else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            if let Some(problem) = crate::providers::cloud_rules::service_account_problem(&bytes) {
+                issues.push(Issue::new(
+                    format!("providers.{name}.service_account_file"),
+                    format!("the file {problem}"),
+                ));
             }
         }
         issues
@@ -2583,6 +2932,201 @@ mod tests {
             .map(Issue::to_string)
             .collect();
         assert!(has(&found, "keys[0].secret"), "{found:?}");
+    }
+
+    fn cloud(extra: &str) -> String {
+        format!("{MINIMAL}\n{extra}\n")
+    }
+
+    const AZURE: &str =
+        "[providers.azure]\nkind = \"azure\"\nendpoint = \"https://res.openai.azure.com\"\n\
+        binding = \"azure-prod\"\napi_key = { env = \"AZ_KEY\" }\n\
+        deployments = { \"chat-prod\" = \"gpt-6-sol\" }\n";
+    const BEDROCK: &str =
+        "[providers.bedrock]\nkind = \"bedrock\"\nprofile = \"prod\"\nregion = \"us-east-1\"\n";
+    const VERTEX: &str =
+        "[providers.vertex-gemini]\nkind = \"vertex-gemini\"\nproject = \"my-project\"\n\
+        region = \"us-central1\"\nbinding = \"v-prod\"\nservice_account_file = \"/etc/sa.json\"\n";
+
+    #[test]
+    fn cloud_providers_are_accepted_and_validated_by_path() {
+        for ok in [AZURE, BEDROCK, VERTEX] {
+            assert!(
+                ServeConfig::parse(&cloud(ok), Format::Toml).is_ok(),
+                "{ok}: {:?}",
+                issues(&cloud(ok))
+            );
+        }
+        let both = cloud(&format!(
+            "{VERTEX}{}",
+            VERTEX.replace("vertex-gemini", "vertex-anthropic")
+        ));
+        assert!(
+            ServeConfig::parse(&both, Format::Toml).is_ok(),
+            "{:?}",
+            issues(&both)
+        );
+        for (text, path) in [
+            // a required field missing
+            (BEDROCK.replace("profile = \"prod\"\n", ""), "providers.bedrock.profile"),
+            (VERTEX.replace("binding = \"v-prod\"\n", ""), "providers.vertex-gemini.binding"),
+            (AZURE.replace("deployments = { \"chat-prod\" = \"gpt-6-sol\" }\n", ""), "providers.azure.deployments"),
+            (AZURE.replace("api_key = { env = \"AZ_KEY\" }\n", ""), "providers.azure.api_key"),
+            // a value the transport would refuse on every request
+            (BEDROCK.replace("us-east-1", "us-iso-east-1"), "providers.bedrock.region"),
+            (BEDROCK.replace("us-east-1", "US_EAST"), "providers.bedrock.region"),
+            (VERTEX.replace("my-project", "My_Project"), "providers.vertex-gemini.project"),
+            (AZURE.replace("https://res", "http://res"), "providers.azure.endpoint"),
+            (AZURE.replace("\"chat-prod\"", "\"bad name\""), "providers.azure.deployments.bad name"),
+            (AZURE.replace("\"gpt-6-sol\"", "\" \""), "providers.azure.deployments.chat-prod"),
+            (VERTEX.replace("/etc/sa.json", "sa.json"), "providers.vertex-gemini.service_account_file"),
+            // another kind's field, and fields a cloud kind does not take
+            (format!("{BEDROCK}project = \"p\"\n"), "providers.bedrock.project"),
+            (format!("{AZURE}profile = \"p\"\n"), "providers.azure.profile"),
+            (format!("{BEDROCK}api_key = {{ env = \"X\" }}\n"), "providers.bedrock.api_key"),
+            (format!("{VERTEX}base_url = \"https://x.example\"\n"), "providers.vertex-gemini.base_url"),
+            (format!("{BEDROCK}config_file = \"/etc/aws/config\"\n"), "providers.bedrock"),
+            // names are reserved for their kinds
+            (BEDROCK.replace("[providers.bedrock]", "[providers.aws]"), "providers.aws"),
+            (
+                "[providers.azure]\nkind = \"openai-compatible\"\nbase_url = \"https://x.example/v1\"\n".into(),
+                "providers.azure",
+            ),
+        ] {
+            let text = cloud(&text);
+            assert!(has(&issues(&text), path), "{path}: {:?}", issues(&text));
+        }
+        // The two Vertex kinds share one identity.
+        let split = cloud(&format!(
+            "{VERTEX}{}",
+            VERTEX
+                .replace("vertex-gemini", "vertex-anthropic")
+                .replace("v-prod", "other")
+        ));
+        assert!(
+            has(&issues(&split), "providers.vertex-anthropic.binding"),
+            "{:?}",
+            issues(&split)
+        );
+    }
+
+    #[test]
+    fn cloud_kinds_need_the_serve_cloud_build() {
+        let config = ServeConfig::parse(&cloud(BEDROCK), Format::Toml).unwrap();
+        let found: Vec<String> = config
+            .feature_issues()
+            .iter()
+            .map(Issue::to_string)
+            .collect();
+        assert_eq!(found.is_empty(), cfg!(feature = "serve-cloud"), "{found:?}");
+        if !cfg!(feature = "serve-cloud") {
+            assert!(has(&found, "providers.bedrock"));
+            assert!(found[0].contains("--features serve-cloud"), "{found:?}");
+        }
+        // A file with no cloud kind is unaffected either way.
+        assert!(ServeConfig::parse(MINIMAL, Format::Toml)
+            .unwrap()
+            .feature_issues()
+            .iter()
+            .all(|i| !i.to_string().contains("serve-cloud")));
+    }
+
+    #[test]
+    fn a_service_account_file_is_checked_without_echoing_it() {
+        let dir = std::env::temp_dir().join(format!("llmshim-sa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            include_str!("jwt_test_rsa_2048.b64").trim()
+        );
+        let account = |token_uri: &str, kind: &str| {
+            serde_json::json!({"type": kind, "client_email": "sa@p.iam.example",
+                "private_key": pem, "token_uri": token_uri, "private_key_id": "k"})
+            .to_string()
+        };
+        let write = |name: &str, content: String| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let config = |path: &std::path::Path| {
+            ServeConfig::parse(
+                &cloud(&VERTEX.replace("/etc/sa.json", path.to_str().unwrap())),
+                Format::Toml,
+            )
+            .unwrap()
+        };
+        // Only the service-account findings: MINIMAL's own secrets are unset here.
+        let absent = |config: &ServeConfig| -> Vec<String> {
+            config
+                .check_secrets_present(&|_| None)
+                .iter()
+                .map(Issue::to_string)
+                .filter(|issue| issue.contains("service_account_file"))
+                .collect()
+        };
+        let good = write(
+            "good.json",
+            account(
+                crate::providers::cloud_rules::GOOGLE_TOKEN_URI,
+                "service_account",
+            ),
+        );
+        assert!(absent(&config(&good)).is_empty());
+        assert!(config(&good).check_credential_files().is_empty());
+        // Missing and empty are absences (status 3); malformed is a defect (status 1).
+        let missing = dir.join("nope.json");
+        let found = absent(&config(&missing));
+        assert!(
+            has(&found, "providers.vertex-gemini.service_account_file"),
+            "{found:?}"
+        );
+        let empty = write("empty.json", " \n".into());
+        assert_eq!(absent(&config(&empty)).len(), 1);
+        assert!(
+            config(&empty).check_credential_files().is_empty(),
+            "absence is not a defect"
+        );
+        for (name, content) in [
+            ("junk.json", "not json".to_string()),
+            (
+                "kind.json",
+                account(
+                    crate::providers::cloud_rules::GOOGLE_TOKEN_URI,
+                    "authorized_user",
+                ),
+            ),
+            (
+                "uri.json",
+                account("https://evil.example/token", "service_account"),
+            ),
+            (
+                "key.json",
+                account(
+                    crate::providers::cloud_rules::GOOGLE_TOKEN_URI,
+                    "service_account",
+                )
+                .replace("BEGIN PRIVATE KEY", "BEGIN WRONG"),
+            ),
+        ] {
+            let path = write(name, content);
+            let found: Vec<String> = config(&path)
+                .check_credential_files()
+                .iter()
+                .map(Issue::to_string)
+                .collect();
+            assert_eq!(found.len(), 1, "{name}: {found:?}");
+            assert!(
+                has(&found, "providers.vertex-gemini.service_account_file"),
+                "{name}"
+            );
+            // The content is never in the message.
+            assert!(
+                !found[0].contains("sa@p.iam") && !found[0].contains("BEGIN"),
+                "{name}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

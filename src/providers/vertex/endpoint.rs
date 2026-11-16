@@ -3,12 +3,7 @@ use super::{GoogleIdentity, VertexError};
 use crate::error::Result;
 
 pub(super) fn root(identity: &GoogleIdentity, publisher: &str) -> Result<String> {
-    let valid = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 128
-            && s.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    };
+    let valid = crate::providers::cloud_rules::vertex_label;
     if !valid(&identity.project) || !valid(&identity.region) {
         return Err(VertexError::service(400, "InvalidProjectOrLocation").into_shim(None));
     }

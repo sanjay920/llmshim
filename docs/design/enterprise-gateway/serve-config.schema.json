@@ -388,8 +388,80 @@
             "null"
           ]
         },
+        "binding": {
+          "default": null,
+          "description": "Vertex and Azure: a stable, non-secret name for this identity. It is part\nof the replay boundary: change it when the identity changes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "config_file": {
+          "default": null,
+          "description": "Bedrock: the AWS config file, with `credentials_file` (both or neither),\nreplacing the SDK's default locations. Absolute paths.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "credentials_file": {
+          "default": null,
+          "description": "Bedrock: see `config_file`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deployments": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Azure: deployment name to the catalog model it serves. At least one.",
+          "type": "object"
+        },
+        "endpoint": {
+          "default": null,
+          "description": "Azure: the resource endpoint, `https://<resource>.openai.azure.com`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "kind": {
           "$ref": "#/$defs/ProviderKind"
+        },
+        "profile": {
+          "default": null,
+          "description": "Bedrock: the AWS SDK profile to use. The profile file is trusted operator\ninput (0020): it may select a role, SSO, a credential source or a\n`credential_process`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project": {
+          "default": null,
+          "description": "Vertex: the Google Cloud project.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "default": null,
+          "description": "Bedrock and Vertex: the cloud region (Vertex also takes `global`, `us`,\n`eu`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service_account_file": {
+          "default": null,
+          "description": "Vertex: the service-account JSON file (an absolute path). Never\napplication-default credentials.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -414,6 +486,26 @@
         {
           "const": "openai-compatible",
           "description": "Any OpenAI Chat Completions-compatible server at `base_url`.",
+          "type": "string"
+        },
+        {
+          "const": "bedrock",
+          "description": "Amazon Bedrock Converse, through an AWS SDK profile (0020). Needs a binary\nbuilt with `--features serve-cloud`.",
+          "type": "string"
+        },
+        {
+          "const": "vertex-gemini",
+          "description": "Gemini on Vertex AI, through a service-account file (0020). Needs\n`--features serve-cloud`.",
+          "type": "string"
+        },
+        {
+          "const": "vertex-anthropic",
+          "description": "Anthropic models on Vertex AI, through a service-account file (0020).\nNeeds `--features serve-cloud`.",
+          "type": "string"
+        },
+        {
+          "const": "azure",
+          "description": "Azure OpenAI / Foundry v1, through a key and named deployments (0020).\nNeeds `--features serve-cloud`.",
           "type": "string"
         }
       ]

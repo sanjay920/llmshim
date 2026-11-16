@@ -991,6 +991,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     let unavailable: std::collections::BTreeSet<&str> =
         absent.iter().map(|issue| issue.path.as_str()).collect();
     let mut defects = config.check_same_values(&env);
+    defects.extend(config.check_credential_files());
     if let Err(issues) = llmshim::serve::build_key_store(&config, &env) {
         defects.extend(issues);
     }
