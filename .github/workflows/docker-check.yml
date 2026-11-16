@@ -19,6 +19,9 @@ permissions:
 jobs:
   docker-check:
     runs-on: ubuntu-latest
+    # Three builds of the whole tree (no dependency layer is cached), one with the
+    # AWS SDK: a hang should cost an hour, not the default six.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Build the image

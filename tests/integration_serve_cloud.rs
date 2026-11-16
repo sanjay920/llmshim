@@ -185,12 +185,27 @@ async fn a_bedrock_profile_that_does_not_exist_fails_the_request_cleanly() {
         "no path: {body}"
     );
     // The identity failed before admission, so no attempt exists to record: the
-    // usage log, which holds one line per admitted attempt, gains none.
-    std::thread::sleep(Duration::from_millis(500));
+    // usage log, which holds one line per admitted attempt, gains none. The log
+    // writer is first in, first out, so once a later record has landed, a record
+    // for the failed request would already be there: wait for that one, then count.
+    assert_eq!(
+        post(&server.base, "inference/test-model").await.status(),
+        200
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lines(&usage) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(200));
     assert_eq!(
         lines(&usage),
-        1,
-        "the failed identity added no record: {}",
+        2,
+        "only the two admitted attempts are recorded, not the failed identity: {}",
         std::fs::read_to_string(&usage).unwrap_or_default()
     );
+    // The replica is unaffected: ready, and the other provider answered above.
+    let ready = reqwest::get(format!("{}/ready", server.base))
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), 200);
 }

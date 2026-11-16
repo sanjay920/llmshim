@@ -156,14 +156,14 @@ log work as for any provider, keyed by the provider name.
 
 `serve-cloud` adds the AWS SDK and the Google and Azure paths to the binary. The
 published image (0019) keeps `serve-redis,serve-otel` until the owner decides. The
-cost, measured on an arm64 build of the Dockerfile: **57.9 MB without, 63 MB with
-`serve-cloud` (+5.1 MB, about 9 %)**; the pull-request job prints both sizes for
-each change (as a job summary) so the figure stays current, and the added build time
-is visible in the job. A deployment that needs these providers builds the image with
-`--build-arg FEATURES=serve-redis,serve-otel,serve-cloud`; a deployment that needs these providers
-builds the image with `--build-arg FEATURES=serve-redis,serve-otel,serve-cloud`,
-and `docker-check.yml` builds that combination on every pull request that touches
-the Dockerfile, so it does not rot.
+cost, as `docker image ls` reports it for the image built from the Dockerfile on
+an arm64 laptop: about 58 MB without and 63 MB with `serve-cloud` (roughly 5 MB, 9 %).
+The pull-request job prints both sizes for its own build as a job summary; it runs on
+amd64, so its figures will differ from these, and the added build time is visible in
+the job. A deployment that needs these providers builds the image with
+`--build-arg FEATURES=serve-redis,serve-otel,serve-cloud`, and `docker-check.yml`
+builds that combination on every pull request that touches the Dockerfile, so it
+does not rot.
 
 ## Not decided here
 

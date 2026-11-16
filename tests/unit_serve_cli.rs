@@ -365,6 +365,15 @@ surprise = true
             stderr.contains("providers.vertex-gemini.service_account_file"),
             "{stderr}"
         );
+        let empty = dir.join("empty.json");
+        std::fs::write(&empty, "  \n").unwrap();
+        let blank = check(&empty, "sa-empty.toml");
+        let stderr = String::from_utf8_lossy(&blank.stderr);
+        assert_eq!(blank.status.code(), Some(3), "{stderr}");
+        assert!(
+            stderr.contains("providers.vertex-gemini.service_account_file"),
+            "{stderr}"
+        );
         let junk = dir.join("junk.json");
         std::fs::write(&junk, "{\"private_key\": \"-----BEGIN PRIVATE KEY-----\"}").unwrap();
         let malformed = check(&junk, "sa-malformed.toml");
