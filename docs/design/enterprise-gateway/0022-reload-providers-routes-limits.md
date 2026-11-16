@@ -177,6 +177,15 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
   also changes another provider, the router is rebuilt whole and the unreadable
   secret is reported by path, rejecting the reload: a router cannot be built without
   every provider, and the running provider objects are not reusable.
+- **A fleet replica ignores a rotated secret when it decides what changed**, so rotating an
+  upstream key file ahead of a roll-out does not stop a caller-key revocation from
+  applying there; only a provider table or route change is refused.
+- **Known limits, stated rather than discovered.** A secret file deleted while its
+  provider's table is unchanged keeps the running key and shows no change in the
+  status. Every provider is rebuilt on any router change, so an unchanged cloud
+  provider's token cache is also dropped (one extra token exchange). A changed or added
+  Vertex provider whose service-account file is missing, empty or malformed rejects
+  the reload.
 - **The status** gains `router_generation`, `env_secret_providers` and, on a
   reload, `changes` (`providers.added: x`, `providers.removed: x`,
   `providers.changed: x`, `routes`).

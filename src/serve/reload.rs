@@ -411,6 +411,14 @@ impl Reloader {
             env,
             Some(&active.router),
         );
+        // A fleet replica cannot change providers, so a rotated secret there is not a
+        // change it could act on: it must not turn a keys-only edit (a revocation)
+        // into a refused one. Only the tables and routes decide.
+        let router = if self.handles.fleet {
+            router.with_secrets_of(&active.router)
+        } else {
+            router
+        };
         let changes = active.router.changes_to(&router);
         let mut next_router = None;
         if !changes.is_empty() {
@@ -430,13 +438,18 @@ impl Reloader {
             let mut found = Vec::new();
             let base = self.handles.router.current();
             let built = super::build::build_router_from(&loaded.config, env, &mut found, &base);
-            found.extend(
-                loaded
-                    .config
-                    .check_credential_files()
-                    .into_iter()
-                    .filter(|issue| router.touches(&changes, &issue.path)),
-            );
+            // The credential files of the providers this reload adds or changes: a
+            // file that is missing, empty or malformed rejects it (a transport that
+            // reads nothing until a request would otherwise fail every one).
+            let mut files = loaded.config.check_secrets_present(env);
+            files.extend(loaded.config.check_credential_files());
+            for issue in files {
+                if router.touches(&changes, &issue.path)
+                    && !found.iter().any(|seen| seen.path == issue.path)
+                {
+                    found.push(issue);
+                }
+            }
             if !found.is_empty() {
                 return reject_now(active, found);
             }
@@ -641,6 +654,18 @@ impl RouterPrint {
             routes: routes_doc.to_string(),
             env_form,
         }
+    }
+
+    /// This print with the secret and file digests of `other` where the provider
+    /// exists in both.
+    fn with_secrets_of(mut self, other: &RouterPrint) -> Self {
+        for (name, print) in &mut self.providers {
+            if let Some(before) = other.providers.get(name) {
+                print.secret.clone_from(&before.secret);
+                print.files.clone_from(&before.files);
+            }
+        }
+        self
     }
 
     fn fingerprint(&self) -> String {
@@ -1362,15 +1387,81 @@ mod tests {
         let a = compat("a", "http://127.0.0.1:1/v1", &secret);
         let fixture =
             Fixture::with_fleet(&with_providers(&a, "", &key("k", "acme", OLD, "")), true);
-        std::fs::write(&secret, "two").unwrap();
+        // A different base URL is a change of the provider's table.
+        let moved = compat("a", "http://127.0.0.1:9/v1", &secret);
+        fixture.write(&with_providers(&moved, "", &key("k", "acme", OLD, "")));
         let Outcome::Rejected { issues, .. } = fixture.reload() else {
             panic!("a fleet replica's workers follow the providers it started with");
         };
         assert_eq!(issues[0].path, "providers");
         // A keys-only edit still applies there.
-        std::fs::write(&secret, "one").unwrap();
         fixture.write(&with_providers(&a, "", &key("k", "acme", NEW, "")));
         assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_rotated_secret_does_not_stop_a_revocation_on_a_fleet_replica() {
+        let directory = std::env::temp_dir().join(format!(
+            "llmshim-fleet-rev-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("k");
+        std::fs::write(&secret, "one").unwrap();
+        let a = compat("a", "http://127.0.0.1:1/v1", &secret);
+        let fixture =
+            Fixture::with_fleet(&with_providers(&a, "", &key("k", "acme", OLD, "")), true);
+        // The operator rotated the upstream key file and then revoked a caller key
+        // before the roll-out reached this replica: the revocation applies.
+        std::fs::write(&secret, "two").unwrap();
+        fixture.write(&with_providers(&a, "", &key("j", "globex", NEW, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        assert!(fixture.identity(OLD).is_none());
+        assert!(fixture.identity(NEW).is_some());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_service_account_file_that_is_missing_or_empty_rejects_the_reload() {
+        let directory =
+            std::env::temp_dir().join(format!("llmshim-sa-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("k");
+        std::fs::write(&secret, "one").unwrap();
+        let a = compat("a", "http://127.0.0.1:1/v1", &secret);
+        let fixture = Fixture::new(&with_providers(&a, "", &key("k", "acme", OLD, "")));
+        let vertex = |file: &std::path::Path| {
+            format!(
+                "[providers.vertex-gemini]\nkind = \"vertex-gemini\"\nproject = \"p\"\nregion = \"us-central1\"\n\
+                 binding = \"b\"\nservice_account_file = \"{}\"\n",
+                file.display()
+            )
+        };
+        let account = directory.join("sa.json");
+        for contents in [None, Some("")] {
+            if let Some(contents) = contents {
+                std::fs::write(&account, contents).unwrap();
+            }
+            fixture.write(&with_providers(
+                &format!("{a}{}", vertex(&account)),
+                "",
+                &key("k", "acme", OLD, ""),
+            ));
+            let outcome = fixture.reload();
+            let Outcome::Rejected { issues, .. } = outcome else {
+                // Without the feature the file is refused whole, which is also a
+                // rejection; anything applied is the defect.
+                panic!("a missing or empty service-account file must reject");
+            };
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path.ends_with(".service_account_file")),
+                "{issues:?}"
+            );
+        }
+        assert_eq!(fixture.reloader.status().router_generation, 0);
         let _ = std::fs::remove_dir_all(directory);
     }
 
