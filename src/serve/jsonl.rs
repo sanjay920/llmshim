@@ -21,6 +21,10 @@ use std::time::Duration;
 
 /// Lines that may wait for the writer before new ones are dropped.
 const QUEUE_LINES: usize = 8192;
+/// Lines dropped because the writer fell behind, by `log`.
+pub(crate) const LINES_DROPPED: &str = "llmshim_log_lines_dropped_total";
+/// Lines the destination refused (a full disk, a closed pipe), by `log`.
+pub(crate) const WRITE_FAILURES: &str = "llmshim_log_write_failures_total";
 
 enum Message {
     Line(String),
@@ -31,6 +35,8 @@ enum Message {
 
 struct Inner {
     name: String,
+    /// `"access"` or `"usage"`: the `log` label of the `/metrics` series.
+    log: &'static str,
     sender: Mutex<Option<SyncSender<Message>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     dropped: AtomicU64,
@@ -75,8 +81,10 @@ pub(crate) struct JsonLines {
 
 impl JsonLines {
     /// `"stdout"`, or an absolute file path created owner-only (0600) and
-    /// appended to. An existing file keeps its mode.
-    pub(crate) fn open(target: &str) -> Result<Self, String> {
+    /// appended to. An existing file keeps its mode. `log` names which log this
+    /// is (`"access"` or `"usage"`) in the `/metrics` series its drops and write
+    /// failures feed.
+    pub(crate) fn open(target: &str, log: &'static str) -> Result<Self, String> {
         let writer: Box<dyn Write + Send> = if target == "stdout" {
             Box::new(std::io::stdout())
         } else {
@@ -93,21 +101,34 @@ impl JsonLines {
                     .map_err(|error| format!("cannot open {target}: {}", error.kind()))?,
             )
         };
-        Ok(Self::spawn(target.to_owned(), writer, QUEUE_LINES))
+        Ok(Self::spawn(target.to_owned(), log, writer, QUEUE_LINES))
     }
 
     #[cfg(test)]
     pub(crate) fn to_writer(writer: Box<dyn Write + Send>) -> Self {
-        Self::spawn("log".to_owned(), writer, QUEUE_LINES)
+        Self::spawn("log".to_owned(), "test", writer, QUEUE_LINES)
     }
 
     #[cfg(test)]
-    fn to_writer_with_capacity(writer: Box<dyn Write + Send>, capacity: usize) -> Self {
-        Self::spawn("log".to_owned(), writer, capacity)
+    fn to_writer_with_capacity(
+        writer: Box<dyn Write + Send>,
+        capacity: usize,
+        log: &'static str,
+    ) -> Self {
+        Self::spawn("log".to_owned(), log, writer, capacity)
     }
 
-    fn spawn(name: String, mut writer: Box<dyn Write + Send>, capacity: usize) -> Self {
+    fn spawn(
+        name: String,
+        log: &'static str,
+        mut writer: Box<dyn Write + Send>,
+        capacity: usize,
+    ) -> Self {
         let (sender, receiver) = sync_channel::<Message>(capacity);
+        // Present from the start at zero, so a rate or an absent-series alert
+        // works before the first drop.
+        crate::gateway::metrics::add(LINES_DROPPED, &[("log", log)], 0);
+        crate::gateway::metrics::add(WRITE_FAILURES, &[("log", log)], 0);
         let failed = Arc::new(AtomicU64::new(0));
         let (worker_failed, worker_name) = (failed.clone(), name.clone());
         let worker = std::thread::Builder::new()
@@ -121,13 +142,14 @@ impl JsonLines {
                             let written = writer
                                 .write_all(line.as_bytes())
                                 .and_then(|()| writer.flush());
-                            if written.is_err()
-                                && worker_failed.fetch_add(1, Ordering::Relaxed) == 0
-                            {
-                                eprintln!(
-                                    "warning: {worker_name}: cannot write log lines; further \
-                                     failures are counted, not printed"
-                                );
+                            if written.is_err() {
+                                crate::gateway::metrics::incr(WRITE_FAILURES, &[("log", log)]);
+                                if worker_failed.fetch_add(1, Ordering::Relaxed) == 0 {
+                                    eprintln!(
+                                        "warning: {worker_name}: cannot write log lines; \
+                                         further failures are counted, not printed"
+                                    );
+                                }
                             }
                         }
                         Message::Barrier(acknowledge) => {
@@ -148,6 +170,7 @@ impl JsonLines {
         Self {
             inner: Arc::new(Inner {
                 name,
+                log,
                 sender: Mutex::new(sender),
                 worker: Mutex::new(worker),
                 dropped: AtomicU64::new(0),
@@ -171,6 +194,7 @@ impl JsonLines {
         match sender.try_send(Message::Line(line)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                crate::gateway::metrics::incr(LINES_DROPPED, &[("log", self.inner.log)]);
                 if self.inner.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
                     eprintln!(
                         "warning: {}: the log writer is not keeping up; dropping lines \
@@ -246,7 +270,7 @@ mod tests {
         let path = dir.join("out.jsonl");
         let target = path.to_str().unwrap();
         for index in 0..2 {
-            let log = JsonLines::open(target).unwrap();
+            let log = JsonLines::open(target, "test").unwrap();
             log.write(&serde_json::json!({"n": index}));
             log.close();
         }
@@ -263,7 +287,7 @@ mod tests {
                 0
             );
         }
-        assert!(JsonLines::open(dir.join("missing/dir/log").to_str().unwrap()).is_err());
+        assert!(JsonLines::open(dir.join("missing/dir/log").to_str().unwrap(), "test").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -332,6 +356,7 @@ mod tests {
                 out: out.clone(),
             }),
             4,
+            "test_overflow",
         );
         let started = Instant::now();
         for n in 0..200 {
@@ -352,6 +377,18 @@ mod tests {
         log.sync();
         let delivered = out.text().lines().count() as u64;
         assert_eq!(delivered + log.dropped(), 200);
+        // The same drops are a /metrics series, by log (this test has a label of
+        // its own, so the count is exact even though the registry is global). After
+        // the gate is open: a failing assertion above this point would leave the
+        // writer stalled and the test hanging on its drop instead of failing.
+        let text = crate::gateway::metrics::render();
+        let series = text
+            .lines()
+            .find(|line| line.starts_with("llmshim_log_lines_dropped_total{log=\"test_overflow\"}"))
+            .unwrap_or_else(|| panic!("no dropped series in {text}"));
+        let counted: u64 = series.rsplit(' ').next().unwrap().parse().unwrap();
+        assert_eq!(counted, log.dropped(), "{series}");
+
         assert!(out
             .text()
             .lines()
@@ -369,11 +406,18 @@ mod tests {
                 Ok(())
             }
         }
-        let log = JsonLines::to_writer(Box::new(Broken));
+        let log = JsonLines::to_writer_with_capacity(Box::new(Broken), QUEUE_LINES, "test_broken");
         for n in 0..5 {
             log.write(&serde_json::json!({"n": n}));
         }
         log.sync();
         assert_eq!(log.failed(), 5);
+        let text = crate::gateway::metrics::render();
+        let series = text
+            .lines()
+            .find(|line| line.starts_with("llmshim_log_write_failures_total{log=\"test_broken\"}"))
+            .unwrap_or_else(|| panic!("no failure series in {text}"));
+        let counted: u64 = series.rsplit(' ').next().unwrap().parse().unwrap();
+        assert_eq!(counted, 5, "{series}");
     }
 }

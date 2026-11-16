@@ -118,7 +118,10 @@ A test replays the ledger's own sequence (80, 80, then 15) against the record.
 - **The writer never blocks the gateway.** Records are queued (8192 of them) for
   a thread that does the writing, so a stalled pipe or a slow disk cannot hold a
   request, a concurrency permit or a lock inside the gateway. When the queue is
-  full new lines are dropped and counted, the first drop is reported on stderr,
+  full new lines are dropped and counted (`llmshim_log_lines_dropped_total{log=...}`
+  and, for a destination that refuses a write,
+  `llmshim_log_write_failures_total{log=...}` in `/metrics`, `log` being `access` or
+  `usage`), the first drop is reported on stderr,
   and the totals are reported at shutdown; a write that fails is counted the
   same way. Each line is one `write_all`, so a failure cannot leave half a line
   for the next to be glued to. Shutdown writes what is queued before exiting.

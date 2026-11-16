@@ -244,7 +244,7 @@ pub async fn build_app(
         .logging
         .access_log
         .as_deref()
-        .map(super::jsonl::JsonLines::open)
+        .map(|target| super::jsonl::JsonLines::open(target, "access"))
     {
         Some(Ok(log)) => {
             logs.push(log.clone());
@@ -273,7 +273,7 @@ pub async fn build_app(
         .logging
         .usage_log
         .as_deref()
-        .map(super::jsonl::JsonLines::open)
+        .map(|target| super::jsonl::JsonLines::open(target, "usage"))
     {
         Some(Ok(log)) => {
             logs.push(log.clone());
