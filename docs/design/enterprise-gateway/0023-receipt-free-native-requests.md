@@ -12,53 +12,77 @@ back, and persist or restore *replay receipts* (a reasoning block's signature, a
 tool call's wire ids) so a later turn can be replayed faithfully (0013's
 "Multi-model conversations", `CLAUDE.md`). Receipt work is blocking file I/O, so
 it runs on a small executor (`src/proxy/wire/mod.rs`): **two** workers, **one**
-at a time for ingress, **8** ingress and **4** egress slots, each class taken
-**without waiting**; a request beyond them is answered `503 native replay
-metadata is busy`.
+at a time for ingress, **8** ingress and **4** egress slots. A slot is taken
+without waiting; the worker permits are then awaited for up to five seconds. A
+request that cannot get them is answered `503 native replay metadata is busy;
+retry the request` with `Retry-After: 1`, and a store lock that times out maps
+to the same 503.
 
 The benchmark (0018) measured the consequence: above a dozen requests in flight
 the native `/v1/chat/completions` wire answered 503 to 15 % of requests at 32
 concurrent and 27 % at 64, each in about half a millisecond, and this is now the
 dominant limit on that wire. 0018 supposed that "the native wire stores replay
-metadata for every answer". Reading the code shows the cause is narrower and the
-fix therefore larger in effect:
+metadata for every answer". Reading the code shows the cause is narrower:
 
-- **Egress** (`response_from_chat`): the chat and Messages wires call
-  `Receipts::put` only for a tool call or a reasoning block. An ordinary text
-  answer never touches the store, yet it still takes an egress slot and a
-  blocking-thread hop, because the whole conversion is handed to the executor.
-- **Ingress** (`request_to_chat_with_limits`): `Receipts::get` is called only for
-  a request that carries an owned tool id or a reasoning handle to restore. A first
-  turn, or any turn whose history is plain text, never reads the store, yet it
-  takes an ingress slot (and the single ingress worker, so ingress is serial).
+- **Egress** (`response_from_chat`): no wire calls `Receipts::put` for an
+  ordinary text answer. A tool call is stored for every wire
+  (`response.rs`, before the wire dispatch), and a reasoning block on the Chat,
+  Messages, Gemini (text thoughts only) and Responses (`responses::retain`) wires.
+  A text answer takes an egress slot and a blocking-thread hop anyway, because the
+  whole conversion is handed to the executor.
+- **Ingress** (`request_to_chat_with_limits`): the reads, per wire, are
+  - Chat: `get_bounded` for **every assistant message** (a reasoning lookup, whether
+    or not a handle is present) and for every call in its `tool_calls`
+    (`import_call` looks the id up before it checks the `call_ls_` prefix, so a
+    legacy client id reads the store too);
+  - Messages: every `tool_use`, and `thinking`/`redacted_thinking` blocks;
+  - Gemini: only `thought` parts (`functionCall` ids are derived, with no read);
+  - Responses: the Chat path, plus `x-responses-reasoning` items.
+  So a first turn, or a history with no assistant turn, never reads the store; **any
+  multi-turn Chat or Responses conversation does**. The benchmark sends one user
+  message (`serve_bench.rs`), which is why it is the free case, and why this
+  change cannot be assumed to help a deployment whose callers replay history: for
+  those, ingress is unchanged and only egress (text answers) is freed.
+- **The Responses wire's `replay_metadata` step** takes a second ingress slot (and
+  the single ingress worker) but does **no receipt I/O**: it transforms the request
+  for the target, filters reasoning and merges messages. It is pure.
 
-So the executor is occupied by work that does no receipt I/O at all. Both
-conversions are otherwise pure and cheap.
+So the executor is occupied by work that does no receipt I/O at all, in the
+benchmark's case entirely and in a replaying caller's case for every text answer
+and for the Responses metadata step.
 
 ## The rule
 
 **Run the conversion first without any store; fall back to the executor only if
 the conversion actually asks for the store.**
 
-- `Receipts` gains a private *tripwire* mode (`Receipts::tripwire()`): a value
-  with no root whose `get`, `get_bounded` and `put` return a fixed
-  `needs-a-receipt` error before touching anything.
-- The executor gains `run_free_first(kind, operation)`: it calls
-  `operation(&Receipts::tripwire())` **inline**, on the request's own task. If that
-  succeeds, or fails for any reason other than the tripwire, that result is the
-  result (an ordinary error is returned as the executor's `Failed`, exactly as
-  today). If it fails *because* the tripwire was hit, the same operation runs
-  again through the executor against the real store, exactly as it does today
-  (same slots, same refusal when busy).
-- Ingress, unary egress and the streaming chat/Messages egress use it. The
-  Responses wire's replay-metadata step and its streaming egress keep the
-  executor: they write item snapshots for every answer by design.
+- `Receipts` gains a private *tripwire* mode (`Receipts::tripwire()`): a value with
+  no root whose `get`, `get_bounded` and `put` return an error **before touching
+  anything** (`get_inner` and `put` check the mode first). It is a `Receipts`, not a
+  new trait, because the conversions take `&Receipts`. It records that it was hit
+  in an `AtomicBool` that `run_free_first` reads: the decision never parses an
+  error message, so a step that wraps or reformats errors cannot turn a tripwire
+  hit into a user-visible 400. The tripwire **never returns `Ok(None)`**: the
+  Responses restore reads `None` as an expired receipt and drops the item, and the
+  Chat import reads it as a legacy id and passes the call through, each a silent
+  wrong success.
+- `ReceiptExecutor::run_free_first(kind, operation)` calls
+  `operation(&Receipts::tripwire())` **inline**, on the request's own task, inside
+  `catch_unwind` (the executor's `spawn_blocking` turns a panic into a fixed
+  `Failed` answer today; inline must not unwind the request task). If the tripwire
+  was not hit, that result is the result: success, or an ordinary error returned as
+  the executor's `Failed` exactly as today. If it was hit, the same operation runs
+  again through the executor against the request's real store (an explicit
+  `Arc<Receipts>` extension still wins), with the same slots and the same refusal
+  when busy.
+- Ingress, unary egress and the streaming egress of the Chat, Messages and Gemini
+  wires use it (the Gemini stream shares the unary path's `response_from_chat` call).
+  The Responses wire's streaming egress and `retain` use it too. The Responses
+  `replay_metadata` step, being pure, runs **inline with no executor** at all.
 
-The decision is made by the code that would do the I/O, not by a predicate
-written beside it, so it cannot disagree with it: a conversion that needs a
-receipt reaches `get`/`put` and is sent to the executor, one that does not never
-does. There is no list of "receipt-bearing" keys to keep in step with the
-conversion.
+The decision is made by the code that would do the I/O, not by a predicate written
+beside it, so it cannot disagree with it: there is no list of "receipt-bearing"
+keys to keep in step with the conversion.
 
 ## What it must not change
 
@@ -75,28 +99,42 @@ conversion.
   native wires stop taking executor slots for receipt-free work, which is the point;
   nothing about receipts that exist or are required changes.
 
-## Cost, and why inline is acceptable
+## Cost, and what the executor provided besides I/O
 
-The inline attempt runs conversion on the async task. It is bounded by the same
-request-size and JSON-complexity limits that already apply to parsing, which is also
-inline; for a request that then needs the store the conversion is done twice (the
-second time on the blocking pool). That doubled CPU applies to requests that
-carry tool calls or reasoning, which also do blocking I/O, so it is small next to
-them. It is measured, not assumed (below).
+- **Doubled CPU** only for a request that needs the store (the inline attempt is
+  discarded), which also does blocking I/O; small next to it.
+- **Concurrency.** The single ingress worker serialised all ingress conversion;
+  inline, conversion runs concurrently, bounded by the body limit, the JSON
+  complexity limit and `enforce_canonical_bounds`. A conversion can inflate (the
+  Messages path clones, the Responses restore expands), so peak memory per request
+  exceeds the body: the benchmark's memory column is re-read after the change.
+- **Cancellation.** The executor stops queued work after a client disconnect; inline
+  there is no queue to wait in.
+- **The lock timeout** (`with_http_lock_timeout`) is thread-local and set only inside
+  the executor. The tripwire never locks, so it is not needed inline. **Invariant:**
+  a real store is never used inline, because its lock acquisition would fall back to
+  a blocking `lock_exclusive` on an async worker.
+- **A receipt-free request no longer creates the store directory or its lock file**
+  (`get` created them); a test asserting that the root exists after any request
+  changes.
 
 ## Tests
 
-- A tripwire `Receipts` refuses `get` and `put` without touching the filesystem
-  (the root need not exist).
-- Ingress and egress of a text-only exchange complete with the executor
-  saturated (every slot held): they were refused before.
-- A request with a tool result or reasoning handle, and an answer with a tool call
-  or reasoning block, still go through the executor and are refused when it is
-  saturated, and produce the same bytes as before.
-- A mutation check: making the tripwire permissive (it returns `Ok(None)`)
-  must fail the "tool result with an owned id still errors" test.
-- The benchmark is re-run (0018's method) and the row for the native wire under
-  concurrency is recorded beside the first two runs.
+- A tripwire `Receipts` refuses `get`, `get_bounded` and `put` without touching the
+  filesystem (the root need not exist) and never returns `Ok(None)`.
+- A text-only exchange (first turn; text answer) completes with every executor slot
+  held on the Chat, Messages and Gemini wires; the Responses `replay_metadata` step
+  takes no slot.
+- A multi-turn Chat request (an assistant message), a request with a tool result or
+  reasoning handle, and an answer with a tool call or reasoning block still go
+  through the executor, are refused when it is saturated, and produce the same
+  bytes as before (a corpus replayed both ways).
+- Mutation checks: a tripwire that returns `Ok(None)` must fail **both** the "tool
+  result with an owned id still errors" test and the "reasoning handle is not
+  silently dropped" test.
+- A conversion that panics returns the executor's fixed failure, inline too.
+- The benchmark is re-run (0018's method), recording the first-turn case it sends
+  and, new, a multi-turn case so the gain is not overstated.
 
 ## Not decided here
 
