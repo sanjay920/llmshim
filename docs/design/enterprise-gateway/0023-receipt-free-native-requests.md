@@ -157,5 +157,5 @@ keys to keep in step with the conversion.
    inline `replay_metadata`, and the tests above.
 3. **Done:** the benchmark re-run recorded in 0018 (third run). The first-turn case
    went from 15 % and 27 % refused at 32 and 64 concurrent to none; a request with two
-   earlier turns is refused 93 % of the time at 32 and 64, because every assistant turn
+   earlier turns is refused about 91 % of the time at 32 and 64, because every assistant turn
    is a locked store lookup (0018 lists options; they need their own note).

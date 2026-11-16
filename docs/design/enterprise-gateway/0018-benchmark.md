@@ -326,17 +326,19 @@ earlier runs sent (a single user message); the second carries two earlier turns.
 
 - **The first-turn case is fixed.** The native `/v1/chat/completions` wire answered every
   request at 32 and 64 concurrent (0 failed of about 560,000 and 550,000), where the
-  first and second runs refused 15 % and 27 %, and throughput there (37,500 and 36,600
-  req/s) is the same as the gateway's own `/v1/chat`. Added latency over the mock is
-  +0.57 ms at 32 and +1.19 ms at 64 (p50), equal to `/v1/chat`'s. Peak RSS after the
-  last phase is 104 MiB, against 105 MiB for the second run's longer-lived process:
+  second run refused 15 % and 27 % (the first run's native-wire failures there were
+  transport errors, not this 503), and throughput there (37,500 and 36,600 req/s) is
+  within 1 % of the gateway's own `/v1/chat`. Added latency over the mock is +0.57 ms
+  at 32 and +1.19 ms at 64 (p50), within 0.02 ms of `/v1/chat`'s. Peak RSS after the
+  last phase is 104 MiB, against 106 MiB at the end of the second run:
   the concurrent conversion 0023 allows did not show up in memory at this load (one
   small message; the memory gate in 0023 asks for a re-read with larger requests
   before a heavier workload is sized from it).
 - **A caller that replays history is not helped, and is hurt worse than the first run
   suggested.** With two earlier turns the native wire is slow even at one connection
-  (3,500 req/s against 6,200) and refuses **93 % of requests at 32 and 64**
-  (699,844 of 773,049; 749,204 of 819,244), while `/v1/chat` is unaffected. This is
+  (3,500 req/s against 6,200) and refuses **about 91 % of requests at 32 and 64**
+  (699,844 of 773,049, 90.5 %; 749,204 of 819,244, 91.5 %; the `requests` column counts
+  only answered requests, so the total is requests plus failed), while `/v1/chat` is unaffected. This is
   what 0023 predicted from the code, not a regression: the Chat wire looks every
   assistant turn up in the receipt store (a `get` that takes the store's lock and
   reads its index), so it needs the executor and its two workers and one serial
