@@ -69,10 +69,10 @@ server works.
   belongs behind a terminating proxy or service mesh.
 - Only `[[keys]]` reload (0012). Any other change needs a restart; the parsed
   configuration is immutable.
-- Process-wide settings still read the environment where they are consumed:
-  the shared HTTP client's retry and timeout variables, and the HTTP listener's
-  connection and header limits (`LLMSHIM_HTTP_*`). They default sensibly and are
-  listed in 0002.
+- The upstream HTTP client's retries, pool and deadlines, and the listener's
+  connection and header limits, come from `[upstream]` and `[server]` (0021): `serve`
+  reads none of the `LLMSHIM_MAX_RETRIES`, `LLMSHIM_UPSTREAM_*` or `LLMSHIM_HTTP_*`
+  variables. What is still read from the environment is listed in 0002.
 - The catalog is the vendored snapshot plus any local override files; `serve`
   makes no catalog refresh call at startup.
 - No logging sink beyond stderr banners. Structured request logs and traces are

@@ -572,8 +572,9 @@ and **never reads the environment** (`LLMSHIM_MAX_RETRIES`, `LLMSHIM_UPSTREAM_*`
 only drive `ShimClient::new()`); `Router::with_http_client` makes a router use it, and
 `bound_client` refuses a scoped router (`without_ambient_proxy`) paired with a client that honours
 ambient proxies. The client's pool settings also reach the scoped transport the cloud providers
-use. These are additive public APIs (a minor bump at the next release); `serve` will take its
-settings from `[upstream]` in slice 3, and the default pool for the shared client stays 4.
+use. These are additive public APIs (a minor bump at the next release); `serve` takes its
+settings from `[upstream]` (and the listener from `[server] max_connections`/`header_timeout_ms`),
+with a pool default that follows `limits.max_concurrency` (at least 256); the shared client keeps 4.
 
 ## Signed images (note 0019)
 

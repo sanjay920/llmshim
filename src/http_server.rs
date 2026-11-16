@@ -20,12 +20,22 @@ const MAX_HEADER_COUNT: usize = 100;
 const MAX_HTTP2_STREAMS: u32 = 128;
 
 #[derive(Clone, Copy)]
-struct HttpServerLimits {
+pub(crate) struct HttpServerLimits {
     maximum_connections: usize,
     header_timeout: Duration,
 }
 
 impl HttpServerLimits {
+    /// Explicit limits, for a server configured from a file: nothing is read
+    /// from the environment.
+    #[cfg(feature = "serve")]
+    pub(crate) fn new(maximum_connections: usize, header_timeout: Duration) -> Self {
+        Self {
+            maximum_connections,
+            header_timeout,
+        }
+    }
+
     fn from_env() -> Self {
         let maximum_connections = std::env::var("LLMSHIM_HTTP_MAX_CONNECTIONS")
             .ok()
@@ -203,7 +213,7 @@ pub(crate) async fn serve(
     .await
 }
 
-async fn serve_with_limits(
+pub(crate) async fn serve_with_limits(
     listener: tokio::net::TcpListener,
     application: axum::Router,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -229,8 +239,8 @@ pub(crate) async fn serve_tls(
     application: axum::Router,
     shutdown: impl Future<Output = ()> + Send + 'static,
     tls: axum_server::tls_rustls::RustlsConfig,
+    limits: HttpServerLimits,
 ) -> Result<(), String> {
-    let limits = HttpServerLimits::from_env();
     let acceptor =
         axum_server::tls_rustls::RustlsAcceptor::new(tls).handshake_timeout(limits.header_timeout);
     let mut server =
@@ -255,8 +265,8 @@ pub(crate) async fn serve_mtls(
     application: axum::Router,
     shutdown: impl Future<Output = ()> + Send + 'static,
     tls: axum_server::tls_rustls::RustlsConfig,
+    limits: HttpServerLimits,
 ) -> Result<(), String> {
-    let limits = HttpServerLimits::from_env();
     let acceptor = PeerCertAcceptor {
         inner: axum_server::tls_rustls::RustlsAcceptor::new(tls)
             .handshake_timeout(limits.header_timeout),

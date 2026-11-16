@@ -58,6 +58,8 @@ environment):
 | Caller keys | `KeyStore` | the hashed store in 0003 |
 | `LLMSHIM_PENALTY_SECS` | `penalty_duration()` | `serve` sets `limits.penalty_secs` (default 5, 1 to 3600) on the gateway's `RealDispatch` and attempt coordinator, so it never falls back to the variable. The gateway and proxy still read it per upstream 429, unchanged. |
 | `LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS` | `ReceiptExecutor` | `serve` builds its store with `DefaultReceiptStore::at(root, timeout)` from `state.receipt_lock_timeout_ms` (1 to 30000, default 2000). Without the argument the value was read once, when the store was built. The gateway and proxy still use `from_env`. |
+| `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`, `LLMSHIM_UPSTREAM_*`, `LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS` | shared HTTP client | `serve` builds the router's own client from `[upstream]` (`ShimClient::from_settings`, which reads no variable; 0021), so it never falls back to them. The proxy, the gateway and library users of `ShimClient::new` still read them, unchanged. |
+| `LLMSHIM_HTTP_MAX_CONNECTIONS`, `LLMSHIM_HTTP_HEADER_TIMEOUT_MS` | `http_server` | `serve` passes `[server] max_connections` and `header_timeout_ms` to both listeners (0021); the proxy and gateway entry points still read the variables. |
 | `LLMSHIM_TRUSTED_ORIGINS` | `OriginPolicy` | already had an env-free constructor, `from_csv`; `from_env` only handles the missing and non-Unicode cases. `from_csv("")` is an error, so `serve` uses `OriginPolicy::default()` for an empty list |
 
 Still read from the environment, to convert before `serve` can boot:
@@ -65,10 +67,7 @@ Still read from the environment, to convert before `serve` can boot:
 | Setting | Where | Notes |
 |---|---|---|
 | `LLMSHIM_GATEWAY_IDEMPOTENCY_TTL_SECS` | `distributed_from_env` | Single-instance mode carries it in `LocalParts`; the distributed path still reads it from the environment. |
-| `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`, `LLMSHIM_UPSTREAM_*`, `LLMSHIM_HTTP_*` | shared HTTP client | Process-wide, initialized once. Needs a per-router client before it can come from a file. |
 | `LLMSHIM_MAX_CONCURRENCY`, `LLMSHIM_QUEUE_TIMEOUT_MS` | `Backpressure::from_env` | Proxy only; `Backpressure::new` already takes values. |
-| `LLMSHIM_HTTP_MAX_CONNECTIONS`, `LLMSHIM_HTTP_HEADER_TIMEOUT_MS` | `http_server` | Inbound listener limits; read by the proxy and gateway entry points. |
-| `LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS` | shared HTTP client deadlines | Process-wide, with the `LLMSHIM_UPSTREAM_*` timeouts above. |
 | `LLMSHIM_NO_STRICT`, `LLMSHIM_NO_SCHEMA_NORMALIZATION`, `LLMSHIM_NO_SCHEMA_CACHE` | schema normalization | Debugging bypasses; process-wide, read at use. A deployment that sets them changes what the server sends upstream, so `serve` documents them as unsupported settings. |
 
 ## Quirks found and preserved
