@@ -69,8 +69,8 @@ Phase 0: a production server mode
       breaker, limiter and application assembly (0002)
 - [x] The last inventory rows of 0002 (the HTTP client and the listener limits) come
       from the file (0021): `[upstream]` and `[server] max_connections` /
-      `header_timeout_ms`. The benchmark re-run that measures the pool change is
-      the one open piece of that note
+      `header_timeout_ms`. The benchmark re-run confirmed the pool finding is
+      resolved for `serve` (0018); the replay-receipt executor is the one limit left
 - [x] `llmshim serve` boots the single-instance gateway from the file, including
       hashed caller keys (0004)
 - [x] Bedrock, Vertex and Azure configurable from the file (0020), behind
@@ -97,9 +97,9 @@ Phase 0: a production server mode
 - [x] The failure-mode table (0014), with outage-survival tests for losing Redis
       (before and during a request) and for `SIGTERM`; its "Not yet tested" list
       is what remains
-- [x] Reproducible benchmark (0018). It found two limits that are open items:
-      the upstream connection pool (4 idle per host, shared client) and the
-      replay-receipt executor (8 ingress and 4 egress slots); neither is changed yet
+- [x] Reproducible benchmark (0018). It found two limits: the upstream connection
+      pool (resolved for `serve` by 0021, re-measured) and the replay-receipt
+      executor (8 ingress and 4 egress slots), still open
 - [x] Configuration-contract tightenings, a structure-only `--check` and a
       checked-in JSON Schema (see "Review follow-ups"; 0013)
 - [x] Pull-request CI for every build, including the Redis-backed tests that are

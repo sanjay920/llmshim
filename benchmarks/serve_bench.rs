@@ -34,6 +34,8 @@ struct Args {
     duration: Duration,
     warmup: Duration,
     think: Duration,
+    /// `[upstream] pool_max_idle_per_host`; unset means the server's own default.
+    pool: Option<u32>,
     binary: String,
     json: Option<String>,
 }
@@ -44,6 +46,7 @@ fn parse() -> Args {
         duration: Duration::from_secs(15),
         warmup: Duration::from_secs(3),
         think: Duration::ZERO,
+        pool: None,
         binary: "target/release/llmshim".into(),
         json: None,
     };
@@ -75,6 +78,7 @@ fn parse() -> Args {
                     value().parse().unwrap_or_else(|_| usage("bad --think-ms")),
                 )
             }
+            "--pool" => args.pool = Some(value().parse().unwrap_or_else(|_| usage("bad --pool"))),
             "--bin" => args.binary = value(),
             "--json" => args.json = Some(value()),
             "-h" | "--help" => usage(""),
@@ -90,7 +94,7 @@ fn usage(problem: &str) -> ! {
     }
     eprintln!(
         "usage: serve_bench [--concurrency N,N,...] [--duration SECS] [--warmup SECS] \
-         [--think-ms MS] [--bin PATH] [--json FILE]"
+         [--think-ms MS] [--pool N] [--bin PATH] [--json FILE]"
     );
     std::process::exit(if problem.is_empty() { 0 } else { 2 });
 }
@@ -103,7 +107,10 @@ fn completion() -> String {
     .to_string()
 }
 
-async fn mock(think: Duration) -> String {
+/// The mock upstream, and a count of the connections it has accepted: what the
+/// gateway (or the client, in the direct phase) opened to it, however it came to.
+async fn mock(think: Duration) -> (String, Arc<std::sync::atomic::AtomicU64>) {
+    use axum::serve::ListenerExt;
     let body = Arc::new(completion());
     let app = axum::Router::new().route(
         "/chat/completions",
@@ -117,10 +124,15 @@ async fn mock(think: Duration) -> String {
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = accepted.clone();
+    let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", bound.local_addr().unwrap());
+    let listener = bound.tap_io(move |_| {
+        counter.fetch_add(1, Ordering::Relaxed);
+    });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    url
+    (url, accepted)
 }
 
 struct Phase {
@@ -138,6 +150,9 @@ struct Phase {
     mean_us: u64,
     /// The serve process's peak resident set during this phase, when sampled.
     peak_kb: Option<u64>,
+    /// Connections the mock accepted during this phase, warm-up included: what
+    /// was opened to the upstream (0021).
+    mock_connections: u64,
 }
 
 impl Phase {
@@ -288,6 +303,7 @@ async fn drive(
             all.iter().sum::<u64>() / all.len() as u64
         },
         peak_kb: sampler.map(|handle| handle.join().unwrap_or(0)),
+        mock_connections: 0,
     }
 }
 
@@ -344,7 +360,7 @@ async fn main() {
         );
         std::process::exit(2);
     }
-    let upstream = mock(args.think).await;
+    let (upstream, accepted) = mock(args.think).await;
 
     let dir = std::env::temp_dir().join(format!("llmshim-serve-bench-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -355,8 +371,11 @@ async fn main() {
             "version = 1\n[server]\nport = 0\n[state]\nreceipts_dir = \"{}\"\n\
              [providers.inference]\nkind = \"openai-compatible\"\nbase_url = \"{upstream}\"\n\
              api_key = {{ env = \"BENCH_UPSTREAM_KEY\" }}\n\
-             [[keys]]\nname = \"bench\"\ntenant = \"bench\"\nsecret = {{ env = \"BENCH_CALLER_KEY\" }}\n",
-            dir.join("receipts").display()
+             [[keys]]\nname = \"bench\"\ntenant = \"bench\"\nsecret = {{ env = \"BENCH_CALLER_KEY\" }}\n{}",
+            dir.join("receipts").display(),
+            args.pool.map_or(String::new(), |n| format!(
+                "[upstream]\npool_max_idle_per_host = {n}\n"
+            ))
         ),
     )
     .unwrap();
@@ -413,7 +432,9 @@ async fn main() {
         if !levels.is_empty() {
             settle(dirty).await;
         }
-        let direct = drive(
+        let opened = || accepted.load(Ordering::Relaxed);
+        let before = opened();
+        let mut direct = drive(
             "mock directly",
             &format!("{upstream}/chat/completions"),
             None,
@@ -422,8 +443,10 @@ async fn main() {
             None,
         )
         .await;
+        direct.mock_connections = opened() - before;
         settle(false).await;
-        let native = drive(
+        let before = opened();
+        let mut native = drive(
             "/v1/chat/completions",
             &format!("{base}/v1/chat/completions"),
             Some(KEY),
@@ -432,8 +455,10 @@ async fn main() {
             Some(pid),
         )
         .await;
+        native.mock_connections = opened() - before;
         settle(!native.failures.is_empty()).await;
-        let own = drive(
+        let before = opened();
+        let mut own = drive(
             "/v1/chat",
             &format!("{base}/v1/chat"),
             Some(KEY),
@@ -442,6 +467,7 @@ async fn main() {
             Some(pid),
         )
         .await;
+        own.mock_connections = opened() - before;
         dirty = !own.failures.is_empty() || !native.failures.is_empty();
         levels.push((direct, native, own));
     }
@@ -470,29 +496,31 @@ async fn main() {
     );
     println!(
         "- load: closed loop at each listed number of concurrent connections, {}s measured after {}s warm-up; \
-         mock think time {} ms; client, mock and gateway on one machine\n",
+         mock think time {} ms; client, mock and gateway on one machine\n- gateway `[upstream] pool_max_idle_per_host`: {}\n",
         args.duration.as_secs(),
         args.warmup.as_secs(),
-        args.think.as_millis()
+        args.think.as_millis(),
+        args.pool.map_or("unset (the server's default: follows the concurrency, at least 256)".to_string(), |n| n.to_string())
     );
     println!(
-        "| connections | path | requests | failed | req/s | p50 | p99 | added p50 | added p99 | peak RSS |\n\
-         | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        "| connections | path | requests | failed | req/s | p50 | p99 | added p50 | added p99 | peak RSS | upstream connections |\n\
+         | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
     let ms = |us: u64| us as f64 / 1000.0;
     for (direct, native, own) in &levels {
         println!(
-            "| {} | mock directly | {} | {} | {:.0} | {:.2} ms | {:.2} ms | | | |",
+            "| {} | mock directly | {} | {} | {:.0} | {:.2} ms | {:.2} ms | | | | {} |",
             direct.concurrency,
             direct.requests,
             direct.errors,
             direct.rps(),
             ms(direct.p50_us),
-            ms(direct.p99_us)
+            ms(direct.p99_us),
+            direct.mock_connections
         );
         for phase in [native, own] {
             println!(
-                "| {} | {} | {} | {} | {:.0} | {:.2} ms | {:.2} ms | {:+.2} ms | {:+.2} ms | {:.1} MiB |",
+                "| {} | {} | {} | {} | {:.0} | {:.2} ms | {:.2} ms | {:+.2} ms | {:+.2} ms | {:.1} MiB | {} |",
                 phase.concurrency,
                 phase.name,
                 phase.requests,
@@ -502,10 +530,16 @@ async fn main() {
                 ms(phase.p99_us),
                 ms(phase.p50_us) - ms(direct.p50_us),
                 ms(phase.p99_us) - ms(direct.p99_us),
-                phase.peak_kb.unwrap_or(0) as f64 / 1024.0
+                phase.peak_kb.unwrap_or(0) as f64 / 1024.0,
+                phase.mock_connections
             );
         }
     }
+    println!(
+        "\n`upstream connections` is how many connections the mock accepted during the phase \
+         (warm-up included): what was opened to the upstream, by the client directly in the \
+         first row of a level and by the gateway in the others."
+    );
     println!(
         "\n**Memory (resident set of the serve process):** {:.1} MiB idle before any load, {:.1} MiB after the last phase.",
         idle_kb as f64 / 1024.0,
@@ -538,7 +572,7 @@ async fn main() {
                 "failures": p.failures.iter().map(|(s, (n, us))| (s.to_string(), json!({"count": n, "total_us": us}))).collect::<serde_json::Map<_, _>>(),
                 "first_failure": p.sample, "rps": p.rps(),
                 "p50_us": p.p50_us, "p99_us": p.p99_us, "mean_us": p.mean_us,
-                "peak_rss_kib": p.peak_kb})
+                "peak_rss_kib": p.peak_kb, "mock_connections": p.mock_connections})
         };
         let report = json!({"date": date, "commit": sha, "rustc": rustc, "host": host, "cpu": cpu(),
             "cores": cores, "open_file_limit": open_files, "duration_secs": args.duration.as_secs(),

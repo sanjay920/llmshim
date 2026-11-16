@@ -1,11 +1,14 @@
 # 0021: The upstream HTTP client and listener limits from the file
 
-Status: slices 2 and 3 implemented: the library (`ClientSettings`,
-`ShimClient::from_settings`, `Router::with_http_client`) and the file's `[upstream]`
-and `[server]` keys, built into the router and the listeners. `serve` no longer reads
-`LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`, `LLMSHIM_UPSTREAM_*`,
-`LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS` or `LLMSHIM_HTTP_*`; the benchmark re-run is slice
-4. A contract note, written before any code (README working rule 3).
+Status: implemented. The library (`ClientSettings`, `ShimClient::from_settings`,
+`Router::with_http_client`), the file's `[upstream]` and `[server]` keys built into the
+router and the listeners, and the benchmark re-run, recorded in 0018 beside the first:
+at 32 and 64 concurrent requests `/v1/chat` now answers every request at 37,000 to
+39,000 per second with a handful of upstream connections, where the first run failed
+and collapsed; an isolating run (the same binary, `--pool 4`) brings the collapse back
+and shows a connection opened per request (16,000 in a phase). `serve` no longer reads `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`,
+`LLMSHIM_UPSTREAM_*`, `LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS` or `LLMSHIM_HTTP_*`. A contract
+note, written before any code (README working rule 3).
 
 ## Why
 
@@ -149,6 +152,6 @@ the other keys are this note's.
    the schema, building the router's client from them, and process tests (a setting
    takes effect, a canary variable does not, an invalid value is refused by path,
    `--check` agrees).
-4. The harness's per-phase accepted-connection count; the benchmark re-run, recorded
+4. Done: the harness's per-phase accepted-connection count; the benchmark re-run, recorded
    in 0018 beside the first; the rows of 0002; the roadmap; and a pointer from 0020's
    "not decided" entry on an inference-only proxy switch to `[upstream] ambient_proxy`.

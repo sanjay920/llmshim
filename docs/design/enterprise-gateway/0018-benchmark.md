@@ -100,7 +100,8 @@ history.)
 
 ## Findings
 
-The benchmark found two limits; neither is changed here, because each is shared
+The benchmark found two limits; neither was changed in the commit that published
+this run (the pool was changed afterwards, by 0021: see the second run below), because each is shared
 code with its own decision.
 
 1. **Connections to the upstream fail once more than a few requests are in flight,
@@ -138,7 +139,8 @@ code with its own decision.
    298,779 in the run above, each in 0.3 ms). Whether an answer with no reasoning
    block or tool call needs a receipt at all is the question to settle.
 
-Both are on the roadmap. Until they are settled, a deployment should not be sized
+*(Superseded in part by the second run below: the pool is resolved for `serve`; the
+receipt executor is not.)* Both are on the roadmap. Until they are settled, a deployment should not be sized
 from a throughput measured above one connection.
 
 ## Not measured
@@ -146,3 +148,128 @@ from a throughput measured above one connection.
 Think time (a real provider's latency hides added latency), streaming, a fleet
 (Redis in the path), TLS termination, and a longer soak. `--think-ms` exists for
 the first; the others are future runs of the same harness.
+
+## Second run (2026-11-16, commit 4327310): after 0021
+
+The change 0021 made (the router's own client, with a pool that follows the
+concurrency served: 256 here) was measured with the same harness, on the same
+machine, with one addition: the harness now counts the connections the mock
+accepted in each phase, so the cause no longer rests on a hand-read `TIME_WAIT`
+figure. The same command; the only differences from the first run are the code
+and that extra column.
+
+- date: 2026-11-16T16:48:07Z
+- commit: 4327310
+- build: release, rustc 1.97.0 (2d8144b78 2026-07-07)
+- host: Darwin 27.2.0 arm64, Apple M5 Pro, 18 logical cores, open-file limit 1048576
+- load: closed loop at each listed number of concurrent connections, 15s measured after 3s warm-up; mock think time 0 ms; client, mock and gateway on one machine
+
+| connections | path | requests | failed | req/s | p50 | p99 | added p50 | added p99 | peak RSS | upstream connections |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | mock directly | 319409 | 0 | 21292 | 0.05 ms | 0.06 ms | | | | 1 |
+| 1 | /v1/chat/completions | 76613 | 0 | 5107 | 0.19 ms | 0.23 ms | +0.15 ms | +0.17 ms | 93.3 MiB | 1 |
+| 1 | /v1/chat | 98232 | 0 | 6548 | 0.15 ms | 0.18 ms | +0.10 ms | +0.12 ms | 93.4 MiB | 0 |
+| 8 | mock directly | 1395183 | 0 | 93006 | 0.08 ms | 0.14 ms | | | | 8 |
+| 8 | /v1/chat/completions | 307918 | 67 | 20526 | 0.39 ms | 0.53 ms | +0.30 ms | +0.39 ms | 97.1 MiB | 7 |
+| 8 | /v1/chat | 378115 | 0 | 25206 | 0.31 ms | 0.45 ms | +0.23 ms | +0.31 ms | 94.9 MiB | 0 |
+| 32 | mock directly | 1803541 | 0 | 120228 | 0.26 ms | 0.41 ms | | | | 32 |
+| 32 | /v1/chat/completions | 485508 | 84800 | 32365 | 0.89 ms | 1.23 ms | +0.63 ms | +0.82 ms | 101.4 MiB | 13 |
+| 32 | /v1/chat | 555488 | 0 | 37030 | 0.84 ms | 1.57 ms | +0.58 ms | +1.15 ms | 101.9 MiB | 11 |
+| 64 | mock directly | 1839764 | 0 | 122643 | 0.52 ms | 0.81 ms | | | | 65 |
+| 64 | /v1/chat/completions | 451686 | 167729 | 30110 | 1.71 ms | 2.19 ms | +1.20 ms | +1.37 ms | 105.1 MiB | 24 |
+| 64 | /v1/chat | 585981 | 0 | 39063 | 1.63 ms | 2.09 ms | +1.11 ms | +1.28 ms | 106.1 MiB | 5 |
+
+`upstream connections` is how many connections the mock accepted during the phase (warm-up included): what was opened to the upstream, by the client directly in the first row of a level and by the gateway in the others.
+
+**Memory (resident set of the serve process):** 11.0 MiB idle before any load, 106.1 MiB after the last phase.
+
+Failures at 8 connections on /v1/chat/completions: 503: 67 (status: count, 0 = transport error); a failed request took 0.4 ms on average; first body: 503: {"error":{"code":null,"message":"native replay metadata is busy; retry the request","param":null,"type":"api_error"}}
+
+Failures at 32 connections on /v1/chat/completions: 503: 84800 (status: count, 0 = transport error); a failed request took 0.5 ms on average; first body: 503: {"error":{"code":null,"message":"native replay metadata is busy; retry the request","param":null,"type":"api_error"}}
+
+Failures at 64 connections on /v1/chat/completions: 503: 167729 (status: count, 0 = transport error); a failed request took 1.1 ms on average; first body: 503: {"error":{"code":null,"message":"native replay metadata is busy; retry the request","param":null,"type":"api_error"}}
+
+### What changed, and what did not
+
+- **The connection churn is gone.** Every 502 `error sending request` of the first
+  run is absent, at every level. On `/v1/chat` there are **no failures at 32 and 64
+  connections**, throughput there is **37,000 and 39,000 requests per second** (the
+  first run: 466 and 5), and the gateway opened **11 and 5 connections to the
+  upstream in the whole phase** (warm-up included), where a connection per request
+  would have been hundreds of thousands. (The gateway's upstream pool persists
+  across phases and levels, so these are the connections opened *in* each phase, on
+  top of idle ones inherited from the one before: the `/v1/chat` phase at 64
+  inherits what the native phase just opened, which is why it shows 5, and the
+  gateway never held 64 upstream connections at once here. The conclusion is that
+  it no longer fails at tens in flight, not that 5 is a cold-start cost.) Added latency is **+0.58 ms at p50 and
+  +1.15 ms at p99 at 32 connections**, and +1.11 / +1.28 ms at 64, with every
+  request answered. This comparison changes the code and the pool default
+  together, so it is consistent with the pool explanation but does not isolate it;
+  the isolating run below does.
+- **The other finding is now the only one left, and larger.** The native wire
+  (`/v1/chat/completions`) still answers 503 `native replay metadata is busy`: 67 of
+  308,000 at 8 connections, **84,800 of 570,000 (15 %) at 32 and 167,000 of 619,000
+  (27 %) at 64**, each refused in about half a millisecond. That is the receipt
+  executor's 8 ingress and 4 egress slots (finding 2); it was hidden before by the
+  connection failures. Throughput on the native wire counts only the requests that
+  were answered 2xx; **the latency and "added" columns of those rows describe only
+  those survivors (85 % at 32, 73 % at 64) and are not the gateway's cost on that
+  route; do not quote them**.
+- **A caveat on the comparison.** Both runs are one machine, with the client, the
+  mock and the gateway sharing it; the figures are for comparing the two runs, not
+  absolute capacity. The mock is HTTP/1.1; an HTTP/2 provider would not have shown
+  the first run's failure at all.
+- **Memory** is about 11 MiB idle and 93 to 106 MiB under load, as before.
+
+### The isolating run: the same binary, the pool set back to 4
+
+The second run changes the code and the pool default together. To isolate the
+pool, the harness gained `--pool N`, which writes `[upstream]
+pool_max_idle_per_host = N` into the gateway's file; this run is the **same
+release binary** as the second run (the example alone was rebuilt), with only that
+one setting changed to the old value of 4 (commit 3d9646b, 2026-11-16):
+
+- date: 2026-11-16T16:52:43Z
+- commit: 3d9646b
+- build: release, rustc 1.97.0 (2d8144b78 2026-07-07)
+- host: Darwin 27.2.0 arm64, Apple M5 Pro, 18 logical cores, open-file limit 1048576
+- load: closed loop at each listed number of concurrent connections, 15s measured after 3s warm-up; mock think time 0 ms; client, mock and gateway on one machine
+- gateway `[upstream] pool_max_idle_per_host`: 4
+
+| connections | path | requests | failed | req/s | p50 | p99 | added p50 | added p99 | peak RSS | upstream connections |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | mock directly | 321832 | 0 | 21454 | 0.05 ms | 0.06 ms | | | | 1 |
+| 1 | /v1/chat/completions | 76815 | 0 | 5121 | 0.19 ms | 0.23 ms | +0.15 ms | +0.17 ms | 93.3 MiB | 1 |
+| 1 | /v1/chat | 100838 | 0 | 6722 | 0.15 ms | 0.18 ms | +0.10 ms | +0.12 ms | 93.4 MiB | 0 |
+| 32 | mock directly | 1695145 | 0 | 113001 | 0.28 ms | 0.44 ms | | | | 32 |
+| 32 | /v1/chat/completions | 101 | 102 | 7 | 0.41 ms | 4276.71 ms | +0.13 ms | +4276.27 ms | 98.4 MiB | 16283 |
+| 32 | /v1/chat | 45 | 104 | 3 | 0.42 ms | 3930.01 ms | +0.14 ms | +3929.57 ms | 98.7 MiB | 16316 |
+
+`upstream connections` is how many connections the mock accepted during the phase (warm-up included): what was opened to the upstream, by the client directly in the first row of a level and by the gateway in the others.
+
+**Memory (resident set of the serve process):** 11.0 MiB idle before any load, 98.7 MiB after the last phase.
+
+Failures at 32 connections on /v1/chat/completions: 502: 102 (status: count, 0 = transport error); a failed request took 3160.6 ms on average; first body: 502: {"error":{"code":null,"message":"HTTP error: error sending request","param":null,"type":"api_error"}}
+
+Failures at 32 connections on /v1/chat: 502: 104 (status: count, 0 = transport error); a failed request took 3292.1 ms on average; first body: 502: {"error":{"code":"provider_error","message":"HTTP error: error sending request"}}
+
+With the pool at 4 the failure comes back exactly as in the first run, on the same
+binary that served 37,000 requests per second a few minutes earlier: at 32
+concurrent requests `/v1/chat` falls to **3 requests per second** (the native wire to
+7), every failure is the 502 `error sending request`, and a failed request takes
+about 3 s (the retry backoff). The new column shows the mechanism directly: the mock
+accepted **16,283 and 16,316 connections** in a phase, where the default pool opened
+13 and 11. That is a connection per request until the machine's ephemeral port range
+(16,384 ports on this host) is spent, which is what the hand-read `TIME_WAIT` count
+in the first run suggested, now measured by the harness and not by hand.
+
+### Status of the findings
+
+1. *Connections to the upstream fail once more than a few requests are in flight*
+   (pool of 4 idle per host): **resolved for `serve`** by 0021, and **isolated**:
+   the same binary fails with a pool of 4 and does not with the default (above).
+   The library's own default stays 4.
+2. *The replay-receipt executor refuses work when its slots are taken*: **open**,
+   and now the dominant limit on the native wire above a dozen requests in flight.
+   Whether an answer with no reasoning block or tool call needs a receipt at all
+   is still the question to settle.
