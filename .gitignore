@@ -4,3 +4,4 @@
 *.local.md
 .claude/rules/
 node_modules/
+/crates/llmshim-control/target

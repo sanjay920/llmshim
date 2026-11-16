@@ -274,6 +274,30 @@ The data-plane half that needs no control plane exists: `src/serve/snapshot.rs`,
 - **The snapshot's `tenants` are not used for the logs**: a key's `tenant` is the team id and the logs
   print it (a name is for the operator's tools; mapping ids to names in a usage record is a log contract
   change, 0010, not made here).
+## Slice 3a as built
+
+`crates/llmshim-control` (`publish = false`): the store and its operations as a library, SQLite
+(`rusqlite`, bundled), schema version 1 (`PRAGMA user_version`). It has **its own workspace and
+lockfile** (the root workspace excludes it), so the database and its C library never enter the root
+crate's graph or lockfile: default, proxy, gateway and `serve` builds do not change, and
+`control-check.yml` fails if `rusqlite` ever appears in the root `Cargo.lock`. It depends on the root
+crate with `features = ["serve"]` for the snapshot signer and loader, so the two cannot drift.
+
+- Orgs, teams, projects, keys (secret, client certificate, workload token), each with a stable opaque id.
+  A secret is 32 random bytes (`ring`), URL-safe, returned once; only its SHA-256 is stored (a test greps
+  every byte of the database file and its log for it). Key names are unique within an organization.
+- Lifecycle: `revoke_key` is terminal; `rotate_key` creates a successor with the same project, limits
+  and restrictions under a new name and leaves the old key active until it is revoked (only secret keys
+  rotate: a certificate or token identity is the workload's own); `update_key_limits` changes limits,
+  budget and expiry. Credentials never change in place.
+- The change history appends one row per mutation (actor, action, subject, detail; never a secret).
+- `build_payload` / `publish_snapshot` produce the next generation (a revoked key is listed `revoked`, an
+  active key past its expiry `expired`), sign it with the seed the caller read from a file (never stored
+  here), and keep the envelope. A test loads a published snapshot with the data plane's own
+  `snapshot::load`, so the format and the rules are the one `serve` applies. Keys and teams are listed in
+  insertion order, so a snapshot's bytes do not depend on random ids.
+- Not in 3a: the HTTP API and its OpenAPI document and the binary (3b), Postgres (4).
+
 ## Slices
 
 1. This note.
@@ -285,7 +309,8 @@ The data-plane half that needs no control plane exists: `src/serve/snapshot.rs`,
    non-advancing generation, the floor across restart, `min_generation`, mutual exclusion
    with `[[keys]]`, the `--check` rules on snapshot keys, stale status and refusal,
    revocation and expiry effect on the next request, a removed signer.
-3. The `llmshim-control` crate: SQLite store, the model above, key lifecycle API.
+3. The `llmshim-control` crate: **3a done** (SQLite store, the model above, key lifecycle, snapshot
+   publication as a library); 3b the HTTP API, its OpenAPI document and the binary.
 4. Postgres.
 5. The pull delivery and the data plane's poller (after 3: the endpoint is its first
    network surface).
