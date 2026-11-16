@@ -5,7 +5,8 @@ Status: implemented. The library (`ClientSettings`, `ShimClient::from_settings`,
 router and the listeners, and the benchmark re-run, recorded in 0018 beside the first:
 at 32 and 64 concurrent requests `/v1/chat` now answers every request at 37,000 to
 39,000 per second with a handful of upstream connections, where the first run failed
-and collapsed. `serve` no longer reads `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`,
+and collapsed; an isolating run (the same binary, `--pool 4`) brings the collapse back
+and shows a connection opened per request (16,000 in a phase). `serve` no longer reads `LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`,
 `LLMSHIM_UPSTREAM_*`, `LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS` or `LLMSHIM_HTTP_*`. A contract
 note, written before any code (README working rule 3).
 
