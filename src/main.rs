@@ -1053,7 +1053,14 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     // Held back until every listener is bound (see below).
     let unstarted_fleet = built.unstarted_fleet.take();
     // Measured against the text the server started from, not a second read.
-    let reloader = match llmshim::serve::Reloader::new(path, &text, format, built.reload.clone()) {
+    let reloader = match llmshim::serve::Reloader::new(
+        path,
+        &text,
+        format,
+        &config,
+        &env,
+        built.reload.clone(),
+    ) {
         Ok(reloader) => std::sync::Arc::new(reloader),
         Err(issues) => {
             report(&issues);

@@ -503,7 +503,7 @@ components:
               dead_letter: {type: integer, minimum: 0, description: Distributed mode only}
     ServeConfigStatus:
       type: object
-      required: [generation, config_sha256, credentials, loaded_at_epoch_secs, last_check_epoch_secs, in_sync, last_reload]
+      required: [generation, config_sha256, credentials, loaded_at_epoch_secs, last_check_epoch_secs, in_sync, last_reload, router_generation, env_secret_providers]
       additionalProperties: false
       properties:
         generation: {type: integer, minimum: 0, description: 0 for the configuration the process started with}
@@ -512,6 +512,16 @@ components:
         loaded_at_epoch_secs: {type: integer, minimum: 0}
         last_check_epoch_secs: {type: [integer, 'null']}
         in_sync: {type: boolean}
+        router_generation:
+          type: integer
+          minimum: 0
+          description: 0 until a reload replaces the providers or routes (0022)
+        env_secret_providers:
+          type: array
+          items: {type: string}
+          description: |
+            Providers whose `api_key` is an `{ env = ... }` reference, which a reload
+            cannot rotate (a process's environment is fixed). Names only.
         last_reload:
           oneOf:
             - type: 'null'
@@ -534,11 +544,18 @@ components:
                 description: The class of the last failed refresh (`network`, `status`, `too_large`, `malformed`, `no_usable_keys`).
     ReloadAttempt:
       type: object
-      required: [at_epoch_secs, outcome, issues]
+      required: [at_epoch_secs, outcome, issues, changes]
       additionalProperties: false
       properties:
         at_epoch_secs: {type: integer, minimum: 0}
         outcome: {type: string, enum: [applied, rejected]}
+        changes:
+          type: array
+          items: {type: string}
+          description: |
+            What an applied reload replaced in the providers and routes, by name
+            (`providers.added: x`, `providers.removed: x`, `providers.changed: x`,
+            `routes`); empty for a keys-only reload or a rejection. Never a value.
         issues:
           type: array
           items:

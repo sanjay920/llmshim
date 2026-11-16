@@ -1,8 +1,10 @@
 # 0022: Reloading providers, routes and rate limits
 
-Status: slice 2 implemented (the router handle: the gateway holds its router behind a
-replaceable handle, admission pins a snapshot that rides the request to its
-dispatch; nothing swaps yet). Slices 3 to 5 are not. A contract note, written before
+Status: slices 2 and 3 implemented. Slice 2: the gateway holds its router behind a
+replaceable handle and admission pins a snapshot that rides the request to its
+dispatch. Slice 3: a reload rebuilds and swaps providers and routes in a single
+instance (a fleet replica refuses the change by path, see below). Slices 4 and 5
+(rate limits; the 0014 rows and the roadmap) are not. A contract note, written before
 any code (README working rule 3). It extends 0012, which reloads `[[keys]]` and
 nothing else.
 
@@ -161,6 +163,26 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
 - The proxy (`llmshim proxy`) keeps its own router and does not reload: its
   `AppState.router` is a public field, and nothing in this note changes it.
 
+## Decided in slice 3
+
+- **A fleet replica refuses a provider or route change by path (`providers`).** The note
+  above has a reload start and stop fleet workers; that needs the fleet backend to
+  accept a provider set that grows and shrinks, which is a change to the distributed
+  queue and its reaper, not to the reload. It ships as its own slice (3b), and until
+  then a fleet replica applies keys (and, with slice 4, limits) and refuses providers
+  and routes by path with "restart to apply", the safe behaviour 0012 already had.
+  The status makes the refusal visible (`in_sync: false`).
+- **An unreadable secret of an unchanged provider does not block an unrelated edit.**
+  Its secret digest is carried over while its table is unchanged. If the same edit
+  also changes another provider, the router is rebuilt whole and the unreadable
+  secret is reported by path, rejecting the reload: a router cannot be built without
+  every provider, and the running provider objects are not reusable.
+- **The status** gains `router_generation`, `env_secret_providers` and, on a
+  reload, `changes` (`providers.added: x`, `providers.removed: x`,
+  `providers.changed: x`, `routes`).
+- **Files in the fingerprint**: a provider's `api_key` file, `service_account_file`,
+  and the Bedrock `config_file`/`credentials_file`, by digest.
+
 ## Slices
 
 1. This note.
@@ -171,7 +193,7 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
    behave as before). New tests: a swap between admission and dispatch does not change
    an admitted request (provider, route, fallback chain), a queued job for a removed
    provider finishes, a stream survives a swap.
-3. **Reload of providers and routes.** The reload builds the new router (sharing the
+3. **Done (single instance; the fleet part is 3b): reload of providers and routes.** The reload builds the new router (sharing the
    breaker and the client), checks the credential files of changed Vertex providers,
    fingerprints resolved provider secrets by digest, swaps the handle, and starts and
    stops fleet workers; the status reports what applied and which secrets are

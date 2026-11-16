@@ -421,7 +421,14 @@ pub async fn build_app(
         .filter_map(|text| super::allowlist::Cidr::parse(text).ok())
         .collect::<Vec<_>>()
         .into();
-    let reload = ReloadHandles::new(keys.clone(), tenants, key_names.clone(), allow.clone());
+    let reload = ReloadHandles::new(
+        keys.clone(),
+        tenants,
+        key_names.clone(),
+        allow.clone(),
+        state.router_handle(),
+        fleet,
+    );
     let reload_status = reload.status_handle();
     // Workload tokens (0017): built after the configuration is accepted, so a
     // file that fails earlier fetches nothing. The keys are fetched lazily, on the
@@ -622,25 +629,67 @@ fn build_router(
     env: &dyn Fn(&str) -> Option<String>,
     issues: &mut Vec<Issue>,
 ) -> Router {
+    build_router_with(config, env, issues, None)
+}
+
+/// The router a reload replaces the running one with (0022): the providers and
+/// routes of `config`, sharing the running router's client (and so its
+/// connection pool) and its breaker (so provider health survives a key
+/// rotation). `[upstream]` is fixed at start, so the client is never rebuilt.
+pub(crate) fn build_router_from(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+    issues: &mut Vec<Issue>,
+    running: &Router,
+) -> Router {
+    build_router_with(config, env, issues, Some(running))
+}
+
+#[cfg(test)]
+pub(crate) fn build_router_for_test(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+    issues: &mut Vec<Issue>,
+) -> Router {
+    build_router(config, env, issues)
+}
+
+fn build_router_with(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+    issues: &mut Vec<Issue>,
+    running: Option<&Router>,
+) -> Router {
     let mut router = Router::new();
+    if let Some(running) = running {
+        if !running.ambient_proxy() {
+            router = router.without_ambient_proxy();
+        }
+        if let Some(client) = running.http_client() {
+            router = router.with_http_client(client.clone());
+        }
+        router = router.with_breaker(running.breaker().clone());
+    }
     // The router's own client, from `[upstream]` and the library's defaults, never
     // from the environment (0021).
-    match config
-        .upstream
-        .settings(config.limits.max_concurrency)
-        .and_then(|settings| {
-            crate::client::ShimClient::from_settings(settings).map(|client| (settings, client))
-        }) {
-        Ok((settings, client)) => {
-            if !settings.ambient_proxy {
-                router = router.without_ambient_proxy();
+    if running.is_none() {
+        match config
+            .upstream
+            .settings(config.limits.max_concurrency)
+            .and_then(|settings| {
+                crate::client::ShimClient::from_settings(settings).map(|client| (settings, client))
+            }) {
+            Ok((settings, client)) => {
+                if !settings.ambient_proxy {
+                    router = router.without_ambient_proxy();
+                }
+                router = router.with_http_client(client);
             }
-            router = router.with_http_client(client);
+            Err(message) => issues.push(Issue {
+                path: "upstream".into(),
+                message: message.into(),
+            }),
         }
-        Err(message) => issues.push(Issue {
-            path: "upstream".into(),
-            message: message.into(),
-        }),
     }
     let mut shared = CloudShared::default();
     for (name, provider) in &config.providers {
