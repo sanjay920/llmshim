@@ -64,6 +64,27 @@ pub fn build_key_store(
     let mut peers: HashMap<String, Identity> = HashMap::new();
     for (index, key) in config.keys.iter().enumerate() {
         let at = format!("keys[{index}]");
+        if let Some(binding) = &key.jwt {
+            let identity = Identity {
+                tenant: key.tenant.clone(),
+                tier: key.tier,
+                rpm: key.rpm,
+                tpm: key.tpm,
+                budget_usd: key.budget_usd,
+                budget_window_secs: key.budget_window_secs,
+                budget_allow_unpriced: key.budget_allow_unpriced,
+            };
+            if peers
+                .insert(jwt_workload(&binding.table, &binding.subject), identity)
+                .is_some()
+            {
+                issues.push(Issue {
+                    path: at,
+                    message: "has the same jwt table and subject as another key".into(),
+                });
+            }
+            continue;
+        }
         if let Some(san) = &key.client_san {
             let identity = Identity {
                 tenant: key.tenant.clone(),
@@ -162,11 +183,26 @@ pub fn key_names(
         .collect()
 }
 
+/// The workload name a verified token is bound to, in the space the key store
+/// keeps certificate workloads in (`dns:`/`uri:` names), under its own prefix: a
+/// table name has no `:`, so two bindings can never produce the same name.
+pub(crate) fn jwt_workload(table: &str, subject: &str) -> String {
+    format!("jwt:{table}:{subject}")
+}
+
 fn credential_scope(
     key: &super::config::GatewayKey,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    Some(if let Some(san) = &key.client_san {
+    Some(if let Some(binding) = &key.jwt {
+        format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "mtls:{}",
+                jwt_workload(&binding.table, &binding.subject)
+            ))
+        )
+    } else if let Some(san) = &key.client_san {
         format!(
             "{:x}",
             Sha256::digest(format!("mtls:{}", super::config::canonical_san(san)))

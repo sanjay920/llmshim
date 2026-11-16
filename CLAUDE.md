@@ -717,7 +717,12 @@ its own config (grow-only tables, updated on a keys reload). A key's
 other address with 403 right after authentication, before replay, receipts and
 admission; the address is the TCP peer, or the right-most non-proxy
 `X-Forwarded-For` entry only when the peer is in `server.trusted_proxies`, and a
-trusted peer without a usable client fails closed; the allowlists reload with the keys. With `--features serve-otel` a
+trusted peer without a usable client fails closed; the allowlists reload with the keys. A key may bind to a workload JWT (`jwt = { table, subject }` with
+`[[auth.jwt]]` issuers, note 0017; `src/serve/jwt.rs` verifies with `ring`, `jwks.rs` fetches
+and caches, `jwt_auth.rs` runs inside the access-log layer): the algorithm list is the
+issuer's, a token-shaped bearer value is only ever verified as a token and never looked
+up as a key, and a verified `(table, sub)` becomes the bound key's identity through the
+same internal header as a client certificate. With `--features serve-otel` a
 `[telemetry]` table exports one request span per request, and one child `llmshim.attempt` span per
 admitted provider attempt (driven by the usage recorder, joined by request id
 through a bounded registry that outlives a streamed response), over OTLP/HTTP

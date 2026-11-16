@@ -52,6 +52,11 @@ pub(crate) struct Record {
     /// `null` when the caller sent none or an unknown one.
     pub key: Option<String>,
     pub credential: Option<String>,
+    /// Why a token was refused before the gateway saw the request
+    /// (`jwt_invalid`, `jwt_unknown_key`, `jwt_unknown_subject`,
+    /// `jwks_unavailable`), `null` otherwise. A class, never the token or the
+    /// claim that failed.
+    pub auth_reason: Option<&'static str>,
 }
 
 /// The first eight hex characters of the SHA-256 of the presented bearer token.
@@ -88,6 +93,7 @@ struct Pending {
     tenant: Option<String>,
     key: Option<String>,
     credential: Option<String>,
+    auth_reason: Option<&'static str>,
     written: bool,
 }
 
@@ -109,6 +115,7 @@ impl Pending {
             tenant: self.tenant.take(),
             key: self.key.take(),
             credential: self.credential.take(),
+            auth_reason: self.auth_reason.take(),
         });
     }
 }
@@ -126,6 +133,7 @@ pub(crate) async fn record_request(
     telemetry: Option<Arc<super::telemetry::Telemetry>>,
     keys: Arc<KeyStore>,
     names: crate::gateway::usage::KeyNames,
+    jwt: Option<super::jwt_auth::JwtAuth>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -140,6 +148,23 @@ pub(crate) async fn record_request(
     request
         .extensions_mut()
         .insert(crate::gateway::http::SettledRequestId(id.clone()));
+    // A token, if there is one, is verified here, inside the id and the log and
+    // before the caller is resolved, so that a refusal is logged with its reason
+    // and a verified token resolves to the key it is bound to. The fingerprint is
+    // of what was presented, taken before the token is replaced by the workload.
+    let presented = {
+        let mut original = request.headers().clone();
+        if crate::proxy::wire::native_route(&path).is_some() {
+            crate::proxy::wire::normalize_auth(&mut original);
+        }
+        fingerprint(&original)
+    };
+    let mut refusal = None;
+    if let Some(jwt) = &jwt {
+        if let Err(failed) = jwt.authenticate(&mut request).await {
+            refusal = Some(failed);
+        }
+    }
     // Resolve the caller before the request is consumed, from the headers as the
     // gateway reads them: on the native routes an `x-api-key` or
     // `x-goog-api-key` is the credential. The same store the gateway
@@ -176,10 +201,14 @@ pub(crate) async fn record_request(
         path: bounded(&path),
         tenant,
         key,
-        credential: fingerprint(&headers),
+        credential: presented,
+        auth_reason: refusal.as_ref().map(|failed| failed.reason),
         written: false,
     };
-    let mut response = next.run(request).await;
+    let mut response = match refusal {
+        Some(failed) => failed.into_response(),
+        None => next.run(request).await,
+    };
     // A response made by a layer outside the gateway's own (the origin check, the
     // hidden admin path) carries no id yet; the caller gets the one the log has.
     if !response.headers().contains_key("x-request-id") {
@@ -242,6 +271,7 @@ mod tests {
             tenant: None,
             key: None,
             credential: Some("0a1b2c3d".into()),
+            auth_reason: None,
         };
         let line = serde_json::to_string(&record).unwrap();
         assert!(!line.contains('\n'));
@@ -250,6 +280,7 @@ mod tests {
         assert!(value["key"].is_null());
         assert_eq!(value["status"], 401);
         assert_eq!(value["credential"], "0a1b2c3d");
+        assert!(value["auth_reason"].is_null());
     }
 
     /// A writer the test can read back.
@@ -319,7 +350,7 @@ mod tests {
                 let log = log.clone();
                 let keys = keys.clone();
                 let names = names();
-                async move { record_request(Some(log), None, keys, names, request, next).await }
+                async move { record_request(Some(log), None, keys, names, None, request, next).await }
             }))
     }
 

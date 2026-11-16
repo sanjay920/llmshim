@@ -408,6 +408,11 @@ pub async fn build_app(
         .into();
     let reload = ReloadHandles::new(keys.clone(), tenants, key_names.clone(), allow.clone());
     let reload_status = reload.status_handle();
+    // Workload tokens (0017): built after the configuration is accepted, so a
+    // file that fails earlier fetches nothing. The keys are fetched lazily, on the
+    // first token, never at startup.
+    let jwt = super::jwt_auth::JwtAuth::new(config, env, Arc::new(KeyStore::Live(keys.clone())))?;
+    let jwks_status = jwt.clone();
     let app = app_with_parts(
         state,
         // No browser origin is trusted. Browsers are not callers of a gateway.
@@ -440,7 +445,17 @@ pub async fn build_app(
                     "/v1/serve/config",
                     axum::routing::get(move || {
                         let status = reload_status.snapshot();
-                        async move { axum::Json(status) }
+                        let jwks = jwks_status.as_ref().map(|jwt| jwt.statuses());
+                        async move {
+                            let mut body = serde_json::to_value(status).unwrap_or_default();
+                            if let (Some(object), Some(jwks)) = (body.as_object_mut(), jwks) {
+                                object.insert(
+                                    "jwks".into(),
+                                    serde_json::to_value(jwks).unwrap_or_default(),
+                                );
+                            }
+                            axum::Json(body)
+                        }
                     }),
                 )
                 .layer(axum::middleware::from_fn(super::mtls::strip_peer_header));
@@ -464,7 +479,7 @@ pub async fn build_app(
     // before it reaches a handler and the 404 for a hidden admin path. It
     // resolves the caller with a store of its own built from the same file.
     let app = match (access_log, telemetry.clone()) {
-        (None, None) => app,
+        (None, None) if jwt.is_none() => app,
         (log, telemetry) => {
             let keys = Arc::new(KeyStore::Live(keys.clone()));
             let names = key_names.clone();
@@ -475,6 +490,7 @@ pub async fn build_app(
                         telemetry.clone(),
                         keys.clone(),
                         names.clone(),
+                        jwt.clone(),
                         request,
                         next,
                     )

@@ -18,6 +18,7 @@ pub mod config;
 mod jsonl;
 pub mod jwks;
 pub mod jwt;
+pub(crate) mod jwt_auth;
 pub mod keys;
 pub mod mtls;
 pub mod reload;

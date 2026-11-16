@@ -76,7 +76,8 @@ Phase 0: a production server mode
 - [x] Separately bound, optionally token-protected `/metrics`, stats and probes (0005)
 - [x] TLS termination with renewal on file change (0007)
 - [x] Mutual TLS and certificate-derived identity (0011)
-- [ ] JWT/OIDC workload identity; optional client certificates; revocation
+- [x] JWT/OIDC workload identity (0017); optional client certificates (0011).
+      Token revocation before `exp` is not supported (short lifetimes bound it)
 - [x] Access log with tenant attribution and credential fingerprints (0009)
 - [x] Token and cost attribution per tenant and attempt (0010)
 - [x] OpenTelemetry traces (design note 0016; metrics stay on `/metrics`): the
@@ -106,8 +107,7 @@ Later phases (each needs its own design note before work starts)
       policy snapshots, bounded local spend allowance during a Redis outage
 - [ ] Hierarchical budgets, model allowlists, tags, alerts, cost exports
 - [ ] Deployments and load balancing across credentials and regions
-- [ ] Workload JWT authentication (design: 0017; mTLS is done: 0011). Per-key IP
-      allowlists are done (`allowed_cidrs`, `server.trusted_proxies`)
+- [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
 - [ ] Audit log
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy
 - [ ] Secret-manager integrations

@@ -1,8 +1,10 @@
 # 0017: Workload JWT authentication and IP allowlists
 
-Status: IP allowlists (slice 2), the JWT verifier (slice 3, `src/serve/jwt.rs`) and the
-JWKS client (slice 4, `src/serve/jwks.rs`) are implemented as units, the last two not
-yet wired to anything; the wiring is not (slice 5).
+Status: implemented (slices 2 to 5): IP allowlists, the JWT verifier and the JWKS client
+(`src/serve/jwt.rs`, `jwks.rs`), and their wiring (`jwt_auth.rs`, run inside the
+access-log layer). `--check` validates the issuer tables and bindings but does not
+probe a JWKS (a check that needs the network cannot gate an offline pipeline); the
+first token loads the keys.
 A contract note, written before any code (README working rule 3). Single
 sign-on for people, SCIM and an admin UI are not part of this note and are not
 started.
@@ -213,5 +215,5 @@ stale serving and refresh refusals.
 4. Done: the JWKS client: fetch, cache, bounded refresh, stale-then-503. (A `ca_file`, when set, is the only trust anchor for the fetch; the
    fetch ignores the ambient proxy. `/ready` does not depend on a JWKS, as decided
    above, so nothing changes there.)
-5. Wiring: the `jwt` key binding, the bearer-shape rule, access-log reasons,
+5. Done: wiring: the `jwt` key binding, the bearer-shape rule, access-log reasons,
    `--check`, reload by path, the schema, an end-to-end test with a local issuer.
