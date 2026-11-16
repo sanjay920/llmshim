@@ -164,10 +164,13 @@ is a later slice with its own transition note.
    test; the trace joins the request id (closing the roadmap line). Done: the
    usage recorder starts and ends the span (so it exists whenever a usage log or
    telemetry is configured; without a usage log the records go nowhere). The
-   request span's context is kept in a registry keyed by request id, 8192 entries
-   at most (a full registry leaves a new request's attempts in their own trace),
-   and stays ten minutes after the request span ends, which is what lets a
-   stream's attempt finish under it. An attempt whose request this replica does
+   request span's context is kept in a registry keyed by request id, only for
+   authenticated callers (an unauthenticated caller chooses its id and must not
+   take another request's entry), the first registration of an id winning. An
+   entry goes as soon as the request has ended and its last attempt has ended; a
+   request that ended with no attempt yet waits 60 seconds, for a stream
+   dispatched after the response head. At most 8192 live entries; when full a new
+   request's attempts start their own trace. An attempt whose request this replica does
    not hold (a fleet job taken elsewhere) starts its own trace and carries the
    request id. The token attributes appear only when the provider reported
    usage; cost only when known. Upstream status is `llmshim.upstream.status_code`.
