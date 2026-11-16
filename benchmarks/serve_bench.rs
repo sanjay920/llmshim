@@ -408,7 +408,6 @@ async fn main() {
     // answer) and llmshim's own `/v1/chat`. A phase that failed leaves the
     // machine's ephemeral ports in TIME_WAIT, so the next phase waits for them.
     let mut levels: Vec<(Phase, Phase, Phase)> = Vec::new();
-    let mut time_wait: Vec<(usize, &'static str, String)> = Vec::new();
     let mut dirty = false;
     for &concurrency in &args.levels {
         if !levels.is_empty() {
@@ -433,7 +432,6 @@ async fn main() {
             Some(pid),
         )
         .await;
-        time_wait.push((concurrency, "/v1/chat/completions", sockets_in_time_wait()));
         settle(!native.failures.is_empty()).await;
         let own = drive(
             "/v1/chat",
@@ -444,7 +442,6 @@ async fn main() {
             Some(pid),
         )
         .await;
-        time_wait.push((concurrency, "/v1/chat", sockets_in_time_wait()));
         dirty = !own.failures.is_empty() || !native.failures.is_empty();
         levels.push((direct, native, own));
     }
@@ -534,10 +531,6 @@ async fn main() {
             }
         }
     }
-    println!("\nSockets in TIME_WAIT on the host at the end of each gateway phase:");
-    for (concurrency, path, count) in &time_wait {
-        println!("- {concurrency} connections, {path}: {count}");
-    }
     if let Some(path) = &args.json {
         let row = |p: &Phase| {
             json!({"path": p.name, "connections": p.concurrency, "requests": p.requests,
@@ -551,7 +544,6 @@ async fn main() {
             "cores": cores, "open_file_limit": open_files, "duration_secs": args.duration.as_secs(),
             "warmup_secs": args.warmup.as_secs(), "think_ms": args.think.as_millis() as u64,
             "levels": levels.iter().map(|(d, n, o)| json!({"direct": row(d), "native": row(n), "own": row(o)})).collect::<Vec<_>>(),
-            "time_wait": time_wait.iter().map(|(c, p, n)| json!({"connections": c, "path": p, "sockets": n})).collect::<Vec<_>>(),
             "rss_kib": {"idle": idle_kb, "after": after_kb}});
         std::fs::write(path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
     }
@@ -582,8 +574,4 @@ impl Drop for Server {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
-}
-
-fn sockets_in_time_wait() -> String {
-    capture("sh", &["-c", "netstat -an | grep -c TIME_WAIT"])
 }
