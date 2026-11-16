@@ -94,6 +94,7 @@ paths:
       description: Terminal.
       responses:
         '200': {description: The revoked key}
+        '400': {$ref: '#/components/responses/Error'}
         '404': {$ref: '#/components/responses/Error'}
         '409': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
@@ -113,7 +114,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/key'}]
     patch:
       operationId: updateLimits
-      description: A whole-limits update, not a merge - a field left out is cleared.
+      description: A whole-limits update, not a merge - every field is named and null clears one; a field left out is a 400.
       requestBody:
         required: true
         content:
@@ -150,7 +151,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/org'}]
     get:
       operationId: latestSnapshot
-      description: The latest signed envelope, as a data plane's `snapshot_file` holds it. ETag is the generation.
+      description: The latest signed envelope, as a data plane's `snapshot_file` holds it. ETag is the generation. It carries the SHA-256 of each secret key's secret (the data plane's input), the only place a hash is served.
       responses:
         '200': {description: The signed envelope}
         '304': {description: Not modified}
@@ -199,7 +200,7 @@ components:
       properties: {id: {type: string}, name: {type: string}, created_at: {type: string}}
     Key:
       type: object
-      description: A key. Its secret and its hash are never in it.
+      description: A key. Its secret and its hash are never in it (a published snapshot, below, carries hashes by design).
       required: [id, org_id, project_id, team_id, name, kind, state, tier, budget_allow_unpriced, created_at]
       properties:
         id: {type: string}
@@ -249,10 +250,12 @@ components:
         expires_at: {type: string, format: date-time}
     Limits:
       type: object
+      description: Every field is named; null clears one. A body that leaves one out is a 400.
       additionalProperties: false
+      required: [rpm, tpm, budget_usd, budget_window_secs, expires_at]
       properties:
-        rpm: {type: integer, minimum: 0}
-        tpm: {type: integer, minimum: 0}
-        budget_usd: {type: number}
-        budget_window_secs: {type: integer}
-        expires_at: {type: string, format: date-time}
+        rpm: {type: [integer, 'null'], minimum: 0}
+        tpm: {type: [integer, 'null'], minimum: 0}
+        budget_usd: {type: [number, 'null']}
+        budget_window_secs: {type: [integer, 'null']}
+        expires_at: {type: [string, 'null'], format: date-time}

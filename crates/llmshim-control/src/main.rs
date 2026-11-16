@@ -7,7 +7,7 @@
 //! Exit status: 0 clean shutdown, 1 it could not start (a file, the address, the database),
 //! 2 bad arguments.
 
-use llmshim_control::api::{router, token_problem, AppState};
+use llmshim_control::api::{router, seed_file_problem, token_problem, AppState};
 use llmshim_control::Store;
 use std::path::PathBuf;
 
@@ -100,6 +100,34 @@ async fn run(options: Options) -> i32 {
             return 1;
         }
     };
+    if let Some(problem) = options
+        .signing_key_file
+        .as_deref()
+        .and_then(seed_file_problem)
+    {
+        eprintln!("{problem}");
+        return 1;
+    }
+    // The database holds key hashes and the history: owner-only from its first byte.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if !options.db.exists() {
+            if let Err(error) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&options.db)
+            {
+                eprintln!(
+                    "cannot create the database {}: {}",
+                    options.db.display(),
+                    error.kind()
+                );
+                return 1;
+            }
+        }
+    }
     let store = match Store::open(&options.db) {
         Ok(store) => store,
         Err(error) => {

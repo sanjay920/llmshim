@@ -435,3 +435,74 @@ fn a_rotation_is_one_unit_it_leaves_no_successor_without_its_record() {
     assert_eq!(f.store.history_rows(100).unwrap().len(), before);
     assert_eq!(f.store.keys(&f.org).unwrap().len(), 2);
 }
+
+#[test]
+fn a_second_active_key_for_the_same_identity_is_refused_so_a_snapshot_is_never_refused_whole() {
+    let mut f = fixture();
+    let san = |f: &mut Fixture, name: &str, text: &str| {
+        let mut new = NewKey::secret(&f.project, name);
+        new.credential = Credential::ClientSan(text.into());
+        f.store.create_key(new, ACTOR)
+    };
+    let jwt = |f: &mut Fixture, name: &str, table: &str, subject: &str| {
+        let mut new = NewKey::secret(&f.project, name);
+        new.credential = Credential::Jwt {
+            table: table.into(),
+            subject: subject.into(),
+        };
+        f.store.create_key(new, ACTOR)
+    };
+    let first = san(&mut f, "a", "dns:Svc.Example.Test").unwrap();
+    assert_eq!(
+        first.record.client_san.as_deref(),
+        Some("dns:svc.example.test")
+    );
+    // The data plane compares DNS names case-insensitively: the same name again conflicts.
+    assert!(matches!(
+        san(&mut f, "b", "dns:svc.example.test"),
+        Err(Error::Conflict(_))
+    ));
+    assert!(san(&mut f, "c", "uri:spiffe://corp/Svc").is_ok());
+    assert!(matches!(
+        san(&mut f, "d", "uri:spiffe://corp/Svc"),
+        Err(Error::Conflict(_))
+    ));
+    jwt(&mut f, "e", "idp", "svc:a").unwrap();
+    assert!(matches!(
+        jwt(&mut f, "g", "idp", "svc:a"),
+        Err(Error::Conflict(_))
+    ));
+    assert!(jwt(&mut f, "h", "idp", "svc:b").is_ok());
+    for bad in ["", "has space", &"x".repeat(513)] {
+        assert!(
+            matches!(jwt(&mut f, "i", "idp", bad), Err(Error::Invalid(_))),
+            "{bad:?}"
+        );
+    }
+    // Revoking the holder frees the identity (the data plane skips a revoked key).
+    f.store.revoke_key(&first.record.id, ACTOR).unwrap();
+    assert!(san(&mut f, "b", "dns:svc.example.test").is_ok());
+    // And what was published loads: no duplicate reached the signed payload.
+    let directory = dir("dups");
+    let (seed, public) = llmshim::serve::snapshot::keygen().unwrap();
+    let published = f.store.publish_snapshot(&f.org, &seed, ACTOR).unwrap();
+    let file = directory.join("snapshot.json");
+    std::fs::write(&file, published.envelope).unwrap();
+    let cp = control_plane(&f.org, &public, &file);
+    assert!(llmshim::serve::snapshot::load(&cp, None, chrono::Utc::now()).is_ok());
+}
+
+#[test]
+fn too_many_networks_are_refused() {
+    let mut f = fixture();
+    let mut new = NewKey::secret(&f.project, "wide");
+    new.allowed_cidrs = Some(
+        (0..257)
+            .map(|n| format!("10.{}.{}.0/24", n / 256, n % 256))
+            .collect(),
+    );
+    assert!(matches!(
+        f.store.create_key(new, ACTOR),
+        Err(Error::Invalid(_))
+    ));
+}

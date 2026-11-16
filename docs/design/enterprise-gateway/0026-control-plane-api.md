@@ -51,15 +51,21 @@ All bodies and answers are JSON (`application/json`); ids are the opaque ids of 
 
 - `credential` is `{"type":"secret"}` (the default), `{"type":"client_san","san":"uri:..."}` or
   `{"type":"jwt","table":"...","subject":"..."}`.
-- `PATCH .../limits` replaces each of the five values it names with what the body says and clears
-  the ones it omits (the store's `LimitsUpdate`): it is a whole-limits update, not a merge.
-- Unknown fields in a body are refused (400), as in the data plane's file.
+- `PATCH .../limits` is a whole-limits update, not a merge: **every** one of the five fields is named and
+  `null` clears one. A body that leaves one out is a 400, so `{"rpm": 5}` cannot silently remove a budget or
+  an expiry.
+- Unknown fields in a body are refused (400), as in the data plane's file. The `Authorization` scheme
+  is case-insensitive. The store refuses what the data plane would refuse as a whole snapshot: networks
+  that do not parse (and more than 256 of them), a second active key for the same client identity
+  (`dns:` names compared case-insensitively) or the same token binding, a token subject outside 1 to 512
+  visible ASCII characters (409 or 400).
 
 ## Secrets
 
 The secret appears in exactly two answers, key creation and rotation, with
 `Cache-Control: no-store`. No other answer, no log line and no history row carries it. A key's
-SHA-256 is never in an answer either.
+SHA-256 is in no key answer. (The published snapshot, which a data plane reads, carries each secret
+key's hash by design; it is a hash of a 256-bit random secret.)
 
 ## Errors
 
@@ -73,7 +79,9 @@ logged to stderr, never sent). A signing-key file that is unreadable or not a ke
 ## The signing key
 
 `--signing-key-file` names a file holding a seed (what `llmshim snapshot keygen` writes). It is
-read **at each publish**, never at start and never stored, so rotating it needs no restart. Without
+read **at each publish** (off the async workers), never stored, so rotating it needs no restart. On Unix
+a seed readable by group or others is refused at start and at each publish, like the token. The database
+file is created owner-only. Without
 the option, `POST .../snapshots` is 503 `signing_key_unconfigured`.
 
 ## OpenAPI

@@ -340,6 +340,9 @@ fn check_fields(new: &NewKey) -> Result<()> {
         if cidrs.is_empty() {
             return invalid("allowed_cidrs is empty, which would refuse every request; omit it");
         }
+        if cidrs.len() > 256 {
+            return invalid("allowed_cidrs holds more than 256 entries");
+        }
         for cidr in cidrs {
             if llmshim::serve::allowlist::Cidr::parse(cidr).is_err() {
                 return invalid("allowed_cidrs holds an entry that is not an address or CIDR");
@@ -816,12 +819,27 @@ fn create_key_in(
                     "a client_san is dns:<name> or uri:<uri>, ASCII, with no whitespace".into(),
                 ));
             }
-            ("client_san", None, None, Some(san.clone()), None, None)
+            // DNS names compare case-insensitively on the data plane, so they are stored (and
+            // made unique) in that form.
+            let canonical = match san.strip_prefix("dns:") {
+                Some(name) => format!("dns:{}", name.to_ascii_lowercase()),
+                None => san.clone(),
+            };
+            ("client_san", None, None, Some(canonical), None, None)
         }
         Credential::Jwt { table, subject } => {
-            if table.is_empty() || subject.is_empty() {
+            if table.is_empty() || table.len() > 128 || !table.bytes().all(|b| b.is_ascii_graphic())
+            {
                 return Err(Error::Invalid(
-                    "a jwt binding needs a table and a subject".into(),
+                    "a jwt table is 1 to 128 visible ASCII characters".into(),
+                ));
+            }
+            if subject.is_empty()
+                || subject.len() > llmshim::serve::jwt::MAX_SUBJECT_BYTES
+                || !subject.bytes().all(|b| b.is_ascii_graphic())
+            {
+                return Err(Error::Invalid(
+                    "a jwt subject is 1 to 512 visible ASCII characters".into(),
                 ));
             }
             (
@@ -973,6 +991,11 @@ CREATE TABLE keys (
     revoked_at TEXT,
     UNIQUE (org_id, name)
 );
+-- What the data plane refuses as a whole snapshot, refused here (an active identity is one key).
+CREATE UNIQUE INDEX keys_client_san ON keys (org_id, client_san)
+    WHERE client_san IS NOT NULL AND state = 'active';
+CREATE UNIQUE INDEX keys_jwt ON keys (org_id, jwt_table, jwt_subject)
+    WHERE jwt_table IS NOT NULL AND state = 'active';
 CREATE TABLE history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,

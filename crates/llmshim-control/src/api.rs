@@ -201,7 +201,11 @@ async fn authenticate(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+        // The scheme is case-insensitive (RFC 7235); the token is not.
+        .and_then(|value| {
+            let (scheme, rest) = value.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then_some(rest)
+        })
         .map(str::trim)
         .unwrap_or("");
     // Digests compared in constant time: the length of what was presented does not matter.
@@ -402,9 +406,40 @@ async fn update_limits(
     State(s): State<Arc<AppState>>,
     h: HeaderMap,
     Path(key): Path<String>,
-    Body(b): Body<LimitsBody>,
+    Body(raw): Body<Value>,
 ) -> ApiResult<Json<KeyRecord>> {
     let actor = actor(&h)?;
+    // A whole-limits update: every field is named, `null` clears one. A body that leaves one
+    // out is refused, so `{"rpm": 5}` cannot silently remove a budget or an expiry.
+    let object = raw.as_object().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "the body must be an object",
+        )
+    })?;
+    for field in [
+        "rpm",
+        "tpm",
+        "budget_usd",
+        "budget_window_secs",
+        "expires_at",
+    ] {
+        if !object.contains_key(field) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("name every limit; send null to clear one ({field} is missing)"),
+            ));
+        }
+    }
+    let b: LimitsBody = serde_json::from_value(raw).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("the body is not what this route takes: {error}"),
+        )
+    })?;
     let update = LimitsUpdate {
         rpm: b.rpm,
         tpm: b.tpm,
@@ -446,24 +481,79 @@ async fn publish(
             "the server was started without --signing-key-file",
         ));
     };
-    // Read now, never kept: rotating the signing key needs no restart.
-    let seed = std::fs::read_to_string(&file).map_err(|error| {
-        eprintln!(
-            "control: cannot read the signing key file: {}",
-            error.kind()
-        );
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            "the signing key could not be read (signing_key)",
-        )
-    })?;
+    // Read now, never kept: rotating the signing key needs no restart. Off the async workers
+    // (a path on a hung mount must not stall them) and refused when other users can read it.
+    let seed = tokio::task::spawn_blocking(move || read_seed(&file))
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "internal error",
+            )
+        })??;
     let published = with_store(&s, move |st| st.publish_snapshot(&org, &seed, &actor)).await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({"generation": published.generation})),
     )
         .into_response())
+}
+
+/// The signing seed, from its file. On Unix a file group- or world-readable is refused: whoever
+/// can read it can forge snapshots.
+fn read_seed(path: &std::path::Path) -> ApiResult<String> {
+    let fail = |what: &str| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("the signing key could not be used ({what}) (signing_key)"),
+        )
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|error| {
+                eprintln!(
+                    "control: cannot read the signing key file: {}",
+                    error.kind()
+                );
+                fail("unreadable")
+            })?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            eprintln!("control: the signing key file is readable by group or others; chmod 600 it");
+            return Err(fail("its file is readable by others"));
+        }
+    }
+    std::fs::read_to_string(path).map_err(|error| {
+        eprintln!(
+            "control: cannot read the signing key file: {}",
+            error.kind()
+        );
+        fail("unreadable")
+    })
+}
+
+/// Why the signing seed file cannot be used as it is, if it cannot: on Unix, readable by group
+/// or others. `None` when it does not exist yet (it is judged when it is read).
+pub fn seed_file_problem(path: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Some(format!(
+                    "{} is readable by group or others; make it owner-only (chmod 600)",
+                    path.display()
+                ));
+            }
+        }
+    }
+    let _ = path;
+    None
 }
 
 async fn latest(

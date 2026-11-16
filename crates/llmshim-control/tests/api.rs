@@ -214,11 +214,21 @@ async fn the_key_lifecycle_over_http_shows_a_secret_once_and_records_the_actor()
 
     // The limits are a whole update.
     let other = rotated.json()["key"]["id"].as_str().unwrap().to_string();
-    let changed = api
+    // A body that leaves a limit out is refused: it cannot silently clear a budget or an expiry.
+    let partial = api
         .ok(
             "PATCH",
             &format!("/v1/keys/{other}/limits"),
             Some(json!({"rpm": 5})),
+        )
+        .await;
+    assert_eq!(partial.status, StatusCode::BAD_REQUEST);
+    assert!(partial.body.contains("tpm"), "{}", partial.body);
+    let changed = api
+        .ok(
+            "PATCH",
+            &format!("/v1/keys/{other}/limits"),
+            Some(json!({"rpm": 5, "tpm": null, "budget_usd": null, "budget_window_secs": null, "expires_at": null})),
         )
         .await;
     assert_eq!(changed.status, StatusCode::OK);
@@ -311,6 +321,11 @@ async fn a_snapshot_is_published_signed_and_served_with_an_etag() {
     let key_file = directory.join("seed");
     let (seed, public) = llmshim::serve::snapshot::keygen().unwrap();
     std::fs::write(&key_file, &seed).unwrap();
+    std::fs::set_permissions(
+        &key_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let api = Api::new(Some(key_file.clone()));
     let (org, _team, project) = api.tree().await;
     api.ok(
@@ -372,6 +387,11 @@ async fn a_snapshot_is_published_signed_and_served_with_an_etag() {
     // The signing key is read at each publish: a bad one fails that publish, publishes
     // nothing, and says nothing about the file.
     std::fs::write(&key_file, "not a key").unwrap();
+    std::fs::set_permissions(
+        &key_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     let failed = api
         .ok("POST", &format!("/v1/orgs/{org}/snapshots"), None)
         .await;
@@ -388,6 +408,11 @@ async fn a_snapshot_is_published_signed_and_served_with_an_etag() {
     assert_eq!(missing.status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(!missing.body.contains(directory.to_str().unwrap()));
     std::fs::write(&key_file, &seed).unwrap();
+    std::fs::set_permissions(
+        &key_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
     assert_eq!(
         api.ok("POST", &format!("/v1/orgs/{org}/snapshots"), None)
             .await
@@ -448,4 +473,72 @@ async fn the_openapi_document_and_the_router_have_the_same_routes() {
             "{method} {path}"
         );
     }
+}
+
+#[tokio::test]
+async fn the_bearer_scheme_is_case_insensitive_and_nothing_else_about_it_is_loosened() {
+    let api = Api::new(None);
+    let ok = api
+        .call_with(
+            "GET",
+            "/v1/orgs",
+            None,
+            None,
+            &[("authorization", &format!("bearer {TOKEN}"))],
+        )
+        .await;
+    assert_eq!(ok.status, StatusCode::OK);
+    for header_value in [
+        TOKEN.to_string(),
+        format!("Basic {TOKEN}"),
+        format!("Bearer{TOKEN}"),
+        "Bearer ".to_string(),
+        format!("Bearer {TOKEN}x"),
+    ] {
+        let answer = api
+            .call_with(
+                "GET",
+                "/v1/orgs",
+                None,
+                None,
+                &[("authorization", &header_value)],
+            )
+            .await;
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "{header_value}");
+    }
+    // HEAD and OPTIONS are not a way around it either.
+    for method in ["HEAD", "OPTIONS"] {
+        let answer = api.call(method, "/v1/orgs", None, None).await;
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn a_signing_key_other_users_can_read_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = dir("seedmode");
+    let key_file = directory.join("seed");
+    let (seed, _) = llmshim::serve::snapshot::keygen().unwrap();
+    std::fs::write(&key_file, &seed).unwrap();
+    let api = Api::new(Some(key_file.clone()));
+    let (org, _, _) = api.tree().await;
+    for mode in [0o644, 0o640, 0o604] {
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(mode)).unwrap();
+        let answer = api
+            .ok("POST", &format!("/v1/orgs/{org}/snapshots"), None)
+            .await;
+        assert_eq!(answer.status, StatusCode::INTERNAL_SERVER_ERROR, "{mode:o}");
+        assert!(
+            answer.body.contains("readable by others"),
+            "{}",
+            answer.body
+        );
+    }
+    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        api.ok("POST", &format!("/v1/orgs/{org}/snapshots"), None)
+            .await
+            .status,
+        StatusCode::CREATED
+    );
 }

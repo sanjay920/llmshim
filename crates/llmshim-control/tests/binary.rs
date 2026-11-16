@@ -79,6 +79,24 @@ fn bad_arguments_and_bad_files_fail_before_serving() {
         stderr.contains("at least 22") && !stderr.contains("short-token"),
         "{stderr}"
     );
+    // A signing key others can read stops the start too.
+    let seed = directory.join("seed");
+    std::fs::write(&seed, "x").unwrap();
+    std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let ok_token = token_file(&directory, TOKEN, 0o600);
+    let (code, stderr) = run(&[
+        "serve",
+        "--db",
+        db,
+        "--listen",
+        "127.0.0.1:0",
+        "--token-file",
+        ok_token.to_str().unwrap(),
+        "--signing-key-file",
+        seed.to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("owner-only"), "{stderr}");
     // A missing token file.
     let (code, _) = run(&[
         "serve",
@@ -179,6 +197,11 @@ fn the_server_serves_over_a_socket_authenticates_and_stops_on_sigterm() {
     assert_eq!(status, 201, "{body}");
     // The data is in the file: a second process would see it.
     assert!(db.exists());
+    assert_eq!(
+        std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the database is owner-only"
+    );
     let killed = Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
         .status()
