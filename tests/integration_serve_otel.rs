@@ -30,6 +30,23 @@ const CLOSED_ATTRIBUTES: &[&str] = &[
     "llmshim.key",
 ];
 
+/// The only attribute keys an attempt span may carry (0016, decision 6).
+const ATTEMPT_ATTRIBUTES: &[&str] = &[
+    "llmshim.provider",
+    "llmshim.model",
+    "llmshim.attempt.kind",
+    "llmshim.attempt.outcome",
+    "llmshim.upstream.status_code",
+    "llmshim.usage.input_tokens",
+    "llmshim.usage.output_tokens",
+    "llmshim.usage.reasoning_tokens",
+    "llmshim.usage.cache_read_tokens",
+    "llmshim.usage.cache_write_tokens",
+    "llmshim.cost_usd",
+    "llmshim.cost_source",
+    "llmshim.request_id",
+];
+
 /// One request the receiver got: its headers and its body.
 type Request = (Vec<(String, String)>, Vec<u8>);
 
@@ -192,7 +209,16 @@ async fn a_request_span_is_exported_with_a_closed_attribute_set_and_no_secret() 
         Some(OTLP_TOKEN),
         "the configured header reaches the collector"
     );
-    let spans = received.spans();
+    let all = received.spans();
+    let attempts: Vec<Span> = all
+        .iter()
+        .filter(|span| span.name == "llmshim.attempt")
+        .cloned()
+        .collect();
+    let spans: Vec<Span> = all
+        .into_iter()
+        .filter(|span| span.name == "llmshim.request")
+        .collect();
     assert_eq!(spans.len(), 2, "one span per request: {spans:#?}");
     let by_id = |id: &str| {
         spans
@@ -236,7 +262,34 @@ async fn a_request_span_is_exported_with_a_closed_attribute_set_and_no_secret() 
     );
     assert!(attribute(refused, "llmshim.tenant").is_none());
 
-    // The attribute set is closed.
+    // The refused request reached no provider, so it has no attempt; the
+    // served one has exactly one, a child of its request span.
+    assert_eq!(attempts.len(), 1, "{attempts:#?}");
+    let attempt = &attempts[0];
+    assert_eq!(attempt.parent_span_id, ok.span_id);
+    assert_eq!(attempt.trace_id, ok.trace_id);
+    assert_eq!(
+        attribute(attempt, "llmshim.request_id").as_deref(),
+        Some("run-5.step-1")
+    );
+    assert_eq!(
+        attribute(attempt, "llmshim.provider").as_deref(),
+        Some("inference")
+    );
+    assert_eq!(
+        attribute(attempt, "llmshim.attempt.outcome").as_deref(),
+        Some("completed")
+    );
+    assert_eq!(
+        attribute(attempt, "llmshim.usage.input_tokens").as_deref(),
+        Some("3")
+    );
+    // A model the catalog has no price for: the cost is unknown, so absent,
+    // never zero.
+    assert!(attribute(attempt, "llmshim.cost_usd").is_none());
+    assert!(attribute(attempt, "llmshim.cost_source").is_none());
+
+    // The attribute sets are closed.
     for span in &spans {
         for (key, _) in attributes(span) {
             assert!(
@@ -244,6 +297,12 @@ async fn a_request_span_is_exported_with_a_closed_attribute_set_and_no_secret() 
                 "unexpected attribute {key}"
             );
         }
+    }
+    for (key, _) in attributes(attempt) {
+        assert!(
+            ATTEMPT_ATTRIBUTES.contains(&key.as_str()),
+            "unexpected attribute {key}"
+        );
     }
     // And nothing secret or private is in anything that was sent.
     for body in received.bodies() {
@@ -263,6 +322,76 @@ async fn a_request_span_is_exported_with_a_closed_attribute_set_and_no_secret() 
             );
         }
     }
+}
+
+/// A streamed answer's attempt ends after the response head went out, and so
+/// after the request span ended; it still joins that request's trace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_streamed_attempt_outlives_its_request_span_and_keeps_its_parent() {
+    let chunk = |delta: &str, finish: &str, usage: &str| {
+        format!(
+            r#"data: {{"id":"c1","object":"chat.completion.chunk","created":1,"model":"test-model","choices":[{{"index":0,"delta":{delta},"finish_reason":{finish}}}]{usage}}}"#
+        )
+    };
+    let body = [
+        chunk(r#"{"role":"assistant","content":"po"}"#, "null", ""),
+        chunk(
+            r#"{"content":"ng"}"#,
+            r#""stop""#,
+            r#","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}"#,
+        ),
+        "data: [DONE]".to_string(),
+    ]
+    .join("\n\n")
+        + "\n\n";
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(1)
+        .create_async()
+        .await;
+    let (endpoint, received) = receiver().await;
+    let server = start(
+        &config(&upstream.url(), &telemetry_table(&endpoint, "")),
+        "otel-stream",
+        &[("SERVE_E2E_OTLP_TOKEN", OTLP_TOKEN)],
+    );
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", server.base))
+        .bearer_auth(CALLER_KEY)
+        .header("x-request-id", "stream-run-1")
+        .json(
+            &serde_json::json!({"model": "inference/test-model", "stream": true,
+            "messages": [{"role": "user", "content": "ping"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.text().await.unwrap().contains("ng"));
+    stop(server).await;
+
+    let spans = received.spans();
+    let request = spans
+        .iter()
+        .find(|s| s.name == "llmshim.request")
+        .expect("a request span");
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == "llmshim.attempt")
+        .expect("an attempt span");
+    assert_eq!(attempt.parent_span_id, request.span_id);
+    assert_eq!(attempt.trace_id, request.trace_id);
+    assert_eq!(
+        attribute(attempt, "llmshim.attempt.kind").as_deref(),
+        Some("stream")
+    );
+    assert_eq!(
+        attribute(attempt, "llmshim.usage.output_tokens").as_deref(),
+        Some("2")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

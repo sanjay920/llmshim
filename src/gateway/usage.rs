@@ -109,6 +109,29 @@ pub struct UsageSetup {
     pub sink: Arc<dyn UsageSink>,
     pub tenants: TenantNames,
     pub keys: KeyNames,
+    /// Starts a trace span for each admitted attempt, when something exports
+    /// traces. Driven from the same two points as the records.
+    pub spans: Option<Arc<dyn AttemptSpans>>,
+}
+
+/// What is known when an attempt is admitted.
+#[cfg_attr(not(feature = "serve-otel"), allow(dead_code))]
+pub struct AttemptBegun<'a> {
+    pub request_id: Option<&'a str>,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub kind: &'static str,
+}
+
+/// Starts the trace span of an attempt. One span per admitted attempt, none for
+/// a refusal, as for the record.
+pub trait AttemptSpans: Send + Sync {
+    fn start(&self, begun: &AttemptBegun<'_>) -> Box<dyn AttemptSpan>;
+}
+
+/// The span of one attempt, ended with the record the usage log would carry.
+pub trait AttemptSpan: Send {
+    fn end(self: Box<Self>, record: &UsageRecord);
 }
 
 /// Tenant names by the hash a policy scope carries.
@@ -210,6 +233,7 @@ impl UsageSetup {
 }
 
 struct Open {
+    span: Option<Box<dyn AttemptSpan>>,
     tenant: Option<String>,
     key: Option<String>,
     request_id: Option<String>,
@@ -229,6 +253,7 @@ struct Open {
 
 /// Tracks attempts in flight and emits one record when each ends.
 pub(crate) struct UsageRecorder {
+    spans: Option<Arc<dyn AttemptSpans>>,
     sink: Arc<dyn UsageSink>,
     tenants: TenantNames,
     keys: KeyNames,
@@ -238,6 +263,7 @@ pub(crate) struct UsageRecorder {
 impl UsageRecorder {
     pub(crate) fn new(setup: UsageSetup) -> Self {
         Self {
+            spans: setup.spans,
             sink: setup.sink,
             tenants: setup.tenants,
             keys: setup.keys,
@@ -254,7 +280,16 @@ impl UsageRecorder {
         credential: Option<&str>,
         request_id: Option<&str>,
     ) {
+        let span = self.spans.as_ref().map(|spans| {
+            spans.start(&AttemptBegun {
+                request_id,
+                provider: identity.provider_name(),
+                model: identity.native_model(),
+                kind: kind_name(identity.kind()),
+            })
+        });
         let open = Open {
+            span,
             tenant: self.tenants.name(tenant_key),
             key: credential.and_then(|credential| self.keys.name(credential)),
             request_id: request_id.map(str::to_owned),
@@ -302,10 +337,14 @@ impl UsageRecorder {
     /// The attempt ended. Exactly one record per admitted attempt: a second call
     /// for the same id (a finish followed by a drop notification) finds nothing.
     pub(crate) fn finish(&self, id: uuid::Uuid, outcome: AttemptOutcome) {
-        let Some(open) = self.open.lock().ok().and_then(|mut a| a.remove(&id)) else {
+        let Some(mut open) = self.open.lock().ok().and_then(|mut a| a.remove(&id)) else {
             return;
         };
+        let span = open.span.take();
         let record = build(id, open, outcome);
+        if let Some(span) = span {
+            span.end(&record);
+        }
         self.sink.record(&record);
     }
 

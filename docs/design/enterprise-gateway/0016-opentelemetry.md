@@ -1,7 +1,7 @@
 # 0016: OpenTelemetry traces
 
-Status: slices 1 to 3 and 5 implemented (the request span, the exporter and the
-log writers' counters); the attempt span (slice 4) remains. A contract note, written
+Status: all five slices implemented (the request span, the exporter, the attempt
+span and the log writers' counters). A contract note, written
 before any code (README working rule 3).
 
 ## What an operator needs
@@ -161,7 +161,16 @@ is a later slice with its own transition note.
    exists; the exporter's queue, batch and timeout sizes are constants, not
    settings.
 4. The attempt span from the attempt hooks; the closed attribute set pinned by a
-   test; the trace joins the request id (closing the roadmap line).
+   test; the trace joins the request id (closing the roadmap line). Done: the
+   usage recorder starts and ends the span (so it exists whenever a usage log or
+   telemetry is configured; without a usage log the records go nowhere). The
+   request span's context is kept in a registry keyed by request id, 8192 entries
+   at most (a full registry leaves a new request's attempts in their own trace),
+   and stays ten minutes after the request span ends, which is what lets a
+   stream's attempt finish under it. An attempt whose request this replica does
+   not hold (a fleet job taken elsewhere) starts its own trace and carries the
+   request id. The token attributes appear only when the provider reported
+   usage; cost only when known. Upstream status is `llmshim.upstream.status_code`.
 5. The log writers' drop and failure counters as `/metrics` series. Done:
    `llmshim_log_lines_dropped_total` and `llmshim_log_write_failures_total`, by
    `log` (`access` or `usage`); the unit tests assert both series.

@@ -11,6 +11,7 @@
 
 use super::config::Telemetry as TelemetryConfig;
 use super::config::{read_secret, Issue};
+use crate::gateway::usage::{AttemptBegun, AttemptSpan, AttemptSpans, UsageRecord};
 use axum::http::HeaderMap;
 use std::sync::Arc;
 
@@ -76,12 +77,26 @@ mod stub {
     impl RequestSpan {
         pub fn end(self, _status: Option<u16>) {}
     }
+
+    struct NoAttemptSpan;
+
+    impl AttemptSpans for Telemetry {
+        fn start(&self, _begun: &AttemptBegun<'_>) -> Box<dyn AttemptSpan> {
+            Box::new(NoAttemptSpan)
+        }
+    }
+
+    impl AttemptSpan for NoAttemptSpan {
+        fn end(self: Box<Self>, _record: &UsageRecord) {}
+    }
 }
 
 #[cfg(feature = "serve-otel")]
 mod real {
     use super::*;
-    use opentelemetry::trace::{Span as _, SpanKind, Status, Tracer as _, TracerProvider as _};
+    use opentelemetry::trace::{
+        Span as _, SpanKind, Status, TraceContextExt as _, Tracer as _, TracerProvider as _,
+    };
     use opentelemetry::{Context, KeyValue};
     use opentelemetry_sdk::propagation::TraceContextPropagator;
     use opentelemetry_sdk::trace::{
@@ -106,12 +121,66 @@ mod real {
     pub const SPANS_DROPPED: &str = "llmshim_telemetry_spans_dropped_total";
     pub const EXPORT_FAILURES: &str = "llmshim_telemetry_export_failures_total";
 
+    /// Request spans an attempt may still be parented to.
+    const REGISTRY: usize = 8192;
+    /// How long a request's context stays after its span ended: a streamed
+    /// answer's attempt finishes after the response head went out.
+    const LINGER: Duration = Duration::from_secs(600);
+
     pub struct Telemetry {
         tracer: SdkTracer,
         provider: SdkTracerProvider,
+        requests: Arc<Requests>,
     }
 
-    pub struct RequestSpan(SdkSpan);
+    /// The span contexts of requests in flight (and recently ended), by request
+    /// id, so an attempt, which the gateway knows only by that id, joins its
+    /// request's trace. Bounded: when full, a new request is simply not
+    /// registered and its attempts start their own traces.
+    #[derive(Default)]
+    struct Requests(std::sync::Mutex<std::collections::HashMap<String, Entry>>);
+
+    struct Entry {
+        context: opentelemetry::trace::SpanContext,
+        ended: Option<std::time::Instant>,
+    }
+
+    impl Requests {
+        fn register(&self, id: &str, context: opentelemetry::trace::SpanContext) {
+            let Ok(mut map) = self.0.lock() else { return };
+            if map.len() >= REGISTRY / 2 {
+                map.retain(|_, e| e.ended.is_none_or(|at| at.elapsed() < LINGER));
+            }
+            if map.len() >= REGISTRY {
+                return;
+            }
+            map.insert(
+                id.to_owned(),
+                Entry {
+                    context,
+                    ended: None,
+                },
+            );
+        }
+
+        fn ended(&self, id: &str) {
+            if let Ok(mut map) = self.0.lock() {
+                if let Some(entry) = map.get_mut(id) {
+                    entry.ended = Some(std::time::Instant::now());
+                }
+            }
+        }
+
+        fn context(&self, id: &str) -> Option<opentelemetry::trace::SpanContext> {
+            self.0.lock().ok()?.get(id).map(|e| e.context.clone())
+        }
+    }
+
+    pub struct RequestSpan {
+        span: SdkSpan,
+        id: String,
+        requests: Arc<Requests>,
+    }
 
     impl Telemetry {
         pub(super) fn start(
@@ -166,7 +235,11 @@ mod real {
                 ))))
                 .build();
             let tracer = provider.tracer("llmshim");
-            Ok(Some(Self { tracer, provider }))
+            Ok(Some(Self {
+                tracer,
+                provider,
+                requests: Arc::default(),
+            }))
         }
 
         /// Start the span of one request. `inbound` is the request's headers when
@@ -204,7 +277,13 @@ mod real {
                 .with_kind(SpanKind::Server)
                 .with_attributes(attributes)
                 .start_with_context(&self.tracer, &parent);
-            RequestSpan(span)
+            self.requests
+                .register(request_id, span.span_context().clone());
+            RequestSpan {
+                span,
+                id: request_id.to_owned(),
+                requests: self.requests.clone(),
+            }
         }
 
         /// Send what is queued and stop the worker, within a bound. Call once,
@@ -220,15 +299,90 @@ mod real {
         pub fn end(mut self, status: Option<u16>) {
             match status {
                 Some(code) => {
-                    self.0
+                    self.span
                         .set_attribute(KeyValue::new("http.response.status_code", i64::from(code)));
                     if code >= 500 {
-                        self.0.set_status(Status::error(format!("HTTP {code}")));
+                        self.span.set_status(Status::error(format!("HTTP {code}")));
                     }
                 }
-                None => self.0.set_status(Status::error("abandoned")),
+                None => self.span.set_status(Status::error("abandoned")),
             }
-            self.0.end();
+            self.span.end();
+            self.requests.ended(&self.id);
+        }
+    }
+
+    /// One `llmshim.attempt` client span per admitted provider attempt, a child
+    /// of its request's span when this replica holds it.
+    struct Attempt(SdkSpan);
+
+    impl AttemptSpans for Telemetry {
+        fn start(&self, begun: &AttemptBegun<'_>) -> Box<dyn AttemptSpan> {
+            let parent = begun
+                .request_id
+                .and_then(|id| self.requests.context(id))
+                .map_or_else(Context::new, |sc| {
+                    Context::new().with_remote_span_context(sc)
+                });
+            let mut attributes = vec![
+                KeyValue::new("llmshim.provider", bounded_text(begun.provider)),
+                KeyValue::new("llmshim.model", bounded_text(begun.model)),
+                KeyValue::new("llmshim.attempt.kind", begun.kind),
+            ];
+            if let Some(id) = begun.request_id {
+                attributes.push(KeyValue::new("llmshim.request_id", id.to_owned()));
+            }
+            let span = self
+                .tracer
+                .span_builder("llmshim.attempt")
+                .with_kind(SpanKind::Client)
+                .with_attributes(attributes)
+                .start_with_context(&self.tracer, &parent);
+            Box::new(Attempt(span))
+        }
+    }
+
+    impl AttemptSpan for Attempt {
+        fn end(mut self: Box<Self>, record: &UsageRecord) {
+            let span = &mut self.0;
+            span.set_attribute(KeyValue::new("llmshim.attempt.outcome", record.outcome));
+            if let Some(status) = record.http_status {
+                span.set_attribute(KeyValue::new(
+                    "llmshim.upstream.status_code",
+                    i64::from(status),
+                ));
+            }
+            let count = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+            if record.usage_reported {
+                span.set_attribute(KeyValue::new(
+                    "llmshim.usage.input_tokens",
+                    count(record.input_tokens),
+                ));
+                span.set_attribute(KeyValue::new(
+                    "llmshim.usage.output_tokens",
+                    count(record.output_tokens),
+                ));
+                if let Some(n) = record.reasoning_tokens {
+                    span.set_attribute(KeyValue::new("llmshim.usage.reasoning_tokens", count(n)));
+                }
+                span.set_attribute(KeyValue::new(
+                    "llmshim.usage.cache_read_tokens",
+                    count(record.cache_read_tokens),
+                ));
+                span.set_attribute(KeyValue::new(
+                    "llmshim.usage.cache_write_tokens",
+                    count(record.cache_write_tokens),
+                ));
+            }
+            // Unknown is absent, never zero.
+            if let (Some(usd), Some(source)) = (record.cost_usd, &record.cost_source) {
+                span.set_attribute(KeyValue::new("llmshim.cost_usd", usd));
+                span.set_attribute(KeyValue::new("llmshim.cost_source", source.clone()));
+            }
+            if record.outcome != "completed" {
+                span.set_status(Status::error(record.outcome));
+            }
+            span.end();
         }
     }
 
