@@ -505,6 +505,20 @@ impl GatewayState {
         }
     }
 
+    /// Pin the router a request was admitted on, where the job will run on this
+    /// replica. A fleet job is run by whichever replica leases it, on that
+    /// replica's router (0022), so there the snapshot would only be held for
+    /// nothing.
+    fn pin_router(
+        &self,
+        scope: &mut crate::gateway::attempt::TrustedPolicyScope,
+        snapshot: Arc<Router>,
+    ) {
+        if matches!(self.backend, Backend::Local(_)) {
+            scope.set_router(snapshot);
+        }
+    }
+
     async fn trusted_policy_scope(
         &self,
         identity: &crate::gateway::auth::Identity,
@@ -760,6 +774,7 @@ fn build_request(
     state: &GatewayState,
     headers: &HeaderMap,
     req: &ChatRequest,
+    preselected: Option<Arc<Router>>,
 ) -> Result<
     (
         String,
@@ -779,7 +794,7 @@ fn build_request(
     })?;
     // One snapshot for the whole request (0022): the provider is resolved against it
     // here and the dispatch that runs the job uses the same one.
-    let snapshot = state.router.current();
+    let snapshot = preselected.unwrap_or_else(|| state.router.current());
     let prepared_request = crate::proxy::convert::prepare_request(&snapshot, req)?;
     let provider_name = prepared_request.target.provider_name.clone();
     let budget_model = prepared_request.target.model.clone();
@@ -879,10 +894,12 @@ async fn chat(
     State(state): State<Arc<GatewayState>>,
     installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
     logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
+    admitted_router: Option<axum::Extension<AdmittedRouter>>,
     headers: HeaderMap,
     uri: Uri,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
+    let preselected = admitted_router.map(|axum::Extension(AdmittedRouter(router))| router);
     let prequeue_permit = prequeue_permit(&state, installed_prequeue_permit).await?;
     if logical_lifetime
         .as_ref()
@@ -901,6 +918,7 @@ async fn chat(
             prequeue_permit,
             logical_lifetime,
             uri.path() == "/v1/responses",
+            preselected,
         )
         .await);
     }
@@ -910,7 +928,7 @@ async fn chat(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let (provider_name, _budget_model, gw, identified_caller, snapshot) =
-        build_request(&state, &headers, &req)?;
+        build_request(&state, &headers, &req, preselected)?;
     let identity = &identified_caller.identity;
     let idempotency_context = idem_key.as_ref().map(|client_key| {
         crate::gateway::idempotency::IdempotencyContext::new(
@@ -930,7 +948,7 @@ async fn chat(
     if state.attempt_coordinator.records_usage() {
         policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
     }
-    policy_scope.set_router(snapshot);
+    state.pin_router(&mut policy_scope, snapshot);
     let prepared_submission = state
         .prepare_submission(gw, policy_scope, false)
         .map_err(|error| gateway_err_to_api(&state, error))?;
@@ -1000,6 +1018,7 @@ async fn chat_stream(
         prequeue_permit,
         logical_lifetime,
         false,
+        None,
     )
     .await
 }
@@ -1011,9 +1030,10 @@ async fn chat_stream_inner(
     prequeue_permit: PrequeuePreparationPermit,
     logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
     responses_identity: bool,
+    preselected: Option<Arc<Router>>,
 ) -> Response {
     let (_provider_name, _budget_model, gw, identified_caller, snapshot) =
-        match build_request(&state, &headers, &req) {
+        match build_request(&state, &headers, &req, preselected) {
             Ok(t) => t,
             Err(e) => return e.into_response(),
         };
@@ -1027,7 +1047,7 @@ async fn chat_stream_inner(
     if state.attempt_coordinator.records_usage() {
         policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
     }
-    policy_scope.set_router(snapshot);
+    state.pin_router(&mut policy_scope, snapshot);
     let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {
         Ok(prepared) => prepared,
         Err(error) => return gateway_err_to_api(&state, error).into_response(),
@@ -1432,6 +1452,11 @@ fn insert_retry_after(response: &mut Response, wait: Duration) {
     }
 }
 
+/// The router the native-route translation layer resolved against, handed on to
+/// admission so both use one snapshot (0022).
+#[derive(Clone)]
+struct AdmittedRouter(Arc<Router>);
+
 async fn native_translate(
     State(state): State<Arc<GatewayState>>,
     mut request: axum::extract::Request,
@@ -1448,7 +1473,13 @@ async fn native_translate(
             );
         }
     }
-    crate::proxy::wire::translate_with_router(request, next, Some(&state.router.current())).await
+    // One snapshot for translation and admission: the replay target translation
+    // builds and the router the request is admitted on must be the same one.
+    let snapshot = state.router.current();
+    request
+        .extensions_mut()
+        .insert(AdmittedRouter(snapshot.clone()));
+    crate::proxy::wire::translate_with_router(request, next, Some(&snapshot)).await
 }
 
 #[cfg(test)]
@@ -4363,7 +4394,7 @@ mod native_tests {
         }))
         .unwrap();
         let (provider_name, budget_model, gateway_request, _, _) =
-            match build_request(&state, &headers, &request) {
+            match build_request(&state, &headers, &request, None) {
                 Ok(prepared) => prepared,
                 Err(_) => panic!("route request should be admitted"),
             };
@@ -4413,7 +4444,7 @@ mod native_tests {
                     "provider_config": {"x-local": {(protected_field):"replacement"}}
                 }))
                 .unwrap();
-                assert!(build_request(&state, &headers, &request).is_err());
+                assert!(build_request(&state, &headers, &request, None).is_err());
             }
 
             let request: ChatRequest = serde_json::from_value(json!({
@@ -4422,10 +4453,11 @@ mod native_tests {
                 "provider_config": {"x-local": {(output_field):7_000}}
             }))
             .unwrap();
-            let (_, _, gateway_request, _, _) = match build_request(&state, &headers, &request) {
-                Ok(prepared) => prepared,
-                Err(_) => panic!("native output limit should remain supported"),
-            };
+            let (_, _, gateway_request, _, _) =
+                match build_request(&state, &headers, &request, None) {
+                    Ok(prepared) => prepared,
+                    Err(_) => panic!("native output limit should remain supported"),
+                };
             assert!(gateway_request.permits >= 7_000);
         }
     }
@@ -4740,6 +4772,88 @@ mod native_tests {
             .await
             .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(fresh["choices"][0]["message"]["content"], "from B");
+        on_b.assert_async().await;
+    }
+
+    /// POST /v1/chat through the real handler and the scheduler.
+    async fn post_chat(app: axum::Router) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(chat_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_request_queued_behind_another_runs_on_the_router_it_was_admitted_on() {
+        // The handler pins the router at admission (0022): with one request in
+        // flight and a second waiting its turn, a reload that replaces the router
+        // in between changes neither. Delete the pin in the handler and the
+        // second request is dispatched on B.
+        let body = |label: &str| {
+            json!({"id": "c", "created": 1, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": label}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+            .to_string()
+        };
+        let mut a = mockito::Server::new_async().await;
+        let first_arrived = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let slow_a = {
+            let body = body("from A");
+            let arrived = first_arrived.clone();
+            a.mock("POST", "/chat/completions")
+                .with_header("content-type", "application/json")
+                .with_chunked_body(move |writer| {
+                    arrived.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(2000));
+                    writer.write_all(body.as_bytes())
+                })
+                .expect(2)
+                .create_async()
+                .await
+        };
+        let (b, on_b) = labelled_upstream("from B", 0).await;
+        let mut parts = LocalParts::from_env();
+        parts.config.max_concurrency_per_provider = 1;
+        let state = GatewayState::from_parts(router_to(a.url()), None, parts);
+        let application = app(state.clone());
+        // Wait on events, not sleeps: admission can be slow on a cold process.
+        let first = tokio::spawn(post_chat(application.clone()));
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while !first_arrived.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < until,
+                "the first request never reached A"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let second = tokio::spawn(post_chat(application.clone()));
+        // The second is admitted (cheap: the process is warm) and waits behind the
+        // first, which holds A for two seconds; the margin is the wait, not a race.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        state.router.replace(router_to(b.url()));
+        for (name, request) in [("first", first), ("second", second)] {
+            let (status, answer) = request.await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{name}: {answer}");
+            assert_eq!(
+                answer["message"]["content"], "from A",
+                "{name} ran on the router it was admitted on"
+            );
+        }
+        slow_a.assert_async().await;
         on_b.assert_async().await;
     }
 
