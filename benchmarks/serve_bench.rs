@@ -34,6 +34,8 @@ struct Args {
     duration: Duration,
     warmup: Duration,
     think: Duration,
+    /// `[upstream] pool_max_idle_per_host`; unset means the server's own default.
+    pool: Option<u32>,
     binary: String,
     json: Option<String>,
 }
@@ -44,6 +46,7 @@ fn parse() -> Args {
         duration: Duration::from_secs(15),
         warmup: Duration::from_secs(3),
         think: Duration::ZERO,
+        pool: None,
         binary: "target/release/llmshim".into(),
         json: None,
     };
@@ -75,6 +78,7 @@ fn parse() -> Args {
                     value().parse().unwrap_or_else(|_| usage("bad --think-ms")),
                 )
             }
+            "--pool" => args.pool = Some(value().parse().unwrap_or_else(|_| usage("bad --pool"))),
             "--bin" => args.binary = value(),
             "--json" => args.json = Some(value()),
             "-h" | "--help" => usage(""),
@@ -90,7 +94,7 @@ fn usage(problem: &str) -> ! {
     }
     eprintln!(
         "usage: serve_bench [--concurrency N,N,...] [--duration SECS] [--warmup SECS] \
-         [--think-ms MS] [--bin PATH] [--json FILE]"
+         [--think-ms MS] [--pool N] [--bin PATH] [--json FILE]"
     );
     std::process::exit(if problem.is_empty() { 0 } else { 2 });
 }
@@ -367,8 +371,11 @@ async fn main() {
             "version = 1\n[server]\nport = 0\n[state]\nreceipts_dir = \"{}\"\n\
              [providers.inference]\nkind = \"openai-compatible\"\nbase_url = \"{upstream}\"\n\
              api_key = {{ env = \"BENCH_UPSTREAM_KEY\" }}\n\
-             [[keys]]\nname = \"bench\"\ntenant = \"bench\"\nsecret = {{ env = \"BENCH_CALLER_KEY\" }}\n",
-            dir.join("receipts").display()
+             [[keys]]\nname = \"bench\"\ntenant = \"bench\"\nsecret = {{ env = \"BENCH_CALLER_KEY\" }}\n{}",
+            dir.join("receipts").display(),
+            args.pool.map_or(String::new(), |n| format!(
+                "[upstream]\npool_max_idle_per_host = {n}\n"
+            ))
         ),
     )
     .unwrap();
@@ -489,10 +496,11 @@ async fn main() {
     );
     println!(
         "- load: closed loop at each listed number of concurrent connections, {}s measured after {}s warm-up; \
-         mock think time {} ms; client, mock and gateway on one machine\n",
+         mock think time {} ms; client, mock and gateway on one machine\n- gateway `[upstream] pool_max_idle_per_host`: {}\n",
         args.duration.as_secs(),
         args.warmup.as_secs(),
-        args.think.as_millis()
+        args.think.as_millis(),
+        args.pool.map_or("unset (the server's default: follows the concurrency, at least 256)".to_string(), |n| n.to_string())
     );
     println!(
         "| connections | path | requests | failed | req/s | p50 | p99 | added p50 | added p99 | peak RSS | upstream connections |\n\
