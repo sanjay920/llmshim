@@ -2,13 +2,8 @@ use llmshim::{
     audio::{TranscriptionModelInfo, TranscriptionRequest},
     provider::Provider,
     providers::{
-        anthropic::Anthropic,
-        chatgpt::{ChatGpt, ChatGptAuth},
-        gemini::Gemini,
-        openai::OpenAi,
-        openai_compat::OpenAiCompatible,
-        openrouter::OpenRouter,
-        xai::Xai,
+        anthropic::Anthropic, gemini::Gemini, openai::OpenAi, openai_compat::OpenAiCompatible,
+        openrouter::OpenRouter, xai::Xai,
     },
     router::Router,
 };
@@ -160,11 +155,8 @@ async fn ids_carry_the_key_a_provider_is_registered_under() {
 
 #[test]
 fn a_provider_without_transcription_lists_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let auth = ChatGptAuth::new(dir.path().join("auth.json"));
     let silent: Vec<(&str, Box<dyn Provider>)> = vec![
         ("anthropic", Box::new(Anthropic::new("test".into()))),
-        ("chatgpt", Box::new(ChatGpt::new(auth))),
         ("gemini", Box::new(Gemini::new("test".into()))),
         (
             "vllm",

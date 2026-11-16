@@ -177,6 +177,16 @@ pub trait Provider: Send + Sync {
         ))
     }
 
+    /// Prepare transcription credentials before dispatch. The default preserves
+    /// synchronous providers and credential wrappers.
+    fn prepare_transcription_request<'a>(
+        &'a self,
+        model: &'a str,
+        request: &'a crate::audio::TranscriptionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::audio::TranscriptionUpload>> + Send + 'a>> {
+        Box::pin(async move { self.transcription_request(model, request) })
+    }
+
     /// Turn the provider answer into transcript text and usage with cost provenance.
     fn transcription_response(
         &self,

@@ -10,7 +10,9 @@ impl ShimClient {
         request: &crate::audio::TranscriptionRequest,
     ) -> Result<crate::audio::TranscriptionResponse> {
         crate::audio::validate_transcription(request)?;
-        let upload = provider.transcription_request(model, request)?;
+        let upload = provider
+            .prepare_transcription_request(model, request)
+            .await?;
         let result = async {
             let attempt = self
                 .send_prepared_with_body(

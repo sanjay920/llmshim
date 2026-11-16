@@ -1,4 +1,5 @@
 //! ChatGPT subscription provider. Address models explicitly as `chatgpt/<model>`.
+mod audio;
 mod auth;
 mod storage;
 mod streaming;
@@ -219,6 +220,43 @@ impl ChatGpt {
 impl Provider for ChatGpt {
     fn name(&self) -> &str {
         "chatgpt"
+    }
+
+    fn transcription_models(&self) -> Vec<crate::audio::TranscriptionModelInfo> {
+        vec![crate::audio::TranscriptionModelInfo::new(
+            self.name(),
+            "transcribe",
+            "ChatGPT dictation",
+        )]
+    }
+
+    fn transcription_request(
+        &self,
+        model: &str,
+        request: &crate::audio::TranscriptionRequest,
+    ) -> Result<crate::audio::TranscriptionUpload> {
+        let endpoint = audio::endpoint(self, model, request)?;
+        audio::upload(self, request, endpoint, self.auth.cached_credentials()?)
+    }
+
+    fn prepare_transcription_request<'a>(
+        &'a self,
+        model: &'a str,
+        request: &'a crate::audio::TranscriptionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::audio::TranscriptionUpload>> + Send + 'a>> {
+        Box::pin(async move {
+            let endpoint = audio::endpoint(self, model, request)?;
+            audio::upload(self, request, endpoint, self.auth.credentials().await?)
+        })
+    }
+
+    fn transcription_response(
+        &self,
+        _model: &str,
+        _request: &crate::audio::TranscriptionRequest,
+        response: Value,
+    ) -> Result<crate::audio::TranscriptionResponse> {
+        audio::response(response)
     }
 
     fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
