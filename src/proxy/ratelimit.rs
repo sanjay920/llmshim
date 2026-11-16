@@ -476,8 +476,13 @@ impl RateLimiter for InMemoryRateLimiter {
     async fn acquire(&self, key: &RateKey, permits: u32) -> Result<(), RetryAfter> {
         let limit = self.config.resolve(&key.provider);
         if limit.is_unlimited() {
-            if self.retuned.load(std::sync::atomic::Ordering::Relaxed) {
-                self.buckets.lock().await.remove(key);
+            if self
+                .retuned
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                // One sweep after a retune, not a lock on every unlimited call.
+                let mut map = self.buckets.lock().await;
+                map.retain(|key, _| !self.config.resolve(&key.provider).is_unlimited());
             }
             return Ok(()); // no-op when unconfigured
         }
@@ -511,8 +516,14 @@ impl RateLimiter for InMemoryRateLimiter {
 
     fn retune(&self, config: RateLimitConfig) {
         self.config.replace(config);
-        self.retuned
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Buckets of providers that no longer have a limit are dropped, now if the
+        // map is free and otherwise at the next call that finds no limit.
+        match self.buckets.try_lock() {
+            Ok(mut map) => map.retain(|key, _| !self.config.resolve(&key.provider).is_unlimited()),
+            Err(_) => self
+                .retuned
+                .store(true, std::sync::atomic::Ordering::Relaxed),
+        }
     }
 }
 
@@ -1612,6 +1623,17 @@ mod tests {
         assert!(limiter.acquire(&key, 1).await.is_ok());
         assert!(limiter.acquire(&key, 1).await.is_ok());
         assert!(limiter.acquire(&key, 1).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retune_keeps_an_active_penalty() {
+        let limiter = InMemoryRateLimiter::new(RateLimitConfig::with_global(Some(60), None));
+        let key = RateKey::provider("p");
+        limiter.penalize(&key, Duration::from_secs(5)).await;
+        limiter.retune(RateLimitConfig::with_global(Some(120), None));
+        assert!(limiter.acquire(&key, 1).await.is_err(), "still backing off");
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(limiter.acquire(&key, 1).await.is_ok());
     }
 
     #[tokio::test(start_paused = true)]

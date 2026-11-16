@@ -196,7 +196,13 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
   returns starts fresh; an unchanged limit is not touched, so a reload that does not
   change the limits (or does not change a provider's) is not a reset. The Redis holders
   present this replica's rate and capacity on every call, and their script clamps a
-  lowered capacity and keeps the tokens. Limits are applied before the router. They are
+  lowered capacity and keeps the tokens. A bucket dropped
+  with its limit takes an active penalty with it. In Redis a removed limit leaves the
+  stored bucket to expire (an hour of inactivity), so a limit that returns within that
+  time resumes the balance it had, clamped to the new capacity, rather than starting
+  full. In memory, buckets of providers without a limit are swept at the reload (or at
+  the next call when the map is busy), once, so an unlimited provider's calls never
+  pay for it. Limits are applied before the router. They are
   in the fingerprint and debounce with everything else, apply on a fleet replica (each
   replica presents its own file's rate), and have their own `limits_generation` beside
   `router_generation`. `[limits]` keeps `max_concurrency`, `queue_timeout_ms` and
