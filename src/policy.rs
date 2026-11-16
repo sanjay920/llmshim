@@ -12,6 +12,10 @@ pub type AttemptPolicyFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a
 pub struct DispatchPolicyContext {
     policy: Arc<dyn AttemptPolicy>,
     state: Arc<DispatchPolicyState>,
+    /// The router the request was admitted against (0022): the dispatch that
+    /// runs it, however long it queued, resolves providers, routes and fallbacks
+    /// against this one and not whatever a reload has since put in force.
+    router: Option<Arc<crate::router::Router>>,
 }
 
 struct DispatchPolicyState {
@@ -27,7 +31,23 @@ impl DispatchPolicyContext {
                 last_refusal: std::sync::Mutex::new(None),
                 logical_deadline: std::sync::Mutex::new(None),
             }),
+            router: None,
         }
+    }
+
+    /// Carry the router the request was admitted against.
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    pub(crate) fn with_router_snapshot(
+        mut self,
+        router: Option<Arc<crate::router::Router>>,
+    ) -> Self {
+        self.router = router;
+        self
+    }
+
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    pub(crate) fn router_snapshot(&self) -> Option<&Arc<crate::router::Router>> {
+        self.router.as_ref()
     }
 
     #[cfg(any(feature = "proxy", test))]

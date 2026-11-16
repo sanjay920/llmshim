@@ -62,6 +62,10 @@ pub(crate) struct TrustedPolicyScope {
     /// The request's id, for the usage record. Set only by `serve`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
+    /// The router the request was admitted against (0022). Never serialized: a job
+    /// that crosses Redis is run by another replica on that replica's router.
+    #[serde(skip)]
+    router: Option<Arc<crate::router::Router>>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -81,7 +85,13 @@ impl TrustedPolicyScope {
             legacy_spend_floor: None,
             credential: None,
             request_id: None,
+            router: None,
         }
+    }
+
+    /// Pin the router this request was admitted against (0022).
+    pub(crate) fn set_router(&mut self, router: Arc<crate::router::Router>) {
+        self.router = Some(router);
     }
 
     /// Record who made the request and under which id, for the usage record.
@@ -878,10 +888,12 @@ impl AttemptCoordinator {
     }
 
     pub(crate) fn context(self: &Arc<Self>, scope: TrustedPolicyScope) -> DispatchPolicyContext {
+        let router = scope.router.clone();
         DispatchPolicyContext::new(Arc::new(CoordinatedAttemptPolicy {
             coordinator: self.clone(),
             scope,
         }))
+        .with_router_snapshot(router)
     }
 
     #[cfg(feature = "redis-coordination")]
@@ -1948,6 +1960,7 @@ mod tests {
             legacy_spend_floor: None,
             credential: None,
             request_id: None,
+            router: None,
         }
     }
 
@@ -2005,6 +2018,7 @@ mod tests {
             legacy_spend_floor: None,
             credential: None,
             request_id: None,
+            router: None,
         }
     }
 
@@ -4557,6 +4571,7 @@ mod usage_records {
             legacy_spend_floor: None,
             credential: None,
             request_id: None,
+            router: None,
         }
     }
 

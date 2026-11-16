@@ -1,8 +1,10 @@
 # 0022: Reloading providers, routes and rate limits
 
-Status: design only. A contract note, written before any code (README working
-rule 3). Nothing here is implemented; the slices are listed at the end. It extends
-0012, which reloads `[[keys]]` and nothing else.
+Status: slice 2 implemented (the router handle: the gateway holds its router behind a
+replaceable handle, admission pins a snapshot that rides the request to its
+dispatch; nothing swaps yet). Slices 3 to 5 are not. A contract note, written before
+any code (README working rule 3). It extends 0012, which reloads `[[keys]]` and
+nothing else.
 
 ## What an operator needs
 
@@ -162,7 +164,7 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
 ## Slices
 
 1. This note.
-2. **The router handle.** `GatewayState` holds the router through a handle yielding
+2. **Done: the router handle.** `GatewayState` holds the router through a handle yielding
    snapshots; admission takes a snapshot and the job carries it; dispatch, fallback,
    repair and streaming use the job's snapshot, never the handle. Nothing swaps yet,
    so every existing test must pass unchanged (the gateway and `llmshim gateway`

@@ -44,13 +44,13 @@ use crate::proxy::ratelimit::{
     build_limiter, estimate_prepared_request_tokens, penalty_duration, Backpressure,
 };
 use crate::proxy::types::{ChatRequest, HealthResponse, ModelsResponse, StreamEvent};
-use crate::router::Router;
+use crate::router::{Router, RouterHandle};
 
 /// The [`Dispatch`] that actually fires upstream LLM calls once the scheduler
 /// admits a job — via the crate's normal `completion` / `stream` paths. Detects
 /// an upstream 429 so the scheduler can penalize the provider's bucket.
 pub struct RealDispatch {
-    router: Arc<Router>,
+    router: RouterHandle,
     logger: Option<Logger>,
     /// The back-off after an upstream 429 that names no `Retry-After`, when the
     /// file sets one; otherwise `LLMSHIM_PENALTY_SECS` (or 5 s).
@@ -116,10 +116,14 @@ impl RealDispatch {
 #[async_trait]
 impl Dispatch for RealDispatch {
     async fn dispatch(&self, _provider: &str, payload: Value) -> Result<Value, DispatchError> {
-        crate::completion_with_logger(self.router.as_ref(), &payload, self.logger.as_ref())
-            .await
-            .map(Self::with_response_identity)
-            .map_err(|error| self.map_err(error, None))
+        crate::completion_with_logger(
+            self.router.current().as_ref(),
+            &payload,
+            self.logger.as_ref(),
+        )
+        .await
+        .map(Self::with_response_identity)
+        .map_err(|error| self.map_err(error, None))
     }
 
     async fn dispatch_with_policy(
@@ -128,8 +132,12 @@ impl Dispatch for RealDispatch {
         payload: Value,
         policy_context: crate::policy::DispatchPolicyContext,
     ) -> Result<Value, DispatchError> {
+        let router = policy_context
+            .router_snapshot()
+            .cloned()
+            .unwrap_or_else(|| self.router.current());
         let result = crate::completion_with_logger_and_policy(
-            self.router.as_ref(),
+            router.as_ref(),
             &payload,
             self.logger.as_ref(),
             &policy_context,
@@ -146,10 +154,13 @@ impl Dispatch for RealDispatch {
         _provider: &str,
         payload: Value,
     ) -> Result<ChunkStream, DispatchError> {
-        let upstream =
-            crate::stream_with_logger(self.router.as_ref(), &payload, self.logger.as_ref())
-                .await
-                .map_err(|error| self.map_err(error, None))?;
+        let upstream = crate::stream_with_logger(
+            self.router.current().as_ref(),
+            &payload,
+            self.logger.as_ref(),
+        )
+        .await
+        .map_err(|error| self.map_err(error, None))?;
         // Map raw ShimError chunks → GatewayError so the channel type is stable.
         let mapped = upstream.map(|item| item.map_err(|e| GatewayError::Upstream(e.to_string())));
         Ok(Box::pin(mapped))
@@ -161,8 +172,12 @@ impl Dispatch for RealDispatch {
         payload: Value,
         policy_context: crate::policy::DispatchPolicyContext,
     ) -> Result<ChunkStream, DispatchError> {
+        let router = policy_context
+            .router_snapshot()
+            .cloned()
+            .unwrap_or_else(|| self.router.current());
         let opened = crate::stream_with_logger_and_policy(
-            self.router.as_ref(),
+            router.as_ref(),
             &payload,
             self.logger.as_ref(),
             &policy_context,
@@ -200,7 +215,7 @@ struct SubmittedValue {
 
 /// Shared state for the gateway HTTP handlers.
 pub struct GatewayState {
-    router: Arc<Router>,
+    router: RouterHandle,
     backend: Backend,
     keystore: crate::gateway::auth::KeyStore,
     attempt_coordinator: Arc<crate::gateway::attempt::AttemptCoordinator>,
@@ -311,7 +326,7 @@ impl GatewayState {
             penalty,
         } = parts;
         // Same fleet-wide provider health the proxy uses.
-        let router = Arc::new(router.with_breaker(breaker));
+        let router = RouterHandle::new(router.with_breaker(breaker));
         let dispatch = Arc::new(RealDispatch {
             router: router.clone(),
             logger,
@@ -427,7 +442,7 @@ impl GatewayState {
             usage,
             penalty,
         } = parts;
-        let router = Arc::new(router.with_breaker(breaker));
+        let router = RouterHandle::new(router.with_breaker(breaker));
         let dispatch = Arc::new(RealDispatch {
             router: router.clone(),
             logger,
@@ -480,8 +495,8 @@ impl GatewayState {
     #[cfg(feature = "redis-coordination")]
     pub(crate) fn start_workers(&self) {
         if let Backend::Distributed(gateway) = &self.backend {
-            let providers: Vec<String> = self
-                .router
+            let router = self.router.current();
+            let providers: Vec<String> = router
                 .provider_keys()
                 .into_iter()
                 .map(String::from)
@@ -633,8 +648,8 @@ impl GatewayState {
             Backend::Local(scheduler) => scheduler.lane_depths(),
             #[cfg(feature = "redis-coordination")]
             Backend::Distributed(gateway) => {
-                let providers: Vec<String> = self
-                    .router
+                let router = self.router.current();
+                let providers: Vec<String> = router
                     .provider_keys()
                     .into_iter()
                     .map(String::from)
@@ -697,8 +712,8 @@ impl GatewayState {
 
     /// Introspection snapshot for the admin stats endpoint.
     async fn stats(&self) -> Value {
-        let providers: Vec<String> = self
-            .router
+        let router = self.router.current();
+        let providers: Vec<String> = router
             .provider_keys()
             .into_iter()
             .map(String::from)
@@ -751,6 +766,7 @@ fn build_request(
         String,
         GatewayRequest,
         crate::gateway::auth::IdentifiedCaller,
+        Arc<Router>,
     ),
     ApiError,
 > {
@@ -761,7 +777,10 @@ fn build_request(
         );
         ApiError::Unauthorized
     })?;
-    let prepared_request = crate::proxy::convert::prepare_request(&state.router, req)?;
+    // One snapshot for the whole request (0022): the provider is resolved against it
+    // here and the dispatch that runs the job uses the same one.
+    let snapshot = state.router.current();
+    let prepared_request = crate::proxy::convert::prepare_request(&snapshot, req)?;
     let provider_name = prepared_request.target.provider_name.clone();
     let budget_model = prepared_request.target.model.clone();
     let permits = estimate_prepared_request_tokens(&prepared_request);
@@ -771,7 +790,7 @@ fn build_request(
         permits,
         payload: prepared_request.payload,
     };
-    Ok((provider_name, budget_model, gw, identified_caller))
+    Ok((provider_name, budget_model, gw, identified_caller, snapshot))
 }
 
 fn idempotency_conflict() -> ApiError {
@@ -890,7 +909,7 @@ async fn chat(
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let (provider_name, _budget_model, gw, identified_caller) =
+    let (provider_name, _budget_model, gw, identified_caller, snapshot) =
         build_request(&state, &headers, &req)?;
     let identity = &identified_caller.identity;
     let idempotency_context = idem_key.as_ref().map(|client_key| {
@@ -911,6 +930,7 @@ async fn chat(
     if state.attempt_coordinator.records_usage() {
         policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
     }
+    policy_scope.set_router(snapshot);
     let prepared_submission = state
         .prepare_submission(gw, policy_scope, false)
         .map_err(|error| gateway_err_to_api(&state, error))?;
@@ -992,7 +1012,7 @@ async fn chat_stream_inner(
     logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
     responses_identity: bool,
 ) -> Response {
-    let (_provider_name, _budget_model, gw, identified_caller) =
+    let (_provider_name, _budget_model, gw, identified_caller, snapshot) =
         match build_request(&state, &headers, &req) {
             Ok(t) => t,
             Err(e) => return e.into_response(),
@@ -1007,6 +1027,7 @@ async fn chat_stream_inner(
     if state.attempt_coordinator.records_usage() {
         policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
     }
+    policy_scope.set_router(snapshot);
     let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {
         Ok(prepared) => prepared,
         Err(error) => return gateway_err_to_api(&state, error).into_response(),
@@ -1078,8 +1099,8 @@ fn stream_event_type(event: &StreamEvent) -> &'static str {
 /// GET /v1/models — models filtered to configured providers.
 async fn list_models(State(state): State<Arc<GatewayState>>) -> Json<ModelsResponse> {
     Json(crate::proxy::convert::models_response(
-        &state.router.provider_keys(),
-        &state.router.served_models(),
+        &state.router.current().provider_keys(),
+        &state.router.current().served_models(),
     ))
 }
 
@@ -1203,6 +1224,7 @@ async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> 
         status: "ok".to_string(),
         providers: state
             .router
+            .current()
             .provider_keys()
             .into_iter()
             .map(String::from)
@@ -1426,7 +1448,7 @@ async fn native_translate(
             );
         }
     }
-    crate::proxy::wire::translate_with_router(request, next, Some(&state.router)).await
+    crate::proxy::wire::translate_with_router(request, next, Some(&state.router.current())).await
 }
 
 #[cfg(test)]
@@ -1520,7 +1542,7 @@ mod native_tests {
             config.clone(),
             limiter,
             Arc::new(RealDispatch {
-                router: router.clone(),
+                router: RouterHandle::from_arc(router.clone()),
                 logger: None,
                 penalty: None,
             }),
@@ -1530,7 +1552,7 @@ mod native_tests {
             ("second-key".into(), identity),
         ]);
         Arc::new(GatewayState {
-            router,
+            router: RouterHandle::from_arc(router),
             backend: Backend::Local(scheduler),
             keystore: crate::gateway::auth::KeyStore::enforced(keys),
             attempt_coordinator,
@@ -1563,7 +1585,7 @@ mod native_tests {
                 crate::proxy::ratelimit::RateLimitConfig::default(),
             )),
             Arc::new(RealDispatch {
-                router: router.clone(),
+                router: RouterHandle::from_arc(router.clone()),
                 logger: None,
                 penalty: None,
             }),
@@ -1578,7 +1600,7 @@ mod native_tests {
             budget_allow_unpriced: false,
         };
         Arc::new(GatewayState {
-            router,
+            router: RouterHandle::from_arc(router),
             backend: Backend::Local(scheduler),
             keystore: crate::gateway::auth::KeyStore::enforced(std::collections::HashMap::from([
                 ("test-key".into(), identity),
@@ -1894,7 +1916,7 @@ mod native_tests {
             budget_allow_unpriced: false,
         };
         Arc::new(GatewayState {
-            router,
+            router: RouterHandle::from_arc(router),
             backend: Backend::Distributed(gateway.clone()),
             keystore: crate::gateway::auth::KeyStore::enforced(std::collections::HashMap::from([
                 ("reassigned-key".into(), identity),
@@ -2163,7 +2185,7 @@ mod native_tests {
         let legacy_key = format!("llmshim:spend:{tenant}:{window_index}");
         let _: () = connection.set(&legacy_key, "0.00000005").await.unwrap();
         let state = GatewayState {
-            router: Arc::new(Router::new()),
+            router: RouterHandle::new(Router::new()),
             backend: Backend::Distributed(gateway),
             keystore: crate::gateway::auth::KeyStore::Open,
             attempt_coordinator,
@@ -2253,7 +2275,7 @@ mod native_tests {
             budget_allow_unpriced: true,
         };
         let state = Arc::new(GatewayState {
-            router,
+            router: RouterHandle::from_arc(router),
             backend: Backend::Distributed(gateway.clone()),
             keystore: crate::gateway::auth::KeyStore::enforced(std::collections::HashMap::from([
                 ("origin-key".into(), identity),
@@ -3844,7 +3866,7 @@ mod native_tests {
                     crate::proxy::ratelimit::RateLimitConfig::default(),
                 )),
                 Arc::new(RealDispatch {
-                    router: router.clone(),
+                    router: RouterHandle::from_arc(router.clone()),
                     logger: None,
                     penalty: None,
                 }),
@@ -3859,7 +3881,7 @@ mod native_tests {
                 budget_allow_unpriced: false,
             };
             Arc::new(GatewayState {
-                router,
+                router: RouterHandle::from_arc(router),
                 backend: Backend::Local(scheduler),
                 keystore: crate::gateway::auth::KeyStore::enforced(
                     std::collections::HashMap::from([("shared-key".into(), identity)]),
@@ -4340,7 +4362,7 @@ mod native_tests {
             "messages": [{"role": "user","content": "hello"}]
         }))
         .unwrap();
-        let (provider_name, budget_model, gateway_request, _) =
+        let (provider_name, budget_model, gateway_request, _, _) =
             match build_request(&state, &headers, &request) {
                 Ok(prepared) => prepared,
                 Err(_) => panic!("route request should be admitted"),
@@ -4400,7 +4422,7 @@ mod native_tests {
                 "provider_config": {"x-local": {(output_field):7_000}}
             }))
             .unwrap();
-            let (_, _, gateway_request, _) = match build_request(&state, &headers, &request) {
+            let (_, _, gateway_request, _, _) = match build_request(&state, &headers, &request) {
                 Ok(prepared) => prepared,
                 Err(_) => panic!("native output limit should remain supported"),
             };
@@ -4646,6 +4668,119 @@ mod native_tests {
         }
     }
 
+    /// A mock upstream that answers one chat completion saying who it is.
+    async fn labelled_upstream(label: &str, calls: usize) -> (mockito::ServerGuard, mockito::Mock) {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"id": "c", "created": 1, "model": "m",
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": label}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+                .to_string(),
+            )
+            .expect(calls)
+            .create_async()
+            .await;
+        (server, mock)
+    }
+
+    fn router_to(url: String) -> Router {
+        Router::new().register(
+            "local",
+            Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
+                "local", url, None,
+            )),
+        )
+    }
+
+    fn chat_payload() -> Value {
+        json!({"model": "local/m", "messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    #[tokio::test]
+    async fn a_request_admitted_on_one_router_runs_on_it_after_the_router_is_replaced() {
+        // 0022: admission pins the router in force; a swap afterwards (a reload)
+        // changes what the next request uses and nothing already admitted.
+        let (a, on_a) = labelled_upstream("from A", 1).await;
+        let (b, on_b) = labelled_upstream("from B", 1).await;
+        let handle = RouterHandle::new(router_to(a.url()));
+        let dispatch = RealDispatch {
+            router: handle.clone(),
+            logger: None,
+            penalty: None,
+        };
+        let state = configured_state_with_router(Router::new());
+        let identity = crate::gateway::auth::Identity {
+            tenant: "t".into(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: None,
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+        };
+        // Admitted against A...
+        let mut scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
+        scope.set_router(handle.current());
+        let admitted = state.attempt_coordinator.context(scope);
+        // ...then a reload puts B in force.
+        handle.replace(router_to(b.url()));
+        let answered = dispatch
+            .dispatch_with_policy("local", chat_payload(), admitted)
+            .await
+            .unwrap_or_else(|error| panic!("the admitted request still runs: {}", error.message));
+        assert_eq!(answered["choices"][0]["message"]["content"], "from A");
+        on_a.assert_async().await;
+        // A request that carries no snapshot (or is admitted after the swap) uses B.
+        let fresh = dispatch
+            .dispatch("local", chat_payload())
+            .await
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(fresh["choices"][0]["message"]["content"], "from B");
+        on_b.assert_async().await;
+    }
+
+    #[test]
+    fn the_admitted_router_rides_the_scope_into_the_context_and_never_through_redis() {
+        let state = configured_state_with_router(Router::new());
+        let identity = crate::gateway::auth::Identity {
+            tenant: "t".into(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: None,
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+        };
+        let admitted = Arc::new(Router::new());
+        let mut scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
+        scope.set_router(admitted.clone());
+        // A job that crosses Redis carries the scope serialized: the snapshot is not
+        // part of it, so the replica that runs the job uses its own router.
+        let wire = serde_json::to_string(&scope).unwrap();
+        let received: crate::gateway::attempt::TrustedPolicyScope =
+            serde_json::from_str(&wire).unwrap();
+        let context = state.attempt_coordinator.context(received);
+        assert!(context.router_snapshot().is_none());
+        let context = state.attempt_coordinator.context(scope);
+        assert!(Arc::ptr_eq(context.router_snapshot().unwrap(), &admitted));
+    }
+
+    #[test]
+    fn a_snapshot_survives_a_swap_and_the_swap_takes_effect_for_new_readers() {
+        let handle = RouterHandle::new(Router::new());
+        let before = handle.current();
+        handle.replace(router_to("http://127.0.0.1:1".into()));
+        assert!(
+            before.provider_keys().is_empty(),
+            "a snapshot is not edited"
+        );
+        assert_eq!(handle.current().provider_keys(), vec!["local"]);
+    }
+
     #[tokio::test]
     async fn real_dispatch_assigns_identity_before_gateway_storage() {
         for supplied_identity in [false, true] {
@@ -4674,7 +4809,7 @@ mod native_tests {
                 .create_async()
                 .await;
             let dispatch = RealDispatch {
-                router: Arc::new(Router::new().register(
+                router: RouterHandle::new(Router::new().register(
                     "local",
                     Box::new(crate::providers::openai_compat::OpenAiCompatible::new(
                         "local",
