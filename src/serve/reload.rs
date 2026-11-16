@@ -1,8 +1,9 @@
-//! Replacing the caller keys of a running server (0012).
+//! Replacing what a running server reloads: the caller keys (0012), and the
+//! providers, routes and provider rate limits (0022).
 //!
-//! Only `[[keys]]` can change while the server runs. Providers, listeners, TLS
-//! paths, fleet settings and every other table are fixed at start, because they
-//! are held by objects that cannot be swapped safely. A reload is therefore
+//! Only those can change while the server runs. Listeners, TLS paths, fleet
+//! settings and every other table are fixed at start, because they are held by
+//! objects that cannot be swapped safely. A reload is therefore
 //! all-or-nothing:
 //!
 //! 1. the new file must pass everything `--check` applies (shape, references,

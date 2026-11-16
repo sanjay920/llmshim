@@ -1,13 +1,13 @@
 # 0022: Reloading providers, routes and rate limits
 
-Status: slices 2, 3, 3b and 4 implemented. Slice 2: the gateway holds its router behind a
+Status: all slices (2, 3, 3b, 4 and 5) implemented. Slice 2: the gateway holds its router behind a
 replaceable handle and admission pins a snapshot that rides the request to its
 dispatch. Slice 3: a reload rebuilds and swaps providers and routes in a single
 instance. Slice 3b: on a fleet replica the same reload also starts workers for an added
 provider and stops those of a removed one (below). Slice 4: a reload retunes the provider
-rate limits in all four holders, on a fleet replica too. Slice 5 (the 0014 rows, 0012's
-text, the roadmap and CLAUDE.md) is not. A contract note, written before
-any code (README working rule 3). It extends 0012, which reloads `[[keys]]` and
+rate limits in all four holders, on a fleet replica too. Slice 5 is the documentation
+(the 0014 rows, 0012's status, the roadmap and CLAUDE.md). A contract note, written before
+any code (README working rule 3). It extends 0012, which reloaded `[[keys]]` and
 nothing else.
 
 ## What an operator needs
@@ -70,8 +70,9 @@ one that also changes anything in the right-hand column is refused whole.
   that does not know the job's provider (a roll-out in progress, or a removal)
   answers `503 provider_unavailable` with `Retry-After`, **not** 502: it is a local
   condition, not an upstream failure, so it is not recorded by the breaker, not
-  retried onto another provider, and the spend reserved for the attempt is
-  released because nothing was sent. A fallback entry the worker's snapshot no
+  retried onto another provider, and no spend is reserved for it: the failure
+  is at provider resolution, before any attempt exists, so nothing was sent and there
+  is nothing to release. A fallback entry the worker's snapshot no
   longer resolves is skipped with the same classification, and the chain continues.
 - **Built whole, then swapped.** The new router is fully built before anything is
   replaced: every provider constructed from its table, every route checked against
@@ -256,10 +257,10 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
    one in flight; an added and a removed provider; a provider that cannot be built
    rejects the whole reload with no secret in the fingerprint or the status; an
    env-form secret is flagged; the fleet 503 `provider_unavailable` and its
-   classification (no breaker observation, reservation released); an added provider's
+   classification (503, `Retry-After`; no attempt exists to observe or reserve); an added provider's
    worker starts.
 4. **Done: rate limits.** The four holders become retunable; the reload applies the limits
    before the router. Tests: a lowered rate applies to the next request, including
    retries, repairs and fallbacks, and keeps the tokens; a removed limit removes the
    bucket; a reload is not a reset; Redis presents the new rate.
-5. The 0014 rows, 0012's "keys only" text, the roadmap and CLAUDE.md.
+5. **Done:** the 0014 rows, 0012's "keys only" text, the roadmap and CLAUDE.md.

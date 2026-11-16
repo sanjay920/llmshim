@@ -1,6 +1,6 @@
 # 0012: Reloading caller keys without a restart
 
-Status: implemented for `[[keys]]`. Nothing else in the file reloads.
+Status: implemented for `[[keys]]`. Providers, routes and the provider rate limits reload by the same mechanism (0022); every other table is still fixed at start and a reload that changes one is refused by path.
 
 ## What it is
 
