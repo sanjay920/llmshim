@@ -125,10 +125,9 @@ pub struct ServeConfig {
     /// How a running server picks up changes to `keys`.
     #[serde(default)]
     pub reload: Reload,
-    /// Export traces to an OpenTelemetry collector (0016). **Not implemented
-    /// yet**: the table is part of the contract and validated, and a file that
-    /// sets it is refused at startup until the exporter exists. It will need a
-    /// binary built with `--features serve-otel`.
+    /// Export traces to an OpenTelemetry collector (0016). Needs a binary built
+    /// with `--features serve-otel`; without it a file that sets this table is
+    /// refused at startup.
     #[serde(default)]
     pub telemetry: Option<Telemetry>,
 }
@@ -1311,19 +1310,12 @@ impl ServeConfig {
                 "fleet mode needs a binary built with --features serve-redis",
             ));
         }
-        if self.telemetry.is_some() {
-            // Until the exporter exists (0016, slice 3) the table is accepted by
-            // the contract but refused at startup, in either build: a setting
-            // that is parsed and then ignored would say traces are leaving when
-            // none are.
+        if self.telemetry.is_some() && !cfg!(feature = "serve-otel") {
+            // A setting that is parsed and then ignored would say traces are
+            // leaving when none are.
             issues.push(Issue::new(
                 "telemetry",
-                if cfg!(feature = "serve-otel") {
-                    "trace export is designed (0016) but not implemented yet; remove [telemetry]"
-                } else {
-                    "trace export needs a binary built with --features serve-otel \
-                     (and is not implemented yet, 0016)"
-                },
+                "trace export needs a binary built with --features serve-otel",
             ));
         }
         issues
@@ -2680,11 +2672,14 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_is_refused_at_startup_until_the_exporter_exists() {
+    fn telemetry_needs_the_serve_otel_build() {
         let config = ServeConfig::parse(&with_telemetry(""), Format::Toml).unwrap();
         let found = config.feature_issues();
-        assert!(
+        // Refused without the feature, accepted with it: a setting is never
+        // parsed and then ignored.
+        assert_eq!(
             found.iter().any(|issue| issue.path == "telemetry"),
+            !cfg!(feature = "serve-otel"),
             "{found:?}"
         );
         assert!(ServeConfig::parse(MINIMAL, Format::Toml)

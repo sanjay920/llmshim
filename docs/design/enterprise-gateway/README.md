@@ -49,7 +49,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0013: llmshim as a component](0013-component-bar.md)
 - [0014: What happens when a dependency fails](0014-failure-modes.md)
 - [0015: The operational endpoints are in the OpenAPI document](0015-operational-api.md)
-- [0016: OpenTelemetry traces (proposed)](0016-opentelemetry.md)
+- [0016: OpenTelemetry traces](0016-opentelemetry.md)
 
 ## Roadmap
 
@@ -78,8 +78,9 @@ Phase 0: a production server mode
 - [ ] JWT/OIDC workload identity; optional client certificates; revocation
 - [x] Access log with tenant attribution and credential fingerprints (0009)
 - [x] Token and cost attribution per tenant and attempt (0010)
-- [ ] OpenTelemetry traces (design note 0016, proposed; metrics stay on
-      `/metrics`)
+- [ ] OpenTelemetry traces (design note 0016; metrics stay on `/metrics`): the
+      request span and the exporter are done (`serve-otel`); the attempt span and
+      the log writers' counters remain
 - [x] Helm chart, validated by rendering and `serve --check` (0008)
 - [ ] Published, signed images and an SBOM
 - [x] The failure-mode table (0014), with outage-survival tests for losing Redis

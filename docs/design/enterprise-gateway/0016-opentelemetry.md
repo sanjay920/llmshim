@@ -1,8 +1,8 @@
 # 0016: OpenTelemetry traces
 
-Status: proposed. A contract note, written before any code (README working rule
-3). Nothing here is implemented; it is the design the next slices build, so that
-review can argue with the decisions before they cost anything.
+Status: slices 1 to 3 implemented (the request span and the exporter); the
+attempt span and the log writers' counters remain. A contract note, written
+before any code (README working rule 3).
 
 ## What an operator needs
 
@@ -86,6 +86,11 @@ are another organization's endpoint, and a trace id there would let them correla
 requests we sent on behalf of different callers. `x-request-id` is already
 settled by the outermost layer (0009) and the span carries it.
 
+(`http.route` in the first sketch became **`url.path`**: it is the raw path, not a
+route template, so the honest name is the path's. A caller who authenticates can
+force sampling with the `sampled` flag of its own `traceparent`; that is the
+point of honoring it.)
+
 **8. Telemetry fails open.** The rule of 0013 bar item 2 applies: a collector
 that is down, slow or wrong never blocks or fails a request. Spans go to a bounded
 batch processor on its own thread; when the queue is full a span is dropped and
@@ -143,6 +148,18 @@ is a later slice with its own transition note.
 3. The request span and propagation; the exporter; the bounded processor; the
    drop and failure counters in `/metrics`; an end-to-end test against a local
    OTLP/HTTP receiver, including a collector that is down and one that stalls.
+   Done, with these choices made on the evidence: **option (b)** of decision 2
+   (the OTLP crate needs reqwest 0.13, and 0.13's `rustls` brings aws-lc-rs; the
+   exporter is ours, over the reqwest the crate has; eight packages join
+   `Cargo.lock` under `serve-otel`, with no tonic, no aws-lc and no second
+   reqwest); a bounded queue of 2048 spans drained by a worker thread (batches of
+   256, a partial batch after 5 s, a 10 s export deadline, a 5 s shutdown bound)
+   in place of the SDK's batch processor, so that a drop is counted:
+   `llmshim_telemetry_spans_dropped_total` and
+   `llmshim_telemetry_export_failures_total`. The resource is built without the
+   SDK's environment detectors (`OTEL_*` is not read). Only the request span
+   exists; the exporter's queue, batch and timeout sizes are constants, not
+   settings.
 4. The attempt span from the attempt hooks; the closed attribute set pinned by a
    test; the trace joins the request id (closing the roadmap line).
 5. The log writers' drop and failure counters as `/metrics` series.

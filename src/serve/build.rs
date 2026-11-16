@@ -71,14 +71,20 @@ pub struct Built {
 /// The log destinations the server writes. Each queues lines for a writer
 /// thread, so [`Logs::close`] must run at shutdown or lines still queued are
 /// lost.
-pub struct Logs(Vec<super::jsonl::JsonLines>);
+pub struct Logs(
+    Vec<super::jsonl::JsonLines>,
+    Option<Arc<super::telemetry::Telemetry>>,
+);
 
 impl Logs {
-    /// Write everything queued and stop the writers. Call once, after the
-    /// listeners have stopped.
+    /// Write everything queued and stop the writers (and send the spans still
+    /// queued, within a bound). Call once, after the listeners have stopped.
     pub fn close(&self) {
         for log in &self.0 {
             log.close();
+        }
+        if let Some(telemetry) = &self.1 {
+            telemetry.shutdown();
         }
     }
 }
@@ -253,6 +259,13 @@ pub async fn build_app(
         None => None,
     };
 
+    // Started with the logs, after the configuration is accepted: it spawns a
+    // thread, so a configuration that fails earlier starts nothing.
+    let telemetry = match &config.telemetry {
+        Some(table) => super::telemetry::start(table, env).map_err(|issue| vec![issue])?,
+        None => None,
+    };
+
     // Opened with the access log, after the configuration is accepted. Tenants
     // are named from this configuration, because the policy scope that crosses
     // Redis in a fleet carries only a hash of the tenant.
@@ -421,14 +434,16 @@ pub async fn build_app(
     // Outermost, so the log sees every outcome, including a request refused
     // before it reaches a handler and the 404 for a hidden admin path. It
     // resolves the caller with a store of its own built from the same file.
-    let app = match access_log {
-        Some(log) => {
+    let app = match (access_log, telemetry.clone()) {
+        (None, None) => app,
+        (log, telemetry) => {
             let keys = Arc::new(KeyStore::Live(keys.clone()));
             let names = key_names.clone();
             app.layer(axum::middleware::from_fn(
                 move |request: Request, next: Next| {
                     super::access_log::record_request(
                         log.clone(),
+                        telemetry.clone(),
                         keys.clone(),
                         names.clone(),
                         request,
@@ -437,7 +452,6 @@ pub async fn build_app(
                 },
             ))
         }
-        None => app,
     };
     // Bind the verified client certificate's name to each request, and strip the
     // internal header from everything a caller sends. Outermost, so nothing (not
@@ -464,7 +478,7 @@ pub async fn build_app(
         caller_keys: config.keys.len(),
         authenticated,
         admin_authenticated,
-        logs: Logs(logs),
+        logs: Logs(logs, telemetry),
         reload,
     })
 }

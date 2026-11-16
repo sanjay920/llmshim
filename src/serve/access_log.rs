@@ -79,7 +79,8 @@ fn bounded(text: &str) -> String {
 /// a deadline cancelled it), when this is dropped, so an abandoned request that
 /// may already have been billed upstream is not missing from the audit trail.
 struct Pending {
-    log: Arc<JsonLines>,
+    log: Option<Arc<JsonLines>>,
+    span: Option<super::telemetry::RequestSpan>,
     started: std::time::Instant,
     request_id: Option<String>,
     method: String,
@@ -93,7 +94,11 @@ struct Pending {
 impl Pending {
     fn write(&mut self, status: Option<u16>) {
         self.written = true;
-        self.log.write(&Record {
+        if let Some(span) = self.span.take() {
+            span.end(status);
+        }
+        let Some(log) = &self.log else { return };
+        log.write(&Record {
             event: "access",
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             request_id: self.request_id.take(),
@@ -117,7 +122,8 @@ impl Drop for Pending {
 }
 
 pub(crate) async fn record_request(
-    log: Arc<JsonLines>,
+    log: Option<Arc<JsonLines>>,
+    telemetry: Option<Arc<super::telemetry::Telemetry>>,
     keys: Arc<KeyStore>,
     names: crate::gateway::usage::KeyNames,
     mut request: Request,
@@ -143,16 +149,33 @@ pub(crate) async fn record_request(
         crate::proxy::wire::normalize_auth(&mut headers);
     }
     let caller = keys.identify_caller(&headers).ok();
+    let tenant = caller.as_ref().map(|caller| caller.identity.tenant.clone());
+    let key = caller
+        .as_ref()
+        .and_then(|caller| names.name(&caller.credential_scope));
+    // An inbound traceparent is honored only from a caller the key store
+    // recognises (0016, decision 7).
+    let span = telemetry.as_ref().map(|telemetry| {
+        telemetry.request_span(
+            request.method().as_str(),
+            &bounded(&path),
+            &id,
+            &super::telemetry::SpanCaller {
+                tenant: tenant.clone(),
+                key: key.clone(),
+            },
+            caller.is_some().then_some(&headers),
+        )
+    });
     let mut pending = Pending {
         log,
+        span,
         started: std::time::Instant::now(),
         request_id: Some(id.clone()),
         method: request.method().to_string(),
         path: bounded(&path),
-        tenant: caller.as_ref().map(|caller| caller.identity.tenant.clone()),
-        key: caller
-            .as_ref()
-            .and_then(|caller| names.name(&caller.credential_scope)),
+        tenant,
+        key,
         credential: fingerprint(&headers),
         written: false,
     };
@@ -296,7 +319,7 @@ mod tests {
                 let log = log.clone();
                 let keys = keys.clone();
                 let names = names();
-                async move { record_request(log, keys, names, request, next).await }
+                async move { record_request(Some(log), None, keys, names, request, next).await }
             }))
     }
 

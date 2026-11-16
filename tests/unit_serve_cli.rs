@@ -310,10 +310,12 @@ surprise = true
         assert!(!stderr.contains("too-short"), "never the value");
     }
 
+    #[cfg(not(feature = "serve-otel"))]
     #[test]
-    fn a_telemetry_table_is_refused_until_the_exporter_exists() {
-        // Accepted by the contract (the schema has it), refused at startup in every
-        // build, so a file cannot say traces leave when none do (0016).
+    fn a_telemetry_table_is_refused_without_the_serve_otel_build() {
+        // Accepted by the contract (the schema has it), refused at startup in a
+        // build without the exporter, so a file cannot say traces leave when none do
+        // (0016).
         let path = write(
             "telemetry.toml",
             &format!(
@@ -333,6 +335,57 @@ surprise = true
             assert!(stderr.contains("telemetry:"), "{args:?}: {stderr}");
             assert!(!stderr.contains("listening on"), "{args:?}: {stderr}");
         }
+    }
+
+    #[cfg(feature = "serve-otel")]
+    #[test]
+    fn a_telemetry_table_checks_in_the_serve_otel_build_and_its_header_secret_is_status_3() {
+        let path = write(
+            "telemetry-otel.toml",
+            &format!(
+                "{CONFIG}\n[telemetry]\notlp_endpoint = \"https://collector.internal:4318\"\n\
+                 [telemetry.headers]\nauthorization = {{ env = \"SERVE_TEST_OTLP\" }}\n"
+            ),
+        );
+        let structure = run(
+            &[
+                "serve",
+                "--config",
+                path.to_str().unwrap(),
+                "--check",
+                "--structure-only",
+            ],
+            &[],
+        );
+        assert_eq!(
+            structure.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&structure.stderr)
+        );
+        // The header's secret is unavailable here: status 3, naming the setting.
+        let missing = run(
+            &["serve", "--config", path.to_str().unwrap(), "--check"],
+            &SECRETS,
+        );
+        let stderr = String::from_utf8_lossy(&missing.stderr);
+        assert_eq!(missing.status.code(), Some(3), "{stderr}");
+        assert!(
+            stderr.contains("telemetry.headers.authorization"),
+            "{stderr}"
+        );
+        let mut with_secret = SECRETS.to_vec();
+        with_secret.push(("SERVE_TEST_OTLP", "collector-token-0123456789"));
+        let present = run(
+            &["serve", "--config", path.to_str().unwrap(), "--check"],
+            &with_secret,
+        );
+        assert_eq!(
+            present.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&present.stderr)
+        );
     }
 
     #[test]

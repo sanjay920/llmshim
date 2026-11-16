@@ -41,6 +41,8 @@ jobs:
           # keep refusing a [telemetry] table (0016).
           cargo clippy --locked --all-targets --features serve-otel -- -D warnings
           cargo test --locked --features serve-otel --test unit_serve_cli
+          cargo test --locked --features serve-otel --test integration_serve_otel
+          cargo test --locked --features serve-otel --lib serve::
 
   serve-redis-check:
     runs-on: ubuntu-latest
