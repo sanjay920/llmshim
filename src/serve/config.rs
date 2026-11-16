@@ -151,6 +151,9 @@ pub struct ServeConfig {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ControlPlane {
+    /// The organization whose snapshots this replica takes (the payload's `org`). A
+    /// snapshot for another organization is refused even if a trusted key signed it.
+    pub org: String,
     /// Public keys that may have signed a snapshot, each `ed25519:<base64 of the
     /// 32-byte key>` (`llmshim snapshot keygen` prints one). More than one lets a
     /// signing key rotate: add the new public key first.
@@ -1122,6 +1125,12 @@ impl ServeConfig {
             issues.push(Issue::new(
                 "server.allow_unauthenticated",
                 "cannot be true with [control_plane], which exists to identify callers",
+            ));
+        }
+        if control_plane.org.is_empty() || control_plane.org.len() > 128 {
+            issues.push(Issue::new(
+                "control_plane.org",
+                "must be 1 to 128 characters",
             ));
         }
         if control_plane.verify_keys.is_empty() {
@@ -2731,6 +2740,7 @@ mod tests {
         [state]
         policy_dir = "/var/lib/llmshim/policy"
         [control_plane]
+        org = "org_test"
         verify_keys = ["ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaA="]
         snapshot_file = "/var/lib/llmshim/snapshot.json"
     "#;

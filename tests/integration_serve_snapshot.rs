@@ -81,6 +81,7 @@ impl Plane {
             port = 0
             token = {{ env = "SERVE_E2E_ADMIN_TOKEN" }}
             [control_plane]
+            org = "org_test"
             verify_keys = ["{public}"]
             snapshot_file = "{file}"
             {extra}
@@ -206,6 +207,110 @@ async fn a_snapshot_that_does_not_verify_or_advance_never_changes_what_serves() 
     // Not a snapshot at all.
     std::fs::write(plane.snapshot_file(), "garbage").unwrap();
     rejected("garbage", "well-formed").await;
+}
+
+fn floor_generation(plane: &Plane) -> u64 {
+    let text =
+        std::fs::read_to_string(plane.dir.0.join("policy").join("applied-snapshot.json")).unwrap();
+    serde_json::from_str::<Value>(&text).unwrap()["generation"]
+        .as_u64()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_floor_follows_what_applied_and_never_what_was_refused() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-floor-follows");
+    plane.write(&payload(5, vec![key("alpha", ALPHA, "active")]));
+    let server = start(
+        &plane.config(&upstream.url(), ""),
+        "snapshot-floor-follows",
+        &[],
+    );
+    assert_eq!(floor_generation(&plane), 5);
+    // Refused (older): the floor stays.
+    plane.write(&payload(4, vec![key("bravo", BRAVO, "active")]));
+    hangup(&server);
+    wait_for_reload(&server, "the refusal", |s| {
+        s["last_reload"]["issues"]
+            .to_string()
+            .contains("does not advance")
+    })
+    .await;
+    assert_eq!(floor_generation(&plane), 5);
+    // The same keys at a higher generation: nothing changes for callers, and the floor advances.
+    plane.write(&payload(8, vec![key("alpha", ALPHA, "active")]));
+    hangup(&server);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while floor_generation(&plane) != 8 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the floor did not follow"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+}
+
+#[tokio::test]
+async fn a_running_replica_never_goes_behind_what_it_applied_even_if_the_floor_file_is_lowered() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-memory-floor");
+    plane.write(&payload(5, vec![key("alpha", ALPHA, "active")]));
+    let server = start(
+        &plane.config(&upstream.url(), ""),
+        "snapshot-memory-floor",
+        &[],
+    );
+    // Someone deletes the record and puts an older, validly signed snapshot in place.
+    std::fs::remove_file(plane.dir.0.join("policy").join("applied-snapshot.json")).unwrap();
+    plane.write(&payload(2, vec![key("bravo", BRAVO, "active")]));
+    hangup(&server);
+    wait_for_reload(&server, "the refusal", |s| {
+        s["last_reload"]["issues"]
+            .to_string()
+            .contains("does not advance")
+    })
+    .await;
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+    assert_eq!(status_of(&server, BRAVO).await, 401);
+}
+
+#[tokio::test]
+async fn another_organizations_snapshot_and_a_changed_trust_setting_are_refused() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-org");
+    plane.write(&payload(1, vec![key("alpha", ALPHA, "active")]));
+    let server = start(&plane.config(&upstream.url(), ""), "snapshot-org", &[]);
+    let mut other = payload(2, vec![key("bravo", BRAVO, "active")]);
+    other["org"] = json!("org_other");
+    plane.write(&other);
+    hangup(&server);
+    wait_for_reload(&server, "the org refusal", |s| {
+        s["last_reload"]["issues"]
+            .to_string()
+            .contains("another organization")
+    })
+    .await;
+    assert_eq!(status_of(&server, BRAVO).await, 401);
+    // Trusting a different key is a change outside what reloads (slice 2b): the
+    // snapshot on disk no longer verifies against the new setting, so the whole
+    // reload is refused and the keys in force keep serving.
+    let (_, other_public) = snapshot::keygen().unwrap();
+    let edited = plane
+        .config(&upstream.url(), "")
+        .replace(&plane.public, &other_public)
+        .replace("{DIR}", server.dir.0.to_str().unwrap());
+    std::fs::write(server.dir.0.join("gateway.toml"), edited).unwrap();
+    hangup(&server);
+    let status = wait_for_reload(&server, "the path refusal", |s| {
+        s["last_reload"]["issues"]
+            .to_string()
+            .contains("verify_keys")
+    })
+    .await;
+    assert_eq!(status["generation"], 0);
+    assert_eq!(status_of(&server, ALPHA).await, 200);
 }
 
 fn base64_of(payload: &Value) -> String {

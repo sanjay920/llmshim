@@ -74,6 +74,10 @@
             "null"
           ]
         },
+        "org": {
+          "description": "The organization whose snapshots this replica takes (the payload's `org`). A\nsnapshot for another organization is refused even if a trusted key signed it.",
+          "type": "string"
+        },
         "snapshot_file": {
           "description": "The snapshot file (an absolute path), written by whatever distributes it\nand watched like the keys of a file.",
           "type": "string"
@@ -87,6 +91,7 @@
         }
       },
       "required": [
+        "org",
         "verify_keys",
         "snapshot_file"
       ],

@@ -106,6 +106,7 @@ pub enum Refusal {
     UnknownVersion,
     NotAdvancing,
     Conflicting,
+    WrongOrg,
     InvalidContent(String),
 }
 
@@ -126,6 +127,9 @@ impl Refusal {
             Self::Conflicting => {
                 "a snapshot with the generation in force but different content".into()
             }
+            Self::WrongOrg => {
+                "the snapshot belongs to another organization than control_plane.org".into()
+            }
             Self::InvalidContent(why) => why.clone(),
         }
     }
@@ -138,6 +142,7 @@ impl Refusal {
 /// A verified snapshot, turned into what the server reads.
 #[derive(Debug)]
 pub struct Snapshot {
+    pub org: String,
     pub generation: u64,
     /// SHA-256 of the signed payload bytes, to recognize the same snapshot again.
     pub payload_sha256: String,
@@ -152,6 +157,8 @@ pub struct Snapshot {
 /// What a replica remembers of the snapshot it last applied.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Floor {
+    /// The organization the snapshot belongs to.
+    pub org: String,
     pub generation: u64,
     pub payload_sha256: String,
 }
@@ -273,8 +280,10 @@ pub fn read_floor(dir: &Path) -> Result<Option<Floor>, Issue> {
     }
 }
 
-/// Remember `snapshot` as the one in force: written to a temporary file and renamed,
-/// so a crash leaves the old floor or the new, never half of one.
+/// Remember a snapshot as the one in force. Never lowers what is recorded (two
+/// replicas sharing a directory, or a late writer, cannot move the floor back),
+/// writes through a temporary name of its own and syncs the file and the directory
+/// before and after the rename, so a crash leaves the old record or the new one.
 pub fn write_floor(dir: &Path, floor: &Floor) -> Result<(), Issue> {
     let fail = |error: std::io::Error| {
         Issue::new(
@@ -283,10 +292,25 @@ pub fn write_floor(dir: &Path, floor: &Floor) -> Result<(), Issue> {
         )
     };
     std::fs::create_dir_all(dir).map_err(fail)?;
-    let temp = dir.join(".applied-snapshot.tmp");
+    if let Some(existing) = read_floor(dir)? {
+        if existing.org == floor.org && existing.generation > floor.generation {
+            return Ok(());
+        }
+    }
+    let temp = dir.join(format!(".applied-snapshot.{}.tmp", std::process::id()));
     let body = serde_json::to_vec(floor).map_err(|e| fail(e.into()))?;
-    std::fs::write(&temp, body).map_err(fail)?;
-    std::fs::rename(&temp, dir.join("applied-snapshot.json")).map_err(fail)
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temp).map_err(fail)?;
+        file.write_all(&body).map_err(fail)?;
+        file.sync_all().map_err(fail)?;
+    }
+    std::fs::rename(&temp, dir.join("applied-snapshot.json")).map_err(fail)?;
+    // Best effort: not every platform can sync a directory.
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+    Ok(())
 }
 
 /// Read, verify and judge the snapshot `control_plane` names, against the floor.
@@ -302,11 +326,18 @@ pub fn load(
         std::fs::read(&control_plane.snapshot_file).map_err(|_| refuse(Refusal::Unreadable))?;
     let (payload, payload_sha256, signer) =
         verify_envelope(&bytes, &control_plane.verify_keys).map_err(refuse)?;
+    if payload.org != control_plane.org {
+        return Err(refuse(Refusal::WrongOrg));
+    }
     let minimum = control_plane.min_generation.unwrap_or(0);
     if payload.generation < minimum {
         return Err(refuse(Refusal::NotAdvancing));
     }
     if let Some(floor) = floor {
+        // A record made for another organization is not this replica's history.
+        if floor.org != payload.org {
+            return Err(refuse(Refusal::WrongOrg));
+        }
         if payload.generation < floor.generation {
             return Err(refuse(Refusal::NotAdvancing));
         }
@@ -316,12 +347,31 @@ pub fn load(
     }
     let (keys, inactive) = to_keys(&payload, now).map_err(refuse)?;
     Ok(Snapshot {
+        org: payload.org.clone(),
         generation: payload.generation,
         payload_sha256,
         signer,
         keys,
         inactive,
     })
+}
+
+/// Judge a loaded snapshot against the generation this process itself applied, so a
+/// running replica does not depend on the file on disk alone for its rollback
+/// protection (someone who can write `policy_dir` can lower that).
+pub fn against_applied(snapshot: &Snapshot, applied: &Floor) -> Result<(), Issue> {
+    let refusal = if snapshot.org != applied.org {
+        Refusal::WrongOrg
+    } else if snapshot.generation < applied.generation {
+        Refusal::NotAdvancing
+    } else if snapshot.generation == applied.generation
+        && snapshot.payload_sha256 != applied.payload_sha256
+    {
+        Refusal::Conflicting
+    } else {
+        return Ok(());
+    };
+    Err(refusal.issue())
 }
 
 /// Generate a signing key: its 32-byte seed (base64) and the `verify_keys` entry.
@@ -351,6 +401,9 @@ pub fn sign(payload: &serde_json::Value, seed_b64: &str) -> Result<String, Strin
     if typed.version != PAYLOAD_VERSION {
         return Err("the payload's version is not one this build writes".into());
     }
+    // What the data plane would refuse about the content, refused here too: a state,
+    // an expiry. (The key rules themselves run where the file's other settings are known.)
+    to_keys(&typed, chrono::Utc::now()).map_err(|refusal| refusal.message())?;
     let bytes = canonical(payload);
     let envelope = Envelope {
         format: FORMAT.into(),
@@ -451,7 +504,7 @@ mod tests {
 
         fn control_plane(&self) -> ControlPlane {
             let text = format!(
-                "verify_keys = [\"{}\"]\nsnapshot_file = \"{}\"\n",
+                "org = \"org_test\"\nverify_keys = [\"{}\"]\nsnapshot_file = \"{}\"\n",
                 self.public,
                 self.dir.join("snapshot.json").display()
             );
@@ -580,6 +633,7 @@ mod tests {
         ));
         let first = fixture.load(None).unwrap();
         let floor = Floor {
+            org: "org_test".into(),
             generation: first.generation,
             payload_sha256: first.payload_sha256.clone(),
         };
@@ -603,6 +657,37 @@ mod tests {
             json!([active("other", "token-two-0123456789abcdef")]),
         ));
         assert_eq!(fixture.load(Some(&floor)).unwrap().generation, 6);
+    }
+
+    #[test]
+    fn a_snapshot_of_another_organization_is_refused_even_if_validly_signed() {
+        let fixture = Fixture::new();
+        let mut other = payload(9, json!([active("ci", "token-one-0123456789abcdef")]));
+        other["org"] = json!("org_other");
+        fixture.write(&other);
+        assert!(refused(fixture.load(None)).contains("another organization"));
+        // And a floor recorded for another organization is not this replica's history.
+        fixture.write(&payload(
+            9,
+            json!([active("ci", "token-one-0123456789abcdef")]),
+        ));
+        let foreign = Floor {
+            org: "org_other".into(),
+            generation: 1,
+            payload_sha256: "00".repeat(32),
+        };
+        assert!(refused(fixture.load(Some(&foreign))).contains("another organization"));
+    }
+
+    #[test]
+    fn signing_refuses_content_the_data_plane_would_refuse() {
+        let fixture = Fixture::new();
+        let mut odd = active("odd", "token-four-0123456789abcdef");
+        odd["state"] = json!("suspended");
+        assert!(sign(&payload(1, json!([odd])), &fixture.seed).is_err());
+        let mut bad = active("bad", "token-five-0123456789abcdef");
+        bad["expires_at"] = json!("tomorrow");
+        assert!(sign(&payload(1, json!([bad])), &fixture.seed).is_err());
     }
 
     #[test]
@@ -634,9 +719,23 @@ mod tests {
         let names: Vec<_> = snapshot.keys.iter().map(|k| k.name.as_str()).collect();
         assert_eq!(names, ["ci", "soon"]);
         assert_eq!(snapshot.inactive, 1);
+        // A state no signer of this build writes, signed by hand: refused at load.
         let mut odd = active("odd", "token-four-0123456789abcdef");
         odd["state"] = json!("suspended");
-        fixture.write(&payload(2, json!([odd])));
+        let bytes = canonical(&payload(2, json!([odd])));
+        let pair =
+            Ed25519KeyPair::from_seed_unchecked(&B64.decode(&fixture.seed).unwrap()).unwrap();
+        let envelope = Envelope {
+            format: FORMAT.into(),
+            key_id: fixture.public.clone(),
+            payload: B64.encode(&bytes),
+            signature: B64.encode(pair.sign(&bytes).as_ref()),
+        };
+        std::fs::write(
+            fixture.dir.join("snapshot.json"),
+            serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
         assert!(refused(fixture.load(None)).contains("state"));
     }
 
@@ -658,11 +757,23 @@ mod tests {
         let dir = fixture.dir.join("policy");
         assert_eq!(read_floor(&dir).unwrap(), None);
         let floor = Floor {
+            org: "org_test".into(),
             generation: 9,
             payload_sha256: "ab".repeat(32),
         };
         write_floor(&dir, &floor).unwrap();
         assert_eq!(read_floor(&dir).unwrap(), Some(floor));
+        // A late writer cannot move the floor back.
+        write_floor(
+            &dir,
+            &Floor {
+                org: "org_test".into(),
+                generation: 4,
+                payload_sha256: "cd".repeat(32),
+            },
+        )
+        .unwrap();
+        assert_eq!(read_floor(&dir).unwrap().unwrap().generation, 9);
         std::fs::write(dir.join("applied-snapshot.json"), "not json").unwrap();
         let issue = read_floor(&dir).unwrap_err();
         assert_eq!(issue.path, "state.policy_dir");

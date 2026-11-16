@@ -962,10 +962,15 @@ fn cmd_snapshot(options: &cli::SnapshotOptions) -> i32 {
                 Ok(text) => text,
                 Err(message) => return fail(message),
             };
+            // Written beside the target and renamed, so a watcher never reads half of it.
             let out = options.output.as_deref().unwrap_or_default();
-            match std::fs::write(out, envelope) {
+            let temp = format!("{out}.tmp-{}", std::process::id());
+            match std::fs::write(&temp, envelope).and_then(|()| std::fs::rename(&temp, out)) {
                 Ok(()) => 0,
-                Err(error) => fail(format!("cannot write {out}: {}", error.kind())),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&temp);
+                    fail(format!("cannot write {out}: {}", error.kind()))
+                }
             }
         }
         _ => {
@@ -1136,6 +1141,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         format,
         &config,
         &env,
+        snapshot.as_ref(),
         built.reload.clone(),
     ) {
         Ok(reloader) => std::sync::Arc::new(reloader),
@@ -1150,6 +1156,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         if let Err(issue) = llmshim::serve::snapshot::write_floor(
             dir,
             &llmshim::serve::snapshot::Floor {
+                org: snapshot.org.clone(),
                 generation: snapshot.generation,
                 payload_sha256: snapshot.payload_sha256.clone(),
             },
