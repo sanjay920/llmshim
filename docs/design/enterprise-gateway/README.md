@@ -79,7 +79,7 @@ Phase 0: a production server mode
       naming the rebuild flag. Not in the published image (about 5 MB more, `docker image ls` on arm64; the owner's call)
 - [x] Redis fleet mode under `serve`, behind `serve-redis` (0006)
 - [x] Caller keys reload without a restart: SIGHUP and a watched file (0012)
-- [x] Reload of providers, routes and provider rate limits, single instance and fleet (0022). Provider secrets rotate only as `{ file }` references; `[server]`, `[admin]`, `[fleet]`, `[upstream]`, `[auth.jwt]` and `limits.max_concurrency`, `queue_timeout_ms`, `penalty_secs` stay fixed at start
+- [x] Reload of providers, routes and provider rate limits, single instance and fleet (0022). Provider secrets rotate only as `{ file }` references; `[server]`, `[admin]`, `[fleet]`, `[state]`, `[logging]`, `[telemetry]`, `[reload]`, `[upstream]`, `[auth.jwt]` and `limits.max_concurrency`, `queue_timeout_ms`, `penalty_secs` stay fixed at start
 - [x] Separately bound, optionally token-protected `/metrics`, stats and probes (0005)
 - [x] TLS termination with renewal on file change (0007)
 - [x] Mutual TLS and certificate-derived identity (0011)

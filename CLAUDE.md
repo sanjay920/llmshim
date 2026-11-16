@@ -790,9 +790,10 @@ snapshot (`AdmittedRouter` extension, `DispatchPolicyContext::router_snapshot`, 
 only, never through Redis). Limits are retuned first, in all four holders, through the
 defaulted `RateLimiter::retune` / `AttemptRates::retune`; buckets keep their tokens. Provider
 secrets are fingerprinted by digest, so only `{ file }` references rotate (the status lists the
-`{ env }` ones). A fleet replica starts and stops workers through `DistributedGateway::
-sync_workers`, and a job whose provider the replica lacks answers 503 `provider_unavailable`
-(`serve` builds only). `--features serve-cloud` is needed for the Vertex credential-file test.
+`{ env }` ones). A fleet replica starts and stops workers through
+`DistributedGateway::sync_workers`, and a job whose provider the replica lacks answers 503
+`provider_unavailable` (`serve` builds only). The Vertex credential-file reload test needs
+`serve-cloud`.
 
 ## Cloud transports from the `serve` file (note 0020)
 
