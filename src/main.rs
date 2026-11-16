@@ -911,6 +911,114 @@ async fn reload_loop(
     }
 }
 
+/// With `[control_plane.source]`: fetch the snapshot once before the keys are read from it.
+/// `Some(exit code)` to stop. A control plane that is down is not a reason to refuse to start
+/// when a verified snapshot is already cached (the last good one serves, 0024); with none it
+/// is, because no caller could be identified.
+#[cfg(feature = "serve")]
+async fn startup_pull(
+    path: &std::path::Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<bool, i32> {
+    use llmshim::serve::snapshot_pull::{Pulled, Puller};
+    let Ok(loaded) = llmshim::serve::ServeConfig::load_with_text_resolving(path, false) else {
+        return Ok(false);
+    };
+    let (Some(control_plane), Some(dir)) = (
+        loaded
+            .config
+            .control_plane
+            .as_ref()
+            .filter(|c| c.source.is_some()),
+        loaded.config.state.policy_dir.as_ref(),
+    ) else {
+        return Ok(false);
+    };
+    let mut puller = match Puller::new(control_plane, dir) {
+        Ok(puller) => puller,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return Err(1);
+        }
+    };
+    let pulled = match puller.token(env) {
+        Ok(token) => puller.pull(token).await,
+        Err(reason) => Err(reason),
+    };
+    match pulled {
+        Ok(Pulled::Updated(generation)) => {
+            eprintln!("control plane: pulled snapshot generation {generation}");
+            Ok(true)
+        }
+        Ok(Pulled::NotModified) => Ok(true),
+        Err(reason) if puller.has_cache() => {
+            eprintln!("control plane: {reason}; serving the cached snapshot");
+            Ok(false)
+        }
+        Err(reason) => {
+            eprintln!(
+                "control plane: {reason}, and no snapshot is cached: no caller could be identified"
+            );
+            Err(1)
+        }
+    }
+}
+
+/// Poll the control plane for a newer snapshot and, when one verifies, apply it at once (the
+/// reload a signal would run). A failure changes nothing and is reported once per distinct
+/// reason; the status keeps showing the latest.
+#[cfg(feature = "serve")]
+async fn pull_loop(
+    mut puller: llmshim::serve::snapshot_pull::Puller,
+    reloader: std::sync::Arc<llmshim::serve::Reloader>,
+    clock: Option<llmshim::serve::snapshot::SnapshotClock>,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
+) {
+    use llmshim::serve::snapshot_pull::Pulled;
+    let env = |name: &str| std::env::var(name).ok();
+    let mut ticker = tokio::time::interval(puller.poll_interval());
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The start just pulled.
+    ticker.tick().await;
+    let mut last_error: Option<String> = None;
+    loop {
+        tokio::select! {
+            _ = stopped.wait_for(|stop| *stop) => return,
+            _ = ticker.tick() => {}
+        }
+        let pulled = match puller.token(&env) {
+            Ok(token) => puller.pull(token).await,
+            Err(reason) => Err(reason),
+        };
+        match pulled {
+            Ok(result) => {
+                last_error = None;
+                if let Some(clock) = &clock {
+                    clock.pulled(Ok(()));
+                }
+                if let Pulled::Updated(generation) = result {
+                    eprintln!("control plane: pulled snapshot generation {generation}");
+                    let current = reloader.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let env = |name: &str| std::env::var(name).ok();
+                        current.reload(&env)
+                    })
+                    .await;
+                }
+            }
+            Err(reason) => {
+                if let Some(clock) = &clock {
+                    clock.pulled(Err(reason.clone()));
+                }
+                if last_error.as_deref() != Some(reason.as_str()) {
+                    eprintln!("control plane: {reason}");
+                    last_error = Some(reason);
+                }
+            }
+        }
+    }
+}
+
 /// `llmshim snapshot keygen|sign|verify` (0024). Exit 0 on success, 1 on any failure.
 #[cfg(feature = "serve")]
 fn cmd_snapshot(options: &cli::SnapshotOptions) -> i32 {
@@ -1024,6 +1132,15 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         }
     };
     let env = |name: &str| std::env::var(name).ok();
+    // A pulled snapshot is fetched before the keys are read from it (0024). `--check` and
+    // `--structure-only` fetch nothing.
+    let mut pulled_at_start = false;
+    if !options.check {
+        match startup_pull(path, &env).await {
+            Err(code) => return code,
+            Ok(pulled) => pulled_at_start = pulled,
+        }
+    }
     let llmshim::serve::Loaded {
         config,
         text,
@@ -1173,6 +1290,12 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             snapshot.signer
         );
     }
+    // With `[control_plane.source]`: the poller that keeps the cached snapshot current.
+    let control_puller = config.control_plane.as_ref().and_then(|control_plane| {
+        let dir = config.state.policy_dir.as_ref()?;
+        control_plane.source.as_ref()?;
+        llmshim::serve::snapshot_pull::Puller::new(control_plane, dir).ok()
+    });
     let listener = match cli::bind(built.address).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -1275,6 +1398,19 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     let wait_for_stop = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
         let _ = stopped.wait_for(|stop| *stop).await;
     };
+    if pulled_at_start {
+        if let Some(clock) = built.reload.snapshot_clock() {
+            clock.pulled(Ok(()));
+        }
+    }
+    if let Some(puller) = control_puller {
+        tokio::spawn(pull_loop(
+            puller,
+            reloader.clone(),
+            built.reload.snapshot_clock(),
+            stopped.clone(),
+        ));
+    }
     tokio::spawn(reload_loop(
         reloader,
         poll,

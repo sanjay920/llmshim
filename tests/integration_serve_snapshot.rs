@@ -809,3 +809,257 @@ async fn a_key_in_the_file_expires_at_request_time_too() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
+
+// ---- a snapshot pulled from a control plane (0024, 0026) ----
+
+const CONTROL_TOKEN: &str = "control-plane-token-0123456789abcdef";
+
+impl Plane {
+    /// The configuration with the snapshot pulled from `control` instead of read from a file.
+    fn pulled_config(&self, upstream: &str, control: &str, extra: &str) -> String {
+        self.config(upstream, "")
+            .replace(
+                &format!("snapshot_file = \"{}\"", self.snapshot_file().display()),
+                &format!(
+                    "[control_plane.source]\nurl = \"{control}\"\ntoken = {{ env = \"SERVE_E2E_CONTROL_TOKEN\" }}\nallow_insecure_http = true\npoll_interval_secs = 1\n{extra}\n"
+                ),
+            )
+            // `[control_plane]` keys must precede its sub-table: move `org` and the keys above.
+            .to_string()
+    }
+
+    fn envelope(&self, payload: &Value) -> String {
+        snapshot::sign(payload, &self.seed).unwrap()
+    }
+}
+
+async fn control_plane(
+    plane: &Plane,
+    generation: u64,
+    keys: Vec<Value>,
+) -> (mockito::ServerGuard, mockito::Mock) {
+    let mut control = mockito::Server::new_async().await;
+    let mock = serve_generation(&mut control, plane, generation, keys).await;
+    (control, mock)
+}
+
+async fn serve_generation(
+    control: &mut mockito::ServerGuard,
+    plane: &Plane,
+    generation: u64,
+    keys: Vec<Value>,
+) -> mockito::Mock {
+    control
+        .mock("GET", "/v1/orgs/org_test/snapshot")
+        .match_header("authorization", format!("Bearer {CONTROL_TOKEN}").as_str())
+        .with_header("content-type", "application/json")
+        .with_header("etag", &format!("\"{generation}\""))
+        .with_body(plane.envelope(&payload(generation, keys)))
+        .create_async()
+        .await
+}
+
+const PULL_ENV: [(&str, &str); 1] = [("SERVE_E2E_CONTROL_TOKEN", CONTROL_TOKEN)];
+
+#[tokio::test]
+async fn a_snapshot_is_pulled_at_start_and_a_new_generation_applies_without_a_signal() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("pull-apply");
+    let (mut control, first) = control_plane(&plane, 1, vec![key("alpha", ALPHA, "active")]).await;
+    let server = start(
+        &plane.pulled_config(&upstream.url(), &control.url(), ""),
+        "pull-apply",
+        &PULL_ENV,
+    );
+    assert_eq!(
+        status_of(&server, ALPHA).await,
+        200,
+        "served from what was pulled"
+    );
+    assert!(
+        plane.dir.0.join("policy").join("snapshot.json").exists(),
+        "and kept"
+    );
+    let status = snapshot_status(&server).await;
+    assert_eq!(status["generation"], 1);
+    assert!(status["last_pull_ok_at_epoch_secs"].is_u64(), "{status}");
+
+    // A new generation: alpha is revoked, bravo added. No SIGHUP, no file edit.
+    first.remove_async().await;
+    let _second = serve_generation(
+        &mut control,
+        &plane,
+        2,
+        vec![
+            key("alpha", ALPHA, "revoked"),
+            key("bravo", BRAVO, "active"),
+        ],
+    )
+    .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while status_of(&server, ALPHA).await != 401 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the new generation never applied"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(status_of(&server, BRAVO).await, 200);
+    assert_eq!(snapshot_status(&server).await["generation"], 2);
+}
+
+#[tokio::test]
+async fn an_unreachable_or_wrong_control_plane_never_changes_what_serves_and_is_reported() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("pull-down");
+    let (mut control, first) = control_plane(&plane, 1, vec![key("alpha", ALPHA, "active")]).await;
+    let server = start(
+        &plane.pulled_config(&upstream.url(), &control.url(), ""),
+        "pull-down",
+        &PULL_ENV,
+    );
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+
+    // The control plane starts answering 500: the last good snapshot keeps serving.
+    first.remove_async().await;
+    let _broken = control
+        .mock("GET", "/v1/orgs/org_test/snapshot")
+        .with_status(500)
+        .create_async()
+        .await;
+    wait_for_reload(&server, "the failure", |s| {
+        s["snapshot"]["last_pull_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("500"))
+    })
+    .await;
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+}
+
+#[tokio::test]
+async fn a_pulled_snapshot_that_does_not_verify_is_refused_and_never_cached() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("pull-refused");
+    let (mut control, first) = control_plane(&plane, 1, vec![key("alpha", ALPHA, "active")]).await;
+    let server = start(
+        &plane.pulled_config(&upstream.url(), &control.url(), ""),
+        "pull-refused",
+        &PULL_ENV,
+    );
+    let cache = plane.dir.0.join("policy").join("snapshot.json");
+    let before = std::fs::read(&cache).unwrap();
+    first.remove_async().await;
+    // Signed by a key this replica does not trust, claiming a higher generation.
+    let (other_seed, _) = snapshot::keygen().unwrap();
+    let forged = snapshot::sign(
+        &payload(9, vec![key("bravo", BRAVO, "active")]),
+        &other_seed,
+    )
+    .unwrap();
+    let _forged = control
+        .mock("GET", "/v1/orgs/org_test/snapshot")
+        .with_body(forged)
+        .create_async()
+        .await;
+    wait_for_reload(&server, "the refusal", |s| {
+        s["snapshot"]["last_pull_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("refused"))
+    })
+    .await;
+    assert_eq!(
+        std::fs::read(&cache).unwrap(),
+        before,
+        "the cache keeps the last good one"
+    );
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+    assert_eq!(status_of(&server, BRAVO).await, 401);
+}
+
+#[tokio::test]
+async fn a_wrong_token_is_reported_without_echoing_it() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("pull-token");
+    let (control, _first) = control_plane(&plane, 1, vec![key("alpha", ALPHA, "active")]).await;
+    // The first pull succeeds with the right token; rotate to a wrong one by restarting
+    // with a cache and a different environment.
+    let server = start(
+        &plane.pulled_config(&upstream.url(), &control.url(), ""),
+        "pull-token-1",
+        &PULL_ENV,
+    );
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+    drop(server);
+    let wrong = [(
+        "SERVE_E2E_CONTROL_TOKEN",
+        "a-different-token-0123456789abcdef",
+    )];
+    let server = start(
+        &plane.pulled_config(&upstream.url(), &control.url(), ""),
+        "pull-token-2",
+        &wrong,
+    );
+    // Still serving from the cache the right token filled; the status says why it is not
+    // getting anything newer.
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+    let status = wait_for_reload(&server, "the refusal", |s| {
+        s["snapshot"]["last_pull_error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty())
+    })
+    .await;
+    let error = status["snapshot"]["last_pull_error"].as_str().unwrap();
+    assert!(
+        !error.contains("a-different-token") && !error.contains(CONTROL_TOKEN),
+        "{error}"
+    );
+    assert!(
+        !server
+            .stderr
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("a-different-token")),
+        "the token reached the log"
+    );
+}
+
+#[tokio::test]
+async fn start_without_a_cache_needs_the_control_plane_and_with_one_it_does_not() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("pull-start");
+    let (control, _first) = control_plane(&plane, 1, vec![key("alpha", ALPHA, "active")]).await;
+    let url = control.url();
+    let config = plane.pulled_config(&upstream.url(), &url, "");
+    let server = start(&config, "pull-start-1", &PULL_ENV);
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+    drop(server);
+    drop(control);
+    // The control plane is gone. With the cache, a restart serves from it.
+    let server = start(&config, "pull-start-2", &PULL_ENV);
+    assert_eq!(
+        status_of(&server, ALPHA).await,
+        200,
+        "served from the cache"
+    );
+    drop(server);
+    // Without one, there is nobody to identify: the start fails and says so.
+    std::fs::remove_file(plane.dir.0.join("policy").join("snapshot.json")).unwrap();
+    let path = plane.dir.0.join("gateway.toml");
+    std::fs::write(
+        &path,
+        config.replace("{DIR}", plane.dir.0.to_str().unwrap()),
+    )
+    .unwrap();
+    let (code, stderr) = run_with_args(
+        &path,
+        &[],
+        &[
+            ("SERVE_E2E_UPSTREAM_KEY", UPSTREAM_KEY),
+            ("SERVE_E2E_ADMIN_TOKEN", ADMIN_TOKEN),
+            ("SERVE_E2E_CONTROL_TOKEN", CONTROL_TOKEN),
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("no snapshot is cached"), "{stderr}");
+}

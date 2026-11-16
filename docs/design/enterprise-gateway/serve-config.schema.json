@@ -94,8 +94,23 @@
           "type": "boolean"
         },
         "snapshot_file": {
-          "description": "The snapshot file (an absolute path), written by whatever distributes it\nand watched like the keys of a file.",
-          "type": "string"
+          "default": null,
+          "description": "The snapshot file (an absolute path), written by whatever distributes it\nand watched like the keys of a file. Exactly one of this and `source`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SnapshotSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Pull the snapshot from a control plane instead (0024): this replica polls it,\nverifies what it gets against `verify_keys`, and keeps the last good one in\n`state.policy_dir`, which it serves from while the control plane is unreachable."
         },
         "verify_keys": {
           "description": "Public keys that may have signed a snapshot, each `ed25519:<base64 of the\n32-byte key>` (`llmshim snapshot keygen` prints one). More than one lets a\nsigning key rotate: add the new public key first.",
@@ -107,8 +122,7 @@
       },
       "required": [
         "org",
-        "verify_keys",
-        "snapshot_file"
+        "verify_keys"
       ],
       "type": "object"
     },
@@ -727,6 +741,40 @@
           "type": "array"
         }
       },
+      "type": "object"
+    },
+    "SnapshotSource": {
+      "additionalProperties": false,
+      "description": "Where a replica pulls its snapshot from (0024, 0026): `GET {url}/v1/orgs/{org}/snapshot`.",
+      "properties": {
+        "allow_insecure_http": {
+          "default": false,
+          "description": "Allow a plain `http://` url: the token and the snapshot then cross the network\nunprotected (the snapshot is signed; the token is not protected).",
+          "type": "boolean"
+        },
+        "poll_interval_secs": {
+          "default": null,
+          "description": "Seconds between polls, 1 to 3600. Defaults to 15.",
+          "maximum": 3600,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "token": {
+          "$ref": "#/$defs/SecretRef",
+          "description": "The control plane's bearer token, by secret reference. Read at each poll, so a\nrotated file takes effect without a restart."
+        },
+        "url": {
+          "description": "The control plane's base address, `https://...` (plain `http://` needs\n`allow_insecure_http`). No credentials, path or query in it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "token"
+      ],
       "type": "object"
     },
     "State": {

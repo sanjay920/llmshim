@@ -84,6 +84,11 @@ impl ReloadHandles {
         }
     }
 
+    /// The age and pull state of the snapshot in force, with `[control_plane]`.
+    pub fn snapshot_clock(&self) -> Option<super::snapshot::SnapshotClock> {
+        self.clock.clone()
+    }
+
     /// What the admin listener reports.
     pub fn status(&self) -> ReloadStatus {
         let mut status = self.status.snapshot();

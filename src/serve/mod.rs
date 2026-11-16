@@ -23,6 +23,7 @@ pub mod keys;
 pub mod mtls;
 pub mod reload;
 pub mod snapshot;
+pub mod snapshot_pull;
 pub(crate) mod telemetry;
 
 pub use build::{

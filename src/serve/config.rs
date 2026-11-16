@@ -146,6 +146,38 @@ pub struct ServeConfig {
     pub control_plane: Option<ControlPlane>,
 }
 
+/// Where a replica pulls its snapshot from (0024, 0026): `GET {url}/v1/orgs/{org}/snapshot`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct SnapshotSource {
+    /// The control plane's base address, `https://...` (plain `http://` needs
+    /// `allow_insecure_http`). No credentials, path or query in it.
+    pub url: String,
+    /// The control plane's bearer token, by secret reference. Read at each poll, so a
+    /// rotated file takes effect without a restart.
+    pub token: SecretRef,
+    /// Seconds between polls, 1 to 3600. Defaults to 15.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 3600))]
+    pub poll_interval_secs: Option<u64>,
+    /// Allow a plain `http://` url: the token and the snapshot then cross the network
+    /// unprotected (the snapshot is signed; the token is not protected).
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+}
+
+impl ControlPlane {
+    /// The file the snapshot is read from: `snapshot_file`, or where a pulled one is kept.
+    pub fn snapshot_path(&self, policy_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+        match (&self.snapshot_file, &self.source, policy_dir) {
+            (Some(file), _, _) => Some(file.clone()),
+            (None, Some(_), Some(dir)) => Some(dir.join("snapshot.json")),
+            _ => None,
+        }
+    }
+}
+
 /// A signed snapshot as the source of caller keys (0024). Needs `state.policy_dir`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -159,8 +191,14 @@ pub struct ControlPlane {
     /// signing key rotate: add the new public key first.
     pub verify_keys: Vec<String>,
     /// The snapshot file (an absolute path), written by whatever distributes it
-    /// and watched like the keys of a file.
-    pub snapshot_file: PathBuf,
+    /// and watched like the keys of a file. Exactly one of this and `source`.
+    #[serde(default)]
+    pub snapshot_file: Option<PathBuf>,
+    /// Pull the snapshot from a control plane instead (0024): this replica polls it,
+    /// verifies what it gets against `verify_keys`, and keeps the last good one in
+    /// `state.policy_dir`, which it serves from while the control plane is unreachable.
+    #[serde(default)]
+    pub source: Option<SnapshotSource>,
     /// A floor for the snapshot's generation, so a replica with no record of what it
     /// applied (a first boot) still refuses a snapshot older than this. Defaults to 0.
     #[serde(default)]
@@ -1099,7 +1137,11 @@ impl ServeConfig {
             Some(dir) => super::snapshot::read_floor(dir).map_err(|issue| vec![issue])?,
             None => None,
         };
-        let snapshot = super::snapshot::load(&control_plane, floor.as_ref(), chrono::Utc::now())?;
+        let path = control_plane
+            .snapshot_path(self.state.policy_dir.as_deref())
+            .ok_or_else(|| vec![Issue::new("control_plane", "has no snapshot to read")])?;
+        let snapshot =
+            super::snapshot::load_from(&path, &control_plane, floor.as_ref(), chrono::Utc::now())?;
         if snapshot.keys.is_empty() {
             return Err(vec![Issue::new(
                 "control_plane.snapshot_file",
@@ -1124,6 +1166,44 @@ impl ServeConfig {
                     )
                 })
                 .collect())
+        }
+    }
+
+    fn validate_snapshot_source(&self, source: &SnapshotSource, issues: &mut Vec<Issue>) {
+        let at = "control_plane.source";
+        let secure = source.url.starts_with("https://");
+        let plain = source.url.starts_with("http://");
+        if !secure && !(plain && source.allow_insecure_http) {
+            issues.push(Issue::new(
+                format!("{at}.url"),
+                if plain {
+                    "is plain http: the token would cross the network unprotected; use https, or set allow_insecure_http"
+                } else {
+                    "must start with https:// (or http:// with allow_insecure_http)"
+                },
+            ));
+        } else {
+            let rest = source.url.split_once("://").map_or("", |(_, rest)| rest);
+            if rest.is_empty()
+                || rest.contains(['@', '?', '#', ' '])
+                || rest.trim_end_matches('/').contains('/')
+                || !source.url.bytes().all(|b| b.is_ascii_graphic())
+            {
+                issues.push(Issue::new(
+                    format!("{at}.url"),
+                    "must be just a scheme and host (and port): no credentials, path or query",
+                ));
+            }
+        }
+        validate_secret(&source.token, &format!("{at}.token"), issues);
+        if source
+            .poll_interval_secs
+            .is_some_and(|s| !(1..=3600).contains(&s))
+        {
+            issues.push(Issue::new(
+                format!("{at}.poll_interval_secs"),
+                "must be 1 to 3600",
+            ));
         }
     }
 
@@ -1177,11 +1257,18 @@ impl ServeConfig {
                 ));
             }
         }
-        if !control_plane.snapshot_file.is_absolute() {
-            issues.push(Issue::new(
+        match (&control_plane.snapshot_file, &control_plane.source) {
+            (Some(_), Some(_)) => issues.push(Issue::new(
+                "control_plane.source",
+                "cannot be combined with snapshot_file: one source of the snapshot",
+            )),
+            (None, None) => issues.push(Issue::new("control_plane", "set snapshot_file or source")),
+            (Some(file), None) if !file.is_absolute() => issues.push(Issue::new(
                 "control_plane.snapshot_file",
                 "must be an absolute path",
-            ));
+            )),
+            (None, Some(source)) => self.validate_snapshot_source(source, &mut *issues),
+            _ => {}
         }
         match &self.state.policy_dir {
             None => issues.push(Issue::new(
@@ -2783,6 +2870,21 @@ mod tests {
         snapshot_file = "/var/lib/llmshim/snapshot.json"
     "#;
 
+    const PULLED: &str = r#"
+        version = 1
+        [providers.openai]
+        kind = "openai"
+        api_key = { env = "OPENAI_API_KEY" }
+        [state]
+        policy_dir = "/var/lib/llmshim/policy"
+        [control_plane]
+        org = "org_test"
+        verify_keys = ["ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaA="]
+        [control_plane.source]
+        url = "https://control.internal.example"
+        token = { env = "CONTROL_TOKEN" }
+    "#;
+
     #[test]
     fn a_control_plane_replaces_keys_and_has_its_own_rules() {
         // Valid without [[keys]]: the snapshot is the source of who may call (0024).
@@ -2824,6 +2926,51 @@ mod tests {
             "",
         );
         assert!(has(&issues(&neither), "keys"));
+    }
+
+    #[test]
+    fn a_pulled_snapshot_source_has_its_own_rules() {
+        assert!(issues(PULLED).is_empty(), "{:?}", issues(PULLED));
+        // One source of the snapshot, and at least one.
+        let both = PULLED.replace(
+            "[control_plane.source]",
+            "snapshot_file = \"/var/lib/llmshim/snapshot.json\"\n        [control_plane.source]",
+        );
+        assert!(has(&issues(&both), "control_plane.source"));
+        let neither = PULLED.replace(
+            "[control_plane.source]\n        url = \"https://control.internal.example\"\n        token = { env = \"CONTROL_TOKEN\" }",
+            "",
+        );
+        assert!(has(&issues(&neither), "control_plane"));
+        // The token crosses the network: https, or an explicit choice.
+        let plain = PULLED.replace("https://", "http://");
+        assert!(has(&issues(&plain), "control_plane.source.url"));
+        let allowed = format!("{plain}\n        allow_insecure_http = true");
+        assert!(issues(&allowed).is_empty(), "{:?}", issues(&allowed));
+        // Just a host: no credentials, path, query or space.
+        for bad in [
+            "https://user:pw@control.example",
+            "https://control.example/v1",
+            "https://control.example?x=1",
+            "ftp://control.example",
+            "control.example",
+        ] {
+            let text = PULLED.replace("https://control.internal.example", bad);
+            assert!(has(&issues(&text), "control_plane.source.url"), "{bad}");
+        }
+        assert!(issues(&PULLED.replace(
+            "https://control.internal.example",
+            "https://control.example:8443/"
+        ))
+        .is_empty());
+        let slow = format!("{PULLED}\n        poll_interval_secs = 0");
+        assert!(has(
+            &issues(&slow),
+            "control_plane.source.poll_interval_secs"
+        ));
+        // The cache needs the directory that records what was applied.
+        let no_dir = PULLED.replace("policy_dir = \"/var/lib/llmshim/policy\"", "");
+        assert!(has(&issues(&no_dir), "state.policy_dir"));
     }
 
     #[test]
