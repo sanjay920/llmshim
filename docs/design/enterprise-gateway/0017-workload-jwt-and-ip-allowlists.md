@@ -117,8 +117,9 @@ limits, budget) applies unchanged: the token only proves **which key**.
   fall to plain text. Keys are cached for `jwks_refresh_secs`. An unknown `kid` triggers one
   refresh, at most once per 30 seconds per issuer, so a flood of random `kid`s
   cannot turn the gateway into a request amplifier against the issuer. An attempt is
-  stamped when it starts, so a caller that goes away mid-fetch does not reset the
-  floor. A key the issuer rotates in just after a load is therefore unknown for up
+  stamped when it starts, and the fetch is a task of its own: a caller that goes
+  away mid-fetch neither aborts it nor costs the issuer the interval, and a caller
+  that has keys within the stale window is served at once while the refresh runs. A key the issuer rotates in just after a load is therefore unknown for up
   to 30 seconds: the consumer treats an unknown `kid` inside that window as a
   retryable 401 (`Retry-After`), not a permanent verdict.
 - **JWKS failures fail closed, with stale keys served for a bounded, configured

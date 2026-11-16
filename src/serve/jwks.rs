@@ -7,6 +7,9 @@
 //!   than once per `MIN_RETRY` (30 s): a failing issuer is not hammered by every
 //!   request, and a flood of tokens with unknown `kid`s cannot make the gateway an
 //!   amplifier against it.
+//! - **The fetch is a task of its own**, so a caller that goes away does not abort
+//!   it, and cached keys still within the stale window are served at once while a
+//!   refresh runs in the background: only a caller with nothing usable waits.
 //! - **Keys are fresh for `refresh`.** After that a refresh is tried on the next
 //!   use; if it fails, the cached keys keep verifying for up to `max_stale` more
 //!   (an issuer outage need not take the platform down), then the issuer is
@@ -57,9 +60,10 @@ struct State {
     fetched_at: Option<Instant>,
     last_attempt: Option<Instant>,
     last_error: Option<&'static str>,
+    in_flight: bool,
 }
 
-/// What `/v1/serve/config` will report for an issuer.
+/// What `/v1/serve/config` reports for an issuer.
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct Status {
     pub loaded: bool,
@@ -70,11 +74,25 @@ pub struct Status {
 }
 
 pub struct Jwks {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     name: String,
     fetcher: Arc<dyn Fetch>,
     settings: Settings,
     state: Mutex<State>,
-    flight: tokio::sync::Mutex<()>,
+    done: tokio::sync::Notify,
+}
+
+/// Clears the in-flight flag however the refresh task ends, a panic included.
+struct Finish(Arc<Inner>);
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        self.0.locked().in_flight = false;
+        self.0.done.notify_waiters();
+    }
 }
 
 impl Jwks {
@@ -85,22 +103,18 @@ impl Jwks {
         crate::gateway::metrics::add(STALE_SERVED, &[("issuer", name)], 0);
         crate::gateway::metrics::add(REFUSED, &[("issuer", name)], 0);
         Self {
-            name: name.to_owned(),
-            fetcher,
-            settings,
-            state: Mutex::new(State::default()),
-            flight: tokio::sync::Mutex::new(()),
+            inner: Arc::new(Inner {
+                name: name.to_owned(),
+                fetcher,
+                settings,
+                state: Mutex::new(State::default()),
+                done: tokio::sync::Notify::new(),
+            }),
         }
     }
 
-    fn locked(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     pub fn status(&self) -> Status {
-        let state = self.locked();
+        let state = self.inner.locked();
         Status {
             loaded: state.keys.is_some(),
             keys: state.keys.as_ref().map_or(0, |keys| keys.len()),
@@ -109,26 +123,42 @@ impl Jwks {
         }
     }
 
-    /// The keys to verify with now, refreshing first when they are older than
-    /// `refresh`.
+    /// The keys to verify with now. Past `refresh` a refresh is started in the
+    /// background, and cached keys still within `refresh + max_stale` are served
+    /// at once, so a slow issuer never holds a request that has keys to use; only
+    /// a caller with nothing usable waits for the fetch.
     pub async fn keys(&self) -> Result<Arc<KeySet>, Unavailable> {
-        if let Some(keys) = self.fresh() {
+        if let Some(keys) = self.inner.fresh() {
             return Ok(keys);
         }
-        self.refresh().await;
-        self.usable()
+        self.inner.start_refresh();
+        if let Ok(keys) = self.inner.usable() {
+            return Ok(keys);
+        }
+        self.inner.wait_idle().await;
+        self.inner.usable()
     }
 
     /// For a token whose `kid` the cached keys do not know: one more refresh,
-    /// but never sooner than `MIN_RETRY` after the last attempt. Returns the keys
-    /// to try again with (the same ones when the refresh was not allowed).
+    /// but never sooner than `MIN_RETRY` after the last attempt, waited for
+    /// because the caller needs the answer. Returns the keys to try again with
+    /// (the same ones when the refresh was not allowed).
     pub async fn keys_for_unknown_kid(&self) -> Result<Arc<KeySet>, Unavailable> {
-        if !self.may_attempt() {
-            crate::gateway::metrics::incr(REFUSED, &[("issuer", &self.name)]);
-            return self.usable();
+        if !self.inner.may_attempt() {
+            crate::gateway::metrics::incr(REFUSED, &[("issuer", &self.inner.name)]);
+            return self.inner.usable();
         }
-        self.refresh().await;
-        self.usable()
+        self.inner.start_refresh();
+        self.inner.wait_idle().await;
+        self.inner.usable()
+    }
+}
+
+impl Inner {
+    fn locked(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn fresh(&self) -> Option<Arc<KeySet>> {
@@ -165,25 +195,30 @@ impl Jwks {
             .is_none_or(|at| at.elapsed() >= MIN_RETRY)
     }
 
-    /// One fetch at a time. A caller that waited for another's fetch does not
-    /// start a second one.
-    async fn refresh(&self) {
-        let waiting_since = Instant::now();
-        let _flight = self.flight.lock().await;
+    /// Start a refresh unless one is running or the last attempt was under
+    /// `MIN_RETRY` ago. The fetch runs in a task of its own: a caller that goes
+    /// away (a client that disconnected) neither aborts it nor leaves the issuer
+    /// looking unavailable for the interval. The attempt is stamped as it starts.
+    fn start_refresh(self: &Arc<Self>) {
         {
-            let state = self.locked();
-            let someone_just_tried = state.last_attempt.is_some_and(|at| at >= waiting_since);
+            let mut state = self.locked();
             let too_soon = state
                 .last_attempt
                 .is_some_and(|at| at.elapsed() < MIN_RETRY);
-            if someone_just_tried || too_soon {
+            if state.in_flight || too_soon {
                 return;
             }
+            state.in_flight = true;
+            state.last_attempt = Some(Instant::now());
         }
-        // Stamped before the fetch, not after: a caller whose future is dropped
-        // mid-fetch (a client that disconnected) must not leave the floor
-        // unrecorded, or a stream of them would fetch back to back.
-        self.locked().last_attempt = Some(Instant::now());
+        let inner = self.clone();
+        tokio::spawn(async move {
+            let _finish = Finish(inner.clone());
+            inner.refresh().await;
+        });
+    }
+
+    async fn refresh(&self) {
         let outcome = match self.fetcher.fetch().await {
             Ok(document) => match KeySet::from_jwks(&document) {
                 Ok(keys) if !keys.is_empty() => Ok(keys),
@@ -193,7 +228,6 @@ impl Jwks {
             Err(class) => Err(class),
         };
         let mut state = self.locked();
-        state.last_attempt = Some(Instant::now());
         match outcome {
             Ok(keys) => {
                 state.keys = Some(Arc::new(keys));
@@ -211,6 +245,19 @@ impl Jwks {
                     &[("issuer", &self.name), ("outcome", "failed")],
                 );
             }
+        }
+    }
+
+    /// Wait until no refresh is running.
+    async fn wait_idle(&self) {
+        loop {
+            let notified = self.done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.locked().in_flight {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -384,6 +431,11 @@ mod tests {
         )
     }
 
+    /// Let background refresh tasks run (the clock is paused, so this is instant).
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
     fn good() -> Result<Vec<u8>, &'static str> {
         Ok(DOC.as_bytes().to_vec())
     }
@@ -410,6 +462,7 @@ mod tests {
         assert_eq!(script.calls(), 1);
         tokio::time::advance(Duration::from_secs(2)).await;
         jwks.keys().await.unwrap();
+        settle().await;
         assert_eq!(script.calls(), 2, "refreshed once past the interval");
         let status = jwks.status();
         assert!(status.loaded && status.keys == 1 && status.last_error.is_none());
@@ -458,7 +511,11 @@ mod tests {
         jwks.keys().await.unwrap();
         // Past the refresh interval, the refresh fails: the cached keys serve.
         tokio::time::advance(Duration::from_secs(301)).await;
-        assert!(jwks.keys().await.is_ok());
+        assert!(
+            jwks.keys().await.is_ok(),
+            "served at once, refresh in the background"
+        );
+        settle().await;
         assert_eq!(jwks.status().last_error, Some("status"));
         assert!(metric(STALE_SERVED, "issuer=\"stale\"") >= 1);
         // Up to refresh + max_stale.
@@ -469,27 +526,60 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_cancelled_fetch_still_counts_as_an_attempt() {
+    async fn a_caller_that_goes_away_neither_aborts_the_fetch_nor_costs_the_issuer() {
         let script = Arc::new(Script {
             answers: Mutex::new(vec![good()].into()),
             calls: AtomicUsize::new(0),
-            delay: Duration::from_secs(1000),
+            delay: Duration::from_secs(5),
         });
         let jwks = Arc::new(jwks("cancel", &script));
         let task = {
             let jwks = jwks.clone();
-            tokio::spawn(async move { jwks.keys_for_unknown_kid().await })
+            tokio::spawn(async move { jwks.keys().await })
         };
         tokio::time::advance(Duration::from_secs(1)).await;
         task.abort();
         let _ = task.await;
-        // A flood of callers right after: none may start another fetch.
-        for _ in 0..20 {
-            let _ = jwks.keys_for_unknown_kid().await;
-            let _ = jwks.keys().await;
-            tokio::time::advance(Duration::from_secs(1)).await;
-        }
+        // The fetch carries on without its caller, and the next caller gets the
+        // keys it loaded: one fetch in all, no 30 s of an unavailable issuer.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(jwks.keys().await.is_ok());
         assert_eq!(script.calls(), 1);
+        assert!(jwks.status().loaded);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_issuer_does_not_hold_callers_that_have_stale_keys() {
+        let script = Arc::new(Script {
+            answers: Mutex::new(vec![good()].into()),
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+        });
+        let jwks = Arc::new(jwks("hang", &script));
+        jwks.keys().await.unwrap();
+        // Now the issuer hangs for longer than any caller should wait.
+        let hanging = Arc::new(Script {
+            answers: Mutex::new(vec![good()].into()),
+            calls: AtomicUsize::new(0),
+            delay: Duration::from_secs(1000),
+        });
+        let jwks = Jwks {
+            inner: Arc::new(Inner {
+                name: "hang".into(),
+                fetcher: hanging.clone(),
+                settings: jwks.inner.settings,
+                state: Mutex::new(std::mem::take(&mut *jwks.inner.state.lock().unwrap())),
+                done: tokio::sync::Notify::new(),
+            }),
+        };
+        tokio::time::advance(Duration::from_secs(301)).await;
+        let started = Instant::now();
+        for _ in 0..10 {
+            assert!(jwks.keys().await.is_ok());
+        }
+        assert!(started.elapsed() < Duration::from_secs(1), "nobody waited");
+        settle().await;
+        assert_eq!(hanging.calls(), 1, "one background refresh, shared");
     }
 
     #[tokio::test(start_paused = true)]
@@ -534,9 +624,11 @@ mod tests {
         jwks.keys().await.unwrap();
         tokio::time::advance(Duration::from_secs(301)).await;
         assert_eq!(jwks.keys().await.unwrap().len(), 1);
+        settle().await;
         assert_eq!(jwks.status().last_error, Some("no_usable_keys"));
         tokio::time::advance(Duration::from_secs(31)).await;
         assert_eq!(jwks.keys().await.unwrap().len(), 1);
+        settle().await;
         assert_eq!(jwks.status().last_error, Some("malformed"));
     }
 
