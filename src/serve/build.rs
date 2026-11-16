@@ -596,6 +596,7 @@ fn build_router(
     issues: &mut Vec<Issue>,
 ) -> Router {
     let mut router = Router::new();
+    let mut shared = CloudShared::default();
     for (name, provider) in &config.providers {
         let at = format!("providers.{name}");
         let key = match &provider.api_key {
@@ -614,7 +615,7 @@ fn build_router(
         if provider.kind.is_cloud() {
             // A transport that cannot be built is an error, never a provider left
             // out; a build without the feature was refused by `feature_issues`.
-            match cloud_provider(name, provider, key.as_deref()) {
+            match cloud_provider(name, provider, key.as_deref(), &mut shared) {
                 Ok(built) => router = router.register(name, built),
                 Err(found) => issues.extend(found),
             }
@@ -654,6 +655,7 @@ fn cloud_provider(
     name: &str,
     provider: &crate::serve::config::Provider,
     key: Option<&str>,
+    shared: &mut CloudShared,
 ) -> Result<Box<dyn Provider>, Vec<Issue>> {
     use crate::providers::{
         azure::{Azure, AzureIdentity},
@@ -687,24 +689,34 @@ fn cloud_provider(
             Ok(Box::new(bedrock))
         }
         ProviderKind::VertexGemini | ProviderKind::VertexAnthropic => {
-            let identity = GoogleIdentity::service_account(
-                provider
-                    .project
-                    .as_deref()
-                    .ok_or_else(|| missing("project"))?,
-                provider
-                    .region
-                    .as_deref()
-                    .ok_or_else(|| missing("region"))?,
-                provider
-                    .binding
-                    .as_deref()
-                    .ok_or_else(|| missing("binding"))?,
-                provider
-                    .service_account_file
-                    .clone()
-                    .ok_or_else(|| missing("service_account_file"))?,
-            );
+            // The two Vertex kinds name one identity (validation requires their
+            // fields to be equal), so they share one value and with it one token
+            // cache, as `docs/vertex.md` registers them.
+            let identity = match &shared.vertex {
+                Some(identity) => identity.clone(),
+                None => {
+                    let identity = GoogleIdentity::service_account(
+                        provider
+                            .project
+                            .as_deref()
+                            .ok_or_else(|| missing("project"))?,
+                        provider
+                            .region
+                            .as_deref()
+                            .ok_or_else(|| missing("region"))?,
+                        provider
+                            .binding
+                            .as_deref()
+                            .ok_or_else(|| missing("binding"))?,
+                        provider
+                            .service_account_file
+                            .clone()
+                            .ok_or_else(|| missing("service_account_file"))?,
+                    );
+                    shared.vertex = Some(identity.clone());
+                    identity
+                }
+            };
             Ok(if provider.kind == ProviderKind::VertexGemini {
                 Box::new(Vertex::gemini(identity))
             } else {
@@ -717,7 +729,7 @@ fn cloud_provider(
                     .binding
                     .as_deref()
                     .ok_or_else(|| missing("binding"))?,
-                key.ok_or_else(|| missing("api_key"))?.trim(),
+                key.ok_or_else(|| missing("api_key"))?,
             )
             // The message names the setting, never the key or the transport's text.
             .map_err(|_| issue("api_key", "is not usable as an Azure key (no whitespace)"))?;
@@ -743,12 +755,20 @@ fn cloud_provider(
     }
 }
 
+/// What the cloud providers of one configuration share between them.
+#[derive(Default)]
+struct CloudShared {
+    #[cfg(feature = "serve-cloud")]
+    vertex: Option<crate::providers::vertex::GoogleIdentity>,
+}
+
 /// Without the feature `feature_issues` has already refused the configuration.
 #[cfg(not(feature = "serve-cloud"))]
 fn cloud_provider(
     name: &str,
     _provider: &crate::serve::config::Provider,
     _key: Option<&str>,
+    _shared: &mut CloudShared,
 ) -> Result<Box<dyn Provider>, Vec<Issue>> {
     Err(vec![Issue {
         path: format!("providers.{name}"),
