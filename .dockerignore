@@ -1,4 +1,5 @@
 target/
+crates/*/target
 .env
 .env.*
 !.env.example

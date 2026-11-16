@@ -300,3 +300,138 @@ fn an_unreadable_signing_key_or_an_unknown_organization_is_an_error_not_a_snapsh
     // Nothing was published, so the next generation is still the first.
     assert_eq!(f.store.build_payload(&f.org).unwrap()["generation"], 1);
 }
+
+#[test]
+fn a_key_the_data_plane_would_refuse_is_refused_here_and_never_reaches_a_snapshot() {
+    let mut f = fixture();
+    let attempt = |f: &mut Fixture, edit: &dyn Fn(&mut NewKey)| {
+        let mut new = NewKey::secret(&f.project, "k");
+        edit(&mut new);
+        f.store.create_key(new, ACTOR)
+    };
+    assert!(matches!(
+        attempt(&mut f, &|k| k.allowed_cidrs = Some(vec!["nope".into()])),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        attempt(&mut f, &|k| k.allowed_cidrs = Some(vec![])),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        attempt(&mut f, &|k| k.credential =
+            Credential::ClientSan("uri:has space".into())),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        attempt(&mut f, &|k| k.budget_usd = Some(f64::NAN)),
+        Err(Error::Invalid(_))
+    ));
+    assert!(
+        matches!(
+            attempt(&mut f, &|k| k.budget_window_secs = Some(3600)),
+            Err(Error::Invalid(_)),
+        ),
+        "a window needs a budget"
+    );
+    assert!(matches!(
+        attempt(&mut f, &|k| {
+            k.budget_usd = Some(5.0);
+            k.budget_window_secs = Some(0);
+        }),
+        Err(Error::Invalid(_))
+    ));
+    // Nothing partial was left behind: the organization has no keys, and a valid one works.
+    assert!(f.store.keys(&f.org).unwrap().is_empty());
+    assert!(attempt(&mut f, &|k| {
+        k.allowed_cidrs = Some(vec!["10.0.0.0/8".into(), "2001:db8::/32".into()]);
+        k.budget_usd = Some(5.0);
+        k.budget_window_secs = Some(3600);
+    })
+    .is_ok());
+    // An update that would leave the stored flags without a budget is refused too.
+    let mut with_flag = NewKey::secret(&f.project, "flag");
+    with_flag.budget_usd = Some(1.0);
+    with_flag.budget_allow_unpriced = true;
+    let flagged = f.store.create_key(with_flag, ACTOR).unwrap();
+    assert!(matches!(
+        f.store
+            .update_key_limits(&flagged.record.id, LimitsUpdate::default(), ACTOR),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[test]
+fn debug_output_never_shows_a_secret() {
+    let mut f = fixture();
+    let created = f
+        .store
+        .create_key(NewKey::secret(&f.project, "ci"), ACTOR)
+        .unwrap();
+    let secret = created.secret.clone().unwrap();
+    assert!(!format!("{created:?}").contains(&secret));
+    assert!(!format!("{:?}", created.record).contains(&secret));
+    // Nor does the serialized record carry its hash.
+    let record = serde_json::to_string(&created.record).unwrap();
+    assert!(!record.contains("sha256"), "{record}");
+}
+
+#[test]
+fn two_processes_on_one_database_cannot_take_the_same_generation_or_double_revoke() {
+    let directory = dir("two-writers");
+    let database = directory.join("control.db");
+    let mut first = Store::open(&database).unwrap();
+    let org = first.create_org("Acme", ACTOR).unwrap();
+    let team = first.create_team(&org.id, "Platform", ACTOR).unwrap();
+    let project = first.create_project(&team.id, "Checkout", ACTOR).unwrap();
+    let key = first
+        .create_key(NewKey::secret(&project.id, "ci"), ACTOR)
+        .unwrap();
+    let mut second = Store::open(&database).unwrap();
+    let (seed, _) = llmshim::serve::snapshot::keygen().unwrap();
+
+    // The second reads what the first committed: generation 2, and it lists the revocation.
+    assert_eq!(
+        first
+            .publish_snapshot(&org.id, &seed, ACTOR)
+            .unwrap()
+            .generation,
+        1
+    );
+    first.revoke_key(&key.record.id, ACTOR).unwrap();
+    let published = second.publish_snapshot(&org.id, &seed, ACTOR).unwrap();
+    assert_eq!(published.generation, 2);
+    let payload = second.build_payload(&org.id).unwrap();
+    assert_eq!(payload["generation"], 3);
+    let listed = &second.latest_snapshot(&org.id).unwrap().unwrap().envelope;
+    assert!(listed.len() > 10);
+    // The second's own view of the key is the committed one: revoking again conflicts, and
+    // a limits change on it is refused (the state is checked where it is written).
+    assert!(matches!(
+        second.revoke_key(&key.record.id, ACTOR),
+        Err(Error::Conflict(_))
+    ));
+    assert!(matches!(
+        second.update_key_limits(&key.record.id, LimitsUpdate::default(), ACTOR),
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[test]
+fn a_rotation_is_one_unit_it_leaves_no_successor_without_its_record() {
+    let mut f = fixture();
+    let old = f
+        .store
+        .create_key(NewKey::secret(&f.project, "ci"), ACTOR)
+        .unwrap();
+    // A rotation that fails (a name already taken) leaves no successor and no record.
+    f.store
+        .create_key(NewKey::secret(&f.project, "taken"), ACTOR)
+        .unwrap();
+    let before = f.store.history_rows(100).unwrap().len();
+    assert!(matches!(
+        f.store.rotate_key(&old.record.id, "taken", ACTOR),
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(f.store.history_rows(100).unwrap().len(), before);
+    assert_eq!(f.store.keys(&f.org).unwrap().len(), 2);
+}

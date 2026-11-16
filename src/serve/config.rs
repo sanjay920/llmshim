@@ -26,7 +26,7 @@ pub const VERSION: u32 = 1;
 
 /// Largest spend cap the ledger can represent exactly (nano-USD in an f64-safe
 /// integer), matching the gateway's own bound.
-const MAX_BUDGET_USD: f64 = 9_007_199.254_740_992;
+pub const MAX_BUDGET_USD: f64 = 9_007_199.254_740_992;
 
 /// Longest spend window: 366 days. The Redis ledger multiplies the window by 1000
 /// and sets an expiry from it, so an unbounded value is an expiry beyond Redis's
@@ -2609,7 +2609,7 @@ fn valid_name(name: &str) -> bool {
 
 /// `dns:<name>` or `uri:<uri>`, with something after the prefix and no
 /// whitespace or control characters.
-fn valid_client_san(san: &str) -> bool {
+pub fn valid_client_san(san: &str) -> bool {
     let rest = san
         .strip_prefix("dns:")
         .or_else(|| san.strip_prefix("uri:"));

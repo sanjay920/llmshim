@@ -296,6 +296,19 @@ crate with `features = ["serve"]` for the snapshot signer and loader, so the two
   here), and keep the envelope. A test loads a published snapshot with the data plane's own
   `snapshot::load`, so the format and the rules are the one `serve` applies. Keys and teams are listed in
   insertion order, so a snapshot's bytes do not depend on random ids.
+- **Writes are one immediate transaction each** (`BEGIN IMMEDIATE`): a key's state is checked where it is
+  written (`AND state = 'active'`, the changed-row count tested), so two processes on one database cannot both
+  revoke or change a key; a rotation is one unit (no successor without its record); `publish_snapshot` reads
+  the keys, takes the generation and stores the envelope in one write transaction, so a revocation made before
+  it returns is in the snapshot and two publishers never share a generation. A stored value out of its range or a
+  corrupt network list is an error, never a wrapped number or "no restriction". `CreatedKey`'s `Debug` hides the
+  secret; a key's serialized form carries no hash.
+- **The data plane's context-free key rules apply here**, so a snapshot never carries a key `serve` would refuse:
+  networks that parse, a client identity (`valid_client_san`), a budget in range with its window and flag consistent,
+  an RFC 3339 expiry, the name rule. What depends on the data plane's file (an issuer table for a token binding,
+  `trusted_proxies`) is judged there, which refuses the whole snapshot by path with the previous one serving.
+- The control crate's lockfile pins the root crate's version: a root or catalog version bump needs
+  `cargo update -p llmshim -p llmshim-catalog` in `crates/llmshim-control` (noted in CLAUDE.md).
 - Not in 3a: the HTTP API and its OpenAPI document and the binary (3b), Postgres (4).
 
 ## Slices
