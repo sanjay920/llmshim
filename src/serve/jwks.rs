@@ -145,7 +145,12 @@ impl Jwks {
             return Err(Unavailable);
         };
         let age = at.elapsed();
-        if age >= self.settings.refresh + self.settings.max_stale {
+        if age
+            >= self
+                .settings
+                .refresh
+                .saturating_add(self.settings.max_stale)
+        {
             return Err(Unavailable);
         }
         if age >= self.settings.refresh {
@@ -175,6 +180,10 @@ impl Jwks {
                 return;
             }
         }
+        // Stamped before the fetch, not after: a caller whose future is dropped
+        // mid-fetch (a client that disconnected) must not leave the floor
+        // unrecorded, or a stream of them would fetch back to back.
+        self.locked().last_attempt = Some(Instant::now());
         let outcome = match self.fetcher.fetch().await {
             Ok(document) => match KeySet::from_jwks(&document) {
                 Ok(keys) if !keys.is_empty() => Ok(keys),
@@ -457,6 +466,45 @@ mod tests {
         assert!(jwks.keys().await.is_ok());
         tokio::time::advance(Duration::from_secs(2)).await;
         assert_eq!(jwks.keys().await.err(), Some(Unavailable));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_fetch_still_counts_as_an_attempt() {
+        let script = Arc::new(Script {
+            answers: Mutex::new(vec![good()].into()),
+            calls: AtomicUsize::new(0),
+            delay: Duration::from_secs(1000),
+        });
+        let jwks = Arc::new(jwks("cancel", &script));
+        let task = {
+            let jwks = jwks.clone();
+            tokio::spawn(async move { jwks.keys_for_unknown_kid().await })
+        };
+        tokio::time::advance(Duration::from_secs(1)).await;
+        task.abort();
+        let _ = task.await;
+        // A flood of callers right after: none may start another fetch.
+        for _ in 0..20 {
+            let _ = jwks.keys_for_unknown_kid().await;
+            let _ = jwks.keys().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(script.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn huge_windows_do_not_overflow() {
+        let script = Script::new(vec![good()]);
+        let jwks = Jwks::new(
+            "huge",
+            script.clone(),
+            Settings {
+                refresh: Duration::from_secs(u64::MAX),
+                max_stale: Duration::from_secs(u64::MAX),
+            },
+        );
+        assert!(jwks.keys().await.is_ok());
+        assert!(jwks.keys().await.is_ok());
     }
 
     #[tokio::test(start_paused = true)]

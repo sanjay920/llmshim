@@ -114,7 +114,11 @@ limits, budget) applies unchanged: the token only proves **which key**.
   literal, as a validation rule, so a test issuer works and production does not
   fall to plain text. Keys are cached for `jwks_refresh_secs`. An unknown `kid` triggers one
   refresh, at most once per 30 seconds per issuer, so a flood of random `kid`s
-  cannot turn the gateway into a request amplifier against the issuer.
+  cannot turn the gateway into a request amplifier against the issuer. An attempt is
+  stamped when it starts, so a caller that goes away mid-fetch does not reset the
+  floor. A key the issuer rotates in just after a load is therefore unknown for up
+  to 30 seconds: the consumer treats an unknown `kid` inside that window as a
+  retryable 401 (`Retry-After`), not a permanent verdict.
 - **JWKS failures fail closed, with stale keys served for a bounded, configured
   time.** If a refresh fails the cached keys keep verifying for up to
   `jwks_max_stale_secs` (default 1 hour) past their refresh time, so an issuer
