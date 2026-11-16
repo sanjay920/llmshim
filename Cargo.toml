@@ -164,5 +164,5 @@ required-features = ["serve"]
 
 [workspace]
 members = ["crates/llmshim-catalog"]
-exclude = ["clients/python"]
+exclude = ["clients/python", "crates/llmshim-control"]
 resolver = "2"
