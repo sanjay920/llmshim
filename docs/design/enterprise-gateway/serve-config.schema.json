@@ -170,6 +170,14 @@
             "null"
           ]
         },
+        "expires_at": {
+          "default": null,
+          "description": "When this key stops working, as an RFC 3339 time (`2026-12-31T00:00:00Z`). A request\nauthenticated as it at or after that moment is refused with 401, checked at request\ntime against this process's clock: no reload is needed for it to take effect (0024).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "jwt": {
           "anyOf": [
             {

@@ -1,6 +1,6 @@
 # 0024: The control plane
 
-Status: design, 2026-11-16; slice 2a implemented (see "Slice 2a as built"). A contract note, written before any code (README working
+Status: design, 2026-11-16; slice 2 implemented (2a, 2b-1, 2b-2) (see "Slice 2a as built"). A contract note, written before any code (README working
 rule 3): a snapshot format and an HTTP surface each become a compatibility promise.
 It is step 13 of 0013's order of work. It does not start the admin UI, SSO, SCIM or
 audit export (their licensing is undecided, and all of them follow this).
@@ -265,16 +265,18 @@ The data-plane half that needs no control plane exists: `src/serve/snapshot.rs`,
   early and a backward step fresh. `GET /v1/models` is not gated (discovery is not inference).
   The stale gate sits before authentication, so an unauthenticated caller also gets the 503; it
   names no key and no tenant.
-- **Not yet (slice 2b-2):** `expires_at` enforced at
-  request time (2a drops a key already expired when the snapshot is read, and a snapshot that
-  outlives a key's expiry keeps serving it until the next reload), and the snapshot's `tenants`
-  names for the logs (2a uses the team id, as a file key's tenant string is used today). The
-  0014 rows for stale serving come with the stale behaviour.
-
+- **Slice 2b-2 (done):** `expires_at` is a field of `[[keys]]` too (RFC 3339) and is **enforced at request
+  time** against this process's clock, with the allowlists: a key at or past its expiry is refused with 401
+  (`key_expired` in the gateway shape) wherever it is used from, with no reload; a key already expired
+  when a snapshot is read is not loaded; a reload that changes only an expiry is a change (it is in the
+  fingerprint). The earlier text of this bullet on the 2a limit no longer applies.
+- **The snapshot's `tenants` are not used for the logs**: a key's `tenant` is the team id and the logs
+  print it (a name is for the operator's tools; mapping ids to names in a usage record is a log contract
+  change, 0010, not made here).
 ## Slices
 
 1. This note.
-2. (a done, b open: see above) The snapshot envelope and canonical payload, Ed25519 verification and the `snapshot
+2. (a, b-1 and b-2 done; see above) The snapshot envelope and canonical payload, Ed25519 verification and the `snapshot
    sign`/`verify` subcommands, `[control_plane]` with `snapshot_file` as a keys source in
    the 0012 machinery, `expires_at` in the key store (and `[[keys]]`), the persisted
    floor, the 0014 rows, and the regenerated JSON Schema (`tests/unit_serve_cli.rs`

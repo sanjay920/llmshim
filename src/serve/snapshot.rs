@@ -253,6 +253,7 @@ fn to_keys(
                 subject: jwt.subject.clone(),
             }),
             allowed_cidrs: key.allowed_cidrs.clone(),
+            expires_at: key.expires_at.clone(),
             tenant: key.tenant.clone(),
             tier: key.tier,
             rpm: key.rpm,

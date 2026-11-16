@@ -219,24 +219,37 @@ fn credential_scope(
     })
 }
 
-/// The network allowlist of each key that has one, by the key's credential scope.
+/// The network allowlist and expiry of each key that has one, by the key's credential scope.
 /// A key whose secret cannot be read is left out here, and `build_key_store`
 /// reports it (such a key cannot authenticate either, so nothing is left open).
 pub fn allowlists(
     config: &ServeConfig,
     env: &dyn Fn(&str) -> Option<String>,
-) -> std::collections::HashMap<String, std::sync::Arc<[super::allowlist::Cidr]>> {
+) -> std::collections::HashMap<String, super::allowlist::Rule> {
     config
         .keys
         .iter()
         .filter_map(|key| {
-            let nets: Vec<_> = key
-                .allowed_cidrs
-                .as_ref()?
-                .iter()
-                .filter_map(|text| super::allowlist::Cidr::parse(text).ok())
-                .collect();
-            Some((credential_scope(key, env)?, nets.into()))
+            let nets: Option<std::sync::Arc<[super::allowlist::Cidr]>> =
+                key.allowed_cidrs.as_ref().map(|cidrs| {
+                    cidrs
+                        .iter()
+                        .filter_map(|text| super::allowlist::Cidr::parse(text).ok())
+                        .collect::<Vec<_>>()
+                        .into()
+                });
+            let expires_at = key
+                .expires_at
+                .as_ref()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|at| at.timestamp());
+            if nets.is_none() && expires_at.is_none() {
+                return None;
+            }
+            Some((
+                credential_scope(key, env)?,
+                super::allowlist::Rule { nets, expires_at },
+            ))
         })
         .collect()
 }
