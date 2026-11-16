@@ -51,6 +51,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0015: The operational endpoints are in the OpenAPI document](0015-operational-api.md)
 - [0016: OpenTelemetry traces](0016-opentelemetry.md)
 - [0017: Workload JWT authentication and IP allowlists](0017-workload-jwt-and-ip-allowlists.md)
+- [0018: Benchmark](0018-benchmark.md)
 
 ## Roadmap
 
@@ -65,7 +66,9 @@ Phase 0: a production server mode
       breaker, limiter and application assembly (0002)
 - [ ] Remaining inventory row in 0002: the per-router HTTP client settings
       (the other rows, including accounting retention, the penalty and the
-      receipt lock timeout, are converted)
+      receipt lock timeout, are converted). The benchmark (0018) shows why it
+      matters: the shared client's pool of 4 idle connections per host caps
+      throughput under concurrency
 - [x] `llmshim serve` boots the single-instance gateway from the file, including
       hashed caller keys (0004)
 - [ ] Bedrock, Vertex and Azure configurable from the file; a provider whose
@@ -89,7 +92,9 @@ Phase 0: a production server mode
 - [x] The failure-mode table (0014), with outage-survival tests for losing Redis
       (before and during a request) and for `SIGTERM`; its "Not yet tested" list
       is what remains
-- [ ] Reproducible benchmark
+- [x] Reproducible benchmark (0018). It found two limits that are open items:
+      the upstream connection pool (4 idle per host, shared client) and the
+      replay-receipt executor (8 ingress and 4 egress slots); neither is changed yet
 - [x] Configuration-contract tightenings, a structure-only `--check` and a
       checked-in JSON Schema (see "Review follow-ups"; 0013)
 - [x] Pull-request CI for every build, including the Redis-backed tests that are

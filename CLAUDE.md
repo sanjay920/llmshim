@@ -722,7 +722,12 @@ trusted peer without a usable client fails closed; the allowlists reload with th
 and caches, `jwt_auth.rs` runs inside the access-log layer): the algorithm list is the
 issuer's, a token-shaped bearer value is only ever verified as a token and never looked
 up as a key, and a verified `(table, sub)` becomes the bound key's identity through the
-same internal header as a client certificate. With `--features serve-otel` a
+same internal header as a client certificate. `cargo run --release --features serve
+--example serve_bench` (note 0018) measures added latency, throughput and memory of a
+real `serve` process against a mock upstream; its first run found that the shared client
+keeps only 4 idle upstream connections per host and that the replay-receipt executor
+refuses a ninth ingress or fifth egress operation at once, so throughput measured
+above one connection is not yet the gateway's own. With `--features serve-otel` a
 `[telemetry]` table exports one request span per request, and one child `llmshim.attempt` span per
 admitted provider attempt (driven by the usage recorder, joined by request id
 through a bounded registry that outlives a streamed response), over OTLP/HTTP

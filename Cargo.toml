@@ -154,6 +154,11 @@ name = "gateway_loadtest"
 path = "benchmarks/gateway_loadtest.rs"
 required-features = ["gateway"]
 
+[[example]]
+name = "serve_bench"
+path = "benchmarks/serve_bench.rs"
+required-features = ["serve"]
+
 [workspace]
 members = ["crates/llmshim-catalog"]
 exclude = ["clients/python"]
