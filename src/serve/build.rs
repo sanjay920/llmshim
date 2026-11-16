@@ -417,7 +417,10 @@ pub async fn build_app(
             let state = state.clone();
             Arc::new(move |limits| state.apply_limits(limits))
         },
-        fleet,
+        fleet.then(|| {
+            let state = state.clone();
+            Arc::new(move || state.sync_fleet_workers()) as Arc<dyn Fn() + Send + Sync>
+        }),
     );
     let reload_status = reload.status_handle();
     // Workload tokens (0017): built after the configuration is accepted, so a

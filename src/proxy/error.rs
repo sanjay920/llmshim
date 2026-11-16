@@ -12,6 +12,11 @@ pub enum ApiError {
     RateLimited(Duration),
     /// Instance concurrency queue timed out → HTTP 503 + `Retry-After`.
     Overloaded(Duration),
+    /// This replica's router does not know the job's provider (a fleet roll-out or
+    /// a removal, 0022) → HTTP 503 + `Retry-After`, never 502: a local condition,
+    /// not an upstream failure. Constructed by `serve`.
+    #[cfg(feature = "serve")]
+    ProviderUnavailable(Duration),
     /// Whole proxy logical request lifetime expired → HTTP 504.
     RequestTimeout,
     /// Missing or invalid API key → HTTP 401. Constructed by the gateway.
@@ -48,6 +53,15 @@ impl IntoResponse for ApiError {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "overloaded",
                     "Proxy is at capacity; retry after the suggested delay",
+                    retry_after,
+                );
+            }
+            #[cfg(feature = "serve")]
+            ApiError::ProviderUnavailable(retry_after) => {
+                return error_with_retry_after(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provider_unavailable",
+                    "This replica does not serve the provider; retry after the suggested delay",
                     retry_after,
                 );
             }

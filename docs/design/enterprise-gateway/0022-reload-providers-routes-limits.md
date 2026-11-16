@@ -1,11 +1,12 @@
 # 0022: Reloading providers, routes and rate limits
 
-Status: slices 2, 3 and 4 implemented. Slice 2: the gateway holds its router behind a
+Status: slices 2, 3, 3b and 4 implemented. Slice 2: the gateway holds its router behind a
 replaceable handle and admission pins a snapshot that rides the request to its
 dispatch. Slice 3: a reload rebuilds and swaps providers and routes in a single
-instance (a fleet replica refuses the change by path, see below). Slice 4: a reload
-retunes the provider rate limits in all four holders, on a fleet replica too. Slice 5
-(the 0014 rows and the roadmap) and the fleet part of slice 3 (3b) are not. A contract note, written before
+instance. Slice 3b: on a fleet replica the same reload also starts workers for an added
+provider and stops those of a removed one (below). Slice 4: a reload retunes the provider
+rate limits in all four holders, on a fleet replica too. Slice 5 (the 0014 rows, 0012's
+text, the roadmap and CLAUDE.md) is not. A contract note, written before
 any code (README working rule 3). It extends 0012, which reloads `[[keys]]` and
 nothing else.
 
@@ -166,21 +167,11 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
 
 ## Decided in slice 3
 
-- **A fleet replica refuses a provider or route change by path (`providers`).** The note
-  above has a reload start and stop fleet workers; that needs the fleet backend to
-  accept a provider set that grows and shrinks, which is a change to the distributed
-  queue and its reaper, not to the reload. It ships as its own slice (3b), and until
-  then a fleet replica applies keys (and, with slice 4, limits) and refuses providers
-  and routes by path with "restart to apply", the safe behaviour 0012 already had.
-  The status makes the refusal visible (`in_sync: false`).
 - **An unreadable secret of an unchanged provider does not block an unrelated edit.**
   Its secret digest is carried over while its table is unchanged. If the same edit
   also changes another provider, the router is rebuilt whole and the unreadable
   secret is reported by path, rejecting the reload: a router cannot be built without
   every provider, and the running provider objects are not reusable.
-- **A fleet replica ignores a rotated secret when it decides what changed**, so rotating an
-  upstream key file ahead of a roll-out does not stop a caller-key revocation from
-  applying there; only a provider table or route change is refused.
 - **Known limits, stated rather than discovered.** A secret file deleted while its
   provider's table is unchanged keeps the running key and shows no change in the
   status. Every provider is rebuilt on any router change, so an unchanged cloud
@@ -216,6 +207,37 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
 - **Files in the fingerprint**: a provider's `api_key` file, `service_account_file`,
   and the Bedrock `config_file`/`credentials_file`, by digest.
 
+## Slice 3b as built (fleet workers)
+
+- `DistributedGateway` keeps a registry of the workers it started (`ManagedWorkers`):
+  one preparation semaphore per provider, shared by its two protocol workers. The start
+  (`start_managed_workers`, once, after every listener is bound) reads the provider set
+  at that moment; `sync_workers` follows it afterwards, and a sync that arrives before
+  the start is a no-op (so a reload cannot start workers early).
+- An added provider gets workers at once. A removed provider's semaphore is **closed**:
+  its workers end at the next turn of their loop, and a leased job already running holds
+  its own permit in its own task, so it finishes. Jobs left in the queue for a removed
+  provider are served by whichever replica still has it. The reaper reads a provider
+  list that only grows, so expired leases of a removed provider are still redelivered.
+- The reload calls the sync after the router is replaced, so a job leased for an added
+  provider finds it in the router.
+- **503 `provider_unavailable`.** A job whose provider this replica's router does not know
+  (a roll-out in progress, or a removal) is answered 503 with `Retry-After` (the
+  configured penalty) and the code `provider_unavailable`, never 502. It fails at
+  provider resolution, before any attempt exists, so nothing was sent, no spend was
+  reserved (nothing to release) and the breaker, which observes the client's result,
+  never sees it. A fallback entry the router does not resolve was already skipped by the
+  chain (`fallback.rs` records it and continues). The new `ApiError::ProviderUnavailable`
+  variant and the dispatch mapping exist only in a `serve` build: `llmshim gateway` keeps
+  its 502.
+- The start reads the provider list under the registry's lock, so a reload that lands
+  during startup syncs after it. The 503 covers a provider the router does not resolve;
+  a route the replica does not yet have fails route expansion and an all-unknown
+  fallback chain ends as `all_failed`, neither a 503 (a roll-out gap, stated here).
+- Process test (`integration_serve_fleet`): a provider added by a reload is served by
+  the replica from then on; unit test against Redis: workers start for an added provider
+  and stop leasing for a removed one.
+
 ## Slices
 
 1. This note.
@@ -226,7 +248,7 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
    behave as before). New tests: a swap between admission and dispatch does not change
    an admitted request (provider, route, fallback chain), a queued job for a removed
    provider finishes, a stream survives a swap.
-3. **Done (single instance; the fleet part is 3b): reload of providers and routes.** The reload builds the new router (sharing the
+3. **Done (the fleet part is 3b, also done): reload of providers and routes.** The reload builds the new router (sharing the
    breaker and the client), checks the credential files of changed Vertex providers,
    fingerprints resolved provider secrets by digest, swaps the handle, and starts and
    stops fleet workers; the status reports what applied and which secrets are

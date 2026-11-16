@@ -48,9 +48,10 @@ pub struct ReloadHandles {
     /// router is replaced, so a lowered limit takes hold no later than the
     /// provider that needs it.
     pub(crate) limits: Arc<dyn Fn(crate::proxy::ratelimit::RateLimitConfig) + Send + Sync>,
-    /// A fleet replica's workers follow the provider set it started with, so a
-    /// reload cannot change providers or routes there yet (0022, slice 3).
-    pub(crate) fleet: bool,
+    /// A fleet replica's workers follow the provider set (0022): called after the
+    /// router is replaced, so workers start for an added provider and a removed
+    /// provider's stop. `None` for a single instance, whose lanes are made on demand.
+    pub(crate) workers: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(crate) status: StatusHandle,
 }
 
@@ -62,7 +63,7 @@ impl ReloadHandles {
         allow: super::allowlist::AllowTable,
         router: crate::router::RouterHandle,
         limits: Arc<dyn Fn(crate::proxy::ratelimit::RateLimitConfig) + Send + Sync>,
-        fleet: bool,
+        workers: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         Self {
             keys,
@@ -71,7 +72,7 @@ impl ReloadHandles {
             allow,
             router,
             limits,
-            fleet,
+            workers,
             status: StatusHandle::default(),
         }
     }
@@ -429,30 +430,11 @@ impl Reloader {
             env,
             Some(&active.router),
         );
-        // A fleet replica cannot change providers, so a rotated secret there is not a
-        // change it could act on: it must not turn a keys-only edit (a revocation)
-        // into a refused one. Only the tables and routes decide.
-        let router = if self.handles.fleet {
-            router.with_secrets_of(&active.router)
-        } else {
-            router
-        };
         let mut changes = active.router.changes_to(&router);
         let limits = limits_print(&loaded.config);
         let limits_changed = limits != active.limits;
         let mut next_router = None;
         if !changes.is_empty() {
-            if self.handles.fleet {
-                return reject_now(
-                    active,
-                    vec![Issue {
-                        path: "providers".into(),
-                        message: "providers and routes cannot change on a fleet replica while \
-                                  it is running; restart to apply"
-                            .into(),
-                    }],
-                );
-            }
             // Built whole before anything is replaced; a provider that cannot be
             // built rejects the reload by path and the old router keeps serving.
             let mut found = Vec::new();
@@ -527,6 +509,11 @@ impl Reloader {
         }
         if let Some(next) = next_router {
             self.handles.router.replace(next);
+            // Then the workers (a fleet): a job for an added provider is leased by
+            // this replica from here on.
+            if let Some(workers) = &self.handles.workers {
+                workers();
+            }
         }
         let env_form = router.env_form();
         active.router = router;
@@ -705,18 +692,6 @@ impl RouterPrint {
         }
     }
 
-    /// This print with the secret and file digests of `other` where the provider
-    /// exists in both.
-    fn with_secrets_of(mut self, other: &RouterPrint) -> Self {
-        for (name, print) in &mut self.providers {
-            if let Some(before) = other.providers.get(name) {
-                print.secret.clone_from(&before.secret);
-                print.files.clone_from(&before.files);
-            }
-        }
-        self
-    }
-
     fn fingerprint(&self) -> String {
         let mut text = self.routes.clone();
         for (name, print) in &self.providers {
@@ -841,6 +816,8 @@ mod tests {
         keys: LiveKeys,
         router: crate::router::RouterHandle,
         limiter: Arc<crate::proxy::ratelimit::InMemoryRateLimiter>,
+        /// How many times the fleet's workers were asked to follow the providers.
+        synced: Arc<std::sync::atomic::AtomicUsize>,
         reloader: Reloader,
     }
 
@@ -869,6 +846,8 @@ mod tests {
                 super::super::build::rate_limit_config(&loaded.config),
             ));
             let retuned = limiter.clone();
+            let synced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = synced.clone();
             let reloader = Reloader::new(
                 &file,
                 &loaded.text,
@@ -884,7 +863,11 @@ mod tests {
                     Arc::new(move |limits| {
                         crate::proxy::ratelimit::RateLimiter::retune(&*retuned, limits)
                     }),
-                    fleet,
+                    fleet.then(|| {
+                        Arc::new(move || {
+                            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }) as Arc<dyn Fn() + Send + Sync>
+                    }),
                 ),
             )
             .unwrap();
@@ -894,6 +877,7 @@ mod tests {
                 keys,
                 router,
                 limiter,
+                synced,
                 reloader,
             }
         }
@@ -1445,47 +1429,41 @@ mod tests {
     }
 
     #[test]
-    fn a_fleet_replica_refuses_a_provider_change_by_path() {
+    fn a_fleet_replica_follows_a_provider_change_with_its_workers() {
         let directory =
             std::env::temp_dir().join(format!("llmshim-fleet-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&directory).unwrap();
         let secret = directory.join("k");
         std::fs::write(&secret, "one").unwrap();
         let a = compat("a", "http://127.0.0.1:1/v1", &secret);
+        let b = compat("b", "http://127.0.0.1:2/v1", &secret);
         let fixture =
             Fixture::with_fleet(&with_providers(&a, "", &key("k", "acme", OLD, "")), true);
-        // A different base URL is a change of the provider's table.
-        let moved = compat("a", "http://127.0.0.1:9/v1", &secret);
-        fixture.write(&with_providers(&moved, "", &key("k", "acme", OLD, "")));
-        let Outcome::Rejected { issues, .. } = fixture.reload() else {
-            panic!("a fleet replica's workers follow the providers it started with");
-        };
-        assert_eq!(issues[0].path, "providers");
-        // A keys-only edit still applies there.
+        let synced = || fixture.synced.load(std::sync::atomic::Ordering::SeqCst);
+        // A keys-only edit changes no provider: the workers are left alone.
         fixture.write(&with_providers(&a, "", &key("k", "acme", NEW, "")));
         assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn a_rotated_secret_does_not_stop_a_revocation_on_a_fleet_replica() {
-        let directory = std::env::temp_dir().join(format!(
-            "llmshim-fleet-rev-{}",
-            uuid::Uuid::new_v4().simple()
+        assert_eq!(synced(), 0);
+        // An added provider asks the workers to follow, after the router changed.
+        fixture.write(&with_providers(
+            &format!("{a}{b}"),
+            "",
+            &key("k", "acme", NEW, ""),
         ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let secret = directory.join("k");
-        std::fs::write(&secret, "one").unwrap();
-        let a = compat("a", "http://127.0.0.1:1/v1", &secret);
-        let fixture =
-            Fixture::with_fleet(&with_providers(&a, "", &key("k", "acme", OLD, "")), true);
-        // The operator rotated the upstream key file and then revoked a caller key
-        // before the roll-out reached this replica: the revocation applies.
-        std::fs::write(&secret, "two").unwrap();
-        fixture.write(&with_providers(&a, "", &key("j", "globex", NEW, "")));
         assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
-        assert!(fixture.identity(OLD).is_none());
-        assert!(fixture.identity(NEW).is_some());
+        assert_eq!(synced(), 1);
+        assert_eq!(fixture.router.current().provider_keys().len(), 2);
+        // A rotated secret and a revocation in one edit both apply there too.
+        std::fs::write(&secret, "two").unwrap();
+        fixture.write(&with_providers(
+            &format!("{a}{b}"),
+            "",
+            &key("j", "globex", OLD, ""),
+        ));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        assert_eq!(synced(), 2);
+        assert!(fixture.identity(NEW).is_none());
+        assert!(fixture.identity(OLD).is_some());
         let _ = std::fs::remove_dir_all(directory);
     }
 
