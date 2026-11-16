@@ -79,8 +79,8 @@ Phase 0: a production server mode
 - [x] Access log with tenant attribution and credential fingerprints (0009)
 - [x] Token and cost attribution per tenant and attempt (0010)
 - [ ] OpenTelemetry traces (design note 0016; metrics stay on `/metrics`): the
-      request span and the exporter are done (`serve-otel`); the attempt span and
-      the log writers' counters remain
+      request span and the exporter are done (`serve-otel`), as are the log
+      writers' counters in `/metrics`; the attempt span remains
 - [x] Helm chart, validated by rendering and `serve --check` (0008)
 - [ ] Published, signed images and an SBOM
 - [x] The failure-mode table (0014), with outage-survival tests for losing Redis
@@ -202,9 +202,6 @@ Operability
   (`RedisRateLimiter`) and the older per-tenant `SpendStore` are documented in
   the code as failing open. Establish which of them `serve` can reach, test it,
   or correct 0006 (0014, "Not yet tested").
-- **The log writer** (`jsonl.rs`) drops and counts lines when its queue is full;
-  a metric for the count (and for write failures) belongs with the
-  OpenTelemetry item.
 - **Shutdown**: a replica does not release leases it holds for peers' jobs on
   SIGTERM (as `gateway`); they wait out the lease timeout.
 - **The Helm chart** has no `preStop` hook and a 60 s grace period that is
