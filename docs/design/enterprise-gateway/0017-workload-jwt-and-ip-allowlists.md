@@ -1,6 +1,8 @@
 # 0017: Workload JWT authentication and IP allowlists
 
-Status: IP allowlists implemented (slice 2); the JWT parts are not (slices 3 to 5).
+Status: IP allowlists (slice 2) and the JWT verifier as a unit (slice 3, `src/serve/jwt.rs`,
+not yet wired to anything) are implemented; the JWKS client and the wiring are not
+(slices 4 and 5).
 A contract note, written before any code (README working rule 3). Single
 sign-on for people, SCIM and an admin UI are not part of this note and are not
 started.
@@ -197,7 +199,7 @@ stale serving and refresh refusals.
    validation, schema and OpenAPI, tests (forged `X-Forwarded-For` with and
    without a trusted proxy; each credential kind refused outside its network;
    admission untouched on refusal; mutation checks).
-3. The JWT verifier as a unit: parsing, claims, algorithms, JWK matching, against
+3. Done: the JWT verifier as a unit: parsing, claims, algorithms, JWK matching, against
    fixed test vectors and a local JWKS server (the confusion attacks: `alg: none`,
    `HS256` with the public key, wrong `kty`, missing `exp`, audience mismatch,
    skew edges, oversize token), with no wiring.

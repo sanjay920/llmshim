@@ -23,7 +23,7 @@ gateway-redis = ["gateway", "redis-coordination"]
 redis-coordination = ["proxy", "dep:redis"]
 # In development: a config-file-driven server (`llmshim serve`). Off by default
 # and implied by no other feature; see docs/design/enterprise-gateway.
-serve = ["gateway", "dep:x509-parser", "dep:tokio-rustls", "dep:schemars"]
+serve = ["gateway", "dep:ring", "dep:x509-parser", "dep:tokio-rustls", "dep:schemars"]
 # `serve` with fleet mode: a shared Redis queue, rate limits, spend ledger and
 # provider health across replicas. Needed for the `[fleet]` configuration table.
 serve-redis = ["serve", "gateway-redis"]
