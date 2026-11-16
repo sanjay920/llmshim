@@ -258,6 +258,38 @@ impl ReceiptExecutor {
             .map_err(|_| ReceiptWorkError::Busy)?
     }
 
+    /// Run `operation` without any store first (0023): inline, against a
+    /// [`Receipts::tripwire`], and only when it asked for a receipt run it again
+    /// on the executor against `real`. A panic inline is the fixed failure the
+    /// blocking pool would have produced, not an unwind of the request task. A
+    /// real store is never used inline: its lock would block an async worker.
+    async fn run_free_first<T, F>(
+        &self,
+        kind: ReceiptWorkKind,
+        real: Arc<Receipts>,
+        operation: F,
+    ) -> std::result::Result<T, ReceiptWorkError>
+    where
+        T: Send + 'static,
+        F: Fn(&Receipts) -> Result<T> + Send + 'static,
+    {
+        let tripwire = Receipts::tripwire();
+        let attempt =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(&tripwire)));
+        match attempt {
+            Err(_) => {
+                return Err(ReceiptWorkError::Failed(
+                    "native replay metadata is unavailable".into(),
+                ))
+            }
+            Ok(result) if !tripwire.tripwire_hit() => {
+                return result.map_err(ReceiptWorkError::Failed)
+            }
+            Ok(_) => {}
+        }
+        self.run(kind, move || operation(&real)).await
+    }
+
     async fn run<T, F>(
         &self,
         kind: ReceiptWorkKind,
@@ -1013,17 +1045,10 @@ pub(crate) async fn translate_with_router(
             .iter()
             .any(|item| item == "reasoning.encrypted_content")
     });
-    let request_receipts = receipts.clone();
     let request_scope = scope.clone();
     let mut chat = match receipt_executor
-        .run(ReceiptWorkKind::Ingress, move || {
-            request_to_chat_with_limits(
-                &native,
-                wire,
-                &request_receipts,
-                &request_scope,
-                restoration_limits,
-            )
+        .run_free_first(ReceiptWorkKind::Ingress, receipts.clone(), move |store| {
+            request_to_chat_with_limits(&native, wire, store, &request_scope, restoration_limits)
         })
         .await
     {
@@ -1049,19 +1074,21 @@ pub(crate) async fn translate_with_router(
                 .ok()?;
             Some((provider, model, prepared.payload))
         });
-        let result = receipt_executor
-            .run(ReceiptWorkKind::Ingress, move || {
-                let target = destination.and_then(|(provider, model, payload)| {
-                    let native = provider.transform_request(&model, &payload).ok()?;
-                    Some(provider.request_replay_target(&model, &native))
-                });
-                let metadata = responses::replay_metadata(&mut chat, target.as_ref())?;
-                Ok((
-                    enforce_canonical_bounds(chat, restoration_limits)?,
-                    metadata,
-                ))
-            })
-            .await;
+        // Pure: it transforms the request for the target, filters reasoning and
+        // merges messages, with no receipt I/O (0023), so no executor slot.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let target = destination.and_then(|(provider, model, payload)| {
+                let native = provider.transform_request(&model, &payload).ok()?;
+                Some(provider.request_replay_target(&model, &native))
+            });
+            let metadata = responses::replay_metadata(&mut chat, target.as_ref())?;
+            Ok::<_, String>((
+                enforce_canonical_bounds(std::mem::take(&mut chat), restoration_limits)?,
+                metadata,
+            ))
+        }))
+        .unwrap_or_else(|_| Err("native replay metadata is unavailable".to_string()))
+        .map_err(ReceiptWorkError::Failed);
         match result {
             Ok((prepared, metadata)) => {
                 chat = prepared;
@@ -1337,11 +1364,10 @@ pub(crate) async fn translate_with_router(
             if let Some(redactor) = &redactor {
                 response = (redactor.0)(&response);
             }
-            let response_receipts = receipts.clone();
             let response_scope = scope.clone();
             let native = match receipt_executor
-                .run(ReceiptWorkKind::Egress, move || {
-                    response_from_chat(&response, wire, &response_receipts, &response_scope)
+                .run_free_first(ReceiptWorkKind::Egress, receipts.clone(), move |store| {
+                    response_from_chat(&response, wire, store, &response_scope)
                 })
                 .await
             {
@@ -1448,11 +1474,10 @@ pub(crate) async fn translate_with_router(
         None => value,
     };
     let mut native = if parts.status.is_success() {
-        let response_receipts = receipts.clone();
         let response_scope = scope.clone();
         match receipt_executor
-            .run(ReceiptWorkKind::Egress, move || {
-                response_from_chat(&value, wire, &response_receipts, &response_scope)
+            .run_free_first(ReceiptWorkKind::Egress, receipts.clone(), move |store| {
+                response_from_chat(&value, wire, store, &response_scope)
             })
             .await
         {
@@ -2029,6 +2054,223 @@ mod async_receipt_tests {
             release_sender.send(()).unwrap();
             assert!(ingress_task.await.unwrap().is_ok());
         }
+    }
+
+    // ---- 0023: work that needs no receipt does not take an executor slot ----
+
+    fn saturated(executor: &ReceiptExecutor) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let mut held = Vec::new();
+        for capacity in [&executor.ingress_capacity, &executor.egress_capacity] {
+            while let Ok(permit) = capacity.clone().try_acquire_owned() {
+                held.push(permit);
+            }
+        }
+        held
+    }
+
+    #[test]
+    fn a_tripwire_store_refuses_everything_without_touching_the_filesystem() {
+        let store = Receipts::tripwire();
+        assert!(!store.tripwire_hit());
+        let key = json!("k");
+        assert!(store.get("s", "call", &key).is_err());
+        assert!(store.tripwire_hit(), "the read was noticed");
+        let store = Receipts::tripwire();
+        assert!(store.put("s", "call", &key, &json!({})).is_err());
+        assert!(store.tripwire_hit(), "the write was noticed");
+        let store = Receipts::tripwire();
+        let mut budget = receipts::RestorationBudget::new(receipts::RestorationLimits::default());
+        assert!(store
+            .get_bounded("s", "reasoning", &key, &mut budget)
+            .is_err());
+        assert!(store.tripwire_hit(), "the bounded read was noticed");
+    }
+
+    #[tokio::test]
+    async fn work_that_needs_no_receipt_completes_with_every_slot_held() {
+        let executor = ReceiptExecutor::new();
+        let held = saturated(&executor);
+        assert!(!held.is_empty());
+        let real = Arc::new(Receipts::new(std::env::temp_dir().join("never-used-0023")));
+        for kind in [ReceiptWorkKind::Ingress, ReceiptWorkKind::Egress] {
+            let answer = executor
+                .run_free_first(kind, real.clone(), |_store| Ok(7))
+                .await
+                .expect("a receipt-free conversion needs no slot");
+            assert_eq!(answer, 7);
+        }
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn work_that_needs_a_receipt_still_takes_a_slot_and_is_refused_when_busy() {
+        let executor = ReceiptExecutor::new();
+        let directory =
+            std::env::temp_dir().join(format!("receipts-0023-{}", uuid::Uuid::new_v4()));
+        let real = Arc::new(Receipts::new(directory.clone()));
+        let asks = |store: &Receipts| {
+            store
+                .get("s", "call", &json!("k"))
+                .map(|found| found.is_none())
+        };
+        // Free slots: it runs on the executor against the real store (and finds
+        // nothing, which is an answer, not an error).
+        assert!(executor
+            .run_free_first(ReceiptWorkKind::Ingress, real.clone(), asks)
+            .await
+            .unwrap());
+        let held = saturated(&executor);
+        let refused = executor
+            .run_free_first(ReceiptWorkKind::Ingress, real, asks)
+            .await;
+        assert!(
+            matches!(refused, Err(ReceiptWorkError::Busy)),
+            "{refused:?}"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn a_native_text_exchange_is_served_with_the_executor_saturated_and_a_replay_is_not() {
+        // The wire level of the rule: a first turn with a text answer needs no
+        // receipt in either direction; an assistant turn in the history (a lookup
+        // on the Chat wire) or a tool-call answer (a store) still does.
+        let directory = tempfile::tempdir().unwrap();
+        let store = DefaultReceiptStore::new(Arc::new(Receipts::new(directory.path().to_owned())));
+        let held = saturated(&store.executor);
+        let text = || async {
+            Json(json!({"id": "i", "model": "local/test",
+                "message": {"role": "assistant", "content": "pong"},
+                "finish_reason": "stop", "usage": {}}))
+        };
+        let application = |answer_with_a_call: bool| {
+            Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(move || async move {
+                        if answer_with_a_call {
+                            Json(canonical_response())
+                        } else {
+                            text().await
+                        }
+                    }),
+                )
+                .layer(axum::middleware::from_fn(translate))
+                .layer(axum::middleware::from_fn(bound_inference_request_json))
+                .layer(axum::middleware::from_fn_with_state(
+                    store.clone(),
+                    install_default_receipt_store,
+                ))
+        };
+        let send = |app: Router, messages: Value| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "local/test", "messages": messages}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+        let first_turn = json!([{"role": "user", "content": "hi"}]);
+        assert_eq!(
+            send(application(false), first_turn.clone()).await,
+            StatusCode::OK
+        );
+        let replayed = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "again"}
+        ]);
+        assert_eq!(
+            send(application(false), replayed).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an assistant turn is looked up, so it needs a slot"
+        );
+        assert_eq!(
+            send(application(true), first_turn).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a tool-call answer is stored, so it needs a slot"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn an_owned_call_id_without_a_receipt_still_fails_closed_through_the_free_first_path() {
+        // The inline attempt reaches the store (the tripwire), the real run finds no
+        // receipt and the request errors: it is never served as if the id were a
+        // legacy one. A free-first path that treated the tripwire's refusal as
+        // "nothing to restore" would answer 200 here.
+        let directory = tempfile::tempdir().unwrap();
+        let store = DefaultReceiptStore::new(Arc::new(Receipts::new(directory.path().to_owned())));
+        let application = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|| async { Json(json!({"id": "i", "model": "m", "message": {"role": "assistant", "content": "x"}, "finish_reason": "stop", "usage": {}})) }),
+            )
+            .layer(axum::middleware::from_fn(translate))
+            .layer(axum::middleware::from_fn(bound_inference_request_json))
+            .layer(axum::middleware::from_fn_with_state(
+                store,
+                install_default_receipt_store,
+            ));
+        let status = application
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "local/test", "messages": [
+                            {"role": "user", "content": "hi"},
+                            {"role": "assistant", "content": null, "tool_calls": [{
+                                "id": "call_ls_never_issued", "type": "function",
+                                "function": {"name": "read", "arguments": "{}"}}]},
+                            {"role": "tool", "tool_call_id": "call_ls_never_issued", "content": "ok"}
+                        ]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_client_error(), "{status}");
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_the_inline_attempt_is_the_fixed_failure_not_an_unwind() {
+        let executor = ReceiptExecutor::new();
+        let real = Arc::new(Receipts::new(std::env::temp_dir().join("never-used-0023")));
+        let answer: std::result::Result<u8, _> = executor
+            .run_free_first(ReceiptWorkKind::Ingress, real, |_store| {
+                panic!("conversion")
+            })
+            .await;
+        match answer {
+            Err(ReceiptWorkError::Failed(message)) => {
+                assert_eq!(message, "native replay metadata is unavailable")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_conversion_error_that_is_not_a_receipt_is_returned_as_it_always_was() {
+        let executor = ReceiptExecutor::new();
+        let real = Arc::new(Receipts::new(std::env::temp_dir().join("never-used-0023")));
+        let answer: std::result::Result<u8, _> = executor
+            .run_free_first(ReceiptWorkKind::Ingress, real, |_store| {
+                Err("invalid request".to_string())
+            })
+            .await;
+        assert!(matches!(answer, Err(ReceiptWorkError::Failed(m)) if m == "invalid request"));
     }
 
     #[tokio::test]

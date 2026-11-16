@@ -191,8 +191,8 @@ pub(in crate::proxy::wire) fn stream_response(
         }
         let failure_snapshot = super::response(&canonical, &canonical["usage"], "stop");
         let native = executor
-            .run(ReceiptWorkKind::Egress, move || {
-                response_from_chat(&canonical, Wire::Responses, &receipts, &scope)
+            .run_free_first(ReceiptWorkKind::Egress, receipts, move |store| {
+                response_from_chat(&canonical, Wire::Responses, store, &scope)
             })
             .await;
         match native {
