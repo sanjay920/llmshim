@@ -24,7 +24,10 @@ pub mod mtls;
 pub mod reload;
 pub(crate) mod telemetry;
 
-pub use build::{admin_token_digest, build_app, fleet_redis_url, start_fleet_workers, Built, Logs};
+pub use build::{
+    admin_token_digest, build_app, fleet_redis_url, start_fleet_workers, Built, ListenerLimits,
+    Logs,
+};
 pub use config::{schema as config_schema, Format, Issue, Loaded, ServeConfig};
 pub use keys::build_key_store;
 pub use reload::{Outcome, ReloadHandles, ReloadStatus, Reloader};

@@ -67,11 +67,10 @@ Phase 0: a production server mode
 - [x] Caller keys: hashed key store built from the file, errors returned (0003)
 - [x] Environment-free constructors for origin policy, deadlines, receipts,
       breaker, limiter and application assembly (0002)
-- [ ] Remaining inventory row in 0002: the per-router HTTP client settings
-      (the other rows, including accounting retention, the penalty and the
-      receipt lock timeout, are converted). The benchmark (0018) shows why it
-      matters: the shared client's pool of 4 idle connections per host caps
-      throughput under concurrency
+- [x] The last inventory rows of 0002 (the HTTP client and the listener limits) come
+      from the file (0021): `[upstream]` and `[server] max_connections` /
+      `header_timeout_ms`. The benchmark re-run that measures the pool change is
+      the one open piece of that note
 - [x] `llmshim serve` boots the single-instance gateway from the file, including
       hashed caller keys (0004)
 - [x] Bedrock, Vertex and Azure configurable from the file (0020), behind

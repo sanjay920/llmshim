@@ -66,6 +66,21 @@ pub struct Built {
     pub logs: Logs,
     /// What a [`super::Reloader`] replaces while the server runs.
     pub reload: ReloadHandles,
+    /// The inbound limits the listeners are started with (0021).
+    pub listener: ListenerLimits,
+}
+
+/// The limits of the inbound listeners, from `[server]` (0021).
+#[derive(Debug, Clone, Copy)]
+pub struct ListenerLimits {
+    pub max_connections: usize,
+    pub header_timeout: Duration,
+}
+
+impl ListenerLimits {
+    /// The defaults the listener has always had.
+    pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+    pub const DEFAULT_HEADER_TIMEOUT_MS: u64 = 15_000;
 }
 
 /// The log destinations the server writes. Each queues lines for a writer
@@ -525,6 +540,18 @@ pub async fn build_app(
         admin_authenticated,
         logs: Logs(logs, telemetry),
         reload,
+        listener: ListenerLimits {
+            max_connections: config
+                .server
+                .max_connections
+                .map_or(ListenerLimits::DEFAULT_MAX_CONNECTIONS, |n| n as usize),
+            header_timeout: Duration::from_millis(
+                config
+                    .server
+                    .header_timeout_ms
+                    .unwrap_or(ListenerLimits::DEFAULT_HEADER_TIMEOUT_MS),
+            ),
+        },
     })
 }
 
@@ -596,6 +623,25 @@ fn build_router(
     issues: &mut Vec<Issue>,
 ) -> Router {
     let mut router = Router::new();
+    // The router's own client, from `[upstream]` and the library's defaults, never
+    // from the environment (0021).
+    match config
+        .upstream
+        .settings(config.limits.max_concurrency)
+        .and_then(|settings| {
+            crate::client::ShimClient::from_settings(settings).map(|client| (settings, client))
+        }) {
+        Ok((settings, client)) => {
+            if !settings.ambient_proxy {
+                router = router.without_ambient_proxy();
+            }
+            router = router.with_http_client(client);
+        }
+        Err(message) => issues.push(Issue {
+            path: "upstream".into(),
+            message: message.into(),
+        }),
+    }
     let mut shared = CloudShared::default();
     for (name, provider) in &config.providers {
         let at = format!("providers.{name}");

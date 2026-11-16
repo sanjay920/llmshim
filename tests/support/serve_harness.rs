@@ -90,6 +90,17 @@ pub fn start(config: &str, label: &str, extra_env: &[(&str, &str)]) -> Server {
         .env("LLMSHIM_GATEWAY_RETAINED_JOBS", "1")
         .env("LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS", "1")
         .env("LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS", "1")
+        // The upstream client and the listener come from the file (0021). Each of
+        // these would break every request or connection if `serve` read it: a
+        // 1 ms attempt, connect and policy deadline, one inbound connection, a
+        // 1 ms header deadline.
+        .env("LLMSHIM_UPSTREAM_UNARY_ATTEMPT_TIMEOUT_MS", "1")
+        .env("LLMSHIM_UPSTREAM_STREAM_ATTEMPT_TIMEOUT_MS", "1")
+        .env("LLMSHIM_UPSTREAM_CONNECT_TIMEOUT_MS", "1")
+        .env("LLMSHIM_UPSTREAM_HEADER_TIMEOUT_MS", "1")
+        .env("LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS", "1")
+        .env("LLMSHIM_HTTP_MAX_CONNECTIONS", "1")
+        .env("LLMSHIM_HTTP_HEADER_TIMEOUT_MS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

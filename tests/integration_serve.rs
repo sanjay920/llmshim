@@ -860,17 +860,13 @@ async fn every_failed_attempt_is_recorded_with_an_unknown_cost() {
         .await;
     let dir = tempdir::Dir::new("usage-failed");
     let usage_path = dir.0.join("usage.jsonl");
-    let extra = format!("[logging]\nusage_log = \"{}\"", usage_path.display());
-    // One retry and a short backoff, so the test stays quick; the client's own
-    // retry settings are the one thing `serve` still reads from the environment.
-    let server = start(
-        &priced_config(&upstream.url(), &extra),
-        "usage-failed",
-        &[
-            ("LLMSHIM_MAX_RETRIES", "1"),
-            ("LLMSHIM_MAX_BACKOFF_SECS", "1"),
-        ],
+    // One retry and a short backoff, so the test stays quick: from `[upstream]`,
+    // since `serve` reads the client's retry settings from the file (0021).
+    let extra = format!(
+        "[logging]\nusage_log = \"{}\"\n[upstream]\nmax_retries = 1\nmax_backoff_secs = 1",
+        usage_path.display()
     );
+    let server = start(&priced_config(&upstream.url(), &extra), "usage-failed", &[]);
 
     let response = chat(&server, Some(CALLER_KEY), "openai/gpt-6-luna").await;
     assert!(response.status().is_server_error(), "{}", response.status());
@@ -918,7 +914,15 @@ async fn the_back_off_after_a_429_comes_from_the_file_and_never_from_the_environ
     // A provider that rate-limits without saying for how long. The caller is told
     // how long to wait: the file's `penalty_secs` when set, else 5 s, and in both
     // cases not the `LLMSHIM_PENALTY_SECS` the process was started with (9).
-    for (extra, expected) in [("[limits]\npenalty_secs = 7", "7"), ("", "5")] {
+    // One retry and a short backoff keep it quick; they come from `[upstream]`.
+    const QUICK: &str = "[upstream]\nmax_retries = 1\nmax_backoff_secs = 1";
+    for (extra, expected) in [
+        (
+            "[limits]\npenalty_secs = 7\n[upstream]\nmax_retries = 1\nmax_backoff_secs = 1",
+            "7",
+        ),
+        (QUICK, "5"),
+    ] {
         let mut upstream = mockito::Server::new_async().await;
         let _mock = upstream
             .mock("POST", "/chat/completions")
@@ -931,12 +935,7 @@ async fn the_back_off_after_a_429_comes_from_the_file_and_never_from_the_environ
         let server = start(
             &config(&upstream.url(), extra),
             "penalty",
-            &[
-                ("LLMSHIM_PENALTY_SECS", "9"),
-                // The shared client's retries are process-wide; keep them short.
-                ("LLMSHIM_MAX_RETRIES", "1"),
-                ("LLMSHIM_MAX_BACKOFF_SECS", "1"),
-            ],
+            &[("LLMSHIM_PENALTY_SECS", "9")],
         );
         let response = chat(&server, Some(CALLER_KEY), "inference/test-model").await;
         assert_eq!(response.status(), 429, "{extra:?}");

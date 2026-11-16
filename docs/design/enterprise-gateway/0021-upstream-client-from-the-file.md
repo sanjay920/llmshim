@@ -1,9 +1,11 @@
 # 0021: The upstream HTTP client and listener limits from the file
 
-Status: slice 2 implemented (the library: `ClientSettings`, `ShimClient::from_settings`,
-`Router::with_http_client`, `bound_client` using it); the file's keys, the listener
-limits and the benchmark re-run are slices 3 and 4. A contract note, written before
-any code (README working rule 3).
+Status: slices 2 and 3 implemented: the library (`ClientSettings`,
+`ShimClient::from_settings`, `Router::with_http_client`) and the file's `[upstream]`
+and `[server]` keys, built into the router and the listeners. `serve` no longer reads
+`LLMSHIM_MAX_RETRIES`, `LLMSHIM_MAX_BACKOFF_SECS`, `LLMSHIM_UPSTREAM_*`,
+`LLMSHIM_ATTEMPT_POLICY_TIMEOUT_MS` or `LLMSHIM_HTTP_*`; the benchmark re-run is slice
+4. A contract note, written before any code (README working rule 3).
 
 ## Why
 
@@ -142,7 +144,7 @@ the other keys are this note's.
    the shared and the scoped transport); a client built from
    settings ignores every `LLMSHIM_*` canary in the environment; a router without a
    client behaves as before; the empty-table-equals-defaults pin.
-3. The configuration: the `[upstream]` and `[server]` keys, their validation,
+3. Done: the configuration: the `[upstream]` and `[server]` keys, their validation,
    the schema, building the router's client from them, and process tests (a setting
    takes effect, a canary variable does not, an invalid value is refused by path,
    `--check` agrees).

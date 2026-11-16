@@ -792,13 +792,14 @@ async fn serve_listener(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     tls: Option<axum_server::tls_rustls::RustlsConfig>,
     require_client_certificate: bool,
+    limits: http_server::HttpServerLimits,
 ) -> Result<(), String> {
     match tls {
         Some(tls) if require_client_certificate => {
-            http_server::serve_mtls(listener, application, shutdown, tls).await
+            http_server::serve_mtls(listener, application, shutdown, tls, limits).await
         }
-        Some(tls) => http_server::serve_tls(listener, application, shutdown, tls).await,
-        None => http_server::serve(listener, application, shutdown).await,
+        Some(tls) => http_server::serve_tls(listener, application, shutdown, tls, limits).await,
+        None => http_server::serve_with_limits(listener, application, shutdown, limits).await,
     }
 }
 
@@ -1174,6 +1175,11 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             serve_tls::watch(rustls_config.clone(), watched.clone(), label);
         }
     }
+    // From the file, never the environment (0021): both listeners.
+    let listener_limits = http_server::HttpServerLimits::new(
+        built.listener.max_connections,
+        built.listener.header_timeout,
+    );
     let main_server = serve_listener(
         listener,
         built.app,
@@ -1186,6 +1192,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             .tls
             .as_ref()
             .is_some_and(|tls| tls.client_ca_file.is_some()),
+        listener_limits,
     );
     let logs = built.logs;
     let result = match admin {
@@ -1196,6 +1203,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
                 wait_for_stop(stopped),
                 admin_tls.map(|(rustls_config, _)| rustls_config),
                 false,
+                listener_limits,
             );
             // If either listener ends, stop the other too. Waiting for both would
             // leave a server running with half of its surface gone, and its

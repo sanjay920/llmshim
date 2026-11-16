@@ -130,6 +130,11 @@ pub struct ServeConfig {
     /// refused at startup.
     #[serde(default)]
     pub telemetry: Option<Telemetry>,
+    /// How the gateway talks to providers (0021): retries, the connection pool,
+    /// the proxy policy and every attempt deadline. Fixed at start. `serve` reads
+    /// none of the `LLMSHIM_*` variables these replace.
+    #[serde(default)]
+    pub upstream: Upstream,
     /// Other ways a caller proves who it is (0017). Fixed at start: a change is
     /// refused by a reload, though a key's `jwt` binding reloads with the key.
     #[serde(default)]
@@ -219,6 +224,129 @@ pub struct Telemetry {
     /// secret reference: the value is never written in the file.
     #[serde(default, deserialize_with = "unique_map")]
     pub headers: BTreeMap<String, SecretRef>,
+}
+
+/// How the gateway talks to providers (0021). Every key is optional and defaults
+/// to what the library's client uses without any `LLMSHIM_*` variable, except
+/// the pool, which follows the concurrency served. The deadlines are in
+/// milliseconds and may not be set so as to make another unreachable.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Upstream {
+    /// Retries after the first attempt of a transport error or a 429/5xx
+    /// (0 to 10). Defaults to 3.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 10))]
+    pub max_retries: Option<u32>,
+    /// The cap of one retry wait, in seconds (1 to 300). Defaults to 60.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 300))]
+    pub max_backoff_secs: Option<u64>,
+    /// Idle connections kept per upstream host (1 to 4096). Defaults to the larger
+    /// of 256 and `limits.max_concurrency`. An HTTP/1.1 upstream needs one per
+    /// request in flight to avoid a connection per request; an HTTP/2 upstream
+    /// multiplexes. Several providers on one host share it.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 4096))]
+    pub pool_max_idle_per_host: Option<u32>,
+    /// How long an idle connection is kept, in seconds (1 to 3600). Defaults to 90.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 3600))]
+    pub pool_idle_timeout_secs: Option<u64>,
+    /// Honour `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`. Defaults to true. The cloud
+    /// transports never do.
+    #[serde(default)]
+    pub ambient_proxy: Option<bool>,
+    /// Defaults to 30000.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub connect_timeout_ms: Option<u64>,
+    /// Defaults to 600000.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub response_header_timeout_ms: Option<u64>,
+    /// Defaults to 10000.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub policy_callback_timeout_ms: Option<u64>,
+    /// Defaults to 10000.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub error_body_idle_timeout_ms: Option<u64>,
+    /// Defaults to 30000.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub error_body_total_timeout_ms: Option<u64>,
+    /// Defaults to 300000.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub unary_idle_timeout_ms: Option<u64>,
+    /// Defaults to 1800000.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub unary_attempt_timeout_ms: Option<u64>,
+    /// Defaults to 300000.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub stream_idle_timeout_ms: Option<u64>,
+    /// Defaults to 7200000.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub stream_attempt_timeout_ms: Option<u64>,
+}
+
+impl Upstream {
+    /// The settings this table describes, over the library's defaults. Never reads
+    /// the environment. `concurrency` is `limits.max_concurrency`, which the pool
+    /// default follows.
+    pub fn settings(
+        &self,
+        concurrency: Option<u32>,
+    ) -> Result<crate::client::ClientSettings, &'static str> {
+        use std::time::Duration;
+        let mut settings = crate::client::ClientSettings::default();
+        if let Some(n) = self.max_retries {
+            settings.max_retries = n;
+        }
+        if let Some(secs) = self.max_backoff_secs {
+            settings.max_backoff = Duration::from_secs(secs);
+        }
+        settings.pool_max_idle_per_host = self
+            .pool_max_idle_per_host
+            .map(|n| n as usize)
+            .unwrap_or_else(|| (concurrency.unwrap_or(0) as usize).clamp(256, 4096));
+        if let Some(secs) = self.pool_idle_timeout_secs {
+            settings.pool_idle_timeout = Duration::from_secs(secs);
+        }
+        if let Some(ambient) = self.ambient_proxy {
+            settings.ambient_proxy = ambient;
+        }
+        // The defaults are the library's own (`AttemptDeadlines::default`), so
+        // an empty table cannot drift from them.
+        let ms = |value: Option<u64>, default: Duration| {
+            value.map(Duration::from_millis).unwrap_or(default)
+        };
+        let d = settings.deadlines;
+        settings.deadlines = d
+            .with_connect_timeout(ms(self.connect_timeout_ms, d.connect))?
+            .with_response_header_timeout(ms(self.response_header_timeout_ms, d.response_headers))?
+            .with_policy_callback_timeout(ms(self.policy_callback_timeout_ms, d.policy_callback))?
+            .with_error_body_timeouts(
+                ms(self.error_body_idle_timeout_ms, d.error_body_idle),
+                ms(self.error_body_total_timeout_ms, d.error_body_total),
+            )?
+            .with_unary_timeouts(
+                ms(self.unary_idle_timeout_ms, d.unary_body_idle),
+                ms(self.unary_attempt_timeout_ms, d.unary_attempt_total),
+            )?
+            .with_stream_timeouts(
+                ms(self.stream_idle_timeout_ms, d.stream_semantic_idle),
+                ms(self.stream_attempt_timeout_ms, d.stream_attempt_total),
+            )?;
+        settings.validate()?;
+        Ok(settings)
+    }
 }
 
 /// Reloading `[[keys]]` without a restart.
@@ -325,6 +453,17 @@ pub struct Server {
     /// HTTP and belongs behind a terminating proxy or service mesh.
     #[serde(default)]
     pub tls: Option<Tls>,
+    /// Inbound connections held at once (1 to 65535). Defaults to 1024. Replaces
+    /// `LLMSHIM_HTTP_MAX_CONNECTIONS`, which `serve` does not read.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 65535))]
+    pub max_connections: Option<u32>,
+    /// How long a connection has to deliver a request's headers (the TLS handshake
+    /// included), in milliseconds (1 to 600000). Defaults to 15000. Replaces
+    /// `LLMSHIM_HTTP_HEADER_TIMEOUT_MS`, which `serve` does not read.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 600000))]
+    pub header_timeout_ms: Option<u64>,
     /// Networks whose connections are load balancers or proxies that set
     /// `X-Forwarded-For`. Only a connection from inside them has its client
     /// address read from that header (the right-most entry that is not itself
@@ -341,6 +480,8 @@ impl Default for Server {
             port: default_port(),
             allow_unauthenticated: false,
             tls: None,
+            max_connections: None,
+            header_timeout_ms: None,
             trusted_proxies: Vec::new(),
         }
     }
@@ -907,6 +1048,7 @@ impl ServeConfig {
         self.validate_logging(&mut issues);
         self.validate_telemetry(&mut issues);
         self.validate_auth(&mut issues);
+        self.validate_upstream(&mut issues);
         self.validate_keys(&mut issues);
         self.validate_tenant_limits(&mut issues);
         self.validate_routes(&mut issues);
@@ -1347,6 +1489,116 @@ impl ServeConfig {
                 issues.push(Issue::new(
                     "logging.usage_log",
                     "must differ from logging.access_log; two logs cannot share a file",
+                ));
+            }
+        }
+    }
+
+    /// The upstream client's and the listener's limits (0021): each key's range,
+    /// then the ordering of the deadlines, so no deadline is set past the one that
+    /// bounds it.
+    fn validate_upstream(&self, issues: &mut Vec<Issue>) {
+        let u = &self.upstream;
+        let mut bound = |key: &str, value: Option<u64>, lo: u64, hi: u64| {
+            if value.is_some_and(|v| !(lo..=hi).contains(&v)) {
+                issues.push(Issue::new(key, format!("must be between {lo} and {hi}")));
+                false
+            } else {
+                true
+            }
+        };
+        let mut ok = true;
+        ok &= bound("upstream.max_retries", u.max_retries.map(u64::from), 0, 10);
+        ok &= bound("upstream.max_backoff_secs", u.max_backoff_secs, 1, 300);
+        ok &= bound(
+            "upstream.pool_max_idle_per_host",
+            u.pool_max_idle_per_host.map(u64::from),
+            1,
+            4096,
+        );
+        ok &= bound(
+            "upstream.pool_idle_timeout_secs",
+            u.pool_idle_timeout_secs,
+            1,
+            3600,
+        );
+        for (key, value) in [
+            ("connect_timeout_ms", u.connect_timeout_ms),
+            ("response_header_timeout_ms", u.response_header_timeout_ms),
+            ("policy_callback_timeout_ms", u.policy_callback_timeout_ms),
+            ("error_body_idle_timeout_ms", u.error_body_idle_timeout_ms),
+            ("error_body_total_timeout_ms", u.error_body_total_timeout_ms),
+            ("unary_idle_timeout_ms", u.unary_idle_timeout_ms),
+            ("unary_attempt_timeout_ms", u.unary_attempt_timeout_ms),
+            ("stream_idle_timeout_ms", u.stream_idle_timeout_ms),
+            ("stream_attempt_timeout_ms", u.stream_attempt_timeout_ms),
+        ] {
+            // Positive; the upper end is "finite", which the library checks.
+            ok &= bound(&format!("upstream.{key}"), value, 1, 24 * 3600 * 1000 * 365);
+        }
+        ok &= bound(
+            "server.max_connections",
+            self.server.max_connections.map(u64::from),
+            1,
+            65535,
+        );
+        ok &= bound(
+            "server.header_timeout_ms",
+            self.server.header_timeout_ms,
+            1,
+            600_000,
+        );
+        if !ok {
+            return;
+        }
+        let settings = match u.settings(self.limits.max_concurrency) {
+            Ok(settings) => settings,
+            Err(message) => {
+                issues.push(Issue::new("upstream", message));
+                return;
+            }
+        };
+        // Each deadline may not exceed the one that bounds it, or it could never
+        // fire. The values are the effective ones, defaults included.
+        let d = settings.deadlines;
+        let ms = |value: std::time::Duration| value.as_millis();
+        let attempts = ms(d.unary_attempt_total).min(ms(d.stream_attempt_total));
+        for (key, value, limit, bounded_by) in [
+            (
+                "connect_timeout_ms",
+                ms(d.connect),
+                attempts,
+                "the attempt timeouts",
+            ),
+            (
+                "response_header_timeout_ms",
+                ms(d.response_headers),
+                attempts,
+                "the attempt timeouts",
+            ),
+            (
+                "unary_idle_timeout_ms",
+                ms(d.unary_body_idle),
+                ms(d.unary_attempt_total),
+                "unary_attempt_timeout_ms",
+            ),
+            (
+                "stream_idle_timeout_ms",
+                ms(d.stream_semantic_idle),
+                ms(d.stream_attempt_total),
+                "stream_attempt_timeout_ms",
+            ),
+            (
+                "error_body_idle_timeout_ms",
+                ms(d.error_body_idle),
+                ms(d.error_body_total),
+                "error_body_total_timeout_ms",
+            ),
+        ] {
+            if value > limit {
+                issues.push(Issue::new(
+                    format!("upstream.{key}"),
+                    format!("may not exceed {bounded_by} (it could never fire)"),
                 ));
             }
         }
@@ -2526,10 +2778,11 @@ mod tests {
             "reload",
             "telemetry",
             "auth",
+            "upstream",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 13, "a new table needs a line here");
+        assert_eq!(properties.len(), 14, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
     }
 
@@ -3258,6 +3511,125 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_upstream_table_is_the_librarys_defaults_with_a_pool_that_follows_the_concurrency() {
+        use crate::client::ClientSettings;
+        let library = ClientSettings::default();
+        let empty = Upstream::default().settings(None).unwrap();
+        // Every field but the pool is the library's own, so this cannot drift.
+        let mut expected = library;
+        expected.pool_max_idle_per_host = 256;
+        assert_eq!(empty, expected);
+        // The pool follows the concurrency served, floored at 256 and capped at 4096.
+        for (concurrency, pool) in [
+            (None, 256),
+            (Some(10), 256),
+            (Some(1000), 1000),
+            (Some(100_000), 4096),
+        ] {
+            assert_eq!(
+                Upstream::default()
+                    .settings(concurrency)
+                    .unwrap()
+                    .pool_max_idle_per_host,
+                pool,
+                "{concurrency:?}"
+            );
+        }
+        // A value the file sets is used as written, even below the concurrency.
+        let set = Upstream {
+            pool_max_idle_per_host: Some(8),
+            ..Upstream::default()
+        };
+        assert_eq!(set.settings(Some(1000)).unwrap().pool_max_idle_per_host, 8);
+    }
+
+    #[test]
+    fn upstream_and_listener_keys_are_validated_by_path() {
+        let with = |upstream: &str, server: &str| {
+            let text = MINIMAL.replacen(
+                "[providers.openai]",
+                &format!("[server]\n{server}\n[upstream]\n{upstream}\n[providers.openai]"),
+                1,
+            );
+            text
+        };
+        assert!(ServeConfig::parse(
+            &with("max_retries = 10", "max_connections = 65535"),
+            Format::Toml
+        )
+        .is_ok());
+        for (upstream, server, path) in [
+            ("max_retries = 11", "", "upstream.max_retries"),
+            ("max_backoff_secs = 0", "", "upstream.max_backoff_secs"),
+            ("max_backoff_secs = 301", "", "upstream.max_backoff_secs"),
+            (
+                "pool_max_idle_per_host = 0",
+                "",
+                "upstream.pool_max_idle_per_host",
+            ),
+            (
+                "pool_max_idle_per_host = 4097",
+                "",
+                "upstream.pool_max_idle_per_host",
+            ),
+            (
+                "pool_idle_timeout_secs = 3601",
+                "",
+                "upstream.pool_idle_timeout_secs",
+            ),
+            ("connect_timeout_ms = 0", "", "upstream.connect_timeout_ms"),
+            ("", "max_connections = 0", "server.max_connections"),
+            ("", "max_connections = 65536", "server.max_connections"),
+            ("", "header_timeout_ms = 0", "server.header_timeout_ms"),
+            ("", "header_timeout_ms = 600001", "server.header_timeout_ms"),
+            // A deadline past the one that bounds it could never fire.
+            (
+                "connect_timeout_ms = 3600000",
+                "",
+                "upstream.connect_timeout_ms",
+            ),
+            (
+                "response_header_timeout_ms = 1900000",
+                "",
+                "upstream.response_header_timeout_ms",
+            ),
+            (
+                "unary_idle_timeout_ms = 2000000",
+                "",
+                "upstream.unary_idle_timeout_ms",
+            ),
+            (
+                "stream_idle_timeout_ms = 8000000",
+                "",
+                "upstream.stream_idle_timeout_ms",
+            ),
+            (
+                "error_body_idle_timeout_ms = 40000",
+                "",
+                "upstream.error_body_idle_timeout_ms",
+            ),
+        ] {
+            let text = with(upstream, server);
+            assert!(
+                has(&issues(&text), path),
+                "{upstream} {server}: {:?}",
+                issues(&text)
+            );
+        }
+        // An unknown key is refused (the parser names it; it has no path of its own).
+        assert!(!issues(&with("unknown_key = 1", "")).is_empty());
+        // The ordering uses the effective values, defaults included: shortening
+        // the attempt below the default header deadline is the same mistake.
+        let text = with("unary_attempt_timeout_ms = 1000", "");
+        assert!(
+            has(&issues(&text), "upstream.response_header_timeout_ms")
+                || has(&issues(&text), "upstream.connect_timeout_ms"),
+            "{:?}",
+            issues(&text)
+        );
     }
 
     #[test]
