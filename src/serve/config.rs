@@ -52,7 +52,7 @@ pub struct Issue {
 }
 
 impl Issue {
-    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             path: printable(&path.into()),
             message: printable(&message.into()),
@@ -139,6 +139,29 @@ pub struct ServeConfig {
     /// refused by a reload, though a key's `jwt` binding reloads with the key.
     #[serde(default)]
     pub auth: Auth,
+    /// Take the caller keys from a signed policy snapshot (0024) instead of
+    /// `[[keys]]`. The two cannot be combined. Fixed at start, except that a
+    /// snapshot file's content reloads like keys do.
+    #[serde(default)]
+    pub control_plane: Option<ControlPlane>,
+}
+
+/// A signed snapshot as the source of caller keys (0024). Needs `state.policy_dir`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ControlPlane {
+    /// Public keys that may have signed a snapshot, each `ed25519:<base64 of the
+    /// 32-byte key>` (`llmshim snapshot keygen` prints one). More than one lets a
+    /// signing key rotate: add the new public key first.
+    pub verify_keys: Vec<String>,
+    /// The snapshot file (an absolute path), written by whatever distributes it
+    /// and watched like the keys of a file.
+    pub snapshot_file: PathBuf,
+    /// A floor for the snapshot's generation, so a replica with no record of what it
+    /// applied (a first boot) still refuses a snapshot older than this. Defaults to 0.
+    #[serde(default)]
+    pub min_generation: Option<u64>,
 }
 
 /// Caller authentication beyond bearer keys and client certificates.
@@ -400,6 +423,8 @@ pub struct Loaded {
     pub config: ServeConfig,
     pub text: String,
     pub format: Format,
+    /// The verified snapshot the keys came from, when `[control_plane]` is set.
+    pub snapshot: Option<super::snapshot::Snapshot>,
 }
 
 /// Read a table, refusing a repeated name. JSON parsers otherwise keep the
@@ -579,6 +604,11 @@ pub struct State {
     #[serde(default)]
     #[schemars(range(min = 1, max = 30000))]
     pub receipt_lock_timeout_ms: Option<u64>,
+    /// Where a replica records the generation of the snapshot it last applied (an
+    /// absolute path to a writable directory), so a restart cannot be rolled back
+    /// to an older snapshot. Required with `[control_plane]` (0024).
+    #[serde(default)]
+    pub policy_dir: Option<PathBuf>,
 }
 
 /// What the server records about the requests it handles.
@@ -999,6 +1029,15 @@ impl ServeConfig {
     /// format, so a caller that compares files later compares what it started
     /// from rather than a second read.
     pub fn load_with_text(path: &Path) -> Result<Loaded, Vec<Issue>> {
+        Self::load_with_text_resolving(path, true)
+    }
+
+    /// [`Self::load_with_text`], optionally leaving a `[control_plane]` snapshot
+    /// unread: `serve --check --structure-only` reads nothing but the file.
+    pub fn load_with_text_resolving(
+        path: &Path,
+        resolve_snapshot: bool,
+    ) -> Result<Loaded, Vec<Issue>> {
         let format = match path.extension().and_then(|e| e.to_str()) {
             Some("toml") => Format::Toml,
             Some("json") => Format::Json,
@@ -1015,12 +1054,106 @@ impl ServeConfig {
                 format!("cannot read {}: {}", path.display(), error.kind()),
             )]
         })?;
-        let config = Self::parse(&text, format)?;
+        let mut config = Self::parse(&text, format)?;
+        let snapshot = if resolve_snapshot {
+            config.apply_snapshot()?
+        } else {
+            None
+        };
         Ok(Loaded {
             config,
             text,
             format,
+            snapshot,
         })
+    }
+
+    /// With `[control_plane]`: read and verify the snapshot, judge it against the
+    /// floor `state.policy_dir` holds, put its keys where `[[keys]]` would be and
+    /// check them by the rules file keys are checked by (0024). Reads files; records
+    /// nothing (the caller records the generation once the snapshot is applied).
+    fn apply_snapshot(&mut self) -> Result<Option<super::snapshot::Snapshot>, Vec<Issue>> {
+        let Some(control_plane) = self.control_plane.clone() else {
+            return Ok(None);
+        };
+        let floor = match &self.state.policy_dir {
+            Some(dir) => super::snapshot::read_floor(dir).map_err(|issue| vec![issue])?,
+            None => None,
+        };
+        let snapshot = super::snapshot::load(&control_plane, floor.as_ref(), chrono::Utc::now())?;
+        if snapshot.keys.is_empty() {
+            return Err(vec![Issue::new(
+                "control_plane.snapshot_file",
+                "the snapshot has no active key, so no caller could be identified",
+            )]);
+        }
+        self.keys = snapshot.keys.clone();
+        let mut issues = Vec::new();
+        self.validate_keys(&mut issues);
+        self.validate_tenant_limits(&mut issues);
+        if issues.is_empty() {
+            Ok(Some(snapshot))
+        } else {
+            // The snapshot's keys are reported at the setting that named it, with
+            // the rule that refused them; the keys[N] paths index its active keys.
+            Err(issues
+                .into_iter()
+                .map(|issue| {
+                    Issue::new(
+                        format!("control_plane.snapshot_file ({})", issue.path),
+                        issue.message,
+                    )
+                })
+                .collect())
+        }
+    }
+
+    fn validate_control_plane(&self, issues: &mut Vec<Issue>) {
+        let Some(control_plane) = &self.control_plane else {
+            return;
+        };
+        if !self.keys.is_empty() {
+            issues.push(Issue::new(
+                "control_plane",
+                "cannot be combined with [[keys]]: two sources of truth for who may call",
+            ));
+        }
+        if self.server.allow_unauthenticated {
+            issues.push(Issue::new(
+                "server.allow_unauthenticated",
+                "cannot be true with [control_plane], which exists to identify callers",
+            ));
+        }
+        if control_plane.verify_keys.is_empty() {
+            issues.push(Issue::new(
+                "control_plane.verify_keys",
+                "needs at least one public key",
+            ));
+        }
+        for (n, key) in control_plane.verify_keys.iter().enumerate() {
+            if let Err(message) = super::snapshot::parse_verify_key(key) {
+                issues.push(Issue::new(
+                    format!("control_plane.verify_keys[{n}]"),
+                    message,
+                ));
+            }
+        }
+        if !control_plane.snapshot_file.is_absolute() {
+            issues.push(Issue::new(
+                "control_plane.snapshot_file",
+                "must be an absolute path",
+            ));
+        }
+        match &self.state.policy_dir {
+            None => issues.push(Issue::new(
+                "state.policy_dir",
+                "is required with [control_plane]: it records the generation applied, so a restart cannot be rolled back",
+            )),
+            Some(dir) if !dir.is_absolute() => {
+                issues.push(Issue::new("state.policy_dir", "must be an absolute path"))
+            }
+            Some(_) => {}
+        }
     }
 
     fn validate(&self) -> Vec<Issue> {
@@ -1051,6 +1184,7 @@ impl ServeConfig {
         self.validate_upstream(&mut issues);
         self.validate_keys(&mut issues);
         self.validate_tenant_limits(&mut issues);
+        self.validate_control_plane(&mut issues);
         self.validate_routes(&mut issues);
         issues
     }
@@ -1084,7 +1218,10 @@ impl ServeConfig {
             }
             Ok(_) => {}
         }
-        if self.keys.is_empty() && !self.server.allow_unauthenticated {
+        if self.keys.is_empty()
+            && !self.server.allow_unauthenticated
+            && self.control_plane.is_none()
+        {
             issues.push(Issue::new(
                 "keys",
                 "no caller keys are defined; add [[keys]], or set server.allow_unauthenticated = true \
@@ -2586,6 +2723,61 @@ mod tests {
             .any(|issue| issue.starts_with(&format!("{path}:")))
     }
 
+    const CONTROL_PLANE: &str = r#"
+        version = 1
+        [providers.openai]
+        kind = "openai"
+        api_key = { env = "OPENAI_API_KEY" }
+        [state]
+        policy_dir = "/var/lib/llmshim/policy"
+        [control_plane]
+        verify_keys = ["ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaA="]
+        snapshot_file = "/var/lib/llmshim/snapshot.json"
+    "#;
+
+    #[test]
+    fn a_control_plane_replaces_keys_and_has_its_own_rules() {
+        // Valid without [[keys]]: the snapshot is the source of who may call (0024).
+        assert!(
+            issues(CONTROL_PLANE).is_empty(),
+            "{:?}",
+            issues(CONTROL_PLANE)
+        );
+        // Never both: two sources of truth.
+        let both = format!(
+            "{CONTROL_PLANE}\n[[keys]]\nname = \"ci\"\ntenant = \"t\"\nsecret = {{ env = \"K\" }}"
+        );
+        assert!(has(&issues(&both), "control_plane"));
+        // The record of what was applied is required, or a restart could be rolled back.
+        let no_dir = CONTROL_PLANE.replace("policy_dir = \"/var/lib/llmshim/policy\"", "");
+        assert!(has(&issues(&no_dir), "state.policy_dir"));
+        let relative = CONTROL_PLANE.replace("/var/lib/llmshim/policy", "policy");
+        assert!(has(&issues(&relative), "state.policy_dir"));
+        let relative_file =
+            CONTROL_PLANE.replace("/var/lib/llmshim/snapshot.json", "snapshot.json");
+        assert!(has(&issues(&relative_file), "control_plane.snapshot_file"));
+        // A verify key that is not a 32-byte Ed25519 key is refused by position.
+        let bad_key = CONTROL_PLANE.replace(
+            "ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaA=",
+            "ed25519:AAAA",
+        );
+        assert!(has(&issues(&bad_key), "control_plane.verify_keys[0]"));
+        let none = CONTROL_PLANE.replace(
+            "verify_keys = [\"ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaA=\"]",
+            "verify_keys = []",
+        );
+        assert!(has(&issues(&none), "control_plane.verify_keys"));
+        // Open serving cannot be combined with it.
+        let open = format!("{CONTROL_PLANE}\n[server]\nallow_unauthenticated = true");
+        assert!(has(&issues(&open), "server.allow_unauthenticated"));
+        // Without a control plane the old rule stands: callers must be defined.
+        let neither = MINIMAL.replace(
+            "[[keys]]\n        name = \"ci\"\n        tenant = \"platform\"\n        secret = { env = \"CI_GATEWAY_KEY\" }",
+            "",
+        );
+        assert!(has(&issues(&neither), "keys"));
+    }
+
     #[test]
     fn the_documented_example_is_valid() {
         let example = include_str!("../../docs/design/enterprise-gateway/example.toml");
@@ -2797,10 +2989,11 @@ mod tests {
             "telemetry",
             "auth",
             "upstream",
+            "control_plane",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 14, "a new table needs a line here");
+        assert_eq!(properties.len(), 15, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
     }
 

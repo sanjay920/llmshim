@@ -486,6 +486,10 @@ impl Reloader {
         }
         if fingerprint == active.fingerprint {
             active.pending = None;
+            // The same keys, but possibly a higher generation: the floor follows.
+            if let Err(issue) = record_snapshot(&loaded) {
+                return reject_now(active, vec![issue]);
+            }
             return Step::Unchanged { config_sha256 };
         }
         if debounce {
@@ -496,6 +500,9 @@ impl Reloader {
             }
         }
         active.pending = None;
+        if let Err(issue) = record_snapshot(&loaded) {
+            return reject_now(active, vec![issue]);
+        }
         let credentials = store.credential_count();
         // The allowlists first, and keyed by credential rather than by asking the
         // store (see `allowlist::enforce`): a key that is new in this reload and
@@ -546,6 +553,22 @@ enum Step {
         issues: Vec<Issue>,
         repeated: bool,
     },
+}
+
+/// Record the snapshot a load verified as the one in force (0024): a replica that
+/// restarts must not accept an older one.
+fn record_snapshot(loaded: &super::config::Loaded) -> Result<(), Issue> {
+    if let (Some(snapshot), Some(dir)) = (&loaded.snapshot, loaded.config.state.policy_dir.as_ref())
+    {
+        super::snapshot::write_floor(
+            dir,
+            &super::snapshot::Floor {
+                generation: snapshot.generation,
+                payload_sha256: snapshot.payload_sha256.clone(),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn reject(active: &mut Active, config_sha256: &str, issues: Vec<Issue>) -> Step {

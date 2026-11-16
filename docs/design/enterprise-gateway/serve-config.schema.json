@@ -61,6 +61,37 @@
       },
       "type": "object"
     },
+    "ControlPlane": {
+      "additionalProperties": false,
+      "description": "A signed snapshot as the source of caller keys (0024). Needs `state.policy_dir`.",
+      "properties": {
+        "min_generation": {
+          "default": null,
+          "description": "A floor for the snapshot's generation, so a replica with no record of what it\napplied (a first boot) still refuses a snapshot older than this. Defaults to 0.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "snapshot_file": {
+          "description": "The snapshot file (an absolute path), written by whatever distributes it\nand watched like the keys of a file.",
+          "type": "string"
+        },
+        "verify_keys": {
+          "description": "Public keys that may have signed a snapshot, each `ed25519:<base64 of the\n32-byte key>` (`llmshim snapshot keygen` prints one). More than one lets a\nsigning key rotate: add the new public key first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "verify_keys",
+        "snapshot_file"
+      ],
+      "type": "object"
+    },
     "Fleet": {
       "additionalProperties": false,
       "description": "Fleet mode. Requires a binary built with `--features serve-redis`.",
@@ -683,6 +714,14 @@
             "null"
           ]
         },
+        "policy_dir": {
+          "default": null,
+          "description": "Where a replica records the generation of the snapshot it last applied (an\nabsolute path to a writable directory), so a restart cannot be rolled back\nto an older snapshot. Required with `[control_plane]` (0024).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "receipt_lock_timeout_ms": {
           "default": null,
           "description": "How long a request waits for the receipt directory's lock, in\nmilliseconds (1 to 30000). Defaults to 2000. Replaces the\n`LLMSHIM_REPLAY_RECEIPTS_LOCK_TIMEOUT_MS` variable, which `serve` does not\nread. Several replicas sharing one receipts volume contend for this lock.",
@@ -943,6 +982,17 @@
     "auth": {
       "$ref": "#/$defs/Auth",
       "description": "Other ways a caller proves who it is (0017). Fixed at start: a change is\nrefused by a reload, though a key's `jwt` binding reloads with the key."
+    },
+    "control_plane": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ControlPlane"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Take the caller keys from a signed policy snapshot (0024) instead of\n`[[keys]]`. The two cannot be combined. Fixed at start, except that a\nsnapshot file's content reloads like keys do."
     },
     "fleet": {
       "anyOf": [
