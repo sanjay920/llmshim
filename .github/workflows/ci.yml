@@ -47,6 +47,16 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+  release-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: The release gate's wait script
+        run: bash .github/scripts/test-wait-for-green.sh
+      - name: Every publishing job waits behind the release gate
+        run: ruby .github/scripts/verify-release-gate.rb
+
   clippy:
     name: clippy (${{ matrix.name }})
     runs-on: ubuntu-latest

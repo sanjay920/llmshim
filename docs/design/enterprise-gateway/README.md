@@ -106,8 +106,9 @@ Phase 0: a production server mode
       (0015)
 - [x] A request id unique across instances, with the tenant and key name joined
       across the access log, the usage records and the trace (0013)
-- [ ] The release gate builds and tests `serve` and waits for a green `ci.yml`
-      (0013)
+- [x] The release gate builds and tests `serve` and waits for a green `ci.yml`
+      and `serve-check.yml` on the tagged commit (0013). Requiring them by branch
+      protection on `main` is a repository setting for the owner, not changed
 
 Later phases (each needs its own design note before work starts)
 

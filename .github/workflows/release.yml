@@ -23,12 +23,42 @@ jobs:
         env:
           LLMSHIM_CATALOG_OFFLINE: '1'
         run: cargo test --workspace --features proxy --tests
+      # `serve` is default-off and unstable, but a release must still build and
+      # pass it: a change to shared code reaches it too.
+      - name: Clippy (serve)
+        run: cargo clippy --workspace --all-targets --features serve -- -D warnings
+      - name: Unit tests (serve)
+        env:
+          LLMSHIM_CATALOG_OFFLINE: '1'
+        run: cargo test --workspace --features serve --lib
 
   windows-check:
     uses: ./.github/workflows/windows-check.yml
 
+  # The tagged commit must already have passed the full CI (every build, the
+  # Redis-backed tests) and the `serve` suites that run on every merge to main. A
+  # tag on a commit that never ran them, or that failed them, is refused here, and
+  # every publishing job waits behind `release-inputs`, which waits for this.
+  ci-green:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The script that waits is itself tested
+        run: bash .github/scripts/test-wait-for-green.sh
+      - name: Wait for a green ci.yml and serve-check.yml on this commit
+        run: .github/scripts/wait-for-green.sh "${{ github.sha }}" ci.yml serve-check.yml
+
   release-inputs:
-    needs: [test, windows-check]
+    needs: [test, windows-check, ci-green]
     runs-on: ubuntu-latest
     permissions:
       contents: read

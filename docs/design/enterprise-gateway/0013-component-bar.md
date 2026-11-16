@@ -122,7 +122,13 @@ of untested corners makes that worse, not better.
 7. JWT/OIDC workload identity and IP allowlists (design note first).
 8. A reproducible benchmark.
 9. Published, signed images and an SBOM.
-10. The release gate builds and tests `serve` and waits for a green `ci.yml`.
+10. The release gate builds and tests `serve` and waits for a green `ci.yml`. Done:
+    `release.yml` lints and tests `serve`, and a `ci-green` job (every publisher waits
+    behind `release-inputs`, which needs it) refuses a tag whose commit has no green
+    `ci.yml` and `serve-check.yml` run, waiting up to an hour for a pending one
+    (`.github/scripts/wait-for-green.sh`, tested by `test-wait-for-green.sh` in `ci.yml`
+    and again in the release). Branch protection requiring those workflows on `main`
+    is a repository setting and is the owner's to apply; it is not changed here.
 11. Bedrock, Vertex and Azure from the file.
 12. Reload of everything beyond keys.
 13. The control plane (design note first).
