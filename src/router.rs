@@ -70,6 +70,42 @@ pub struct Router {
     http_client: Option<crate::client::ShimClient>,
 }
 
+/// The router as the gateway holds it: a value that a reload can replace as a
+/// whole (0022). A reader takes a snapshot with [`Self::current`] and keeps it for
+/// as long as it needs one consistent router; replacing the router never changes a
+/// snapshot already taken.
+#[cfg(feature = "gateway")]
+#[derive(Clone)]
+pub(crate) struct RouterHandle(Arc<std::sync::RwLock<Arc<Router>>>);
+
+#[cfg(feature = "gateway")]
+impl RouterHandle {
+    pub(crate) fn new(router: Router) -> Self {
+        Self::from_arc(Arc::new(router))
+    }
+
+    pub(crate) fn from_arc(router: Arc<Router>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(router)))
+    }
+
+    /// The router in force now. Hold it for the duration of one decision.
+    pub(crate) fn current(&self) -> Arc<Router> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Make `next` the router in force. Snapshots already taken keep theirs.
+    #[allow(dead_code)]
+    pub(crate) fn replace(&self, next: Router) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
+    }
+}
+
 impl Default for Router {
     fn default() -> Self {
         Self::new()
