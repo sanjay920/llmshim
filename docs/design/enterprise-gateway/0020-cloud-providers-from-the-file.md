@@ -1,12 +1,12 @@
 # 0020: Bedrock, Vertex and Azure from the file
 
-Status: slices 2 and 3 implemented: the configuration and its validation, and the
-providers built into the router from the file (`/v1/models` lists Azure's
-deployments through a new defaulted `Provider::served_models`). A build without
-`serve-cloud` refuses such a file; slice 4 adds the CI job, the image build check
-and the 0014 row. A contract note, written before any code (README working rule 3).
-The process tests (`tests/integration_serve_cloud.rs`) run in the `serve-cloud`
-build, which CI gains in slice 4.
+Status: implemented. The configuration and its validation (slice 2), the providers
+built into the router from the file, with Azure's deployments listed in
+`/v1/models` through a new defaulted `Provider::served_models` (slice 3), and the
+CI that keeps it building (slice 4: a `serve-cloud-check` job that runs every test
+in the combined build, an image build with the cloud transports on each Dockerfile
+pull request, and the 0014 row). A build without `serve-cloud` refuses such a
+file. A contract note, written before any code (README working rule 3).
 
 ## What an operator needs
 
@@ -155,8 +155,12 @@ log work as for any provider, keyed by the provider name.
 ## What is not in the published image yet
 
 `serve-cloud` adds the AWS SDK and the Google and Azure paths to the binary. The
-published image (0019) keeps `serve-redis,serve-otel` until the size and build-time
-cost is measured and the owner decides; a deployment that needs these providers
+published image (0019) keeps `serve-redis,serve-otel` until the owner decides. The
+cost, measured on an arm64 build of the Dockerfile: **57.9 MB without, 63 MB with
+`serve-cloud` (+5.1 MB, about 9 %)**; the pull-request job prints both sizes for
+each change (as a job summary) so the figure stays current, and the added build time
+is visible in the job. A deployment that needs these providers builds the image with
+`--build-arg FEATURES=serve-redis,serve-otel,serve-cloud`; a deployment that needs these providers
 builds the image with `--build-arg FEATURES=serve-redis,serve-otel,serve-cloud`,
 and `docker-check.yml` builds that combination on every pull request that touches
 the Dockerfile, so it does not rot.
@@ -188,5 +192,5 @@ the Dockerfile, so it does not rot.
    locally; Bedrock and Vertex fail a request cleanly when their identity cannot be
    resolved, with no budget reserved; and their request construction stays
    covered by the transports' own fixture tests.
-4. `serve-check.yml` builds and tests `serve-cloud`; `docker-check.yml` builds the
+4. Done: `serve-check.yml` builds and tests `serve-cloud`; `docker-check.yml` builds the
    image with it; the 0014 row; the docs.

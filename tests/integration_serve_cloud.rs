@@ -137,13 +137,37 @@ async fn a_deployment_the_file_does_not_name_is_refused_locally() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bedrock_profile_that_does_not_exist_fails_the_request_cleanly() {
     let dir = tempdir::Dir::new("cloud-bedrock");
-    let upstream = mockito::Server::new_async().await;
+    let mut upstream = mockito::Server::new_async().await;
+    let _ok = upstream
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(harness::completion("pong"))
+        .create_async()
+        .await;
     let sa = service_account(&dir.0);
+    let usage = dir.0.join("usage.jsonl");
+    let logging = format!("\n[logging]\nusage_log = \"{}\"\n", usage.display());
     let server = start(
-        &config(&upstream.url(), &clouds(&sa)),
+        &config(&upstream.url(), &(clouds(&sa) + &logging)),
         "cloud-bedrock",
         &ENV,
     );
+    // The log works: an admitted attempt through another provider is recorded.
+    assert_eq!(
+        post(&server.base, "inference/test-model").await.status(),
+        200
+    );
+    let lines = |path: &std::path::Path| {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lines(&usage) < 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(lines(&usage), 1);
     let started = Instant::now();
     let response = post(&server.base, "bedrock/anthropic.claude-sonnet-5-5-v1:0").await;
     let status = response.status().as_u16();
@@ -159,5 +183,14 @@ async fn a_bedrock_profile_that_does_not_exist_fails_the_request_cleanly() {
     assert!(
         !body.contains(&dir.0.display().to_string()),
         "no path: {body}"
+    );
+    // The identity failed before admission, so no attempt exists to record: the
+    // usage log, which holds one line per admitted attempt, gains none.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        lines(&usage),
+        1,
+        "the failed identity added no record: {}",
+        std::fs::read_to_string(&usage).unwrap_or_default()
     );
 }
