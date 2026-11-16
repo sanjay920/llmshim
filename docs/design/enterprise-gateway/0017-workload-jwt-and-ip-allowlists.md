@@ -69,7 +69,10 @@ limits, budget) applies unchanged: the token only proves **which key**.
   signature); `EdDSA` only Ed25519. A usable key has `use` absent or `sig`,
   `key_ops` absent or containing `verify`, and a JWK `alg`, if present, equal to
   the token's. A token whose header has `crit`, or `b64: false`, is refused (RFC
-  7515 requires refusing a `crit` the verifier does not implement). A token with
+  7515 requires refusing a `crit` the verifier does not implement). The RSA exponent must be odd and at least 3; a `kid` that is not text (in a
+  token or a JWK) is not a missing `kid`; a JWKS holds at most 256 keys; a `kid`
+  that appears twice names nothing, and a key dropped for it still counts as a key
+  for the "only usable key" rule. A token with
   an unknown `kid` is a 401 while a refresh is allowed or just happened, and 503
   only if the refresh itself failed.
 - **Claims.** `iss` equals the configured issuer exactly; `aud` (a string or an

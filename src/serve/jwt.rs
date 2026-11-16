@@ -116,7 +116,14 @@ struct VerifyKey {
 #[derive(Debug, Clone, Default)]
 pub struct KeySet {
     keys: Vec<VerifyKey>,
+    /// Whether a token without a `kid` may be matched: only when the document
+    /// held exactly one usable key (a key dropped for a repeated `kid` counts, so
+    /// the choice never depends on what was left over).
+    kidless_ok: bool,
 }
+
+/// The most keys a document may hold. A real issuer has a handful.
+pub const MAX_KEYS: usize = 256;
 
 fn b64(text: &str) -> Option<Vec<u8>> {
     URL_SAFE_NO_PAD.decode(text).ok()
@@ -153,7 +160,11 @@ fn der_integer(bytes: &[u8]) -> Vec<u8> {
 fn rsa_public_key(n: &[u8], e: &[u8]) -> Option<Vec<u8>> {
     let modulus: Vec<u8> = n.iter().copied().skip_while(|b| *b == 0).collect();
     let bits = modulus.len() * 8 - modulus.first()?.leading_zeros() as usize;
-    if !(2048..=8192).contains(&bits) || e.is_empty() {
+    let exponent: Vec<u8> = e.iter().copied().skip_while(|b| *b == 0).collect();
+    // An odd exponent of at least 3 (ring and every real issuer: 65537).
+    let odd_and_big =
+        exponent.last().is_some_and(|b| b % 2 == 1) && (exponent.len() > 1 || exponent[0] >= 3);
+    if !(2048..=8192).contains(&bits) || !odd_and_big {
         return None;
     }
     let mut body = der_integer(&modulus);
@@ -215,8 +226,14 @@ impl VerifyKey {
             }
             _ => return None,
         };
+        let kid = match object.get("kid") {
+            None => None,
+            Some(Value::String(kid)) => Some(kid.clone()),
+            // A `kid` that is not text names nothing; the key cannot be chosen.
+            Some(_) => return None,
+        };
         Some(Self {
-            kid: text(object, "kid").map(str::to_owned),
+            kid,
             alg: text(object, "alg").map(str::to_owned),
             material,
         })
@@ -235,24 +252,28 @@ impl KeySet {
             .get("keys")
             .and_then(Value::as_array)
             .ok_or_else(|| "has no \"keys\" array".to_string())?;
+        if keys.len() > MAX_KEYS {
+            return Err(format!("has more than {MAX_KEYS} keys"));
+        }
         let usable: Vec<VerifyKey> = keys.iter().filter_map(VerifyKey::from_jwk).collect();
-        let repeated: Vec<&String> = usable
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for kid in usable.iter().filter_map(|key| key.kid.as_deref()) {
+            *counts.entry(kid).or_default() += 1;
+        }
+        let kidless_ok = usable.len() == 1;
+        let kept = usable
             .iter()
-            .filter_map(|key| key.kid.as_ref())
-            .filter(|kid| {
-                usable
-                    .iter()
-                    .filter(|other| other.kid.as_ref() == Some(*kid))
-                    .count()
-                    > 1
+            .filter(|key| {
+                key.kid
+                    .as_deref()
+                    .is_none_or(|kid| counts.get(kid) == Some(&1))
             })
-            .collect();
-        let keys = usable
-            .iter()
-            .filter(|key| key.kid.as_ref().is_none_or(|kid| !repeated.contains(&kid)))
             .cloned()
             .collect();
-        Ok(Self { keys })
+        Ok(Self {
+            keys: kept,
+            kidless_ok,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -274,9 +295,10 @@ impl KeySet {
                 .filter(fitting)
                 .find(|key| key.kid.as_deref() == Some(kid)),
             None => {
-                let mut candidates = self.keys.iter().filter(fitting);
-                let only = candidates.next()?;
-                candidates.next().is_none().then_some(only)
+                if !self.kidless_ok {
+                    return None;
+                }
+                self.keys.iter().find(fitting)
             }
         }
     }
@@ -286,15 +308,17 @@ impl KeySet {
 /// first a JSON object with a string `alg`. Decides only whether the value is
 /// treated as a token or looked up as a key (0017).
 pub fn is_jwt_shaped(token: &str) -> bool {
-    if token.len() > MAX_TOKEN_BYTES {
-        return false;
-    }
+    // Any length: an oversized token is still a token, and `verify` refuses it,
+    // so it is never looked up as a key. Only the header is decoded, bounded.
     let mut parts = token.split('.');
     let (Some(head), Some(_), Some(_), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return false;
     };
+    if head.len() > 4096 {
+        return false;
+    }
     b64(head)
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|value| value.get("alg").map(Value::is_string))
@@ -340,9 +364,12 @@ pub fn verify(token: &str, keys: &KeySet, policy: &Policy, now: u64) -> Result<V
         .ok()
         .filter(|alg| policy.algorithms.contains(alg))
         .ok_or(Failure::Algorithm)?;
-    let key = keys
-        .select(text(&header, "kid"), alg, alg_name)
-        .ok_or(Failure::Key)?;
+    let kid = match header.get("kid") {
+        None => None,
+        Some(Value::String(kid)) => Some(kid.as_str()),
+        Some(_) => return Err(Failure::Malformed),
+    };
+    let key = keys.select(kid, alg, alg_name).ok_or(Failure::Key)?;
     let signature = b64(sig).ok_or(Failure::Malformed)?;
     let signed = &token[..head.len() + 1 + body.len()];
     let check = |algorithm: &'static dyn signature::VerificationAlgorithm, public: &[u8]| {
@@ -660,6 +687,21 @@ mod tests {
         let (a, b) = (ed(), ed());
         let keys = set(&[a.jwk("same"), b.jwk("same")]);
         assert!(keys.is_empty());
+        // A real key beside a repeated pair is not "the only key" for a kidless token.
+        let real = ed();
+        let mixed = set(&[a.jwk("same"), b.jwk("same"), real.jwk("real")]);
+        let kidless = real.token(None, "EdDSA", &claims());
+        assert_eq!(
+            verify(&kidless, &mixed, &policy(&all()), NOW),
+            Err(Failure::Key)
+        );
+        assert!(verify(
+            &real.token(Some("real"), "EdDSA", &claims()),
+            &mixed,
+            &policy(&all()),
+            NOW
+        )
+        .is_ok());
     }
 
     #[test]
@@ -863,7 +905,151 @@ mod tests {
         ] {
             assert!(!is_jwt_shaped(not), "{not:?}");
         }
-        assert!(!is_jwt_shaped(&"a".repeat(MAX_TOKEN_BYTES + 1)));
+        // Oversized but shaped like one: still a token (verify refuses it).
+        let big = format!(
+            "{}.{}.sig",
+            encode(&json!({"alg": "EdDSA"})),
+            "a".repeat(MAX_TOKEN_BYTES)
+        );
+        assert!(is_jwt_shaped(&big));
+        assert!(
+            !is_jwt_shaped(&"a".repeat(MAX_TOKEN_BYTES + 1)),
+            "no dots, no shape"
+        );
         assert_eq!(peek_issuer("nonsense"), None);
+    }
+
+    #[test]
+    fn a_kidless_token_needs_the_only_key_of_the_document() {
+        let (e, r) = (ed(), rsa());
+        // Two usable keys of different kinds: still two keys, so no kidless match.
+        let keys = set(&[e.jwk("e"), r.jwk("r")]);
+        let token = e.token(None, "EdDSA", &claims());
+        assert_eq!(
+            verify(&token, &keys, &policy(&all()), NOW),
+            Err(Failure::Key)
+        );
+    }
+
+    #[test]
+    fn a_kid_that_is_not_text_is_not_a_missing_kid() {
+        let signer = ed();
+        let keys = set(&[signer.jwk("k")]);
+        let header = json!({"alg": "EdDSA", "kid": 7});
+        let message = unsigned(&header, &claims());
+        let token = format!("{message}.{}", signer.sign(&message));
+        assert_eq!(
+            verify(&token, &keys, &policy(&all()), NOW),
+            Err(Failure::Malformed)
+        );
+        let mut jwk = signer.jwk("k");
+        jwk["kid"] = json!(7);
+        assert!(
+            set(&[jwk]).is_empty(),
+            "a key whose kid is not text names nothing"
+        );
+    }
+
+    #[test]
+    fn rsa_sizes_and_exponents_are_bounded() {
+        let exponent = [1u8, 0, 1];
+        let modulus = |bits: usize| {
+            let mut n = vec![0xFFu8; bits.div_ceil(8)];
+            n[0] = 0xFFu8 >> (n.len() * 8 - bits);
+            n[0] |= 0x80u8 >> (n.len() * 8 - bits);
+            n
+        };
+        assert!(rsa_public_key(&modulus(2047), &exponent).is_none());
+        assert!(rsa_public_key(&modulus(2048), &exponent).is_some());
+        assert!(rsa_public_key(&modulus(8192), &exponent).is_some());
+        assert!(rsa_public_key(&modulus(8193), &exponent).is_none());
+        for bad in [&[0u8][..], &[1], &[2], &[0, 0], &[]] {
+            assert!(rsa_public_key(&modulus(2048), bad).is_none(), "{bad:?}");
+        }
+        assert!(rsa_public_key(&modulus(2048), &[3]).is_some());
+        // A leading zero on the modulus does not change its size.
+        let mut padded = vec![0];
+        padded.extend(modulus(2048));
+        assert!(rsa_public_key(&padded, &exponent).is_some());
+        // The long DER length form is used for a large key.
+        assert_eq!(
+            &rsa_public_key(&modulus(8192), &exponent).unwrap()[..2],
+            &[0x30, 0x82]
+        );
+    }
+
+    #[test]
+    fn base64_must_be_canonical_and_the_header_is_signed() {
+        let signer = ed();
+        let keys = set(&[signer.jwk("k")]);
+        let token = signer.token(Some("k"), "EdDSA", &claims());
+        let parts: Vec<&str> = token.split('.').collect();
+        // Padded base64 in any part is not base64url-without-padding.
+        let padded = format!("{}=.{}.{}", parts[0], parts[1], parts[2]);
+        assert!(verify(&padded, &keys, &policy(&all()), NOW).is_err());
+        // Changing only the header (kid) breaks the signature: header is covered.
+        let other = signer.token(Some("k"), "EdDSA", &claims());
+        let header2 = encode(&json!({"alg": "EdDSA", "kid": "k", "typ": "at+jwt"}));
+        let swapped = format!(
+            "{header2}.{}.{}",
+            parts[1],
+            other.split('.').nth(2).unwrap()
+        );
+        assert_eq!(
+            verify(&swapped, &keys, &policy(&all()), NOW),
+            Err(Failure::Signature)
+        );
+    }
+
+    #[test]
+    fn exp_must_be_a_sane_number() {
+        let signer = ed();
+        let keys = set(&[signer.jwk("k")]);
+        let at = |exp: Value| {
+            let mut c = claims();
+            c["exp"] = exp;
+            verify(
+                &signer.token(Some("k"), "EdDSA", &c),
+                &keys,
+                &policy(&all()),
+                NOW,
+            )
+        };
+        assert!(at(json!(NOW + 60)).is_ok());
+        assert!(
+            at(json!((NOW + 60) as f64 + 0.5)).is_ok(),
+            "fractional seconds are numbers"
+        );
+        for bad in [
+            json!(-1),
+            json!(0),
+            json!(1e300),
+            json!(null),
+            json!(true),
+            json!("1"),
+        ] {
+            assert_eq!(at(bad.clone()), Err(Failure::Claim("exp")), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_algorithm_the_issuer_omitted_is_refused_even_with_its_key_present() {
+        let signer = ed();
+        let other = rsa();
+        let keys = set(&[signer.jwk("e"), other.jwk("r")]);
+        let token = signer.token(Some("e"), "EdDSA", &claims());
+        assert_eq!(
+            verify(&token, &keys, &policy(&[Alg::Rs256]), NOW),
+            Err(Failure::Algorithm)
+        );
+    }
+
+    #[test]
+    fn a_document_with_too_many_keys_is_refused() {
+        let signer = ed();
+        let many: Vec<Value> = (0..=MAX_KEYS)
+            .map(|n| signer.jwk(&format!("k{n}")))
+            .collect();
+        assert!(KeySet::from_jwks(json!({ "keys": many }).to_string().as_bytes()).is_err());
     }
 }
