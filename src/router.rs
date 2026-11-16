@@ -233,6 +233,23 @@ impl Router {
         self.providers.keys().map(|s| s.as_str()).collect()
     }
 
+    /// The models registered providers serve beyond the curated list, as
+    /// `(provider key, model)` pairs in a stable order.
+    pub fn served_models(&self) -> Vec<(String, String)> {
+        let mut served: Vec<(String, String)> = self
+            .providers
+            .iter()
+            .flat_map(|(key, provider)| {
+                provider
+                    .served_models()
+                    .into_iter()
+                    .map(move |model| (key.clone(), model))
+            })
+            .collect();
+        served.sort();
+        served
+    }
+
     pub fn get(&self, key: &str) -> Result<&dyn Provider> {
         self.providers
             .get(key)

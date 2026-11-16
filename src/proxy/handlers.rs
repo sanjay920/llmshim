@@ -251,7 +251,10 @@ async fn chat_stream_inner(
 /// (`object`/`data`, which is what an OpenAI SDK's `models.list()` parses) and
 /// llmshim's own `models` array, which existing clients keep reading.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
-    Json(convert::models_response(&state.router.provider_keys()))
+    Json(convert::models_response(
+        &state.router.provider_keys(),
+        &state.router.served_models(),
+    ))
 }
 
 /// GET /health — health check

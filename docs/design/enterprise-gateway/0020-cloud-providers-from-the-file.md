@@ -1,12 +1,12 @@
 # 0020: Bedrock, Vertex and Azure from the file
 
-Status: slice 2 implemented (the feature, the configuration, its validation and the
-`--check` rules); the providers are not yet built from the file (slice 3).
-Until then a build with `serve-cloud` accepts such a file at `--check` and refuses
-it at start ("not wired into the server yet"), so nothing is silently left out. A
-contract note, written before any code (README working rule 3); the slices are at
-the end. `--check`'s exit codes for the service-account file are exercised by a
-process test that runs in the `serve-cloud` build, which CI gains in slice 4.
+Status: slices 2 and 3 implemented: the configuration and its validation, and the
+providers built into the router from the file (`/v1/models` lists Azure's
+deployments through a new defaulted `Provider::served_models`). A build without
+`serve-cloud` refuses such a file; slice 4 adds the CI job, the image build check
+and the 0014 row. A contract note, written before any code (README working rule 3).
+The process tests (`tests/integration_serve_cloud.rs`) run in the `serve-cloud`
+build, which CI gains in slice 4.
 
 ## What an operator needs
 
@@ -180,7 +180,7 @@ the Dockerfile, so it does not rot.
    validation by path, one kind's field on another kind, the shared-Vertex-identity
    rule, the missing-feature refusal, the secret-file checks (exit 3 and 1), the
    example file.
-3. Building the providers into the router from the file (build errors as issues,
+3. Done: building the providers into the router from the file (build errors as issues,
    `/v1/models` from deployments) and the process tests. An Azure success path
    cannot be tested end to end (the transport refuses a non-https endpoint and
    `llmshim` has no test trust anchor), so the process tests cover what can be
