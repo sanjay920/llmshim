@@ -20,27 +20,38 @@ usable from certain networks, so a leaked bearer key is useless outside them.
 [[auth.jwt]]                       # one table per trusted issuer
 name = "cluster"                   # shown in logs and /v1/serve/config; [A-Za-z0-9._-]
 issuer = "https://oidc.example.com"          # exact `iss`
-jwks_url = "https://oidc.example.com/keys"   # https only (loopback http allowed in tests)
+jwks_url = "https://oidc.example.com/keys"   # https; http only for a loopback address literal
+ca_file = "/etc/llmshim/jwks-ca.pem"         # optional: a private CA for the JWKS fetch
+headers = { authorization = { env = "JWKS_TOKEN" } }   # optional, secret references (as 0016)
 audience = "llmshim"                         # `aud` must contain it
 algorithms = ["RS256", "ES256"]              # required, non-empty; see Rules
 clock_skew_secs = 30                         # default 30, at most 300
 jwks_refresh_secs = 300                      # default 300, at least 30
+jwks_max_stale_secs = 3600                   # default 3600; 0 = never verify on stale keys
 
 [[keys]]
 name = "checkout"
 tenant = "payments"
-jwt = { issuer = "cluster", subject = "system:serviceaccount:payments:checkout" }
+jwt = { table = "cluster", subject = "system:serviceaccount:payments:checkout" }
 allowed_cidrs = ["10.0.0.0/8", "2001:db8::/32"]   # optional, on any key
 tier = 2
 ```
 
 A `[[keys]]` entry sets exactly one of `secret`, `sha256`, `client_san` and `jwt`
-(extending the rule 0011 set). `jwt.issuer` names an `[[auth.jwt]]` table;
-`jwt.subject` is the exact `sub`. Every other setting of the key (tenant, tier,
+(extending the rule 0011 set). `jwt.table` is the `name` of an `[[auth.jwt]]` table
+(not its `issuer` URL); `jwt.subject` is the exact `sub`. Table names are unique,
+`issuer` URLs are unique across tables, and two keys may not bind the same
+`(table, subject)`: each collides at `--check`, as a duplicate `client_san` does
+(0011). Without any `[[auth.jwt]]` table nothing below applies and every bearer
+value is looked up as a key, exactly as today. Every other setting of the key (tenant, tier,
 limits, budget) applies unchanged: the token only proves **which key**.
 
 ## Rules
 
+- **Choosing the table.** The verifier reads the token's *unverified* `iss` for one
+  purpose only: to pick the table whose `issuer` equals it exactly. No match is a
+  401 without any network activity, so one issuer's outage cannot turn unrelated
+  tokens into 503s. Nothing else from an unverified token is trusted.
 - **Algorithms are configuration, never the token.** The token's `alg` header is
   accepted only if the issuer's `algorithms` lists it. `none`, every `HS*` and any
   algorithm the build cannot verify are refused at `--check`, not at request time.
@@ -50,22 +61,41 @@ limits, budget) applies unchanged: the token only proves **which key**.
 - **The key is chosen by `kid`, from the issuer's JWKS, and must fit the
   algorithm.** A token without a `kid` is accepted only when the JWKS has exactly
   one usable key. A JWK's `kty`/`crv` must match the token's `alg`; a mismatch is
-  a failure, not a try-the-next-key.
+  a failure, not a try-the-next-key. `ring` has no JWK parser, so the verifier
+  builds keys itself, and refuses what it cannot vouch for: RSA only 2048 to 8192
+  bits; EC only P-256 (`ES256`, as an uncompressed point with the fixed-length
+  signature); `EdDSA` only Ed25519. A usable key has `use` absent or `sig`,
+  `key_ops` absent or containing `verify`, and a JWK `alg`, if present, equal to
+  the token's. A token whose header has `crit`, or `b64: false`, is refused (RFC
+  7515 requires refusing a `crit` the verifier does not implement). A token with
+  an unknown `kid` is a 401 while a refresh is allowed or just happened, and 503
+  only if the refresh itself failed.
 - **Claims.** `iss` equals the configured issuer exactly; `aud` (a string or an
   array) contains the audience; `exp` is required and must be in the future and
   `nbf`, when present, in the past, each within the skew; `sub` is required and is
   the whole identity. A token without `exp` is refused: a non-expiring bearer is a
-  key with extra steps. A token whose lifetime (`exp` minus `iat`, when `iat` is
-  present) exceeds 24 hours is refused too.
-- **A bearer key decides alone, as in 0011.** A request whose `Authorization:
-  Bearer` value is not a JWT shape (three dot-separated base64url parts whose first
+  key with extra steps. **`exp` more than 24 hours from now is refused**, whether
+  or not `iat` is present (the bound is on remaining life, so omitting `iat`
+  buys nothing); an `iat` more than the skew in the future is refused.
+- **A bearer key decides alone, as in 0011.** With at least one `[[auth.jwt]]`
+  table, a request whose `Authorization: Bearer` value is not a JWT shape (three dot-separated base64url parts whose first
   part decodes to a JSON object with `alg`) is looked up as a key, exactly as
   today. A JWT-shaped value is verified as a JWT and **never** falls back to key
   lookup: a failed token cannot be rescued by happening to equal a key's secret.
+  To keep an existing configuration from locking itself out, `--check` refuses a
+  `secret` key whose value is JWT-shaped when any table exists (a `sha256` key is
+  opaque and cannot be checked; the note in the key's docs says so).
 - **Unknown workload fails closed.** A valid token whose issuer and subject no
   key lists gets 401, and the response says nothing about which part failed (the
   access log records a reason class: `jwt_invalid`, `jwt_unknown_subject`,
   `jwks_unavailable`).
+- **Credential scope.** Idempotency entries, replay receipts, the usage log and the
+  fleet job scope are keyed by a digest of the credential (0003, 0010). A JWT is
+  re-minted about hourly, so a token digest would orphan that state on every
+  renewal and let a replayed `Idempotency-Key` bill twice. A JWT caller's scope is
+  the digest of `("jwt", table name, sub)`, domain-separated so it cannot equal a
+  token digest or an mTLS scope (0011); only the digest ever reaches Redis, and
+  the existing test that names stay out of Redis covers it.
 - **One identity per request.** Presenting both a JWT and a certificate-derived
   identity is the same ambiguity 0011 refuses; the token wins as a bearer does,
   and the certificate header is ignored.
@@ -73,16 +103,26 @@ limits, budget) applies unchanged: the token only proves **which key**.
   issuer, a 5-second connect and 10-second total timeout, a 1 MiB body limit, no
   redirects, https only, and the address is the configured one (no discovery
   document, no `jku` header, no `x5u`: a token never chooses where its key comes
-  from). Keys are cached for `jwks_refresh_secs`. An unknown `kid` triggers one
+  from). The fetch uses its own HTTP client, not the shared provider client, and
+  ignores `HTTP_PROXY`/`ALL_PROXY` (the trust path is the configured address and
+  `ca_file`, nothing ambient). `http://` is accepted only for a loopback address
+  literal, as a validation rule, so a test issuer works and production does not
+  fall to plain text. Keys are cached for `jwks_refresh_secs`. An unknown `kid` triggers one
   refresh, at most once per 30 seconds per issuer, so a flood of random `kid`s
   cannot turn the gateway into a request amplifier against the issuer.
-- **JWKS failures fail closed, with stale keys served for a bounded time.** If a
-  refresh fails the cached keys keep verifying for up to 1 hour past their
-  refresh time (an issuer outage must not take the platform down), then verification
-  fails with 503 `jwks_unavailable` and `Retry-After`. At startup an unreachable
-  JWKS is not fatal (the replica would otherwise not boot in an outage that
-  predates it), but `--check` reports it, and `/ready` is not ready until every
-  issuer has loaded keys once.
+- **JWKS failures fail closed, with stale keys served for a bounded, configured
+  time.** If a refresh fails the cached keys keep verifying for up to
+  `jwks_max_stale_secs` (default 1 hour) past their refresh time, so an issuer
+  outage need not take the platform down, then verification fails with 503
+  `jwks_unavailable` and `Retry-After`. **The revocation bound is therefore
+  `jwks_refresh_secs + jwks_max_stale_secs` while the issuer is unreachable**, and
+  `jwks_refresh_secs` otherwise; an operator who wants a tighter bound sets the
+  stale window to 0. At startup an unreachable JWKS is not fatal (the replica
+  would otherwise not boot in an outage that predates it) and `--check` reports it.
+  **`/ready` does not depend on any JWKS**: an unready replica receives no
+  traffic, so one issuer's outage would take down bearer-key and mTLS callers too.
+  A tokenless issuer's callers get 503; its state is on `/v1/serve/config`
+  (loaded, age, last error class) and in metrics.
 - **Secrets stay secrets.** A token is never logged, echoed, put in a span, a
   header towards a provider, or an error message. The JWKS URL may carry no
   credentials (userinfo is refused at validation).
@@ -100,12 +140,24 @@ limits, budget) applies unchanged: the token only proves **which key**.
 - **The peer address is the TCP peer, unless the peer is a trusted proxy.**
   `trusted_proxies` is a list of CIDRs (default empty). Only when the connection's
   peer is inside it is the right-most `X-Forwarded-For` entry **not** in
-  `trusted_proxies` taken as the client; `Forwarded` and every other header are
-  ignored. With no trusted proxies a forged `X-Forwarded-For` has no effect, which
-  a test pins. An unparseable or missing entry falls back to the peer address.
-- **Checked after authentication, before admission.** A request authenticated as
-  a key whose `allowed_cidrs` do not contain the client address is refused with
-  403 and never reaches the queue, a rate bucket or a budget. The refusal is
+  `trusted_proxies` taken as the client (multiple header lines are joined in
+  order first); `Forwarded` and every other header are ignored. With no trusted
+  proxies a forged `X-Forwarded-For` has no effect, which a test pins. **A trusted
+  peer with no usable client address fails closed:** a missing header, an entry
+  that is not a bare IP (a port, brackets, a zone id), or entries that are all
+  trusted proxies leave the request with no client address, and a key with
+  `allowed_cidrs` refuses it (403). The proxy's own address never stands in for
+  the client, because trusted ranges often sit inside the allowed ones.
+- **Addresses are normalised.** An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, as
+  a dual-stack listener reports an IPv4 peer) is unmapped before every comparison
+  (peer, forwarded entries, CIDRs). A CIDR with host bits set (`10.1.2.3/8`) and
+  one in `::ffff:0:0/96` are refused at validation.
+- **Checked right after authentication, before idempotency replay, receipt
+  lookup and admission, on every route** (`/v1/chat`, the native `/v1/messages`
+  and `/v1/chat/completions`, `/v1/responses`). A request authenticated as a key
+  whose `allowed_cidrs` do not contain the client address is refused with 403 and
+  never reaches a cached response, the queue, a rate bucket or a budget. Under
+  `allow_unauthenticated` there is no key, so no allowlist applies. The refusal is
   logged with the key's name and the address. It applies to all four credential
   kinds, so a stolen bearer key and a replayed JWT are both bound to the network.
 - **The listener's own address is not a network policy.** `[server] host` still
@@ -134,6 +186,11 @@ limits, budget) applies unchanged: the token only proves **which key**.
 - Opaque (non-JWT) access tokens.
 
 ## Slices
+
+Every slice that adds a dependency or a response shape also adds its 0014 row and
+an outage test in the `serve` suite (the JWKS endpoint going away is the new row),
+the 401/403/503 shapes in `api/openapi.yaml`, and metrics for refresh outcomes,
+stale serving and refresh refusals.
 
 1. This note.
 2. IP allowlists: `allowed_cidrs`, `trusted_proxies`, the 403 path, `--check`
