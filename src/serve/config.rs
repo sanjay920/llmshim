@@ -165,6 +165,17 @@ pub struct ControlPlane {
     /// applied (a first boot) still refuses a snapshot older than this. Defaults to 0.
     #[serde(default)]
     pub min_generation: Option<u64>,
+    /// Report the snapshot in force as `stale` once it is older than this many seconds,
+    /// counted from when its generation was applied (a distributor that wants silence to
+    /// count as fresh re-issues). An alert only, unless `refuse_when_stale`.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 31536000))]
+    pub max_age_secs: Option<u64>,
+    /// With `max_age_secs`: refuse new inference requests with 503 while the snapshot is
+    /// stale. `/health`, `/ready` and the operational endpoints keep answering. Off by
+    /// default: a control plane that is down must not take inference down (0024).
+    #[serde(default)]
+    pub refuse_when_stale: bool,
 }
 
 /// Caller authentication beyond bearer keys and client certificates.
@@ -1125,6 +1136,20 @@ impl ServeConfig {
             issues.push(Issue::new(
                 "server.allow_unauthenticated",
                 "cannot be true with [control_plane], which exists to identify callers",
+            ));
+        }
+        if let Some(max) = control_plane.max_age_secs {
+            if !(1..=31_536_000).contains(&max) {
+                issues.push(Issue::new(
+                    "control_plane.max_age_secs",
+                    "must be 1 to 31536000",
+                ));
+            }
+        }
+        if control_plane.refuse_when_stale && control_plane.max_age_secs.is_none() {
+            issues.push(Issue::new(
+                "control_plane.refuse_when_stale",
+                "needs max_age_secs: it is the age at which requests are refused",
             ));
         }
         if control_plane.org.is_empty() || control_plane.org.len() > 128 {

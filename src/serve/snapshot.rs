@@ -374,6 +374,112 @@ pub fn against_applied(snapshot: &Snapshot, applied: &Floor) -> Result<(), Issue
     Err(refusal.issue())
 }
 
+/// How old the snapshot in force is, shared by the reloader (which records what it
+/// applies), the status the admin listener serves and the request gate (0024). Age is
+/// measured from when a **new generation** was applied (or the start), by this
+/// process's clock: a distributor that wants "no news" to count as fresh re-issues.
+#[derive(Clone)]
+pub struct SnapshotClock(std::sync::Arc<ClockInner>);
+
+struct ClockInner {
+    org: String,
+    max_age_secs: Option<u64>,
+    refuse_when_stale: bool,
+    state: std::sync::Mutex<ClockState>,
+}
+
+struct ClockState {
+    generation: u64,
+    signer: String,
+    applied_at: u64,
+    signer_untrusted: bool,
+}
+
+/// What `/v1/serve/config` reports about the snapshot in force. Names and numbers
+/// only: never a key, a digest or a signature.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SnapshotStatus {
+    pub org: String,
+    pub generation: u64,
+    pub signer: String,
+    pub applied_at_epoch_secs: u64,
+    pub max_age_secs: Option<u64>,
+    /// Older than `max_age_secs` (never true without one): an alert, and a refusal of
+    /// new inference requests only with `refuse_when_stale`.
+    pub stale: bool,
+    /// The signer of the snapshot in force is no longer in `verify_keys`: it keeps
+    /// serving until a snapshot from a trusted key replaces it.
+    pub signer_untrusted: bool,
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl SnapshotClock {
+    pub fn new(control_plane: &ControlPlane) -> Self {
+        Self(std::sync::Arc::new(ClockInner {
+            org: control_plane.org.clone(),
+            max_age_secs: control_plane.max_age_secs,
+            refuse_when_stale: control_plane.refuse_when_stale,
+            state: std::sync::Mutex::new(ClockState {
+                generation: 0,
+                signer: String::new(),
+                applied_at: epoch_secs(),
+                signer_untrusted: false,
+            }),
+        }))
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ClockState> {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A snapshot was applied. The age restarts only when the generation is new.
+    pub fn applied(&self, generation: u64, signer: &str) {
+        let mut state = self.state();
+        if state.generation != generation || state.signer.is_empty() {
+            state.applied_at = epoch_secs();
+        }
+        state.generation = generation;
+        state.signer = signer.to_owned();
+    }
+
+    pub fn set_signer_untrusted(&self, untrusted: bool) {
+        self.state().signer_untrusted = untrusted;
+    }
+
+    fn stale_at(&self, state: &ClockState, now: u64) -> bool {
+        self.0
+            .max_age_secs
+            .is_some_and(|max| now.saturating_sub(state.applied_at) > max)
+    }
+
+    /// Whether a new inference request is refused now.
+    pub fn refusing(&self) -> bool {
+        self.0.refuse_when_stale && self.stale_at(&self.state(), epoch_secs())
+    }
+
+    pub fn status(&self) -> SnapshotStatus {
+        let state = self.state();
+        SnapshotStatus {
+            org: self.0.org.clone(),
+            generation: state.generation,
+            signer: state.signer.clone(),
+            applied_at_epoch_secs: state.applied_at,
+            max_age_secs: self.0.max_age_secs,
+            stale: self.stale_at(&state, epoch_secs()),
+            signer_untrusted: state.signer_untrusted,
+        }
+    }
+}
+
 /// Generate a signing key: its 32-byte seed (base64) and the `verify_keys` entry.
 pub fn keygen() -> Result<(String, String), &'static str> {
     let mut seed = [0u8; 32];

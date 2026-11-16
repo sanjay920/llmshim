@@ -407,6 +407,10 @@ pub async fn build_app(
         .filter_map(|text| super::allowlist::Cidr::parse(text).ok())
         .collect::<Vec<_>>()
         .into();
+    let clock = config
+        .control_plane
+        .as_ref()
+        .map(super::snapshot::SnapshotClock::new);
     let reload = ReloadHandles::new(
         keys.clone(),
         tenants,
@@ -421,6 +425,7 @@ pub async fn build_app(
             let state = state.clone();
             Arc::new(move || state.sync_fleet_workers()) as Arc<dyn Fn() + Send + Sync>
         }),
+        clock.clone(),
     );
     let reload_status = reload.status_handle();
     // Workload tokens (0017): built after the configuration is accepted, so a
@@ -451,6 +456,21 @@ pub async fn build_app(
             super::allowlist::enforce(allow.clone(), trusted.clone(), request, next)
         },
     ));
+    // With `refuse_when_stale` and a snapshot older than `max_age_secs`: new inference
+    // requests are refused; the operational endpoints keep answering (0024).
+    let app = match (&clock, config.control_plane.as_ref()) {
+        (Some(clock), Some(control_plane)) if control_plane.refuse_when_stale => {
+            let clock = clock.clone();
+            app.layer(axum::middleware::from_fn(
+                move |request: Request, next: Next| {
+                    let clock = clock.clone();
+                    async move { stale_gate(clock, request, next).await }
+                },
+            ))
+        }
+        _ => app,
+    };
+    let status_clock = clock.clone();
     let (app, admin) = match admin_address {
         Some(admin_address) => {
             // The admin routes never read the key store, but the internal header
@@ -460,9 +480,17 @@ pub async fn build_app(
                     "/v1/serve/config",
                     axum::routing::get(move || {
                         let status = reload_status.snapshot();
+                        let snapshot = status_clock.as_ref().map(|clock| clock.status());
                         let jwks = jwks_status.as_ref().map(|jwt| jwt.statuses());
                         async move {
                             let mut body = serde_json::to_value(status).unwrap_or_default();
+                            if let (Some(object), Some(snapshot)) = (body.as_object_mut(), snapshot)
+                            {
+                                object.insert(
+                                    "snapshot".into(),
+                                    serde_json::to_value(snapshot).unwrap_or_default(),
+                                );
+                            }
                             if let (Some(object), Some(jwks)) = (body.as_object_mut(), jwks) {
                                 object.insert(
                                     "jwks".into(),
@@ -557,6 +585,38 @@ pub async fn build_app(
 
 /// The main listener does not serve operational endpoints once they have a
 /// listener of their own.
+/// Refuse a new inference request while the policy snapshot is stale and the file says to
+/// (0024). The operational endpoints are not inference.
+async fn stale_gate(
+    clock: super::snapshot::SnapshotClock,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !clock.refusing() || crate::gateway::http::ADMIN_PATHS.contains(&request.uri().path()) {
+        return next.run(request).await;
+    }
+    let message =
+        "The policy snapshot is older than control_plane.max_age_secs; retry after it is refreshed";
+    let mut response = match crate::proxy::wire::native_route(request.uri().path()) {
+        Some(route) => crate::proxy::wire::fail(
+            route.wire,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            message,
+        ),
+        None => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": {
+                "code": "policy_snapshot_stale", "message": message}})),
+        )
+            .into_response(),
+    };
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("30"),
+    );
+    response
+}
+
 async fn hide_admin_paths(request: Request, next: Next) -> Response {
     if crate::gateway::http::ADMIN_PATHS.contains(&request.uri().path()) {
         return StatusCode::NOT_FOUND.into_response();
