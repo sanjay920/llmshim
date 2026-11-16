@@ -1,6 +1,6 @@
 # 0023: Native requests and answers that need no replay receipt
 
-Status: slice 2 implemented (the tripwire, `run_free_first` and its use on every native conversion; the benchmark re-run is slice 3). A contract note, written before any code (README working rule 3).
+Status: implemented (the tripwire, `run_free_first` and its use on every native conversion; the benchmark re-run is in 0018). It fixes receipt-free requests and does not help a caller that replays history. A contract note, written before any code (README working rule 3).
 The change is behavioural, not a new setting: nothing in the configuration file,
 the HTTP API or the receipt store's on-disk format changes.
 
@@ -155,4 +155,7 @@ keys to keep in step with the conversion.
 1. This note.
 2. **Done:** the tripwire, `run_free_first`, its use on every native conversion, the
    inline `replay_metadata`, and the tests above.
-3. The benchmark re-run recorded in 0018, and the roadmap line.
+3. **Done:** the benchmark re-run recorded in 0018 (third run). The first-turn case
+   went from 15 % and 27 % refused at 32 and 64 concurrent to none; a request with two
+   earlier turns is refused 93 % of the time at 32 and 64, because every assistant turn
+   is a locked store lookup (0018 lists options; they need their own note).

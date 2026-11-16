@@ -273,3 +273,83 @@ in the first run suggested, now measured by the harness and not by hand.
    and now the dominant limit on the native wire above a dozen requests in flight.
    Whether an answer with no reasoning block or tool call needs a receipt at all
    is still the question to settle.
+
+## Third run (2026-11-16, commit cf8b7e8): after 0023
+
+Binary built from cf8b7e8; the harness is that commit plus the `--history` flag added in
+the commit that records this run (the report's "working tree not clean" is that flag).
+Same host (Darwin 27.2.0 arm64, Apple M5 Pro, 18 logical cores), same method, release
+build, 15 s measured after 3 s warm-up, mock think time 0 ms. The harness gained
+`--history N` (earlier user/assistant text turns carried in every request), so the case
+the first two runs could not show is measured too. The first table is the request the
+earlier runs sent (a single user message); the second carries two earlier turns.
+
+**One user message** (`--concurrency 1,8,32,64`):
+
+| connections | path | requests | failed | req/s | p50 | p99 | added p50 | added p99 | peak RSS | upstream connections |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | mock directly | 330324 | 0 | 22020 | 0.04 ms | 0.06 ms | | | | 1 |
+| 1 | /v1/chat/completions | 92786 | 0 | 6185 | 0.16 ms | 0.20 ms | +0.11 ms | +0.14 ms | 90.8 MiB | 1 |
+| 1 | /v1/chat | 99864 | 0 | 6657 | 0.15 ms | 0.19 ms | +0.10 ms | +0.13 ms | 90.8 MiB | 0 |
+| 8 | mock directly | 1356092 | 0 | 90400 | 0.09 ms | 0.15 ms | | | | 8 |
+| 8 | /v1/chat/completions | 347704 | 0 | 23179 | 0.34 ms | 0.48 ms | +0.25 ms | +0.34 ms | 92.2 MiB | 7 |
+| 8 | /v1/chat | 356420 | 0 | 23760 | 0.33 ms | 0.47 ms | +0.25 ms | +0.33 ms | 92.2 MiB | 0 |
+| 32 | mock directly | 1695023 | 0 | 112994 | 0.28 ms | 0.45 ms | | | | 33 |
+| 32 | /v1/chat/completions | 562604 | 0 | 37505 | 0.85 ms | 1.15 ms | +0.57 ms | +0.70 ms | 99.4 MiB | 24 |
+| 32 | /v1/chat | 567208 | 0 | 37812 | 0.84 ms | 1.14 ms | +0.56 ms | +0.69 ms | 99.4 MiB | 0 |
+| 64 | mock directly | 1720036 | 0 | 114660 | 0.55 ms | 0.88 ms | | | | 65 |
+| 64 | /v1/chat/completions | 549457 | 0 | 36628 | 1.74 ms | 2.24 ms | +1.19 ms | +1.36 ms | 104.2 MiB | 32 |
+| 64 | /v1/chat | 545021 | 0 | 36332 | 1.75 ms | 2.20 ms | +1.21 ms | +1.32 ms | 104.5 MiB | 0 |
+
+**Memory (resident set of the serve process):** 11.0 MiB idle before any load, 104.5 MiB after the last phase.
+
+**Two earlier user/assistant turns** (`--history 2`):
+
+| connections | path | requests | failed | req/s | p50 | p99 | added p50 | added p99 | peak RSS | upstream connections |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | mock directly | 344325 | 0 | 22953 | 0.04 ms | 0.06 ms | | | | 1 |
+| 1 | /v1/chat/completions | 52805 | 0 | 3520 | 0.28 ms | 0.35 ms | +0.24 ms | +0.28 ms | 91.0 MiB | 1 |
+| 1 | /v1/chat | 89359 | 0 | 5957 | 0.16 ms | 0.22 ms | +0.12 ms | +0.16 ms | 91.2 MiB | 0 |
+| 8 | mock directly | 1454142 | 0 | 96936 | 0.08 ms | 0.14 ms | | | | 8 |
+| 8 | /v1/chat/completions | 134479 | 0 | 8965 | 0.87 ms | 1.16 ms | +0.79 ms | +1.03 ms | 90.5 MiB | 1 |
+| 8 | /v1/chat | 357078 | 0 | 23804 | 0.33 ms | 0.47 ms | +0.25 ms | +0.33 ms | 92.9 MiB | 6 |
+| 32 | mock directly | 1619086 | 0 | 107932 | 0.29 ms | 0.47 ms | | | | 32 |
+| 32 | /v1/chat/completions | 73205 | 699844 | 4880 | 2.40 ms | 2.79 ms | +2.11 ms | +2.31 ms | 96.8 MiB | 0 |
+| 32 | /v1/chat | 543017 | 0 | 36199 | 0.87 ms | 1.22 ms | +0.58 ms | +0.75 ms | 99.8 MiB | 24 |
+| 64 | mock directly | 1751515 | 0 | 116760 | 0.54 ms | 0.85 ms | | | | 64 |
+| 64 | /v1/chat/completions | 70040 | 749204 | 4669 | 3.24 ms | 4.33 ms | +2.70 ms | +3.48 ms | 101.5 MiB | 0 |
+| 64 | /v1/chat | 567617 | 0 | 37838 | 1.68 ms | 2.19 ms | +1.14 ms | +1.34 ms | 105.5 MiB | 57 |
+
+**Memory (resident set of the serve process):** 11.0 MiB idle before any load, 105.5 MiB after the last phase.
+
+### Reading it
+
+- **The first-turn case is fixed.** The native `/v1/chat/completions` wire answered every
+  request at 32 and 64 concurrent (0 failed of about 560,000 and 550,000), where the
+  first and second runs refused 15 % and 27 %, and throughput there (37,500 and 36,600
+  req/s) is the same as the gateway's own `/v1/chat`. Added latency over the mock is
+  +0.57 ms at 32 and +1.19 ms at 64 (p50), equal to `/v1/chat`'s. Peak RSS after the
+  last phase is 104 MiB, against 105 MiB for the second run's longer-lived process:
+  the concurrent conversion 0023 allows did not show up in memory at this load (one
+  small message; the memory gate in 0023 asks for a re-read with larger requests
+  before a heavier workload is sized from it).
+- **A caller that replays history is not helped, and is hurt worse than the first run
+  suggested.** With two earlier turns the native wire is slow even at one connection
+  (3,500 req/s against 6,200) and refuses **93 % of requests at 32 and 64**
+  (699,844 of 773,049; 749,204 of 819,244), while `/v1/chat` is unaffected. This is
+  what 0023 predicted from the code, not a regression: the Chat wire looks every
+  assistant turn up in the receipt store (a `get` that takes the store's lock and
+  reads its index), so it needs the executor and its two workers and one serial
+  ingress worker, and everything beyond them is refused. The first run did not show it
+  because it never sent an assistant turn.
+
+### Status of the findings
+
+2. *The replay-receipt executor refuses work when its slots are taken*: **resolved for
+   receipt-free requests** (0023), **open for a caller that replays history**. A
+   text-only assistant turn has no receipt to find, yet it pays for a locked store
+   lookup. Ideas, none decided: answer the lookup from the store's in-memory index
+   without the file lock when the receipt cannot exist (a negative check), skip the
+   lookup for an assistant message that carries no reasoning and no tool calls (the
+   wire writes a reasoning receipt only for those), or give the executor a bounded
+   wait and more workers. Each changes what a replay can find, so it needs its own note.

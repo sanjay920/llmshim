@@ -36,6 +36,9 @@ struct Args {
     think: Duration,
     /// `[upstream] pool_max_idle_per_host`; unset means the server's own default.
     pool: Option<u32>,
+    /// Earlier user/assistant text turns carried in every request (0023): with
+    /// any, the native Chat wire looks each assistant turn up in the receipt store.
+    history: usize,
     binary: String,
     json: Option<String>,
 }
@@ -47,6 +50,7 @@ fn parse() -> Args {
         warmup: Duration::from_secs(3),
         think: Duration::ZERO,
         pool: None,
+        history: 0,
         binary: "target/release/llmshim".into(),
         json: None,
     };
@@ -79,6 +83,9 @@ fn parse() -> Args {
                 )
             }
             "--pool" => args.pool = Some(value().parse().unwrap_or_else(|_| usage("bad --pool"))),
+            "--history" => {
+                args.history = value().parse().unwrap_or_else(|_| usage("bad --history"))
+            }
             "--bin" => args.binary = value(),
             "--json" => args.json = Some(value()),
             "-h" | "--help" => usage(""),
@@ -94,7 +101,7 @@ fn usage(problem: &str) -> ! {
     }
     eprintln!(
         "usage: serve_bench [--concurrency N,N,...] [--duration SECS] [--warmup SECS] \
-         [--think-ms MS] [--pool N] [--bin PATH] [--json FILE]"
+         [--think-ms MS] [--pool N] [--history N] [--bin PATH] [--json FILE]"
     );
     std::process::exit(if problem.is_empty() { 0 } else { 2 });
 }
@@ -196,9 +203,13 @@ async fn drive(
         .pool_max_idle_per_host(concurrency)
         .build()
         .unwrap();
-    let body = json!({"model": "inference/bench-model",
-        "messages": [{"role": "user", "content": "ping"}]})
-    .to_string();
+    let mut messages = Vec::new();
+    for turn in 0..args.history {
+        messages.push(json!({"role": "user", "content": format!("earlier {turn}")}));
+        messages.push(json!({"role": "assistant", "content": "pong"}));
+    }
+    messages.push(json!({"role": "user", "content": "ping"}));
+    let body = json!({"model": "inference/bench-model", "messages": messages}).to_string();
     let stop = Arc::new(AtomicBool::new(false));
     let measuring = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
@@ -496,10 +507,11 @@ async fn main() {
     );
     println!(
         "- load: closed loop at each listed number of concurrent connections, {}s measured after {}s warm-up; \
-         mock think time {} ms; client, mock and gateway on one machine\n- gateway `[upstream] pool_max_idle_per_host`: {}\n",
+         mock think time {} ms; client, mock and gateway on one machine\n- request history: {} earlier user/assistant text turn(s) before the ping\n- gateway `[upstream] pool_max_idle_per_host`: {}\n",
         args.duration.as_secs(),
         args.warmup.as_secs(),
         args.think.as_millis(),
+        args.history,
         args.pool.map_or("unset (the server's default: follows the concurrency, at least 256)".to_string(), |n| n.to_string())
     );
     println!(
