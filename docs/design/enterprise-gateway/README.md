@@ -54,6 +54,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0018: Benchmark](0018-benchmark.md)
 - [0019: Published, signed images and an SBOM](0019-signed-images.md)
 - [0020: Bedrock, Vertex and Azure from the file](0020-cloud-providers-from-the-file.md)
+- [0021: The upstream HTTP client and listener limits from the file](0021-upstream-client-from-the-file.md)
 
 ## Roadmap
 

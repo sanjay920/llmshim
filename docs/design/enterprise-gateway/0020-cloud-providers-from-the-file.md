@@ -171,7 +171,8 @@ does not rot.
   sources for Vertex other than a service-account file. Each needs a way to
   describe a token source in a file.
 - More than one instance of a kind in one file.
-- An inference-only `ambient_proxy`.
+- An inference-only `ambient_proxy` (0021 defines `[upstream] ambient_proxy`, which
+  does not apply to these transports: their transport is always scoped).
 - Catalog rows or prices for cloud-hosted models beyond what the catalog already
   carries for the exact `vertex-*/<model>` and Azure rows.
 
