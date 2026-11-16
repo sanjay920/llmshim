@@ -44,6 +44,24 @@ jobs:
           cargo test --locked --features serve-otel --test integration_serve_otel
           cargo test --locked --features serve-otel --lib serve::
 
+  # The cloud transports built into `serve` (0020): the AWS SDK, the Google and
+  # Azure paths and the configuration kinds that name them. Without this job the
+  # `serve-cloud` combination would compile nowhere in CI.
+  serve-cloud-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --features serve-cloud -- -D warnings
+      - name: Tests (every one, so the process tests and the exit codes run)
+        env:
+          LLMSHIM_CATALOG_OFFLINE: '1'
+        run: cargo test --locked --features serve-cloud --tests
+
   serve-redis-check:
     runs-on: ubuntu-latest
     timeout-minutes: 30

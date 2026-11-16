@@ -73,10 +73,9 @@ Phase 0: a production server mode
       throughput under concurrency
 - [x] `llmshim serve` boots the single-instance gateway from the file, including
       hashed caller keys (0004)
-- [ ] Bedrock, Vertex and Azure configurable from the file (0020): the
-      configuration, its validation, the providers built into the router and the
-      process tests are done; the `serve-cloud` CI job, the image build check and
-      the 0014 row remain
+- [x] Bedrock, Vertex and Azure configurable from the file (0020), behind
+      `serve-cloud`; a provider whose feature is not compiled is a startup error
+      naming the rebuild flag. Not in the published image (about 5 MB more, `docker image ls` on arm64; the owner's call)
 - [x] Redis fleet mode under `serve`, behind `serve-redis` (0006)
 - [x] Caller keys reload without a restart: SIGHUP and a watched file (0012)
 - [ ] Reload of everything else (providers, routes, limits)

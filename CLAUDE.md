@@ -769,6 +769,14 @@ pins that a build without the feature does not know the command. Never drive
 `process::exit` below `main` on this path. The `Serve feature` CI job builds and
 tests it on every PR; the release gate does not.
 
+## Cloud transports from the `serve` file (note 0020)
+
+`--features serve-cloud` builds Bedrock, Vertex and Azure into `serve`, so `[providers.*]` can
+use `kind = "bedrock" | "vertex-gemini" | "vertex-anthropic" | "azure"`. Each kind takes only
+its own fields; the transports' validation rules live in `providers::cloud_rules` and the
+transports and the file both call them, so they cannot disagree. A build without the feature
+refuses such a file naming the flag. `serve-cloud-check` runs every test in that build.
+
 ## Optional Bedrock transport
 
 The default-off `bedrock` feature exposes `providers::bedrock::{AwsProfile, Bedrock}`.

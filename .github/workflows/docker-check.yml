@@ -19,6 +19,9 @@ permissions:
 jobs:
   docker-check:
     runs-on: ubuntu-latest
+    # Three builds of the whole tree (no dependency layer is cached), one with the
+    # AWS SDK: a hang should cost an hour, not the default six.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Build the image
@@ -48,3 +51,18 @@ jobs:
           # command and hide a binary that dies at exec.
           schema=$(docker run --rm llmshim-ci-serve serve --print-schema)
           grep -q '"properties"' <<<"$schema"
+      - name: The cloud transports build into the image too, and what they cost
+        run: |
+          # Not the published feature set (0019): the combination a deployment on
+          # AWS, Google Cloud or Azure builds (0020). It must not rot, and the two
+          # sizes are what the decision to publish it rests on.
+          docker build --build-arg FEATURES=serve-redis,serve-otel,serve-cloud --tag llmshim-ci-cloud .
+          schema=$(docker run --rm llmshim-ci-cloud serve --print-schema)
+          grep -q '"properties"' <<<"$schema"
+          {
+            echo "### Image size"
+            echo "| features | size |"
+            echo "| --- | --- |"
+            echo "| serve-redis,serve-otel | $(docker image ls llmshim-ci-serve --format '{{.Size}}') |"
+            echo "| serve-redis,serve-otel,serve-cloud | $(docker image ls llmshim-ci-cloud --format '{{.Size}}') |"
+          } >> "$GITHUB_STEP_SUMMARY"
