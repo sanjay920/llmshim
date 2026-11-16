@@ -101,6 +101,39 @@ pub trait RateLimiter: Send + Sync {
     /// Record an upstream 429 for `key` so its bucket backs off. When the
     /// coordinator is distributed this backoff is shared across replicas.
     async fn penalize(&self, key: &RateKey, retry_after: Duration);
+
+    /// Follow a new set of limits (a reloaded configuration, 0022). A limiter
+    /// that holds its limits behind this method keeps the tokens its buckets
+    /// have, clamped to the new capacity, so a reload is not a reset. The
+    /// default does nothing, so an implementation that cannot be retuned (a
+    /// caller's own) is unchanged.
+    fn retune(&self, _config: RateLimitConfig) {}
+}
+
+/// The limits a limiter reads on every call, replaceable as a whole (0022).
+/// Cloning the config out of the lock per call is avoided: `resolve` reads
+/// under a short read lock.
+#[derive(Debug, Default)]
+pub(crate) struct LiveLimits(std::sync::RwLock<RateLimitConfig>);
+
+impl LiveLimits {
+    pub(crate) fn new(config: RateLimitConfig) -> Self {
+        Self(std::sync::RwLock::new(config))
+    }
+
+    pub(crate) fn resolve(&self, provider: &str) -> ProviderLimit {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolve(provider)
+    }
+
+    pub(crate) fn replace(&self, config: RateLimitConfig) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+    }
 }
 
 // ===========================================================================
@@ -146,6 +179,29 @@ impl TokenBucket {
             last: now,
             penalty_until: None,
         }
+    }
+
+    /// Follow a changed per-minute limit (0022). Time so far is credited at the
+    /// old rate, and the balance is clamped to the new capacity: a lowered limit
+    /// bites at once, a raised one refills at the new rate from what is there.
+    /// An unchanged limit leaves the bucket untouched.
+    fn retune(&mut self, per_minute: f64, now: Instant) {
+        let capacity = if per_minute == 0.0 {
+            0.0
+        } else {
+            per_minute.max(1.0)
+        };
+        if capacity == self.capacity {
+            return;
+        }
+        self.refill(now);
+        self.capacity = capacity;
+        self.refill_per_sec = if per_minute == 0.0 {
+            0.0
+        } else {
+            (per_minute / 60.0).max(f64::MIN_POSITIVE)
+        };
+        self.tokens = self.tokens.min(capacity);
     }
 
     /// Replenish tokens for the time elapsed since the last refill.
@@ -203,6 +259,22 @@ struct KeyBuckets {
 }
 
 impl KeyBuckets {
+    /// Follow `limit`: keep the tokens of a bucket whose limit changed, make one
+    /// for a limit that appeared and drop one whose limit is gone.
+    fn retune(&mut self, limit: ProviderLimit, now: Instant) {
+        fn one(bucket: &mut Option<TokenBucket>, limit: Option<u32>, now: Instant) {
+            match (limit, bucket.as_mut()) {
+                (Some(per_minute), Some(existing)) => existing.retune(per_minute as f64, now),
+                (Some(per_minute), None) => {
+                    *bucket = Some(TokenBucket::from_per_minute(per_minute as f64, now))
+                }
+                (None, _) => *bucket = None,
+            }
+        }
+        one(&mut self.rpm, limit.rpm, now);
+        one(&mut self.tpm, limit.tpm, now);
+    }
+
     /// Atomically admit one request (1 RPM token, `tpm_permits` TPM tokens).
     /// Both buckets must have room or neither is charged — returns the larger
     /// suggested wait on failure.
@@ -371,14 +443,18 @@ impl RateLimitConfig {
 /// replica. A `Mutex<HashMap>` is fine here: the critical section is a few
 /// float ops, dwarfed by the upstream network call it guards.
 pub struct InMemoryRateLimiter {
-    config: RateLimitConfig,
+    config: LiveLimits,
+    /// Set by [`RateLimiter::retune`]: the next call that finds no limit drops
+    /// the buckets, so a limit that comes back starts from a fresh bucket.
+    retuned: std::sync::atomic::AtomicBool,
     buckets: Mutex<HashMap<RateKey, KeyBuckets>>,
 }
 
 impl InMemoryRateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
-            config,
+            config: LiveLimits::new(config),
+            retuned: std::sync::atomic::AtomicBool::new(false),
             buckets: Mutex::new(HashMap::new()),
         }
     }
@@ -400,6 +476,14 @@ impl RateLimiter for InMemoryRateLimiter {
     async fn acquire(&self, key: &RateKey, permits: u32) -> Result<(), RetryAfter> {
         let limit = self.config.resolve(&key.provider);
         if limit.is_unlimited() {
+            if self
+                .retuned
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                // One sweep after a retune, not a lock on every unlimited call.
+                let mut map = self.buckets.lock().await;
+                map.retain(|key, _| !self.config.resolve(&key.provider).is_unlimited());
+            }
             return Ok(()); // no-op when unconfigured
         }
         if limit.has_zero_limit() {
@@ -410,6 +494,7 @@ impl RateLimiter for InMemoryRateLimiter {
         let entry = map
             .entry(key.clone())
             .or_insert_with(|| self.buckets_for(limit, now));
+        entry.retune(limit, now);
         entry
             .acquire(permits.max(1) as f64, now)
             .map_err(RetryAfter)
@@ -425,7 +510,20 @@ impl RateLimiter for InMemoryRateLimiter {
         let entry = map
             .entry(key.clone())
             .or_insert_with(|| self.buckets_for(limit, now));
+        entry.retune(limit, now);
         entry.penalize(retry_after, now);
+    }
+
+    fn retune(&self, config: RateLimitConfig) {
+        self.config.replace(config);
+        // Buckets of providers that no longer have a limit are dropped, now if the
+        // map is free and otherwise at the next call that finds no limit.
+        match self.buckets.try_lock() {
+            Ok(mut map) => map.retain(|key, _| !self.config.resolve(&key.provider).is_unlimited()),
+            Err(_) => self
+                .retuned
+                .store(true, std::sync::atomic::Ordering::Relaxed),
+        }
     }
 }
 
@@ -571,7 +669,7 @@ mod redis_impl {
     /// [`crate::client`] still protects against provider 429s.
     pub struct RedisRateLimiter {
         connections: crate::redis_operation::RedisConnectionManagerCache,
-        config: RateLimitConfig,
+        config: LiveLimits,
         rate_limit_script: redis::Script,
         penalty_script: redis::Script,
     }
@@ -584,7 +682,7 @@ mod redis_impl {
             let client = redis::Client::open(url)?;
             Ok(Self {
                 connections: crate::redis_operation::RedisConnectionManagerCache::new(client),
-                config,
+                config: LiveLimits::new(config),
                 rate_limit_script: redis::Script::new(RATE_LIMIT_LUA),
                 penalty_script: redis::Script::new(PENALTY_LUA),
             })
@@ -689,6 +787,13 @@ mod redis_impl {
             {
                 eprintln!("warning: redis penalize skipped, operation failed ({error})");
             }
+        }
+
+        /// Each call presents this replica's rate and capacity, so the shared
+        /// bucket follows whichever replica asks; the script clamps a lowered
+        /// capacity on the next call and keeps the tokens.
+        fn retune(&self, config: RateLimitConfig) {
+            self.config.replace(config);
         }
     }
 
@@ -1498,6 +1603,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_limiter_presents_the_retuned_limit_and_keeps_the_tokens() {
+        let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
+            return;
+        };
+        let provider = format!("limiter-retune-{}", uuid::Uuid::new_v4().simple());
+        let key = RateKey::provider(&provider);
+        let limiter = RedisRateLimiter::new(&url, RateLimitConfig::with_global(Some(100), None))
+            .expect("valid Redis URL");
+        for _ in 0..4 {
+            limiter.acquire(&key, 1).await.unwrap();
+        }
+        limiter.retune(RateLimitConfig::with_global(Some(2), None));
+        assert!(limiter.acquire(&key, 1).await.is_ok());
+        assert!(limiter.acquire(&key, 1).await.is_ok());
+        assert!(limiter.acquire(&key, 1).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retune_keeps_an_active_penalty() {
+        let limiter = InMemoryRateLimiter::new(RateLimitConfig::with_global(Some(60), None));
+        let key = RateKey::provider("p");
+        limiter.penalize(&key, Duration::from_secs(5)).await;
+        limiter.retune(RateLimitConfig::with_global(Some(120), None));
+        assert!(limiter.acquire(&key, 1).await.is_err(), "still backing off");
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(limiter.acquire(&key, 1).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inmemory_retune_clamps_keeps_tokens_and_is_not_a_reset() {
+        let limiter = InMemoryRateLimiter::new(RateLimitConfig::with_global(Some(60), None));
+        let key = RateKey::provider("p");
+        for _ in 0..50 {
+            limiter.acquire(&key, 1).await.unwrap();
+        }
+        // 10 left. Retuning to the same limit is not a reset.
+        limiter.retune(RateLimitConfig::with_global(Some(60), None));
+        for _ in 0..10 {
+            limiter.acquire(&key, 1).await.unwrap();
+        }
+        assert!(limiter.acquire(&key, 1).await.is_err());
+        // Time refills at the new rate after a raise: 120/min is 2 per second.
+        limiter.retune(RateLimitConfig::with_global(Some(120), None));
+        // The bucket follows the new limit at its next use, crediting the time
+        // so far at the old rate (nothing has passed), then refills at the new.
+        assert!(limiter.acquire(&key, 1).await.is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        limiter.acquire(&key, 1).await.unwrap();
+        limiter.acquire(&key, 1).await.unwrap();
+        assert!(limiter.acquire(&key, 1).await.is_err());
     }
 
     #[cfg(feature = "redis-coordination")]

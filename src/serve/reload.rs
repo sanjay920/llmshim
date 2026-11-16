@@ -44,6 +44,10 @@ pub struct ReloadHandles {
     pub(crate) allow: super::allowlist::AllowTable,
     /// The gateway's router (0022): providers and routes are replaced as one.
     pub(crate) router: crate::router::RouterHandle,
+    /// Retunes every holder of the provider limits (0022). Called before the
+    /// router is replaced, so a lowered limit takes hold no later than the
+    /// provider that needs it.
+    pub(crate) limits: Arc<dyn Fn(crate::proxy::ratelimit::RateLimitConfig) + Send + Sync>,
     /// A fleet replica's workers follow the provider set it started with, so a
     /// reload cannot change providers or routes there yet (0022, slice 3).
     pub(crate) fleet: bool,
@@ -57,6 +61,7 @@ impl ReloadHandles {
         key_names: KeyNames,
         allow: super::allowlist::AllowTable,
         router: crate::router::RouterHandle,
+        limits: Arc<dyn Fn(crate::proxy::ratelimit::RateLimitConfig) + Send + Sync>,
         fleet: bool,
     ) -> Self {
         Self {
@@ -65,6 +70,7 @@ impl ReloadHandles {
             key_names,
             allow,
             router,
+            limits,
             fleet,
             status: StatusHandle::default(),
         }
@@ -132,6 +138,9 @@ pub struct ReloadStatus {
     pub last_reload: Option<ReloadAttempt>,
     /// 0 until a reload replaces the providers or routes; each such reload adds one.
     pub router_generation: u64,
+    /// 0 until a reload changes the rate limits; each such reload adds one. The
+    /// limits are separate objects from the router (0022), so each has its own.
+    pub limits_generation: u64,
     /// Providers whose `api_key` is an `{ env = ... }` reference. A process's
     /// environment cannot change while it runs, so a reload cannot rotate these:
     /// only a `{ file }` secret can be rotated (0022).
@@ -179,6 +188,8 @@ struct Active {
     document: Value,
     /// What the providers and routes in force were built from.
     router: RouterPrint,
+    /// What the rate limits in force were built from.
+    limits: String,
     fingerprint: String,
     enforced: bool,
     /// A digest of the last rejection, to recognize a repeat.
@@ -214,16 +225,19 @@ impl Reloader {
         let document = document_without_reloadable(text, format).map_err(file_issue)?;
         let (providers_doc, routes_doc) = reloadable_parts(text, format).map_err(file_issue)?;
         let router = RouterPrint::of(config, &providers_doc, &routes_doc, env, None);
+        let limits = limits_print(config);
         let current = handles.keys.current();
         let active = Active {
             document,
             fingerprint: format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{}",
                 current.fingerprint(),
                 handles.allow.fingerprint(),
-                router.fingerprint()
+                router.fingerprint(),
+                limits
             ),
             router,
+            limits,
             enforced: current.is_enforced(),
             last_rejection: None,
             pending: None,
@@ -240,6 +254,7 @@ impl Reloader {
                 in_sync: true,
                 last_reload: None,
                 router_generation: 0,
+                limits_generation: 0,
                 env_secret_providers: active.router.env_form(),
             };
         });
@@ -284,8 +299,11 @@ impl Reloader {
                     changes,
                     env_form,
                 } => {
-                    if !changes.is_empty() {
+                    if changes.iter().any(|change| change != "limits") {
                         status.router_generation += 1;
+                    }
+                    if changes.iter().any(|change| change == "limits") {
+                        status.limits_generation += 1;
                     }
                     status.env_secret_providers.clone_from(env_form);
                     status.generation = *generation;
@@ -419,7 +437,9 @@ impl Reloader {
         } else {
             router
         };
-        let changes = active.router.changes_to(&router);
+        let mut changes = active.router.changes_to(&router);
+        let limits = limits_print(&loaded.config);
+        let limits_changed = limits != active.limits;
         let mut next_router = None;
         if !changes.is_empty() {
             if self.handles.fleet {
@@ -472,11 +492,15 @@ impl Reloader {
         // fingerprint, one debounce.
         let allowlists = super::keys::allowlists(&loaded.config, env);
         let fingerprint = format!(
-            "{}:{}:{}",
+            "{}:{}:{}:{}",
             store.fingerprint(),
             super::allowlist::AllowTable::fingerprint_of(&allowlists),
-            router.fingerprint()
+            router.fingerprint(),
+            limits
         );
+        if limits_changed {
+            changes.push("limits".to_string());
+        }
         if fingerprint == active.fingerprint {
             active.pending = None;
             return Step::Unchanged { config_sha256 };
@@ -495,6 +519,12 @@ impl Reloader {
         // restricted is already bound when the store starts to know it.
         self.handles.allow.replace(allowlists);
         self.handles.keys.replace(store);
+        // The limits first, then the router (0022): a lowered limit holds no later
+        // than the provider that needs it.
+        if limits_changed {
+            (self.handles.limits)(super::build::rate_limit_config(&loaded.config));
+            active.limits = limits;
+        }
         if let Some(next) = next_router {
             self.handles.router.replace(next);
         }
@@ -563,6 +593,17 @@ fn document_without_reloadable(text: &str, format: Format) -> Result<Value, Stri
         for name in ["keys", "providers", "routes"] {
             table.remove(name);
         }
+        // The rate limits reload too; the rest of `[limits]` does not. An emptied
+        // table is dropped so that a file with only limits and one with no
+        // `[limits]` table at all compare equal.
+        if let Some(Value::Object(limits)) = table.get_mut("limits") {
+            for name in ["rpm", "tpm", "providers"] {
+                limits.remove(name);
+            }
+            if limits.is_empty() {
+                table.remove("limits");
+            }
+        }
     }
     Ok(document)
 }
@@ -572,6 +613,14 @@ fn reloadable_parts(text: &str, format: Format) -> Result<(Value, Value), String
     let document = parse_document(text, format)?;
     let part = |name: &str| document.get(name).cloned().unwrap_or(Value::Null);
     Ok((part("providers"), part("routes")))
+}
+
+/// What the provider rate limits are, as text to compare: the values only.
+fn limits_print(config: &ServeConfig) -> String {
+    format!(
+        "{:?}:{:?}:{:?}",
+        config.limits.rpm, config.limits.tpm, config.limits.providers
+    )
 }
 
 /// What one provider was built from: its table as written, and digests of the
@@ -791,6 +840,7 @@ mod tests {
         file: PathBuf,
         keys: LiveKeys,
         router: crate::router::RouterHandle,
+        limiter: Arc<crate::proxy::ratelimit::InMemoryRateLimiter>,
         reloader: Reloader,
     }
 
@@ -815,6 +865,10 @@ mod tests {
                 super::super::build::build_router_for_test(&loaded.config, &env, &mut issues),
             );
             assert!(issues.is_empty(), "{issues:?}");
+            let limiter = Arc::new(crate::proxy::ratelimit::InMemoryRateLimiter::new(
+                super::super::build::rate_limit_config(&loaded.config),
+            ));
+            let retuned = limiter.clone();
             let reloader = Reloader::new(
                 &file,
                 &loaded.text,
@@ -827,6 +881,9 @@ mod tests {
                     key_names,
                     crate::serve::allowlist::AllowTable::default(),
                     router.clone(),
+                    Arc::new(move |limits| {
+                        crate::proxy::ratelimit::RateLimiter::retune(&*retuned, limits)
+                    }),
                     fleet,
                 ),
             )
@@ -836,6 +893,7 @@ mod tests {
                 file,
                 keys,
                 router,
+                limiter,
                 reloader,
             }
         }
@@ -964,7 +1022,10 @@ mod tests {
     fn putting_a_rejected_file_back_clears_the_alert() {
         let initial = text("", &key("a", "acme", OLD, ""));
         let fixture = Fixture::new(&initial);
-        fixture.write(&text("[limits]\nrpm = 1", &key("a", "acme", OLD, "")));
+        fixture.write(&text(
+            "[limits]\nqueue_timeout_ms = 1",
+            &key("a", "acme", OLD, ""),
+        ));
         assert!(matches!(fixture.reload(), Outcome::Rejected { .. }));
         let rejected = fixture.reloader.status();
         assert!(!rejected.in_sync, "the file is not what is running");
@@ -1058,7 +1119,7 @@ mod tests {
         let fixture = Fixture::new(&text("[server]\nport = 3000", &key("a", "acme", OLD, "")));
         // Also revokes the key and adds one, which must not be applied alone.
         fixture.write(&text(
-            "[server]\nport = 3001\n[limits]\nrpm = 10",
+            "[server]\nport = 3001\n[limits]\nmax_concurrency = 10",
             &key("b", "globex", NEW, ""),
         ));
         let Outcome::Rejected { issues, .. } = fixture.reload() else {
@@ -1080,7 +1141,10 @@ mod tests {
     fn the_same_failure_is_flagged_as_a_repeat_until_the_file_changes() {
         let initial = text("", &key("a", "acme", OLD, ""));
         let fixture = Fixture::new(&initial);
-        fixture.write(&text("[limits]\nrpm = 1", &key("a", "acme", OLD, "")));
+        fixture.write(&text(
+            "[limits]\nqueue_timeout_ms = 1",
+            &key("a", "acme", OLD, ""),
+        ));
         assert!(matches!(
             fixture.reload(),
             Outcome::Rejected {
@@ -1099,7 +1163,10 @@ mod tests {
             "a repeat keeps the time it first failed"
         );
         // A different failure is news again.
-        fixture.write(&text("[limits]\nrpm = 2", &key("a", "acme", OLD, "")));
+        fixture.write(&text(
+            "[limits]\nqueue_timeout_ms = 2",
+            &key("a", "acme", OLD, ""),
+        ));
         assert!(matches!(
             fixture.reload(),
             Outcome::Rejected {
@@ -1464,6 +1531,105 @@ mod tests {
         }
         assert_eq!(fixture.reloader.status().router_generation, 0);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    // ---- rate limits (0022, slice 4) ----
+
+    fn key_for(provider: &str) -> crate::proxy::ratelimit::RateKey {
+        crate::proxy::ratelimit::RateKey {
+            provider: provider.to_string(),
+            tenant: None,
+        }
+    }
+
+    async fn drain(
+        limiter: &crate::proxy::ratelimit::InMemoryRateLimiter,
+        provider: &str,
+    ) -> usize {
+        let mut admitted = 0;
+        while crate::proxy::ratelimit::RateLimiter::acquire(limiter, &key_for(provider), 1)
+            .await
+            .is_ok()
+        {
+            admitted += 1;
+            assert!(admitted < 10_000, "the limiter never refused");
+        }
+        admitted
+    }
+
+    #[tokio::test]
+    async fn a_lowered_limit_applies_to_the_next_request_and_keeps_the_tokens() {
+        let fixture = Fixture::new(&text("[limits]\nrpm = 100", &key("k", "acme", OLD, "")));
+        // Spend 60 of the 100 tokens.
+        for _ in 0..60 {
+            crate::proxy::ratelimit::RateLimiter::acquire(&*fixture.limiter, &key_for("openai"), 1)
+                .await
+                .unwrap();
+        }
+        // Lower to 30: the 40 tokens left are clamped to the new capacity.
+        fixture.write(&text("[limits]\nrpm = 30", &key("k", "acme", OLD, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        assert_eq!(fixture.reloader.status().limits_generation, 1);
+        assert_eq!(fixture.reloader.status().router_generation, 0);
+        assert_eq!(
+            fixture.reloader.status().last_reload.unwrap().changes,
+            ["limits"]
+        );
+        assert_eq!(drain(&fixture.limiter, "openai").await, 30);
+    }
+
+    #[tokio::test]
+    async fn a_reload_is_not_a_limit_reset_for_a_provider_whose_limit_did_not_change() {
+        let fixture = Fixture::new(&text("[limits]\nrpm = 100", &key("k", "acme", OLD, "")));
+        for _ in 0..90 {
+            crate::proxy::ratelimit::RateLimiter::acquire(&*fixture.limiter, &key_for("openai"), 1)
+                .await
+                .unwrap();
+        }
+        // Another change entirely (a caller key); the same limit is presented again.
+        fixture.write(&text("[limits]\nrpm = 100", &key("j", "globex", NEW, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        assert_eq!(fixture.reloader.status().limits_generation, 0);
+        assert!(drain(&fixture.limiter, "openai").await <= 11);
+    }
+
+    #[tokio::test]
+    async fn a_removed_limit_removes_the_bucket_and_a_raised_one_refills_from_what_is_left() {
+        let fixture = Fixture::new(&text("[limits]\nrpm = 10", &key("k", "acme", OLD, "")));
+        assert_eq!(drain(&fixture.limiter, "openai").await, 10);
+        fixture.write(&text("", &key("k", "acme", OLD, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        // No limit: nothing is refused.
+        assert!(crate::proxy::ratelimit::RateLimiter::acquire(
+            &*fixture.limiter,
+            &key_for("openai"),
+            1
+        )
+        .await
+        .is_ok());
+        // The limit comes back, higher: a fresh bucket, not the drained one.
+        fixture.write(&text("[limits]\nrpm = 20", &key("k", "acme", OLD, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        assert_eq!(drain(&fixture.limiter, "openai").await, 20);
+        assert_eq!(fixture.reloader.status().limits_generation, 2);
+    }
+
+    #[test]
+    fn a_limits_change_applies_on_a_fleet_replica_and_the_other_limits_stay_refused() {
+        let fixture = Fixture::with_fleet(
+            &text("[limits]\nrpm = 100", &key("k", "acme", OLD, "")),
+            true,
+        );
+        fixture.write(&text("[limits]\nrpm = 50", &key("k", "acme", OLD, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        fixture.write(&text(
+            "[limits]\nrpm = 50\nqueue_timeout_ms = 10",
+            &key("k", "acme", OLD, ""),
+        ));
+        let Outcome::Rejected { issues, .. } = fixture.reload() else {
+            panic!("the queue timeout is fixed at start");
+        };
+        assert_eq!(issues[0].path, "limits");
     }
 
     #[test]

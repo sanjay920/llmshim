@@ -332,21 +332,7 @@ pub async fn build_app(
     if let Some(ms) = config.limits.queue_timeout_ms {
         gateway.max_wait = Duration::from_millis(ms);
     }
-    let rate_limits = RateLimitConfig::with_limits(
-        ProviderLimit {
-            rpm: config.limits.rpm,
-            tpm: config.limits.tpm,
-        },
-        config.limits.providers.iter().map(|(name, limit)| {
-            (
-                name.clone(),
-                ProviderLimit {
-                    rpm: limit.rpm,
-                    tpm: limit.tpm,
-                },
-            )
-        }),
-    );
+    let rate_limits = rate_limit_config(config);
     let idempotency_ttl_secs = config
         .state
         .idempotency_ttl_secs
@@ -427,6 +413,10 @@ pub async fn build_app(
         key_names.clone(),
         allow.clone(),
         state.router_handle(),
+        {
+            let state = state.clone();
+            Arc::new(move |limits| state.apply_limits(limits))
+        },
         fleet,
     );
     let reload_status = reload.status_handle();
@@ -652,6 +642,26 @@ pub(crate) fn build_router_for_test(
     issues: &mut Vec<Issue>,
 ) -> Router {
     build_router(config, env, issues)
+}
+
+/// The provider limits the file sets (`[limits] rpm`, `tpm` and
+/// `[limits.providers.*]`): built at start and again by a reload (0022).
+pub(crate) fn rate_limit_config(config: &ServeConfig) -> RateLimitConfig {
+    RateLimitConfig::with_limits(
+        ProviderLimit {
+            rpm: config.limits.rpm,
+            tpm: config.limits.tpm,
+        },
+        config.limits.providers.iter().map(|(name, limit)| {
+            (
+                name.clone(),
+                ProviderLimit {
+                    rpm: limit.rpm,
+                    tpm: limit.tpm,
+                },
+            )
+        }),
+    )
 }
 
 fn build_router_with(

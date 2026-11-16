@@ -673,6 +673,13 @@ pub struct DistributedGateway {
 }
 
 impl DistributedGateway {
+    /// Follow a new set of limits (0022): the shared limiter presents this
+    /// replica's rate on every call.
+    #[cfg(feature = "serve")]
+    pub(crate) fn retune_limits(&self, config: crate::proxy::ratelimit::RateLimitConfig) {
+        self.limiter.retune(config);
+    }
+
     /// Connect to Redis and build the gateway. The rate limiter should be the
     /// shared [`RedisRateLimiter`] so the whole fleet coordinates.
     pub async fn connect(

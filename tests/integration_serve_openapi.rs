@@ -213,7 +213,7 @@ async fn a_rejected_reload_still_satisfies_the_status_schema() {
     rewrite(
         &server,
         &format!(
-            "{}\n[limits]\nrpm = 600\n",
+            "{}\n[limits]\nqueue_timeout_ms = 6000\n",
             admin_config("http://127.0.0.1:1")
         ),
     );
