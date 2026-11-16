@@ -309,7 +309,7 @@ crate with `features = ["serve"]` for the snapshot signer and loader, so the two
   `trusted_proxies`) is judged there, which refuses the whole snapshot by path with the previous one serving.
 - The control crate's lockfile pins the root crate's version: a root or catalog version bump needs
   `cargo update -p llmshim -p llmshim-catalog` in `crates/llmshim-control` (noted in CLAUDE.md).
-- Not in 3a: the HTTP API and its OpenAPI document and the binary (3b), Postgres (4).
+- Slice 3b added the HTTP API (0026), `openapi.yaml` (compared with the router's route table in both directions by a test) and the `llmshim-control serve` binary. Postgres is slice 4.
 
 ## Slices
 
@@ -323,7 +323,7 @@ crate with `features = ["serve"]` for the snapshot signer and loader, so the two
    with `[[keys]]`, the `--check` rules on snapshot keys, stale status and refusal,
    revocation and expiry effect on the next request, a removed signer.
 3. The `llmshim-control` crate: **3a done** (SQLite store, the model above, key lifecycle, snapshot
-   publication as a library); 3b the HTTP API, its OpenAPI document and the binary.
+   publication as a library); 3b done (the HTTP API of 0026, its OpenAPI document and the `llmshim-control` binary).
 4. Postgres.
 5. The pull delivery and the data plane's poller (after 3: the endpoint is its first
    network surface).

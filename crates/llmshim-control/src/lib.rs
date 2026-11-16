@@ -14,6 +14,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+pub mod api;
+
 const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]
@@ -338,6 +340,9 @@ fn check_fields(new: &NewKey) -> Result<()> {
         if cidrs.is_empty() {
             return invalid("allowed_cidrs is empty, which would refuse every request; omit it");
         }
+        if cidrs.len() > 256 {
+            return invalid("allowed_cidrs holds more than 256 entries");
+        }
         for cidr in cidrs {
             if llmshim::serve::allowlist::Cidr::parse(cidr).is_err() {
                 return invalid("allowed_cidrs holds an entry that is not an address or CIDR");
@@ -503,6 +508,46 @@ impl Store {
         found
             .map(|_| ())
             .ok_or_else(|| Error::NotFound(format!("{table} {id}")))
+    }
+
+    pub fn orgs(&self) -> Result<Vec<Org>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id, name, created_at FROM orgs ORDER BY rowid")?;
+        let rows = statement.query_map([], |row| {
+            Ok(Org {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn projects(&self, team_id: &str) -> Result<Vec<Project>> {
+        require_in(&self.conn, "teams", team_id)?;
+        let mut statement = self.conn.prepare(
+            "SELECT id, team_id, name, created_at FROM projects WHERE team_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([team_id], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                team_id: row.get(1)?,
+                name: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn teams_checked(&self, org_id: &str) -> Result<Vec<Team>> {
+        require_in(&self.conn, "orgs", org_id)?;
+        teams_of(&self.conn, org_id)
+    }
+
+    pub fn keys_checked(&self, org_id: &str) -> Result<Vec<KeyRecord>> {
+        require_in(&self.conn, "orgs", org_id)?;
+        keys_of(&self.conn, org_id)
     }
 
     pub fn teams(&self, org_id: &str) -> Result<Vec<Team>> {
@@ -774,12 +819,27 @@ fn create_key_in(
                     "a client_san is dns:<name> or uri:<uri>, ASCII, with no whitespace".into(),
                 ));
             }
-            ("client_san", None, None, Some(san.clone()), None, None)
+            // DNS names compare case-insensitively on the data plane, so they are stored (and
+            // made unique) in that form.
+            let canonical = match san.strip_prefix("dns:") {
+                Some(name) => format!("dns:{}", name.to_ascii_lowercase()),
+                None => san.clone(),
+            };
+            ("client_san", None, None, Some(canonical), None, None)
         }
         Credential::Jwt { table, subject } => {
-            if table.is_empty() || subject.is_empty() {
+            if table.is_empty() || table.len() > 128 || !table.bytes().all(|b| b.is_ascii_graphic())
+            {
                 return Err(Error::Invalid(
-                    "a jwt binding needs a table and a subject".into(),
+                    "a jwt table is 1 to 128 visible ASCII characters".into(),
+                ));
+            }
+            if subject.is_empty()
+                || subject.len() > llmshim::serve::jwt::MAX_SUBJECT_BYTES
+                || !subject.bytes().all(|b| b.is_ascii_graphic())
+            {
+                return Err(Error::Invalid(
+                    "a jwt subject is 1 to 512 visible ASCII characters".into(),
                 ));
             }
             (
@@ -931,6 +991,11 @@ CREATE TABLE keys (
     revoked_at TEXT,
     UNIQUE (org_id, name)
 );
+-- What the data plane refuses as a whole snapshot, refused here (an active identity is one key).
+CREATE UNIQUE INDEX keys_client_san ON keys (org_id, client_san)
+    WHERE client_san IS NOT NULL AND state = 'active';
+CREATE UNIQUE INDEX keys_jwt ON keys (org_id, jwt_table, jwt_subject)
+    WHERE jwt_table IS NOT NULL AND state = 'active';
 CREATE TABLE history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,

@@ -20,11 +20,21 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 ring = "0.17"
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 
 [dev-dependencies]
 serde_json = "1"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+serde_yaml = "0.9"
+uuid = { version = "1", features = ["v4"] }
 
 # Its own workspace and lockfile, so the database and its C library never enter the root
 # crate's dependency graph or its lockfile: default, proxy, gateway and serve builds do not
 # change (working rule 1).
 [workspace]
+
+[[bin]]
+name = "llmshim-control"
+path = "src/main.rs"
