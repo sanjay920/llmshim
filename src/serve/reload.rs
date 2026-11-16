@@ -41,15 +41,22 @@ pub struct ReloadHandles {
     pub(crate) keys: LiveKeys,
     pub(crate) tenants: TenantNames,
     pub(crate) key_names: KeyNames,
+    pub(crate) allow: super::allowlist::AllowTable,
     pub(crate) status: StatusHandle,
 }
 
 impl ReloadHandles {
-    pub(crate) fn new(keys: LiveKeys, tenants: TenantNames, key_names: KeyNames) -> Self {
+    pub(crate) fn new(
+        keys: LiveKeys,
+        tenants: TenantNames,
+        key_names: KeyNames,
+        allow: super::allowlist::AllowTable,
+    ) -> Self {
         Self {
             keys,
             tenants,
             key_names,
+            allow,
             status: StatusHandle::default(),
         }
     }
@@ -183,7 +190,7 @@ impl Reloader {
         let current = handles.keys.current();
         let active = Active {
             document,
-            fingerprint: current.fingerprint(),
+            fingerprint: format!("{}:{}", current.fingerprint(), handles.allow.fingerprint()),
             enforced: current.is_enforced(),
             last_rejection: None,
             pending: None,
@@ -359,7 +366,14 @@ impl Reloader {
         self.handles
             .key_names
             .add(super::keys::key_names(&loaded.config, env));
-        let fingerprint = store.fingerprint();
+        // Who may call and from where change together or not at all: one
+        // fingerprint, one debounce.
+        let allowlists = super::keys::allowlists(&loaded.config, env);
+        let fingerprint = format!(
+            "{}:{}",
+            store.fingerprint(),
+            super::allowlist::AllowTable::fingerprint_of(&allowlists)
+        );
         if fingerprint == active.fingerprint {
             active.pending = None;
             return Step::Unchanged { config_sha256 };
@@ -373,6 +387,10 @@ impl Reloader {
         }
         active.pending = None;
         let credentials = store.credential_count();
+        // The allowlists first, and keyed by credential rather than by asking the
+        // store (see `allowlist::enforce`): a key that is new in this reload and
+        // restricted is already bound when the store starts to know it.
+        self.handles.allow.replace(allowlists);
         self.handles.keys.replace(store);
         active.fingerprint = fingerprint;
         let generation = self.handles.status.snapshot().generation + 1;
@@ -521,7 +539,12 @@ mod tests {
                 &file,
                 &loaded.text,
                 loaded.format,
-                ReloadHandles::new(keys.clone(), tenants, key_names),
+                ReloadHandles::new(
+                    keys.clone(),
+                    tenants,
+                    key_names,
+                    crate::serve::allowlist::AllowTable::default(),
+                ),
             )
             .unwrap();
             Self {

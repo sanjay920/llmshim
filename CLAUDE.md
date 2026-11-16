@@ -712,7 +712,12 @@ process, so replicas and restarts do not repeat; a build without `serve` keeps
 when a usage log is configured, the first 16 hex digits of the credential's
 digest) and the request id, never a name, and a test pins that names stay out of
 Redis; each replica names tenants and keys from
-its own config (grow-only tables, updated on a keys reload). With `--features serve-otel` a
+its own config (grow-only tables, updated on a keys reload). A key's
+`allowed_cidrs` (note 0017, `src/serve/allowlist.rs`) refuses a caller from any
+other address with 403 right after authentication, before replay, receipts and
+admission; the address is the TCP peer, or the right-most non-proxy
+`X-Forwarded-For` entry only when the peer is in `server.trusted_proxies`, and a
+trusted peer without a usable client fails closed; the allowlists reload with the keys. With `--features serve-otel` a
 `[telemetry]` table exports one request span per request, and one child `llmshim.attempt` span per
 admitted provider attempt (driven by the usage recorder, joined by request id
 through a bounded registry that outlives a streamed response), over OTLP/HTTP

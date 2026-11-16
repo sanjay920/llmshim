@@ -1,7 +1,7 @@
 # 0017: Workload JWT authentication and IP allowlists
 
-Status: design only. A contract note, written before any code (README working
-rule 3). Nothing here is implemented; the slices are listed at the end. Single
+Status: IP allowlists implemented (slice 2); the JWT parts are not (slices 3 to 5).
+A contract note, written before any code (README working rule 3). Single
 sign-on for people, SCIM and an admin UI are not part of this note and are not
 started.
 
@@ -193,7 +193,7 @@ the 401/403/503 shapes in `api/openapi.yaml`, and metrics for refresh outcomes,
 stale serving and refresh refusals.
 
 1. This note.
-2. IP allowlists: `allowed_cidrs`, `trusted_proxies`, the 403 path, `--check`
+2. Done: IP allowlists: `allowed_cidrs`, `trusted_proxies`, the 403 path, `--check`
    validation, schema and OpenAPI, tests (forged `X-Forwarded-For` with and
    without a trusted proxy; each credential kind refused outside its network;
    admission untouched on refusal; mutation checks).

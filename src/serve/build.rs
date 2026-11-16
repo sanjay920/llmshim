@@ -398,7 +398,15 @@ pub async fn build_app(
 
     let admin_authenticated = admin_token.is_some();
     let admin_state = state.clone();
-    let reload = ReloadHandles::new(keys.clone(), tenants, key_names.clone());
+    let allow = super::allowlist::AllowTable::new(super::keys::allowlists(config, env));
+    let trusted: Arc<[super::allowlist::Cidr]> = config
+        .server
+        .trusted_proxies
+        .iter()
+        .filter_map(|text| super::allowlist::Cidr::parse(text).ok())
+        .collect::<Vec<_>>()
+        .into();
+    let reload = ReloadHandles::new(keys.clone(), tenants, key_names.clone(), allow.clone());
     let reload_status = reload.status_handle();
     let app = app_with_parts(
         state,
@@ -415,6 +423,14 @@ pub async fn build_app(
             ),
         ),
     );
+    // Inside the access log (which then records the 403 with the key's name) and
+    // outside the gateway, so a refused caller reaches no cached replay, receipt,
+    // queue or budget.
+    let app = app.layer(axum::middleware::from_fn(
+        move |request: Request, next: Next| {
+            super::allowlist::enforce(allow.clone(), trusted.clone(), request, next)
+        },
+    ));
     let (app, admin) = match admin_address {
         Some(admin_address) => {
             // The admin routes never read the key store, but the internal header

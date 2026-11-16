@@ -158,23 +158,49 @@ pub fn key_names(
     config
         .keys
         .iter()
+        .filter_map(|key| Some((credential_scope(key, env)?, key.name.clone())))
+        .collect()
+}
+
+fn credential_scope(
+    key: &super::config::GatewayKey,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    Some(if let Some(san) = &key.client_san {
+        format!(
+            "{:x}",
+            Sha256::digest(format!("mtls:{}", super::config::canonical_san(san)))
+        )
+    } else {
+        match (&key.secret, &key.sha256) {
+            (Some(secret), None) => {
+                let token = read_secret(secret, env).ok()?;
+                format!("{:x}", Sha256::digest(token.as_bytes()))
+            }
+            (None, Some(digest)) => digest.clone(),
+            _ => return None,
+        }
+    })
+}
+
+/// The network allowlist of each key that has one, by the key's credential scope.
+/// A key whose secret cannot be read is left out here, and `build_key_store`
+/// reports it (such a key cannot authenticate either, so nothing is left open).
+pub fn allowlists(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> std::collections::HashMap<String, std::sync::Arc<[super::allowlist::Cidr]>> {
+    config
+        .keys
+        .iter()
         .filter_map(|key| {
-            let scope = if let Some(san) = &key.client_san {
-                format!(
-                    "{:x}",
-                    Sha256::digest(format!("mtls:{}", super::config::canonical_san(san)))
-                )
-            } else {
-                match (&key.secret, &key.sha256) {
-                    (Some(secret), None) => {
-                        let token = read_secret(secret, env).ok()?;
-                        format!("{:x}", Sha256::digest(token.as_bytes()))
-                    }
-                    (None, Some(digest)) => digest.clone(),
-                    _ => return None,
-                }
-            };
-            Some((scope, key.name.clone()))
+            let nets: Vec<_> = key
+                .allowed_cidrs
+                .as_ref()?
+                .iter()
+                .filter_map(|text| super::allowlist::Cidr::parse(text).ok())
+                .collect();
+            Some((credential_scope(key, env)?, nets.into()))
         })
         .collect()
 }
