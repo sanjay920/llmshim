@@ -509,6 +509,12 @@ impl GatewayState {
     /// replica. A fleet job is run by whichever replica leases it, on that
     /// replica's router (0022), so there the snapshot would only be held for
     /// nothing.
+    /// The handle a reload replaces the router through (0022).
+    #[cfg(feature = "serve")]
+    pub(crate) fn router_handle(&self) -> RouterHandle {
+        self.router.clone()
+    }
+
     fn pin_router(
         &self,
         scope: &mut crate::gateway::attempt::TrustedPolicyScope,

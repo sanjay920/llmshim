@@ -462,3 +462,54 @@ fn a_reload_interval_out_of_range_fails_the_check() {
         "{stderr}"
     );
 }
+
+#[tokio::test]
+async fn a_rotated_provider_key_file_is_used_by_the_next_request() {
+    // 0022: the file's text does not change, only the secret file does. The new key
+    // reaches the upstream on the next request, and the status says that the
+    // providers were replaced (by name, never a value).
+    let mut upstream = mockito::Server::new_async().await;
+    let mut expect = |key: &str| {
+        upstream
+            .mock("POST", "/chat/completions")
+            .match_header("authorization", format!("Bearer {key}").as_str())
+            .with_header("content-type", "application/json")
+            .with_body(completion("pong"))
+            .expect(1)
+    };
+    let one = expect("provider-key-one").create_async().await;
+    let two = expect("provider-key-two").create_async().await;
+    let url = upstream.url();
+    let dir = tempdir::Dir::new("reload-provider-key");
+    let secret = dir.0.join("provider.key");
+    std::fs::write(&secret, "provider-key-one\n").unwrap();
+    let provider = format!(
+        "[providers.rotating]\nkind = \"openai-compatible\"\nbase_url = \"{url}\"\n\
+         api_key = {{ file = \"{}\" }}\n",
+        secret.display()
+    );
+    let server = start(&render(&url, &provider, ""), "reload-provider-key", &[]);
+    assert_eq!(
+        chat(&server, Some(CALLER_KEY), "rotating/test-model")
+            .await
+            .status(),
+        200
+    );
+    std::fs::write(&secret, "provider-key-two\n").unwrap();
+    hangup(&server);
+    let status = applied(&server, 1).await;
+    assert_eq!(status["router_generation"], 1, "{status}");
+    assert_eq!(
+        status["last_reload"]["changes"],
+        json!(["providers.changed: rotating"])
+    );
+    assert!(!status.to_string().contains("provider-key"), "{status}");
+    assert_eq!(
+        chat(&server, Some(CALLER_KEY), "rotating/test-model")
+            .await
+            .status(),
+        200
+    );
+    one.assert_async().await;
+    two.assert_async().await;
+}

@@ -29,7 +29,7 @@ use crate::gateway::usage::{KeyNames, TenantNames};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,6 +42,11 @@ pub struct ReloadHandles {
     pub(crate) tenants: TenantNames,
     pub(crate) key_names: KeyNames,
     pub(crate) allow: super::allowlist::AllowTable,
+    /// The gateway's router (0022): providers and routes are replaced as one.
+    pub(crate) router: crate::router::RouterHandle,
+    /// A fleet replica's workers follow the provider set it started with, so a
+    /// reload cannot change providers or routes there yet (0022, slice 3).
+    pub(crate) fleet: bool,
     pub(crate) status: StatusHandle,
 }
 
@@ -51,12 +56,16 @@ impl ReloadHandles {
         tenants: TenantNames,
         key_names: KeyNames,
         allow: super::allowlist::AllowTable,
+        router: crate::router::RouterHandle,
+        fleet: bool,
     ) -> Self {
         Self {
             keys,
             tenants,
             key_names,
             allow,
+            router,
+            fleet,
             status: StatusHandle::default(),
         }
     }
@@ -95,6 +104,10 @@ pub struct ReloadAttempt {
     pub outcome: &'static str,
     /// Why it was rejected. Paths and messages only, never a value.
     pub issues: Vec<IssueView>,
+    /// What an applied reload changed in the providers and routes, by name:
+    /// `providers.added: x`, `providers.removed: x`, `providers.changed: x`,
+    /// `routes`. Never a value.
+    pub changes: Vec<String>,
 }
 
 /// What an operator needs to know that a reload took effect (or did not).
@@ -117,6 +130,12 @@ pub struct ReloadStatus {
     /// The latest applied or rejected reload. A no-change check is not recorded
     /// here.
     pub last_reload: Option<ReloadAttempt>,
+    /// 0 until a reload replaces the providers or routes; each such reload adds one.
+    pub router_generation: u64,
+    /// Providers whose `api_key` is an `{ env = ... }` reference. A process's
+    /// environment cannot change while it runs, so a reload cannot rotate these:
+    /// only a `{ file }` secret can be rotated (0022).
+    pub env_secret_providers: Vec<String>,
 }
 
 /// Shared, so the admin listener can report what the reloader did.
@@ -155,8 +174,11 @@ pub enum Outcome {
 }
 
 struct Active {
-    /// The configuration document without `[[keys]]`.
+    /// The configuration document without `[[keys]]`, `[providers.*]` and
+    /// `[routes.*]`, which a reload replaces.
     document: Value,
+    /// What the providers and routes in force were built from.
+    router: RouterPrint,
     fingerprint: String,
     enforced: bool,
     /// A digest of the last rejection, to recognize a repeat.
@@ -179,18 +201,29 @@ impl Reloader {
         path: &Path,
         text: &str,
         format: Format,
+        config: &ServeConfig,
+        env: &dyn Fn(&str) -> Option<String>,
         handles: ReloadHandles,
     ) -> Result<Self, Vec<Issue>> {
-        let document = document_without_keys(text, format).map_err(|message| {
+        let file_issue = |message| {
             vec![Issue {
                 path: "(file)".into(),
                 message,
             }]
-        })?;
+        };
+        let document = document_without_reloadable(text, format).map_err(file_issue)?;
+        let (providers_doc, routes_doc) = reloadable_parts(text, format).map_err(file_issue)?;
+        let router = RouterPrint::of(config, &providers_doc, &routes_doc, env, None);
         let current = handles.keys.current();
         let active = Active {
             document,
-            fingerprint: format!("{}:{}", current.fingerprint(), handles.allow.fingerprint()),
+            fingerprint: format!(
+                "{}:{}:{}",
+                current.fingerprint(),
+                handles.allow.fingerprint(),
+                router.fingerprint()
+            ),
+            router,
             enforced: current.is_enforced(),
             last_rejection: None,
             pending: None,
@@ -206,6 +239,8 @@ impl Reloader {
                 last_check_epoch_secs: None,
                 in_sync: true,
                 last_reload: None,
+                router_generation: 0,
+                env_secret_providers: active.router.env_form(),
             };
         });
         Ok(Self {
@@ -246,7 +281,13 @@ impl Reloader {
                     generation,
                     credentials,
                     config_sha256,
+                    changes,
+                    env_form,
                 } => {
+                    if !changes.is_empty() {
+                        status.router_generation += 1;
+                    }
+                    status.env_secret_providers.clone_from(env_form);
                     status.generation = *generation;
                     status.credentials = *credentials;
                     status.in_sync = true;
@@ -255,6 +296,7 @@ impl Reloader {
                         at_epoch_secs: now,
                         outcome: "applied",
                         issues: Vec::new(),
+                        changes: changes.clone(),
                     });
                 }
                 Step::Unchanged { config_sha256 } => {
@@ -272,6 +314,7 @@ impl Reloader {
                             at_epoch_secs: now,
                             outcome: "rejected",
                             issues: issues.iter().map(IssueView::from).collect(),
+                            changes: Vec::new(),
                         });
                     }
                 }
@@ -306,8 +349,13 @@ impl Reloader {
         let reject_now = |active: &mut Active, issues| reject(active, &config_sha256, issues);
 
         // Everything outside the keys must be what the server started with.
-        let document = match document_without_keys(&loaded.text, loaded.format) {
-            Ok(document) => document,
+        let parsed =
+            document_without_reloadable(&loaded.text, loaded.format).and_then(|document| {
+                reloadable_parts(&loaded.text, loaded.format)
+                    .map(|(providers, routes)| (document, providers, routes))
+            });
+        let (document, providers_doc, routes_doc) = match parsed {
+            Ok(parts) => parts,
             Err(message) => {
                 return reject_now(
                     active,
@@ -326,10 +374,11 @@ impl Reloader {
             message: "cannot change while the server is running; restart to apply".into(),
         }));
         issues.extend(loaded.config.feature_issues());
-        // Only the rules about caller keys. A provider, admin or Redis secret
-        // that cannot be read right now must not stop a revocation from
-        // applying, and a rotated one is not this reload's business (it is
-        // outside the keys and needs a restart, 0012).
+        // The rules about caller keys, and about their values against the
+        // upstream keys. A provider, admin or Redis secret that cannot be read
+        // right now must not stop a revocation from applying: an unreadable
+        // secret of a provider whose table is unchanged counts as unchanged
+        // (0022), and the admin and Redis secrets are outside the reload.
         issues.extend(loaded.config.check_same_values(env));
         if !issues.is_empty() {
             return reject_now(active, issues);
@@ -354,6 +403,59 @@ impl Reloader {
             );
         }
 
+        // Providers and routes (0022): what they were built from, by digest.
+        let router = RouterPrint::of(
+            &loaded.config,
+            &providers_doc,
+            &routes_doc,
+            env,
+            Some(&active.router),
+        );
+        // A fleet replica cannot change providers, so a rotated secret there is not a
+        // change it could act on: it must not turn a keys-only edit (a revocation)
+        // into a refused one. Only the tables and routes decide.
+        let router = if self.handles.fleet {
+            router.with_secrets_of(&active.router)
+        } else {
+            router
+        };
+        let changes = active.router.changes_to(&router);
+        let mut next_router = None;
+        if !changes.is_empty() {
+            if self.handles.fleet {
+                return reject_now(
+                    active,
+                    vec![Issue {
+                        path: "providers".into(),
+                        message: "providers and routes cannot change on a fleet replica while \
+                                  it is running; restart to apply"
+                            .into(),
+                    }],
+                );
+            }
+            // Built whole before anything is replaced; a provider that cannot be
+            // built rejects the reload by path and the old router keeps serving.
+            let mut found = Vec::new();
+            let base = self.handles.router.current();
+            let built = super::build::build_router_from(&loaded.config, env, &mut found, &base);
+            // The credential files of the providers this reload adds or changes: a
+            // file that is missing, empty or malformed rejects it (a transport that
+            // reads nothing until a request would otherwise fail every one).
+            let mut files = loaded.config.check_secrets_present(env);
+            files.extend(loaded.config.check_credential_files());
+            for issue in files {
+                if router.touches(&changes, &issue.path)
+                    && !found.iter().any(|seen| seen.path == issue.path)
+                {
+                    found.push(issue);
+                }
+            }
+            if !found.is_empty() {
+                return reject_now(active, found);
+            }
+            next_router = Some(built);
+        }
+
         active.last_rejection = None;
         // Labels first, and whether or not anything else changed: a request
         // admitted under new keys must find its tenant's and its key's name
@@ -370,9 +472,10 @@ impl Reloader {
         // fingerprint, one debounce.
         let allowlists = super::keys::allowlists(&loaded.config, env);
         let fingerprint = format!(
-            "{}:{}",
+            "{}:{}:{}",
             store.fingerprint(),
-            super::allowlist::AllowTable::fingerprint_of(&allowlists)
+            super::allowlist::AllowTable::fingerprint_of(&allowlists),
+            router.fingerprint()
         );
         if fingerprint == active.fingerprint {
             active.pending = None;
@@ -392,12 +495,19 @@ impl Reloader {
         // restricted is already bound when the store starts to know it.
         self.handles.allow.replace(allowlists);
         self.handles.keys.replace(store);
+        if let Some(next) = next_router {
+            self.handles.router.replace(next);
+        }
+        let env_form = router.env_form();
+        active.router = router;
         active.fingerprint = fingerprint;
         let generation = self.handles.status.snapshot().generation + 1;
         Step::Applied {
             generation,
             credentials,
             config_sha256,
+            changes,
+            env_form,
         }
     }
 }
@@ -407,6 +517,8 @@ enum Step {
         generation: u64,
         credentials: usize,
         config_sha256: String,
+        changes: Vec<String>,
+        env_form: Vec<String>,
     },
     Unchanged {
         config_sha256: String,
@@ -436,16 +548,174 @@ fn reject(active: &mut Active, config_sha256: &str, issues: Vec<Issue>) -> Step 
     Step::Rejected { issues, repeated }
 }
 
-/// The file as a generic document with the `keys` array removed.
-fn document_without_keys(text: &str, format: Format) -> Result<Value, String> {
-    let mut document: Value = match format {
-        Format::Toml => toml::from_str(text).map_err(|error| error.message().to_string())?,
-        Format::Json => serde_json::from_str(text).map_err(|error| error.to_string())?,
-    };
+fn parse_document(text: &str, format: Format) -> Result<Value, String> {
+    match format {
+        Format::Toml => toml::from_str(text).map_err(|error| error.message().to_string()),
+        Format::Json => serde_json::from_str(text).map_err(|error| error.to_string()),
+    }
+}
+
+/// The file as a generic document without what a reload replaces: the `keys`
+/// array, `[providers.*]` and `[routes.*]`.
+fn document_without_reloadable(text: &str, format: Format) -> Result<Value, String> {
+    let mut document = parse_document(text, format)?;
     if let Value::Object(table) = &mut document {
-        table.remove("keys");
+        for name in ["keys", "providers", "routes"] {
+            table.remove(name);
+        }
     }
     Ok(document)
+}
+
+/// The `providers` and `routes` tables as written.
+fn reloadable_parts(text: &str, format: Format) -> Result<(Value, Value), String> {
+    let document = parse_document(text, format)?;
+    let part = |name: &str| document.get(name).cloned().unwrap_or(Value::Null);
+    Ok((part("providers"), part("routes")))
+}
+
+/// What one provider was built from: its table as written, and digests of the
+/// secret and of the credential files it reads. Digests only: nothing here is
+/// a secret, and nothing here is ever reported but by provider name.
+#[derive(Clone, PartialEq, Eq)]
+struct ProviderPrint {
+    table: String,
+    secret: String,
+    files: String,
+}
+
+/// What the providers and routes in force were built from (0022).
+#[derive(Clone, Default)]
+struct RouterPrint {
+    providers: BTreeMap<String, ProviderPrint>,
+    routes: String,
+    env_form: Vec<String>,
+}
+
+impl RouterPrint {
+    fn of(
+        config: &ServeConfig,
+        providers_doc: &Value,
+        routes_doc: &Value,
+        env: &dyn Fn(&str) -> Option<String>,
+        previous: Option<&RouterPrint>,
+    ) -> Self {
+        let mut providers = BTreeMap::new();
+        let mut env_form = Vec::new();
+        for (name, provider) in &config.providers {
+            let table = providers_doc
+                .get(name)
+                .map(Value::to_string)
+                .unwrap_or_default();
+            let before = previous.and_then(|print| print.providers.get(name));
+            let secret = match &provider.api_key {
+                None => "-".to_string(),
+                Some(reference) => {
+                    if reference.env.is_some() {
+                        env_form.push(name.clone());
+                    }
+                    match super::config::read_secret(reference, env) {
+                        Ok(value) => sha256_hex(value.as_bytes()),
+                        // Unreadable now: a provider whose table is unchanged keeps
+                        // what it had (an unrelated edit is not blocked by it); a
+                        // changed one is distinct, so the rebuild reports the path.
+                        Err(_) => match before {
+                            Some(before) if before.table == table => before.secret.clone(),
+                            _ => "unreadable".to_string(),
+                        },
+                    }
+                }
+            };
+            let digest_of = |path: &Option<PathBuf>| -> String {
+                path.as_ref()
+                    .map(|path| match std::fs::read(path) {
+                        Ok(bytes) => sha256_hex(&bytes),
+                        Err(_) => "unreadable".to_string(),
+                    })
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            let files = format!(
+                "{}:{}:{}",
+                digest_of(&provider.service_account_file),
+                digest_of(&provider.config_file),
+                digest_of(&provider.credentials_file)
+            );
+            providers.insert(
+                name.clone(),
+                ProviderPrint {
+                    table,
+                    secret,
+                    files,
+                },
+            );
+        }
+        Self {
+            providers,
+            routes: routes_doc.to_string(),
+            env_form,
+        }
+    }
+
+    /// This print with the secret and file digests of `other` where the provider
+    /// exists in both.
+    fn with_secrets_of(mut self, other: &RouterPrint) -> Self {
+        for (name, print) in &mut self.providers {
+            if let Some(before) = other.providers.get(name) {
+                print.secret.clone_from(&before.secret);
+                print.files.clone_from(&before.files);
+            }
+        }
+        self
+    }
+
+    fn fingerprint(&self) -> String {
+        let mut text = self.routes.clone();
+        for (name, print) in &self.providers {
+            text.push_str(&format!(
+                "\n{name}|{}|{}|{}",
+                print.table, print.secret, print.files
+            ));
+        }
+        sha256_hex(text.as_bytes())
+    }
+
+    fn env_form(&self) -> Vec<String> {
+        self.env_form.clone()
+    }
+
+    /// What changed from `self` to `next`, by name.
+    fn changes_to(&self, next: &RouterPrint) -> Vec<String> {
+        let mut changes = Vec::new();
+        for (name, print) in &next.providers {
+            match self.providers.get(name) {
+                None => changes.push(format!("providers.added: {name}")),
+                Some(before) if before != print => {
+                    changes.push(format!("providers.changed: {name}"))
+                }
+                Some(_) => {}
+            }
+        }
+        for name in self.providers.keys() {
+            if !next.providers.contains_key(name) {
+                changes.push(format!("providers.removed: {name}"));
+            }
+        }
+        if self.routes != next.routes {
+            changes.push("routes".to_string());
+        }
+        changes
+    }
+
+    /// Whether `path` (`providers.<name>.<field>`) belongs to a provider the
+    /// changes name as added or changed.
+    fn touches(&self, changes: &[String], path: &str) -> bool {
+        changes.iter().any(|change| {
+            change
+                .strip_prefix("providers.added: ")
+                .or_else(|| change.strip_prefix("providers.changed: "))
+                .is_some_and(|name| path.starts_with(&format!("providers.{name}.")))
+        })
+    }
 }
 
 /// Dotted paths at which `old` and `new` differ. Values are never reported.
@@ -520,11 +790,16 @@ mod tests {
         directory: PathBuf,
         file: PathBuf,
         keys: LiveKeys,
+        router: crate::router::RouterHandle,
         reloader: Reloader,
     }
 
     impl Fixture {
         fn new(initial: &str) -> Self {
+            Self::with_fleet(initial, false)
+        }
+
+        fn with_fleet(initial: &str, fleet: bool) -> Self {
             let directory = std::env::temp_dir()
                 .join(format!("llmshim-reload-{}", uuid::Uuid::new_v4().simple()));
             std::fs::create_dir_all(&directory).unwrap();
@@ -535,15 +810,24 @@ mod tests {
             let keys = LiveKeys::new(store);
             let tenants = TenantNames::new(loaded.config.keys.iter().map(|k| k.tenant.clone()));
             let key_names = KeyNames::new(crate::serve::keys::key_names(&loaded.config, &env));
+            let mut issues = Vec::new();
+            let router = crate::router::RouterHandle::new(
+                super::super::build::build_router_for_test(&loaded.config, &env, &mut issues),
+            );
+            assert!(issues.is_empty(), "{issues:?}");
             let reloader = Reloader::new(
                 &file,
                 &loaded.text,
                 loaded.format,
+                &loaded.config,
+                &env,
                 ReloadHandles::new(
                     keys.clone(),
                     tenants,
                     key_names,
                     crate::serve::allowlist::AllowTable::default(),
+                    router.clone(),
+                    fleet,
                 ),
             )
             .unwrap();
@@ -551,6 +835,7 @@ mod tests {
                 directory,
                 file,
                 keys,
+                router,
                 reloader,
             }
         }
@@ -935,5 +1220,259 @@ mod tests {
         let mut paths = Vec::new();
         changed_paths(&old, &new, "", &mut paths);
         assert_eq!(paths, ["fleet", "limits", "providers.y", "server.port"]);
+    }
+
+    // ---- providers and routes (0022, slice 3) ----
+
+    fn with_providers(providers: &str, routes: &str, keys: &str) -> String {
+        format!("version = 1\n{providers}\n{routes}\n{keys}")
+    }
+
+    fn compat(name: &str, url: &str, key_file: &std::path::Path) -> String {
+        format!(
+            "[providers.{name}]\nkind = \"openai-compatible\"\nbase_url = \"{url}\"\n\
+             api_key = {{ file = \"{}\" }}\n",
+            key_file.display()
+        )
+    }
+
+    fn chat() -> serde_json::Value {
+        serde_json::json!({"model": "a/m", "messages": [{"role": "user", "content": "hi"}]})
+    }
+
+    fn completion_body() -> String {
+        serde_json::json!({"id": "c", "created": 1, "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_rotated_file_key_is_used_by_the_next_request_and_not_by_one_in_flight() {
+        let mut upstream = mockito::Server::new_async().await;
+        let old = upstream
+            .mock("POST", "/chat/completions")
+            .match_header("authorization", "Bearer key-one")
+            .with_header("content-type", "application/json")
+            .with_body(completion_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let new = upstream
+            .mock("POST", "/chat/completions")
+            .match_header("authorization", "Bearer key-two")
+            .with_header("content-type", "application/json")
+            .with_body(completion_body())
+            .expect(1)
+            .create_async()
+            .await;
+        let directory =
+            std::env::temp_dir().join(format!("llmshim-rotate-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("upstream.key");
+        std::fs::write(&secret, "key-one\n").unwrap();
+        let initial = with_providers(
+            &compat("a", &upstream.url(), &secret),
+            "",
+            &key("k", "acme", OLD, ""),
+        );
+        let fixture = Fixture::new(&initial);
+        // The configuration is byte-identical; only the secret file changed.
+        let in_flight = fixture.router.current();
+        std::fs::write(&secret, "key-two\n").unwrap();
+        let Outcome::Applied { .. } = fixture.reload() else {
+            panic!("a rotated secret file is a change");
+        };
+        let status = fixture.reloader.status();
+        assert_eq!(status.router_generation, 1);
+        let last = status.last_reload.unwrap();
+        assert_eq!(last.changes, ["providers.changed: a"]);
+        // Neither the status nor any report carries a secret.
+        let shown = format!("{last:?}");
+        assert!(
+            !shown.contains("key-one") && !shown.contains("key-two"),
+            "{shown}"
+        );
+        // The request admitted before the swap finishes on the old key.
+        crate::completion(&in_flight, &chat()).await.unwrap();
+        // The next request uses the new one.
+        crate::completion(&fixture.router.current(), &chat())
+            .await
+            .unwrap();
+        old.assert_async().await;
+        new.assert_async().await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn providers_are_added_and_removed_and_routes_change_as_one_router() {
+        let directory =
+            std::env::temp_dir().join(format!("llmshim-add-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("k");
+        std::fs::write(&secret, "secret-value").unwrap();
+        let a = compat("a", "http://127.0.0.1:1/v1", &secret);
+        let b = compat("b", "http://127.0.0.1:2/v1", &secret);
+        let fixture = Fixture::new(&with_providers(&a, "", &key("k", "acme", OLD, "")));
+        assert_eq!(fixture.router.current().provider_keys(), ["a"]);
+        fixture.write(&with_providers(
+            &format!("{a}{b}"),
+            "[routes.fast]\nmodel = \"b/m\"\n",
+            &key("k", "acme", OLD, ""),
+        ));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        let router = fixture.router.current();
+        let mut keys = router.provider_keys();
+        keys.sort();
+        assert_eq!(keys, ["a", "b"]);
+        let last = fixture.reloader.status().last_reload.unwrap();
+        assert_eq!(last.changes, ["providers.added: b", "routes"]);
+        fixture.write(&with_providers(&b, "", &key("k", "acme", OLD, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        assert_eq!(fixture.router.current().provider_keys(), ["b"]);
+        let last = fixture.reloader.status().last_reload.unwrap();
+        assert_eq!(last.changes, ["providers.removed: a", "routes"]);
+        assert_eq!(fixture.reloader.status().router_generation, 2);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_provider_that_cannot_be_built_rejects_the_whole_reload_and_echoes_no_secret() {
+        let directory =
+            std::env::temp_dir().join(format!("llmshim-bad-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("k");
+        std::fs::write(&secret, "secret-value").unwrap();
+        let a = compat("a", "http://127.0.0.1:1/v1", &secret);
+        let fixture = Fixture::new(&with_providers(&a, "", &key("k", "acme", OLD, "")));
+        let before = Arc::as_ptr(&fixture.router.current());
+        // Adds a provider whose secret file does not exist, and swaps the caller key
+        // in the same edit: neither applies.
+        let missing = directory.join("missing");
+        let b = compat("b", "http://127.0.0.1:2/v1", &missing);
+        fixture.write(&with_providers(
+            &format!("{a}{b}"),
+            "",
+            &key("j", "globex", NEW, ""),
+        ));
+        let Outcome::Rejected { issues, .. } = fixture.reload() else {
+            panic!("an unbuildable provider rejects the reload");
+        };
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == "providers.b.api_key"));
+        assert!(!format!("{issues:?}").contains("secret-value"));
+        assert_eq!(Arc::as_ptr(&fixture.router.current()), before);
+        assert!(fixture.identity(NEW).is_none());
+        assert!(fixture.identity(OLD).is_some());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn env_form_provider_secrets_are_flagged_in_the_status() {
+        let fixture = Fixture::new(&text("", &key("a", "acme", OLD, "")));
+        // `text` configures the one provider with { env = ... }: a reload cannot
+        // rotate it, so the status says so.
+        assert_eq!(fixture.reloader.status().env_secret_providers, ["openai"]);
+    }
+
+    #[test]
+    fn a_fleet_replica_refuses_a_provider_change_by_path() {
+        let directory =
+            std::env::temp_dir().join(format!("llmshim-fleet-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("k");
+        std::fs::write(&secret, "one").unwrap();
+        let a = compat("a", "http://127.0.0.1:1/v1", &secret);
+        let fixture =
+            Fixture::with_fleet(&with_providers(&a, "", &key("k", "acme", OLD, "")), true);
+        // A different base URL is a change of the provider's table.
+        let moved = compat("a", "http://127.0.0.1:9/v1", &secret);
+        fixture.write(&with_providers(&moved, "", &key("k", "acme", OLD, "")));
+        let Outcome::Rejected { issues, .. } = fixture.reload() else {
+            panic!("a fleet replica's workers follow the providers it started with");
+        };
+        assert_eq!(issues[0].path, "providers");
+        // A keys-only edit still applies there.
+        fixture.write(&with_providers(&a, "", &key("k", "acme", NEW, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_rotated_secret_does_not_stop_a_revocation_on_a_fleet_replica() {
+        let directory = std::env::temp_dir().join(format!(
+            "llmshim-fleet-rev-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("k");
+        std::fs::write(&secret, "one").unwrap();
+        let a = compat("a", "http://127.0.0.1:1/v1", &secret);
+        let fixture =
+            Fixture::with_fleet(&with_providers(&a, "", &key("k", "acme", OLD, "")), true);
+        // The operator rotated the upstream key file and then revoked a caller key
+        // before the roll-out reached this replica: the revocation applies.
+        std::fs::write(&secret, "two").unwrap();
+        fixture.write(&with_providers(&a, "", &key("j", "globex", NEW, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        assert!(fixture.identity(OLD).is_none());
+        assert!(fixture.identity(NEW).is_some());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(feature = "serve-cloud")]
+    #[test]
+    fn a_service_account_file_that_is_missing_or_empty_rejects_the_reload() {
+        let directory =
+            std::env::temp_dir().join(format!("llmshim-sa-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let secret = directory.join("k");
+        std::fs::write(&secret, "one").unwrap();
+        let a = compat("a", "http://127.0.0.1:1/v1", &secret);
+        let fixture = Fixture::new(&with_providers(&a, "", &key("k", "acme", OLD, "")));
+        let vertex = |file: &std::path::Path| {
+            format!(
+                "[providers.vertex-gemini]\nkind = \"vertex-gemini\"\nproject = \"p\"\nregion = \"us-central1\"\n\
+                 binding = \"b\"\nservice_account_file = \"{}\"\n",
+                file.display()
+            )
+        };
+        let account = directory.join("sa.json");
+        for contents in [None, Some("")] {
+            if let Some(contents) = contents {
+                std::fs::write(&account, contents).unwrap();
+            }
+            fixture.write(&with_providers(
+                &format!("{a}{}", vertex(&account)),
+                "",
+                &key("k", "acme", OLD, ""),
+            ));
+            let outcome = fixture.reload();
+            let Outcome::Rejected { issues, .. } = outcome else {
+                // Without the feature the file is refused whole, which is also a
+                // rejection; anything applied is the defect.
+                panic!("a missing or empty service-account file must reject");
+            };
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path.ends_with(".service_account_file")),
+                "{issues:?}"
+            );
+        }
+        assert_eq!(fixture.reloader.status().router_generation, 0);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_keys_only_edit_does_not_replace_the_router() {
+        let fixture = Fixture::new(&text("", &key("a", "acme", OLD, "")));
+        let before = Arc::as_ptr(&fixture.router.current());
+        fixture.write(&text("", &key("a", "acme", NEW, "")));
+        assert!(matches!(fixture.reload(), Outcome::Applied { .. }));
+        assert_eq!(Arc::as_ptr(&fixture.router.current()), before);
+        assert_eq!(fixture.reloader.status().router_generation, 0);
     }
 }
