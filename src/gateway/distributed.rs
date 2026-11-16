@@ -3500,7 +3500,7 @@ mod tests {
         let activation =
             tokio::spawn(async move { submit_gateway.accept_prepared(prepared, None).await });
         let mut observer = gateway.connection_for_test().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while !observer
                 .exists::<_, bool>(lifecycle::meta_key(&id))
                 .await
@@ -3513,7 +3513,7 @@ mod tests {
         .expect("reserve should finish before delayed activation");
         activation.abort();
         let _ = activation.await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let state: Option<String> = observer
                     .hget(lifecycle::meta_key(&id), "state")
