@@ -22,6 +22,7 @@ pub(crate) mod jwt_auth;
 pub mod keys;
 pub mod mtls;
 pub mod reload;
+pub mod snapshot;
 pub(crate) mod telemetry;
 
 pub use build::{

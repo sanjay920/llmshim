@@ -1,6 +1,6 @@
 # 0024: The control plane
 
-Status: design, 2026-11-16. A contract note, written before any code (README working
+Status: design, 2026-11-16; slice 2a implemented (see "Slice 2a as built"). A contract note, written before any code (README working
 rule 3): a snapshot format and an HTTP surface each become a compatibility promise.
 It is step 13 of 0013's order of work. It does not start the admin UI, SSO, SCIM or
 audit export (their licensing is undecided, and all of them follow this).
@@ -212,10 +212,54 @@ never in the database.
 - Licensing of SSO, SCIM, audit export and the admin UI (still the owner's).
 - Postgres schema and migration tooling (decided with slice 3 against a running schema).
 
+## Slice 2a as built
+
+The data-plane half that needs no control plane exists: `src/serve/snapshot.rs`, the
+`[control_plane]` table (`verify_keys`, `snapshot_file`, `min_generation`), `state.policy_dir`
+(required with it), and `llmshim snapshot keygen|sign|verify`.
+
+- **The organization is bound.** `[control_plane] org` is required; a snapshot whose `org` differs,
+  or a floor recorded for another organization, is refused even if a trusted key signed it. `sign`
+  also refuses the content the data plane would refuse about a key's state and expiry.
+- A snapshot whose generation is huge (a signer's mistake) raises the floor to it and so refuses every
+  later one until the record is removed by an operator: the signer, not the data plane, must not do
+  that. A floor write that fails (a full or read-only directory) rejects the reload, so a revocation
+  waits on a writable `policy_dir`: stated, not hidden.
+- The snapshot's active keys become the `GatewayKey` list `[[keys]]` would have been, so the key
+  store, allowlists, budgets, logs and the existing reload all work unchanged: a reload reads the
+  file again, and a higher generation applies by the same all-or-nothing, debounced path as a
+  keys edit. The snapshot's keys go through the file's own key rules (`validate_keys`,
+  `validate_tenant_limits`, `check_same_values`), reported at
+  `control_plane.snapshot_file (keys[N].…)`; a snapshot with no active key is refused.
+- The envelope is as specified: `format`, `key_id` (the `ed25519:<base64 public key>` itself),
+  `payload` (base64 of the canonical bytes) and `signature`. `sign` re-encodes the payload
+  canonically (sorted keys, no whitespace; the writer is hand-made so it does not depend on a
+  `serde_json` feature) and refuses a payload the data plane would refuse.
+- **The floor**: `applied-snapshot.json` in `state.policy_dir` holds the organization, the applied
+  generation and the SHA-256 of its payload. It is written once the snapshot has verified and passed
+  every check, **just before** it replaces the keys (at start, after the application is built and
+  before serving; on every reload that applies it or finds it unchanged), so a crash leaves a floor
+  equal to the file, which reloads as the same snapshot. It is written through a temporary name of
+  its own with the file and directory synced, and never lowers what is recorded (two replicas on one
+  directory cannot move it back); `--check` never writes it. A running replica also keeps the
+  generation it applied in memory and never reloads behind it, so lowering or deleting the file
+  cannot roll a live replica back (a restart is judged by the file: the stated first-boot limit,
+  bounded by `min_generation`). A snapshot below the
+  floor or `min_generation` is refused; the same generation with different content is refused; the
+  same snapshot again is fine. An unreadable floor file is an error, never "no floor".
+- `serve --check --structure-only` reads no snapshot; `--check` reads it and the floor and writes
+  nothing.
+- **Not in 2a (slice 2b):** `verify_keys` changing on a reload, `max_age_secs`/`refuse_when_stale`
+  and the status fields (generation, signer, `stale`, `signer_untrusted`), `expires_at` enforced at
+  request time (2a drops a key already expired when the snapshot is read, and a snapshot that
+  outlives a key's expiry keeps serving it until the next reload), and the snapshot's `tenants`
+  names for the logs (2a uses the team id, as a file key's tenant string is used today). The
+  0014 rows for stale serving come with the stale behaviour.
+
 ## Slices
 
 1. This note.
-2. The snapshot envelope and canonical payload, Ed25519 verification and the `snapshot
+2. (a done, b open: see above) The snapshot envelope and canonical payload, Ed25519 verification and the `snapshot
    sign`/`verify` subcommands, `[control_plane]` with `snapshot_file` as a keys source in
    the 0012 machinery, `expires_at` in the key store (and `[[keys]]`), the persisted
    floor, the 0014 rows, and the regenerated JSON Schema (`tests/unit_serve_cli.rs`

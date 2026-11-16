@@ -911,6 +911,84 @@ async fn reload_loop(
     }
 }
 
+/// `llmshim snapshot keygen|sign|verify` (0024). Exit 0 on success, 1 on any failure.
+#[cfg(feature = "serve")]
+fn cmd_snapshot(options: &cli::SnapshotOptions) -> i32 {
+    use llmshim::serve::snapshot;
+    let fail = |message: String| {
+        eprintln!("{message}");
+        1
+    };
+    match options.action.as_str() {
+        "keygen" => {
+            let out = options.output.as_deref().unwrap_or_default();
+            let (seed, public) = match snapshot::keygen() {
+                Ok(pair) => pair,
+                Err(message) => return fail(message.into()),
+            };
+            // Owner-only from the first byte, and never overwriting a key.
+            let mut file = std::fs::OpenOptions::new();
+            file.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+            match file.open(out) {
+                Ok(mut file) => {
+                    if let Err(error) = std::io::Write::write_all(&mut file, seed.as_bytes()) {
+                        return fail(format!("cannot write {out}: {}", error.kind()));
+                    }
+                }
+                Err(error) => return fail(format!("cannot create {out}: {}", error.kind())),
+            }
+            println!("{public}");
+            0
+        }
+        "sign" => {
+            let read = |path: &str| {
+                std::fs::read_to_string(path)
+                    .map_err(|error| format!("cannot read {path}: {}", error.kind()))
+            };
+            let seed = match read(options.key_file.as_deref().unwrap_or_default()) {
+                Ok(text) => text,
+                Err(message) => return fail(message),
+            };
+            let payload =
+                match read(options.input.as_deref().unwrap_or_default()).and_then(|text| {
+                    serde_json::from_str(&text).map_err(|e| format!("the payload is not JSON: {e}"))
+                }) {
+                    Ok(value) => value,
+                    Err(message) => return fail(message),
+                };
+            let envelope = match snapshot::sign(&payload, &seed) {
+                Ok(text) => text,
+                Err(message) => return fail(message),
+            };
+            // Written beside the target and renamed, so a watcher never reads half of it.
+            let out = options.output.as_deref().unwrap_or_default();
+            let temp = format!("{out}.tmp-{}", std::process::id());
+            match std::fs::write(&temp, envelope).and_then(|()| std::fs::rename(&temp, out)) {
+                Ok(()) => 0,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&temp);
+                    fail(format!("cannot write {out}: {}", error.kind()))
+                }
+            }
+        }
+        _ => {
+            let input = options.input.as_deref().unwrap_or_default();
+            match std::fs::read(input) {
+                Ok(bytes) => match snapshot::describe(&bytes, &options.verify_keys) {
+                    Ok(line) => {
+                        println!("{line}");
+                        0
+                    }
+                    Err(message) => fail(format!("{input}: {message}")),
+                },
+                Err(error) => fail(format!("cannot read {input}: {}", error.kind())),
+            }
+        }
+    }
+}
+
 /// `llmshim serve` exit statuses. 0 is success, 2 is bad arguments (reported
 /// before this function runs). The two below let a pipeline tell "the file is
 /// wrong" from "this environment cannot check it".
@@ -950,7 +1028,11 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         config,
         text,
         format,
-    } = match llmshim::serve::ServeConfig::load_with_text(path) {
+        snapshot,
+    } = match llmshim::serve::ServeConfig::load_with_text_resolving(
+        path,
+        !(options.check && options.structure_only),
+    ) {
         Ok(loaded) => loaded,
         Err(issues) => {
             report(&issues);
@@ -1059,6 +1141,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         format,
         &config,
         &env,
+        snapshot.as_ref(),
         built.reload.clone(),
     ) {
         Ok(reloader) => std::sync::Arc::new(reloader),
@@ -1067,6 +1150,28 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             return 1;
         }
     };
+    // The snapshot in force is recorded before serving, so a restart can never
+    // fall back to an older one (0024).
+    if let (Some(snapshot), Some(dir)) = (&snapshot, config.state.policy_dir.as_ref()) {
+        if let Err(issue) = llmshim::serve::snapshot::write_floor(
+            dir,
+            &llmshim::serve::snapshot::Floor {
+                org: snapshot.org.clone(),
+                generation: snapshot.generation,
+                payload_sha256: snapshot.payload_sha256.clone(),
+            },
+        ) {
+            report(&[issue]);
+            return 1;
+        }
+        eprintln!(
+            "policy snapshot generation {} applied ({} active key(s), {} inactive, signed by {})",
+            snapshot.generation,
+            snapshot.keys.len(),
+            snapshot.inactive,
+            snapshot.signer
+        );
+    }
     let listener = match cli::bind(built.address).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -1608,6 +1713,8 @@ async fn main() {
         }
         #[cfg(feature = "serve")]
         "serve" => std::process::exit(cmd_serve(&options.serve).await),
+        #[cfg(feature = "serve")]
+        "snapshot" => std::process::exit(cmd_snapshot(&options.snapshot)),
         "chat" => { /* fall through to chat */ }
         _ => {
             eprintln!("Unknown command: {}\n", cmd);

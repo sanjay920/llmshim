@@ -198,6 +198,9 @@ struct Active {
     last_rejection: Option<String>,
     /// The change a poll saw last time and did not apply yet.
     pending: Option<String>,
+    /// The snapshot this process applied (0024): a reload never goes behind it,
+    /// whatever the floor file on disk says.
+    applied: Option<super::snapshot::Floor>,
 }
 
 /// Reloads `[[keys]]` from the configuration file the server started from.
@@ -216,6 +219,7 @@ impl Reloader {
         format: Format,
         config: &ServeConfig,
         env: &dyn Fn(&str) -> Option<String>,
+        snapshot: Option<&super::snapshot::Snapshot>,
         handles: ReloadHandles,
     ) -> Result<Self, Vec<Issue>> {
         let file_issue = |message| {
@@ -243,6 +247,11 @@ impl Reloader {
             enforced: current.is_enforced(),
             last_rejection: None,
             pending: None,
+            applied: snapshot.map(|snapshot| super::snapshot::Floor {
+                org: snapshot.org.clone(),
+                generation: snapshot.generation,
+                payload_sha256: snapshot.payload_sha256.clone(),
+            }),
         };
         let credentials = current.credential_count();
         let config_sha256 = sha256_hex(text.as_bytes());
@@ -367,6 +376,11 @@ impl Reloader {
         };
         let config_sha256 = sha256_hex(loaded.text.as_bytes());
         let reject_now = |active: &mut Active, issues| reject(active, &config_sha256, issues);
+        if let (Some(snapshot), Some(applied)) = (&loaded.snapshot, &active.applied) {
+            if let Err(issue) = super::snapshot::against_applied(snapshot, applied) {
+                return reject_now(active, vec![issue]);
+            }
+        }
 
         // Everything outside the keys must be what the server started with.
         let parsed =
@@ -486,6 +500,10 @@ impl Reloader {
         }
         if fingerprint == active.fingerprint {
             active.pending = None;
+            // The same keys, but possibly a higher generation: the floor follows.
+            if let Err(issue) = record_snapshot(&loaded, &mut active.applied) {
+                return reject_now(active, vec![issue]);
+            }
             return Step::Unchanged { config_sha256 };
         }
         if debounce {
@@ -496,6 +514,9 @@ impl Reloader {
             }
         }
         active.pending = None;
+        if let Err(issue) = record_snapshot(&loaded, &mut active.applied) {
+            return reject_now(active, vec![issue]);
+        }
         let credentials = store.credential_count();
         // The allowlists first, and keyed by credential rather than by asking the
         // store (see `allowlist::enforce`): a key that is new in this reload and
@@ -546,6 +567,25 @@ enum Step {
         issues: Vec<Issue>,
         repeated: bool,
     },
+}
+
+/// Record the snapshot a load verified as the one in force (0024): a replica that
+/// restarts must not accept an older one.
+fn record_snapshot(
+    loaded: &super::config::Loaded,
+    applied: &mut Option<super::snapshot::Floor>,
+) -> Result<(), Issue> {
+    if let (Some(snapshot), Some(dir)) = (&loaded.snapshot, loaded.config.state.policy_dir.as_ref())
+    {
+        let floor = super::snapshot::Floor {
+            org: snapshot.org.clone(),
+            generation: snapshot.generation,
+            payload_sha256: snapshot.payload_sha256.clone(),
+        };
+        super::snapshot::write_floor(dir, &floor)?;
+        *applied = Some(floor);
+    }
+    Ok(())
 }
 
 fn reject(active: &mut Active, config_sha256: &str, issues: Vec<Issue>) -> Step {
@@ -855,6 +895,7 @@ mod tests {
                 loaded.format,
                 &loaded.config,
                 &env,
+                loaded.snapshot.as_ref(),
                 ReloadHandles::new(
                     keys.clone(),
                     tenants,
