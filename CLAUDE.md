@@ -561,8 +561,9 @@ Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: an fmt+clippy+test 
 `release.yml` also lints and tests `serve`, and a `ci-green` job refuses a tag whose commit has
 no green `ci.yml` and `serve-check.yml` run (`.github/scripts/wait-for-green.sh`, which waits
 for a pending run and judges by the newest; tested by `test-wait-for-green.sh`). Every
-publisher waits behind `release-inputs`, which needs it. A tag therefore waits for CI on
-the commit it names: tag a commit CI has finished with.
+publisher waits behind `release-inputs`, which needs it. Only runs from a push to `main` count,
+so a tag must name a commit that reached `main` and finished CI there. GitHub keeps run records,
+but if one is ever gone a re-run of an old release is refused: roll the tag forward instead.
 
 ## Signed images (note 0019)
 

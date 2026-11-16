@@ -11,6 +11,7 @@ mkdir "$work/bin"
 cat > "$work/bin/gh" <<'GH'
 #!/usr/bin/env bash
 workflow=""
+echo "$*" >> "$FAKE_GH_DIR/calls"
 while [ "$#" -gt 0 ]; do
   [ "$1" = "--workflow" ] && workflow="$2"
   shift
@@ -62,12 +63,21 @@ expect "a cancelled run refuses" 1 "$(run '[{"status":"completed","conclusion":"
 expect "an in-progress run is waited for, then green passes" 0 "$(run "$busy" "$busy" "$ok")"
 expect "an in-progress run that goes red refuses" 1 "$(run "$busy" "$red")"
 expect "no run at all refuses after the grace" 1 "$(run "$none")"
-run "$none" >/dev/null; said "no ci.yml run exists"
+run "$none" >/dev/null; said "no push-to-main ci.yml run exists"
 run "$busy" >/dev/null; WAIT_TIMEOUT_SECS=0 run "$busy" >/dev/null; said "timed out"
 expect "a run that appears after a wait is used" 0 "$(NO_RUN_GRACE_SECS=60 run "$none" "$none" "$ok")"
 expect "a run that never finishes times out" 1 "$(WAIT_TIMEOUT_SECS=0 run "$busy")"
 expect "the newest run decides: green after red passes" 0 "$(run "$rerun")"
 expect "the newest run decides: red after green refuses" 1 "$(run "$stale")"
+
+# Only a push to main counts: the query must say so (the fake would answer
+# whatever it is asked, so the flags themselves are what is checked).
+rm -f "$work/calls"
+run "$ok" >/dev/null
+for flag in "--event push" "--branch main" "--commit $sha"; do
+  grep -q -- "$flag" "$work/calls" || { echo "FAIL: gh was not asked with $flag" >&2; exit 1; }
+done
+echo "ok: the query is for push runs on main"
 
 # Every named workflow must be green, not just the first.
 rm -f "$work"/*.n

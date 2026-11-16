@@ -18,4 +18,10 @@ reaches = lambda do |job, seen = []|
 end
 loose = (jobs.keys - gate).reject { |job| reaches.(job) }
 abort "jobs that do not wait for the release gate: #{loose.join(', ')}" unless loose.empty?
+# A condition on a publishing job (`if: always()`, `!cancelled()`) could run it
+# after the gate failed, so none may have one.
+conditional = (jobs.keys - gate).select { |job| jobs.fetch(job).key?("if") }
+abort "publishing jobs with an `if`: #{conditional.join(', ')}" unless conditional.empty?
+gate_conditional = gate.select { |job| jobs.fetch(job).key?("if") }
+abort "gate jobs with an `if`: #{gate_conditional.join(', ')}" unless gate_conditional.empty?
 puts "every publishing job waits behind the release gate (#{(jobs.keys - gate).size} jobs)"

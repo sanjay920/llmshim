@@ -7,6 +7,9 @@
 #
 # Needs `gh` (authenticated through GH_TOKEN) and `jq`. The newest run of a
 # workflow decides, so a re-run that turned green outranks the red one before it.
+# Only runs triggered by a push to `main` count: a pull request's green run for a
+# head commit that never reached `main`, or a later manual or scheduled run, must
+# neither admit a tag nor outrank the run a merge produced.
 # WAIT_TIMEOUT_SECS (3600), NO_RUN_GRACE_SECS (900) and POLL_SECS (30) tune it.
 set -euo pipefail
 
@@ -26,16 +29,21 @@ poll_secs="${POLL_SECS:-30}"
 started=$(date +%s)
 
 for workflow in "$@"; do
+  # The grace for a run to appear is per workflow; the timeout is for the whole wait.
+  workflow_started=$(date +%s)
   while true; do
-    runs=$(gh run list --workflow "$workflow" --commit "$sha" --limit 20 --json status,conclusion)
+    runs=$(gh run list --workflow "$workflow" --commit "$sha" --event push --branch main \
+      --limit 20 --json status,conclusion)
     count=$(jq 'length' <<<"$runs")
-    elapsed=$(($(date +%s) - started))
+    now=$(date +%s)
+    elapsed=$((now - started))
+    waited=$((now - workflow_started))
     if [ "$count" -eq 0 ]; then
-      if [ "$elapsed" -ge "$grace_secs" ]; then
-        echo "no $workflow run exists for $sha after ${elapsed}s: refusing" >&2
+      if [ "$waited" -ge "$grace_secs" ]; then
+        echo "no push-to-main $workflow run exists for $sha after ${waited}s: refusing" >&2
         exit 1
       fi
-      echo "waiting for a $workflow run for $sha (${elapsed}s)"
+      echo "waiting for a push-to-main $workflow run for $sha (${waited}s)"
     else
       status=$(jq -r '.[0].status' <<<"$runs")
       conclusion=$(jq -r '.[0].conclusion' <<<"$runs")
