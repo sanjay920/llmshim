@@ -2866,34 +2866,8 @@ impl ServeConfig {
             }
         }
         for (at, secret) in self.secret_refs() {
-            if let Some(name) = &secret.env {
-                match env(name) {
-                    Some(value) if !value.trim().is_empty() => {}
-                    Some(_) => issues.push(Issue::new(
-                        at,
-                        format!("environment variable {name} is empty"),
-                    )),
-                    None => issues.push(Issue::new(
-                        at,
-                        format!("environment variable {name} is not set"),
-                    )),
-                }
-            } else if let Some(path) = &secret.file {
-                match std::fs::read_to_string(path) {
-                    Ok(value) if !value.trim().is_empty() => {}
-                    Ok(_) => issues.push(Issue::new(
-                        at,
-                        format!("secret file {} is empty", path.display()),
-                    )),
-                    Err(error) => issues.push(Issue::new(
-                        at,
-                        format!(
-                            "cannot read secret file {}: {}",
-                            path.display(),
-                            error.kind()
-                        ),
-                    )),
-                }
+            if let Err(message) = read_secret(secret, env) {
+                issues.push(Issue::new(at, message));
             }
         }
         issues
@@ -3000,32 +2974,56 @@ pub(crate) fn is_redis_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// The most a secret file may hold. A token, key or URL is far smaller; the cap keeps a wrong path
+/// (a device, a log) from being read into memory (note 0033).
+pub(crate) const MAX_SECRET_BYTES: u64 = 64 * 1024;
+
 /// Resolve a secret reference to its value, trimmed. The error names the
-/// variable or file, never a value.
+/// variable or file, never a value. A value must be one line of at most
+/// [`MAX_SECRET_BYTES`]: an interior newline or control character would split a header or
+/// a URL, so it is refused rather than passed on (note 0033).
 pub(crate) fn read_secret(
     secret: &SecretRef,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, String> {
+    use std::io::Read;
     let value = match (&secret.env, &secret.file) {
         (Some(name), _) => {
             env(name).ok_or_else(|| format!("environment variable {name} is not set"))?
         }
-        (None, Some(path)) => std::fs::read_to_string(path).map_err(|error| {
-            format!(
-                "cannot read secret file {}: {}",
-                path.display(),
-                error.kind()
-            )
-        })?,
+        (None, Some(path)) => {
+            let unreadable = |error: std::io::Error| {
+                format!(
+                    "cannot read secret file {}: {}",
+                    path.display(),
+                    error.kind()
+                )
+            };
+            let mut text = String::new();
+            std::fs::File::open(path)
+                .and_then(|file| file.take(MAX_SECRET_BYTES + 1).read_to_string(&mut text))
+                .map_err(unreadable)?;
+            if text.len() as u64 > MAX_SECRET_BYTES {
+                return Err(format!(
+                    "secret file {} is larger than {MAX_SECRET_BYTES} bytes",
+                    path.display()
+                ));
+            }
+            text
+        }
         (None, None) => return Err("no secret reference".into()),
+    };
+    let what = || match (&secret.env, &secret.file) {
+        (Some(name), _) => format!("environment variable {name}"),
+        (None, Some(path)) => format!("secret file {}", path.display()),
+        (None, None) => unreachable!("handled above"),
     };
     let value = value.trim();
     if value.is_empty() {
-        return Err(match (&secret.env, &secret.file) {
-            (Some(name), _) => format!("environment variable {name} is empty"),
-            (None, Some(path)) => format!("secret file {} is empty", path.display()),
-            (None, None) => unreachable!("handled above"),
-        });
+        return Err(format!("{} is empty", what()));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{} is not a single line", what()));
     }
     Ok(value.to_string())
 }
@@ -3222,6 +3220,60 @@ mod tests {
         tenant = "platform"
         secret = { env = "CI_GATEWAY_KEY" }
     "#;
+
+    fn secret_in(name: &str, bytes: &[u8]) -> (SecretRef, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("llmshim-secret-{}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        (
+            SecretRef {
+                env: None,
+                file: Some(path.clone()),
+            },
+            path,
+        )
+    }
+
+    #[test]
+    fn a_secret_is_one_bounded_line_and_the_error_never_holds_the_value() {
+        let none = |_: &str| None;
+        // A trailing newline is the way every secret mount writes a value.
+        let (ok, path) = secret_in("ok", b"sk-token-value\n");
+        assert_eq!(read_secret(&ok, &none).unwrap(), "sk-token-value");
+        let _ = std::fs::remove_file(path);
+        // An interior newline would split a header; a control character likewise.
+        for (name, bytes) in [
+            ("lines", b"first-part\nsecond-part".as_slice()),
+            ("tab", b"first\tsecond".as_slice()),
+        ] {
+            let (secret, path) = secret_in(name, bytes);
+            let error = read_secret(&secret, &none).unwrap_err();
+            assert!(error.contains("not a single line"), "{error}");
+            assert!(
+                !error.contains("first") && !error.contains("second"),
+                "{error}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+        // One byte over the cap is refused without reading the rest into memory.
+        let (big, path) = secret_in("big", &vec![b'a'; MAX_SECRET_BYTES as usize + 1]);
+        let error = read_secret(&big, &none).unwrap_err();
+        assert!(error.contains("larger than"), "{error}");
+        let _ = std::fs::remove_file(path);
+        let (edge, path) = secret_in("edge", &vec![b'a'; MAX_SECRET_BYTES as usize]);
+        assert!(read_secret(&edge, &none).is_ok());
+        let _ = std::fs::remove_file(path);
+        // The same rule holds for an environment value.
+        let env = SecretRef {
+            env: Some("X".into()),
+            file: None,
+        };
+        let error = read_secret(&env, &|_: &str| Some("qq\nzz".to_string())).unwrap_err();
+        assert!(
+            error.contains("not a single line") && !error.contains("qq"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn reload_watches_every_thirty_seconds_unless_told_otherwise() {

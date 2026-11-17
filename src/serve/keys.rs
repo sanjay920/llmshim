@@ -398,7 +398,8 @@ mod tests {
             // A byte-order mark survives `trim` and is not whitespace.
             ("\u{feff}ci-token-0123456789abcdef", "visible ASCII"),
             ("caf\u{e9}-token-0123456789abcd", "visible ASCII"),
-            ("tab\tseparated-0123456789abc", "visible ASCII"),
+            // A control character is refused earlier, by the shared secret reader (note 0033).
+            ("tab\tseparated-0123456789abc", "not a single line"),
         ] {
             let issues = build_key_store(&config(""), &env_with(value))
                 .err()
