@@ -36,12 +36,16 @@ one reader that `serve --check`, boot, reload, keys, JWT, telemetry and snapshot
 
 - **At most 64 KiB.** A wrong path (a device, a log file) is never read into memory whole: the read
   stops one byte past the cap and the file is refused, by path.
-- **One line.** Surrounding whitespace is trimmed (a mount's trailing newline), but a value with an
-  interior newline or other control character is refused: it would split an HTTP header or a URL.
-  The message names the variable or file, never the value.
+- **Valid UTF-8, one line.** Surrounding whitespace is trimmed (a mount's trailing newline), but a
+  value with an interior newline, a control character, a byte-order mark (it survives trimming, and a
+  Windows editor writes it) or a Unicode line separator is refused: it would split an HTTP header or a
+  URL. A file that is not UTF-8 is refused the same way. The message names the variable or file, never
+  the value.
 
-Both refusals are a secret that cannot be used, so they take the "secret unavailable" exit status (3)
-of `serve --check`, like an unset variable.
+These refusals are a defect in what was configured, so `serve --check` reports them with status 1
+(`check_secret_values`), not 3. Status 3 stays what it was, a secret that is unset, blank or unreadable
+(a fact about the environment, which a pipeline may retry); a value that is present but malformed will
+not get better by retrying. Boot and reload refuse the same values through the same reader.
 
 ## Not built
 
@@ -54,5 +58,9 @@ of `serve --check`, like an unset variable.
 
 `config::tests::a_secret_is_one_bounded_line_and_the_error_never_holds_the_value`: a trailing newline
 is accepted, an interior newline and a tab are refused without echoing the value, the file cap is exact
-(at the cap accepted, one over refused), and an environment value is held to the same rule. Disabling
-either the control-character check or the size check fails it.
+(at the cap accepted, one over refused, also when the cut falls inside a multibyte character), a BOM, a
+separator, CRLF, NUL and non-UTF-8 are malformed, an absent file stays unavailable, and an environment
+value is held to the same rule. Disabling either the control-character check or the size check fails it.
+`unit_serve_cli::a_secret_that_is_present_but_not_one_line_is_a_defect_not_an_absence` pins status 1 and
+the absence of the value from the output; dropping `check_secret_values` fails it. Environment values have
+no size cap (the OS bounds them).

@@ -2866,7 +2866,21 @@ impl ServeConfig {
             }
         }
         for (at, secret) in self.secret_refs() {
-            if let Err(message) = read_secret(secret, env) {
+            if let Err((SecretProblem::Unavailable, message)) = read_secret_classified(secret, env)
+            {
+                issues.push(Issue::new(at, message));
+            }
+        }
+        issues
+    }
+
+    /// Secrets that are present but unusable: too large, not UTF-8, or not one line of text. A
+    /// defect in what was configured (status 1), where an absent secret is a fact about the
+    /// environment (status 3). Names the setting and never the value (note 0033).
+    pub fn check_secret_values(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<Issue> {
+        let mut issues = Vec::new();
+        for (at, secret) in self.secret_refs() {
+            if let Err((SecretProblem::Malformed, message)) = read_secret_classified(secret, env) {
                 issues.push(Issue::new(at, message));
             }
         }
@@ -2978,52 +2992,80 @@ pub(crate) fn is_redis_url(url: &str) -> bool {
 /// (a device, a log) from being read into memory (note 0033).
 pub(crate) const MAX_SECRET_BYTES: u64 = 64 * 1024;
 
+/// Why a secret reference gave no usable value: a fact about this environment (unset, blank,
+/// unreadable), or a defect in the value itself (too large, not one line of text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretProblem {
+    Unavailable,
+    Malformed,
+}
+
 /// Resolve a secret reference to its value, trimmed. The error names the
-/// variable or file, never a value. A value must be one line of at most
-/// [`MAX_SECRET_BYTES`]: an interior newline or control character would split a header or
-/// a URL, so it is refused rather than passed on (note 0033).
+/// variable or file, never a value. A value must be one line of text of at most
+/// [`MAX_SECRET_BYTES`]: an interior newline, control character, byte-order mark or
+/// line separator would split a header or a URL, so it is refused rather than passed on
+/// (note 0033).
 pub(crate) fn read_secret(
     secret: &SecretRef,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, String> {
+    read_secret_classified(secret, env).map_err(|(_, message)| message)
+}
+
+/// [`read_secret`] with the kind of problem, so `serve --check` can report a malformed
+/// value as a defect (status 1) and an absent one as unavailable (status 3).
+pub(crate) fn read_secret_classified(
+    secret: &SecretRef,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, (SecretProblem, String)> {
     use std::io::Read;
-    let value = match (&secret.env, &secret.file) {
-        (Some(name), _) => {
-            env(name).ok_or_else(|| format!("environment variable {name} is not set"))?
-        }
-        (None, Some(path)) => {
-            let unreadable = |error: std::io::Error| {
-                format!(
-                    "cannot read secret file {}: {}",
-                    path.display(),
-                    error.kind()
-                )
-            };
-            let mut text = String::new();
-            std::fs::File::open(path)
-                .and_then(|file| file.take(MAX_SECRET_BYTES + 1).read_to_string(&mut text))
-                .map_err(unreadable)?;
-            if text.len() as u64 > MAX_SECRET_BYTES {
-                return Err(format!(
-                    "secret file {} is larger than {MAX_SECRET_BYTES} bytes",
-                    path.display()
-                ));
-            }
-            text
-        }
-        (None, None) => return Err("no secret reference".into()),
-    };
+    use SecretProblem::{Malformed, Unavailable};
     let what = || match (&secret.env, &secret.file) {
         (Some(name), _) => format!("environment variable {name}"),
         (None, Some(path)) => format!("secret file {}", path.display()),
-        (None, None) => unreachable!("handled above"),
+        (None, None) => "secret".to_string(),
+    };
+    let value = match (&secret.env, &secret.file) {
+        (Some(name), _) => env(name).ok_or_else(|| {
+            (
+                Unavailable,
+                format!("environment variable {name} is not set"),
+            )
+        })?,
+        (None, Some(path)) => {
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .and_then(|file| file.take(MAX_SECRET_BYTES + 1).read_to_end(&mut bytes))
+                .map_err(|error| {
+                    (
+                        Unavailable,
+                        format!(
+                            "cannot read secret file {}: {}",
+                            path.display(),
+                            error.kind()
+                        ),
+                    )
+                })?;
+            if bytes.len() as u64 > MAX_SECRET_BYTES {
+                return Err((
+                    Malformed,
+                    format!("{} is larger than {MAX_SECRET_BYTES} bytes", what()),
+                ));
+            }
+            String::from_utf8(bytes)
+                .map_err(|_| (Malformed, format!("{} is not valid UTF-8", what())))?
+        }
+        (None, None) => return Err((Unavailable, "no secret reference".into())),
     };
     let value = value.trim();
     if value.is_empty() {
-        return Err(format!("{} is empty", what()));
+        return Err((Unavailable, format!("{} is empty", what())));
     }
-    if value.chars().any(char::is_control) {
-        return Err(format!("{} is not a single line", what()));
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{feff}' | '\u{2028}' | '\u{2029}'))
+    {
+        return Err((Malformed, format!("{} is not a single line", what())));
     }
     Ok(value.to_string())
 }
@@ -3255,6 +3297,38 @@ mod tests {
             );
             let _ = std::fs::remove_file(path);
         }
+        // A byte-order mark survives `trim` and would ride into a header; a separator likewise.
+        for (name, bytes) in [
+            ("bom", "\u{feff}token-value".as_bytes().to_vec()),
+            ("sep", "one\u{2028}two".as_bytes().to_vec()),
+            ("crlf", b"one\r\ntwo".to_vec()),
+            ("nul", b"one\0two".to_vec()),
+        ] {
+            let (secret, path) = secret_in(name, &bytes);
+            let (kind, message) = read_secret_classified(&secret, &none).unwrap_err();
+            assert_eq!(kind, SecretProblem::Malformed, "{name}: {message}");
+            let _ = std::fs::remove_file(path);
+        }
+        // Not UTF-8, and a cut multibyte character at the cap, are malformed (not "unreadable").
+        let (bad, path) = secret_in("latin1", &[0x74, 0xe9, 0x73, 0x74]);
+        let (kind, message) = read_secret_classified(&bad, &none).unwrap_err();
+        assert_eq!(kind, SecretProblem::Malformed, "{message}");
+        let _ = std::fs::remove_file(path);
+        let mut cut = vec![b'a'; MAX_SECRET_BYTES as usize];
+        cut.extend("\u{e9}".as_bytes());
+        let (cut, path) = secret_in("cut", &cut);
+        let error = read_secret(&cut, &none).unwrap_err();
+        assert!(error.contains("larger than"), "{error}");
+        let _ = std::fs::remove_file(path);
+        // An absent secret stays "unavailable", so a pipeline can retry on it.
+        let missing = SecretRef {
+            env: None,
+            file: Some("/nonexistent/llmshim-secret".into()),
+        };
+        assert_eq!(
+            read_secret_classified(&missing, &none).unwrap_err().0,
+            SecretProblem::Unavailable
+        );
         // One byte over the cap is refused without reading the rest into memory.
         let (big, path) = secret_in("big", &vec![b'a'; MAX_SECRET_BYTES as usize + 1]);
         let error = read_secret(&big, &none).unwrap_err();

@@ -395,8 +395,8 @@ mod tests {
         for (value, expected) in [
             ("short-token", "at least 22 characters"),
             ("has a space inside it 0123", "visible ASCII"),
-            // A byte-order mark survives `trim` and is not whitespace.
-            ("\u{feff}ci-token-0123456789abcdef", "visible ASCII"),
+            // A byte-order mark survives `trim`; the shared secret reader refuses it.
+            ("\u{feff}ci-token-0123456789abcdef", "not a single line"),
             ("caf\u{e9}-token-0123456789abcd", "visible ASCII"),
             // A control character is refused earlier, by the shared secret reader (note 0033).
             ("tab\tseparated-0123456789abc", "not a single line"),

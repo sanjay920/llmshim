@@ -1229,7 +1229,8 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     }
     // A rule broken by the value of a secret (a caller token too short, equal to
     // an upstream key, a Redis URL that is not one) is a defect in what was
-    // configured: status 1. A secret that is unset, blank or unreadable is a fact
+    // configured: status 1, as is a secret too large or not one line of text (note 0033).
+    // A secret that is unset, blank or unreadable is a fact
     // about this environment: status 3. Both are reported together and a defect
     // outranks an absence, so a secret that is missing never hides a rule broken
     // by another one that is present: each rule is asked about on its own and the
@@ -1238,6 +1239,7 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     let unavailable: std::collections::BTreeSet<&str> =
         absent.iter().map(|issue| issue.path.as_str()).collect();
     let mut defects = config.check_same_values(&env);
+    defects.extend(config.check_secret_values(&env));
     defects.extend(config.check_credential_files());
     if let Err(issues) = llmshim::serve::build_key_store(&config, &env) {
         defects.extend(issues);
