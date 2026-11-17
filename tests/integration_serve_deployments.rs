@@ -563,3 +563,110 @@ async fn finished_attempts_feed_token_and_unknown_cost_counters_labelled_by_prov
         }
     }
 }
+
+// ---- streaming failover (note 0031) ---------------------------------------------------------
+
+/// A mock that answers with a short chat-completions stream.
+async fn streaming(calls: usize) -> (mockito::ServerGuard, mockito::Mock) {
+    let chunk = |delta: &str, finish: &str, extra: &str| {
+        format!(
+            "data: {{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\
+             \"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{delta},\
+             \"finish_reason\":{finish}}}]{extra}}}"
+        )
+    };
+    let body = [
+        chunk(r#"{"role":"assistant","content":"po"}"#, "null", ""),
+        chunk(
+            r#"{"content":"ng"}"#,
+            r#""stop""#,
+            r#","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}"#,
+        ),
+        "data: [DONE]".to_string(),
+    ]
+    .join("\n\n")
+        + "\n\n";
+    let mut up = mockito::Server::new_async().await;
+    let mock = up
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .expect(calls)
+        .create_async()
+        .await;
+    (up, mock)
+}
+
+async fn ask_stream(base: &str, model: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(CALLER_KEY)
+        .json(&json!({"model": model, "stream": true,
+            "messages": [{"role": "user", "content": "ping"}]}))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_that_fails_to_open_is_retried_on_the_next_target() {
+    let (east, east_mock) = failing(502, 1).await;
+    let (west, west_mock) = streaming(1).await;
+    let server = start(
+        &render(&east.url(), &west.url(), ORDERED, "", None),
+        "dep-stream-failover",
+        &no_client_retries(),
+    );
+    let answer = ask_stream(&server.base, "deployment/chat").await;
+    assert_eq!(answer.status(), 200);
+    let text = answer.text().await.unwrap();
+    assert!(text.contains("po") && text.contains("ng"), "{text}");
+    east_mock.assert_async().await;
+    west_mock.assert_async().await;
+    let metrics = reqwest::Client::new()
+        .get(format!("{}/metrics", server.admin.clone().unwrap()))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains(
+            "llmshim_gateway_deployment_failover_total{deployment=\"chat\",from=\"east/m\",to=\"west/m\"} 1"
+        ),
+        "{metrics}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_is_not_retried_for_a_400_or_when_addressed_to_a_target() {
+    // A 400 is the request's fault; a concrete target is never moved.
+    let (east, east_mock) = failing(400, 1).await;
+    let (west, west_mock) = streaming(0).await;
+    let server = start(
+        &render(&east.url(), &west.url(), ORDERED, "", None),
+        "dep-stream-no-failover",
+        &no_client_retries(),
+    );
+    assert_ne!(
+        ask_stream(&server.base, "deployment/chat").await.status(),
+        200
+    );
+    east_mock.assert_async().await;
+    west_mock.assert_async().await;
+    let (east, east_mock) = failing(502, 1).await;
+    let (west, west_mock) = streaming(0).await;
+    let server = start(
+        &render(&east.url(), &west.url(), ORDERED, "", None),
+        "dep-stream-concrete",
+        &no_client_retries(),
+    );
+    assert!(ask_stream(&server.base, "east/m")
+        .await
+        .status()
+        .is_server_error());
+    east_mock.assert_async().await;
+    west_mock.assert_async().await;
+}

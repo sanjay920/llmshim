@@ -1141,6 +1141,7 @@ fn idem_ttl_secs() -> u64 {
 /// queued request. Returns the caller's [`Identity`] so the handler can apply
 /// per-tenant quotas. Tier comes from the identity (the key in enforced mode,
 /// the header in open mode) — never a client header when auth is enforced.
+#[cfg(test)]
 fn build_request(
     state: &GatewayState,
     headers: &HeaderMap,
@@ -1588,16 +1589,7 @@ async fn chat(
                 );
             }
             Err(err) => {
-                let next = req
-                    .model
-                    .strip_prefix("deployment/")
-                    .filter(|_| retryable_upstream_failure(&err))
-                    .filter(|name| tried.len() < snapshot.deployment_target_count(name).min(3))
-                    .and_then(|name| {
-                        snapshot
-                            .deployment_retry_target(name, &tried)
-                            .map(|target| (name, target))
-                    });
+                let next = failover_target(&req.model, &snapshot, &tried, &err);
                 let Some((name, target)) = next else {
                     return Err(gateway_err_to_api(&state, err));
                 };
@@ -1622,6 +1614,24 @@ async fn chat(
             }
         }
     }
+}
+
+/// The deployment and the next untried target to send a request to after `error`, if it may be
+/// retried at all (note 0031): the request addressed a deployment, the failure is the provider's, and
+/// fewer than `min(targets, 3)` targets have been tried.
+fn failover_target<'a>(
+    model: &'a str,
+    snapshot: &Router,
+    tried: &[String],
+    error: &GatewayError,
+) -> Option<(&'a str, String)> {
+    let name = model
+        .strip_prefix("deployment/")
+        .filter(|_| retryable_upstream_failure(error))
+        .filter(|name| tried.len() < snapshot.deployment_target_count(name).min(3))?;
+    snapshot
+        .deployment_retry_target(name, tried)
+        .map(|target| (name, target))
 }
 
 /// Whether a failed attempt says nothing about the request, so another target may be tried: a 5xx
@@ -1730,44 +1740,103 @@ async fn chat_stream_inner(
     responses_identity: bool,
     preselected: Option<Arc<Router>>,
 ) -> Response {
-    let (_provider_name, _budget_model, gw, identified_caller, snapshot) =
-        match build_request(&state, &headers, &req, preselected) {
-            Ok(t) => t,
-            Err(e) => return e.into_response(),
-        };
-    let identity = identified_caller.identity;
-    #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
-    let mut policy_scope = match state.trusted_policy_scope(&identity).await {
-        Ok(scope) => scope,
-        Err(error) => return gateway_err_to_api(&state, error).into_response(),
-    };
-    #[cfg(feature = "serve")]
-    if state.attempt_coordinator.records_usage() {
-        policy_scope.attribute(
-            &identified_caller.credential_scope,
-            request_id_of(&headers),
-            req.model.strip_prefix("deployment/"),
+    // A stream that fails to open (a 5xx or a transport failure before the first byte) is retried on
+    // another target of its deployment exactly as a unary request is (note 0031): nothing has been
+    // sent to the caller yet, and each retry is a new submission with its own admission and record.
+    let logical_deadline = logical_lifetime
+        .as_ref()
+        .map(|axum::Extension(lifetime)| lifetime.deadline());
+    let mut tried: Vec<String> = Vec::new();
+    let mut forced: Option<String> = None;
+    let mut preselected = preselected;
+    let mut prequeue_permit = Some(prequeue_permit);
+    let mut previous: Option<GatewayError> = None;
+    let mut pending_failover: Option<(String, String, String)> = None;
+    let mut rx = loop {
+        let (_provider_name, _budget_model, gw, identified_caller, snapshot) =
+            match build_request_for(
+                &state,
+                &headers,
+                &req,
+                preselected.clone(),
+                forced.as_deref(),
+            ) {
+                Ok(built) => built,
+                Err(error) => return retry_or(&state, &mut previous, error).into_response(),
+            };
+        preselected = Some(snapshot.clone());
+        if let Some((name, from, to)) = pending_failover.take() {
+            crate::gateway::metrics::incr(
+                crate::gateway::metrics::DEPLOYMENT_FAILOVER,
+                &[("deployment", &name), ("from", &from), ("to", &to)],
+            );
+        }
+        let identity = identified_caller.identity;
+        tried.push(
+            gw.payload
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         );
-    }
-    state.pin_router(&mut policy_scope, snapshot);
-    let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {
-        Ok(prepared) => prepared,
-        Err(error) => return gateway_err_to_api(&state, error).into_response(),
-    };
-    // Admission (queue + rate) happens up front so a rejection is a proper
-    // 429/503 before the SSE response begins, not an SSE error event.
-    let mut rx = match state
-        .submit_stream_prepared(
-            prepared_submission,
-            prequeue_permit,
-            logical_lifetime
-                .as_ref()
-                .map(|axum::Extension(lifetime)| lifetime.deadline()),
-        )
-        .await
-    {
-        Ok(rx) => rx,
-        Err(err) => return gateway_err_to_api(&state, err).into_response(),
+        #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
+        let mut policy_scope = match state.trusted_policy_scope(&identity).await {
+            Ok(scope) => scope,
+            Err(error) => {
+                return retry_or(&state, &mut previous, gateway_err_to_api(&state, error))
+                    .into_response()
+            }
+        };
+        #[cfg(feature = "serve")]
+        if state.attempt_coordinator.records_usage() {
+            policy_scope.attribute(
+                &identified_caller.credential_scope,
+                request_id_of(&headers),
+                req.model.strip_prefix("deployment/"),
+            );
+        }
+        state.pin_router(&mut policy_scope, snapshot.clone());
+        let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return retry_or(&state, &mut previous, gateway_err_to_api(&state, error))
+                    .into_response()
+            }
+        };
+        // Admission (queue + rate) happens up front so a rejection is a proper
+        // 429/503 before the SSE response begins, not an SSE error event.
+        let permit = prequeue_permit
+            .take()
+            .expect("a preparation permit is held for every attempt");
+        match state
+            .submit_stream_prepared(prepared_submission, permit, logical_deadline)
+            .await
+        {
+            Ok(rx) => break rx,
+            Err(err) => {
+                let Some((name, target)) = failover_target(&req.model, &snapshot, &tried, &err)
+                else {
+                    return gateway_err_to_api(&state, err).into_response();
+                };
+                pending_failover = Some((
+                    name.to_owned(),
+                    tried.last().cloned().unwrap_or_default(),
+                    target.clone(),
+                ));
+                previous = Some(err);
+                forced = Some(target);
+                match prequeue_permit_for_retry(&state).await {
+                    Ok(permit) => prequeue_permit = Some(permit),
+                    Err(_) => {
+                        return gateway_err_to_api(
+                            &state,
+                            previous.take().expect("the failure that led to this retry"),
+                        )
+                        .into_response()
+                    }
+                }
+            }
+        }
     };
 
     let event_stream = async_stream::stream! {

@@ -142,7 +142,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Key tags on usage records (0029): `keys[].tags` onto usage records, also in control-plane keys and snapshots
 - [ ] Tenant budgets above key budgets (0030): slices 2 to 5 built (file table, single-instance and Redis ledgers, outage interplay for keys with no cap of their own, team budgets through the control plane); a lease for a key's own cap, reload `started_at` and a refusal-level label are not built
 - [x] Alerts, scheduled cost exports (0034): alerts are Prometheus rules over new provider-labelled spend counters; exports are the usage log; the gateway sends and schedules nothing
-- [ ] Deployments and load balancing across credentials and regions (0031): built through slice 4 (selection, four strategies, health with probes, allowlist, usage field, non-streaming failover, stats view, two accounts via named instances); streaming failover remains
+- [x] Deployments and load balancing across credentials and regions (0031): built through slice 4 (selection, four strategies, health with probes, allowlist, usage field, non-streaming failover, stats view, two accounts via named instances, streaming failover before the first byte)
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
 - [ ] Audit log
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy
