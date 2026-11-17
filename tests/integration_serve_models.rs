@@ -100,6 +100,41 @@ async fn every_entry_point_applies_the_list_and_streaming_does_too() {
         let response = ask(&server.base, path, "inference/forbidden", stream).await;
         assert_eq!(response.status(), 403, "{path} stream={stream}");
     }
+    // The Responses wire, unary and streaming.
+    for stream in [false, true] {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/responses", server.base))
+            .bearer_auth(CALLER_KEY)
+            .json(&json!({"model": "inference/forbidden", "stream": stream, "input": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403, "responses stream={stream}");
+    }
+    // The Gemini wire.
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1beta/models/inference/forbidden:generateContent",
+            server.base
+        ))
+        .bearer_auth(CALLER_KEY)
+        .json(&json!({"contents": [{"role": "user", "parts": [{"text": "ping"}]}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403, "gemini wire");
+    // The Anthropic wire, streaming too.
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/messages", server.base))
+        .header("x-api-key", CALLER_KEY)
+        .json(
+            &json!({"model": "inference/forbidden", "max_tokens": 16, "stream": true,
+            "messages": [{"role": "user", "content": "ping"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403, "anthropic stream");
     // The Anthropic wire.
     let response = reqwest::Client::new()
         .post(format!("{}/v1/messages", server.base))

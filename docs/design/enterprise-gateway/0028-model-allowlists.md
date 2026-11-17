@@ -142,4 +142,6 @@ allowed_models = ["openai/gpt-6-luna", "anthropic/claude-haiku-5-5", "openrouter
 - Tests: `integration_serve_models` (exact, prefix, route, every entry point and streaming, reload,
   refused files by path; the mock upstream is not reached by a refused request), unit tests for
   matching and for the OpenRouter fallback list. The check removed fails five of them.
+- `x-openrouter.preset` is refused for a restricted key on OpenRouter (a preset is configured upstream and can set the model; whether it can override is unverified, so it fails closed), and the `x-openrouter` checks apply only to requests that resolve to OpenRouter.
+- Not covered by a process test: `client_san` and `jwt` keys carrying a list (their identities are built with the same code path, reviewed by reading), and the OpenRouter rules end to end (unit-tested on the payload).
 - Not built: carrying the field in a control-plane snapshot (slice 3).

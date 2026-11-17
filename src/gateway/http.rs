@@ -1203,15 +1203,20 @@ fn request_models_allowed(
     route: Option<&str>,
     payload: &Value,
 ) -> bool {
-    let fallbacks_allowed = match payload.pointer("/x-openrouter/models") {
-        None => true,
-        Some(Value::Array(models)) => models.iter().all(|entry| {
-            entry
-                .as_str()
-                .is_some_and(|entry| identity.permits_model("openrouter", entry, None))
-        }),
-        Some(_) => false,
-    };
+    // Only OpenRouter reads `x-openrouter`: its fallback list names more models than the
+    // primary, and a preset is configured upstream and can set the model there, so a
+    // restricted key may not send one.
+    let fallbacks_allowed = provider_key != "openrouter"
+        || (payload.pointer("/x-openrouter/preset").is_none()
+            && match payload.pointer("/x-openrouter/models") {
+                None => true,
+                Some(Value::Array(models)) => models.iter().all(|entry| {
+                    entry
+                        .as_str()
+                        .is_some_and(|entry| identity.permits_model("openrouter", entry, None))
+                }),
+                Some(_) => false,
+            });
     identity.permits_model(provider_key, model, route) && fallbacks_allowed
 }
 
@@ -5641,5 +5646,21 @@ mod request_id_tests {
             json!({"x-openrouter": {"models": "openai/gpt-6-sol"}})
         ));
         assert!(!ask(json!({"x-openrouter": {"models": [7]}})));
+        // A preset is configured upstream and can set the model there.
+        assert!(!ask(
+            json!({"x-openrouter": {"preset": "@preset/anything"}})
+        ));
+        // The namespace is only read by OpenRouter: another provider ignores it.
+        let other = request_models_allowed(
+            &crate::gateway::auth::Identity {
+                allowed_models: Some(vec!["anthropic/*".into()]),
+                ..key.clone()
+            },
+            "anthropic",
+            "claude-haiku-5-5",
+            None,
+            &json!({"x-openrouter": {"models": ["openai/gpt-6-sol"]}}),
+        );
+        assert!(other);
     }
 }
