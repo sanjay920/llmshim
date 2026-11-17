@@ -33,44 +33,70 @@ kinds they are the same string, and only one entry per kind exists, so nothing h
 
 ## The design
 
-Separate the two meanings with the smallest change that keeps every behavior check exactly as it is:
+Separate the two meanings, keeping every behavior check on the kind exactly as it is.
 
-- **`Provider::name()` keeps meaning (1): the kind.** Nothing that reads it changes: a second OpenAI
-  account is `name() == "openai"` for pricing, replay and tool handling.
-- **A new defaulted method `Provider::instance(&self) -> &str`**, default `self.name()`, is meaning (2):
-  the registered key. It is used by admission only: the admission target's provider name, the
-  client's breaker observation, `fallback.rs`'s breaker use, the usage record, the deployment selector's
-  health question and the lane key. Because it is **defaulted**, no implementation of the public trait
-  breaks and every existing provider keeps its current admission name.
-- Each hosted provider (`OpenAi`, `Anthropic`, `Gemini`, `Xai`, `Cerebras`, `OpenRouter`) gains a builder
-  `with_instance(name)` that sets what `instance()` returns. `serve` builds each `[providers.<name>]`
-  entry with `with_instance(<name>)`, so for the default (an entry named for its kind) `instance() ==
-  name()` and **nothing changes for any existing file**.
-- **The file rule relaxes**: a hosted entry may have any valid provider name, as long as the name is not
-  the **reserved name of another kind** (`anthropic` must be an Anthropic entry; an OpenAI entry called
-  `anthropic` stays refused) and not `route`/`deployment`. `[providers.openai]` stays the entry that
-  `openai/<model>` and a bare `gpt-*` infer to; a second entry, `[providers.openai-b]`, is addressed
-  explicitly (`openai-b/gpt-6-luna`), as OpenRouter, vLLM and SGLang entries already are, because a name
-  prefix cannot be inferred.
-- **Model strings.** `openai-b/gpt-6-luna` splits at the first `/` as it does today; the model after it is
-  resolved against the **kind's** catalog (the instance's `name()`), so canonical spelling and pricing
-  work for the second account exactly as for the first. A test pins this: the router resolves provider
-  key `openai-b` to the instance and asks the catalog about `openai`.
-- **Limits by instance.** `[limits.providers.openai-b]` (and `LLMSHIM_OPENAI_B_RPM` in the env form) key on
-  the instance name; the kind's own table does not leak to the second account. A request to the second
-  account is rate limited, queued, concurrency capped and circuit-broken on its own.
-- **Credentials.** Each entry has its own `api_key` and `base_url`; nothing is inherited from a sibling.
-  The usage record's `provider` is the instance (for the default entry, equal to the kind, so existing
-  records are unchanged), and the `model` is what the instance was asked.
-- **Reasoning replay.** An encrypted reasoning block is bound to the account that issued it
-  (CLAUDE.md, "Multi-model conversations"). The binding is derived from the actual request's origin, so
-  a block issued by account A is not replayed to account B. This is **verified, not assumed**: the first
-  slice's review reads the binding and a test pins it (two instances, one issued block, replay to the
-  other is dropped). A deployment that serves reasoning traffic should use the `conversation` strategy
-  (0031) so a conversation stays on one account.
-- **Not in scope.** The cloud transports (`bedrock`, `vertex-*`, `azure`): their identity is already
-  the deployment or account they are configured with and they have their own multiplicity rules (0020).
-  The `chatgpt` OAuth provider and the environment-derived routers keep their fixed names.
+- **`Provider::name()` keeps meaning the kind.** Pricing (`cost::stamp`/`for_target`), the budget estimator
+  (`gateway/budget.rs`: `catalog::lookup_id("{provider}/{model}")`, the OpenRouter shape checks), the
+  token estimator (`proxy/ratelimit.rs`: reasoning budgets and the omitted-output default per vendor), the
+  reasoning replay policy and its provenance, tool handling, the plan, images and the ChatGPT check all read
+  the kind, and **`ReplayTarget.provider` and `AdmissionTarget.provider_name` stay the kind**. A second
+  OpenAI account is `openai` to every one of them, so `openai-b/gpt-6-luna` is priceable and estimated
+  exactly as `openai/gpt-6-luna` is. (Changing those fields to the instance would break every one of
+  these readers silently: a strict budget would find no price for `openai-b/gpt-6-luna` and refuse every
+  request.)
+- **A new defaulted method `Provider::instance(&self) -> &str`** (default `self.name()`) is the admission
+  identity, and **an `instance` field is added beside the kind** in `AdmissionTarget` and in
+  `AttemptIdentity`. The admission readers move to it, **and only they**: the queue lane
+  (`gateway/http.rs`), the rate-bucket acquire (`proxy/attempt.rs`), the concurrency semaphore, the 429
+  penalty (`gateway/attempt.rs`), the tenant quota key, the usage record and its span
+  (`gateway/usage.rs`), the breaker observation (`client.rs`), `fallback.rs` (the breaker and its
+  `policy_limited_providers` set), the deployment selector's health question (0031), the metric labels,
+  and the library's `LogEntry.provider` and returned stream provider, and the embeddings model ids
+  (`"{instance}/{model}"`, so an id returned is requestable back and reaches the same account). Because
+  the method is defaulted, no implementation of the public trait breaks, and every provider that does not
+  set an instance reports its name.
+- **`instance()` equals the registry key by construction in `serve`**: each `[providers.<name>]` is built
+  with `with_instance(<name>)` and registered under `<name>`, so the lane a request is queued in is the
+  lane the worker that `serve` starts for that registry key serves. A library caller that registers a
+  provider under a key different from its `instance()` has a lane with no worker; the reference says
+  `instance()` must equal the key, and `Router::register` states the rule (it does not enforce it: today's
+  library callers already register under arbitrary keys).
+- **`with_instance`** is a builder on `OpenAi`, `Anthropic`, `Gemini`, `Xai`, `Cerebras` and `OpenRouter`.
+  It adds a private field to structs whose fields are public, so a downstream **struct literal** of one of
+  them stops compiling; `new` and the other builders are unaffected. These types are not among the files
+  the semver rule names, and the crate is `0.x`, where a minor release is the channel for this; the release
+  that ships it says so.
+- **The file rule relaxes**: a hosted entry may have any valid provider name unless the name is the
+  **reserved name of another kind** (an OpenAI entry called `anthropic` stays refused); `route` and
+  `deployment` are refused as provider names (the `deployment` check is added: a provider with that name
+  is unreachable, because `deployment/` is resolved first). An `openai-compatible` entry may not take a
+  hosted name, as today. `[providers.openai]` stays the entry that `openai/<model>` and a bare `gpt-*`
+  infer to; a second entry, `[providers.openai-b]`, is addressed explicitly (`openai-b/gpt-6-luna`), as
+  OpenRouter, vLLM and SGLang entries are, because a name prefix cannot be inferred.
+- **Model resolution is extended, not assumed.** Today `Router::resolve_key` asks the catalog only about a
+  prefix that is a known provider or alias, so `openai-b/<alias or non-canonical spelling>` would be sent
+  **verbatim**, where `openai/<the same>` is rewritten to the catalog's spelling. For a key whose provider
+  reports a different kind, `resolve_key` asks the catalog about `"{kind}/{model}"` and keeps the instance
+  as the provider key, so canonical spelling works for the second account as for the first. A test pins it.
+- **Limits by instance.** `[limits.providers.openai-b]` keys on the instance name and the kind's table does
+  not leak to it (validation already accepts any name in `[providers]`). The **environment form**
+  (`LLMSHIM_<NAME>_RPM`) exists today only for four kinds and a hyphenated instance name has no environment
+  spelling: instance limits are **file-only**, and the note makes no environment promise.
+- **Credentials.** Each entry has its own `api_key` and `base_url`; nothing is inherited. The usage record's
+  `provider` is the instance (equal to the kind for the default entry, so existing records are unchanged).
+- **Reasoning replay is verified, and holds.** An encrypted reasoning block is bound to the issuing
+  account: `ReplayTarget::bind_account` hashes the kind, base URL **and API key** (`reasoning.rs`), and the
+  filter drops an encrypted block whose account differs (`AccountMismatch`). Two OpenAI accounts, even on
+  one host, get different bindings, so no extra slice is needed. Text and redacted blocks are not
+  account-bound (existing behavior). Two instances configured with the same key and base URL share a
+  binding, which is acceptable. A deployment serving reasoning traffic should still use `conversation`
+  (0031) to keep a conversation on one account.
+- **Reload.** Renaming an instance is a removal and an addition (`providers.removed`/`providers.added`): its
+  lane, bucket and circuit state are the old name's and are not carried to the new one. 0022's sentence that
+  a hosted provider's table "must be named for its kind" changes accordingly.
+- **Not in scope.** The cloud transports (`bedrock`, `vertex-*`, `azure`): their identity is the
+  deployment or account they are configured with (0020). `chatgpt` and the environment-derived routers
+  keep their fixed names.
 
 ## What it does not change
 
@@ -102,22 +128,25 @@ and each fails a test.
 
 ## Contract changes (each with its own test when built)
 
-- **`Provider::instance()`** (defaulted; `src/provider.rs`), additive. A minor release, as with
-  `observe_native` (0014 in the crate's history).
-- **`with_instance`** on the six hosted providers (additive, public in `providers/*`).
-- **The file rule** for hosted names (the schema's text and `unit_serve_cli`'s refusal strings change; the
-  JSON Schema itself does not, the field set is unchanged), and `serve-config.schema.json` is regenerated
-  only if a description changes.
+- **`Provider::instance()`** (defaulted; `src/provider.rs`), additive, with the `instance` fields beside
+  the kind in `AdmissionTarget` and `AttemptIdentity`.
+- **`with_instance`** on the six hosted providers (a private field: see the semver sentence above; a
+  `0.x` minor release).
+- **`Router::resolve_key`** asks the catalog about the kind for an instance key (above).
+- **The file rule** for hosted names, the `deployment` provider-name refusal and `unit_serve_cli`'s refusal
+  strings; the JSON Schema is regenerated only if a description changes.
+- **Documents updated with it**: 0001 (the "named for its kind, once" row), 0022 (the reload sentence),
+  0031 (the prerequisite paragraph becomes "built").
 - **0014** gains the rows: two instances of one kind have independent limits, queues and circuits; a
-  second instance in a deployment; a name reserved for another kind is still refused.
+  second instance in a deployment; a name reserved for another kind is still refused; a renamed instance
+  starts fresh state.
 
 ## Slices
 
 1. This note.
 2. `Provider::instance`, the builders, every admission site, the relaxed rule, and the process test and
    mutations above.
-3. (Only if the review finds it necessary) the encrypted-reasoning binding fix, if the verification above
-   shows two accounts of one host share a binding.
+3. (None planned: the encrypted-reasoning binding was verified to be account-specific.)
 
 ## Not decided here
 
