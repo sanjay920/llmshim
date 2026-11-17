@@ -4294,6 +4294,17 @@ mod tests {
         let provider = format!("attempt-budget-{}", uuid::Uuid::new_v4().simple());
         let mut tenant = budget_scope(&format!("redis-{}", uuid::Uuid::new_v4()), 100);
         tenant.budget.as_mut().unwrap().window_secs = 1;
+        // Start just after a window boundary, so the three acquires below cannot straddle one
+        // (the window is one second long, and CI is slow enough to notice).
+        loop {
+            let into_window = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_millis());
+            if into_window < 250 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1000 - into_window as u64 + 10)).await;
+        }
         let first = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
         let second = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
         let frozen = budget_scope(&format!("redis-zero-{}", uuid::Uuid::new_v4()), 0);
