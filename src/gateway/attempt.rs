@@ -52,6 +52,14 @@ pub(crate) struct TrustedPolicyScope {
     budget: Option<crate::gateway::budget::BudgetPolicySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     legacy_spend_floor: Option<LegacySpendFloor>,
+    /// The tenant's own cap over every key's spend (note 0030). Present only for a tenant
+    /// with a `[tenants.<name>]` table, and then `version` is 2: a replica that predates
+    /// the field refuses the job instead of running it with a level unenforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_cap: Option<crate::gateway::budget::BudgetPolicySnapshot>,
+    /// The key's own cap counter id, with `tenant_cap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_cap_id: Option<String>,
     /// The credential the request authenticated with: the first 16 hex digits of
     /// the digest that scopes its state (not the whole digest). It lets the
     /// replica that dispatches the job name the key from its own configuration;
@@ -76,13 +84,34 @@ struct LegacySpendFloor {
 
 impl TrustedPolicyScope {
     pub(crate) fn from_identity(identity: &Identity) -> Self {
+        let tenant_cap = identity.tenant_budget.as_ref().map(|cap| {
+            crate::gateway::budget::BudgetPolicySnapshot::from_parts(
+                cap.budget_usd,
+                cap.budget_window_secs,
+                cap.budget_allow_unpriced,
+            )
+        });
+        // The key's cap counter is named by the key, not its secret, so a rotation keeps it.
+        let key_cap_id = tenant_cap.as_ref().map(|_| {
+            let digest = Sha256::digest(
+                format!(
+                    "{}/{}",
+                    identity.tenant,
+                    identity.key_name.as_deref().unwrap_or_default()
+                )
+                .as_bytes(),
+            );
+            format!("{digest:x}")[..16].to_owned()
+        });
         Self {
-            version: 1,
+            version: if tenant_cap.is_some() { 2 } else { 1 },
             tenant_key: format!("{:x}", Sha256::digest(identity.tenant.as_bytes())),
             rpm: identity.rpm,
             tpm: identity.tpm,
             budget: crate::gateway::budget::BudgetPolicySnapshot::from_identity(identity),
             legacy_spend_floor: None,
+            tenant_cap,
+            key_cap_id,
             credential: None,
             request_id: None,
             router: None,
@@ -94,6 +123,9 @@ impl TrustedPolicyScope {
     /// 0027, requires): `(tenant_key, window_secs, limit_nanos)`.
     #[cfg(feature = "redis-coordination")]
     pub(crate) fn outage_budget(&self) -> Option<(&str, u64, u64)> {
+        if self.tenant_cap.is_some() {
+            return None;
+        }
         let budget = self.budget.as_ref()?;
         (budget.valid && !budget.allow_unpriced).then_some((
             self.tenant_key.as_str(),
@@ -129,6 +161,29 @@ impl TrustedPolicyScope {
         Some(view)
     }
 
+    /// The budget counters this request must fit, as `(ledger tenant key, policy)`. A tenant
+    /// without a table has the one counter it always had; with a table the tenant's cap and
+    /// the key's own cap (if it has one) are separate counters in their own namespaces
+    /// (note 0030).
+    pub(crate) fn budget_levels(
+        &self,
+    ) -> Vec<(String, &crate::gateway::budget::BudgetPolicySnapshot)> {
+        match &self.tenant_cap {
+            None => self
+                .budget
+                .iter()
+                .map(|policy| (self.tenant_key.clone(), policy))
+                .collect(),
+            Some(cap) => {
+                let mut levels = vec![(format!("tenant-cap:{}", self.tenant_key), cap)];
+                if let (Some(policy), Some(id)) = (&self.budget, &self.key_cap_id) {
+                    levels.push((format!("key-cap:{id}"), policy));
+                }
+                levels
+            }
+        }
+    }
+
     /// Pin the router this request was admitted against (0022).
     pub(crate) fn set_router(&mut self, router: Arc<crate::router::Router>) {
         self.router = Some(router);
@@ -154,7 +209,7 @@ impl TrustedPolicyScope {
 
     #[cfg(feature = "redis-coordination")]
     pub(crate) fn is_current(&self) -> bool {
-        self.version == 1
+        matches!(self.version, 1 | 2)
     }
 }
 
@@ -213,6 +268,29 @@ trait AttemptRates: Send + Sync {
     ) -> Result<(), RateRefusal>;
 
     async fn penalize(&self, provider: &str, duration: Duration) -> Result<(), ()>;
+
+    /// [`Self::acquire`] with one quote per budget counter of the scope (note 0030). A ledger
+    /// that has only the single-counter form refuses a scope with more.
+    async fn acquire_levels(
+        &self,
+        provider: &str,
+        scope: &TrustedPolicyScope,
+        permits: u32,
+        attempt_id: uuid::Uuid,
+        quotes: &[crate::gateway::budget::BudgetQuote],
+    ) -> Result<(), RateRefusal> {
+        match quotes {
+            [] => {
+                self.acquire(provider, scope, permits, attempt_id, None)
+                    .await
+            }
+            [one] => {
+                self.acquire(provider, scope, permits, attempt_id, Some(*one))
+                    .await
+            }
+            _ => Err(RateRefusal::Unavailable),
+        }
+    }
 
     /// Nanos charged under a local ledger key, across its windows (outage
     /// recovery, note 0027). Only the in-memory ledger knows it.
@@ -324,6 +402,16 @@ struct Dimensions {
     tpm: HashMap<String, Bucket>,
 }
 
+/// The ledger id of an attempt's `level`-th budget counter: level 0 is the attempt's own id
+/// (so a one-counter attempt is exactly what it always was), later levels derive from it.
+fn level_attempt_id(attempt_id: uuid::Uuid, level: usize) -> uuid::Uuid {
+    if level == 0 {
+        return attempt_id;
+    }
+    const SALT: u128 = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834;
+    uuid::Uuid::from_u128(attempt_id.as_u128() ^ SALT.wrapping_mul(level as u128))
+}
+
 struct LocalRateState {
     global: Dimensions,
     tenant: Dimensions,
@@ -418,16 +506,45 @@ impl LocalAttemptRates {
         quote: Option<crate::gateway::budget::BudgetQuote>,
         test_epoch_secs: Option<u64>,
     ) -> Result<(), RateRefusal> {
+        let quotes: Vec<_> = quote.into_iter().collect();
+        self.acquire_levels_at_epoch(
+            provider,
+            scope,
+            permits,
+            attempt_id,
+            &quotes,
+            test_epoch_secs,
+        )
+        .await
+    }
+
+    /// [`Self::acquire_at_epoch`] for a scope with any number of budget counters: every
+    /// level is checked before any is reserved, so a refusal at one leaves none held.
+    async fn acquire_levels_at_epoch(
+        &self,
+        provider: &str,
+        scope: &TrustedPolicyScope,
+        permits: u32,
+        attempt_id: uuid::Uuid,
+        quotes: &[crate::gateway::budget::BudgetQuote],
+        test_epoch_secs: Option<u64>,
+    ) -> Result<(), RateRefusal> {
+        let levels = scope.budget_levels();
         let global_limit = self.config.resolve(provider);
         let tenant_key = format!("{}:{provider}", scope.tenant_key);
         let mut state = self.state.lock().await;
         let now = Instant::now();
         let now_epoch_secs = test_epoch_secs.unwrap_or_else(epoch_secs);
         purge_expired_budget_state(&mut state, now_epoch_secs);
-        if scope.budget.is_some()
-            && quote.is_some()
-            && (state.budget_attempts.contains_key(&attempt_id)
-                || state.budget_attempts.len() >= self.max_retained_attempts)
+        if levels.len() != quotes.len() {
+            return Err(RateRefusal::Unavailable);
+        }
+        if !levels.is_empty()
+            && ((0..levels.len()).any(|level| {
+                state
+                    .budget_attempts
+                    .contains_key(&level_attempt_id(attempt_id, level))
+            }) || state.budget_attempts.len() + levels.len() > self.max_retained_attempts)
         {
             return Err(RateRefusal::Unavailable);
         }
@@ -487,45 +604,54 @@ impl LocalAttemptRates {
             return Err(RateRefusal::Provider(wait));
         }
 
-        let budget_commit = match (&scope.budget, quote) {
-            (None, None) => None,
-            (Some(policy), Some(mut quote)) => {
-                let window_index = now_epoch_secs / policy.window_secs;
-                let window_key = BudgetWindowKey {
-                    tenant_key: scope.tenant_key.clone(),
-                    window_secs: policy.window_secs,
-                    window_index,
-                };
-                let current = state.budget_totals.get(&window_key).copied().unwrap_or(0);
-                let admitted = !state.budget_frozen.contains(&window_key)
-                    && policy.limit_nanos != 0
-                    && if quote.bounded {
-                        current
-                            .checked_add(quote.amount_nanos)
-                            .is_some_and(|next| next <= policy.limit_nanos)
-                    } else {
-                        current < policy.limit_nanos
-                    };
-                if !admitted {
-                    return Err(RateRefusal::Budget(budget_wait(
-                        policy.window_secs,
-                        now_epoch_secs,
-                    )));
-                }
-                if !quote.bounded {
-                    quote.amount_nanos = policy.limit_nanos - current;
-                }
-                let next_window = window_index
-                    .saturating_add(1)
-                    .saturating_mul(policy.window_secs);
-                Some((
-                    window_key,
-                    quote,
-                    next_window.saturating_add(self.retention_secs),
-                ))
+        // Every level is judged before any is reserved. When more than one refuses, the
+        // wait is the latest of their window ends.
+        let mut budget_commits = Vec::with_capacity(levels.len());
+        let mut refused: Option<Duration> = None;
+        for (level, ((ledger_key, policy), quote)) in levels.iter().zip(quotes).enumerate() {
+            let mut quote = *quote;
+            let window_index = now_epoch_secs / policy.window_secs;
+            let window_key = BudgetWindowKey {
+                tenant_key: ledger_key.clone(),
+                window_secs: policy.window_secs,
+                window_index,
+            };
+            let current = state.budget_totals.get(&window_key).copied().unwrap_or(0);
+            // Checked here, before anything is reserved, so that the commit below cannot
+            // fail half way and leave one level held.
+            if current.checked_add(quote.amount_nanos).is_none() {
+                return Err(RateRefusal::Unavailable);
             }
-            _ => return Err(RateRefusal::Unavailable),
-        };
+            let admitted = !state.budget_frozen.contains(&window_key)
+                && policy.limit_nanos != 0
+                && if quote.bounded {
+                    current
+                        .checked_add(quote.amount_nanos)
+                        .is_some_and(|next| next <= policy.limit_nanos)
+                } else {
+                    current < policy.limit_nanos
+                };
+            if !admitted {
+                let wait = budget_wait(policy.window_secs, now_epoch_secs);
+                refused = Some(refused.map_or(wait, |current: Duration| current.max(wait)));
+                continue;
+            }
+            if !quote.bounded {
+                quote.amount_nanos = policy.limit_nanos - current;
+            }
+            let next_window = window_index
+                .saturating_add(1)
+                .saturating_mul(policy.window_secs);
+            budget_commits.push((
+                level_attempt_id(attempt_id, level),
+                window_key,
+                quote,
+                next_window.saturating_add(self.retention_secs),
+            ));
+        }
+        if let Some(wait) = refused {
+            return Err(RateRefusal::Budget(wait));
+        }
 
         debit_dimension(&mut state.global.rpm, provider, global_limit.rpm, 1.0);
         debit_dimension(
@@ -541,20 +667,20 @@ impl LocalAttemptRates {
             scope.tpm,
             permits.max(1) as f64,
         );
-        if let Some((window_key, quote, expires_at_epoch_secs)) = budget_commit {
+        for (level_id, window_key, quote, expires_at_epoch_secs) in budget_commits {
             let total = state.budget_totals.entry(window_key.clone()).or_insert(0);
             *total = total
                 .checked_add(quote.amount_nanos)
                 .ok_or(RateRefusal::Unavailable)?;
             state
                 .budget_expirations
-                .push(std::cmp::Reverse((expires_at_epoch_secs, attempt_id)));
+                .push(std::cmp::Reverse((expires_at_epoch_secs, level_id)));
             *state
                 .budget_window_references
                 .entry(window_key.clone())
                 .or_insert(0) += 1;
             state.budget_attempts.insert(
-                attempt_id,
+                level_id,
                 AttemptLiability {
                     window_key,
                     pricing_bounded: quote.bounded,
@@ -724,15 +850,76 @@ impl AttemptRates for LocalAttemptRates {
         self.config.replace(config);
     }
 
+    async fn acquire_levels(
+        &self,
+        provider: &str,
+        scope: &TrustedPolicyScope,
+        permits: u32,
+        attempt_id: uuid::Uuid,
+        quotes: &[crate::gateway::budget::BudgetQuote],
+    ) -> Result<(), RateRefusal> {
+        self.acquire_levels_at_epoch(provider, scope, permits, attempt_id, quotes, None)
+            .await
+    }
+
     async fn observe_usage(
         &self,
         scope: &TrustedPolicyScope,
         attempt_id: uuid::Uuid,
+        observation: crate::gateway::budget::SpendObservation,
+    ) -> Result<(), ()> {
+        let mut result = Ok(());
+        for level in 0..scope.budget_levels().len() {
+            let id = level_attempt_id(attempt_id, level);
+            if self.observe_one(id, observation).await.is_err() {
+                result = Err(());
+            }
+        }
+        result
+    }
+
+    async fn finish(
+        &self,
+        scope: &TrustedPolicyScope,
+        attempt_id: uuid::Uuid,
+        outcome: AttemptOutcome,
+    ) -> Result<(), ()> {
+        let mut result = Ok(());
+        for level in 0..scope.budget_levels().len() {
+            let id = level_attempt_id(attempt_id, level);
+            if self.finish_one(id, outcome).await.is_err() {
+                result = Err(());
+            }
+        }
+        result
+    }
+
+    #[cfg(test)]
+    async fn budget_total(&self, scope: &TrustedPolicyScope) -> Option<u64> {
+        let (ledger_key, policy) = scope.budget_levels().into_iter().next()?;
+        let index = epoch_secs() / policy.window_secs;
+        let state = self.state.lock().await;
+        Some(
+            state
+                .budget_totals
+                .get(&BudgetWindowKey {
+                    tenant_key: ledger_key,
+                    window_secs: policy.window_secs,
+                    window_index: index,
+                })
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+}
+
+impl LocalAttemptRates {
+    /// One budget counter's share of [`AttemptRates::observe_usage`].
+    async fn observe_one(
+        &self,
+        attempt_id: uuid::Uuid,
         mut observation: crate::gateway::budget::SpendObservation,
     ) -> Result<(), ()> {
-        if scope.budget.is_none() {
-            return Ok(());
-        }
         let mut state = self.state.lock().await;
         let increase = {
             let attempt = state.budget_attempts.get_mut(&attempt_id).ok_or(())?;
@@ -798,15 +985,8 @@ impl AttemptRates for LocalAttemptRates {
         Ok(())
     }
 
-    async fn finish(
-        &self,
-        scope: &TrustedPolicyScope,
-        attempt_id: uuid::Uuid,
-        outcome: AttemptOutcome,
-    ) -> Result<(), ()> {
-        if scope.budget.is_none() {
-            return Ok(());
-        }
+    /// One budget counter's share of [`AttemptRates::finish`].
+    async fn finish_one(&self, attempt_id: uuid::Uuid, outcome: AttemptOutcome) -> Result<(), ()> {
         let mut state = self.state.lock().await;
         let settlement = {
             let attempt = state.budget_attempts.get_mut(&attempt_id).ok_or(())?;
@@ -855,32 +1035,6 @@ impl AttemptRates for LocalAttemptRates {
         }
         Ok(())
     }
-
-    #[cfg(test)]
-    async fn budget_total(&self, scope: &TrustedPolicyScope) -> Option<u64> {
-        let policy = scope.budget.as_ref()?;
-        let index = epoch_secs() / policy.window_secs;
-        let state = self.state.lock().await;
-        Some(total_for_scope(&state, scope, policy.window_secs, index))
-    }
-}
-
-#[cfg(test)]
-fn total_for_scope(
-    state: &LocalRateState,
-    scope: &TrustedPolicyScope,
-    window_secs: u64,
-    window_index: u64,
-) -> u64 {
-    state
-        .budget_totals
-        .get(&BudgetWindowKey {
-            tenant_key: scope.tenant_key.clone(),
-            window_secs,
-            window_index,
-        })
-        .copied()
-        .unwrap_or_default()
 }
 
 pub(crate) struct AttemptCoordinator {
@@ -1058,7 +1212,7 @@ impl AttemptCoordinator {
         attempt: &PreparedAttempt<'_>,
         scope: &TrustedPolicyScope,
     ) -> Result<(), AttemptPolicyRefusal> {
-        if scope.version != 1 {
+        if !matches!(scope.version, 1 | 2) {
             return Err(AttemptPolicyRefusal::new(
                 AttemptPolicyRefusalKind::CoordinatorUnavailable,
                 None,
@@ -1082,16 +1236,23 @@ impl AttemptCoordinator {
                     Some(self.concurrency_wait),
                 )
             })?;
-        let quote = crate::gateway::budget::quote(scope.budget.as_ref(), attempt)
-            .map_err(|_| AttemptPolicyRefusal::new(AttemptPolicyRefusalKind::Unpriceable, None))?;
+        // One quote per budget counter (a tenant with a table has two, note 0030): an attempt
+        // that cannot be priced is refused unless every level allows it.
+        let mut quotes = Vec::new();
+        for (_, policy) in scope.budget_levels() {
+            let quote = crate::gateway::budget::quote(Some(policy), attempt).map_err(|_| {
+                AttemptPolicyRefusal::new(AttemptPolicyRefusalKind::Unpriceable, None)
+            })?;
+            quotes.extend(quote);
+        }
         let permits = crate::proxy::ratelimit::estimate_attempt_tokens(attempt);
         match self
             .rates
-            .acquire(provider, scope, permits, attempt.identity().id(), quote)
+            .acquire_levels(provider, scope, permits, attempt.identity().id(), &quotes)
             .await
         {
             Ok(()) => {
-                if quote.is_some_and(|quote| !quote.bounded) {
+                if quotes.iter().any(|quote| !quote.bounded) {
                     crate::gateway::metrics::incr(
                         crate::gateway::metrics::UNPRICED_UNDER_CAP,
                         &[
@@ -2081,13 +2242,14 @@ mod tests {
             tpm,
             budget: None,
             legacy_spend_floor: None,
+            tenant_cap: None,
+            key_cap_id: None,
             credential: None,
             request_id: None,
             router: None,
         }
     }
 
-    #[cfg(feature = "redis-coordination")]
     fn budgeted(name: &str, limit_nanos: u64) -> TrustedPolicyScope {
         let mut scope = scope(name, None, None);
         scope.budget = Some(crate::gateway::budget::BudgetPolicySnapshot {
@@ -2126,6 +2288,288 @@ mod tests {
             ]
         );
         assert!(!value.to_string().contains("tag"));
+    }
+
+    /// A scope under a tenant table: the tenant's cap over every key, and (when `key_limit`
+    /// is set) the key's own cap on a counter of its own (note 0030).
+    fn two_level(
+        tenant: &str,
+        key_id: &str,
+        tenant_limit: u64,
+        key_limit: Option<u64>,
+        key_window_secs: u64,
+    ) -> TrustedPolicyScope {
+        let policy = |limit_nanos, window_secs| crate::gateway::budget::BudgetPolicySnapshot {
+            limit_nanos,
+            window_secs,
+            allow_unpriced: false,
+            valid: true,
+        };
+        let mut scope = scope(tenant, None, None);
+        scope.version = 2;
+        scope.tenant_cap = Some(policy(tenant_limit, 3600));
+        scope.key_cap_id = Some(key_id.to_owned());
+        scope.budget = key_limit.map(|limit| policy(limit, key_window_secs));
+        scope
+    }
+
+    async fn total_of(rates: &LocalAttemptRates, ledger_key: &str) -> u64 {
+        let state = rates.state.lock().await;
+        state
+            .budget_totals
+            .iter()
+            .filter(|(key, _)| key.tenant_key == ledger_key)
+            .map(|(_, total)| *total)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn a_request_must_fit_the_tenant_cap_and_its_keys_own_cap_and_a_refusal_holds_nothing() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let capped = two_level("acme", "key-a", 100, Some(50), 3600);
+        let free = two_level("acme", "key-b", 100, None, 3600);
+        let acquire = |scope: &TrustedPolicyScope, quotes: Vec<_>| {
+            let scope = scope.clone();
+            let rates = &rates;
+            async move {
+                rates
+                    .acquire_levels_at_epoch(
+                        "p",
+                        &scope,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &quotes,
+                        Some(10),
+                    )
+                    .await
+            }
+        };
+        let tenant_key = format!("tenant-cap:{}", capped.tenant_key);
+        let key_a = "key-cap:key-a";
+        // The capped key spends its own 50, and that counts toward the tenant's 100.
+        acquire(&capped, vec![quote(30), quote(30)]).await.unwrap();
+        acquire(&capped, vec![quote(20), quote(20)]).await.unwrap();
+        assert_eq!(total_of(&rates, &tenant_key).await, 50);
+        assert_eq!(total_of(&rates, key_a).await, 50);
+        // Its own cap refuses the next one although the tenant has 50 left; nothing moved.
+        assert!(matches!(
+            acquire(&capped, vec![quote(1), quote(1)]).await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert_eq!(total_of(&rates, &tenant_key).await, 50);
+        assert_eq!(total_of(&rates, key_a).await, 50);
+        // The other key has only the tenant cap, which the first key's spend already used.
+        acquire(&free, vec![quote(50)]).await.unwrap();
+        assert_eq!(total_of(&rates, &tenant_key).await, 100);
+        // The tenant is now full: the free key is refused, and the capped key is refused at
+        // the tenant level although its own counter is full too; neither counter moved.
+        assert!(matches!(
+            acquire(&free, vec![quote(1)]).await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert_eq!(total_of(&rates, &tenant_key).await, 100);
+        assert_eq!(total_of(&rates, key_a).await, 50);
+    }
+
+    #[tokio::test]
+    async fn a_key_refused_by_the_tenant_cap_leaves_its_own_counter_untouched() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let key = two_level("acme", "key-a", 40, Some(1000), 3600);
+        let id = uuid::Uuid::new_v4();
+        let refused = rates
+            .acquire_levels_at_epoch("p", &key, 1, id, &[quote(50), quote(50)], Some(10))
+            .await;
+        assert!(matches!(refused, Err(RateRefusal::Budget(_))));
+        // The key level had room, but nothing is held there: atomic across levels.
+        assert_eq!(total_of(&rates, "key-cap:key-a").await, 0);
+        assert_eq!(
+            total_of(&rates, &format!("tenant-cap:{}", key.tenant_key)).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wait_is_the_latest_window_end_of_the_levels_that_refuse() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        // Tenant window 3600, key window 60; both are full at second 10.
+        let key = two_level("acme", "key-a", 0, Some(0), 60);
+        let refused = rates
+            .acquire_levels_at_epoch(
+                "p",
+                &key,
+                1,
+                uuid::Uuid::new_v4(),
+                &[quote(1), quote(1)],
+                Some(10),
+            )
+            .await;
+        match refused {
+            Err(RateRefusal::Budget(wait)) => assert_eq!(wait, Duration::from_secs(3590)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_two_windows_are_independent() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let key = two_level("acme", "key-a", 1000, Some(10), 60);
+        let go = |epoch: u64, amount: u64| {
+            let key = key.clone();
+            let rates = &rates;
+            async move {
+                rates
+                    .acquire_levels_at_epoch(
+                        "p",
+                        &key,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &[quote(amount), quote(amount)],
+                        Some(epoch),
+                    )
+                    .await
+            }
+        };
+        go(10, 10).await.unwrap();
+        assert!(go(20, 1).await.is_err(), "the key's minute is full");
+        // The next minute: the key's counter is fresh, the tenant's hour keeps its spend.
+        go(70, 10).await.unwrap();
+        assert_eq!(
+            total_of(&rates, &format!("tenant-cap:{}", key.tenant_key)).await,
+            20
+        );
+    }
+
+    #[tokio::test]
+    async fn settlement_returns_each_levels_own_liability() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let key = two_level("acme", "key-a", 100, Some(40), 3600);
+        let id = uuid::Uuid::new_v4();
+        // An attempt that cannot be priced holds the remaining allowance at each level
+        // (100 at the tenant, 40 at the key).
+        let unbounded = crate::gateway::budget::BudgetQuote {
+            amount_nanos: 0,
+            bounded: false,
+        };
+        rates
+            .acquire_levels_at_epoch("p", &key, 1, id, &[unbounded, unbounded], Some(10))
+            .await
+            .unwrap();
+        let tenant_key = format!("tenant-cap:{}", key.tenant_key);
+        assert_eq!(total_of(&rates, &tenant_key).await, 100);
+        assert_eq!(total_of(&rates, "key-cap:key-a").await, 40);
+        // It finishes at 7: each level gives back what it held beyond that, no more.
+        rates
+            .observe_usage(&key, id, inferred_terminal_zero_with(7))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &key,
+                id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(total_of(&rates, &tenant_key).await, 7);
+        assert_eq!(total_of(&rates, "key-cap:key-a").await, 7);
+    }
+
+    fn inferred_terminal_zero_with(amount: u64) -> crate::gateway::budget::SpendObservation {
+        crate::gateway::budget::SpendObservation {
+            amount_nanos: Some(amount),
+            authority: crate::gateway::budget::SpendAuthority::Provider,
+            terminal_authoritative: true,
+        }
+    }
+
+    #[test]
+    fn a_scope_without_a_cap_serializes_as_it_always_did_and_one_with_a_cap_is_version_2() {
+        let plain = budgeted("plain", 100);
+        let value = serde_json::to_value(&plain).unwrap();
+        assert_eq!(value["version"], 1);
+        assert!(value.get("tenant_cap").is_none() && value.get("key_cap_id").is_none());
+        let capped = two_level("t", "key-a", 100, Some(50), 3600);
+        let value = serde_json::to_value(&capped).unwrap();
+        assert_eq!(value["version"], 2);
+        assert!(value.get("tenant_cap").is_some() && value.get("key_cap_id").is_some());
+        // The one counter a table-less tenant has is its own tenant key, as before.
+        let levels = plain.budget_levels();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].0, plain.tenant_key);
+        // A level's attempt id is the attempt's own for the first counter.
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(level_attempt_id(id, 0), id);
+        assert_ne!(level_attempt_id(id, 1), id);
+        assert_ne!(level_attempt_id(id, 1), level_attempt_id(id, 2));
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[test]
+    fn a_tenant_with_a_table_is_not_admitted_in_outage_state() {
+        assert!(two_level("t", "k", 100, Some(5), 3600)
+            .outage_budget()
+            .is_none());
+        assert!(two_level("t", "k", 100, None, 3600)
+            .outage_budget()
+            .is_none());
+        assert!(budgeted("plain", 100).outage_budget().is_some());
+    }
+
+    #[test]
+    fn the_key_cap_counter_follows_the_key_name_not_its_secret() {
+        let identity = |name: &str| crate::gateway::auth::Identity {
+            tenant: "acme".into(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(5.0),
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+            allowed_models: None,
+            key_name: Some(name.into()),
+            tenant_budget: Some(crate::gateway::auth::TenantBudget {
+                budget_usd: 100.0,
+                budget_window_secs: None,
+                budget_allow_unpriced: false,
+            }),
+        };
+        let id = |name: &str| {
+            TrustedPolicyScope::from_identity(&identity(name))
+                .key_cap_id
+                .unwrap()
+        };
+        // The same key (a rotated secret does not appear here at all) keeps its counter;
+        // a different name is a different counter.
+        assert_eq!(id("ci"), id("ci"));
+        assert_ne!(id("ci"), id("ci-2"));
+        assert_eq!(id("ci").len(), 16);
+    }
+
+    #[tokio::test]
+    async fn retention_counts_every_level_of_an_attempt() {
+        let rates = LocalAttemptRates::with_retention(RateLimitConfig::default(), 3);
+        let key = two_level("acme", "key-a", 1000, Some(1000), 3600);
+        let go = || {
+            let key = key.clone();
+            let rates = &rates;
+            async move {
+                rates
+                    .acquire_levels_at_epoch(
+                        "p",
+                        &key,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &[quote(1), quote(1)],
+                        Some(10),
+                    )
+                    .await
+            }
+        };
+        go().await.unwrap(); // two entries
+                             // A second would need four: over the limit of three.
+        assert!(matches!(go().await, Err(RateRefusal::Unavailable)));
     }
 
     /// Only a budgeted key whose attempts are priced and bounded can be
@@ -2260,6 +2704,8 @@ mod tests {
                 valid: true,
             }),
             legacy_spend_floor: None,
+            tenant_cap: None,
+            key_cap_id: None,
             credential: None,
             request_id: None,
             router: None,
@@ -4024,6 +4470,8 @@ mod tests {
             budget_window_secs: Some(3_600),
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         };
         let mut connection = rates.connection().await.unwrap();
         let redis_time: (u64, u64) = redis::cmd("TIME")
@@ -4160,6 +4608,8 @@ mod tests {
                 budget_window_secs: Some(3_600),
                 budget_allow_unpriced: false,
                 allowed_models: None,
+                key_name: None,
+                tenant_budget: None,
             };
             let mut connection = rates.connection().await.unwrap();
             let redis_time: (u64, u64) = redis::cmd("TIME")
@@ -4303,6 +4753,8 @@ mod tests {
             budget_window_secs: Some(1),
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         };
         let scope = TrustedPolicyScope::from_identity(&identity);
         let mut connection = rates.connection().await.unwrap();
@@ -4387,6 +4839,8 @@ mod tests {
             budget_window_secs: Some(3_600),
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         };
         let blocked_identity = identity_for(format!("origin-blocked-{namespace}"));
         let blocked_legacy_key =
@@ -4880,6 +5334,8 @@ mod usage_records {
             tpm: None,
             budget: None,
             legacy_spend_floor: None,
+            tenant_cap: None,
+            key_cap_id: None,
             credential: None,
             request_id: None,
             router: None,
@@ -5246,6 +5702,8 @@ mod usage_records {
             budget_window_secs: None,
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         });
         let json = serde_json::to_string(&scope).unwrap();
         assert!(!json.contains("payments"), "{json}");

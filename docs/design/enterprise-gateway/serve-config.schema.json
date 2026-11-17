@@ -917,6 +917,34 @@
       ],
       "type": "object"
     },
+    "TenantBudgetConfig": {
+      "additionalProperties": false,
+      "description": "`[tenants.<name>]`: the tenant's own budget (design note 0030).",
+      "properties": {
+        "budget_allow_unpriced": {
+          "default": false,
+          "description": "Admit attempts whose cost cannot be bounded before sending. With a key cap as well,\nboth levels must allow it.",
+          "type": "boolean"
+        },
+        "budget_usd": {
+          "description": "USD cap over every key of the tenant, per window.",
+          "type": "number"
+        },
+        "budget_window_secs": {
+          "default": null,
+          "description": "The window in seconds (default one day), independent of any key's own.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "budget_usd"
+      ],
+      "type": "object"
+    },
     "Tls": {
       "additionalProperties": false,
       "description": "Server certificate and key, as PEM files. The files are watched: when either\nchanges (a certificate manager renewed it) new connections use the new\nmaterial without a restart. A replacement that does not load is ignored and\nthe previous certificate stays in service.",
@@ -1184,6 +1212,13 @@
         }
       ],
       "description": "Export traces to an OpenTelemetry collector (0016). Needs a binary built\nwith `--features serve-otel`; without it a file that sets this table is\nrefused at startup."
+    },
+    "tenants": {
+      "additionalProperties": {
+        "$ref": "#/$defs/TenantBudgetConfig"
+      },
+      "description": "Tenant-level budgets (design note 0030): a cap over the spend of every key of a\ntenant, on a counter of its own. A key's own `budget_usd` then caps that key.\nSingle-instance only for now.",
+      "type": "object"
     },
     "upstream": {
       "$ref": "#/$defs/Upstream",

@@ -114,6 +114,11 @@ pub struct ServeConfig {
     /// server is a single instance with in-process state.
     #[serde(default)]
     pub fleet: Option<Fleet>,
+    /// Tenant-level budgets (design note 0030): a cap over the spend of every key of a
+    /// tenant, on a counter of its own. A key's own `budget_usd` then caps that key.
+    /// Single-instance only for now.
+    #[serde(default)]
+    pub tenants: BTreeMap<String, TenantBudgetConfig>,
     /// A separate listener for operational endpoints. Without it they are
     /// served on the main listener, as the gateway does.
     #[serde(default)]
@@ -1134,6 +1139,22 @@ pub struct GatewayKey {
     pub tags: std::collections::BTreeMap<String, String>,
 }
 
+/// `[tenants.<name>]`: the tenant's own budget (design note 0030).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct TenantBudgetConfig {
+    /// USD cap over every key of the tenant, per window.
+    pub budget_usd: f64,
+    /// The window in seconds (default one day), independent of any key's own.
+    #[serde(default)]
+    pub budget_window_secs: Option<u64>,
+    /// Admit attempts whose cost cannot be bounded before sending. With a key cap as well,
+    /// both levels must allow it.
+    #[serde(default)]
+    pub budget_allow_unpriced: bool,
+}
+
 /// A named route: `route/<name>` resolves to `model` with default settings.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1469,6 +1490,7 @@ impl ServeConfig {
         self.validate_upstream(&mut issues);
         self.validate_keys(&mut issues);
         self.validate_tenant_limits(&mut issues);
+        self.validate_tenant_budgets(&mut issues);
         self.validate_control_plane(&mut issues);
         self.validate_routes(&mut issues);
         issues
@@ -2271,6 +2293,50 @@ impl ServeConfig {
                         ),
                     ));
                 }
+            }
+        }
+    }
+
+    fn validate_tenant_budgets(&self, issues: &mut Vec<Issue>) {
+        if self.tenants.is_empty() {
+            return;
+        }
+        if self.fleet.is_some() {
+            issues.push(Issue::new(
+                "tenants",
+                "tenant budgets are single-instance for now; remove [tenants] or [fleet] (note 0030)",
+            ));
+        }
+        if self.control_plane.is_some() {
+            issues.push(Issue::new(
+                "tenants",
+                "tenant budgets are not carried by a control-plane snapshot yet (note 0030)",
+            ));
+        }
+        for (name, budget) in &self.tenants {
+            let at = format!("tenants.{name}");
+            if !self.keys.iter().any(|key| &key.tenant == name) {
+                issues.push(Issue::new(
+                    &at,
+                    "names a tenant that no key uses (a misspelling would cap nothing)",
+                ));
+            }
+            if !budget.budget_usd.is_finite()
+                || !(0.0..=MAX_BUDGET_USD).contains(&budget.budget_usd)
+            {
+                issues.push(Issue::new(
+                    format!("{at}.budget_usd"),
+                    format!("must be between 0 and {MAX_BUDGET_USD}"),
+                ));
+            }
+            if budget
+                .budget_window_secs
+                .is_some_and(|secs| !(1..=MAX_BUDGET_WINDOW_SECS).contains(&secs))
+            {
+                issues.push(Issue::new(
+                    format!("{at}.budget_window_secs"),
+                    format!("must be between 1 and {MAX_BUDGET_WINDOW_SECS} (366 days)"),
+                ));
             }
         }
     }
@@ -3400,10 +3466,11 @@ mod tests {
             "auth",
             "upstream",
             "control_plane",
+            "tenants",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 15, "a new table needs a line here");
+        assert_eq!(properties.len(), 16, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
     }
 

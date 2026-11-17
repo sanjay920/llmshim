@@ -1,6 +1,6 @@
 # 0030: Tenant budgets above key budgets
 
-Status: design, 2026-11-17. A contract note, written before any code (README working rule 3): a
+Status: slice 2 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
 file table, an admission rule, a refusal reason and ledger keys become promises, and it touches the
 spend ledger (0010), which every guarantee in 0027 rests on. It is the third slice of the roadmap
 item "hierarchical budgets, tags, alerts, cost exports" (after 0028 and 0029). Nothing here is
@@ -187,3 +187,30 @@ the lease size is then set by the table, which removes today's last-writer-wins 
   would remove that awkward rule; it is a separate cleanup with its own compatibility question.
 - A middle level (project) and its place in the list of counters.
 - Alerts when a level nears its cap.
+
+## As built (slice 2): the file table and the in-memory ledger
+
+- `[tenants.<name>]` (`budget_usd`, `budget_window_secs`, `budget_allow_unpriced`), validated by path
+  (a tenant no key uses, a bad amount or window, unknown fields), refused with `[fleet]` ("single-instance
+  for now") and with `[control_plane]` until slices 3 and 5; it reloads with the keys (it is part of every
+  key's identity, so a change is a new generation).
+- `TrustedPolicyScope` gains `tenant_cap` and `key_cap_id` (serialized only when set) and `version` 2
+  exactly then; `budget_levels()` is the list of counters a request must fit: today's one counter for a
+  tenant with no table, otherwise `tenant-cap:{tenant}` and, if the key has a cap, `key-cap:{id}` (the id
+  is a hash of tenant and key **name**, so a rotation keeps it). `Identity` carries the key's name
+  **only for a tenant with a table**, so renaming a key elsewhere is still not a change.
+- The coordinator quotes each level (an attempt unpriceable at any level is refused, which is the "both
+  flags" rule), and `AttemptRates::acquire_levels` carries the quotes; the Redis ledger keeps the
+  single-quote form and refuses more than one (slice 3), which is why a fleet cannot have tables yet.
+- The in-memory ledger keeps **one liability entry per level**, under the attempt's own id for the first
+  and a derived id for the next, so observe, settle and expiry are the existing per-attempt code run once
+  per level. Admission judges every level before reserving any (the refusal holds nothing) and waits
+  for the latest window end. This differs from the note in one detail: retention counts entries, so a
+  two-level attempt counts twice in the local `max_retained_attempts` (the Redis ledger will keep one
+  record, slice 3).
+- Tests: unit (both caps, atomic refusal, latest wait, independent windows, per-level settlement with an
+  unpriced attempt; mutations that drop the tenant level or settle one level fail them) and
+  `integration_serve_tenant_budgets` (a key cap refuses its key while the other is served, a full tenant
+  cap refuses every key, the no-table behavior unchanged, path validation, a reload of the cap).
+- Outage admission refuses a tenant with a table in this build (`outage_budget` is `None`).
+- `Identity.key_name` and `tenant_budget` are `serde(skip)`: only the `serve` file sets them, never a keys map loaded by the non-`serve` gateway (a key map could otherwise create a tenant cap with no key name and share one key counter).

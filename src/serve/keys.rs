@@ -74,6 +74,8 @@ pub fn build_key_store(
                 budget_window_secs: key.budget_window_secs,
                 budget_allow_unpriced: key.budget_allow_unpriced,
                 allowed_models: key.allowed_models.clone(),
+                key_name: key_name_for_cap(config, key),
+                tenant_budget: tenant_budget(config, &key.tenant),
             };
             if peers
                 .insert(jwt_workload(&binding.table, &binding.subject), identity)
@@ -96,6 +98,8 @@ pub fn build_key_store(
                 budget_window_secs: key.budget_window_secs,
                 budget_allow_unpriced: key.budget_allow_unpriced,
                 allowed_models: key.allowed_models.clone(),
+                key_name: key_name_for_cap(config, key),
+                tenant_budget: tenant_budget(config, &key.tenant),
             };
             if peers
                 .insert(super::config::canonical_san(san), identity)
@@ -148,6 +152,8 @@ pub fn build_key_store(
             budget_window_secs: key.budget_window_secs,
             budget_allow_unpriced: key.budget_allow_unpriced,
             allowed_models: key.allowed_models.clone(),
+            key_name: key_name_for_cap(config, key),
+            tenant_budget: tenant_budget(config, &key.tenant),
         };
         if identities.insert(digest, identity).is_some() {
             issues.push(Issue {
@@ -184,6 +190,27 @@ pub fn key_names(
         .iter()
         .filter_map(|key| Some((credential_scope(key, env)?, key.name.clone())))
         .collect()
+}
+
+/// The key's name, only where a tenant table makes it the name of a counter: a rename is
+/// otherwise not a change to anything a request is judged by (0012), and must not look like one.
+fn key_name_for_cap(config: &ServeConfig, key: &super::config::GatewayKey) -> Option<String> {
+    config
+        .tenants
+        .contains_key(&key.tenant)
+        .then(|| key.name.clone())
+}
+
+/// The tenant-level budget of a key's tenant, if the file has one (note 0030).
+fn tenant_budget(config: &ServeConfig, tenant: &str) -> Option<crate::gateway::auth::TenantBudget> {
+    config
+        .tenants
+        .get(tenant)
+        .map(|budget| crate::gateway::auth::TenantBudget {
+            budget_usd: budget.budget_usd,
+            budget_window_secs: budget.budget_window_secs,
+            budget_allow_unpriced: budget.budget_allow_unpriced,
+        })
 }
 
 /// `(credential scope, tags)` of each key that can be named (note 0029). Labels only.

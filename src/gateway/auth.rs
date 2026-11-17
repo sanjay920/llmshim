@@ -51,6 +51,23 @@ pub struct Identity {
     /// `prefix/*`, or `route/<name>`. `None` is no restriction.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
+    /// Set only by the `serve` file (never read from a keys map: `serde(skip)`). The key's name, which names its own budget counter when its tenant has a
+    /// tenant-level cap (note 0030). Unset for keys that are not from a `serve` file.
+    #[serde(skip)]
+    pub key_name: Option<String>,
+    /// The tenant's own cap over the spend of every key it has (note 0030).
+    #[serde(skip)]
+    pub tenant_budget: Option<TenantBudget>,
+}
+
+/// A tenant-level budget (`[tenants.<name>]`, note 0030).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TenantBudget {
+    pub budget_usd: f64,
+    #[serde(default)]
+    pub budget_window_secs: Option<u64>,
+    #[serde(default)]
+    pub budget_allow_unpriced: bool,
 }
 
 impl Identity {
@@ -336,6 +353,8 @@ impl KeyStore {
                     budget_window_secs: None,
                     budget_allow_unpriced: false,
                     allowed_models: None,
+                    key_name: None,
+                    tenant_budget: None,
                 },
                 credential_scope: "open-development-mode".to_string(),
             }),
@@ -465,6 +484,8 @@ mod tests {
                     budget_window_secs: None,
                     budget_allow_unpriced: false,
                     allowed_models: None,
+                    key_name: None,
+                    tenant_budget: None,
                 },
             )]),
             HashMap::from([(
@@ -478,6 +499,8 @@ mod tests {
                     budget_window_secs: None,
                     budget_allow_unpriced: false,
                     allowed_models: None,
+                    key_name: None,
+                    tenant_budget: None,
                 },
             )]),
         );
@@ -520,6 +543,8 @@ mod tests {
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
                 allowed_models: None,
+                key_name: None,
+                tenant_budget: None,
             },
         );
         keys.insert(
@@ -533,6 +558,8 @@ mod tests {
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
                 allowed_models: None,
+                key_name: None,
+                tenant_budget: None,
             },
         );
         let store = KeyStore::enforced(keys);
@@ -586,6 +613,8 @@ mod tests {
             budget_window_secs: None,
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         }
     }
 
@@ -848,6 +877,8 @@ mod tests {
             budget_window_secs: None,
             budget_allow_unpriced: false,
             allowed_models: Some(list.iter().map(|s| s.to_string()).collect()),
+            key_name: None,
+            tenant_budget: None,
         }
     }
 
