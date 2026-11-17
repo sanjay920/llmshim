@@ -122,15 +122,20 @@ impl TrustedPolicyScope {
     /// that is priced and bounded before sending (what outage admission, note
     /// 0027, requires): `(tenant_key, window_secs, limit_nanos)`.
     #[cfg(feature = "redis-coordination")]
-    pub(crate) fn outage_budget(&self) -> Option<(&str, u64, u64)> {
-        if self.tenant_cap.is_some() {
-            return None;
-        }
-        let budget = self.budget.as_ref()?;
-        (budget.valid && !budget.allow_unpriced).then_some((
-            self.tenant_key.as_str(),
-            budget.window_secs,
-            budget.limit_nanos,
+    pub(crate) fn outage_budget(&self) -> Option<(String, u64, u64)> {
+        // The counter a lease is taken on is the one the Redis ledger holds: the tenant's
+        // own for a tenant with no table, the tenant cap's (in its own namespace) for one
+        // whose key has no cap of its own. A key with a cap of its own would need a second
+        // lease and is refused in outage state (note 0030).
+        let (ledger_key, policy) = match (&self.tenant_cap, &self.budget) {
+            (Some(_), Some(_)) | (None, None) => return None,
+            (Some(cap), None) => (format!("tenant-cap:{}", self.tenant_key), cap),
+            (None, Some(budget)) => (self.tenant_key.clone(), budget),
+        };
+        (policy.valid && !policy.allow_unpriced).then_some((
+            ledger_key,
+            policy.window_secs,
+            policy.limit_nanos,
         ))
     }
 
@@ -145,19 +150,24 @@ impl TrustedPolicyScope {
         window_index: u64,
         rate_fraction: f64,
     ) -> Option<Self> {
-        self.outage_budget()?;
+        let (ledger_key, _, _) = self.outage_budget()?;
         let share = |limit: Option<u32>| {
             limit.map(|value| ((f64::from(value) * rate_fraction).ceil() as u32).max(1))
         };
         let mut view = self.clone();
-        view.tenant_key = outage_tenant_key(&self.tenant_key, epoch, window_index);
+        view.tenant_key = outage_tenant_key(&ledger_key, epoch, window_index);
         view.rpm = share(self.rpm);
         view.tpm = share(self.tpm);
         view.legacy_spend_floor = None;
-        if let Some(budget) = view.budget.as_mut() {
-            budget.limit_nanos = held_nanos;
-            budget.window_secs = OUTAGE_LOCAL_WINDOW_SECS;
-        }
+        // The local view has the one counter a lease is: for a tenant under a table the
+        // tenant cap becomes that counter, and the table's other fields drop out.
+        view.tenant_cap = None;
+        view.key_cap_id = None;
+        view.version = 1;
+        let mut lease = self.tenant_cap.clone().or_else(|| self.budget.clone())?;
+        lease.limit_nanos = held_nanos;
+        lease.window_secs = OUTAGE_LOCAL_WINDOW_SECS;
+        view.budget = Some(lease);
         Some(view)
     }
 
@@ -2649,14 +2659,29 @@ mod tests {
 
     #[cfg(feature = "redis-coordination")]
     #[test]
-    fn a_tenant_with_a_table_is_not_admitted_in_outage_state() {
+    fn outage_admission_follows_the_counter_the_ledger_holds() {
+        // A key with a cap of its own would need a second lease: refused.
         assert!(two_level("t", "k", 100, Some(5), 3600)
             .outage_budget()
             .is_none());
-        assert!(two_level("t", "k", 100, None, 3600)
-            .outage_budget()
-            .is_none());
-        assert!(budgeted("plain", 100).outage_budget().is_some());
+        // A tenant under a table whose key has no cap of its own leases the tenant cap's
+        // counter, in the namespace the Redis ledger uses.
+        let tenant_only = two_level("t", "k", 100, None, 3600);
+        let (ledger_key, window, limit) = tenant_only.outage_budget().unwrap();
+        assert_eq!(ledger_key, format!("tenant-cap:{}", tenant_only.tenant_key));
+        assert_eq!((window, limit), (3600, 100));
+        let view = tenant_only.outage_view(40, 2, 9, 1.0).unwrap();
+        // The local view is one ordinary counter limited to the lease, version 1.
+        assert_eq!(view.version, 1);
+        assert!(view.tenant_cap.is_none() && view.key_cap_id.is_none());
+        let levels = view.budget_levels();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].1.limit_nanos, 40);
+        assert_eq!(levels[0].1.window_secs, OUTAGE_LOCAL_WINDOW_SECS);
+        assert_eq!(levels[0].0, outage_tenant_key(&ledger_key, 2, 9));
+        // A tenant with no table is as it was.
+        let (plain_key, _, _) = budgeted("plain", 100).outage_budget().unwrap();
+        assert_eq!(plain_key, budgeted("plain", 100).tenant_key);
     }
 
     #[test]

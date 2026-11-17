@@ -136,7 +136,7 @@ Later phases (each needs its own design note before work starts)
       bound is on admitted reservations, not spend
 - [x] Per-key model allowlists (0028): `keys[].allowed_models`, 403 before admission; also in control-plane keys and signed snapshots
 - [x] Key tags on usage records (0029): `keys[].tags` onto usage records, also in control-plane keys and snapshots
-- [ ] Tenant budgets above key budgets (0030): slices 2 and 3 built (file table, single-instance and Redis ledgers); outage interplay, status and the control plane remain
+- [ ] Tenant budgets above key budgets (0030): slices 2 to 4 built (file table, single-instance and Redis ledgers, outage interplay for keys with no cap of their own); a lease for a key's own cap, reload `started_at` and a refusal-level label are not built; the control plane (team budgets) remains
 - [ ] Alerts, scheduled cost exports
 - [ ] Deployments and load balancing across credentials and regions
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
