@@ -1,6 +1,6 @@
 # 0030: Tenant budgets above key budgets
 
-Status: slice 2 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
+Status: slices 2 and 3 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
 file table, an admission rule, a refusal reason and ledger keys become promises, and it touches the
 spend ledger (0010), which every guarantee in 0027 rests on. It is the third slice of the roadmap
 item "hierarchical budgets, tags, alerts, cost exports" (after 0028 and 0029). Nothing here is
@@ -214,3 +214,27 @@ the lease size is then set by the table, which removes today's last-writer-wins 
   cap refuses every key, the no-table behavior unchanged, path validation, a reload of the cap).
 - Outage admission refuses a tenant with a table in this build (`outage_budget` is `None`).
 - `Identity.key_name` and `tenant_budget` are `serde(skip)`: only the `serve` file sets them, never a keys map loaded by the non-`serve` gateway (a key map could otherwise create a tenant cap with no key name and share one key counter).
+
+## As built (slice 3): the Redis ledger
+
+- **One script, two levels.** `COMBINED_RATE_LUA` keeps its first level as it was (KEYS 1 to 8, ARGV 1
+  to 28) and gains an optional **second level** (KEYS 9 and 10, ARGV 29 to 33): the second counter's
+  prefix and its own attempt record. Both levels are judged, then both are reserved, inside one call, so
+  a refusal at either leaves both untouched; a refusal for retention or a global freeze (code 4)
+  outranks a budget refusal; the wait is the latest of the refusing levels' window ends. The second level
+  has no legacy floor. A tenant with a table and a key with no cap of its own is the one-level case: the
+  unchanged first-level code on the tenant counter's new namespace.
+- **One record per level, under the level's own counter's TTL** (not one record listing both, as the
+  design sketched): level 0 under the attempt's id, level 1 under the derived id, each a hash with
+  its own `total_key`, `freeze_key` and `liability`. This is what makes settlement the existing
+  per-record script run once per level (each level independent: a failure at one keeps its liability
+  and does not stop the others), and it makes "never resurrect an expired counter" the same invariant as
+  today's (a record and its counter expire together). Cost: a two-level attempt takes **two** entries in
+  the retention index, so `max_retained_attempts` counts levels (the script requires room for two).
+- A tenant with a table has no legacy spend floor (`retain_legacy_spend_floor` returns at once); `[tenants]`
+  is no longer refused with `[fleet]`; `[control_plane]` still refuses it (slice 5). The version 2 scope is
+  refused by a replica that predates it.
+- Tests (real Redis): both levels judged together and a refusal at either holds nothing at the other,
+  each counter has its own expiry, per-level settlement including an unbounded attempt and a repeated
+  settle, and 60 racing requests over two keys that never leave the tenant counter above its cap, never
+  orphan a reservation, and reach the cap. Removing the second level's refusal fails them.

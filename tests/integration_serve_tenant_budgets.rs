@@ -180,15 +180,14 @@ fn a_table_is_checked_by_path() {
         assert_eq!(code, Some(1), "{table}: {text}");
         assert!(text.contains(path), "{table}: {text}");
     }
-    // A fleet does not have them yet.
+    // A fleet has them (the shared ledger holds both counters).
     let fleet = render(
         "http://127.0.0.1:1",
         "",
         "[tenants.platform]\nbudget_usd = 1.0\n[fleet]\nredis_url = { env = \"R\" }",
     );
     let (code, text) = check(&fleet, "tb-fleet");
-    assert_eq!(code, Some(1), "{text}");
-    assert!(text.contains("single-instance"), "{text}");
+    assert_eq!(code, Some(0), "{text}");
     // A good table passes.
     let (code, text) = check(
         &render(
@@ -200,4 +199,35 @@ fn a_table_is_checked_by_path() {
     );
     assert_eq!(code, Some(0), "{text}");
     let _ = completion("x");
+}
+
+/// The same two levels across a fleet: the shared Redis ledger refuses the capped key and
+/// serves the other, with the tenant cap above them. Needs Redis; run one test at a time
+/// (the queue is keyed by provider name):
+/// `LLMSHIM_TEST_REDIS_URL=redis://127.0.0.1:6379 cargo test --features serve-redis
+/// --test integration_serve_tenant_budgets -- --ignored --test-threads=1`
+#[cfg(feature = "serve-redis")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs Redis: set LLMSHIM_TEST_REDIS_URL"]
+async fn a_fleet_replica_enforces_both_levels_through_the_shared_ledger() {
+    let redis = std::env::var("LLMSHIM_TEST_REDIS_URL").expect("set LLMSHIM_TEST_REDIS_URL");
+    let tenant = format!("tenant-{}", uuid::Uuid::new_v4().simple());
+    let (up, mock) = upstream(1).await;
+    let text = render(
+        &up.url(),
+        "budget_usd = 0.0",
+        "[tenants.platform]\nbudget_usd = 100.0\n[fleet]\nredis_url = { env = \"SERVE_E2E_REDIS_URL\" }",
+    )
+    .replace("platform", &tenant);
+    let server = start(
+        &text,
+        "tb-fleet",
+        &[
+            ("SERVE_E2E_FREE_KEY", FREE_KEY),
+            ("SERVE_E2E_REDIS_URL", redis.as_str()),
+        ],
+    );
+    assert_eq!(ask(&server.base, CALLER_KEY).await, 429);
+    assert_eq!(ask(&server.base, FREE_KEY).await, 200);
+    mock.assert_async().await;
 }

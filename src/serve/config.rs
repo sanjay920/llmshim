@@ -116,7 +116,6 @@ pub struct ServeConfig {
     pub fleet: Option<Fleet>,
     /// Tenant-level budgets (design note 0030): a cap over the spend of every key of a
     /// tenant, on a counter of its own. A key's own `budget_usd` then caps that key.
-    /// Single-instance only for now.
     #[serde(default)]
     pub tenants: BTreeMap<String, TenantBudgetConfig>,
     /// A separate listener for operational endpoints. Without it they are
@@ -2300,12 +2299,6 @@ impl ServeConfig {
     fn validate_tenant_budgets(&self, issues: &mut Vec<Issue>) {
         if self.tenants.is_empty() {
             return;
-        }
-        if self.fleet.is_some() {
-            issues.push(Issue::new(
-                "tenants",
-                "tenant budgets are single-instance for now; remove [tenants] or [fleet] (note 0030)",
-            ));
         }
         if self.control_plane.is_some() {
             issues.push(Issue::new(
