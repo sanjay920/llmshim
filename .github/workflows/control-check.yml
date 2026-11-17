@@ -64,4 +64,5 @@ jobs:
         env:
           LLMSHIM_CATALOG_OFFLINE: '1'
           LLMSHIM_CONTROL_TEST_POSTGRES_URL: postgres://postgres:pw@127.0.0.1:5432/postgres?sslmode=disable
+          LLMSHIM_CONTROL_REQUIRE_POSTGRES: '1'
         run: cargo test --locked

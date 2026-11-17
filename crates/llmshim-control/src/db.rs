@@ -94,21 +94,41 @@ pub(crate) trait Exec {
 /// A Postgres client that is dropped on a thread of its own: the synchronous client drives
 /// a runtime when it closes, which a thread inside another runtime (where a `Store` may well
 /// be dropped) may not do.
-pub(crate) struct PgClient(Option<Box<postgres::Client>>);
+pub(crate) struct PgClient {
+    client: Option<Box<postgres::Client>>,
+    target: PgTarget,
+}
 
 impl PgClient {
-    pub(crate) fn new(client: postgres::Client) -> Self {
-        Self(Some(Box::new(client)))
+    pub(crate) fn new(client: postgres::Client, target: PgTarget) -> Self {
+        Self {
+            client: Some(Box::new(client)),
+            target,
+        }
+    }
+
+    /// The client, replaced first if its connection has died (a failover, a restart, an idle
+    /// kill): a database blip must not need a control-plane restart.
+    /// Replace the connection now.
+    pub(crate) fn reconnect(&mut self) {
+        if let Ok(fresh) = connect_postgres(&self.target) {
+            self.client = Some(Box::new(fresh));
+        }
     }
 
     pub(crate) fn client(&mut self) -> &mut postgres::Client {
-        self.0.as_mut().expect("a client until it is dropped")
+        if self.client.as_ref().is_some_and(|c| c.is_closed()) {
+            if let Ok(fresh) = connect_postgres(&self.target) {
+                self.client = Some(Box::new(fresh));
+            }
+        }
+        self.client.as_mut().expect("a client until it is dropped")
     }
 }
 
 impl Drop for PgClient {
     fn drop(&mut self) {
-        if let Some(client) = self.0.take() {
+        if let Some(client) = self.client.take() {
             let _ = std::thread::spawn(move || drop(client)).join();
         }
     }
@@ -162,6 +182,11 @@ impl Backend {
                 std::thread::scope(|scope| {
                     scope
                         .spawn(|| -> Result<T> {
+                            // A dead connection (a failover, an idle kill) is found by a ping
+                            // before any work, and replaced; nothing is retried once work has begun.
+                            if client.client().simple_query("SELECT 1").is_err() {
+                                client.reconnect();
+                            }
                             let mut tx = client.client().transaction().map_err(database)?;
                             if write {
                                 // One writer at a time, for the length of the transaction.
@@ -201,8 +226,10 @@ impl rusqlite::ToSql for Param {
 
 fn sqlite_error(error: rusqlite::Error) -> Error {
     match error {
+        // Only a uniqueness rule is a conflict; a foreign-key, check or not-null failure is not.
         rusqlite::Error::SqliteFailure(failure, _)
-            if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+            if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
         {
             Error::Conflict("a uniqueness rule was violated".into())
         }
@@ -332,26 +359,127 @@ impl Exec for PgExec<'_, '_> {
     }
 }
 
-/// Connect to Postgres. TLS (rustls, the web PKI roots, the host verified) unless the URL says
-/// `sslmode=disable`.
-pub(crate) fn connect_postgres(url: &str) -> Result<postgres::Client> {
-    let config: postgres::Config = url.parse().map_err(|_| {
+/// How to reach a Postgres database, kept so a dead connection can be replaced.
+#[derive(Clone)]
+pub(crate) struct PgTarget {
+    pub(crate) url: String,
+    pub(crate) ca_file: Option<std::path::PathBuf>,
+    pub(crate) schema: Option<String>,
+}
+
+/// Connect to Postgres. **TLS is required** (rustls, the host verified, the web PKI roots or
+/// `ca_file`'s) unless the URL says `sslmode=disable`: `prefer` and `require` both mean
+/// required, so a server (or a man in the middle) that refuses TLS fails the connect and
+/// never gets the password in the clear. Timeouts and keepalives bound every wait: a lock
+/// held by a session that vanished must not hold the control plane for hours.
+pub(crate) fn connect_postgres(target: &PgTarget) -> Result<postgres::Client> {
+    let mut config: postgres::Config = target.url.parse().map_err(|_| {
         Error::Invalid("the database URL is not a Postgres connection string".into())
     })?;
-    let failed = |_| Error::Database("cannot connect to the database".into());
-    if config.get_ssl_mode() == postgres::config::SslMode::Disable {
-        return config.connect(postgres::NoTls).map_err(failed);
-    }
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|_| Error::Database("TLS could not be set up".into()))?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
     config
-        .connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls))
-        .map_err(failed)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .keepalives(true)
+        .keepalives_idle(std::time::Duration::from_secs(30))
+        .options("-c statement_timeout=30000 -c lock_timeout=30000 -c idle_in_transaction_session_timeout=60000");
+    let failed = |_| Error::Database("cannot connect to the database".into());
+    let mut client = if config.get_ssl_mode() == postgres::config::SslMode::Disable {
+        config.connect(postgres::NoTls).map_err(failed)?
+    } else {
+        config.ssl_mode(postgres::config::SslMode::Require);
+        let mut roots = rustls::RootCertStore::empty();
+        match &target.ca_file {
+            Some(path) => {
+                let file = std::fs::File::open(path)
+                    .map_err(|_| Error::Invalid("the CA file cannot be read".into()))?;
+                let mut added = 0;
+                for certificate in rustls_pemfile::certs(&mut std::io::BufReader::new(file)) {
+                    let certificate = certificate.map_err(|_| {
+                        Error::Invalid("the CA file is not PEM certificates".into())
+                    })?;
+                    roots.add(certificate).map_err(|_| {
+                        Error::Invalid("the CA file holds a bad certificate".into())
+                    })?;
+                    added += 1;
+                }
+                if added == 0 {
+                    return Err(Error::Invalid("the CA file holds no certificate".into()));
+                }
+            }
+            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        }
+        let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| Error::Database("TLS could not be set up".into()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config
+            .connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls))
+            .map_err(failed)?
+    };
+    if let Some(schema) = &target.schema {
+        // The schema name is validated by the caller (letters, digits, underscore; not a
+        // reserved one). Created under a lock of its own: two replicas starting together.
+        client
+            .batch_execute(&format!(
+                "BEGIN; SELECT pg_advisory_xact_lock(7240003); \
+                 CREATE SCHEMA IF NOT EXISTS {schema}; COMMIT; SET search_path TO {schema}"
+            ))
+            .map_err(|_| Error::Database("cannot set the schema".into()))?;
+    }
+    Ok(client)
+}
+
+/// A schema name the store will create and use.
+pub(crate) fn schema_problem(schema: &str) -> Option<&'static str> {
+    let bytes = schema.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63 {
+        return Some("a schema name is 1 to 63 characters");
+    }
+    if !bytes[0].is_ascii_lowercase() {
+        return Some("a schema name starts with a letter a-z");
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+    {
+        return Some("a schema name is a-z, 0-9 and '_'");
+    }
+    if schema.starts_with("pg_") || schema == "information_schema" {
+        return Some("a schema name may not be a system schema");
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholders_are_rewritten_for_postgres_and_nothing_else_is_touched() {
+        assert_eq!(
+            pg_sql("INSERT INTO t (a, b) VALUES (?1, ?10) WHERE x = 'a?b' AND y = ?2"),
+            "INSERT INTO t (a, b) VALUES ($1, $10) WHERE x = 'a?b' AND y = $2"
+        );
+    }
+
+    #[test]
+    fn a_schema_name_is_a_plain_unreserved_identifier() {
+        for good in ["control", "t_0123abc", "a"] {
+            assert_eq!(schema_problem(good), None, "{good}");
+        }
+        for bad in [
+            "",
+            "1abc",
+            "Has",
+            "a-b",
+            "a b",
+            "pg_catalog",
+            "information_schema",
+            &"x".repeat(64),
+        ] {
+            assert!(schema_problem(bad).is_some(), "{bad:?}");
+        }
+    }
 }

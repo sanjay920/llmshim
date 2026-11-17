@@ -364,7 +364,19 @@ One store, two backends (`crates/llmshim-control/src/db.rs`): SQLite (one node) 
   (two handles, 16 publishes, generations exactly 1 to 16) fails if the lock is removed.
 - **Creation order is a `seq` column** assigned inside the write transaction (not a row id or a timestamp), so
   lists and a snapshot's bytes are the same on both.
-- **`llmshim-control serve --database-url-file F [--database-schema S]`**: the URL holds the password, so it is
+- **TLS is required** unless the URL says `sslmode=disable`: `prefer`, `require` and no `sslmode` all mean required
+  (the host is verified against the web PKI roots, or `--database-ca-file`'s PEM certificates for a private or provider
+  CA), so a server or a man in the middle that refuses TLS fails the connect and never receives the password in the clear
+  (a test connects without `sslmode` to a server with no TLS and expects failure). `verify-ca` and `verify-full` are not
+  parsed; verification is always on.
+- **A dead connection is replaced**: a ping before each transaction (a failover, an idle kill) reconnects, with no restart;
+  a test kills the session and expects the next call to work. Every connection sets a connect timeout, keepalives,
+  `statement_timeout` and `lock_timeout` (30 s) and `idle_in_transaction_session_timeout` (60 s), so a lock held by a
+  vanished session cannot hold the control plane for hours.
+- **A schema name** starts with a letter, is `a-z0-9_` up to 63 characters, and is not a system schema; the schema is created
+  under an advisory lock of its own. Names and actors refuse control characters on both backends (Postgres cannot store a NUL).
+  `build_payload` takes the write lock, so a preview is one consistent view on Postgres too.
+- **`llmshim-control serve --database-url-file F [--database-schema S] [--database-ca-file C]`**: the URL holds the password, so it is
   read from an owner-only file (never argv), and **no error ever carries it** (tested). `--db` and
   `--database-url-file` are exclusive. A schema name keeps several control planes (or a test) in one database.
 - The synchronous Postgres client drives its own runtime, which a thread inside another runtime may not do, so

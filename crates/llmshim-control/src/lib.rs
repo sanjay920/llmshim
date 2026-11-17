@@ -200,17 +200,19 @@ fn valid_label(name: &str) -> bool {
 }
 
 fn display_name(name: &str, what: &str) -> Result<()> {
-    if name.trim().is_empty() || name.len() > 128 {
+    if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
         return Err(Error::Invalid(format!(
-            "{what} must be 1 to 128 characters"
+            "{what} must be 1 to 128 characters, with no control characters"
         )));
     }
     Ok(())
 }
 
 fn actor_check(actor: &str) -> Result<()> {
-    if actor.trim().is_empty() || actor.len() > 128 {
-        return Err(Error::Invalid("actor must be 1 to 128 characters".into()));
+    if actor.trim().is_empty() || actor.len() > 128 || actor.chars().any(char::is_control) {
+        return Err(Error::Invalid(
+            "actor must be 1 to 128 characters, with no control characters".into(),
+        ));
     }
     Ok(())
 }
@@ -428,36 +430,41 @@ impl Store {
     /// error. `schema`, when given, is the Postgres schema to use (created if absent): several
     /// control planes, or a test, can share one database.
     pub fn open_postgres(url: &str, schema: Option<&str>) -> Result<Self> {
+        Self::open_postgres_with(url, schema, None)
+    }
+
+    /// [`Self::open_postgres`] trusting the PEM certificates in `ca_file` instead of the web PKI
+    /// roots (a private or provider CA).
+    pub fn open_postgres_with(
+        url: &str,
+        schema: Option<&str>,
+        ca_file: Option<&std::path::Path>,
+    ) -> Result<Self> {
         // The synchronous Postgres client runs its own runtime, which a thread already inside
         // an async runtime may not start: connect and initialize on a thread of their own.
         std::thread::scope(|scope| {
             scope
-                .spawn(|| Self::open_postgres_here(url, schema))
+                .spawn(|| Self::open_postgres_here(url, schema, ca_file))
                 .join()
                 .unwrap_or_else(|_| Err(Error::Database("the database thread failed".into())))
         })
     }
 
-    fn open_postgres_here(url: &str, schema: Option<&str>) -> Result<Self> {
-        let mut client = db::connect_postgres(url)?;
-        if let Some(schema) = schema {
-            if schema.is_empty()
-                || schema.len() > 63
-                || !schema
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-            {
-                return Err(Error::Invalid(
-                    "a schema name is 1 to 63 of a-z, 0-9 and '_'".into(),
-                ));
-            }
-            client
-                .batch_execute(&format!(
-                    "CREATE SCHEMA IF NOT EXISTS {schema}; SET search_path TO {schema}"
-                ))
-                .map_err(|_| Error::Database("cannot set the schema".into()))?;
+    fn open_postgres_here(
+        url: &str,
+        schema: Option<&str>,
+        ca_file: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        if let Some(problem) = schema.and_then(db::schema_problem) {
+            return Err(Error::Invalid(problem.into()));
         }
-        Self::initialize(Backend::Postgres(db::PgClient::new(client)))
+        let target = db::PgTarget {
+            url: url.to_string(),
+            ca_file: ca_file.map(std::path::Path::to_path_buf),
+            schema: schema.map(str::to_string),
+        };
+        let client = db::connect_postgres(&target)?;
+        Self::initialize(Backend::Postgres(db::PgClient::new(client, target)))
     }
 
     fn initialize(mut backend: Backend) -> Result<Self> {
@@ -807,7 +814,9 @@ impl Store {
     /// The payload of the next snapshot of an organization (0024): every key it has, with
     /// its state (`expired` for an active key past its time), and the next generation.
     pub fn build_payload(&mut self, org_id: &str) -> Result<Value> {
-        self.backend.transaction(false, |tx| payload_in(tx, org_id))
+        // Under the write lock, like a publish: one consistent view on Postgres, whose reads
+        // are not one snapshot.
+        self.backend.transaction(true, |tx| payload_in(tx, org_id))
     }
 
     /// Build, sign and store the next generation of an organization's snapshot. `seed_b64` is

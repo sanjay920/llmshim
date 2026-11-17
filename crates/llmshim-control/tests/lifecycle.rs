@@ -588,3 +588,73 @@ fn concurrent_publishers_each_get_their_own_generation() {
         "no generation was taken twice or skipped"
     );
 }
+
+#[test]
+fn names_and_actors_refuse_control_characters_on_every_backend() {
+    let mut f = fixture();
+    for bad in ["a\u{0}b", "line\nbreak", "tab\there"] {
+        assert!(
+            matches!(f.store.create_org(bad, ACTOR), Err(Error::Invalid(_))),
+            "{bad:?}"
+        );
+        assert!(
+            matches!(
+                f.store.create_team(&f.org, bad, ACTOR),
+                Err(Error::Invalid(_))
+            ),
+            "{bad:?}"
+        );
+        assert!(
+            matches!(f.store.create_org("ok", bad), Err(Error::Invalid(_))),
+            "actor {bad:?}"
+        );
+    }
+}
+
+#[test]
+fn postgres_requires_tls_names_a_valid_schema_and_survives_a_killed_connection() {
+    let Some(url) = common::postgres_url() else {
+        return;
+    };
+    // No sslmode (so the library default of "prefer") against a server without TLS: refused,
+    // never quietly plaintext. The password is in no message.
+    let bare = url.split('?').next().unwrap().to_string();
+    let error = Store::open_postgres(&bare, Some(&common::fresh_schema()))
+        .err()
+        .expect("no TLS, no connection");
+    assert!(
+        !error.to_string().contains(":pw@") && !error.to_string().contains("pw@"),
+        "{error}"
+    );
+    // A schema name is a plain identifier.
+    for bad in ["1abc", "Has", "a-b", "pg_catalog", "information_schema", ""] {
+        assert!(
+            matches!(
+                Store::open_postgres(&url, Some(bad)),
+                Err(Error::Invalid(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    // A killed session is replaced: the next call works without a restart.
+    let application = format!("reconnect_{}", uuid::Uuid::new_v4().simple());
+    let named = format!("{url}&application_name={application}");
+    let schema = common::fresh_schema();
+    let mut store = Store::open_postgres(&named, Some(&schema)).unwrap();
+    let org = store.create_org("Acme", ACTOR).unwrap();
+    let mut other = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let killed = other
+        .query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1",
+            &[&application],
+        )
+        .unwrap();
+    assert!(!killed.is_empty(), "the session to kill was found");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        store.teams(&org.id).unwrap().len(),
+        0,
+        "the next call reconnected"
+    );
+    assert!(store.create_team(&org.id, "Platform", ACTOR).is_ok());
+}
