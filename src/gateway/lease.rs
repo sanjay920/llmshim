@@ -143,6 +143,8 @@ pub(crate) struct Lease {
 pub(crate) enum LeaseError {
     /// Redis was unreachable or answered unexpectedly.
     Unavailable,
+    /// The call itself was malformed (a bad fraction, window or replica id); Redis was not asked.
+    Invalid,
     /// The lease is being drawn down for recovery; it takes no top-ups.
     Closing,
     /// The fleet's own admission is refusing (accounting index full or frozen).
@@ -219,7 +221,7 @@ impl LeaseLedger {
         fraction: f64,
     ) -> Result<Lease, LeaseError> {
         if !(fraction > 0.0 && fraction <= 1.0) || window_secs == 0 || replica.contains(':') {
-            return Err(LeaseError::Unavailable);
+            return Err(LeaseError::Invalid);
         }
         let reply: Vec<i64> = self
             .connections
@@ -266,7 +268,7 @@ impl LeaseLedger {
         amount_nanos: u64,
     ) -> Result<Draw, LeaseError> {
         if replica.contains(':') {
-            return Err(LeaseError::Unavailable);
+            return Err(LeaseError::Invalid);
         }
         let lease_key = Self::lease_key(tenant_key, window_secs, window_index, replica);
         let draws_key = format!("{lease_key}:draws");
