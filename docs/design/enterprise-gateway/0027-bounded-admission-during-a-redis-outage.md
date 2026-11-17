@@ -201,8 +201,8 @@ outage leaves the mode off. The startup probe still uses `/health`.
 ## Slices
 
 1. This note.
-2. The Lua (take or top up, draw idempotently, release) and the lease on the healthy path, with no
-   admission change: tested against a real Redis for the bound, the window, idempotent draw and
+2. **Built** (`src/gateway/lease.rs`, `gateway-redis` only, unused outside its tests): the Lua (take or
+   top up, draw idempotently, release) and the lease on the healthy path, with no admission change: tested against a real Redis for the bound, the window, idempotent draw and
    stranding.
 3. Recovery: the draw-down and release procedure over synthetic local records, resumable. It lands
    **before** any local admission, because admitting without a way to settle is the unsafe order.
