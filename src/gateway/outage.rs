@@ -26,6 +26,7 @@ pub(crate) struct OutageState {
     failures: VecDeque<u64>,
     in_outage: bool,
     healthy_since: Option<u64>,
+    last_ok: Option<u64>,
 }
 
 impl OutageState {
@@ -35,6 +36,7 @@ impl OutageState {
             failures: VecDeque::new(),
             in_outage: false,
             healthy_since: None,
+            last_ok: None,
         }
     }
 
@@ -46,6 +48,7 @@ impl OutageState {
     /// renewal). A deadline overrun is a failure.
     pub(crate) fn observe(&mut self, now_ms: u64, ok: bool) {
         if ok {
+            self.last_ok = Some(now_ms);
             if self.in_outage && self.healthy_since.is_none() {
                 self.healthy_since = Some(now_ms);
             }
@@ -53,6 +56,9 @@ impl OutageState {
         }
         self.healthy_since = None;
         self.failures.push_back(now_ms);
+        while self.failures.len() > TRIP_FAILURES {
+            self.failures.pop_front();
+        }
         while self
             .failures
             .front()
@@ -69,9 +75,15 @@ impl OutageState {
     /// outage state, Redis has answered without a failure for `recover_after_ms`
     /// and recovery (draw-down and release) has completed.
     pub(crate) fn try_resume(&mut self, now_ms: u64, recovery_complete: bool) -> bool {
-        let steady = self
-            .healthy_since
-            .is_some_and(|since| now_ms.saturating_sub(since) >= self.recover_after_ms);
+        // Steady means answering throughout, not one answer long ago: the last
+        // success must be recent too, so silence is not health.
+        let recent = self
+            .last_ok
+            .is_some_and(|at| now_ms.saturating_sub(at) <= TRIP_WINDOW_MS);
+        let steady = recent
+            && self
+                .healthy_since
+                .is_some_and(|since| now_ms.saturating_sub(since) >= self.recover_after_ms);
         if self.in_outage && steady && recovery_complete {
             self.in_outage = false;
             self.healthy_since = None;
@@ -88,6 +100,8 @@ pub(crate) enum LocalRefusal {
     WindowMargin,
     /// The quote exceeds what the lease has left.
     Exhausted,
+    /// This attempt id already holds a reservation.
+    Duplicate,
 }
 
 /// One replica's in-memory account of one lease while Redis is out. Every
@@ -149,6 +163,9 @@ impl LocalLeaseAccount {
     ) -> Result<(), LocalRefusal> {
         if now_ms.saturating_add(WINDOW_MARGIN_MS) >= self.window_end_ms {
             return Err(LocalRefusal::WindowMargin);
+        }
+        if self.attempts.iter().any(|a| a.id == attempt) {
+            return Err(LocalRefusal::Duplicate);
         }
         if quote_nanos > self.unspent_nanos() {
             return Err(LocalRefusal::Exhausted);
@@ -234,6 +251,7 @@ mod tests {
         }
         s.observe(1_000, true);
         assert!(!s.try_resume(10_000, true), "not yet steady");
+        s.observe(35_000, true);
         assert!(!s.try_resume(40_000, false), "recovery unfinished");
         assert!(s.try_resume(40_000, true));
         assert!(!s.in_outage());
@@ -309,5 +327,24 @@ mod tests {
         assert_eq!((rec.window_index, rec.window_secs), (3, 3600));
         // A final above the quote does not refill or enlarge the lease mid-outage.
         assert_eq!(a.unspent_nanos(), 20);
+    }
+
+    #[test]
+    fn silence_is_not_health() {
+        let mut s = OutageState::new(30_000);
+        for t in [0, 1, 2] {
+            s.observe(t, false);
+        }
+        s.observe(1_000, true);
+        assert!(!s.try_resume(60_000, true), "one answer long ago");
+    }
+
+    #[test]
+    fn an_attempt_id_reserves_once() {
+        let mut a = LocalLeaseAccount::new("t".into(), 3600, 0, 10_000_000, 100);
+        let x = id();
+        a.reserve(0, x, 40).unwrap();
+        assert_eq!(a.reserve(0, x, 40), Err(LocalRefusal::Duplicate));
+        assert_eq!(a.unspent_nanos(), 60);
     }
 }
