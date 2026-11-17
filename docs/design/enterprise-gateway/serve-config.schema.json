@@ -130,6 +130,17 @@
       "additionalProperties": false,
       "description": "Fleet mode. Requires a binary built with `--features serve-redis`.",
       "properties": {
+        "outage_admission": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OutageAdmission"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Keep serving a bounded amount while Redis is unreachable (design note\n0027). Off unless this table is present."
+        },
         "redis_url": {
           "$ref": "#/$defs/SecretRef",
           "description": "The Redis URL (`redis://` or `rediss://`), by reference because it can\ncarry a password."
@@ -436,6 +447,35 @@
             "string",
             "null"
           ]
+        }
+      },
+      "type": "object"
+    },
+    "OutageAdmission": {
+      "additionalProperties": false,
+      "description": "Bounded local admission while Redis is unreachable (design note 0027). Each\nreplica holds a share of its tenants' budgets in advance, in good times,\nand spends only that during an outage.",
+      "properties": {
+        "max_concurrency": {
+          "default": 16,
+          "description": "In-flight upstream requests per replica during an outage (1 to 4096).",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rate_fraction": {
+          "default": 0.1,
+          "description": "Share (0 to 1) of each provider's and tenant's rpm/tpm limits one\nreplica may use during an outage; the operator's estimate of\n`1 / replicas`.",
+          "type": "number"
+        },
+        "recover_after_secs": {
+          "default": 30,
+          "description": "Seconds Redis must answer before the replica leaves the outage path\n(5 to 3600).",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "spend_lease_fraction": {
+          "default": 0.05,
+          "description": "Target share (0 to 1) of a tenant's remaining budget window that each\nreplica holds as its lease. The fleet holds `1 - (1 - f)^replicas` of it\nback from ordinary admission, whether or not an outage happens.",
+          "type": "number"
         }
       },
       "type": "object"

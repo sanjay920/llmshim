@@ -45,6 +45,8 @@ pub mod idempotency;
 #[cfg(feature = "redis-coordination")]
 mod lease;
 pub mod metrics;
+#[cfg(feature = "redis-coordination")]
+mod outage;
 pub mod quota;
 pub(crate) mod usage;
 
