@@ -68,6 +68,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0032: Named instances of hosted providers](0032-provider-instances.md)
 - [0033: Secrets from a secret manager](0033-secret-managers.md)
 - [0034: Alerts and cost exports](0034-alerts-and-cost-exports.md)
+- [0035: Embeddings on the server](0035-embeddings-on-the-server.md)
 
 ## Roadmap
 
@@ -147,7 +148,7 @@ Later phases (each needs its own design note before work starts)
 - [ ] Audit log
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy
 - [x] Secret-manager integrations (0033): files are the integration (Kubernetes, CSI driver, agents); secret values are one line of at most 64 KiB; no vendor client is linked
-- [ ] Config-registered providers; embeddings, images and audio on the server
+- [ ] Config-registered providers (an OpenAI-compatible server by `base_url` is built, 0004); embeddings on the server (0035, slice 1: local scheduler, spend-capped keys refused until a bound exists); images and audio not built
 - [ ] Admin UI, SSO and SCIM (not started: they follow the control plane and the
       licensing decision)
 

@@ -18,7 +18,20 @@ pub struct DispatchPolicyContext {
     router: Option<Arc<crate::router::Router>>,
 }
 
+/// The kind of call an admitted request makes.
+#[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DispatchOperation {
+    #[default]
+    Chat,
+    Embeddings,
+}
+
 struct DispatchPolicyState {
+    /// What the admitted request is (note 0035), as a `DispatchOperation`. Set by the gateway from
+    /// trusted state, never read from the caller's body. Kept here, not on the context, so the
+    /// context (carried by every queued job) does not grow.
+    operation: std::sync::atomic::AtomicU8,
     last_refusal: std::sync::Mutex<Option<AttemptPolicyRefusal>>,
     logical_deadline: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
@@ -28,10 +41,32 @@ impl DispatchPolicyContext {
         Self {
             policy,
             state: Arc::new(DispatchPolicyState {
+                operation: std::sync::atomic::AtomicU8::new(DispatchOperation::Chat as u8),
                 last_refusal: std::sync::Mutex::new(None),
                 logical_deadline: std::sync::Mutex::new(None),
             }),
             router: None,
+        }
+    }
+
+    /// Mark the request as the given operation.
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    pub(crate) fn with_operation(self, operation: DispatchOperation) -> Self {
+        self.state
+            .operation
+            .store(operation as u8, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    pub(crate) fn operation(&self) -> DispatchOperation {
+        match self
+            .state
+            .operation
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            x if x == DispatchOperation::Embeddings as u8 => DispatchOperation::Embeddings,
+            _ => DispatchOperation::Chat,
         }
     }
 

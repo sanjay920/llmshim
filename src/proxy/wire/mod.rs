@@ -108,7 +108,11 @@ pub(crate) async fn install_default_receipt_store(
 pub(crate) async fn bound_inference_request_json(request: Request, next: Next) -> Response {
     let path = request.uri().path();
     if request.method() != axum::http::Method::POST
-        || (path != "/v1/chat" && path != "/v1/chat/stream" && native_route(path).is_none())
+        || (path != "/v1/chat"
+            && path != "/v1/chat/stream"
+            // Only the gateway serves embeddings (note 0035); the proxy has no such route.
+            && !(cfg!(feature = "gateway") && path == "/v1/embeddings")
+            && native_route(path).is_none())
     {
         return next.run(request).await;
     }

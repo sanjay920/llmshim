@@ -77,6 +77,10 @@ pub(crate) struct TrustedPolicyScope {
     /// that crosses Redis is run by another replica on that replica's router.
     #[serde(skip)]
     router: Option<Arc<crate::router::Router>>,
+    /// What the request is (note 0035). Never serialized: only the local backend runs an
+    /// operation other than chat, and a job that crossed Redis is chat.
+    #[serde(skip)]
+    operation: crate::policy::DispatchOperation,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -119,7 +123,14 @@ impl TrustedPolicyScope {
             request_id: None,
             deployment: None,
             router: None,
+            operation: crate::policy::DispatchOperation::Chat,
         }
+    }
+
+    /// Mark the request as embeddings (note 0035).
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn set_operation(&mut self, operation: crate::policy::DispatchOperation) {
+        self.operation = operation;
     }
 
     /// The tenant's budget window this scope draws on, if it has a valid budget
@@ -1173,11 +1184,13 @@ impl AttemptCoordinator {
 
     pub(crate) fn context(self: &Arc<Self>, scope: TrustedPolicyScope) -> DispatchPolicyContext {
         let router = scope.router.clone();
+        let operation = scope.operation;
         DispatchPolicyContext::new(Arc::new(CoordinatedAttemptPolicy {
             coordinator: self.clone(),
             scope,
         }))
         .with_router_snapshot(router)
+        .with_operation(operation)
     }
 
     #[cfg(feature = "redis-coordination")]
@@ -2411,6 +2424,7 @@ mod tests {
             request_id: None,
             deployment: None,
             router: None,
+            operation: Default::default(),
         }
     }
 
@@ -2889,6 +2903,7 @@ mod tests {
             request_id: None,
             deployment: None,
             router: None,
+            operation: Default::default(),
         }
     }
 
@@ -5737,6 +5752,7 @@ mod usage_records {
             request_id: None,
             deployment: None,
             router: None,
+            operation: Default::default(),
         }
     }
 
