@@ -134,7 +134,7 @@ Later phases (each needs its own design note before work starts)
       healthy, a second admission path against it, resumable settlement on recovery; the
       bound is on admitted reservations, not spend
 - [x] Per-key model allowlists (0028): `keys[].allowed_models`, 403 before admission; also in control-plane keys and signed snapshots
-- [x] Key tags on usage records (0029): `keys[].tags` onto usage records; not yet in control-plane snapshots
+- [x] Key tags on usage records (0029): `keys[].tags` onto usage records, also in control-plane keys and snapshots
 - [ ] Hierarchical budgets, alerts, scheduled cost exports
 - [ ] Deployments and load balancing across credentials and regions
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)

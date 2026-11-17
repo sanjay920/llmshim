@@ -253,6 +253,8 @@ struct KeyBody {
     budget_allow_unpriced: bool,
     allowed_cidrs: Option<Vec<String>>,
     allowed_models: Option<Vec<String>>,
+    #[serde(default)]
+    tags: std::collections::BTreeMap<String, String>,
     expires_at: Option<String>,
 }
 
@@ -361,6 +363,7 @@ async fn create_key(
         budget_allow_unpriced: b.budget_allow_unpriced,
         allowed_cidrs: b.allowed_cidrs,
         allowed_models: b.allowed_models,
+        tags: b.tags,
         expires_at: b.expires_at,
     };
     let made = with_store(&s, move |st| st.create_key(new, &actor)).await?;

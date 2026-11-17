@@ -466,7 +466,7 @@ impl Reload {
     }
 }
 
-fn tag_name_problem(name: &str) -> Option<&'static str> {
+pub fn tag_name_problem(name: &str) -> Option<&'static str> {
     let bytes = name.as_bytes();
     let first_ok = bytes.first().is_some_and(u8::is_ascii_lowercase);
     let rest_ok = bytes
@@ -476,7 +476,7 @@ fn tag_name_problem(name: &str) -> Option<&'static str> {
         .then_some("a tag name is 1 to 32 of a-z, 0-9 and '_', starting with a letter")
 }
 
-fn tag_value_problem(value: &str) -> Option<&'static str> {
+pub fn tag_value_problem(value: &str) -> Option<&'static str> {
     let printable = value.bytes().all(|b| (b' '..=b'~').contains(&b));
     let trimmed = value.trim_matches(' ').len() == value.len();
     (!(printable && trimmed && (1..=64).contains(&value.len()))).then_some(

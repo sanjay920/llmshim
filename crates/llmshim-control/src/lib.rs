@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 pub mod api;
 mod db;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -86,6 +86,8 @@ pub struct NewKey {
     /// The models the key may call (data-plane note 0028): `provider/model`, `prefix/*` or
     /// `route/<name>`. `None` is no restriction; an empty list is an error.
     pub allowed_models: Option<Vec<String>>,
+    /// Labels copied onto the key's usage records (data-plane note 0029). Empty is none.
+    pub tags: std::collections::BTreeMap<String, String>,
     /// RFC 3339.
     pub expires_at: Option<String>,
 }
@@ -104,6 +106,7 @@ impl NewKey {
             budget_allow_unpriced: false,
             allowed_cidrs: None,
             allowed_models: None,
+            tags: Default::default(),
             expires_at: None,
         }
     }
@@ -146,6 +149,7 @@ pub struct KeyRecord {
     pub budget_allow_unpriced: bool,
     pub allowed_cidrs: Option<Vec<String>>,
     pub allowed_models: Option<Vec<String>>,
+    pub tags: std::collections::BTreeMap<String, String>,
     pub created_at: String,
     pub revoked_at: Option<String>,
 }
@@ -238,7 +242,7 @@ fn digest(secret: &str) -> String {
 const KEY_COLUMNS: &str = "id, org_id, project_id, team_id, name, kind, state, sha256, \
     client_san, jwt_table, jwt_subject, expires_at, tier, rpm, tpm, budget_usd, \
     budget_window_secs, budget_allow_unpriced, allowed_cidrs, created_at, revoked_at, \
-    allowed_models";
+    allowed_models, tags";
 
 fn key_from_row(row: &Row) -> Result<KeyRecord> {
     let range = |what: &str| Error::Invalid(format!("a stored {what} is out of range"));
@@ -255,6 +259,11 @@ fn key_from_row(row: &Row) -> Result<KeyRecord> {
             Error::Invalid("a stored allowed_models is not a list of strings".into())
         })?),
         None => None,
+    };
+    let tags = match row.opt_text(22)? {
+        Some(text) => serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text)
+            .map_err(|_| Error::Invalid("a stored tags value is not a map of strings".into()))?,
+        None => Default::default(),
     };
     Ok(KeyRecord {
         id: row.text(0)?,
@@ -289,6 +298,7 @@ fn key_from_row(row: &Row) -> Result<KeyRecord> {
         budget_allow_unpriced: row.int(17)? != 0,
         allowed_cidrs,
         allowed_models,
+        tags,
         created_at: row.text(19)?,
         revoked_at: row.opt_text(20)?,
     })
@@ -374,6 +384,18 @@ fn check_fields(new: &NewKey) -> Result<()> {
                     "allowed_models holds an entry that is not provider/model, provider/* or route/<name>",
                 );
             }
+        }
+    }
+    if new.tags.len() > 16 {
+        return invalid("tags holds more than 16 tags");
+    }
+    for (name, value) in &new.tags {
+        if llmshim::serve::config::tag_name_problem(name).is_some()
+            || llmshim::serve::config::tag_value_problem(value).is_some()
+        {
+            return invalid(
+                "a tag name is 1 to 32 of a-z, 0-9 and '_' starting with a letter, and a value is 1 to 64 printable ASCII characters without leading or trailing space",
+            );
         }
     }
     check_budget(
@@ -513,13 +535,13 @@ impl Store {
                             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                             .map_err(|e| Error::Database(e.to_string()))?;
                     }
-                    1 => {
-                        // Version 2 added keys.allowed_models.
-                        // Re-read the version under the write lock: another process starting
-                        // at the same time may have migrated while this one waited.
+                    1 | 2 => {
+                        // Version 2 added keys.allowed_models, version 3 keys.tags. Re-read the
+                        // version under the write lock: another process starting at the same
+                        // time may have migrated while this one waited.
                         let db_err = |e: rusqlite::Error| Error::Database(e.to_string());
                         connection.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
-                        let now: i64 = connection
+                        let mut now: i64 = connection
                             .query_row("PRAGMA user_version", [], |row| row.get(0))
                             .map_err(db_err)?;
                         if now == 1 {
@@ -527,6 +549,15 @@ impl Store {
                                 .execute_batch(
                                     "ALTER TABLE keys ADD COLUMN allowed_models TEXT; \
                                      PRAGMA user_version = 2;",
+                                )
+                                .map_err(db_err)?;
+                            now = 2;
+                        }
+                        if now == 2 {
+                            connection
+                                .execute_batch(
+                                    "ALTER TABLE keys ADD COLUMN tags TEXT; \
+                                     PRAGMA user_version = 3;",
                                 )
                                 .map_err(db_err)?;
                         }
@@ -562,9 +593,13 @@ impl Store {
                         tx.execute("INSERT INTO schema_meta (version) VALUES ($1)", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }
-                    Some(1) => {
-                        // Version 2 added keys.allowed_models.
-                        tx.batch_execute("ALTER TABLE keys ADD COLUMN allowed_models TEXT")
+                    Some(version @ (1 | 2)) => {
+                        // Version 2 added keys.allowed_models, version 3 keys.tags.
+                        if version == 1 {
+                            tx.batch_execute("ALTER TABLE keys ADD COLUMN allowed_models TEXT")
+                                .map_err(fail)?;
+                        }
+                        tx.batch_execute("ALTER TABLE keys ADD COLUMN tags TEXT")
                             .map_err(fail)?;
                         tx.execute("UPDATE schema_meta SET version = $1", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
@@ -785,6 +820,7 @@ impl Store {
                 budget_allow_unpriced: old.budget_allow_unpriced,
                 allowed_cidrs: old.allowed_cidrs.clone(),
                 allowed_models: old.allowed_models.clone(),
+                tags: old.tags.clone(),
                 expires_at: old.expires_at.clone(),
             };
             let (successor_id, secret) = create_key_in(tx, &successor, actor)?;
@@ -999,14 +1035,16 @@ fn create_key_in(tx: &mut dyn Exec, new: &NewKey, actor: &str) -> Result<(String
         .allowed_models
         .as_ref()
         .map(|m| serde_json::to_string(m).unwrap_or_default());
+    let tags_json =
+        (!new.tags.is_empty()).then(|| serde_json::to_string(&new.tags).unwrap_or_default());
     tx.exec(
         &format!(
             "INSERT INTO keys (id, org_id, project_id, team_id, name, kind, state, sha256, \
              client_san, jwt_table, jwt_subject, expires_at, tier, rpm, tpm, budget_usd, \
              budget_window_secs, budget_allow_unpriced, allowed_cidrs, created_at, revoked_at, \
-             allowed_models, seq) \
+             allowed_models, tags, seq) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-             ?16, ?17, ?18, ?19, NULL, ?20, {})",
+             ?16, ?17, ?18, ?19, NULL, ?20, ?21, {})",
             next_seq("keys")
         ),
         &[
@@ -1030,6 +1068,7 @@ fn create_key_in(tx: &mut dyn Exec, new: &NewKey, actor: &str) -> Result<(String
             ot(cidrs.as_deref()),
             t(&created_at),
             ot(models.as_deref()),
+            ot(tags_json.as_deref()),
         ],
     )
     .map_err(|error| match error {
@@ -1045,6 +1084,7 @@ fn create_key_in(tx: &mut dyn Exec, new: &NewKey, actor: &str) -> Result<(String
         &id,
         json!({"project": new.project_id, "name": new.name, "kind": kind,
                "allowed_cidrs": new.allowed_cidrs, "allowed_models": new.allowed_models,
+               "tags": new.tags,
             "expires_at": new.expires_at}),
     )?;
     Ok((id, secret))
@@ -1099,6 +1139,9 @@ fn payload_in(tx: &mut dyn Exec, org_id: &str) -> Result<Value> {
         set("budget_window_secs", json!(key.budget_window_secs));
         set("allowed_cidrs", json!(key.allowed_cidrs));
         // Emitted only when set: a snapshot without it is the one older data planes read.
+        if !key.tags.is_empty() {
+            set("tags", json!(key.tags));
+        }
         if key.allowed_models.is_some() {
             set("allowed_models", json!(key.allowed_models));
         }
@@ -1152,6 +1195,7 @@ CREATE TABLE keys (
     budget_allow_unpriced {int} NOT NULL DEFAULT 0,
     allowed_cidrs TEXT,
     allowed_models TEXT,
+    tags TEXT,
     created_at TEXT NOT NULL,
     revoked_at TEXT,
     seq {int} NOT NULL,

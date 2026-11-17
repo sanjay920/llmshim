@@ -732,13 +732,29 @@ fn a_model_list_is_checked_stored_copied_on_rotation_and_signed_only_when_set() 
     assert_eq!(served("open").allowed_models, None);
 }
 
-/// A database created by the version that had no model lists opens, is migrated in place,
-/// and keeps its keys.
+/// A database made by an earlier schema version opens, is migrated in place, and keeps its
+/// keys: version 1 had neither model lists nor tags, version 2 had model lists only.
 #[test]
-fn a_version_1_database_is_migrated_in_place() {
+fn an_older_database_is_migrated_in_place() {
+    for from in [1_i64, 2] {
+        migrate_from(from);
+    }
+}
+
+fn migrate_from(from: i64) {
+    let drop_columns = if from == 1 {
+        "ALTER TABLE keys DROP COLUMN allowed_models; ALTER TABLE keys DROP COLUMN tags;"
+    } else {
+        "ALTER TABLE keys DROP COLUMN tags;"
+    };
+    let use_new_columns = |store: &mut Store, project: &str| {
+        let mut new = NewKey::secret(project, "new");
+        new.allowed_models = Some(vec!["openai/*".into()]);
+        new.tags = [("env".to_string(), "prod".to_string())].into();
+        let made = store.create_key(new, ACTOR).unwrap();
+        assert_eq!(made.record.tags["env"], "prod");
+    };
     if let Some(url) = common::postgres_url() {
-        // The same, on Postgres: a schema made by this build is turned back into version 1
-        // through a second connection, then opened again.
         let schema = common::fresh_schema();
         let org = {
             let mut store = Store::open_postgres(&url, Some(&schema)).unwrap();
@@ -753,8 +769,7 @@ fn a_version_1_database_is_migrated_in_place() {
         let mut raw = postgres::Client::connect(&url, postgres::NoTls)
             .expect("the test database accepts a plain connection (sslmode=disable)");
         raw.batch_execute(&format!(
-            "SET search_path TO {schema}; ALTER TABLE keys DROP COLUMN allowed_models; \
-             UPDATE schema_meta SET version = 1"
+            "SET search_path TO {schema}; {drop_columns} UPDATE schema_meta SET version = {from}"
         ))
         .unwrap();
         drop(raw);
@@ -762,9 +777,8 @@ fn a_version_1_database_is_migrated_in_place() {
         let keys = store.keys(&org).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].allowed_models, None);
-        let mut new = NewKey::secret(&keys[0].project_id, "new");
-        new.allowed_models = Some(vec!["openai/*".into()]);
-        assert!(store.create_key(new, ACTOR).is_ok());
+        assert!(keys[0].tags.is_empty());
+        use_new_columns(&mut store, &keys[0].project_id);
         // The version was bumped: opening again does not migrate again.
         drop(store);
         let mut again = Store::open_postgres(&url, Some(&schema)).unwrap();
@@ -773,7 +787,7 @@ fn a_version_1_database_is_migrated_in_place() {
     }
     let directory = dir("migrate");
     let file = directory.join("control.db");
-    let f = {
+    let (store, org) = {
         let mut store = Store::open(&file).unwrap();
         let org = store.create_org("Acme", ACTOR).unwrap();
         let team = store.create_team(&org.id, "Platform", ACTOR).unwrap();
@@ -783,24 +797,103 @@ fn a_version_1_database_is_migrated_in_place() {
             .unwrap();
         (store, org.id)
     };
-    drop(f.0);
-    // Make it look like a version 1 file: no column, user_version 1.
+    drop(store);
     {
         let connection = rusqlite::Connection::open(&file).unwrap();
         connection
-            .execute_batch("ALTER TABLE keys DROP COLUMN allowed_models; PRAGMA user_version = 1;")
+            .execute_batch(&format!("{drop_columns} PRAGMA user_version = {from};"))
             .unwrap();
     }
     let mut store = Store::open(&file).unwrap();
-    let keys = store.keys(&f.1).unwrap();
+    let keys = store.keys(&org).unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].allowed_models, None);
-    let mut new = NewKey::secret(&keys[0].project_id, "new");
-    new.allowed_models = Some(vec!["openai/*".into()]);
-    assert!(store.create_key(new, ACTOR).is_ok());
+    assert!(keys[0].tags.is_empty());
+    use_new_columns(&mut store, &keys[0].project_id);
     // The version was bumped: a second start does not migrate again (and so does not fail on
-    // the column that now exists).
+    // the columns that now exist).
     drop(store);
     let mut again = Store::open(&file).unwrap();
-    assert_eq!(again.keys(&f.1).unwrap().len(), 2);
+    assert_eq!(again.keys(&org).unwrap().len(), 2);
+}
+
+#[test]
+fn tags_are_checked_stored_copied_on_rotation_and_signed_only_when_present() {
+    let mut f = fixture();
+    let too_many: std::collections::BTreeMap<String, String> = (0..17)
+        .map(|n| (format!("t{n}"), "v".to_string()))
+        .collect();
+    let bad: Vec<std::collections::BTreeMap<String, String>> = vec![
+        too_many,
+        [("Env".to_string(), "x".to_string())].into(),
+        [("env".to_string(), String::new())].into(),
+        [("env".to_string(), " lead".to_string())].into(),
+        [("env".to_string(), "caf\u{e9}".to_string())].into(),
+        [("a-b".to_string(), "x".to_string())].into(),
+    ];
+    for tags in bad {
+        let mut new = NewKey::secret(&f.project, "bad");
+        new.tags = tags.clone();
+        assert!(
+            matches!(f.store.create_key(new, ACTOR), Err(Error::Invalid(_))),
+            "{tags:?}"
+        );
+    }
+    assert!(f.store.keys(&f.org).unwrap().is_empty());
+    let mut tagged = NewKey::secret(&f.project, "tagged");
+    tagged.tags = [
+        ("product".to_string(), "checkout".to_string()),
+        ("cost_center".to_string(), "cc-4417".to_string()),
+    ]
+    .into();
+    let made = f.store.create_key(tagged, ACTOR).unwrap();
+    f.store
+        .create_key(NewKey::secret(&f.project, "plain"), ACTOR)
+        .unwrap();
+    assert_eq!(
+        f.store.key(&made.record.id).unwrap().tags["cost_center"],
+        "cc-4417"
+    );
+    let next = f
+        .store
+        .rotate_key(&made.record.id, "tagged-2", ACTOR)
+        .unwrap();
+    assert_eq!(next.record.tags, made.record.tags);
+    let payload = f.store.build_payload(&f.org).unwrap();
+    let keys = payload["keys"].as_array().unwrap();
+    let find = |name: &str| keys.iter().find(|k| k["name"] == name).unwrap();
+    assert_eq!(
+        find("tagged")["tags"],
+        json!({"cost_center": "cc-4417", "product": "checkout"})
+    );
+    assert!(find("plain").get("tags").is_none());
+    // The data plane reads them back onto the key it serves.
+    let directory = dir("tags");
+    let (seed, public) = llmshim::serve::snapshot::keygen().unwrap();
+    let published = f.store.publish_snapshot(&f.org, &seed, ACTOR).unwrap();
+    let file = directory.join("snapshot.json");
+    std::fs::write(&file, published.envelope).unwrap();
+    let cp = control_plane(&f.org, &public, &file);
+    let loaded = llmshim::serve::snapshot::load(&cp, None, chrono::Utc::now()).unwrap();
+    let served = |name: &str| loaded.keys.iter().find(|k| k.name == name).unwrap();
+    assert_eq!(served("tagged").tags["product"], "checkout");
+    assert!(served("plain").tags.is_empty());
+}
+
+/// A database from a newer build is refused, not read (and not "migrated" backwards).
+#[test]
+fn a_newer_schema_version_is_refused() {
+    if common::postgres_url().is_some() {
+        return; // the version check is the same match on both backends; this runs the SQLite one
+    }
+    let directory = dir("newer");
+    let file = directory.join("control.db");
+    drop(Store::open(&file).unwrap());
+    {
+        let connection = rusqlite::Connection::open(&file).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 99;")
+            .unwrap();
+    }
+    assert!(matches!(Store::open(&file), Err(Error::Invalid(_))));
 }
