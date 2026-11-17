@@ -257,6 +257,14 @@
             "null"
           ]
         },
+        "tags": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Labels copied onto every usage record this key produces (design note 0029),\nfor chargeback by cost center, environment or product: up to 16, names\n`[a-z][a-z0-9_]{0,31}`, values 1 to 64 printable ASCII characters. Labels\nonly: nothing admits, limits or routes on them.",
+          "type": "object"
+        },
         "tenant": {
           "type": "string"
         },

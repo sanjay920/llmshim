@@ -54,6 +54,10 @@ pub struct UsageRecord {
     /// with. `None` when this replica's configuration does not name the
     /// credential the job carries, or the caller had none.
     pub key: Option<String>,
+    /// The key's operator-chosen labels, names sorted (note 0029); `{}` for a named
+    /// key with none, `null` exactly when `key` is `null`. Labels only: nothing
+    /// admits, limits or routes on them.
+    pub tags: Option<std::collections::BTreeMap<String, String>>,
     /// The request's id: the caller's `x-request-id` when it sent a well-formed
     /// one, otherwise the id the gateway minted. It is the `request_id` of the
     /// request's access-log line, so every attempt of a request (a retry, a
@@ -198,7 +202,13 @@ pub(crate) fn credential_prefix(credential_scope: &str) -> &str {
 /// Callers pass a whole scope digest or the prefix a policy scope carries; the
 /// table is keyed by the prefix either way.
 #[derive(Clone, Default)]
-pub struct KeyNames(Arc<std::sync::RwLock<HashMap<String, String>>>);
+pub struct KeyNames {
+    names: Arc<std::sync::RwLock<HashMap<String, String>>>,
+    /// Operator-chosen labels per credential (design note 0029): copied onto usage
+    /// records, never used to decide anything. A credential with a name and no entry
+    /// here has no tags.
+    tags: Arc<std::sync::RwLock<HashMap<String, std::collections::BTreeMap<String, String>>>>,
+}
 
 impl KeyNames {
     /// `(credential scope, key name)` pairs.
@@ -211,7 +221,7 @@ impl KeyNames {
     /// Make more keys resolvable. A credential already known keeps resolving; a
     /// renamed one resolves to its newest name.
     pub fn add(&self, pairs: impl IntoIterator<Item = (String, String)>) {
-        let mut table = self.0.write().unwrap_or_else(|p| p.into_inner());
+        let mut table = self.names.write().unwrap_or_else(|p| p.into_inner());
         table.extend(
             pairs
                 .into_iter()
@@ -219,8 +229,39 @@ impl KeyNames {
         );
     }
 
+    /// Set the tags of credentials (replacing what each had: a key whose tags were all
+    /// removed resolves to none).
+    pub fn add_tags(
+        &self,
+        pairs: impl IntoIterator<Item = (String, std::collections::BTreeMap<String, String>)>,
+    ) {
+        let mut table = self.tags.write().unwrap_or_else(|p| p.into_inner());
+        table.extend(
+            pairs
+                .into_iter()
+                .map(|(credential, tags)| (credential_prefix(&credential).to_owned(), tags)),
+        );
+    }
+
+    /// The tags of a credential this replica can name: `{}` when it has none, `None`
+    /// exactly when [`Self::name`] is.
+    pub(crate) fn tags(
+        &self,
+        credential: &str,
+    ) -> Option<std::collections::BTreeMap<String, String>> {
+        self.name(credential)?;
+        Some(
+            self.tags
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(credential_prefix(credential))
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
     pub(crate) fn name(&self, credential: &str) -> Option<String> {
-        self.0
+        self.names
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .get(credential_prefix(credential))
@@ -240,6 +281,7 @@ struct Open {
     span: Option<Box<dyn AttemptSpan>>,
     tenant: Option<String>,
     key: Option<String>,
+    tags: Option<std::collections::BTreeMap<String, String>>,
     request_id: Option<String>,
     provider: String,
     model: String,
@@ -306,6 +348,8 @@ impl UsageRecorder {
             span,
             tenant: self.tenants.name(tenant_key),
             key: credential.and_then(|credential| self.keys.name(credential)),
+            // Read with the name, at admission, so the two always agree on one record.
+            tags: credential.and_then(|credential| self.keys.tags(credential)),
             request_id: request_id.map(str::to_owned),
             provider: identity.provider_name().to_owned(),
             model: identity.native_model().to_owned(),
@@ -440,6 +484,7 @@ fn build(
         attempt_id: id.to_string(),
         tenant: open.tenant,
         key: open.key,
+        tags: open.tags,
         request_id: open.request_id,
         provider: open.provider,
         model: open.model,

@@ -186,6 +186,18 @@ pub fn key_names(
         .collect()
 }
 
+/// `(credential scope, tags)` of each key that can be named (note 0029). Labels only.
+pub fn key_tags(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, std::collections::BTreeMap<String, String>)> {
+    config
+        .keys
+        .iter()
+        .filter_map(|key| Some((credential_scope(key, env)?, key.tags.clone())))
+        .collect()
+}
+
 /// The workload name a verified token is bound to, in the space the key store
 /// keeps certificate workloads in (`dns:`/`uri:` names), under its own prefix: a
 /// table name has no `:`, so two bindings can never produce the same name.

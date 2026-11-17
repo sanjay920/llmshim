@@ -554,6 +554,9 @@ impl Reloader {
         self.handles
             .key_names
             .add(super::keys::key_names(&loaded.config, env));
+        self.handles
+            .key_names
+            .add_tags(super::keys::key_tags(&loaded.config, env));
         // Who may call and from where change together or not at all: one
         // fingerprint, one debounce.
         let allowlists = super::keys::allowlists(&loaded.config, env);

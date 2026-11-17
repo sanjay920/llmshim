@@ -466,6 +466,24 @@ impl Reload {
     }
 }
 
+fn tag_name_problem(name: &str) -> Option<&'static str> {
+    let bytes = name.as_bytes();
+    let first_ok = bytes.first().is_some_and(u8::is_ascii_lowercase);
+    let rest_ok = bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_');
+    (!(first_ok && rest_ok && bytes.len() <= 32))
+        .then_some("a tag name is 1 to 32 of a-z, 0-9 and '_', starting with a letter")
+}
+
+fn tag_value_problem(value: &str) -> Option<&'static str> {
+    let printable = value.bytes().all(|b| (b' '..=b'~').contains(&b));
+    let trimmed = value.trim_matches(' ').len() == value.len();
+    (!(printable && trimmed && (1..=64).contains(&value.len()))).then_some(
+        "a tag value is 1 to 64 printable ASCII characters, with no leading or trailing space",
+    )
+}
+
 fn validate_outage_admission(outage: &OutageAdmission, issues: &mut Vec<Issue>) {
     for (path, value) in [
         (
@@ -1108,6 +1126,12 @@ pub struct GatewayKey {
     /// it for no restriction; an empty list is refused.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
+    /// Labels copied onto every usage record this key produces (design note 0029),
+    /// for chargeback by cost center, environment or product: up to 16, names
+    /// `[a-z][a-z0-9_]{0,31}`, values 1 to 64 printable ASCII characters. Labels
+    /// only: nothing admits, limits or routes on them.
+    #[serde(default)]
+    pub tags: std::collections::BTreeMap<String, String>,
 }
 
 /// A named route: `route/<name>` resolves to `model` with default settings.
@@ -2295,6 +2319,17 @@ impl ServeConfig {
                     if let Err(message) = super::allowlist::Cidr::parse(cidr) {
                         issues.push(Issue::new(format!("{at}.allowed_cidrs[{n}]"), message));
                     }
+                }
+            }
+            if key.tags.len() > 16 {
+                issues.push(Issue::new(format!("{at}.tags"), "has more than 16 tags"));
+            }
+            for (name, value) in &key.tags {
+                if let Some(problem) = tag_name_problem(name) {
+                    issues.push(Issue::new(format!("{at}.tags.{name}"), problem));
+                }
+                if let Some(problem) = tag_value_problem(value) {
+                    issues.push(Issue::new(format!("{at}.tags.{name}"), problem));
                 }
             }
             if let Some(models) = &key.allowed_models {
