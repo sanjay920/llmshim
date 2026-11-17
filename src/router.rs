@@ -248,6 +248,12 @@ impl Router {
         )
     }
 
+    /// The kind (`Provider::name`) of the provider registered under `key`: what vendor behavior
+    /// applies to it, which for a named instance (note 0032) differs from the key.
+    pub fn provider_kind(&self, key: &str) -> Option<&str> {
+        self.providers.get(key).map(|provider| provider.name())
+    }
+
     /// The configured deployment names, in order.
     pub fn deployment_names(&self) -> Vec<&str> {
         self.deployments.keys().map(String::as_str).collect()

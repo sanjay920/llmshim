@@ -844,7 +844,6 @@ const HOSTED_NAMES: [&str; 10] = [
 ];
 
 impl ProviderKind {
-    /// The only name a hosted provider may have; `None` for a self-hosted server.
     /// The API-key hosted kinds, which may be configured more than once under different names
     /// (design note 0032). The cloud transports keep one fixed name.
     pub fn supports_instances(self) -> bool {
@@ -859,6 +858,7 @@ impl ProviderKind {
         )
     }
 
+    /// The reserved name of a hosted kind; `None` for a self-hosted server.
     pub fn hosted_name(self) -> Option<&'static str> {
         Some(match self {
             Self::Openai => "openai",

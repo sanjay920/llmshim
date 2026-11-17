@@ -181,3 +181,14 @@ and each fails a test.
   other). Mutations that move the semaphore key or the gateway lane back to the kind fail the process test.
 - Not done: the environment form of limits for instances (file-only, as the note says); 0001 and 0022 and 0031
   are updated by this change.
+
+### Review changes (slice 2)
+
+- The gateway's restricted-key check for OpenRouter's own request fields (`x-openrouter.models`, a preset)
+  reads the **kind** of the provider the request resolved to (`Router::provider_kind`), so a named instance of
+  OpenRouter is checked like the original, and its fallback list is matched under the instance's name.
+- **Not built: `/v1/models`.** The listing is catalog and kind based, so an instance's models are not
+  advertised and a config with only a named instance lists none of its vendor's models; `openai-b/<model>`
+  works when addressed. Listing instance ids is a separate decision (what an instance serves is not known
+  without asking it).
+- A 429 from one instance penalizes that instance's bucket only (pinned by a process test).

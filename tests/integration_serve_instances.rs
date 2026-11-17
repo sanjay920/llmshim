@@ -211,3 +211,25 @@ fn the_name_rule_allows_instances_and_still_protects_reserved_names() {
         assert!(text.contains(&format!("providers.{name}")), "{text}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_429_from_one_account_penalizes_that_accounts_bucket_and_not_the_others() {
+    let (a, a_mock) = upstream(1).await;
+    // The second account always answers 429.
+    let mut b = mockito::Server::new_async().await;
+    let _b_mock = b
+        .mock("POST", "/responses")
+        .with_status(429)
+        .with_header("content-type", "application/json")
+        .with_body("{\"error\":{\"message\":\"slow down\"}}")
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    // Both accounts have a bucket (a penalty applies to a bucket that exists).
+    let extra = "[limits.providers.openai]\nrpm = 600\n[limits.providers.openai-b]\nrpm = 600\n";
+    let server = start(&render(&a.url(), &b.url(), "", extra), "inst-429", &env());
+    assert_eq!(ask(&server.base, "openai-b/gpt-6-luna").await, 429);
+    // The first account's bucket was not penalized by the second's 429: it still serves at once.
+    assert_eq!(ask(&server.base, "openai/gpt-6-luna").await, 200);
+    a_mock.assert_async().await;
+}
