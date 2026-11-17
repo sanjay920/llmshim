@@ -171,6 +171,8 @@ async fn sigterm_lets_an_in_flight_request_finish_then_exits_zero() {
 #[cfg(feature = "serve-redis")]
 mod redis_outage {
     use super::*;
+
+    const CAPPED_KEY: &str = "capped-caller-key-0123456789abcdef";
     use tokio::net::{TcpListener, TcpStream};
 
     /// A TCP forwarder to the real Redis that a test can cut and restore: a
@@ -561,7 +563,9 @@ mod redis_outage {
         let redis_through_proxy = format!("redis://{}", proxy.address);
         let logging = format!("\n[logging]\nusage_log = \"{}\"\n", usage_path.display());
         let extra = &format!("[tenants.{tenant}]\nbudget_usd = 100.0\n[fleet]\nredis_url = {{ env = \"SERVE_E2E_REDIS_URL\" }}\n\
-                     [fleet.outage_admission]\nspend_lease_fraction = 0.5\nrecover_after_secs = 5");
+                     [fleet.outage_admission]\nspend_lease_fraction = 0.5\nrecover_after_secs = 5\n\
+                     [[keys]]\nname = \"capped\"\ntenant = \"{tenant}\"\n\
+                     secret = {{ env = \"SERVE_E2E_CAPPED_KEY\" }}\nbudget_usd = 1.0\n");
         let text = (config(&upstream.url(), extra) + &logging)
             .replace("providers.inference", "providers.openai")
             .replace("kind = \"openai-compatible\"", "kind = \"openai\"")
@@ -569,7 +573,10 @@ mod redis_outage {
         let mut server = start(
             &text,
             "outage-admission",
-            &[("SERVE_E2E_REDIS_URL", redis_through_proxy.as_str())],
+            &[
+                ("SERVE_E2E_REDIS_URL", redis_through_proxy.as_str()),
+                ("SERVE_E2E_CAPPED_KEY", CAPPED_KEY),
+            ],
         );
         let base = server.base.clone();
         let client = client();
@@ -615,6 +622,20 @@ mod redis_outage {
             200,
             "a replica serving from its lease stays in the Service"
         );
+        // A key with a cap of its own would need a second lease: refused, not served.
+        let capped = client
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(CAPPED_KEY)
+            .json(&json!({"model": model, "max_tokens": 50,
+                "messages": [{"role": "user", "content": "ping"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            matches!(capped.status().as_u16(), 429 | 503),
+            "a key with its own cap is not served in outage state: {}",
+            capped.status()
+        );
         // Status and metrics say so, without naming a tenant.
         let stats: serde_json::Value = client
             .get(format!("{base}/v1/gateway/stats"))
@@ -654,7 +675,10 @@ mod redis_outage {
         // Requests keep being served (locally, then through the fleet) while
         // the lease is settled; no restart is needed.
         while !settled(&server) && recovering.elapsed() < Duration::from_secs(90) {
-            assert_eq!(ask().await.unwrap().status(), 200);
+            // The first fleet request after the outage may meet a connection that has to be
+            // rebuilt: a retryable 502 or 503, never a stuck state.
+            let status = ask().await.unwrap().status().as_u16();
+            assert!(matches!(status, 200 | 502 | 503), "{status}");
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         assert!(
@@ -696,6 +720,33 @@ mod redis_outage {
         let _ = std::fs::remove_file(&usage_path);
         mock.assert_async().await;
         assert_no_panic(&server.stderr.lock().unwrap());
+        // The lease and its settlement sit on the tenant cap's counter, the one the fleet
+        // path reserves in, and not on the tenant's plain counter.
+        use sha2::{Digest, Sha256};
+        let hash = format!("{:x}", Sha256::digest(tenant.as_bytes()));
+        let redis = redis::Client::open(target.as_str()).unwrap();
+        let mut connection = redis.get_multiplexed_async_connection().await.unwrap();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("llmshim:gw:budget:v1:tenant-cap:{hash}:*"))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(!keys.is_empty(), "the tenant cap's counter exists");
+        let plain: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("llmshim:gw:budget:v1:{hash}:*"))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(plain.is_empty(), "the plain counter is not used: {plain:?}");
+        let leases: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("llmshim:gw:lease:v1:tenant-cap:{hash}:*"))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            !leases.is_empty(),
+            "the lease is on the tenant cap's counter"
+        );
     }
 
     /// Redis goes away while a request is already with the provider. The caller
