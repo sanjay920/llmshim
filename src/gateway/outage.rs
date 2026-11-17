@@ -535,6 +535,17 @@ mod tests {
         ))
     }
 
+    /// These tests admit against the current hour's window and refuse inside its last
+    /// `WINDOW_MARGIN_MS`; started in the last couple of minutes of an hour they would see that margin
+    /// rather than the rule under test (CI hit it at 11:59:46). Wait out the boundary instead.
+    async fn clear_of_the_window_end() {
+        let window_ms = 3600 * 1000;
+        let to_end = window_ms - now_ms() % window_ms;
+        if to_end < 120_000 {
+            tokio::time::sleep(Duration::from_millis(to_end + 1_000)).await;
+        }
+    }
+
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -663,6 +674,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn an_outage_is_served_from_the_lease_and_settled_on_recovery() {
+        clear_of_the_window_end().await;
         let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
             return;
         };
@@ -732,6 +744,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn a_flapping_redis_keeps_local_admission_on_the_lease_and_settles_nothing() {
+        clear_of_the_window_end().await;
         let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
             return;
         };
@@ -761,6 +774,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn nothing_is_admitted_inside_the_window_margin() {
+        clear_of_the_window_end().await;
         let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
             return;
         };
@@ -787,6 +801,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn a_second_outage_in_the_same_window_has_its_own_lease() {
+        clear_of_the_window_end().await;
         let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
             return;
         };
