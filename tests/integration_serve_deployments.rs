@@ -302,3 +302,146 @@ fn a_deployment_is_checked_by_path() {
     }
     let _ = CALLER_KEY;
 }
+
+// ---- failover (note 0031, slice 3) ----------------------------------------------------------
+
+/// `[upstream] max_retries = 0` keeps the client from retrying a 5xx itself, so what the tests count
+/// is the deployment's own failover (a file's `[upstream]` is the only place `serve` reads that).
+const ORDERED: &str = r#"
+    [deployments.chat]
+    strategy = "ordered"
+    targets = [{ model = "east/m" }, { model = "west/m" }]
+    [upstream]
+    max_retries = 0
+"#;
+
+/// A mock that answers every call with `status`.
+async fn failing(status: usize, calls: usize) -> (mockito::ServerGuard, mockito::Mock) {
+    let mut up = mockito::Server::new_async().await;
+    let mock = up
+        .mock("POST", "/chat/completions")
+        .with_status(status)
+        .with_header("content-type", "application/json")
+        .with_body("{\"error\":{\"message\":\"nope\"}}")
+        .expect(calls)
+        .create_async()
+        .await;
+    (up, mock)
+}
+
+/// No retries inside the client: each target is hit once per attempt, so what the test counts is
+/// the deployment's own failover.
+fn no_client_retries() -> [(&'static str, &'static str); 2] {
+    [
+        ("SERVE_E2E_ADMIN_TOKEN", ADMIN_TOKEN),
+        ("LLMSHIM_MAX_RETRIES", "0"),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_5xx_from_the_first_target_is_retried_on_the_next_and_each_attempt_is_recorded() {
+    let (east, east_mock) = failing(502, 1).await;
+    let (west, west_mock) = upstream(1).await;
+    let dir = tempdir::Dir::new("dep-failover");
+    let log = dir.0.join("usage.jsonl");
+    let server = start(
+        &render(&east.url(), &west.url(), ORDERED, "", Some(&log)),
+        "dep-failover",
+        &no_client_retries(),
+    );
+    assert_eq!(
+        ask(&server.base, "deployment/chat", None).await.status(),
+        200
+    );
+    east_mock.assert_async().await;
+    west_mock.assert_async().await;
+    // Two usage records, one per attempt, under one request id and the one deployment name.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let records = loop {
+        let found: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        if found.len() >= 2 || std::time::Instant::now() > deadline {
+            break found;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert!(records.iter().all(|r| r["deployment"] == "chat"));
+    let by = |p: &str| records.iter().find(|r| r["provider"] == p).unwrap().clone();
+    assert_eq!(by("east")["outcome"], "http_failure");
+    assert_eq!(by("west")["outcome"], "completed");
+    assert_eq!(by("east")["request_id"], by("west")["request_id"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_400_or_a_429_is_not_retried_elsewhere() {
+    for status in [400, 429] {
+        let (east, east_mock) = failing(status, 1).await;
+        // The second target must never be called.
+        let (west, west_mock) = upstream(0).await;
+        let server = start(
+            &render(&east.url(), &west.url(), ORDERED, "", None),
+            "dep-no-failover",
+            &no_client_retries(),
+        );
+        let answer = ask(&server.base, "deployment/chat", None).await;
+        assert_ne!(answer.status(), 200, "{status}");
+        east_mock.assert_async().await;
+        west_mock.assert_async().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_target_is_tried_once_and_the_last_failure_is_what_the_caller_sees() {
+    let (east, east_mock) = failing(502, 1).await;
+    let (west, west_mock) = failing(503, 1).await;
+    let server = start(
+        &render(&east.url(), &west.url(), ORDERED, "", None),
+        "dep-all-fail",
+        &no_client_retries(),
+    );
+    let answer = ask(&server.base, "deployment/chat", None).await;
+    assert!(answer.status().is_server_error(), "{}", answer.status());
+    east_mock.assert_async().await;
+    west_mock.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_the_key_may_not_make_returns_the_original_failure_not_a_403() {
+    // The key may call east only. East fails with a 502; west would be the retry, which the list does
+    // not allow: the caller sees the 502 it earned, and west is never called.
+    let (east, east_mock) = failing(502, 1).await;
+    let (west, west_mock) = upstream(0).await;
+    let server = start(
+        &render(
+            &east.url(),
+            &west.url(),
+            ORDERED,
+            "allowed_models = [\"east/m\"]",
+            None,
+        ),
+        "dep-failover-allow",
+        &no_client_retries(),
+    );
+    let answer = ask(&server.base, "deployment/chat", None).await;
+    assert_eq!(answer.status(), 502);
+    east_mock.assert_async().await;
+    west_mock.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_addressed_to_a_target_is_never_moved() {
+    let (east, east_mock) = failing(502, 1).await;
+    let (west, west_mock) = upstream(0).await;
+    let server = start(
+        &render(&east.url(), &west.url(), ORDERED, "", None),
+        "dep-direct",
+        &no_client_retries(),
+    );
+    assert_eq!(ask(&server.base, "east/m", None).await.status(), 502);
+    east_mock.assert_async().await;
+    west_mock.assert_async().await;
+}

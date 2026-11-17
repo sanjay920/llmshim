@@ -1,6 +1,6 @@
 # 0031: Deployments: one name, several targets
 
-Status: slice 2 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a file
+Status: slices 2 and 3 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a file
 table, a model-string prefix, an allowlist rule, a usage-record field and a failure behavior become
 promises. It is the roadmap item "deployments and load balancing across credentials and regions".
 Nothing here is started.
@@ -254,3 +254,30 @@ slice, stated now so slice 2's shape allows it:
   reasoning or tool conversations should use `conversation`, which is deterministic (stated above).
 - A fallback-chain entry that is a deployment resolves what it expanded to (library and proxy users;
   `serve` has no fallback). Not covered by a test of its own.
+
+## As built (slice 3): failover (unary)
+
+- In the gateway's unary `chat` handler a request addressed to `deployment/<name>` is retried on another
+  target when its attempt fails with a **provider 5xx (500, 502, 503, 504, 529) or a transport failure**
+  (`retryable_upstream_failure`, which reads the `Display` text of `ShimError`; a test pins the formats). The
+  retry is a **new submission** (a fresh preparation permit, policy scope, queue lane and admission, so it reserves
+  its own spend and rate tokens and writes its own usage record under the same request id and deployment name),
+  to the next **untried** target in file order, preferring one whose circuit is not open and reserving its probe
+  (`Router::deployment_retry_target`); at most `min(targets, 3)` attempts, each target once; every attempt resolves on
+  the first attempt's router snapshot.
+- **Not retried:** any 429 (from the provider or the caller's own limits and budget: moving the load would not
+  help, or it is not the target's fault), every 4xx, every local refusal and overload, a failure in a
+  distributed gateway's own plumbing; and a request that named a concrete target.
+  (This is narrower than the design sketch, which allowed a 429 with a long backoff: separating an account's own
+  limit from the caller's needs the refusal's kind through the dispatch error, and is left out.)
+- If the retry cannot be prepared (the key's list does not allow the next target), the caller gets the original
+  failure, not a 403 about a target it did not choose. The failover counter
+  `llmshim_gateway_deployment_failover_total{deployment,from,to}` counts retries.
+- Tests (process, `[upstream] max_retries = 0` so the client does not retry a 5xx itself): a 502 then a served
+  retry with two usage records under one request id; a 400 and a 429 are not retried; every target tried once
+  and the last failure returned; the allowlist case; a concrete target is never moved. A unit test pins the
+  classification; treating a 400 as retryable fails the process test. (A provider 429 never reaches the
+  classifier as a status: the dispatch maps it to a rate-limit marker first, so it is not retried by construction.)
+- **Not built:** failover for streaming requests (a failure before the first byte could be retried the same way;
+  the stream handler's structure needs its own change), the `/v1/gateway/stats` view of each deployment's targets
+  and circuit state (slice 4), and 0014 rows for failover.

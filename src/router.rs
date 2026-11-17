@@ -254,6 +254,44 @@ impl Router {
         self.providers.get(key).map(|provider| provider.name())
     }
 
+    /// How many targets a deployment has (0 for an unknown name).
+    pub fn deployment_target_count(&self, name: &str) -> usize {
+        self.deployments
+            .get(name)
+            .map_or(0, |deployment| deployment.targets().len())
+    }
+
+    /// The target a failed request to `deployment/<name>` should try next: the first target, in
+    /// file order, that has not been tried, preferring one whose circuit is not open, and reserving
+    /// the probe slot for the one chosen (note 0031's failover). `None` when every target has been
+    /// tried.
+    pub fn deployment_retry_target(&self, name: &str, tried: &[String]) -> Option<String> {
+        let deployment = self.deployments.get(name)?;
+        let now = std::time::Instant::now();
+        let untried: Vec<&crate::deployment::Target> = deployment
+            .targets()
+            .iter()
+            .filter(|target| !tried.contains(&target.model))
+            .collect();
+        let usable = |target: &crate::deployment::Target| match self.resolve(&target.model) {
+            Ok((provider, _)) => {
+                !self.breaker.should_skip(provider.instance())
+                    || self.breaker.probe_due(provider.instance(), now)
+            }
+            Err(_) => true,
+        };
+        let chosen = untried
+            .iter()
+            .find(|target| usable(target))
+            .or_else(|| untried.first())?;
+        if let Ok((provider, _)) = self.resolve(&chosen.model) {
+            if self.breaker.should_skip(provider.instance()) {
+                let _ = self.breaker.try_admit_probe(provider.instance(), now);
+            }
+        }
+        Some(chosen.model.clone())
+    }
+
     /// The configured deployment names, in order.
     pub fn deployment_names(&self) -> Vec<&str> {
         self.deployments.keys().map(String::as_str).collect()
