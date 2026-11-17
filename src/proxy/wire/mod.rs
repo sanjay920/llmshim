@@ -1070,8 +1070,14 @@ pub(crate) async fn translate_with_router(
     };
     let replay_metadata = if wire == Wire::Responses {
         let destination = router.and_then(|router| {
-            let req =
+            let mut req =
                 serde_json::from_value::<crate::proxy::types::ChatRequest>(chat.clone()).ok()?;
+            // A deployment is picked when the request is prepared for dispatch; preparing it here
+            // as well would advance its counter twice per request and could disagree with the
+            // dispatch. The probable target is read without picking (note 0031).
+            if let Some(target) = router.peek_deployment(&chat) {
+                req.model = target;
+            }
             let prepared = crate::proxy::convert::prepare_request(router, &req).ok()?;
             let (provider, model) = router
                 .resolve_owned(prepared.payload["model"].as_str()?)

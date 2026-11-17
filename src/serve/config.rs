@@ -118,6 +118,10 @@ pub struct ServeConfig {
     /// tenant, on a counter of its own. A key's own `budget_usd` then caps that key.
     #[serde(default)]
     pub tenants: BTreeMap<String, TenantBudgetConfig>,
+    /// Named deployments: `deployment/<name>` resolves, per request, to one of several targets
+    /// (design note 0031). Reloads with the providers and routes.
+    #[serde(default)]
+    pub deployments: BTreeMap<String, DeploymentConfig>,
     /// A separate listener for operational endpoints. Without it they are
     /// served on the main listener, as the gateway does.
     #[serde(default)]
@@ -1157,6 +1161,41 @@ pub struct GatewayKey {
     pub tags: std::collections::BTreeMap<String, String>,
 }
 
+/// `[deployments.<name>]`: one name, several targets (design note 0031).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct DeploymentConfig {
+    /// How a target is chosen: `round_robin` (the default), `weighted`, `ordered` (a primary and
+    /// standbys) or `conversation` (one conversation keeps one target).
+    #[serde(default)]
+    pub strategy: DeploymentStrategy,
+    /// The targets, 1 to 16, each a `provider/model` of a configured provider.
+    pub targets: Vec<DeploymentTarget>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentStrategy {
+    #[default]
+    RoundRobin,
+    Weighted,
+    Ordered,
+    Conversation,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct DeploymentTarget {
+    /// `provider/model`, with a provider from `[providers.*]`; never a `route/` or `deployment/`
+    /// string.
+    pub model: String,
+    /// 1 to 1000, with `weighted` or `conversation`; default 1.
+    #[serde(default)]
+    pub weight: Option<u32>,
+}
+
 /// `[tenants.<name>]`: the tenant's own budget (design note 0030).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1515,6 +1554,7 @@ impl ServeConfig {
         self.validate_keys(&mut issues);
         self.validate_tenant_limits(&mut issues);
         self.validate_tenant_budgets(&mut issues);
+        self.validate_deployments(&mut issues);
         self.validate_control_plane(&mut issues);
         self.validate_routes(&mut issues);
         issues
@@ -2340,6 +2380,72 @@ impl ServeConfig {
                 ));
             }
             check_tenant_budget_values(&at, budget, issues);
+        }
+    }
+
+    fn validate_deployments(&self, issues: &mut Vec<Issue>) {
+        for (name, deployment) in &self.deployments {
+            let at = format!("deployments.{name}");
+            if !valid_name(name) {
+                issues.push(Issue::new(&at, NAME_RULE));
+            } else if self.routes.contains_key(name) {
+                issues.push(Issue::new(
+                    &at,
+                    "has the name of a route; one namespace keeps a log line unambiguous",
+                ));
+            }
+            if deployment.targets.is_empty() || deployment.targets.len() > 16 {
+                issues.push(Issue::new(
+                    format!("{at}.targets"),
+                    "must list 1 to 16 targets",
+                ));
+            }
+            let weighted = matches!(
+                deployment.strategy,
+                DeploymentStrategy::Weighted | DeploymentStrategy::Conversation
+            );
+            let mut seen = BTreeSet::new();
+            for (n, target) in deployment.targets.iter().enumerate() {
+                let path = format!("{at}.targets[{n}]");
+                match target.model.split_once('/') {
+                    Some((provider, model)) if !model.is_empty() => {
+                        if provider == "route" || provider == "deployment" {
+                            issues.push(Issue::new(
+                                format!("{path}.model"),
+                                "must be a provider/model, not a route or a deployment (they do not chain)",
+                            ));
+                        } else if !self.providers.contains_key(provider) {
+                            issues.push(Issue::new(
+                                format!("{path}.model"),
+                                "names a provider that is not in [providers.*]",
+                            ));
+                        }
+                    }
+                    _ => issues.push(Issue::new(
+                        format!("{path}.model"),
+                        "must be provider/model",
+                    )),
+                }
+                if !seen.insert(target.model.as_str()) {
+                    issues.push(Issue::new(
+                        format!("{path}.model"),
+                        "is listed twice (use a weight to prefer a target)",
+                    ));
+                }
+                if let Some(weight) = target.weight {
+                    if !weighted {
+                        issues.push(Issue::new(
+                            format!("{path}.weight"),
+                            "needs strategy \"weighted\" or \"conversation\"",
+                        ));
+                    } else if !(1..=1000).contains(&weight) {
+                        issues.push(Issue::new(
+                            format!("{path}.weight"),
+                            "must be between 1 and 1000",
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -3469,10 +3575,11 @@ mod tests {
             "upstream",
             "control_plane",
             "tenants",
+            "deployments",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 16, "a new table needs a line here");
+        assert_eq!(properties.len(), 17, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
     }
 

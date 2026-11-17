@@ -24,6 +24,9 @@ One JSON line per provider **attempt**, when the attempt ends:
 named key with none, `null` exactly when `key` is `null`. They are resolved when the attempt is
 admitted, with the key's name, and are labels only: nothing admits, limits or routes on them.
 
+`deployment` is the name the caller addressed (`deployment/<name>`, note 0031), `null` otherwise; `provider` and
+`model` are the target that served the attempt.
+
 `admission` is `"fleet"` for an attempt admitted the ordinary way and `"outage"`
 for one admitted on a replica-owned spend lease while Redis was unreachable
 (`[fleet.outage_admission]`, 0027). A consumer that ignores unknown fields is

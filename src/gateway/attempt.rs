@@ -70,6 +70,9 @@ pub(crate) struct TrustedPolicyScope {
     /// The request's id, for the usage record. Set only by `serve`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
+    /// The deployment the caller addressed (`deployment/<name>`), for the usage record (note 0031).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deployment: Option<String>,
     /// The router the request was admitted against (0022). Never serialized: a job
     /// that crosses Redis is run by another replica on that replica's router.
     #[serde(skip)]
@@ -114,6 +117,7 @@ impl TrustedPolicyScope {
             key_cap_id,
             credential: None,
             request_id: None,
+            deployment: None,
             router: None,
         }
     }
@@ -201,10 +205,16 @@ impl TrustedPolicyScope {
 
     /// Record who made the request and under which id, for the usage record.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
-    pub(crate) fn attribute(&mut self, credential_scope: &str, request_id: Option<&str>) {
+    pub(crate) fn attribute(
+        &mut self,
+        credential_scope: &str,
+        request_id: Option<&str>,
+        deployment: Option<&str>,
+    ) {
         self.credential =
             Some(crate::gateway::usage::credential_prefix(credential_scope).to_owned());
         self.request_id = request_id.map(str::to_owned);
+        self.deployment = deployment.map(str::to_owned);
     }
 
     #[cfg(feature = "redis-coordination")]
@@ -1282,6 +1292,7 @@ impl AttemptCoordinator {
                         &scope.tenant_key,
                         scope.credential.as_deref(),
                         scope.request_id.as_deref(),
+                        scope.deployment.as_deref(),
                     );
                 }
                 Ok(())
@@ -2398,6 +2409,7 @@ mod tests {
             key_cap_id: None,
             credential: None,
             request_id: None,
+            deployment: None,
             router: None,
         }
     }
@@ -2419,7 +2431,7 @@ mod tests {
     #[test]
     fn the_scope_that_crosses_redis_carries_no_key_name_or_tags() {
         let mut scope = scope("fields", Some(1), Some(1));
-        scope.attribute("a-credential-scope-0123456789abcdef", Some("req-1"));
+        scope.attribute("a-credential-scope-0123456789abcdef", Some("req-1"), None);
         let value = serde_json::to_value(&scope).unwrap();
         let mut found: Vec<&str> = value
             .as_object()
@@ -2875,6 +2887,7 @@ mod tests {
             key_cap_id: None,
             credential: None,
             request_id: None,
+            deployment: None,
             router: None,
         }
     }
@@ -5722,6 +5735,7 @@ mod usage_records {
             key_cap_id: None,
             credential: None,
             request_id: None,
+            deployment: None,
             router: None,
         }
     }
@@ -5820,7 +5834,7 @@ mod usage_records {
         ] {
             let mut scope = scope(Some("payments"), None);
             if let Some(credential) = credential {
-                scope.attribute(credential, request_id);
+                scope.attribute(credential, request_id, None);
             }
             let mut tracker = admit(&coordinator, scope, AttemptKind::Completion)
                 .await
@@ -5850,7 +5864,7 @@ mod usage_records {
         // key's name do not.
         let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let mut attributed = scope(Some("payments"), None);
-        attributed.attribute(digest, Some("req-1"));
+        attributed.attribute(digest, Some("req-1"), None);
         let text = serde_json::to_string(&attributed).unwrap();
         assert!(text.contains(&digest[..16]) && text.contains("req-1"));
         assert!(

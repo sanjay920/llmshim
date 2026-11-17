@@ -64,6 +64,9 @@ pub struct UsageRecord {
     /// fallback) joins to it and to the caller's own logs. `None` for a job that
     /// carries none.
     pub request_id: Option<String>,
+    /// The deployment the caller addressed (`deployment/<name>`), `null` otherwise; `provider` and
+    /// `model` are the target that served the attempt (note 0031).
+    pub deployment: Option<String>,
     pub provider: String,
     pub model: String,
     /// `"completion"` or `"stream"`.
@@ -283,6 +286,7 @@ struct Open {
     key: Option<String>,
     tags: Option<std::collections::BTreeMap<String, String>>,
     request_id: Option<String>,
+    deployment: Option<String>,
     provider: String,
     model: String,
     kind: &'static str,
@@ -335,6 +339,7 @@ impl UsageRecorder {
         tenant_key: &str,
         credential: Option<&str>,
         request_id: Option<&str>,
+        deployment: Option<&str>,
     ) {
         let span = self.spans.as_ref().map(|spans| {
             spans.start(&AttemptBegun {
@@ -351,6 +356,7 @@ impl UsageRecorder {
             // Read with the name, at admission, so the two always agree on one record.
             tags: credential.and_then(|credential| self.keys.tags(credential)),
             request_id: request_id.map(str::to_owned),
+            deployment: deployment.map(str::to_owned),
             provider: identity.provider_name().to_owned(),
             model: identity.native_model().to_owned(),
             kind: kind_name(identity.kind()),
@@ -486,6 +492,7 @@ fn build(
         key: open.key,
         tags: open.tags,
         request_id: open.request_id,
+        deployment: open.deployment,
         provider: open.provider,
         model: open.model,
         kind: open.kind,
