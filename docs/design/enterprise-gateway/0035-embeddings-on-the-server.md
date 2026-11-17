@@ -30,15 +30,28 @@ observation. There is no second dispatch, auth or queue path (the rule the nativ
 - **Auth and allowlist.** The caller is identified exactly as for chat (401 otherwise). A key with
   `allowed_models` may embed only a listed routing id (403 `model_not_allowed`, before the provider). The
   key's rpm/tpm apply through the same buckets.
-- **Spend.** The reservation model is built for the chat wires. An embeddings attempt has no enforceable
-  pre-send bound yet, so a key with a spend cap (its own or its tenant's) is refused with
-  `400 unpriceable_under_budget` rather than served unmetered, unless that cap sets
-  `budget_allow_unpriced` (the explicit opt-in, 0030). Spend that is observed is recorded and settled as for
-  chat (the billed tokens and the catalog price). A bound for embeddings is the next slice.
+- **Spend.** The reservation model is built for the chat wires: it assumes one request fits in one
+  context window, which a batch of texts does not, so an embeddings attempt has **no enforceable pre-send
+  bound**. A key with a spend cap (its own or its tenant's) is therefore refused with
+  `400 unpriceable_under_budget`, **even with `budget_allow_unpriced`**: an unbounded attempt holds the level's
+  whole remaining allowance until a provider's own bill settles it, embeddings carry none, and the first call
+  would starve the key for the rest of its window (a process test found this: the second call was a 429). A key
+  with no cap is served, and its spend is observed and recorded (billed tokens, catalog price). A bound for
+  embeddings (batch size times the model's input limit, at the input rate) is the next slice; until then a
+  capped key cannot embed.
 - **Where it runs.** The local scheduler only. With `[fleet]` the answer is `501 not_implemented`: a
   distributed job carries a chat payload, and running an embeddings one as chat would be a wrong answer.
 - **Not built:** images and audio endpoints; chunking or splitting a batch (never: work the caller did not
   ask for); base64 for non-f32; idempotency keys for embeddings; embeddings through a fleet.
+
+### Token accounting on the OpenAI wires (found in review)
+
+An embeddings body counts `prompt_tokens` and `total_tokens` and has no output. The OpenAI Responses
+normalization read only `input_tokens` and wrote 0 into `prompt_tokens`, so a usage record for an OpenAI
+embedding would have said 0 input tokens next to a correct cost. It now keeps `prompt_tokens` when
+`input_tokens` is absent, and an input-only body (input counter equal to the total, no output counter at
+all) counts as complete counters on the chat and Responses wires. Pinned by
+`integration_serve_embeddings::the_openai_wire_records_the_prompt_tokens_an_embeddings_body_reports`.
 
 ## How it is built
 

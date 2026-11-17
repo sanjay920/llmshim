@@ -152,6 +152,8 @@ async fn a_single_string_and_base64_are_accepted_and_bad_shapes_are_400() {
     assert_eq!(floats, [1.0, 2.0]);
     // Token arrays, a bad format, an empty batch: refused before the provider.
     for bad in [
+        json!({"model": "route/anything", "input": "x"}),
+        json!({"model": "deployment/anything", "input": "x"}),
         json!({"model": "embed/m", "input": [1, 2, 3]}),
         json!({"model": "embed/m", "input": "x", "encoding_format": "hex"}),
         json!({"model": "embed/m", "input": []}),
@@ -207,8 +209,7 @@ async fn a_zero_tenant_rate_limit_refuses_embeddings_before_the_provider() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_budgeted_key_is_refused_until_embeddings_have_a_spend_bound_unless_unpriced_is_allowed()
-{
+async fn a_key_with_a_spend_cap_is_refused_until_embeddings_have_a_spend_bound() {
     // Spend reservation is built for chat wires; an embeddings attempt has no enforceable bound yet
     // (note 0035), so a capped key is refused, not served unmetered. `budget_allow_unpriced` is the
     // explicit opt-in for that.
@@ -229,7 +230,7 @@ async fn a_budgeted_key_is_refused_until_embeddings_have_a_spend_bound_unless_un
     assert!(text.contains("unpriceable_under_budget"), "{text}");
     mock.assert_async().await;
 
-    let (up, mock) = upstream(1).await;
+    let (up, mock) = upstream(0).await;
     let server = start(
         &config(
             &up.url(),
@@ -245,6 +246,52 @@ async fn a_budgeted_key_is_refused_until_embeddings_have_a_spend_bound_unless_un
         json!({"model": "embed/embed-model", "input": ["first", "second"]}),
     )
     .await;
-    assert_eq!(answer.status(), 200);
+    // Even the explicit opt-in does not admit it: an unbounded attempt would hold the key's whole
+    // allowance until a provider bill settled it, and embeddings carry none.
+    assert_eq!(answer.status(), 400);
     mock.assert_async().await;
+}
+
+/// The same file against `kind = "openai"` (the Responses wire, which counts `input_tokens`): an
+/// embeddings body counts `prompt_tokens`, and that must still reach the usage record.
+fn openai_config(upstream: &str, key_extra: &str, log: &std::path::Path) -> String {
+    config(upstream, key_extra, Some(log)).replace(
+        "[providers.embed]\n        kind = \"openai-compatible\"",
+        "[providers.openai]\n        kind = \"openai\"",
+    )
+}
+
+async fn records_of(log: &std::path::Path, at_least: usize) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let found: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        if found.len() >= at_least || std::time::Instant::now() > deadline {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_openai_wire_records_the_prompt_tokens_an_embeddings_body_reports() {
+    let (up, mock) = upstream(1).await;
+    let dir = tempdir::Dir::new("emb-openai");
+    let log = dir.0.join("usage.jsonl");
+    let server = start(&openai_config(&up.url(), "", &log), "emb-openai", &env());
+    let answer = embed(
+        &server.base,
+        Some(CALLER_KEY),
+        json!({"model": "openai/text-embedding-3-small", "input": ["a", "b"]}),
+    )
+    .await;
+    assert_eq!(answer.status(), 200, "{}", answer.text().await.unwrap());
+    mock.assert_async().await;
+    let records = records_of(&log, 1).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["input_tokens"], 7, "{records:?}");
+    assert_eq!(records[0]["output_tokens"], 0, "{records:?}");
 }

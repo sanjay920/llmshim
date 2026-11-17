@@ -1805,7 +1805,14 @@ async fn embeddings(
         dimensions: body.dimensions,
     };
     let snapshot = state.router.current();
-    // A route or deployment name is not an embeddings model: it resolves to a chat target.
+    // A route or deployment name is not an embeddings model: it resolves to a chat target (a route
+    // is refused here; `resolve` itself refuses a deployment).
+    if request.model.starts_with("route/") {
+        return Err(invalid_request(
+            "a route is not an embeddings model; address the model itself",
+            "model",
+        ));
+    }
     let (provider, model) = snapshot.resolve(&request.model).map_err(ApiError::from)?;
     let identity = &identified_caller.identity;
     if identity.allowed_models.is_some() {

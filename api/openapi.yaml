@@ -171,8 +171,9 @@ paths:
         Served by the gateway (`llmshim serve`), not by `llmshim proxy`. `input` is a string or an
         array of strings (token arrays are refused); `encoding_format` is `float` (default) or
         `base64` (little-endian f32). Admitted by the same key, allowlist, rate and usage rules as
-        a completion. A key with a spend cap is refused with `unpriceable_under_budget` unless it
-        sets `budget_allow_unpriced`. A fleet gateway answers 501. `usage.cost_usd` is `null` when
+        a completion. A key with a spend cap (its own or its tenant's) is refused with
+        `unpriceable_under_budget` until embeddings have a spend bound; `budget_allow_unpriced`
+        does not change that. A fleet gateway answers 501. `usage.cost_usd` is `null` when
         the price is unknown.
       requestBody:
         required: true

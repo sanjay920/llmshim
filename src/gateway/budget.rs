@@ -62,6 +62,27 @@ pub(crate) fn quote(
     policy: Option<&BudgetPolicySnapshot>,
     attempt: &PreparedAttempt<'_>,
 ) -> Result<Option<BudgetQuote>, BudgetPlanError> {
+    quote_with(policy, attempt, true)
+}
+
+/// [`quote`] for an operation that has no enforceable pre-send bound (embeddings, note 0035): the
+/// chat reservation assumes one request fits in one context window, which a batch does not, so
+/// it is never bounded, whatever the catalog holds. It is refused at every capped level, even
+/// one that allows unpriced attempts: an unbounded attempt holds the level's whole remaining
+/// allowance until a provider's own bill settles it, and an embeddings call carries none, so the
+/// first call would starve the key for the rest of its window.
+pub(crate) fn quote_unbounded(
+    policy: Option<&BudgetPolicySnapshot>,
+    attempt: &PreparedAttempt<'_>,
+) -> Result<Option<BudgetQuote>, BudgetPlanError> {
+    quote_with(policy, attempt, false)
+}
+
+fn quote_with(
+    policy: Option<&BudgetPolicySnapshot>,
+    attempt: &PreparedAttempt<'_>,
+    can_bound: bool,
+) -> Result<Option<BudgetQuote>, BudgetPlanError> {
     let Some(policy) = policy else {
         return Ok(None);
     };
@@ -75,10 +96,10 @@ pub(crate) fn quote(
         }));
     }
     let (amount_nanos, bounded) = match conservative_reservation_nanos(attempt)
-        .filter(|amount| *amount <= MAX_EXACT_REDIS_NANOS)
+        .filter(|amount| can_bound && *amount <= MAX_EXACT_REDIS_NANOS)
     {
         Some(amount) => (amount, true),
-        None if policy.allow_unpriced => (0, false),
+        None if policy.allow_unpriced && can_bound => (0, false),
         None => return Err(BudgetPlanError::Unpriceable),
     };
     Ok(Some(BudgetQuote {
