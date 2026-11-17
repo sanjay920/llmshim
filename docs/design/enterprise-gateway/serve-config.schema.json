@@ -166,6 +166,17 @@
             "null"
           ]
         },
+        "allowed_models": {
+          "default": null,
+          "description": "The models this key may call (design note 0028): exact routing ids\n(`openai/gpt-6-luna`, as `GET /v1/models` lists them), `provider/*`\nprefixes, or `route/<name>`. A request for any other model is refused\nwith 403 `model_not_allowed` before anything is reserved or queued. Omit\nit for no restriction; an empty list is refused.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "budget_allow_unpriced": {
           "default": false,
           "description": "Admit requests whose cost cannot be bounded before sending.",

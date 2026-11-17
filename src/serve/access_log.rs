@@ -321,6 +321,7 @@ mod tests {
                 budget_usd: None,
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
+                allowed_models: None,
             },
         )])))
     }

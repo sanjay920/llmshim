@@ -47,6 +47,56 @@ pub struct Identity {
     /// attempts are rejected once known spend reaches the cap.
     #[serde(default)]
     pub budget_allow_unpriced: bool,
+    /// Models this key may call (note 0028): exact `provider/model` routing ids,
+    /// `prefix/*`, or `route/<name>`. `None` is no restriction.
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
+}
+
+impl Identity {
+    /// Whether the key may call `provider`'s `model`. `route` is the route name the
+    /// request addressed, if it addressed one (`route/<name>` in the list admits it).
+    pub fn permits_model(&self, provider: &str, model: &str, route: Option<&str>) -> bool {
+        let Some(list) = &self.allowed_models else {
+            return true;
+        };
+        let id = format!("{provider}/{model}");
+        list.iter()
+            .any(|entry| model_entry_matches(entry, &id, route))
+    }
+}
+
+/// One allowlist entry against a routing id and the route the request addressed
+/// (`route/<name>`): exact, or a `prefix/*` entry (the separator is part of the
+/// prefix). A route is matched as its own `route/<name>` id, so `route/*` admits
+/// routes and never a model.
+pub(crate) fn model_entry_matches(entry: &str, id: &str, route: Option<&str>) -> bool {
+    let matches = |candidate: &str| match entry.strip_suffix('*') {
+        Some(prefix) => candidate.starts_with(prefix),
+        None => entry == candidate,
+    };
+    matches(id) || route.is_some_and(|name| matches(&format!("route/{name}")))
+}
+
+/// Why an `allowed_models` entry is refused, or `None` when it is well formed.
+pub fn model_entry_problem(entry: &str) -> Option<&'static str> {
+    if entry.is_empty() {
+        return Some("is empty");
+    }
+    if entry.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("contains whitespace or a control character");
+    }
+    if !entry.contains('/') {
+        return Some("must be provider/model, provider/*, or route/<name>");
+    }
+    let stars = entry.matches('*').count();
+    if stars > 1 || (stars == 1 && !entry.ends_with("/*")) {
+        return Some("may use * only as a final /* (a prefix)");
+    }
+    if entry == "/*" || entry.starts_with("/") {
+        return Some("must start with a provider");
+    }
+    None
 }
 
 /// Authentication failure — both map to HTTP 401.
@@ -285,6 +335,7 @@ impl KeyStore {
                     budget_usd: None,
                     budget_window_secs: None,
                     budget_allow_unpriced: false,
+                    allowed_models: None,
                 },
                 credential_scope: "open-development-mode".to_string(),
             }),
@@ -413,6 +464,7 @@ mod tests {
                     budget_usd: None,
                     budget_window_secs: None,
                     budget_allow_unpriced: false,
+                    allowed_models: None,
                 },
             )]),
             HashMap::from([(
@@ -425,6 +477,7 @@ mod tests {
                     budget_usd: None,
                     budget_window_secs: None,
                     budget_allow_unpriced: false,
+                    allowed_models: None,
                 },
             )]),
         );
@@ -466,6 +519,7 @@ mod tests {
                 budget_usd: None,
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
+                allowed_models: None,
             },
         );
         keys.insert(
@@ -478,6 +532,7 @@ mod tests {
                 budget_usd: None,
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
+                allowed_models: None,
             },
         );
         let store = KeyStore::enforced(keys);
@@ -530,6 +585,7 @@ mod tests {
             budget_usd: None,
             budget_window_secs: None,
             budget_allow_unpriced: false,
+            allowed_models: None,
         }
     }
 
@@ -779,5 +835,70 @@ mod tests {
         assert!(
             KeyStore::Live(LiveKeys::new(store)).has_peer("uri:spiffe://corp/payments/checkout")
         );
+    }
+
+    #[cfg(feature = "gateway")]
+    fn restricted(list: &[&str]) -> Identity {
+        Identity {
+            tenant: "t".into(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: None,
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+            allowed_models: Some(list.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    #[test]
+    fn entries_match_exactly_by_prefix_or_by_route() {
+        let id = restricted(&["openai/gpt-6-luna", "openrouter/anthropic/*", "route/cheap"]);
+        assert!(id.permits_model("openai", "gpt-6-luna", None));
+        assert!(!id.permits_model("openai", "gpt-6-sol", None));
+        // Case and spelling are exact.
+        assert!(!id.permits_model("openai", "GPT-6-luna", None));
+        assert!(id.permits_model("openrouter", "anthropic/claude-sonnet-5", None));
+        // The separator is part of the prefix: no lookalike provider or vendor.
+        assert!(!id.permits_model("openrouter", "anthropicx/model", None));
+        assert!(!id.permits_model("openrouter-b", "anthropic/model", None));
+        // A route is admitted by its own name, and naming a model never admits a route.
+        assert!(id.permits_model("openai", "gpt-6-sol", Some("cheap")));
+        assert!(!id.permits_model("openai", "gpt-6-sol", Some("dear")));
+        let by_model = restricted(&["openai/gpt-6-sol"]);
+        assert!(by_model.permits_model("openai", "gpt-6-sol", None));
+        // `route/*` admits routes and never a model.
+        let routes = restricted(&["route/*"]);
+        assert!(routes.permits_model("openai", "anything", Some("x")));
+        assert!(!routes.permits_model("openai", "anything", None));
+        // No list, no restriction.
+        let mut open = restricted(&[]);
+        open.allowed_models = None;
+        assert!(open.permits_model("anything", "goes", None));
+    }
+
+    #[test]
+    fn malformed_entries_are_named() {
+        for bad in [
+            "",
+            "gpt-6-luna",
+            "openai/a b",
+            "*",
+            "/x",
+            "openai/*/x",
+            "ope*nai/x",
+            "openai/\u{7}x",
+        ] {
+            assert!(model_entry_problem(bad).is_some(), "{bad:?}");
+        }
+        for good in [
+            "openai/gpt-6-luna",
+            "openai/*",
+            "openrouter/anthropic/*",
+            "route/cheap",
+            "route/*",
+        ] {
+            assert_eq!(model_entry_problem(good), None, "{good}");
+        }
     }
 }

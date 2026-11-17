@@ -1161,6 +1161,26 @@ fn build_request(
     // here and the dispatch that runs the job uses the same one.
     let snapshot = preselected.unwrap_or_else(|| state.router.current());
     let prepared_request = crate::proxy::convert::prepare_request(&snapshot, req)?;
+    let identity = &identified_caller.identity;
+    if identity.allowed_models.is_some() {
+        // The routing id of what the request addressed, once routes and aliases are
+        // resolved: what the key's list is matched against (note 0028).
+        let (provider_key, model) = snapshot.routing_id(&req.model).map_err(ApiError::from)?;
+        let route = req.model.strip_prefix("route/");
+        if !request_models_allowed(
+            identity,
+            &provider_key,
+            &model,
+            route,
+            &prepared_request.payload,
+        ) {
+            crate::gateway::metrics::incr(
+                crate::gateway::metrics::REJECTED,
+                &[("provider", &provider_key), ("reason", "model_not_allowed")],
+            );
+            return Err(model_not_allowed());
+        }
+    }
     let provider_name = prepared_request.target.provider_name.clone();
     let budget_model = prepared_request.target.model.clone();
     let permits = estimate_prepared_request_tokens(&prepared_request);
@@ -1171,6 +1191,46 @@ fn build_request(
         payload: prepared_request.payload,
     };
     Ok((provider_name, budget_model, gw, identified_caller, snapshot))
+}
+
+/// Whether a restricted key may send this request: its routing id (or the route it
+/// addressed) is listed, and so is every model of OpenRouter's own fallback list
+/// (`x-openrouter.models`) when the request carries one (note 0028).
+fn request_models_allowed(
+    identity: &crate::gateway::auth::Identity,
+    provider_key: &str,
+    model: &str,
+    route: Option<&str>,
+    payload: &Value,
+) -> bool {
+    let fallbacks_allowed = match payload.pointer("/x-openrouter/models") {
+        None => true,
+        Some(Value::Array(models)) => models.iter().all(|entry| {
+            entry
+                .as_str()
+                .is_some_and(|entry| identity.permits_model("openrouter", entry, None))
+        }),
+        Some(_) => false,
+    };
+    identity.permits_model(provider_key, model, route) && fallbacks_allowed
+}
+
+/// 403 for a model outside the key's `allowed_models` (note 0028). It names no
+/// model and lists nothing.
+fn model_not_allowed() -> ApiError {
+    ApiError::from(ShimError::ProviderError {
+        status: StatusCode::FORBIDDEN.as_u16(),
+        body: json!({
+            "error": {
+                "message": "model not allowed for this key",
+                "type": "permission_error",
+                "param": "model",
+                "code": "model_not_allowed"
+            }
+        })
+        .to_string(),
+        retry_after: None,
+    })
 }
 
 fn idempotency_conflict() -> ApiError {
@@ -1917,6 +1977,7 @@ mod native_tests {
                 budget_usd: None,
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
+                allowed_models: None,
             },
         )
     }
@@ -2006,6 +2067,7 @@ mod native_tests {
             budget_usd: None,
             budget_window_secs: None,
             budget_allow_unpriced: false,
+            allowed_models: None,
         };
         Arc::new(GatewayState {
             router: RouterHandle::from_arc(router),
@@ -2324,6 +2386,7 @@ mod native_tests {
             budget_usd: None,
             budget_window_secs: None,
             budget_allow_unpriced: false,
+            allowed_models: None,
         };
         Arc::new(GatewayState {
             router: RouterHandle::from_arc(router),
@@ -2587,6 +2650,7 @@ mod native_tests {
             budget_usd: Some(1.0),
             budget_window_secs: Some(window_secs),
             budget_allow_unpriced: false,
+            allowed_models: None,
         };
         let mut connection = gateway.connection_for_test().await.unwrap();
         let redis_time: (u64, u64) = redis::cmd("TIME")
@@ -2687,6 +2751,7 @@ mod native_tests {
             budget_usd: Some(1.0),
             budget_window_secs: Some(3_600),
             budget_allow_unpriced: true,
+            allowed_models: None,
         };
         let state = Arc::new(GatewayState {
             router: RouterHandle::from_arc(router),
@@ -2964,6 +3029,7 @@ mod native_tests {
             budget_usd: Some(limit_usd),
             budget_window_secs: Some(3600),
             budget_allow_unpriced: allow_unpriced,
+            allowed_models: None,
         }
     }
 
@@ -4295,6 +4361,7 @@ mod native_tests {
                 budget_usd: None,
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
+                allowed_models: None,
             };
             Arc::new(GatewayState {
                 router: RouterHandle::from_arc(router),
@@ -5140,6 +5207,7 @@ mod native_tests {
             budget_usd: None,
             budget_window_secs: None,
             budget_allow_unpriced: false,
+            allowed_models: None,
         };
         // Admitted against A...
         let mut scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
@@ -5286,6 +5354,7 @@ mod native_tests {
             budget_usd: None,
             budget_window_secs: None,
             budget_allow_unpriced: false,
+            allowed_models: None,
         };
         let admitted = Arc::new(Router::new());
         let mut scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
@@ -5537,5 +5606,40 @@ mod request_id_tests {
         assert!(minted.starts_with(&prefix), "{minted}");
         let (kept, _) = through(Some(b"has a space")).await;
         assert_eq!(kept, "has a space");
+    }
+
+    #[test]
+    fn a_restricted_key_must_list_every_model_of_openrouters_own_fallback_list() {
+        let key = crate::gateway::auth::Identity {
+            tenant: "t".into(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: None,
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+            allowed_models: Some(vec!["openrouter/anthropic/*".into()]),
+        };
+        let ask = |payload: Value| {
+            request_models_allowed(
+                &key,
+                "openrouter",
+                "anthropic/claude-haiku-5-5",
+                None,
+                &payload,
+            )
+        };
+        assert!(ask(json!({})));
+        assert!(ask(
+            json!({"x-openrouter": {"models": ["anthropic/claude-sonnet-5"]}})
+        ));
+        assert!(!ask(
+            json!({"x-openrouter": {"models": ["anthropic/a", "openai/gpt-6-sol"]}})
+        ));
+        // Anything that is not a list of strings is refused rather than guessed at.
+        assert!(!ask(
+            json!({"x-openrouter": {"models": "openai/gpt-6-sol"}})
+        ));
+        assert!(!ask(json!({"x-openrouter": {"models": [7]}})));
     }
 }

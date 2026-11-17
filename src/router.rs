@@ -451,6 +451,14 @@ impl Router {
         Ok((self.get(&key)?, model))
     }
 
+    /// The routing id a request addresses once routes and aliases are resolved:
+    /// `provider/model` in the router's canonical spelling (the id `GET /v1/models`
+    /// lists). What a per-key model allowlist is matched against (note 0028).
+    #[cfg(feature = "gateway")]
+    pub(crate) fn routing_id(&self, model: &str) -> Result<(String, String)> {
+        self.resolve_key(model)
+    }
+
     pub fn resolve_owned(&self, model: &str) -> Result<(std::sync::Arc<dyn Provider>, String)> {
         let (key, model) = self.resolve_key(model)?;
         let provider = self

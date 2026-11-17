@@ -271,6 +271,8 @@ fn to_keys(
             budget_usd: key.budget_usd,
             budget_window_secs: key.budget_window_secs,
             budget_allow_unpriced: key.budget_allow_unpriced,
+            // Not carried by the signed format yet (design note 0028, slice 3).
+            allowed_models: None,
         });
     }
     Ok((keys, inactive))
