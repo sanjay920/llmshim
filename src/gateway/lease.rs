@@ -699,7 +699,7 @@ mod tests {
         let Some(l) = ledger() else { return };
         assert_eq!(
             l.top_up(&tenant(), "a:draws", WINDOW, LIMIT, 0.1).await,
-            Err(LeaseError::Unavailable)
+            Err(LeaseError::Invalid)
         );
     }
 
