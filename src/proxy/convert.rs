@@ -6,8 +6,13 @@ use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionTarget {
+    /// The provider kind (pricing, estimation, replay).
     #[cfg(any(feature = "gateway", test))]
     pub provider_name: String,
+    /// The admission identity: the lane and limits the request is charged to (note 0032).
+    #[cfg(any(feature = "gateway", test))]
+    #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
+    pub instance: String,
     #[cfg(any(feature = "gateway", test))]
     pub model: String,
     pub policy: RequestAdmissionPolicy,
@@ -140,6 +145,8 @@ fn admission_target(provider: &dyn Provider, resolved_model: String) -> Admissio
     AdmissionTarget {
         #[cfg(any(feature = "gateway", test))]
         provider_name: provider.name().to_string(),
+        #[cfg(any(feature = "gateway", test))]
+        instance: provider.instance().to_string(),
         policy: provider.request_admission_policy(),
         #[cfg(any(feature = "gateway", test))]
         model: provider
@@ -300,6 +307,7 @@ mod admission_tests {
         for (provider_name, _wire, namespace, protected_fields) in cases {
             let target = AdmissionTarget {
                 provider_name: provider_name.into(),
+                instance: provider_name.into(),
                 model: "test".into(),
                 policy: RequestAdmissionPolicy::namespaced(namespace, protected_fields, &[], &[]),
             };
@@ -309,6 +317,7 @@ mod admission_tests {
 
         let xai_target = AdmissionTarget {
             provider_name: "xai".into(),
+            instance: "xai".into(),
             model: "grok-4.7".into(),
             policy: RequestAdmissionPolicy::default(),
         };

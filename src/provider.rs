@@ -63,6 +63,15 @@ impl ProviderRequest {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
 
+    /// The admission identity: which account and address a request is charged to (queue lane,
+    /// rate buckets, concurrency, circuit, usage record). Defaults to [`Self::name`], the kind;
+    /// `serve` sets it to the registered key of an entry, so two accounts of one hosted vendor
+    /// are admitted separately while pricing, replay and tool handling still read the kind
+    /// (design note 0032). It must equal the key the provider is registered under.
+    fn instance(&self) -> &str {
+        self.name()
+    }
+
     /// Whether this instance reaches the documented native endpoint for catalog defaults.
     /// Custom endpoints and adapters must not inherit another endpoint's omitted-control defaults.
     fn uses_documented_model_defaults(&self) -> bool {
@@ -97,7 +106,12 @@ pub trait Provider: Send + Sync {
         model: &str,
         request: &ProviderRequest,
     ) -> crate::reasoning::ReplayTarget {
-        self.replay_target(request.body["model"].as_str().unwrap_or(model))
+        let mut target = self.replay_target(request.body["model"].as_str().unwrap_or(model));
+        // The target a request is dispatched to carries the admission identity (note 0032).
+        if self.instance() != target.provider {
+            target.instance = Some(self.instance().to_owned());
+        }
+        target
     }
 
     /// Transform an OpenAI-format request into the provider's native format.

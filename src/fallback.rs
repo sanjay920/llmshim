@@ -133,11 +133,11 @@ async fn completion_with_fallback_inner(
                 continue;
             }
         };
-        if policy_limited_providers.contains(provider.name()) {
+        if policy_limited_providers.contains(provider.instance()) {
             errors.push(format!(
                 "{}: skipped provider {} after attempt policy refusal",
                 model_str,
-                provider.name()
+                provider.instance()
             ));
             continue;
         }
@@ -152,11 +152,11 @@ async fn completion_with_fallback_inner(
             // once per chain entry: the attempt that opens a circuit is usually
             // this loop's own, and continuing to retry past it is exactly the
             // "retrying into a known-dead target" the breaker exists to stop.
-            if !router.breaker().admit(provider.name()).await {
+            if !router.breaker().admit(provider.instance()).await {
                 errors.push(format!(
                     "{}: circuit open for provider {}",
                     model_str,
-                    provider.name()
+                    provider.instance()
                 ));
                 break; // move to next model
             }
@@ -174,7 +174,7 @@ async fn completion_with_fallback_inner(
                 Ok(result) => {
                     if let Some(logger) = logger {
                         logger.log(&LogEntry::from_response(
-                            provider.name(),
+                            provider.instance(),
                             model_str,
                             &result,
                             timer.elapsed(),
@@ -198,7 +198,7 @@ async fn completion_with_fallback_inner(
                     }
                     if let Some(logger) = logger {
                         logger.log(&LogEntry::from_error(
-                            provider.name(),
+                            provider.instance(),
                             model_str,
                             &error.to_string(),
                             timer.elapsed(),
@@ -210,7 +210,7 @@ async fn completion_with_fallback_inner(
                 Err(crate::client::DispatchFailure::Local(error)) => {
                     if let Some(logger) = logger {
                         logger.log(&LogEntry::from_error(
-                            provider.name(),
+                            provider.instance(),
                             model_str,
                             &error.to_string(),
                             timer.elapsed(),
@@ -222,7 +222,7 @@ async fn completion_with_fallback_inner(
                 Err(crate::client::DispatchFailure::LocalTimeout(error)) => {
                     if let Some(logger) = logger {
                         logger.log(&LogEntry::from_error(
-                            provider.name(),
+                            provider.instance(),
                             model_str,
                             &error.to_string(),
                             timer.elapsed(),
@@ -237,7 +237,7 @@ async fn completion_with_fallback_inner(
                 Err(crate::client::DispatchFailure::LogicalTimeout(error)) => {
                     if let Some(logger) = logger {
                         logger.log(&LogEntry::from_error(
-                            provider.name(),
+                            provider.instance(),
                             model_str,
                             &error.to_string(),
                             timer.elapsed(),
@@ -250,7 +250,7 @@ async fn completion_with_fallback_inner(
                 {
                     let error = refusal.into_shim_error();
                     errors.push(format!("{}: {}", model_str, error));
-                    policy_limited_providers.insert(provider.name().to_owned());
+                    policy_limited_providers.insert(provider.instance().to_owned());
                     provider_limit_error = Some(error);
                     attempted_distinct_provider_after_limit = false;
                     break;
@@ -259,7 +259,7 @@ async fn completion_with_fallback_inner(
                     let error = refusal.into_shim_error();
                     if let Some(logger) = logger {
                         logger.log(&LogEntry::from_error(
-                            provider.name(),
+                            provider.instance(),
                             model_str,
                             &error.to_string(),
                             timer.elapsed(),
@@ -271,7 +271,7 @@ async fn completion_with_fallback_inner(
                     let error = policy_error.into_shim_error();
                     if let Some(logger) = logger {
                         logger.log(&LogEntry::from_error(
-                            provider.name(),
+                            provider.instance(),
                             model_str,
                             &error.to_string(),
                             timer.elapsed(),

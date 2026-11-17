@@ -85,6 +85,10 @@ impl DispatchPolicyContext {
             id: uuid::Uuid::new_v4(),
             kind,
             provider_name: prepared_target.provider.clone(),
+            instance: prepared_target
+                .instance
+                .clone()
+                .unwrap_or_else(|| prepared_target.provider.clone()),
             resolved_model: resolved_model.to_owned(),
             native_model: prepared_target.model.clone(),
             pricing_model: prepared_target.pricing_model().to_owned(),
@@ -332,6 +336,7 @@ pub struct AttemptIdentity {
     id: uuid::Uuid,
     kind: AttemptKind,
     provider_name: String,
+    instance: String,
     resolved_model: String,
     native_model: String,
     pricing_model: String,
@@ -349,8 +354,15 @@ impl AttemptIdentity {
         self.kind
     }
 
+    /// The provider kind: what pricing, estimation and replay read.
     pub fn provider_name(&self) -> &str {
         &self.provider_name
+    }
+
+    /// The admission identity: the lane, rate bucket, concurrency, circuit and usage record the
+    /// attempt is charged to (equal to the kind unless the entry is a named instance, note 0032).
+    pub fn instance(&self) -> &str {
+        &self.instance
     }
 
     pub fn resolved_model(&self) -> &str {
@@ -386,6 +398,7 @@ impl std::fmt::Debug for AttemptIdentity {
             .field("id", &self.id)
             .field("kind", &self.kind)
             .field("provider_name", &self.provider_name)
+            .field("instance", &self.instance)
             .field("resolved_model", &self.resolved_model)
             .field("native_model", &self.native_model)
             .field("wire", &self.wire)

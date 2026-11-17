@@ -7,13 +7,21 @@ use serde_json::Value;
 
 pub struct Cerebras {
     inner: OpenAiCompatible,
+    instance: Option<String>,
 }
 
 impl Cerebras {
     pub fn new(api_key: String) -> Self {
         Self {
             inner: OpenAiCompatible::new("cerebras", "https://api.cerebras.ai/v1", Some(api_key)),
+            instance: None,
         }
+    }
+
+    /// A named instance of the kind (design note 0032).
+    pub fn with_instance(mut self, name: &str) -> Self {
+        self.instance = Some(name.to_owned());
+        self
     }
 
     pub fn with_base_url(mut self, base_url: String) -> Self {
@@ -25,6 +33,10 @@ impl Cerebras {
 impl Provider for Cerebras {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn instance(&self) -> &str {
+        self.instance.as_deref().unwrap_or(self.name())
     }
 
     fn request_admission_policy(&self) -> RequestAdmissionPolicy {

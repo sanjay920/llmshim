@@ -238,7 +238,7 @@ slice, stated now so slice 2's shape allows it:
   against the pick and a list naming the deployment, an idempotent retry that replays, a reload that removes
   a target, unknown names, path validation). Matching the allowlist against anything but the prepared
   payload fails the allowlist test.
-- Still the prerequisite named above: two accounts of one hosted vendor cannot be targets. Failover (slice
+- Two accounts of one hosted vendor are targets since 0032 (a named instance has its own admission identity). Failover (slice
   3) and the stats status (slice 4) are not built.
 
 ### Review changes (slice 2)

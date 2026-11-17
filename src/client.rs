@@ -431,7 +431,7 @@ impl ShimClient {
         outcome: std::result::Result<(), &ShimError>,
     ) {
         if let Some(breaker) = &self.breaker {
-            breaker.observe(provider.name(), outcome).await;
+            breaker.observe(provider.instance(), outcome).await;
         }
     }
 

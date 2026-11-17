@@ -93,9 +93,9 @@ one that also changes anything in the right-hand column is refused whole.
   limits first, so a lowered limit takes hold no later than the provider that needs
   it. The status reports the generation of each.
 - **State keyed by provider name survives.** The breaker (provider health), the
-  rate buckets and the lanes are keyed by the provider's name, which for a hosted
-  provider cannot change (its table must be named for its kind), so a changed
-  provider keeps them: a rotated key does not forget that the provider has been
+  rate buckets and the lanes are keyed by the entry's name (its admission identity,
+  0032), which cannot change without removing the entry and adding another, so a changed
+  provider keeps them (a renamed instance is a new one and starts fresh): a rotated key does not forget that the provider has been
   failing and does not refill its bucket. The new router shares the existing
   breaker and the existing client (and so the connection pool); only the provider
   objects and the routes are new. A renamed `openai-compatible` table is a removal

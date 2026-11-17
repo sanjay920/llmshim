@@ -810,7 +810,7 @@ fn build_router_with(
                 base_url.unwrap_or_default(),
                 key,
             )),
-            (kind, Some(key)) => hosted(kind, key, base_url),
+            (kind, Some(key)) => hosted(name, kind, key, base_url),
             // Rejected by validation; unreachable for a loaded configuration.
             (_, None) => continue,
         };
@@ -981,10 +981,16 @@ fn cloud_provider(
     }])
 }
 
-fn hosted(kind: ProviderKind, key: String, base_url: Option<String>) -> Box<dyn Provider> {
+fn hosted(
+    name: &str,
+    kind: ProviderKind,
+    key: String,
+    base_url: Option<String>,
+) -> Box<dyn Provider> {
     macro_rules! on_base {
         ($provider:expr) => {{
-            let provider = $provider;
+            // Each entry is a named instance of its kind: admitted by its own name (note 0032).
+            let provider = $provider.with_instance(name);
             match base_url {
                 Some(url) => Box::new(provider.with_base_url(url)) as Box<dyn Provider>,
                 None => Box::new(provider) as Box<dyn Provider>,

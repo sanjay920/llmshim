@@ -1209,7 +1209,9 @@ fn build_request(
             ],
         );
     }
-    let provider_name = prepared_request.target.provider_name.clone();
+    // The lane and the response's provider are the admission identity (note 0032); the kind
+    // stays on `target.provider_name` for what reads vendor behavior.
+    let provider_name = prepared_request.target.instance.clone();
     let budget_model = prepared_request.target.model.clone();
     let permits = estimate_prepared_request_tokens(&prepared_request);
     let gw = GatewayRequest {
