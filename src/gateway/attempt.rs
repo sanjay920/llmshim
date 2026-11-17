@@ -1275,7 +1275,7 @@ impl AttemptCoordinator {
         let mut quotes = Vec::new();
         for (_, policy) in scope.budget_levels() {
             let quote = if scope.operation == crate::policy::DispatchOperation::Embeddings {
-                crate::gateway::budget::quote_unbounded(Some(policy), attempt)
+                crate::gateway::budget::quote_embeddings(Some(policy), attempt)
             } else {
                 crate::gateway::budget::quote(Some(policy), attempt)
             }

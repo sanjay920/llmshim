@@ -62,26 +62,27 @@ pub(crate) fn quote(
     policy: Option<&BudgetPolicySnapshot>,
     attempt: &PreparedAttempt<'_>,
 ) -> Result<Option<BudgetQuote>, BudgetPlanError> {
-    quote_with(policy, attempt, true)
+    quote_with(policy, attempt, false)
 }
 
-/// [`quote`] for an operation that has no enforceable pre-send bound (embeddings, note 0035): the
-/// chat reservation assumes one request fits in one context window, which a batch does not, so
-/// it is never bounded, whatever the catalog holds. It is refused at every capped level, even
-/// one that allows unpriced attempts: an unbounded attempt holds the level's whole remaining
-/// allowance until a provider's own bill settles it, and an embeddings call carries none, so the
-/// first call would starve the key for the rest of its window.
-pub(crate) fn quote_unbounded(
+/// [`quote`] for an embeddings attempt (note 0035). The chat reservation assumes one request fits
+/// in one context window, which a batch does not, so embeddings have their own bound: the request
+/// body's size in bytes at the model's input price (see `embedding_reservation_nanos`). With no
+/// such bound the attempt is refused at every capped level, even one that allows unpriced attempts:
+/// an unbounded attempt holds the level's whole remaining allowance until a provider's own bill
+/// settles it, and an embeddings call carries none, so the first call would starve the key for the
+/// rest of its window.
+pub(crate) fn quote_embeddings(
     policy: Option<&BudgetPolicySnapshot>,
     attempt: &PreparedAttempt<'_>,
 ) -> Result<Option<BudgetQuote>, BudgetPlanError> {
-    quote_with(policy, attempt, false)
+    quote_with(policy, attempt, true)
 }
 
 fn quote_with(
     policy: Option<&BudgetPolicySnapshot>,
     attempt: &PreparedAttempt<'_>,
-    can_bound: bool,
+    embeddings: bool,
 ) -> Result<Option<BudgetQuote>, BudgetPlanError> {
     let Some(policy) = policy else {
         return Ok(None);
@@ -95,17 +96,58 @@ fn quote_with(
             bounded: true,
         }));
     }
-    let (amount_nanos, bounded) = match conservative_reservation_nanos(attempt)
-        .filter(|amount| can_bound && *amount <= MAX_EXACT_REDIS_NANOS)
-    {
-        Some(amount) => (amount, true),
-        None if policy.allow_unpriced && can_bound => (0, false),
-        None => return Err(BudgetPlanError::Unpriceable),
+    let reservation = if embeddings {
+        embedding_reservation_nanos(attempt)
+    } else {
+        conservative_reservation_nanos(attempt)
     };
+    let (amount_nanos, bounded) =
+        match reservation.filter(|amount| *amount <= MAX_EXACT_REDIS_NANOS) {
+            Some(amount) => (amount, true),
+            None if policy.allow_unpriced && !embeddings => (0, false),
+            None => return Err(BudgetPlanError::Unpriceable),
+        };
     Ok(Some(BudgetQuote {
         amount_nanos,
         bounded,
     }))
+}
+
+/// The most an embeddings attempt can cost, or `None` when that cannot be bounded.
+///
+/// A token covers at least one byte of the text it came from, and the request body holds every text
+/// (escaped, so never shorter), so the body's length in bytes plus a fixed margin for special tokens
+/// is an upper bound on the billed input tokens, however many texts the batch holds. It is priced at
+/// the model's input rate, which must come from a trusted source (local policy or a verified builtin
+/// row, never models.dev) and must not vary with context size. There is no output.
+fn embedding_reservation_nanos(attempt: &PreparedAttempt<'_>) -> Option<u64> {
+    const MARGIN_TOKENS: u128 = 64;
+    let identity = attempt.identity();
+    // Gemini's batchEmbedContents answer carries no token counts, so nothing would ever settle the
+    // reservation and each call would hold its bound until the window rolled: no bound, so refused.
+    if identity.wire() == WireFormat::GoogleGenerateContent {
+        return None;
+    }
+    let qualified = format!("{}/{}", identity.provider_name(), identity.pricing_model());
+    let model_info = crate::catalog::lookup_id(&qualified)?;
+    if model_info.context_cost_tiers.is_some() || !trusted_price_source(&model_info, "cost.input") {
+        return None;
+    }
+    let rate = model_info.cost.as_ref()?.input?;
+    if !rate.is_finite() || rate < 0.0 {
+        return None;
+    }
+    let rate_nanos_per_million = (rate * NANOS_PER_USD).ceil();
+    if !rate_nanos_per_million.is_finite() || rate_nanos_per_million > u64::MAX as f64 {
+        return None;
+    }
+    let body_bytes = serde_json::to_vec(attempt.native_body()).ok()?.len() as u128;
+    let tokens = body_bytes.checked_add(MARGIN_TOKENS)?;
+    let numerator = tokens.checked_mul(rate_nanos_per_million as u128)?;
+    let nanos = numerator
+        .checked_add(PER_MILLION - 1)?
+        .checked_div(PER_MILLION)?;
+    u64::try_from(nanos).ok()
 }
 
 pub(crate) fn observed_cost_nanos(usage: &Value) -> Option<u64> {

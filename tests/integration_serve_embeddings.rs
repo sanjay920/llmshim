@@ -295,3 +295,163 @@ async fn the_openai_wire_records_the_prompt_tokens_an_embeddings_body_reports() 
     assert_eq!(records[0]["input_tokens"], 7, "{records:?}");
     assert_eq!(records[0]["output_tokens"], 0, "{records:?}");
 }
+
+// ---- spend bound (note 0035, slice 2) --------------------------------------------------------
+
+/// A project catalog file that gives the embedding model a trusted (local) input price.
+fn priced_catalog(dir: &tempdir::Dir) -> String {
+    let path = dir.0.join("models.toml");
+    std::fs::write(
+        &path,
+        "[models.\"openai/text-embedding-3-small\".cost]\ninput = 0.02\n",
+    )
+    .unwrap();
+    path.display().to_string()
+}
+
+fn priced_env(catalog: &str) -> Vec<(String, String)> {
+    vec![
+        ("SERVE_E2E_ADMIN_TOKEN".into(), ADMIN_TOKEN.into()),
+        ("LLMSHIM_CATALOG_PROJECT".into(), catalog.into()),
+    ]
+}
+
+fn borrowed(env: &[(String, String)]) -> Vec<(&str, &str)> {
+    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capped_key_can_embed_when_the_model_has_a_trusted_price_and_each_call_settles() {
+    // The reservation is a few thousand nanodollars, the real cost of a call a hundred or so, and
+    // the cap fits one reservation but not two held at once: three calls in a row only succeed if
+    // each one settles and releases what it held.
+    let (up, mock) = upstream(3).await;
+    let dir = tempdir::Dir::new("emb-bound");
+    let log = dir.0.join("usage.jsonl");
+    let env = priced_env(&priced_catalog(&dir));
+    let server = start(
+        &openai_config(&up.url(), "budget_usd = 0.000004", &log),
+        "emb-bound",
+        &borrowed(&env),
+    );
+    for call in 0..3 {
+        let answer = embed(
+            &server.base,
+            Some(CALLER_KEY),
+            json!({"model": "openai/text-embedding-3-small", "input": ["first", "second"]}),
+        )
+        .await;
+        let status = answer.status();
+        assert_eq!(status, 200, "call {call}: {}", answer.text().await.unwrap());
+    }
+    mock.assert_async().await;
+    let records = records_of(&log, 3).await;
+    assert!(
+        records.iter().all(|r| r["cost_usd"].as_f64().is_some()),
+        "{records:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cap_below_the_reservation_refuses_before_the_provider() {
+    let (up, mock) = upstream(0).await;
+    let dir = tempdir::Dir::new("emb-bound-low");
+    let log = dir.0.join("usage.jsonl");
+    let env = priced_env(&priced_catalog(&dir));
+    // 100 nanodollars is far under the reservation of a request this size.
+    let server = start(
+        &openai_config(&up.url(), "budget_usd = 0.0000001", &log),
+        "emb-bound-low",
+        &borrowed(&env),
+    );
+    let answer = embed(
+        &server.base,
+        Some(CALLER_KEY),
+        json!({"model": "openai/text-embedding-3-small", "input": ["first", "second"]}),
+    )
+    .await;
+    assert_eq!(answer.status(), 429);
+    mock.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bigger_batch_reserves_more_so_the_bound_follows_the_batch_not_one_context_window() {
+    // The same cap that served a short batch refuses a long one: the reservation grows with the
+    // bytes sent, which is what makes it an upper bound for any batch.
+    let (up, mock) = upstream(1).await;
+    let dir = tempdir::Dir::new("emb-bound-batch");
+    let log = dir.0.join("usage.jsonl");
+    let env = priced_env(&priced_catalog(&dir));
+    let server = start(
+        &openai_config(&up.url(), "budget_usd = 0.000004", &log),
+        "emb-bound-batch",
+        &borrowed(&env),
+    );
+    let long = "x".repeat(200_000);
+    let refused = embed(
+        &server.base,
+        Some(CALLER_KEY),
+        json!({"model": "openai/text-embedding-3-small", "input": [long]}),
+    )
+    .await;
+    assert_eq!(refused.status(), 429);
+    let short = embed(
+        &server.base,
+        Some(CALLER_KEY),
+        json!({"model": "openai/text-embedding-3-small", "input": ["first", "second"]}),
+    )
+    .await;
+    assert_eq!(short.status(), 200);
+    mock.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_trusted_price_a_capped_key_is_still_refused() {
+    // The builtin row for this model carries no price of its own (models.dev's is not trusted for
+    // a bound), so there is nothing to bound with.
+    let (up, mock) = upstream(0).await;
+    let dir = tempdir::Dir::new("emb-bound-unpriced");
+    let log = dir.0.join("usage.jsonl");
+    let server = start(
+        &openai_config(&up.url(), "budget_usd = 5.0", &log),
+        "emb-bound-unpriced",
+        &env(),
+    );
+    let answer = embed(
+        &server.base,
+        Some(CALLER_KEY),
+        json!({"model": "openai/text-embedding-3-small", "input": ["first"]}),
+    )
+    .await;
+    assert_eq!(answer.status(), 400);
+    mock.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gemini_embeddings_report_no_tokens_so_a_capped_key_is_refused_even_with_a_local_price() {
+    // batchEmbedContents answers with vectors only: nothing would settle a reservation, and every
+    // call would hold its bound until the window rolled.
+    let (up, mock) = upstream(0).await;
+    let dir = tempdir::Dir::new("emb-gemini");
+    let log = dir.0.join("usage.jsonl");
+    let catalog = dir.0.join("models.toml");
+    std::fs::write(
+        &catalog,
+        "[models.\"gemini/gemini-embedding-001\".cost]\ninput = 0.15\n",
+    )
+    .unwrap();
+    let env = priced_env(&catalog.display().to_string());
+    let config = config(&up.url(), "budget_usd = 5.0", Some(&log)).replace(
+        "[providers.embed]\n        kind = \"openai-compatible\"",
+        "[providers.gemini]\n        kind = \"gemini\"",
+    );
+    let server = start(&config, "emb-gemini", &borrowed(&env));
+    let answer = embed(
+        &server.base,
+        Some(CALLER_KEY),
+        json!({"model": "gemini/gemini-embedding-001", "input": ["first"]}),
+    )
+    .await;
+    assert_eq!(answer.status(), 400, "{}", answer.text().await.unwrap());
+    mock.assert_async().await;
+}
