@@ -489,6 +489,12 @@ async fn the_stats_list_each_deployments_targets_and_a_tripped_circuit_shows_as_
     assert_eq!(after[0]["targets"][0]["circuit"], "open", "{after}");
     assert_eq!(after[0]["targets"][1]["circuit"], "closed", "{after}");
     // Nothing secret rides along: only the model, weight and circuit keys.
-    let keys: Vec<&String> = after[0]["targets"][0].as_object().unwrap().keys().collect();
-    assert_eq!(keys.len(), 3, "{keys:?}");
+    let mut keys: Vec<&str> = after[0]["targets"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["circuit", "model", "weight"]);
 }
