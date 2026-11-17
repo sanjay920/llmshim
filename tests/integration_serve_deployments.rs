@@ -498,3 +498,68 @@ async fn the_stats_list_each_deployments_targets_and_a_tripped_circuit_shows_as_
     keys.sort_unstable();
     assert_eq!(keys, ["circuit", "model", "weight"]);
 }
+
+// ---- spend counters (note 0034) --------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finished_attempts_feed_token_and_unknown_cost_counters_labelled_by_provider_only() {
+    // `east/m` is not a priced model, so its cost is unknown: counted as unknown, never as zero.
+    let (east, _east_mock) = upstream(1).await;
+    let (west, _west_mock) = upstream(0).await;
+    // The counters ride the usage recorder, which exists when a usage log (or telemetry) is set.
+    let dir = tempdir::Dir::new("dep-spend");
+    let log = dir.0.join("usage.jsonl");
+    let server = start(
+        &render(&east.url(), &west.url(), ORDERED, "", Some(&log)),
+        "dep-spend",
+        &no_client_retries(),
+    );
+    assert_eq!(
+        ask(&server.base, "deployment/chat", None).await.status(),
+        200
+    );
+    let admin = server.admin.clone().expect("an [admin] listener");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let text = loop {
+        let text = reqwest::Client::new()
+            .get(format!("{admin}/metrics"))
+            .bearer_auth(ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if text.contains("llmshim_gateway_cost_unknown_total")
+            || std::time::Instant::now() > deadline
+        {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        text.contains("llmshim_gateway_cost_unknown_total{provider=\"east\"} 1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("llmshim_gateway_tokens_total{kind=\"input\",provider=\"east\"} 3"),
+        "{text}"
+    );
+    assert!(
+        text.contains("llmshim_gateway_tokens_total{kind=\"output\",provider=\"east\"} 1"),
+        "{text}"
+    );
+    // Unknown is not free: no cost series was written for it.
+    assert!(
+        !text.contains("llmshim_gateway_cost_usd_nanos_total{"),
+        "{text}"
+    );
+    // Nothing per tenant, key or model rides on a spend series.
+    for line in text.lines().filter(|l| {
+        l.starts_with("llmshim_gateway_cost") || l.starts_with("llmshim_gateway_tokens")
+    }) {
+        for label in ["tenant", "key=", "model", "request"] {
+            assert!(!line.contains(label), "{line}");
+        }
+    }
+}
