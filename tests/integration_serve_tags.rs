@@ -188,8 +188,10 @@ async fn open_mode_has_no_key_and_so_null_tags() {
 fn bad_tags_are_refused_by_path() {
     use std::process::Command;
     for (tags, path) in [
-        (r#"{ Env = "x" }"#, "keys[0].tags.Env"),
-        (r#"{ "has-dash" = "x" }"#, "keys[0].tags.has-dash"),
+        (r#"{ Env = "x" }"#, "keys[0].tags[0]"),
+        (r#"{ "has-dash" = "x" }"#, "keys[0].tags[0]"),
+        // A name with a control character is never echoed into the output.
+        ("{ \"a\\u001b[31mb\" = \"x\" }", "keys[0].tags[0]"),
         (r#"{ env = "" }"#, "keys[0].tags.env"),
         (r#"{ env = " lead" }"#, "keys[0].tags.env"),
         (r#"{ env = "café" }"#, "keys[0].tags.env"),
@@ -215,6 +217,10 @@ fn bad_tags_are_refused_by_path() {
             + &String::from_utf8_lossy(&output.stdout);
         assert_eq!(output.status.code(), Some(1), "{tags}: {text}");
         assert!(text.contains(path), "{tags}: {text}");
+        assert!(
+            !text.contains('\u{1b}'),
+            "an invalid name is not echoed: {text:?}"
+        );
     }
     // Seventeen tags is one too many.
     let many: String = (0..17)

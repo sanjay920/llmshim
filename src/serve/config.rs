@@ -2324,12 +2324,25 @@ impl ServeConfig {
             if key.tags.len() > 16 {
                 issues.push(Issue::new(format!("{at}.tags"), "has more than 16 tags"));
             }
-            for (name, value) in &key.tags {
+            for (n, (name, value)) in key.tags.iter().enumerate() {
+                // An invalid name is not echoed into the path (it may be long or hold
+                // control characters): it is named by its position.
+                let valid = tag_name_problem(name).is_none();
+                let label = if valid {
+                    name.clone()
+                } else {
+                    format!("[{n}]")
+                };
+                let path = if valid {
+                    format!("{at}.tags.{label}")
+                } else {
+                    format!("{at}.tags{label}")
+                };
                 if let Some(problem) = tag_name_problem(name) {
-                    issues.push(Issue::new(format!("{at}.tags.{name}"), problem));
+                    issues.push(Issue::new(path.clone(), problem));
                 }
                 if let Some(problem) = tag_value_problem(value) {
-                    issues.push(Issue::new(format!("{at}.tags.{name}"), problem));
+                    issues.push(Issue::new(path, problem));
                 }
             }
             if let Some(models) = &key.allowed_models {
