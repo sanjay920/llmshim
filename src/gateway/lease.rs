@@ -21,9 +21,11 @@ use crate::redis_operation::RedisConnectionManagerCache;
 const MAX_EXACT: u64 = crate::gateway::budget::MAX_EXACT_REDIS_NANOS;
 
 /// Top a lease up (or down) to `fraction` of what the tenant has left.
-/// KEYS[1] counter prefix, KEYS[2] lease prefix; ARGV: replica, fraction, limit,
-/// window_secs, retention_secs, max_exact.
-/// Returns {held, window_index, window_end_ms} or {-2} when the lease is closing.
+/// KEYS[1] counter prefix, KEYS[2] lease prefix, KEYS[3] accounting index, KEYS[4] its
+/// freeze marker; ARGV: replica, fraction, limit, window_secs, retention_secs,
+/// max_exact, max_retained_attempts.
+/// Returns {held, window_index, window_end_ms}, {-2} when the lease is closing, or
+/// {-3} when the fleet's own admission is refusing (index frozen or full).
 const TOP_UP_LUA: &str = r#"
     local t = redis.call('TIME')
     local now = t[1] * 1000 + math.floor(t[2] / 1000)
@@ -40,18 +42,27 @@ const TOP_UP_LUA: &str = r#"
     if redis.call('HGET', lease_key, 'state') == 'closing' then
         return {-2}
     end
+    if redis.call('EXISTS', KEYS[4]) == 1 or
+            redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[7]) then
+        return {-3}
+    end
     local own = tonumber(redis.call('HGET', lease_key, 'held')) or 0
     if redis.call('EXISTS', total_key .. ':frozen') == 1 then
         return {own, window_index, window_end}
     end
     local total = tonumber(redis.call('GET', total_key)) or 0
-    local avail = math.max(0, limit - total + own)
+    -- Spend by older binaries not yet applied to the counter counts as spent,
+    -- as the fleet's own admission counts it.
+    local known = tonumber(redis.call('GET', total_key .. ':legacy-known-floor')) or 0
+    local applied = tonumber(redis.call('GET', total_key .. ':legacy-floor')) or 0
+    local legacy_delta = math.max(0, known - applied)
+    local avail = math.max(0, limit - total - legacy_delta + own)
     local target = math.min(avail, math.floor(avail * fraction))
     if target ~= own then
         total = total + (target - own)
         if total < 0 then total = 0 end
         if total > max_exact then return {own, window_index, window_end} end
-        redis.call('SET', total_key, total, 'PX', ttl)
+        redis.call('SET', total_key, total, 'PX', math.max(ttl, redis.call('PTTL', total_key)))
         redis.call('HSET', lease_key, 'held', target, 'state', 'open',
             'window_end', window_end)
         redis.call('PEXPIRE', lease_key, ttl)
@@ -79,11 +90,13 @@ const DRAW_LUA: &str = r#"
         if total > max_exact - excess then
             total = max_exact
             redis.call('SET', KEYS[3] .. ':frozen', 1,
-                'PX', math.max(1, redis.call('PTTL', KEYS[3])))
+                'PX', math.max(1, redis.call('PTTL', KEYS[1])))
         else
             total = total + excess
         end
-        redis.call('SET', KEYS[3], total, 'KEEPTTL')
+        local counter_ttl = redis.call('PTTL', KEYS[3])
+        if counter_ttl < 0 then counter_ttl = math.max(1, redis.call('PTTL', KEYS[1])) end
+        redis.call('SET', KEYS[3], total, 'PX', counter_ttl)
     end
     redis.call('HSET', KEYS[1], 'held', held, 'state', 'closing')
     redis.call('HSET', KEYS[2], ARGV[1], amount)
@@ -96,8 +109,10 @@ const DRAW_LUA: &str = r#"
 const RELEASE_LUA: &str = r#"
     if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
     local held = tonumber(redis.call('HGET', KEYS[1], 'held')) or 0
-    local total = tonumber(redis.call('GET', KEYS[2])) or 0
-    redis.call('SET', KEYS[2], math.max(0, total - held), 'KEEPTTL')
+    if redis.call('EXISTS', KEYS[2]) == 1 then
+        local total = tonumber(redis.call('GET', KEYS[2])) or 0
+        redis.call('SET', KEYS[2], math.max(0, total - held), 'KEEPTTL')
+    end
     redis.call('DEL', KEYS[1])
     return held
 "#;
@@ -117,6 +132,8 @@ pub(crate) enum LeaseError {
     Unavailable,
     /// The lease is being drawn down for recovery; it takes no top-ups.
     Closing,
+    /// The fleet's own admission is refusing (accounting index full or frozen).
+    Refused,
     /// No such lease (never taken, or already released).
     Missing,
 }
@@ -136,16 +153,28 @@ pub(crate) struct LeaseLedger {
     draw: redis::Script,
     release: redis::Script,
     retention_secs: u64,
+    accounting_index_key: String,
+    max_retained_attempts: usize,
 }
 
 impl LeaseLedger {
-    pub(crate) fn new(url: &str, retention_secs: u64) -> redis::RedisResult<Self> {
+    /// `retention_secs`, `accounting_index_key` and `max_retained_attempts` must be
+    /// the fleet attempt coordinator's own, so a lease is refused whenever the
+    /// fleet's admission would be.
+    pub(crate) fn new(
+        url: &str,
+        retention_secs: u64,
+        accounting_index_key: String,
+        max_retained_attempts: usize,
+    ) -> redis::RedisResult<Self> {
         Ok(Self {
             connections: RedisConnectionManagerCache::new(redis::Client::open(url)?),
             top_up: redis::Script::new(TOP_UP_LUA),
             draw: redis::Script::new(DRAW_LUA),
             release: redis::Script::new(RELEASE_LUA),
             retention_secs,
+            accounting_index_key,
+            max_retained_attempts,
         })
     }
 
@@ -175,7 +204,7 @@ impl LeaseLedger {
         limit_nanos: u64,
         fraction: f64,
     ) -> Result<Lease, LeaseError> {
-        if !(fraction > 0.0 && fraction <= 1.0) || window_secs == 0 {
+        if !(fraction > 0.0 && fraction <= 1.0) || window_secs == 0 || replica.contains(':') {
             return Err(LeaseError::Unavailable);
         }
         let reply: Vec<i64> = self
@@ -184,12 +213,15 @@ impl LeaseLedger {
                 self.top_up
                     .key(Self::counter_prefix(tenant_key, window_secs))
                     .key(Self::lease_prefix(tenant_key, window_secs))
+                    .key(&self.accounting_index_key)
+                    .key(format!("{}:frozen", self.accounting_index_key))
                     .arg(replica)
                     .arg(fraction)
                     .arg(limit_nanos)
                     .arg(window_secs)
                     .arg(self.retention_secs)
                     .arg(MAX_EXACT)
+                    .arg(self.max_retained_attempts)
                     .invoke_async(&mut connection)
                     .await
             })
@@ -197,6 +229,7 @@ impl LeaseLedger {
             .map_err(|_| LeaseError::Unavailable)?;
         match reply.as_slice() {
             [-2] => Err(LeaseError::Closing),
+            [-3] => Err(LeaseError::Refused),
             [held, index, end] if *held >= 0 && *index >= 0 && *end >= 0 => Ok(Lease {
                 held_nanos: *held as u64,
                 window_index: *index as u64,
@@ -218,6 +251,9 @@ impl LeaseLedger {
         attempt_id: uuid::Uuid,
         amount_nanos: u64,
     ) -> Result<Draw, LeaseError> {
+        if replica.contains(':') {
+            return Err(LeaseError::Unavailable);
+        }
         let lease_key = Self::lease_key(tenant_key, window_secs, window_index, replica);
         let draws_key = format!("{lease_key}:draws");
         let counter_key = format!(
@@ -309,7 +345,15 @@ mod tests {
 
     fn ledger() -> Option<LeaseLedger> {
         let url = std::env::var("LLMSHIM_REDIS_URL").ok()?;
-        Some(LeaseLedger::new(&url, 60).unwrap())
+        Some(
+            LeaseLedger::new(
+                &url,
+                60,
+                format!("llmshim:gw:test-index:{}", uuid::Uuid::new_v4().simple()),
+                1000,
+            )
+            .unwrap(),
+        )
     }
 
     fn tenant() -> String {
@@ -443,5 +487,96 @@ mod tests {
         let other = l.top_up(&t, "live", WINDOW, LIMIT, 0.1).await.unwrap();
         assert_eq!(other.held_nanos, 90_000_000);
         assert_eq!(l.counter(&t, WINDOW, lease.window_index).await, 190_000_000);
+    }
+
+    async fn raw(l: &LeaseLedger) -> redis::aio::ConnectionManager {
+        l.connections.connection_for_test().await.unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn unapplied_legacy_spend_is_not_leased() {
+        let Some(l) = ledger() else { return };
+        let t = tenant();
+        let first = l.top_up(&t, "a", WINDOW, LIMIT, 0.5).await.unwrap();
+        let key = format!(
+            "{}{}:legacy-known-floor",
+            LeaseLedger::counter_prefix(&t, WINDOW),
+            first.window_index
+        );
+        let mut c = raw(&l).await;
+        let _: () = redis::cmd("SET")
+            .arg(key)
+            .arg(800_000_000_u64)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        // 500M held and 800M unapplied leave 200M of headroom (own share included),
+        // so half of it is 100M, not half of 500M.
+        let again = l.top_up(&t, "a", WINDOW, LIMIT, 0.5).await.unwrap();
+        assert_eq!(again.held_nanos, 100_000_000);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn no_lease_while_the_fleet_accounting_is_refusing() {
+        let Some(l) = ledger() else { return };
+        let t = tenant();
+        let mut c = raw(&l).await;
+        let _: () = redis::cmd("SET")
+            .arg(format!("{}:frozen", l.accounting_index_key))
+            .arg(1)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            l.top_up(&t, "a", WINDOW, LIMIT, 0.1).await,
+            Err(LeaseError::Refused)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn a_lost_counter_is_not_recreated_without_expiry() {
+        let Some(l) = ledger() else { return };
+        let t = tenant();
+        let lease = l.top_up(&t, "a", WINDOW, LIMIT, 0.1).await.unwrap();
+        let counter = format!(
+            "{}{}",
+            LeaseLedger::counter_prefix(&t, WINDOW),
+            lease.window_index
+        );
+        let mut c = raw(&l).await;
+        let _: () = redis::cmd("DEL")
+            .arg(&counter)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        l.draw(
+            &t,
+            "a",
+            WINDOW,
+            lease.window_index,
+            uuid::Uuid::new_v4(),
+            150_000_000,
+        )
+        .await
+        .unwrap();
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(&counter)
+            .query_async(&mut c)
+            .await
+            .unwrap();
+        assert!(ttl > 0, "{ttl}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn a_replica_id_cannot_collide_with_the_draws_key() {
+        let Some(l) = ledger() else { return };
+        assert_eq!(
+            l.top_up(&tenant(), "a:draws", WINDOW, LIMIT, 0.1).await,
+            Err(LeaseError::Unavailable)
+        );
     }
 }
