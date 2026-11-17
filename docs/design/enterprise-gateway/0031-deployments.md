@@ -278,8 +278,7 @@ slice, stated now so slice 2's shape allows it:
   and the last failure returned; the allowlist case; a concrete target is never moved. A unit test pins the
   classification; treating a 400 as retryable fails the process test. (A provider 429 never reaches the
   classifier as a status: the dispatch maps it to a rate-limit marker first, so it is not retried by construction.)
-- **Not built:** failover for streaming requests (a failure before the first byte could be retried the same way;
-  the stream handler's structure needs its own change). The stats view is slice 4 below; 0014 has the failover rows.
+- **Not built here:** failover for streaming requests (built later, see "Streaming failover"). The stats view is slice 4 below; 0014 has the failover rows.
 
 ### Review changes (slice 3)
 
@@ -306,3 +305,27 @@ deployments: each entry is `{name, strategy, targets: [{model, weight, circuit}]
 (the provider instance, 0032); a fleet's shared health is not consulted, so replicas can differ. It carries no
 key, URL, tenant or credential, only the file's own model strings. Process test: three 502s from the first
 target show it `open`; pinning `state_name` to `closed` fails it.
+
+### Streaming failover
+
+A request with `stream: true` (the chat stream, `/v1/chat/completions`, `/v1/messages` and the Responses
+wire all reach one handler) is retried on the next target by the same rule as a unary one: the
+failure is the provider's (a 5xx or a transport failure), it happens **while the stream is being
+opened**, before any byte has gone to the caller, and fewer than `min(targets, 3)` targets have been tried.
+`failover_target` is the one function both handlers ask, so the two cannot disagree. A stream whose
+first byte has been sent is never retried: the caller has the start of an answer, and a second target's
+would be a different one. Each retry is a new submission to the next target's lane with its own
+admission, spend and usage record; the failover metric is counted when the retry has been prepared;
+a retry the key's list does not allow returns the original failure. Streams carry no idempotency key, so
+nothing about replay changes.
+
+**Limits.** Only the local scheduler fails a stream over. With `[fleet]` (the distributed backend) an
+upstream open failure reaches the caller as an error item on the stream, after admission has returned, so
+the handler never sees it as an open failure and does not retry: **streaming failover is not built for a
+fleet**, and a unary request is. For the same reason an error that arrives as the first item of an
+opened stream (a managed stream that fails while buffering, say) is not retried. Both are "not built", not
+refused: a fleet worker would have to report the open outcome before returning the receiver.
+
+Tests: `integration_serve_deployments::a_stream_that_fails_to_open_is_retried_on_the_next_target` (the
+caller gets the second target's stream and the failover series counts it; making the stream handler
+refuse every retry fails it) and `::a_stream_is_not_retried_for_a_400_or_when_addressed_to_a_target`.
