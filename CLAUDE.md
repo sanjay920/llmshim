@@ -801,7 +801,9 @@ secrets are fingerprinted by digest, so only `{ file }` references rotate (the s
 root workspace so SQLite's C library never enters the root graph; `control-check.yml` proves it) holds
 orgs, teams, projects, the key lifecycle, the change history and signed snapshots, with an axum API
 (`openapi.yaml`, compared with its route table by a test) and the `llmshim-control serve` binary. A key's
-secret is generated there, shown once, and only its SHA-256 is stored. The data plane takes its keys from
+secret is generated there, shown once, and only its SHA-256 is stored. SQLite or Postgres
+(`--database-url-file`, one store behind `db.rs`; the suite runs on both, Postgres via
+`LLMSHIM_CONTROL_TEST_POSTGRES_URL`). The data plane takes its keys from
 a snapshot with `[control_plane]` (`src/serve/snapshot.rs`; a file, or `source` pulled by
 `snapshot_pull.rs`; it needs `state.policy_dir`): Ed25519, a monotonic generation recorded in `state.policy_dir` (and in memory), the
 organization bound, `expires_at` enforced at request time, a stale age with optional

@@ -1,3 +1,5 @@
+mod common;
+
 use llmshim_control::{Credential, Error, LimitsUpdate, NewKey, Store};
 use serde_json::json;
 use std::path::PathBuf;
@@ -21,7 +23,7 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let mut store = Store::open_in_memory().unwrap();
+    let mut store = common::store();
     let org = store.create_org("Acme", ACTOR).unwrap();
     let team = store.create_team(&org.id, "Platform", ACTOR).unwrap();
     let project = store.create_project(&team.id, "Checkout", ACTOR).unwrap();
@@ -44,11 +46,63 @@ fn control_plane(
     .unwrap()
 }
 
+/// Two handles on one database: SQLite files, or two connections to one Postgres schema.
+fn two_handles(label: &str) -> (Store, Store, PathBuf, Option<(String, String)>) {
+    let directory = dir(label);
+    match common::postgres_url() {
+        Some(url) => {
+            let schema = common::fresh_schema();
+            let first = Store::open_postgres(&url, Some(&schema)).unwrap();
+            let second = Store::open_postgres(&url, Some(&schema)).unwrap();
+            (first, second, directory, Some((url, schema)))
+        }
+        None => {
+            let database = directory.join("control.db");
+            let first = Store::open(&database).unwrap();
+            let second = Store::open(&database).unwrap();
+            (first, second, directory, None)
+        }
+    }
+}
+
+/// Everything the database holds, as text, to look for a secret in.
+fn everything_stored(
+    directory: &std::path::Path,
+    postgres: &Option<(String, String)>,
+) -> Vec<Vec<u8>> {
+    match postgres {
+        None => std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect(),
+        Some((url, schema)) => {
+            let mut client = postgres::Client::connect(url, postgres::NoTls)
+                .or_else(|_| {
+                    postgres::Client::connect(&format!("{url}?sslmode=disable"), postgres::NoTls)
+                })
+                .expect("a plain connection for the check");
+            client
+                .batch_execute(&format!("SET search_path TO {schema}"))
+                .unwrap();
+            ["orgs", "teams", "projects", "keys", "history", "snapshots"]
+                .iter()
+                .map(|table| {
+                    let rows = client
+                        .query(&format!("SELECT x::text FROM {table} x"), &[])
+                        .unwrap();
+                    rows.iter()
+                        .map(|r| r.get::<_, String>(0))
+                        .collect::<String>()
+                        .into_bytes()
+                })
+                .collect()
+        }
+    }
+}
+
 #[test]
 fn a_secret_is_shown_once_and_only_its_hash_is_stored() {
-    let directory = dir("hash");
-    let database = directory.join("control.db");
-    let mut store = Store::open(&database).unwrap();
+    let (mut store, _second, directory, postgres) = two_handles("hash");
     let org = store.create_org("Acme", ACTOR).unwrap();
     let team = store.create_team(&org.id, "Platform", ACTOR).unwrap();
     let project = store.create_project(&team.id, "Checkout", ACTOR).unwrap();
@@ -60,10 +114,12 @@ fn a_secret_is_shown_once_and_only_its_hash_is_stored() {
         .expect("a secret key returns its secret once");
     assert!(secret.len() >= 22, "the data plane refuses a shorter token");
     assert_eq!(created.record.state, "active");
+    let (seed, _) = llmshim::serve::snapshot::keygen().unwrap();
+    store.publish_snapshot(&org.id, &seed, ACTOR).unwrap();
     drop(store);
-    // Every byte of the database file (and its write-ahead log) is free of the secret.
-    for entry in std::fs::read_dir(&directory).unwrap() {
-        let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+    // Every byte the database holds (a SQLite file and its log, or every Postgres table) is
+    // free of the secret.
+    for bytes in everything_stored(&directory, &postgres) {
         assert!(
             !bytes
                 .windows(secret.len())
@@ -71,9 +127,9 @@ fn a_secret_is_shown_once_and_only_its_hash_is_stored() {
             "the secret is in the database"
         );
     }
-    // Reopening keeps the data (and the schema version is accepted).
-    let store = Store::open(&database).unwrap();
-    assert_eq!(store.keys(&org.id).unwrap().len(), 1);
+    // A second handle sees the data (and the schema version is accepted).
+    let mut again = _second;
+    assert_eq!(again.keys(&org.id).unwrap().len(), 1);
 }
 
 #[test]
@@ -377,16 +433,13 @@ fn debug_output_never_shows_a_secret() {
 
 #[test]
 fn two_processes_on_one_database_cannot_take_the_same_generation_or_double_revoke() {
-    let directory = dir("two-writers");
-    let database = directory.join("control.db");
-    let mut first = Store::open(&database).unwrap();
+    let (mut first, mut second, _directory, _) = two_handles("two-writers");
     let org = first.create_org("Acme", ACTOR).unwrap();
     let team = first.create_team(&org.id, "Platform", ACTOR).unwrap();
     let project = first.create_project(&team.id, "Checkout", ACTOR).unwrap();
     let key = first
         .create_key(NewKey::secret(&project.id, "ci"), ACTOR)
         .unwrap();
-    let mut second = Store::open(&database).unwrap();
     let (seed, _) = llmshim::serve::snapshot::keygen().unwrap();
 
     // The second reads what the first committed: generation 2, and it lists the revocation.
@@ -505,4 +558,33 @@ fn too_many_networks_are_refused() {
         f.store.create_key(new, ACTOR),
         Err(Error::Invalid(_))
     ));
+}
+
+#[test]
+fn concurrent_publishers_each_get_their_own_generation() {
+    let (mut first, mut second, _directory, _) = two_handles("concurrent");
+    let org = first.create_org("Acme", ACTOR).unwrap();
+    let team = first.create_team(&org.id, "Platform", ACTOR).unwrap();
+    let project = first.create_project(&team.id, "Checkout", ACTOR).unwrap();
+    first
+        .create_key(NewKey::secret(&project.id, "ci"), ACTOR)
+        .unwrap();
+    let (seed, _) = llmshim::serve::snapshot::keygen().unwrap();
+    let publish = |store: &mut Store, org: &str, seed: &str| {
+        (0..8)
+            .map(|_| store.publish_snapshot(org, seed, ACTOR).unwrap().generation)
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| publish(&mut first, &org.id, &seed));
+        let b = scope.spawn(|| publish(&mut second, &org.id, &seed));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    let mut all: Vec<u64> = a.into_iter().chain(b).collect();
+    all.sort_unstable();
+    assert_eq!(
+        all,
+        (1..=16).collect::<Vec<_>>(),
+        "no generation was taken twice or skipped"
+    );
 }

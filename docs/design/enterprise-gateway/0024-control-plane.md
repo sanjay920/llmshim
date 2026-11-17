@@ -352,6 +352,31 @@ with the bearer token and `If-None-Match: "<generation>"`.
 - A reload that refuses a snapshot just cached (another change in the same file) is logged and shown in
   `last_pull_error`, not swallowed.
 
+## Slice 4 as built (Postgres)
+
+One store, two backends (`crates/llmshim-control/src/db.rs`): SQLite (one node) and Postgres (the
+`postgres` crate, synchronous; TLS with rustls and the web PKI roots, the host verified, unless the URL says
+`sslmode=disable`). The control plane's SQL is written once, with numbered `?N` placeholders (rewritten to
+`$N` for Postgres), behind a small transaction interface; the schema is generated per dialect.
+
+- **Writers are serialized the same way in both**: SQLite `BEGIN IMMEDIATE`, Postgres a transaction-level
+  advisory lock; so every state check is made where the write is, as in 3a. A concurrent-publishers test
+  (two handles, 16 publishes, generations exactly 1 to 16) fails if the lock is removed.
+- **Creation order is a `seq` column** assigned inside the write transaction (not a row id or a timestamp), so
+  lists and a snapshot's bytes are the same on both.
+- **`llmshim-control serve --database-url-file F [--database-schema S]`**: the URL holds the password, so it is
+  read from an owner-only file (never argv), and **no error ever carries it** (tested). `--db` and
+  `--database-url-file` are exclusive. A schema name keeps several control planes (or a test) in one database.
+- The synchronous Postgres client drives its own runtime, which a thread inside another runtime may not do, so
+  each transaction runs on a scoped thread of its own and the client is dropped on one too; the cost is a thread
+  per control-plane call, which is irrelevant at this call rate.
+- **The whole suite runs on both backends** (a test helper picks the store from
+  `LLMSHIM_CONTROL_TEST_POSTGRES_URL`; `control-check.yml` has a Postgres service and runs it twice), including
+  "the secret is in no table" (every Postgres table dumped as text and searched) and the real server on Postgres
+  with a restart.
+- Migrations: schema version 1 is recorded (`PRAGMA user_version`, or `schema_meta` in Postgres); a database of
+  another version is refused. Moving data between SQLite and Postgres is not provided.
+
 ## Slices
 
 1. This note.
@@ -365,5 +390,5 @@ with the bearer token and `If-None-Match: "<generation>"`.
    revocation and expiry effect on the next request, a removed signer.
 3. The `llmshim-control` crate: **3a done** (SQLite store, the model above, key lifecycle, snapshot
    publication as a library); 3b done (the HTTP API of 0026, its OpenAPI document and the `llmshim-control` binary).
-4. Postgres.
+4. **Done:** Postgres (above).
 5. **Done:** the pull delivery and the data plane's poller (above).

@@ -1,6 +1,6 @@
 name: Control plane
 
-# `llmshim-control` (design note 0024) is a separate, unpublished crate with its own
+# `llmshim-control` (design notes 0024, 0026) is a separate, unpublished crate with its own
 # workspace and lockfile, so the database and its C library never enter the root crate's
 # dependency graph. This keeps it formatted, warning-free and tested on each pull request,
 # on main and weekly, and proves the root lockfile stays free of it.
@@ -23,6 +23,18 @@ jobs:
   control-check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,8 +42,8 @@ jobs:
           components: clippy, rustfmt
       - name: The root lockfile has no database in it
         run: |
-          if grep -q 'name = "rusqlite"' Cargo.lock; then
-            echo "rusqlite is in the root Cargo.lock: the control plane's dependencies leaked into the root crate" >&2
+          if grep -qE 'name = "(rusqlite|postgres|tokio-postgres)"' Cargo.lock; then
+            echo "a database driver is in the root Cargo.lock: the control plane's dependencies leaked into the root crate" >&2
             exit 1
           fi
       - name: Format
@@ -40,8 +52,16 @@ jobs:
       - name: Clippy
         working-directory: crates/llmshim-control
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Tests
+      - name: Tests on SQLite
         working-directory: crates/llmshim-control
         env:
           LLMSHIM_CATALOG_OFFLINE: '1'
+        run: cargo test --locked
+      - name: The same tests on Postgres
+        # Every test builds its own schema in this database (`t_<uuid>`), so the suites do not
+        # share rows; the process test starts the real server on it.
+        working-directory: crates/llmshim-control
+        env:
+          LLMSHIM_CATALOG_OFFLINE: '1'
+          LLMSHIM_CONTROL_TEST_POSTGRES_URL: postgres://postgres:pw@127.0.0.1:5432/postgres?sslmode=disable
         run: cargo test --locked
