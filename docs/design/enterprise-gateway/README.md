@@ -127,9 +127,10 @@ Later phases (each needs its own design note before work starts)
       or pulled from the control plane), the `llmshim-control` server and its
       OpenAPI document. A separate, unpublished crate with its own lockfile
 - [x] Control plane on Postgres (0024 slice 4): one store, two backends; the whole suite runs on both
-- [ ] Bounded admission during a Redis outage (a local spend allowance): designed in
-      0027 (a second admission path with a pre-reserved spend lease; the bound is on
-      admitted reservations, not spend); not built
+- [x] Bounded admission during a Redis outage (a local spend allowance), opt-in
+      `[fleet.outage_admission]` (0027): a replica-owned spend lease taken while Redis is
+      healthy, a second admission path against it, resumable settlement on recovery; the
+      bound is on admitted reservations, not spend
 - [ ] Hierarchical budgets, model allowlists, tags, alerts, cost exports
 - [ ] Deployments and load balancing across credentials and regions
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)

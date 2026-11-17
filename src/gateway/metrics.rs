@@ -30,6 +30,13 @@ pub const UPSTREAM_LATENCY: &str = "llmshim_gateway_upstream_latency_ms";
 /// Current queue depth (gauge, label: provider) — set at scrape time.
 pub const QUEUE_DEPTH: &str = "llmshim_gateway_queue_depth";
 
+/// 1 while this replica admits requests from a lease because Redis is
+/// unreachable (gauge) — set at scrape time. Only with `[fleet.outage_admission]`.
+pub const OUTAGE_ADMISSION_ACTIVE: &str = "llmshim_gateway_outage_admission_active";
+/// Nanos of the replica's lease: unspent at the start of an outage, held while
+/// healthy (gauge) — set at scrape time, summed over tenants.
+pub const OUTAGE_LEASE_NANOS: &str = "llmshim_gateway_outage_lease_nanos";
+
 /// Upper bounds (ms) for latency histograms — the Prometheus `le` buckets.
 const BUCKETS_MS: &[f64] = &[
     1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0,

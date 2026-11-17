@@ -782,6 +782,21 @@ pins that a build without the feature does not know the command. Never drive
 `process::exit` below `main` on this path. The `Serve feature` CI job builds and
 tests it on every PR; the release gate does not.
 
+## Bounded admission during a Redis outage (note 0027)
+
+Opt-in `[fleet.outage_admission]` (needs `[fleet]`, `serve-redis`). While Redis is healthy each
+replica holds a **lease**: a target share of a tenant's remaining budget window, reserved in the
+shared counter (`gateway/lease.rs`, three Lua scripts: top up to a target, idempotent per-attempt
+draw, release with a tombstone). `OutageManager` (`gateway/outage.rs`) renews leases, trips to
+outage state after three failed probes, and on recovery (only after `recover_after_secs` of steady
+health) drains running requests, draws what the local ledger spent and releases the rest, then
+resumes with a new lease epoch. In outage state a budgeted, priceable request is re-scoped
+(`TrustedPolicyScope::outage_view`: a local ledger key per lease and epoch, budget = lease, a
+window that never rolls, rpm/tpm cut to `rate_fraction`) and run on a second scheduler and
+in-memory attempt coordinator; the bound is on admitted **reservations**, not spend. `/ready`
+stays 200 while a lease is held; usage records carry `admission: "outage"`. A replica that dies
+strands its lease to window end. Mode off changes nothing.
+
 ## Reloading providers, routes and limits (note 0022)
 
 The gateway holds its router behind a `RouterHandle`; a reload builds a whole new router
