@@ -1151,6 +1151,29 @@ fn build_request(
     ),
     ApiError,
 > {
+    build_request_for(state, headers, req, preselected, None)
+}
+
+/// [`build_request`], with the request prepared for `forced` (a concrete target) instead of the
+/// model the caller sent: a retry of a deployment request after its first target failed. The
+/// caller's own model string still names the alias for the allowlist, the usage record and the
+/// metrics (note 0031).
+fn build_request_for(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    req: &ChatRequest,
+    preselected: Option<Arc<Router>>,
+    forced: Option<&str>,
+) -> Result<
+    (
+        String,
+        String,
+        GatewayRequest,
+        crate::gateway::auth::IdentifiedCaller,
+        Arc<Router>,
+    ),
+    ApiError,
+> {
     let identified_caller = state.keystore.identify_caller(headers).map_err(|_| {
         crate::gateway::metrics::incr(
             crate::gateway::metrics::REJECTED,
@@ -1161,7 +1184,15 @@ fn build_request(
     // One snapshot for the whole request (0022): the provider is resolved against it
     // here and the dispatch that runs the job uses the same one.
     let snapshot = preselected.unwrap_or_else(|| state.router.current());
-    let prepared_request = crate::proxy::convert::prepare_request(&snapshot, req)?;
+    let prepared_request = match forced {
+        Some(target) => {
+            // The envelope was validated by the first attempt; only the model differs.
+            let mut value = crate::proxy::convert::request_to_value(req);
+            value["model"] = json!(target);
+            crate::proxy::convert::prepare_engine_request(&snapshot, value)?
+        }
+        None => crate::proxy::convert::prepare_request(&snapshot, req)?,
+    };
     let identity = &identified_caller.identity;
     if identity.allowed_models.is_some() {
         // The routing id of what the request addressed, once routes and aliases are
@@ -1199,7 +1230,12 @@ fn build_request(
             return Err(model_not_allowed());
         }
     }
-    if let Some(name) = req.model.strip_prefix("deployment/") {
+    // Counted once per request: a retry is counted by the failover counter instead.
+    if let Some(name) = req
+        .model
+        .strip_prefix("deployment/")
+        .filter(|_| forced.is_none())
+    {
         crate::gateway::metrics::incr(
             crate::gateway::metrics::DEPLOYMENT_SELECTED,
             &[
@@ -1404,83 +1440,250 @@ async fn chat(
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let (provider_name, _budget_model, gw, identified_caller, snapshot) =
-        build_request(&state, &headers, &req, preselected)?;
-    let identity = &identified_caller.identity;
-    let idempotency_context = idem_key.as_ref().map(|client_key| {
-        // A deployment's pick is in the payload; fingerprinting that would make a retry that picks
-        // the other target a 409. The caller's own model string stands in for it (note 0031).
-        let payload = if req.model.starts_with("deployment/") {
-            let mut caller_view = gw.payload.clone();
-            caller_view["model"] = json!(req.model);
-            std::borrow::Cow::Owned(caller_view)
-        } else {
-            std::borrow::Cow::Borrowed(&gw.payload)
-        };
-        crate::gateway::idempotency::IdempotencyContext::new(
-            &identity.tenant,
-            &identified_caller.credential_scope,
-            uri.path(),
-            client_key,
-            &payload,
-        )
-    });
-    #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
-    let mut policy_scope = state
-        .trusted_policy_scope(identity)
-        .await
-        .map_err(|error| gateway_err_to_api(&state, error))?;
-    #[cfg(feature = "serve")]
-    if state.attempt_coordinator.records_usage() {
-        policy_scope.attribute(
-            &identified_caller.credential_scope,
-            request_id_of(&headers),
-            req.model.strip_prefix("deployment/"),
-        );
-    }
-    state.pin_router(&mut policy_scope, snapshot);
-    let prepared_submission = state
-        .prepare_submission(gw, policy_scope, false)
-        .map_err(|error| gateway_err_to_api(&state, error))?;
-
-    // Retry-safety: a repeated Idempotency-Key returns the first result.
-    if let Some(context) = &idempotency_context {
-        match state.idem_lookup(context).await {
-            crate::gateway::idempotency::IdempotencyLookup::Replay(cached_response) => {
-                return Ok((
-                    [("idempotency-replayed", "true")],
-                    Json(value_to_response(&cached_response, &provider_name, 0)),
+    // A request addressed to a deployment may be retried on another of its targets when the one it
+    // was sent to fails in a way that says nothing about the request (note 0031). Each retry is a
+    // new submission to the next target's lane, with its own admission, spend and usage record.
+    let mut tried: Vec<String> = Vec::new();
+    let mut forced: Option<String> = None;
+    let mut preselected = preselected;
+    let mut prequeue_permit = Some(prequeue_permit);
+    let mut idempotency_context = None;
+    // The failure that led to the current retry: if the retry cannot even be prepared (the key's list
+    // does not allow the next target, say), the caller gets that failure, not an error about a
+    // target they never chose.
+    let mut previous: Option<GatewayError> = None;
+    let mut pending_failover: Option<(String, String, String)> = None;
+    loop {
+        let (provider_name, _budget_model, gw, identified_caller, snapshot) =
+            match build_request_for(
+                &state,
+                &headers,
+                &req,
+                preselected.clone(),
+                forced.as_deref(),
+            ) {
+                Ok(built) => built,
+                Err(error) => {
+                    return Err(match previous.take() {
+                        Some(failure) => gateway_err_to_api(&state, failure),
+                        None => error,
+                    })
+                }
+            };
+        // Every attempt of one request resolves on the first attempt's router snapshot.
+        preselected = Some(snapshot.clone());
+        if let Some((name, from, to)) = pending_failover.take() {
+            crate::gateway::metrics::incr(
+                crate::gateway::metrics::DEPLOYMENT_FAILOVER,
+                &[("deployment", &name), ("from", &from), ("to", &to)],
+            );
+        }
+        let identity = &identified_caller.identity;
+        let first_attempt = tried.is_empty();
+        if first_attempt {
+            idempotency_context = idem_key.as_ref().map(|client_key| {
+                // A deployment's pick is in the payload; fingerprinting that would make a retry that
+                // picks the other target a 409. The caller's own model string stands in for it.
+                let payload = if req.model.starts_with("deployment/") {
+                    let mut caller_view = gw.payload.clone();
+                    caller_view["model"] = json!(req.model);
+                    std::borrow::Cow::Owned(caller_view)
+                } else {
+                    std::borrow::Cow::Borrowed(&gw.payload)
+                };
+                crate::gateway::idempotency::IdempotencyContext::new(
+                    &identity.tenant,
+                    &identified_caller.credential_scope,
+                    uri.path(),
+                    client_key,
+                    &payload,
                 )
-                    .into_response());
-            }
-            crate::gateway::idempotency::IdempotencyLookup::Conflict => {
-                return Err(idempotency_conflict());
-            }
-            crate::gateway::idempotency::IdempotencyLookup::Miss => {}
+            });
         }
-    }
+        tried.push(
+            gw.payload
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        );
+        #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
+        let mut policy_scope = match state.trusted_policy_scope(identity).await {
+            Ok(scope) => scope,
+            Err(error) => {
+                return Err(retry_or(
+                    &state,
+                    &mut previous,
+                    gateway_err_to_api(&state, error),
+                ))
+            }
+        };
+        #[cfg(feature = "serve")]
+        if state.attempt_coordinator.records_usage() {
+            policy_scope.attribute(
+                &identified_caller.credential_scope,
+                request_id_of(&headers),
+                req.model.strip_prefix("deployment/"),
+            );
+        }
+        state.pin_router(&mut policy_scope, snapshot.clone());
+        let prepared_submission = match state.prepare_submission(gw, policy_scope, false) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(retry_or(
+                    &state,
+                    &mut previous,
+                    gateway_err_to_api(&state, error),
+                ))
+            }
+        };
 
-    let timer = RequestTimer::start();
-    match state
-        .submit_prepared(prepared_submission, prequeue_permit, logical_deadline)
-        .await
-    {
-        Ok(submitted) => {
+        // Retry-safety: a repeated Idempotency-Key returns the first result.
+        if first_attempt {
             if let Some(context) = &idempotency_context {
-                state
-                    .idem_store(
-                        context,
-                        &submitted.value,
-                        #[cfg(feature = "redis-coordination")]
-                        submitted.lifecycle_reference.as_ref(),
-                    )
-                    .await;
+                match state.idem_lookup(context).await {
+                    crate::gateway::idempotency::IdempotencyLookup::Replay(cached_response) => {
+                        return Ok((
+                            [("idempotency-replayed", "true")],
+                            Json(value_to_response(&cached_response, &provider_name, 0)),
+                        )
+                            .into_response());
+                    }
+                    crate::gateway::idempotency::IdempotencyLookup::Conflict => {
+                        return Err(idempotency_conflict());
+                    }
+                    crate::gateway::idempotency::IdempotencyLookup::Miss => {}
+                }
             }
-            let elapsed = timer.elapsed().as_millis() as u64;
-            Ok(Json(value_to_response(&submitted.value, &provider_name, elapsed)).into_response())
         }
-        Err(err) => Err(gateway_err_to_api(&state, err)),
+
+        let timer = RequestTimer::start();
+        let permit = prequeue_permit
+            .take()
+            .expect("a preparation permit is held for every attempt");
+        match state
+            .submit_prepared(prepared_submission, permit, logical_deadline)
+            .await
+        {
+            Ok(submitted) => {
+                if let Some(context) = &idempotency_context {
+                    state
+                        .idem_store(
+                            context,
+                            &submitted.value,
+                            #[cfg(feature = "redis-coordination")]
+                            submitted.lifecycle_reference.as_ref(),
+                        )
+                        .await;
+                }
+                let elapsed = timer.elapsed().as_millis() as u64;
+                return Ok(
+                    Json(value_to_response(&submitted.value, &provider_name, elapsed))
+                        .into_response(),
+                );
+            }
+            Err(err) => {
+                let next = req
+                    .model
+                    .strip_prefix("deployment/")
+                    .filter(|_| retryable_upstream_failure(&err))
+                    .filter(|name| tried.len() < snapshot.deployment_target_count(name).min(3))
+                    .and_then(|name| {
+                        snapshot
+                            .deployment_retry_target(name, &tried)
+                            .map(|target| (name, target))
+                    });
+                let Some((name, target)) = next else {
+                    return Err(gateway_err_to_api(&state, err));
+                };
+                previous = Some(err);
+                // Counted when the retry has been prepared (below), not here: a retry the key may not
+                // make, or that cannot get a permit, is not a failover.
+                pending_failover = Some((
+                    name.to_owned(),
+                    tried.last().cloned().unwrap_or_default(),
+                    target.clone(),
+                ));
+                forced = Some(target);
+                match prequeue_permit_for_retry(&state).await {
+                    Ok(permit) => prequeue_permit = Some(permit),
+                    Err(_) => {
+                        return Err(gateway_err_to_api(
+                            &state,
+                            previous.take().expect("the failure that led to this retry"),
+                        ))
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Whether a failed attempt says nothing about the request, so another target may be tried: a 5xx
+/// from the provider or a transport failure (note 0031). A 429 and every local refusal (the
+/// caller's own limits and budget, a policy refusal, an overload) are not: they are not the
+/// target's fault, or they would only move the load. The strings are the `Display` of
+/// `ShimError`, pinned by a test.
+fn retryable_upstream_failure(error: &GatewayError) -> bool {
+    let GatewayError::Upstream(message) = error else {
+        return false;
+    };
+    if message.starts_with("HTTP error:") {
+        return true;
+    }
+    let Some((status, body)) = message
+        .strip_prefix("provider error (")
+        .and_then(|rest| rest.split_once("): "))
+    else {
+        return false;
+    };
+    status
+        .parse::<u16>()
+        .is_ok_and(|status| matches!(status, 500 | 502 | 503 | 504 | 529))
+        && !is_local_diagnostic(body)
+}
+
+/// llmshim's own 5xx diagnostics, raised **after** the provider answered with a success (an answer
+/// that was billed but that cannot be used: an output contract it did not meet, a response shape
+/// or terminal reason that is unsupported, a tool call that does not validate) or by the policy
+/// layer. They say nothing about the target's health, and every target would give the same answer
+/// again, so they are not retried. A new local diagnostic of this kind belongs here.
+fn is_local_diagnostic(body: &str) -> bool {
+    const LOCAL: &[&str] = &[
+        "response did not satisfy the requested output contract",
+        "upstream JSON exceeds complexity limit",
+        "invalid upstream tool call",
+        "invalid upstream response shape",
+        "embeddings response has no data array",
+        "no candidates in response",
+        "no supported terminal",
+        "no output in response",
+        "returned an embeddings response but has no embeddings wire",
+        "attempt policy observation failed",
+        "attempt policy coordinator unavailable",
+    ];
+    LOCAL.iter().any(|known| body.contains(known))
+        || body == crate::derived_response::DERIVED_RESPONSE_ERROR
+}
+
+/// The failure to report when a retry could not even be made: the one that led to the retry, when
+/// there is one (note 0031), otherwise `error` itself.
+fn retry_or(
+    state: &GatewayState,
+    previous: &mut Option<GatewayError>,
+    error: ApiError,
+) -> ApiError {
+    match previous.take() {
+        Some(failure) => gateway_err_to_api(state, failure),
+        None => error,
+    }
+}
+
+/// A fresh preparation permit for a retry (the first attempt's was spent queueing).
+async fn prequeue_permit_for_retry(
+    state: &GatewayState,
+) -> Result<PrequeuePreparationPermit, ApiError> {
+    prequeue_permit(state, None).await
 }
 
 /// POST /v1/chat/stream — always SSE, queued by priority.
@@ -5764,5 +5967,68 @@ mod request_id_tests {
         assert!(!on_instance(
             json!({"x-openrouter": {"preset": "@preset/anything"}})
         ));
+    }
+
+    #[test]
+    fn only_a_provider_5xx_or_a_transport_failure_is_retried_on_another_target() {
+        let upstream = |status: u16, body: &str| {
+            GatewayError::Upstream(
+                ShimError::ProviderError {
+                    status,
+                    body: body.into(),
+                    retry_after: None,
+                }
+                .to_string(),
+            )
+        };
+        for status in [500, 502, 503, 504, 529] {
+            assert!(
+                retryable_upstream_failure(&upstream(status, "boom")),
+                "{status}"
+            );
+        }
+        // The request is wrong everywhere, or the failure is not the target's.
+        for status in [400, 401, 403, 404, 422, 429] {
+            assert!(
+                !retryable_upstream_failure(&upstream(status, "no")),
+                "{status}"
+            );
+        }
+        // llmshim's own 5xx diagnostics, raised after the provider answered and was billed, would
+        // give the same answer on every target: never retried.
+        for body in [
+            "response did not satisfy the requested output contract",
+            "upstream JSON exceeds complexity limit",
+            "invalid upstream tool call: bad arguments",
+            "invalid upstream response shape",
+            "Anthropic response has no supported terminal stop reason",
+            "no candidates in response: {}",
+            "attempt policy observation failed",
+        ] {
+            assert!(!retryable_upstream_failure(&upstream(502, body)), "{body}");
+            assert!(!retryable_upstream_failure(&upstream(503, body)), "{body}");
+        }
+        assert!(!retryable_upstream_failure(&upstream(
+            502,
+            crate::derived_response::DERIVED_RESPONSE_ERROR
+        )));
+        // Local conditions are never retried elsewhere.
+        for message in [
+            "llmshim-rate-limit:5000",
+            "llmshim-overload:100",
+            "llmshim-coordinator-unavailable",
+            "llmshim-unpriceable-under-budget",
+            "llmshim-provider-unavailable:5000",
+            "distributed gateway: Connection reset by peer",
+        ] {
+            assert!(
+                !retryable_upstream_failure(&GatewayError::Upstream(message.into())),
+                "{message}"
+            );
+        }
+        assert!(!retryable_upstream_failure(&GatewayError::Timeout));
+        assert!(retryable_upstream_failure(&GatewayError::Upstream(
+            "HTTP error: error sending request".into()
+        )));
     }
 }

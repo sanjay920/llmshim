@@ -33,6 +33,9 @@ pub const QUEUE_DEPTH: &str = "llmshim_gateway_queue_depth";
 /// Requests resolved to a deployment's target (counter, labels: deployment, target). The label sets
 /// are the configured names, so their cardinality is bounded by the file (note 0031).
 pub const DEPLOYMENT_SELECTED: &str = "llmshim_gateway_deployment_selected_total";
+/// Requests retried on another target of their deployment after the first failed (counter, labels:
+/// deployment, from, to). Bounded by the file's names (note 0031).
+pub const DEPLOYMENT_FAILOVER: &str = "llmshim_gateway_deployment_failover_total";
 /// 1 while this replica admits requests from a lease because Redis is
 /// unreachable (gauge) — set at scrape time. Only with `[fleet.outage_admission]`.
 pub const OUTAGE_ADMISSION_ACTIVE: &str = "llmshim_gateway_outage_admission_active";
