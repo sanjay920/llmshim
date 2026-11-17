@@ -60,6 +60,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0024: The control plane](0024-control-plane.md)
 - [0025: No receipt lookup for an assistant turn that cannot have one](0025-no-lookup-without-a-receipt.md)
 - [0026: The control plane's HTTP API](0026-control-plane-api.md)
+- [0027: Bounded admission during a Redis outage](0027-bounded-admission-during-a-redis-outage.md)
 
 ## Roadmap
 
@@ -126,8 +127,9 @@ Later phases (each needs its own design note before work starts)
       or pulled from the control plane), the `llmshim-control` server and its
       OpenAPI document. A separate, unpublished crate with its own lockfile
 - [x] Control plane on Postgres (0024 slice 4): one store, two backends; the whole suite runs on both
-- [ ] Bounded admission during a Redis outage (a local spend allowance): its own
-      design note first; it is a second admission path, not only a spend rule (0024)
+- [ ] Bounded admission during a Redis outage (a local spend allowance): designed in
+      0027 (a second admission path with a pre-reserved spend lease; the bound is on
+      admitted reservations, not spend); not built
 - [ ] Hierarchical budgets, model allowlists, tags, alerts, cost exports
 - [ ] Deployments and load balancing across credentials and regions
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
