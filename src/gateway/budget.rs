@@ -123,6 +123,11 @@ fn quote_with(
 fn embedding_reservation_nanos(attempt: &PreparedAttempt<'_>) -> Option<u64> {
     const MARGIN_TOKENS: u128 = 64;
     let identity = attempt.identity();
+    // Gemini's batchEmbedContents answer carries no token counts, so nothing would ever settle the
+    // reservation and each call would hold its bound until the window rolled: no bound, so refused.
+    if identity.wire() == WireFormat::GoogleGenerateContent {
+        return None;
+    }
     let qualified = format!("{}/{}", identity.provider_name(), identity.pricing_model());
     let model_info = crate::catalog::lookup_id(&qualified)?;
     if model_info.context_cost_tiers.is_some() || !trusted_price_source(&model_info, "cost.input") {

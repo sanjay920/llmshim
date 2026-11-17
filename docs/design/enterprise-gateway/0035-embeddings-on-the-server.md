@@ -48,6 +48,16 @@ observation. There is no second dispatch, auth or queue path (the rule the nativ
   a 429). With a bound, a cap below the reservation is a 429 before the provider, the attempt reserves what the
   bound says and settles at the billed tokens' catalog price, and the reservation is released. A key with no
   cap is served and its spend recorded either way.
+
+  Limits found in review. **Gemini** embeddings (`batchEmbedContents`) answer with vectors and no token
+  counts, so nothing would ever settle a reservation and each call would hold its bound until the window
+  rolled: a capped key is refused for them (`unpriceable_under_budget`), local price or not. As for chat, a
+  non-2xx answer, a transport failure and an abandoned call keep the reservation (only a completed, counted
+  attempt releases it), and a client retry reserves again; an embeddings reservation is far larger than the
+  call's real cost, so a flaky provider drains a tight cap faster than the spend does. A self-hosted model
+  that adds more than a few special tokens per text could bill above the bound; settlement then raises the
+  liability past the reservation instead of failing. A batch whose reservation exceeds the exact-counter
+  ceiling is a 400 `unpriceable_under_budget`, not a 429.
 - **Where it runs.** The local scheduler only. With `[fleet]` the answer is `501 not_implemented`: a
   distributed job carries a chat payload, and running an embeddings one as chat would be a wrong answer.
 - **Not built:** images and audio endpoints; chunking or splitting a batch (never: work the caller did not

@@ -426,3 +426,32 @@ async fn without_a_trusted_price_a_capped_key_is_still_refused() {
     assert_eq!(answer.status(), 400);
     mock.assert_async().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gemini_embeddings_report_no_tokens_so_a_capped_key_is_refused_even_with_a_local_price() {
+    // batchEmbedContents answers with vectors only: nothing would settle a reservation, and every
+    // call would hold its bound until the window rolled.
+    let (up, mock) = upstream(0).await;
+    let dir = tempdir::Dir::new("emb-gemini");
+    let log = dir.0.join("usage.jsonl");
+    let catalog = dir.0.join("models.toml");
+    std::fs::write(
+        &catalog,
+        "[models.\"gemini/gemini-embedding-001\".cost]\ninput = 0.15\n",
+    )
+    .unwrap();
+    let env = priced_env(&catalog.display().to_string());
+    let config = config(&up.url(), "budget_usd = 5.0", Some(&log)).replace(
+        "[providers.embed]\n        kind = \"openai-compatible\"",
+        "[providers.gemini]\n        kind = \"gemini\"",
+    );
+    let server = start(&config, "emb-gemini", &borrowed(&env));
+    let answer = embed(
+        &server.base,
+        Some(CALLER_KEY),
+        json!({"model": "gemini/gemini-embedding-001", "input": ["first"]}),
+    )
+    .await;
+    assert_eq!(answer.status(), 400, "{}", answer.text().await.unwrap());
+    mock.assert_async().await;
+}
