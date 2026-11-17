@@ -533,9 +533,12 @@ mod deadline_tests {
                         )),
                     );
                 let deadlines = crate::client::AttemptDeadlines::default()
-                    .with_response_header_timeout(Duration::from_millis(20))
+                    // The first server stalls for a full second, so a quarter of a second still
+                    // times it out, and leaves a loaded runner room to answer the second one
+                    // (20 ms did not: CI saw the fallback time out too).
+                    .with_response_header_timeout(Duration::from_millis(250))
                     .unwrap()
-                    .with_unary_timeouts(Duration::from_millis(20), Duration::from_secs(1))
+                    .with_unary_timeouts(Duration::from_millis(250), Duration::from_secs(1))
                     .unwrap();
                 let client = crate::client::ShimClient::new()
                     .with_attempt_deadlines(deadlines)

@@ -163,6 +163,41 @@ paths:
               schema: {type: string}
         default:
           description: Native error with preserved HTTP status and Retry-After when applicable
+  /v1/embeddings:
+    post:
+      operationId: embeddings
+      summary: OpenAI-shaped embeddings (gateway only)
+      description: >-
+        Served by the gateway (`llmshim serve`), not by `llmshim proxy`. `input` is a string or an
+        array of strings (token arrays are refused); `encoding_format` is `float` (default) or
+        `base64` (little-endian f32). Admitted by the same key, allowlist, rate and usage rules as
+        a completion. A key with a spend cap (its own or its tenant's) is refused with
+        `unpriceable_under_budget` until embeddings have a spend bound; `budget_allow_unpriced`
+        does not change that. A fleet gateway answers 501. `usage.cost_usd` is `null` when
+        the price is unknown.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input]
+              properties:
+                model: {type: string, description: Routing id, e.g. openai/text-embedding-3-small}
+                input:
+                  oneOf:
+                    - {type: string}
+                    - {type: array, items: {type: string}}
+                dimensions: {type: integer, minimum: 1}
+                encoding_format: {type: string, enum: [float, base64]}
+      responses:
+        '200':
+          description: One embedding per input, in input order
+          content:
+            application/json:
+              schema: {type: object}
+        default:
+          description: Error object with preserved HTTP status
   /v1/messages:
     post:
       operationId: nativeMessages

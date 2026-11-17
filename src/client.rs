@@ -956,11 +956,41 @@ impl ShimClient {
         result.map_err(DispatchFailure::into_public)
     }
 
+    /// [`Self::embeddings`] under a trusted attempt policy: the attempt is admitted by the policy
+    /// (rate, concurrency, spend) before it is sent and reported to it as it ends, exactly as a
+    /// completion is (note 0035).
+    pub async fn embeddings_with_policy(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &serde_json::Value,
+        policy_context: &DispatchPolicyContext,
+    ) -> Result<serde_json::Value> {
+        let result = self
+            .embeddings_dispatch_with(provider, model, request, Some(policy_context))
+            .await;
+        if let Some(outcome) = Self::breaker_outcome(&result) {
+            self.observe(provider, outcome).await;
+        }
+        result.map_err(DispatchFailure::into_public)
+    }
+
     pub(crate) async fn embeddings_dispatch(
         &self,
         provider: &dyn Provider,
         model: &str,
         request: &serde_json::Value,
+    ) -> DispatchResult<serde_json::Value> {
+        self.embeddings_dispatch_with(provider, model, request, None)
+            .await
+    }
+
+    async fn embeddings_dispatch_with(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &serde_json::Value,
+        policy_context: Option<&DispatchPolicyContext>,
     ) -> DispatchResult<serde_json::Value> {
         // The batch is checked before anything is rendered or sent: a batch a
         // server could never accept is a local mistake, not a request.
@@ -978,7 +1008,7 @@ impl ShimClient {
             attempt_deadline,
         } = self
             .send_prepared(
-                None,
+                policy_context,
                 AttemptKind::Completion,
                 model,
                 Some(&target),

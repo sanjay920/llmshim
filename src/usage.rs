@@ -478,12 +478,14 @@ fn usage_observation(
 ) -> Option<NativeUsageObservation> {
     let counters_complete = match wire {
         WireFormat::OpenAiChat => {
-            has_counter(native_usage, "/prompt_tokens")
-                && has_counter(native_usage, "/completion_tokens")
+            (has_counter(native_usage, "/prompt_tokens")
+                && has_counter(native_usage, "/completion_tokens"))
+                || input_only_total(native_usage, "/prompt_tokens")
         }
         WireFormat::OpenAiResponses => {
-            has_counter(native_usage, "/input_tokens")
-                && has_counter(native_usage, "/output_tokens")
+            (has_counter(native_usage, "/input_tokens")
+                && has_counter(native_usage, "/output_tokens"))
+                || input_only_total(native_usage, "/prompt_tokens")
         }
         WireFormat::AnthropicMessages => {
             has_counter(native_usage, "/input_tokens")
@@ -510,6 +512,18 @@ fn usage_observation(
         counters_complete,
         explicit_zero,
     })
+}
+
+/// An input-only count: the input counter and a total equal to it, with no output counter at all
+/// (what an embeddings call reports). The output is then zero by arithmetic, so the counters are
+/// complete; an input counter alone, or a total above it, is not (note 0035).
+fn input_only_total(value: &Value, input: &str) -> bool {
+    let counter = |pointer: &str| value.pointer(pointer).and_then(Value::as_u64);
+    matches!(
+        (counter(input), counter("/total_tokens")),
+        (Some(prompt), Some(total)) if prompt == total
+    ) && value.pointer("/completion_tokens").is_none()
+        && value.pointer("/output_tokens").is_none()
 }
 
 fn has_counter(value: &Value, pointer: &str) -> bool {
@@ -577,8 +591,10 @@ fn normalize_native_usage(wire: WireFormat, native_usage: &Value) -> Option<Valu
     let mut normalized = native_usage.clone();
     match wire {
         WireFormat::OpenAiResponses => {
+            // An embeddings body (also on this wire) counts `prompt_tokens`, with no output.
             normalized["prompt_tokens"] = native_usage
                 .get("input_tokens")
+                .or_else(|| native_usage.get("prompt_tokens"))
                 .cloned()
                 .unwrap_or(json!(0));
             normalized["completion_tokens"] = native_usage

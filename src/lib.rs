@@ -195,6 +195,26 @@ pub async fn embeddings_with_client(
     embeddings::parse(provider.instance(), &model, request.input.len(), response)
 }
 
+/// An admitted embeddings call (note 0035): `payload` is the OpenAI-shaped body with the caller's
+/// `model`, and the answer is the provider-normalized body (`data`, `usage`) that
+/// [`embeddings::parse`] reads. The attempt goes through the same policy as a completion.
+#[cfg(feature = "gateway")]
+pub(crate) async fn embeddings_value_with_policy(
+    router: &Router,
+    payload: &Value,
+    policy_context: &DispatchPolicyContext,
+) -> Result<Value> {
+    let model_str = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(error::ShimError::MissingModel)?;
+    let (provider, model) = router.resolve(model_str)?;
+    let client = bound_client(router)?;
+    client
+        .embeddings_with_policy(provider, &model, payload, policy_context)
+        .await
+}
+
 /// Streaming entry point. Returns an SSE stream of OpenAI-format chunks.
 pub async fn stream(
     router: &Router,

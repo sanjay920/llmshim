@@ -145,6 +145,14 @@ impl Dispatch for RealDispatch {
             .router_snapshot()
             .cloned()
             .unwrap_or_else(|| self.router.current());
+        // An embeddings call (note 0035) is told apart by the trusted context, never by the body.
+        if policy_context.operation() == crate::policy::DispatchOperation::Embeddings {
+            let result =
+                crate::embeddings_value_with_policy(router.as_ref(), &payload, &policy_context)
+                    .await;
+            let refusal = policy_context.take_last_refusal();
+            return result.map_err(|error| self.map_err(error, refusal));
+        }
         let result = crate::completion_with_logger_and_policy(
             router.as_ref(),
             &payload,
@@ -1701,6 +1709,222 @@ async fn prequeue_permit_for_retry(
     prequeue_permit(state, None).await
 }
 
+/// A 400 in the OpenAI error shape, naming the field and never echoing a value.
+fn invalid_request(message: &str, param: &str) -> ApiError {
+    ApiError::from(ShimError::ProviderError {
+        status: StatusCode::BAD_REQUEST.as_u16(),
+        body: json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": param,
+                "code": "invalid_request"
+            }
+        })
+        .to_string(),
+        retry_after: None,
+    })
+}
+
+/// The inbound `POST /v1/embeddings` body, in OpenAI's shape.
+#[derive(serde::Deserialize)]
+struct EmbeddingsBody {
+    model: String,
+    input: Value,
+    #[serde(default)]
+    dimensions: Option<u32>,
+    #[serde(default)]
+    encoding_format: Option<String>,
+}
+
+/// The texts of an embeddings `input`: one string or an array of strings. Token arrays are not
+/// supported: a vector from tokens of a tokenizer llmshim does not know is a wrong answer.
+fn embedding_texts(input: &Value) -> Result<Vec<String>, ApiError> {
+    match input {
+        Value::String(text) => Ok(vec![text.clone()]),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                invalid_request("input must be a string or an array of strings", "input")
+            }),
+        _ => Err(invalid_request(
+            "input must be a string or an array of strings",
+            "input",
+        )),
+    }
+}
+
+/// POST /v1/embeddings — OpenAI-shaped, admitted by the same rate, concurrency, spend and
+/// allowlist rules as a completion (note 0035). Local scheduler only: a fleet answers 501.
+async fn embeddings(
+    State(state): State<Arc<GatewayState>>,
+    installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
+    logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
+    headers: HeaderMap,
+    Json(body): Json<EmbeddingsBody>,
+) -> Result<Response, ApiError> {
+    let prequeue_permit = prequeue_permit(&state, installed_prequeue_permit).await?;
+    let identified_caller = state.keystore.identify_caller(&headers).map_err(|_| {
+        crate::gateway::metrics::incr(
+            crate::gateway::metrics::REJECTED,
+            &[("provider", "unknown"), ("reason", "unauthorized")],
+        );
+        ApiError::Unauthorized
+    })?;
+    if !matches!(state.backend, Backend::Local(_)) {
+        return Err(ApiError::from(ShimError::ProviderError {
+            status: StatusCode::NOT_IMPLEMENTED.as_u16(),
+            body: json!({
+                "error": {
+                    "message": "embeddings are not available on a fleet gateway",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "not_implemented"
+                }
+            })
+            .to_string(),
+            retry_after: None,
+        }));
+    }
+    let base64 = match body.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(_) => {
+            return Err(invalid_request(
+                "encoding_format must be float or base64",
+                "encoding_format",
+            ))
+        }
+    };
+    let texts = embedding_texts(&body.input)?;
+    let request = crate::embeddings::EmbeddingRequest {
+        model: body.model.clone(),
+        input: texts,
+        dimensions: body.dimensions,
+    };
+    let snapshot = state.router.current();
+    // A route or deployment name is not an embeddings model: it resolves to a chat target (a route
+    // is refused here; `resolve` itself refuses a deployment).
+    if request.model.starts_with("route/") {
+        return Err(invalid_request(
+            "a route is not an embeddings model; address the model itself",
+            "model",
+        ));
+    }
+    let (provider, model) = snapshot.resolve(&request.model).map_err(ApiError::from)?;
+    let identity = &identified_caller.identity;
+    if identity.allowed_models.is_some() {
+        let (provider_key, routed) = snapshot
+            .routing_id(&request.model)
+            .map_err(ApiError::from)?;
+        if !identity.permits_model(&provider_key, &routed, None) {
+            crate::gateway::metrics::incr(
+                crate::gateway::metrics::REJECTED,
+                &[("provider", &provider_key), ("reason", "model_not_allowed")],
+            );
+            return Err(model_not_allowed());
+        }
+    }
+    let mut payload = crate::embeddings::payload(&request);
+    payload["model"] = json!(request.model);
+    // The dispatch's own three refusals, asked here too (cheap, pure, same order) so a request no
+    // provider could accept is a 400 before it queues, not a 502 out of the dispatcher.
+    crate::embeddings::admit_batch(provider, &payload).map_err(ApiError::from)?;
+    provider
+        .transform_embedding_request(&model, &payload)
+        .map_err(ApiError::from)?;
+    crate::embeddings::admit_model(provider, &model, &payload).map_err(ApiError::from)?;
+    let permits = request
+        .input
+        .iter()
+        .map(|text| text.len() as u64 / 4 + 1)
+        .sum::<u64>()
+        .min(u64::from(u32::MAX)) as u32;
+    let gw = GatewayRequest {
+        provider: provider.instance().to_owned(),
+        tier: identity.tier,
+        permits,
+        payload,
+    };
+    #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
+    let mut policy_scope = state
+        .trusted_policy_scope(identity)
+        .await
+        .map_err(|error| gateway_err_to_api(&state, error))?;
+    #[cfg(feature = "serve")]
+    if state.attempt_coordinator.records_usage() {
+        policy_scope.attribute(
+            &identified_caller.credential_scope,
+            request_id_of(&headers),
+            None,
+        );
+    }
+    state.pin_router(&mut policy_scope, snapshot.clone());
+    policy_scope.set_operation(crate::policy::DispatchOperation::Embeddings);
+    let prepared = state
+        .prepare_submission(gw, policy_scope, false)
+        .map_err(|error| gateway_err_to_api(&state, error))?;
+    let submitted = state
+        .submit_prepared(
+            prepared,
+            prequeue_permit,
+            logical_lifetime
+                .as_ref()
+                .map(|axum::Extension(lifetime)| lifetime.deadline()),
+        )
+        .await
+        .map_err(|error| gateway_err_to_api(&state, error))?;
+    let parsed = crate::embeddings::parse(
+        provider.instance(),
+        &model,
+        request.input.len(),
+        submitted.value,
+    )
+    .map_err(ApiError::from)?;
+    Ok(Json(embeddings_response(&body.model, &parsed, base64)).into_response())
+}
+
+/// OpenAI's list-of-embeddings answer. `base64` packs each vector as little-endian f32, which is
+/// what the OpenAI SDKs ask for by default and decode. Cost rides on `usage`; `null` is unknown.
+fn embeddings_response(
+    requested_model: &str,
+    embeddings: &crate::embeddings::Embeddings,
+    base64: bool,
+) -> Value {
+    use base64::Engine as _;
+    let data: Vec<Value> = embeddings
+        .vectors
+        .iter()
+        .enumerate()
+        .map(|(index, vector)| {
+            let embedding = if base64 {
+                let bytes: Vec<u8> = vector
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect();
+                json!(base64::engine::general_purpose::STANDARD.encode(bytes))
+            } else {
+                json!(vector)
+            };
+            json!({"object": "embedding", "index": index, "embedding": embedding})
+        })
+        .collect();
+    let tokens = embeddings.usage.input_tokens;
+    json!({
+        "object": "list",
+        "data": data,
+        "model": embeddings.revision.as_deref().unwrap_or(requested_model),
+        "usage": {
+            "prompt_tokens": tokens,
+            "total_tokens": tokens,
+            "cost_usd": embeddings.usage.cost_usd,
+            "cost_source": embeddings.usage.cost_source,
+        }
+    })
+}
+
 /// POST /v1/chat/stream — always SSE, queued by priority.
 async fn chat_stream(
     State(state): State<Arc<GatewayState>>,
@@ -2089,6 +2313,7 @@ pub(crate) fn app_with_parts(
         .route("/v1/responses", post(chat))
         .route("/v1beta/models/{*rest}", post(chat))
         .route("/v1/chat/stream", post(chat_stream))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
         .route("/v1/gateway/stats", get(stats))
         .route("/metrics", get(metrics))
@@ -2153,8 +2378,10 @@ async fn admit_ingress_preparation(
     let state = &ingress.gateway;
     let inference_path = request.uri().path().to_owned();
     let requires_preparation = request.method() == axum::http::Method::POST
-        && (matches!(inference_path.as_str(), "/v1/chat" | "/v1/chat/stream")
-            || crate::proxy::wire::native_route(&inference_path).is_some());
+        && (matches!(
+            inference_path.as_str(),
+            "/v1/chat" | "/v1/chat/stream" | "/v1/embeddings"
+        ) || crate::proxy::wire::native_route(&inference_path).is_some());
     if !requires_preparation {
         return next.run(request).await;
     }
