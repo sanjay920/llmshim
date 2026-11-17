@@ -144,4 +144,25 @@ allowed_models = ["openai/gpt-6-luna", "anthropic/claude-haiku-5-5", "openrouter
   matching and for the OpenRouter fallback list. The check removed fails five of them.
 - `x-openrouter.preset` is refused for a restricted key on OpenRouter (a preset is configured upstream and can set the model; whether it can override is unverified, so it fails closed), and the `x-openrouter` checks apply only to requests that resolve to OpenRouter.
 - Not covered by a process test: `client_san` and `jwt` keys carrying a list (their identities are built with the same code path, reviewed by reading), and the OpenRouter rules end to end (unit-tested on the payload).
-- Not built: carrying the field in a control-plane snapshot (slice 3).
+- Slice 3 below.
+
+## As built (slice 3): the control plane
+
+- **Signed format.** `SnapshotKey` gains an optional `allowed_models`, written **only when the key
+  has a list**. The payload `version` stays 1: a snapshot with no restricted key is byte-compatible
+  with older data planes; one with a restricted key is **refused whole** by a data plane that
+  predates the field (`deny_unknown_fields`) and that replica keeps serving the previous snapshot,
+  reported by `snapshot.last_error`. That is the intended failure: a key is never served without the
+  restriction it was signed with. Upgrade data planes before restricting keys in a control plane.
+- **Data plane.** The snapshot's list goes onto the key's identity and is validated by the same rules
+  as a file (a bad list refuses the snapshot by path, the previous one serving).
+- **Control plane.** `keys.allowed_models` (a JSON list, schema version 2 for both SQLite and
+  Postgres; a version 1 database is migrated in place by an `ALTER TABLE ... ADD COLUMN`, in a
+  transaction), validated with the data plane's own rule (`gateway::auth::model_entry_problem`, at
+  most 256 entries, never empty), set at creation (`POST /v1/projects/{id}/keys` body field
+  `allowed_models`), copied on rotation, listed on the key. Like `allowed_cidrs`, it is not a limit
+  and has no `PATCH`: to change a list, create a successor and revoke the old key.
+- **Tests.** Control plane (both backends): refusals, storage, rotation, payload presence and
+  absence, a published snapshot read back by the data plane, an in-place migration from version 1
+  (SQLite and Postgres). Data plane (process): a snapshot key with a list is restricted, the key
+  beside it is not, and a bad list in generation 2 leaves generation 1 in force.

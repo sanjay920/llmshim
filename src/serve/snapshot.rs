@@ -86,6 +86,11 @@ pub struct SnapshotKey {
     pub budget_allow_unpriced: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Present only when the key is restricted (design note 0028). A data plane that
+    /// predates the field refuses the whole snapshot (unknown field) and keeps serving
+    /// the previous one: never a key silently unrestricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -271,8 +276,7 @@ fn to_keys(
             budget_usd: key.budget_usd,
             budget_window_secs: key.budget_window_secs,
             budget_allow_unpriced: key.budget_allow_unpriced,
-            // Not carried by the signed format yet (design note 0028, slice 3).
-            allowed_models: None,
+            allowed_models: key.allowed_models.clone(),
         });
     }
     Ok((keys, inactive))

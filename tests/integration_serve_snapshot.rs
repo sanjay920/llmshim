@@ -127,6 +127,44 @@ async fn a_signed_snapshot_is_the_source_of_who_may_call() {
     );
 }
 
+/// A key's model list travels in the signed snapshot and restricts what it may call (0028);
+/// the unrestricted key beside it is unaffected.
+#[tokio::test]
+async fn a_snapshot_key_with_a_model_list_may_call_only_those_models() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-models");
+    let mut restricted = key("alpha", ALPHA, "active");
+    restricted["allowed_models"] = json!([MODEL]);
+    plane.write(&payload(1, vec![restricted, key("bravo", BRAVO, "active")]));
+    let server = start(&plane.config(&upstream.url(), ""), "snapshot-models", &[]);
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+    let other = chat(&server, Some(ALPHA), "inference/other-model").await;
+    assert_eq!(other.status().as_u16(), 403);
+    // The key with no list calls any model.
+    let free = chat(&server, Some(BRAVO), "inference/other-model").await;
+    assert_ne!(free.status().as_u16(), 403);
+    // A list that would be refused in a file is refused in a snapshot, by path, and the
+    // replica keeps what it applied.
+    let mut bad = key("alpha", ALPHA, "active");
+    bad["allowed_models"] = json!([]);
+    plane.write(&payload(2, vec![bad]));
+    hangup(&server);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        snapshot_status(&server).await["generation"],
+        1,
+        "generation 2 was refused, so generation 1 is still the one in force"
+    );
+    assert_eq!(
+        chat(&server, Some(ALPHA), "inference/other-model")
+            .await
+            .status()
+            .as_u16(),
+        403,
+        "the previous snapshot still serves"
+    );
+}
+
 #[tokio::test]
 async fn a_new_generation_applies_on_reload_and_revocation_takes_effect() {
     let (upstream, _mock) = mock(1).await;

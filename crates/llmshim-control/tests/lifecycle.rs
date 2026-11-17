@@ -658,3 +658,136 @@ fn postgres_requires_tls_names_a_valid_schema_and_survives_a_killed_connection()
     );
     assert!(store.create_team(&org.id, "Platform", ACTOR).is_ok());
 }
+
+#[test]
+fn a_model_list_is_checked_stored_copied_on_rotation_and_signed_only_when_set() {
+    let mut f = fixture();
+    // Refused like the data plane would refuse it.
+    for bad in [
+        vec![],
+        vec!["gpt-6-luna".to_string()],
+        vec!["openai/*/x".to_string()],
+        vec!["*".to_string()],
+        (0..257).map(|n| format!("openai/m{n}")).collect(),
+    ] {
+        let mut new = NewKey::secret(&f.project, "bad");
+        new.allowed_models = Some(bad.clone());
+        assert!(
+            matches!(f.store.create_key(new, ACTOR), Err(Error::Invalid(_))),
+            "{bad:?}"
+        );
+    }
+    assert!(f.store.keys(&f.org).unwrap().is_empty());
+    let mut restricted = NewKey::secret(&f.project, "batch");
+    restricted.allowed_models = Some(vec!["openai/gpt-6-luna".into(), "route/cheap".into()]);
+    let batch = f.store.create_key(restricted, ACTOR).unwrap();
+    let open = f
+        .store
+        .create_key(NewKey::secret(&f.project, "open"), ACTOR)
+        .unwrap();
+    assert_eq!(
+        f.store.key(&batch.record.id).unwrap().allowed_models,
+        Some(vec![
+            "openai/gpt-6-luna".to_string(),
+            "route/cheap".to_string()
+        ])
+    );
+    assert_eq!(f.store.key(&open.record.id).unwrap().allowed_models, None);
+    // A rotation keeps the restriction.
+    let next = f
+        .store
+        .rotate_key(&batch.record.id, "batch-2", ACTOR)
+        .unwrap();
+    assert_eq!(next.record.allowed_models, batch.record.allowed_models);
+    // The payload names the list on the keys that have one and omits it elsewhere, so a
+    // snapshot with no restricted key is the one an older data plane still reads.
+    let payload = f.store.build_payload(&f.org).unwrap();
+    let keys = payload["keys"].as_array().unwrap();
+    let find = |name: &str| keys.iter().find(|k| k["name"] == name).unwrap();
+    assert_eq!(
+        find("batch")["allowed_models"],
+        json!(["openai/gpt-6-luna", "route/cheap"])
+    );
+    assert!(find("open").get("allowed_models").is_none());
+    // And the data plane reads it back onto the key it serves.
+    let directory = dir("models");
+    let (seed, public) = llmshim::serve::snapshot::keygen().unwrap();
+    let published = f.store.publish_snapshot(&f.org, &seed, ACTOR).unwrap();
+    let file = directory.join("snapshot.json");
+    std::fs::write(&file, published.envelope).unwrap();
+    let cp = control_plane(&f.org, &public, &file);
+    let loaded = llmshim::serve::snapshot::load(&cp, None, chrono::Utc::now()).unwrap();
+    let served = |name: &str| loaded.keys.iter().find(|k| k.name == name).unwrap();
+    assert_eq!(
+        served("batch").allowed_models,
+        Some(vec![
+            "openai/gpt-6-luna".to_string(),
+            "route/cheap".to_string()
+        ])
+    );
+    assert_eq!(served("open").allowed_models, None);
+}
+
+/// A database created by the version that had no model lists opens, is migrated in place,
+/// and keeps its keys.
+#[test]
+fn a_version_1_database_is_migrated_in_place() {
+    if let Some(url) = common::postgres_url() {
+        // The same, on Postgres: a schema made by this build is turned back into version 1
+        // through a second connection, then opened again.
+        let schema = common::fresh_schema();
+        let org = {
+            let mut store = Store::open_postgres(&url, Some(&schema)).unwrap();
+            let org = store.create_org("Acme", ACTOR).unwrap();
+            let team = store.create_team(&org.id, "Platform", ACTOR).unwrap();
+            let project = store.create_project(&team.id, "Checkout", ACTOR).unwrap();
+            store
+                .create_key(NewKey::secret(&project.id, "old"), ACTOR)
+                .unwrap();
+            org.id
+        };
+        let mut raw = postgres::Client::connect(&url, postgres::NoTls)
+            .expect("the test database accepts a plain connection (sslmode=disable)");
+        raw.batch_execute(&format!(
+            "SET search_path TO {schema}; ALTER TABLE keys DROP COLUMN allowed_models; \
+             UPDATE schema_meta SET version = 1"
+        ))
+        .unwrap();
+        drop(raw);
+        let mut store = Store::open_postgres(&url, Some(&schema)).unwrap();
+        let keys = store.keys(&org).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].allowed_models, None);
+        let mut new = NewKey::secret(&keys[0].project_id, "new");
+        new.allowed_models = Some(vec!["openai/*".into()]);
+        assert!(store.create_key(new, ACTOR).is_ok());
+        return;
+    }
+    let directory = dir("migrate");
+    let file = directory.join("control.db");
+    let f = {
+        let mut store = Store::open(&file).unwrap();
+        let org = store.create_org("Acme", ACTOR).unwrap();
+        let team = store.create_team(&org.id, "Platform", ACTOR).unwrap();
+        let project = store.create_project(&team.id, "Checkout", ACTOR).unwrap();
+        store
+            .create_key(NewKey::secret(&project.id, "old"), ACTOR)
+            .unwrap();
+        (store, org.id)
+    };
+    drop(f.0);
+    // Make it look like a version 1 file: no column, user_version 1.
+    {
+        let connection = rusqlite::Connection::open(&file).unwrap();
+        connection
+            .execute_batch("ALTER TABLE keys DROP COLUMN allowed_models; PRAGMA user_version = 1;")
+            .unwrap();
+    }
+    let mut store = Store::open(&file).unwrap();
+    let keys = store.keys(&f.1).unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].allowed_models, None);
+    let mut new = NewKey::secret(&keys[0].project_id, "new");
+    new.allowed_models = Some(vec!["openai/*".into()]);
+    assert!(store.create_key(new, ACTOR).is_ok());
+}

@@ -39,7 +39,7 @@ All bodies and answers are JSON (`application/json`); ids are the opaque ids of 
 | `GET /v1/orgs/{org}/teams` | | 200 `{teams: [...]}` |
 | `POST /v1/teams/{team}/projects` | `{name}` | 201 project |
 | `GET /v1/teams/{team}/projects` | | 200 `{projects: [...]}` |
-| `POST /v1/projects/{project}/keys` | `{name, credential?, tier?, rpm?, tpm?, budget_usd?, budget_window_secs?, budget_allow_unpriced?, allowed_cidrs?, expires_at?}` | 201 `{key, secret}` |
+| `POST /v1/projects/{project}/keys` | `{name, credential?, tier?, rpm?, tpm?, budget_usd?, budget_window_secs?, budget_allow_unpriced?, allowed_cidrs?, allowed_models?, expires_at?}` | 201 `{key, secret}` |
 | `GET /v1/orgs/{org}/keys` | | 200 `{keys: [...]}` |
 | `GET /v1/keys/{key}` | | 200 key |
 | `POST /v1/keys/{key}/revoke` | | 200 key |

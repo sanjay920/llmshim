@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 pub mod api;
 mod db;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -83,6 +83,9 @@ pub struct NewKey {
     pub budget_window_secs: Option<u64>,
     pub budget_allow_unpriced: bool,
     pub allowed_cidrs: Option<Vec<String>>,
+    /// The models the key may call (data-plane note 0028): `provider/model`, `prefix/*` or
+    /// `route/<name>`. `None` is no restriction; an empty list is an error.
+    pub allowed_models: Option<Vec<String>>,
     /// RFC 3339.
     pub expires_at: Option<String>,
 }
@@ -100,6 +103,7 @@ impl NewKey {
             budget_window_secs: None,
             budget_allow_unpriced: false,
             allowed_cidrs: None,
+            allowed_models: None,
             expires_at: None,
         }
     }
@@ -141,6 +145,7 @@ pub struct KeyRecord {
     pub budget_window_secs: Option<u64>,
     pub budget_allow_unpriced: bool,
     pub allowed_cidrs: Option<Vec<String>>,
+    pub allowed_models: Option<Vec<String>>,
     pub created_at: String,
     pub revoked_at: Option<String>,
 }
@@ -232,7 +237,8 @@ fn digest(secret: &str) -> String {
 
 const KEY_COLUMNS: &str = "id, org_id, project_id, team_id, name, kind, state, sha256, \
     client_san, jwt_table, jwt_subject, expires_at, tier, rpm, tpm, budget_usd, \
-    budget_window_secs, budget_allow_unpriced, allowed_cidrs, created_at, revoked_at";
+    budget_window_secs, budget_allow_unpriced, allowed_cidrs, created_at, revoked_at, \
+    allowed_models";
 
 fn key_from_row(row: &Row) -> Result<KeyRecord> {
     let range = |what: &str| Error::Invalid(format!("a stored {what} is out of range"));
@@ -241,6 +247,12 @@ fn key_from_row(row: &Row) -> Result<KeyRecord> {
     let allowed_cidrs = match row.opt_text(18)? {
         Some(text) => Some(serde_json::from_str::<Vec<String>>(&text).map_err(|_| {
             Error::Invalid("a stored allowed_cidrs is not a list of strings".into())
+        })?),
+        None => None,
+    };
+    let allowed_models = match row.opt_text(21)? {
+        Some(text) => Some(serde_json::from_str::<Vec<String>>(&text).map_err(|_| {
+            Error::Invalid("a stored allowed_models is not a list of strings".into())
         })?),
         None => None,
     };
@@ -276,6 +288,7 @@ fn key_from_row(row: &Row) -> Result<KeyRecord> {
             .map_err(|_| range("budget_window_secs"))?,
         budget_allow_unpriced: row.int(17)? != 0,
         allowed_cidrs,
+        allowed_models,
         created_at: row.text(19)?,
         revoked_at: row.opt_text(20)?,
     })
@@ -345,6 +358,21 @@ fn check_fields(new: &NewKey) -> Result<()> {
         for cidr in cidrs {
             if llmshim::serve::allowlist::Cidr::parse(cidr).is_err() {
                 return invalid("allowed_cidrs holds an entry that is not an address or CIDR");
+            }
+        }
+    }
+    if let Some(models) = &new.allowed_models {
+        if models.is_empty() {
+            return invalid("allowed_models is empty, which would refuse every request; omit it");
+        }
+        if models.len() > 256 {
+            return invalid("allowed_models holds more than 256 entries");
+        }
+        for entry in models {
+            if llmshim::gateway::auth::model_entry_problem(entry).is_some() {
+                return invalid(
+                    "allowed_models holds an entry that is not provider/model, provider/* or route/<name>",
+                );
             }
         }
     }
@@ -485,6 +513,15 @@ impl Store {
                             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                             .map_err(|e| Error::Database(e.to_string()))?;
                     }
+                    1 => {
+                        // Version 2 added keys.allowed_models.
+                        connection
+                            .execute_batch(
+                                "BEGIN; ALTER TABLE keys ADD COLUMN allowed_models TEXT; \
+                                 PRAGMA user_version = 2; COMMIT;",
+                            )
+                            .map_err(|e| Error::Database(e.to_string()))?;
+                    }
                     SCHEMA_VERSION => {}
                     other => {
                         return Err(Error::Invalid(format!(
@@ -513,6 +550,13 @@ impl Store {
                     None => {
                         tx.batch_execute(&schema(true)).map_err(fail)?;
                         tx.execute("INSERT INTO schema_meta (version) VALUES ($1)", &[&SCHEMA_VERSION])
+                            .map_err(fail)?;
+                    }
+                    Some(1) => {
+                        // Version 2 added keys.allowed_models.
+                        tx.batch_execute("ALTER TABLE keys ADD COLUMN allowed_models TEXT")
+                            .map_err(fail)?;
+                        tx.execute("UPDATE schema_meta SET version = $1", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }
                     Some(SCHEMA_VERSION) => {}
@@ -730,6 +774,7 @@ impl Store {
                 budget_window_secs: old.budget_window_secs,
                 budget_allow_unpriced: old.budget_allow_unpriced,
                 allowed_cidrs: old.allowed_cidrs.clone(),
+                allowed_models: old.allowed_models.clone(),
                 expires_at: old.expires_at.clone(),
             };
             let (successor_id, secret) = create_key_in(tx, &successor, actor)?;
@@ -940,13 +985,18 @@ fn create_key_in(tx: &mut dyn Exec, new: &NewKey, actor: &str) -> Result<(String
         .allowed_cidrs
         .as_ref()
         .map(|c| serde_json::to_string(c).unwrap_or_default());
+    let models = new
+        .allowed_models
+        .as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_default());
     tx.exec(
         &format!(
             "INSERT INTO keys (id, org_id, project_id, team_id, name, kind, state, sha256, \
              client_san, jwt_table, jwt_subject, expires_at, tier, rpm, tpm, budget_usd, \
-             budget_window_secs, budget_allow_unpriced, allowed_cidrs, created_at, revoked_at, seq) \
+             budget_window_secs, budget_allow_unpriced, allowed_cidrs, created_at, revoked_at, \
+             allowed_models, seq) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-             ?16, ?17, ?18, ?19, NULL, {})",
+             ?16, ?17, ?18, ?19, NULL, ?20, {})",
             next_seq("keys")
         ),
         &[
@@ -969,6 +1019,7 @@ fn create_key_in(tx: &mut dyn Exec, new: &NewKey, actor: &str) -> Result<(String
             i(i64::from(new.budget_allow_unpriced)),
             ot(cidrs.as_deref()),
             t(&created_at),
+            ot(models.as_deref()),
         ],
     )
     .map_err(|error| match error {
@@ -1036,6 +1087,10 @@ fn payload_in(tx: &mut dyn Exec, org_id: &str) -> Result<Value> {
         set("budget_usd", json!(key.budget_usd));
         set("budget_window_secs", json!(key.budget_window_secs));
         set("allowed_cidrs", json!(key.allowed_cidrs));
+        // Emitted only when set: a snapshot without it is the one older data planes read.
+        if key.allowed_models.is_some() {
+            set("allowed_models", json!(key.allowed_models));
+        }
         keys.push(entry);
     }
     Ok(json!({
@@ -1085,6 +1140,7 @@ CREATE TABLE keys (
     budget_usd {real}, budget_window_secs {int},
     budget_allow_unpriced {int} NOT NULL DEFAULT 0,
     allowed_cidrs TEXT,
+    allowed_models TEXT,
     created_at TEXT NOT NULL,
     revoked_at TEXT,
     seq {int} NOT NULL,
