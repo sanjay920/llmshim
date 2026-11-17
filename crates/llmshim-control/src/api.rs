@@ -252,6 +252,7 @@ struct KeyBody {
     #[serde(default)]
     budget_allow_unpriced: bool,
     allowed_cidrs: Option<Vec<String>>,
+    allowed_models: Option<Vec<String>>,
     expires_at: Option<String>,
 }
 
@@ -359,6 +360,7 @@ async fn create_key(
         budget_window_secs: b.budget_window_secs,
         budget_allow_unpriced: b.budget_allow_unpriced,
         allowed_cidrs: b.allowed_cidrs,
+        allowed_models: b.allowed_models,
         expires_at: b.expires_at,
     };
     let made = with_store(&s, move |st| st.create_key(new, &actor)).await?;
