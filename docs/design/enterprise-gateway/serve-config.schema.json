@@ -126,6 +126,58 @@
       ],
       "type": "object"
     },
+    "DeploymentConfig": {
+      "additionalProperties": false,
+      "description": "`[deployments.<name>]`: one name, several targets (design note 0031).",
+      "properties": {
+        "strategy": {
+          "$ref": "#/$defs/DeploymentStrategy",
+          "description": "How a target is chosen: `round_robin` (the default), `weighted`, `ordered` (a primary and\nstandbys) or `conversation` (one conversation keeps one target)."
+        },
+        "targets": {
+          "description": "The targets, 1 to 16, each a `provider/model` of a configured provider.",
+          "items": {
+            "$ref": "#/$defs/DeploymentTarget"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "targets"
+      ],
+      "type": "object"
+    },
+    "DeploymentStrategy": {
+      "enum": [
+        "round_robin",
+        "weighted",
+        "ordered",
+        "conversation"
+      ],
+      "type": "string"
+    },
+    "DeploymentTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "description": "`provider/model`, with a provider from `[providers.*]`; never a `route/` or `deployment/`\nstring.",
+          "type": "string"
+        },
+        "weight": {
+          "default": null,
+          "description": "1 to 1000, with `weighted` or `conversation`; default 1.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
     "Fleet": {
       "additionalProperties": false,
       "description": "Fleet mode. Requires a binary built with `--features serve-redis`.",
@@ -1156,6 +1208,13 @@
         }
       ],
       "description": "Take the caller keys from a signed policy snapshot (0024) instead of\n`[[keys]]`. The two cannot be combined. Fixed at start, except that a\nsnapshot file's content reloads like keys do."
+    },
+    "deployments": {
+      "additionalProperties": {
+        "$ref": "#/$defs/DeploymentConfig"
+      },
+      "description": "Named deployments: `deployment/<name>` resolves, per request, to one of several targets\n(design note 0031). Reloads with the providers and routes.",
+      "type": "object"
     },
     "fleet": {
       "anyOf": [

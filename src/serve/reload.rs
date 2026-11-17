@@ -695,7 +695,7 @@ fn document_without_reloadable(text: &str, format: Format) -> Result<Value, Stri
     if let Value::Object(table) = &mut document {
         // `tenants` (budgets, note 0030) reload with the keys: a tenant's cap is part of
         // the identity of every key under it.
-        for name in ["keys", "tenants", "providers", "routes"] {
+        for name in ["keys", "tenants", "providers", "routes", "deployments"] {
             table.remove(name);
         }
         // A verify key can be added or removed without a restart (0024): the next
@@ -722,7 +722,11 @@ fn document_without_reloadable(text: &str, format: Format) -> Result<Value, Stri
 fn reloadable_parts(text: &str, format: Format) -> Result<(Value, Value), String> {
     let document = parse_document(text, format)?;
     let part = |name: &str| document.get(name).cloned().unwrap_or(Value::Null);
-    Ok((part("providers"), part("routes")))
+    // Deployments rebuild the router like routes do, so they travel with them (note 0031).
+    Ok((
+        part("providers"),
+        serde_json::json!({"routes": part("routes"), "deployments": part("deployments")}),
+    ))
 }
 
 /// What the provider rate limits are, as text to compare: the values only.

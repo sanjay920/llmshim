@@ -825,6 +825,29 @@ fn build_router_with(
             },
         );
     }
+    for (name, deployment) in &config.deployments {
+        use crate::deployment::{Deployment, Strategy, Target};
+        use crate::serve::config::DeploymentStrategy;
+        router = router.deployment(
+            name,
+            Deployment::new(
+                match deployment.strategy {
+                    DeploymentStrategy::RoundRobin => Strategy::RoundRobin,
+                    DeploymentStrategy::Weighted => Strategy::Weighted,
+                    DeploymentStrategy::Ordered => Strategy::Ordered,
+                    DeploymentStrategy::Conversation => Strategy::Conversation,
+                },
+                deployment
+                    .targets
+                    .iter()
+                    .map(|target| Target {
+                        model: target.model.clone(),
+                        weight: target.weight.unwrap_or(1),
+                    })
+                    .collect(),
+            ),
+        );
+    }
     router
 }
 

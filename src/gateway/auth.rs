@@ -71,28 +71,29 @@ pub struct TenantBudget {
 }
 
 impl Identity {
-    /// Whether the key may call `provider`'s `model`. `route` is the route name the
-    /// request addressed, if it addressed one (`route/<name>` in the list admits it).
-    pub fn permits_model(&self, provider: &str, model: &str, route: Option<&str>) -> bool {
+    /// Whether the key may call `provider`'s `model`. `alias` is the route or deployment the
+    /// request addressed, if it addressed one, as the caller wrote it (`route/<name>` or
+    /// `deployment/<name>`): a list that names it admits the request (note 0028, 0031).
+    pub fn permits_model(&self, provider: &str, model: &str, alias: Option<&str>) -> bool {
         let Some(list) = &self.allowed_models else {
             return true;
         };
         let id = format!("{provider}/{model}");
         list.iter()
-            .any(|entry| model_entry_matches(entry, &id, route))
+            .any(|entry| model_entry_matches(entry, &id, alias))
     }
 }
 
-/// One allowlist entry against a routing id and the route the request addressed
-/// (`route/<name>`): exact, or a `prefix/*` entry (the separator is part of the
-/// prefix). A route is matched as its own `route/<name>` id, so `route/*` admits
-/// routes and never a model.
-pub(crate) fn model_entry_matches(entry: &str, id: &str, route: Option<&str>) -> bool {
+/// One allowlist entry against a routing id and the route or deployment the request addressed
+/// (`route/<name>`, `deployment/<name>`): exact, or a `prefix/*` entry (the separator is part
+/// of the prefix). An alias is matched as its own id, so `route/*` and `deployment/*` admit
+/// those names and never a model.
+pub(crate) fn model_entry_matches(entry: &str, id: &str, alias: Option<&str>) -> bool {
     let matches = |candidate: &str| match entry.strip_suffix('*') {
         Some(prefix) => candidate.starts_with(prefix),
         None => entry == candidate,
     };
-    matches(id) || route.is_some_and(|name| matches(&format!("route/{name}")))
+    matches(id) || alias.is_some_and(matches)
 }
 
 /// Why an `allowed_models` entry is refused, or `None` when it is well formed.
@@ -894,13 +895,13 @@ mod tests {
         assert!(!id.permits_model("openrouter", "anthropicx/model", None));
         assert!(!id.permits_model("openrouter-b", "anthropic/model", None));
         // A route is admitted by its own name, and naming a model never admits a route.
-        assert!(id.permits_model("openai", "gpt-6-sol", Some("cheap")));
-        assert!(!id.permits_model("openai", "gpt-6-sol", Some("dear")));
+        assert!(id.permits_model("openai", "gpt-6-sol", Some("route/cheap")));
+        assert!(!id.permits_model("openai", "gpt-6-sol", Some("route/dear")));
         let by_model = restricted(&["openai/gpt-6-sol"]);
         assert!(by_model.permits_model("openai", "gpt-6-sol", None));
         // `route/*` admits routes and never a model.
         let routes = restricted(&["route/*"]);
-        assert!(routes.permits_model("openai", "anything", Some("x")));
+        assert!(routes.permits_model("openai", "anything", Some("route/x")));
         assert!(!routes.permits_model("openai", "anything", None));
         // No list, no restriction.
         let mut open = restricted(&[]);

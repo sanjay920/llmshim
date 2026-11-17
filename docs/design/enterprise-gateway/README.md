@@ -139,7 +139,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Key tags on usage records (0029): `keys[].tags` onto usage records, also in control-plane keys and snapshots
 - [ ] Tenant budgets above key budgets (0030): slices 2 to 5 built (file table, single-instance and Redis ledgers, outage interplay for keys with no cap of their own, team budgets through the control plane); a lease for a key's own cap, reload `started_at` and a refusal-level label are not built
 - [ ] Alerts, scheduled cost exports
-- [ ] Deployments and load balancing across credentials and regions: designed in 0031; not built
+- [ ] Deployments and load balancing across credentials and regions (0031): slice 2 built (selection over distinct providers, four strategies, health with probes, allowlist and usage field); failover, stats, and two accounts of one hosted vendor (a provider-identity prerequisite) remain
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
 - [ ] Audit log
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy

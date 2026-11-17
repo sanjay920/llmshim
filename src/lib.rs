@@ -10,6 +10,7 @@ pub mod config;
 pub mod cost;
 pub mod credentials;
 mod default_secret_file;
+pub mod deployment;
 mod derived_response;
 pub mod embeddings;
 pub mod env;

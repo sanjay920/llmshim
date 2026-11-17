@@ -56,12 +56,19 @@ pub fn parse_model(model: &str, aliases: &HashMap<String, String>) -> Result<(St
 /// — without any of them learning a new field.
 pub const ROUTE_PREFIX: &str = "route/";
 
+/// Prefix of a model string that names a deployment: one name, several targets (design note
+/// 0031). Resolved once, by [`Router::expand_route`], to one concrete `provider/model`.
+pub const DEPLOYMENT_PREFIX: &str = "deployment/";
+
 /// Registry of configured providers.
 pub struct Router {
     providers: HashMap<String, std::sync::Arc<dyn Provider>>,
     pub aliases: HashMap<String, String>,
     /// Caller-defined named routes. llmshim never interprets a name.
     routes: BTreeMap<String, Route>,
+    /// Named deployments (note 0031). Their balancing state is per router: a reload that
+    /// builds a new router starts it fresh.
+    deployments: BTreeMap<String, crate::deployment::Deployment>,
     /// Provider health. Separate from rate-limit backoff: see `crate::breaker`.
     breaker: Arc<ProviderBreaker>,
     ambient_proxy: bool,
@@ -161,6 +168,7 @@ impl Router {
             providers: HashMap::new(),
             aliases: HashMap::new(),
             routes: BTreeMap::new(),
+            deployments: BTreeMap::new(),
             breaker: Arc::new(ProviderBreaker::from_env()),
             ambient_proxy: true,
             http_client: None,
@@ -205,6 +213,18 @@ impl Router {
     pub fn route(mut self, name: &str, route: Route) -> Self {
         self.routes.insert(name.to_string(), route);
         self
+    }
+
+    /// Register a deployment: `deployment/<name>` then resolves, per request, to one of its
+    /// targets (design note 0031).
+    pub fn deployment(mut self, name: &str, deployment: crate::deployment::Deployment) -> Self {
+        self.deployments.insert(name.to_string(), deployment);
+        self
+    }
+
+    /// The configured deployment names, in order.
+    pub fn deployment_names(&self) -> Vec<&str> {
+        self.deployments.keys().map(String::as_str).collect()
     }
 
     /// Replace the provider-health breaker — how the proxy attaches a
@@ -268,6 +288,35 @@ impl Router {
         let Some(model) = request.get("model").and_then(serde_json::Value::as_str) else {
             return Ok(Cow::Borrowed(request));
         };
+        if let Some(name) = model.strip_prefix(DEPLOYMENT_PREFIX) {
+            let deployment =
+                self.deployments
+                    .get(name)
+                    .ok_or_else(|| ShimError::ProviderError {
+                        status: 400,
+                        body: format!(
+                            "unknown deployment: {name:?} (configured: {:?})",
+                            self.deployment_names()
+                        ),
+                        retry_after: None,
+                    })?;
+            // A target whose circuit is open is skipped; one whose cooldown has passed is
+            // probed (a real request goes through, because an open circuit closes only when a
+            // dispatch records a success). Local health only: the shared view is asynchronous.
+            let now = std::time::Instant::now();
+            let usable = |target: &str| match self.resolve(target) {
+                Ok((provider, _)) => {
+                    let name = provider.name();
+                    !self.breaker.should_skip(name) || self.breaker.try_admit_probe(name, now)
+                }
+                // A target that no longer resolves is the file's problem, not health.
+                Err(_) => true,
+            };
+            let target = deployment.pick(&usable, crate::deployment::conversation_hash(request));
+            let mut expanded = request.clone();
+            expanded["model"] = serde_json::json!(target.model);
+            return Ok(Cow::Owned(expanded));
+        }
         let Some(route) = self.route_target(model)? else {
             return Ok(Cow::Borrowed(request));
         };
@@ -470,6 +519,15 @@ impl Router {
     }
 
     fn resolve_key(&self, model: &str) -> Result<(String, String)> {
+        // A deployment is resolved once, by `expand_route`, and its pick written into the request;
+        // resolving the name here would pick a second time (note 0031).
+        if model.starts_with(DEPLOYMENT_PREFIX) {
+            return Err(ShimError::ProviderError {
+                status: 400,
+                body: "a deployment name is resolved when the request is prepared, not here".into(),
+                retry_after: None,
+            });
+        }
         // A named route resolves to its model before anything else, so every
         // caller of `resolve` — including the proxy's admission control — sees
         // the real provider rather than skipping rate limiting on an

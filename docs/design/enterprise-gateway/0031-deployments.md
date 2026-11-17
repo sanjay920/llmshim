@@ -1,6 +1,6 @@
 # 0031: Deployments: one name, several targets
 
-Status: design, 2026-11-17. A contract note, written before any code (README working rule 3): a file
+Status: slice 2 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a file
 table, a model-string prefix, an allowlist rule, a usage-record field and a failure behavior become
 promises. It is the roadmap item "deployments and load balancing across credentials and regions".
 Nothing here is started.
@@ -210,3 +210,33 @@ slice, stated now so slice 2's shape allows it:
 - Affinity for prompt caching.
 - Whether a deployment may carry settings of its own (today routes carry them and do not chain, so a
   default-settings deployment would be two names for one thing).
+
+## As built (slice 2): selection
+
+- `crate::deployment` (`Deployment`, `Strategy`, `Target`): `round_robin`, `weighted` (smooth), `ordered`,
+  `conversation` (weighted rendezvous hashing on a hash of the request's first two messages; the tenant
+  is not in the request value `expand_route` sees, so the hash is over the messages alone). `pick` takes a
+  `usable(target)` closure and ignores health when nothing is usable.
+- `Router::deployment(name, Deployment)` registers one; `Router::expand_route` picks **once** and writes the
+  concrete `provider/model` into the request. Its `usable` asks the local breaker with `provider.name()`
+  (the name admission uses) and **probes** a target past its cooldown (`try_admit_probe`), so a skipped
+  target can close again. `resolve`, `resolve_key` and `routing_id` return a 400 for a `deployment/` string.
+- The gateway's allowlist check resolves the **prepared payload's** model, with `route/<name>` and
+  `deployment/<name>` as aliases that a list can name (`Identity::permits_model` now takes the alias as
+  the caller wrote it). Idempotency fingerprints the caller's model string for a deployment. The scope
+  carries the deployment name for the usage record's new `deployment` field; a counter
+  `llmshim_gateway_deployment_selected_total{deployment,target}` counts picks.
+- `[deployments.<name>]` in the file (`strategy`, `targets[]` with `model` and `weight`), validated by path
+  (1 to 16 targets, a configured provider, no `route/` or `deployment/` target, no duplicates, a weight
+  only with `weighted` or `conversation`, 1 to 1000, a name that is not a route's); it reloads with the
+  providers and routes (`document_without_reloadable`, `reloadable_parts` and the router print carry it,
+  and a change is reported as `routes`).
+- Tests: the selector (weights over a period and interleaved, round robin, ordered, health, affinity and
+  re-homing only the skipped target's conversations), the router (one pick, the name refused elsewhere,
+  an open circuit skipped, all-open ignores health, a probe recovers a target; removing the probe fails
+  it), and a process test over two mock providers (the 6:2 ratio of 3:1, the usage record, the allowlist
+  against the pick and a list naming the deployment, an idempotent retry that replays, a reload that removes
+  a target, unknown names, path validation). Matching the allowlist against anything but the prepared
+  payload fails the allowlist test.
+- Still the prerequisite named above: two accounts of one hosted vendor cannot be targets. Failover (slice
+  3) and the stats status (slice 4) are not built.

@@ -1166,13 +1166,24 @@ fn build_request(
     if identity.allowed_models.is_some() {
         // The routing id of what the request addressed, once routes and aliases are
         // resolved: what the key's list is matched against (note 0028).
-        let (provider_key, model) = snapshot.routing_id(&req.model).map_err(ApiError::from)?;
-        let route = req.model.strip_prefix("route/");
+        // Matched against the model the PREPARED request carries: a deployment was resolved to one
+        // target by `expand_route`, and resolving the name again here would pick a second time and
+        // could disagree with what is dispatched (note 0031).
+        let prepared_model = prepared_request
+            .payload
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (provider_key, model) = snapshot
+            .routing_id(prepared_model)
+            .map_err(ApiError::from)?;
+        let alias = (req.model.starts_with("route/") || req.model.starts_with("deployment/"))
+            .then_some(req.model.as_str());
         if !request_models_allowed(
             identity,
             &provider_key,
             &model,
-            route,
+            alias,
             &prepared_request.payload,
         ) {
             crate::gateway::metrics::incr(
@@ -1181,6 +1192,22 @@ fn build_request(
             );
             return Err(model_not_allowed());
         }
+    }
+    if let Some(name) = req.model.strip_prefix("deployment/") {
+        crate::gateway::metrics::incr(
+            crate::gateway::metrics::DEPLOYMENT_SELECTED,
+            &[
+                ("deployment", name),
+                (
+                    "target",
+                    prepared_request
+                        .payload
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ),
+            ],
+        );
     }
     let provider_name = prepared_request.target.provider_name.clone();
     let budget_model = prepared_request.target.model.clone();
@@ -1201,7 +1228,7 @@ fn request_models_allowed(
     identity: &crate::gateway::auth::Identity,
     provider_key: &str,
     model: &str,
-    route: Option<&str>,
+    alias: Option<&str>,
     payload: &Value,
 ) -> bool {
     // Only OpenRouter reads `x-openrouter`: its fallback list names more models than the
@@ -1218,7 +1245,7 @@ fn request_models_allowed(
                 }),
                 Some(_) => false,
             });
-    identity.permits_model(provider_key, model, route) && fallbacks_allowed
+    identity.permits_model(provider_key, model, alias) && fallbacks_allowed
 }
 
 /// 403 for a model outside the key's `allowed_models` (note 0028). It names no
@@ -1372,12 +1399,21 @@ async fn chat(
         build_request(&state, &headers, &req, preselected)?;
     let identity = &identified_caller.identity;
     let idempotency_context = idem_key.as_ref().map(|client_key| {
+        // A deployment's pick is in the payload; fingerprinting that would make a retry that picks
+        // the other target a 409. The caller's own model string stands in for it (note 0031).
+        let payload = if req.model.starts_with("deployment/") {
+            let mut caller_view = gw.payload.clone();
+            caller_view["model"] = json!(req.model);
+            std::borrow::Cow::Owned(caller_view)
+        } else {
+            std::borrow::Cow::Borrowed(&gw.payload)
+        };
         crate::gateway::idempotency::IdempotencyContext::new(
             &identity.tenant,
             &identified_caller.credential_scope,
             uri.path(),
             client_key,
-            &gw.payload,
+            &payload,
         )
     });
     #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
@@ -1387,7 +1423,11 @@ async fn chat(
         .map_err(|error| gateway_err_to_api(&state, error))?;
     #[cfg(feature = "serve")]
     if state.attempt_coordinator.records_usage() {
-        policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
+        policy_scope.attribute(
+            &identified_caller.credential_scope,
+            request_id_of(&headers),
+            req.model.strip_prefix("deployment/"),
+        );
     }
     state.pin_router(&mut policy_scope, snapshot);
     let prepared_submission = state
@@ -1486,7 +1526,11 @@ async fn chat_stream_inner(
     };
     #[cfg(feature = "serve")]
     if state.attempt_coordinator.records_usage() {
-        policy_scope.attribute(&identified_caller.credential_scope, request_id_of(&headers));
+        policy_scope.attribute(
+            &identified_caller.credential_scope,
+            request_id_of(&headers),
+            req.model.strip_prefix("deployment/"),
+        );
     }
     state.pin_router(&mut policy_scope, snapshot);
     let prepared_submission = match state.prepare_submission(gw, policy_scope, true) {

@@ -30,6 +30,9 @@ pub const UPSTREAM_LATENCY: &str = "llmshim_gateway_upstream_latency_ms";
 /// Current queue depth (gauge, label: provider) — set at scrape time.
 pub const QUEUE_DEPTH: &str = "llmshim_gateway_queue_depth";
 
+/// Requests resolved to a deployment's target (counter, labels: deployment, target). The label sets
+/// are the configured names, so their cardinality is bounded by the file (note 0031).
+pub const DEPLOYMENT_SELECTED: &str = "llmshim_gateway_deployment_selected_total";
 /// 1 while this replica admits requests from a lease because Redis is
 /// unreachable (gauge) — set at scrape time. Only with `[fleet.outage_admission]`.
 pub const OUTAGE_ADMISSION_ACTIVE: &str = "llmshim_gateway_outage_admission_active";
