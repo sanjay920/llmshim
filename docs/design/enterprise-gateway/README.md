@@ -61,6 +61,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0025: No receipt lookup for an assistant turn that cannot have one](0025-no-lookup-without-a-receipt.md)
 - [0026: The control plane's HTTP API](0026-control-plane-api.md)
 - [0027: Bounded admission during a Redis outage](0027-bounded-admission-during-a-redis-outage.md)
+- [0028: Per-key model allowlists](0028-model-allowlists.md)
 
 ## Roadmap
 
@@ -131,7 +132,8 @@ Later phases (each needs its own design note before work starts)
       `[fleet.outage_admission]` (0027): a replica-owned spend lease taken while Redis is
       healthy, a second admission path against it, resumable settlement on recovery; the
       bound is on admitted reservations, not spend
-- [ ] Hierarchical budgets, model allowlists, tags, alerts, cost exports
+- [ ] Per-key model allowlists: designed in 0028; not built
+- [ ] Hierarchical budgets, tags, alerts, cost exports
 - [ ] Deployments and load balancing across credentials and regions
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
 - [ ] Audit log
