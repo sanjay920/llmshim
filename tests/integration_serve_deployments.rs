@@ -445,3 +445,50 @@ async fn a_request_addressed_to_a_target_is_never_moved() {
     east_mock.assert_async().await;
     west_mock.assert_async().await;
 }
+
+// ---- status (note 0031, slice 4) -------------------------------------------------------------
+
+async fn deployment_stats(server: &harness::Server) -> Value {
+    let stats: Value = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/gateway/stats",
+            server.admin.clone().expect("an [admin] listener")
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    stats["deployments"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stats_list_each_deployments_targets_and_a_tripped_circuit_shows_as_open() {
+    // Three 502s from east trip its breaker (the default threshold); west answers every retry.
+    let (east, _east_mock) = failing(502, 3).await;
+    let (west, _west_mock) = upstream(3).await;
+    let server = start(
+        &render(&east.url(), &west.url(), ORDERED, "", None),
+        "dep-stats",
+        &no_client_retries(),
+    );
+    let before = deployment_stats(&server).await;
+    assert_eq!(before[0]["name"], "chat");
+    assert_eq!(before[0]["strategy"], "ordered");
+    assert_eq!(before[0]["targets"][0]["model"], "east/m");
+    assert_eq!(before[0]["targets"][0]["circuit"], "closed");
+    for _ in 0..3 {
+        assert_eq!(
+            ask(&server.base, "deployment/chat", None).await.status(),
+            200
+        );
+    }
+    let after = deployment_stats(&server).await;
+    assert_eq!(after[0]["targets"][0]["circuit"], "open", "{after}");
+    assert_eq!(after[0]["targets"][1]["circuit"], "closed", "{after}");
+    // Nothing secret rides along: only the model, weight and circuit keys.
+    let keys: Vec<&String> = after[0]["targets"][0].as_object().unwrap().keys().collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+}

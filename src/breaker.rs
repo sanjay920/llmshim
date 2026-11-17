@@ -185,6 +185,16 @@ impl ProviderBreaker {
         )
     }
 
+    /// `closed`, `open` or `half_open`: what the breaker has seen of `target` on this instance
+    /// (status only; the shared fleet view is not consulted).
+    pub fn state_name(&self, target: &str) -> &'static str {
+        match self.lock().get(target) {
+            Some(TargetState::Open { .. }) => "open",
+            Some(TargetState::HalfOpen { .. }) => "half_open",
+            _ => "closed",
+        }
+    }
+
     /// Reserve the single half-open probe slot for `target`.
     ///
     /// `true` only when the target was open, its cooldown had elapsed, and this

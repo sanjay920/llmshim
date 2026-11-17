@@ -239,7 +239,7 @@ slice, stated now so slice 2's shape allows it:
   a target, unknown names, path validation). Matching the allowlist against anything but the prepared
   payload fails the allowlist test.
 - Two accounts of one hosted vendor are targets since 0032 (a named instance has its own admission identity). Failover (slice
-  3) and the stats status (slice 4) are not built.
+  3) is built; the stats status is under slice 4 below.
 
 ### Review changes (slice 2)
 
@@ -279,8 +279,7 @@ slice, stated now so slice 2's shape allows it:
   classification; treating a 400 as retryable fails the process test. (A provider 429 never reaches the
   classifier as a status: the dispatch maps it to a rate-limit marker first, so it is not retried by construction.)
 - **Not built:** failover for streaming requests (a failure before the first byte could be retried the same way;
-  the stream handler's structure needs its own change), the `/v1/gateway/stats` view of each deployment's targets
-  and circuit state (slice 4), and 0014 rows for failover.
+  the stream handler's structure needs its own change). The stats view is slice 4 below; 0014 has the failover rows.
 
 ### Review changes (slice 3)
 
@@ -298,3 +297,12 @@ slice, stated now so slice 2's shape allows it:
   Responses wire the reasoning replay filter ran for the first pick's target (the per-provider transform
   still drops anything foreign or from another account on the retry target, but the response's
   `reasoning_dropped` and `controls_dropped` describe the first target).
+
+### Status (slice 4)
+
+`/v1/gateway/stats` (admin listener) gains a `deployments` array, present only when the file has
+deployments: each entry is `{name, strategy, targets: [{model, weight, circuit}]}`. `circuit` is
+`closed`, `open` or `half_open`: what this replica's breaker has seen of the account the target is sent to
+(the provider instance, 0032); a fleet's shared health is not consulted, so replicas can differ. It carries no
+key, URL, tenant or credential, only the file's own model strings. Process test: three 502s from the first
+target show it `open`; pinning `state_name` to `closed` fails it.

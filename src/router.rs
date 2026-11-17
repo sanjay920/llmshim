@@ -254,6 +254,36 @@ impl Router {
         self.providers.get(key).map(|provider| provider.name())
     }
 
+    /// Each deployment's strategy and targets with the local circuit state of the account each
+    /// target is sent to, for status (note 0031).
+    pub fn deployment_overview(&self) -> Vec<serde_json::Value> {
+        self.deployments
+            .iter()
+            .map(|(name, deployment)| {
+                let targets: Vec<serde_json::Value> = deployment
+                    .targets()
+                    .iter()
+                    .map(|target| {
+                        let circuit = self
+                            .resolve(&target.model)
+                            .map(|(provider, _)| self.breaker.state_name(provider.instance()))
+                            .unwrap_or("unknown");
+                        serde_json::json!({
+                            "model": target.model,
+                            "weight": target.weight,
+                            "circuit": circuit,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "name": name,
+                    "strategy": deployment.strategy().name(),
+                    "targets": targets,
+                })
+            })
+            .collect()
+    }
+
     /// How many targets a deployment has (0 for an unknown name).
     pub fn deployment_target_count(&self, name: &str) -> usize {
         self.deployments
