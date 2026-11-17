@@ -414,7 +414,7 @@ impl RateLimitConfig {
     /// Every limit multiplied by `fraction` (0 to 1], rounded up, at least 1:
     /// one replica's share during an outage (design note 0027). An unset
     /// limit stays unset.
-    #[cfg(feature = "redis-coordination")]
+    #[cfg(all(feature = "gateway", feature = "redis-coordination"))]
     pub(crate) fn scaled(&self, fraction: f64) -> Self {
         let scale = |limit: Option<u32>| {
             limit.map(|value| ((f64::from(value) * fraction).ceil() as u32).max(1))
