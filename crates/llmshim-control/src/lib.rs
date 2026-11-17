@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 pub mod api;
 mod db;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -42,12 +42,23 @@ pub struct Org {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Team {
     pub id: String,
     pub org_id: String,
     pub name: String,
     pub created_at: String,
+    /// The team's budget over every key of the team (the data plane's tenant level, note 0030).
+    pub budget: Option<TeamBudget>,
+}
+
+/// A team's budget: the data plane's `[tenants.<name>]` (design note 0030), carried in the
+/// signed snapshot's tenant record when set.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TeamBudget {
+    pub budget_usd: f64,
+    pub budget_window_secs: Option<u64>,
+    pub budget_allow_unpriced: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -327,19 +338,34 @@ fn keys_of(tx: &mut dyn Exec, org_id: &str) -> Result<Vec<KeyRecord>> {
 
 fn teams_of(tx: &mut dyn Exec, org_id: &str) -> Result<Vec<Team>> {
     tx.query(
-        "SELECT id, org_id, name, created_at FROM teams WHERE org_id = ?1 ORDER BY seq",
+        "SELECT id, org_id, name, created_at, budget_usd, budget_window_secs, \
+         budget_allow_unpriced FROM teams WHERE org_id = ?1 ORDER BY seq",
         &[t(org_id)],
     )?
     .iter()
-    .map(|row| {
-        Ok(Team {
-            id: row.text(0)?,
-            org_id: row.text(1)?,
-            name: row.text(2)?,
-            created_at: row.text(3)?,
-        })
-    })
+    .map(team_from_row)
     .collect()
+}
+
+fn team_from_row(row: &Row) -> Result<Team> {
+    let budget =
+        match row.opt_real(4)? {
+            Some(budget_usd) => Some(TeamBudget {
+                budget_usd,
+                budget_window_secs: row.opt_int(5)?.map(u64::try_from).transpose().map_err(
+                    |_| Error::Invalid("a stored team budget window is out of range".into()),
+                )?,
+                budget_allow_unpriced: row.int(6)? != 0,
+            }),
+            None => None,
+        };
+    Ok(Team {
+        id: row.text(0)?,
+        org_id: row.text(1)?,
+        name: row.text(2)?,
+        created_at: row.text(3)?,
+        budget,
+    })
 }
 
 /// The rules a data plane applies to a key that need no knowledge of its configuration, so a
@@ -535,7 +561,7 @@ impl Store {
                             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                             .map_err(|e| Error::Database(e.to_string()))?;
                     }
-                    1 | 2 => {
+                    1..=3 => {
                         // Version 2 added keys.allowed_models, version 3 keys.tags. Re-read the
                         // version under the write lock: another process starting at the same
                         // time may have migrated while this one waited.
@@ -558,6 +584,19 @@ impl Store {
                                 .execute_batch(
                                     "ALTER TABLE keys ADD COLUMN tags TEXT; \
                                      PRAGMA user_version = 3;",
+                                )
+                                .map_err(db_err)?;
+                            now = 3;
+                        }
+                        if now == 3 {
+                            // Version 4: a team's budget (note 0030).
+                            connection
+                                .execute_batch(
+                                    "ALTER TABLE teams ADD COLUMN budget_usd REAL; \
+                                     ALTER TABLE teams ADD COLUMN budget_window_secs INTEGER; \
+                                     ALTER TABLE teams ADD COLUMN budget_allow_unpriced \
+                                         INTEGER NOT NULL DEFAULT 0; \
+                                     PRAGMA user_version = 4;",
                                 )
                                 .map_err(db_err)?;
                         }
@@ -593,14 +632,23 @@ impl Store {
                         tx.execute("INSERT INTO schema_meta (version) VALUES ($1)", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }
-                    Some(version @ (1 | 2)) => {
-                        // Version 2 added keys.allowed_models, version 3 keys.tags.
+                    Some(version @ (1..=3)) => {
+                        // Version 2 added keys.allowed_models, 3 keys.tags, 4 a team's budget.
                         if version == 1 {
                             tx.batch_execute("ALTER TABLE keys ADD COLUMN allowed_models TEXT")
                                 .map_err(fail)?;
                         }
-                        tx.batch_execute("ALTER TABLE keys ADD COLUMN tags TEXT")
-                            .map_err(fail)?;
+                        if version <= 2 {
+                            tx.batch_execute("ALTER TABLE keys ADD COLUMN tags TEXT")
+                                .map_err(fail)?;
+                        }
+                        tx.batch_execute(
+                            "ALTER TABLE teams ADD COLUMN budget_usd DOUBLE PRECISION; \
+                             ALTER TABLE teams ADD COLUMN budget_window_secs BIGINT; \
+                             ALTER TABLE teams ADD COLUMN budget_allow_unpriced \
+                                 BIGINT NOT NULL DEFAULT 0",
+                        )
+                        .map_err(fail)?;
                         tx.execute("UPDATE schema_meta SET version = $1", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }
@@ -650,6 +698,7 @@ impl Store {
             org_id: org_id.into(),
             name: name.into(),
             created_at: now(),
+            budget: None,
         };
         self.backend.transaction(true, |tx| {
             require_in(tx, "orgs", org_id)?;
@@ -732,6 +781,76 @@ impl Store {
                 })
             })
             .collect()
+        })
+    }
+
+    /// Set (or, with `None`, clear) a team's budget: the cap over every key of the team that the
+    /// data plane applies as a tenant budget (note 0030), with the data plane's own bounds.
+    pub fn set_team_budget(
+        &mut self,
+        team_id: &str,
+        budget: Option<TeamBudget>,
+        actor: &str,
+    ) -> Result<Team> {
+        actor_check(actor)?;
+        if let Some(b) = &budget {
+            if !b.budget_usd.is_finite()
+                || !(0.0..=llmshim::serve::config::MAX_BUDGET_USD).contains(&b.budget_usd)
+            {
+                return Err(Error::Invalid(format!(
+                    "budget_usd must be between 0 and {}",
+                    llmshim::serve::config::MAX_BUDGET_USD
+                )));
+            }
+            if b.budget_window_secs.is_some_and(|secs| {
+                !(1..=llmshim::serve::config::MAX_BUDGET_WINDOW_SECS).contains(&secs)
+            }) {
+                return Err(Error::Invalid(format!(
+                    "budget_window_secs must be between 1 and {}",
+                    llmshim::serve::config::MAX_BUDGET_WINDOW_SECS
+                )));
+            }
+        }
+        self.backend.transaction(true, |tx| {
+            require_in(tx, "teams", team_id)?;
+            tx.exec(
+                "UPDATE teams SET budget_usd = ?2, budget_window_secs = ?3, \
+                 budget_allow_unpriced = ?4 WHERE id = ?1",
+                &[
+                    t(team_id),
+                    of(budget.as_ref().map(|b| b.budget_usd)),
+                    oi(budget
+                        .as_ref()
+                        .and_then(|b| b.budget_window_secs)
+                        .map(|v| v as i64)),
+                    i(i64::from(
+                        budget.as_ref().is_some_and(|b| b.budget_allow_unpriced),
+                    )),
+                ],
+            )?;
+            history(
+                tx,
+                actor,
+                if budget.is_some() {
+                    "team.budget_set"
+                } else {
+                    "team.budget_cleared"
+                },
+                team_id,
+                json!({"budget_usd": budget.as_ref().map(|b| b.budget_usd),
+                    "budget_window_secs": budget.as_ref().and_then(|b| b.budget_window_secs),
+                    "budget_allow_unpriced":
+                        budget.as_ref().is_some_and(|b| b.budget_allow_unpriced)}),
+            )?;
+            let rows = tx.query(
+                "SELECT id, org_id, name, created_at, budget_usd, budget_window_secs, \
+                 budget_allow_unpriced FROM teams WHERE id = ?1",
+                &[t(team_id)],
+            )?;
+            team_from_row(
+                rows.first()
+                    .ok_or_else(|| Error::NotFound(format!("teams {team_id}")))?,
+            )
         })
     }
 
@@ -1102,7 +1221,20 @@ fn payload_in(tx: &mut dyn Exec, org_id: &str) -> Result<Value> {
         .int(0)?;
     let teams: Vec<Value> = teams_of(tx, org_id)?
         .into_iter()
-        .map(|team| json!({"id": team.id, "name": team.name}))
+        .map(|team| {
+            let mut entry = json!({"id": team.id, "name": team.name});
+            // Emitted only when set: a snapshot without a budget is the one older data planes read.
+            if let (Some(budget), Some(object)) = (&team.budget, entry.as_object_mut()) {
+                object.insert("budget_usd".into(), json!(budget.budget_usd));
+                if let Some(window) = budget.budget_window_secs {
+                    object.insert("budget_window_secs".into(), json!(window));
+                }
+                if budget.budget_allow_unpriced {
+                    object.insert("budget_allow_unpriced".into(), json!(true));
+                }
+            }
+            entry
+        })
         .collect();
     let at = chrono::Utc::now();
     let mut keys = Vec::new();
@@ -1172,7 +1304,9 @@ CREATE TABLE orgs (
 );
 CREATE TABLE teams (
     id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id),
-    name TEXT NOT NULL, created_at TEXT NOT NULL, seq {int} NOT NULL
+    name TEXT NOT NULL, created_at TEXT NOT NULL, seq {int} NOT NULL,
+    budget_usd {real}, budget_window_secs {int},
+    budget_allow_unpriced {int} NOT NULL DEFAULT 0
 );
 CREATE TABLE projects (
     id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id),

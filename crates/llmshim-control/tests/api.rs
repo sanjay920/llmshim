@@ -556,3 +556,45 @@ async fn a_signing_key_other_users_can_read_is_refused() {
         StatusCode::CREATED
     );
 }
+
+#[tokio::test]
+async fn a_teams_budget_is_set_changed_cleared_and_refused_when_wrong() {
+    let api = Api::new(None);
+    let (org, team, _project) = api.tree().await;
+    let path = format!("/v1/teams/{team}/budget");
+    let set = api
+        .ok(
+            "PUT",
+            &path,
+            Some(json!({"budget_usd": 25.0, "budget_window_secs": 3600})),
+        )
+        .await;
+    assert_eq!(set.status, StatusCode::OK);
+    assert_eq!(set.json()["budget"]["budget_usd"], 25.0);
+    // The team list shows it.
+    let teams = api
+        .ok("GET", &format!("/v1/orgs/{org}/teams"), None)
+        .await
+        .json();
+    assert_eq!(teams["teams"][0]["budget"]["budget_window_secs"], 3600);
+    for body in [
+        json!({"budget_usd": -1.0}),
+        json!({"budget_usd": 1.0, "budget_window_secs": 0}),
+        json!({"budget_usd": 1.0, "surprise": true}),
+        json!({}),
+    ] {
+        let bad = api.ok("PUT", &path, Some(body.clone())).await;
+        assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    let missing = api
+        .ok(
+            "PUT",
+            "/v1/teams/team_nope/budget",
+            Some(json!({"budget_usd": 1.0})),
+        )
+        .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    let cleared = api.ok("DELETE", &path, None).await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert!(cleared.json()["budget"].is_null());
+}

@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -22,6 +22,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/v1/orgs"),
     ("post", "/v1/orgs/{org}/teams"),
     ("get", "/v1/orgs/{org}/teams"),
+    ("put", "/v1/teams/{team}/budget"),
+    ("delete", "/v1/teams/{team}/budget"),
     ("post", "/v1/teams/{team}/projects"),
     ("get", "/v1/teams/{team}/projects"),
     ("post", "/v1/projects/{project}/keys"),
@@ -320,6 +322,44 @@ async fn list_teams(
     Ok(Json(json!({"teams": teams})))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeamBudgetBody {
+    budget_usd: f64,
+    budget_window_secs: Option<u64>,
+    #[serde(default)]
+    budget_allow_unpriced: bool,
+}
+
+async fn set_team_budget(
+    State(s): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(team): Path<String>,
+    Body(b): Body<TeamBudgetBody>,
+) -> ApiResult<Json<crate::Team>> {
+    let actor = actor(&h)?;
+    let budget = crate::TeamBudget {
+        budget_usd: b.budget_usd,
+        budget_window_secs: b.budget_window_secs,
+        budget_allow_unpriced: b.budget_allow_unpriced,
+    };
+    let team = with_store(&s, move |st| {
+        st.set_team_budget(&team, Some(budget), &actor)
+    })
+    .await?;
+    Ok(Json(team))
+}
+
+async fn clear_team_budget(
+    State(s): State<Arc<AppState>>,
+    h: HeaderMap,
+    Path(team): Path<String>,
+) -> ApiResult<Json<crate::Team>> {
+    let actor = actor(&h)?;
+    let team = with_store(&s, move |st| st.set_team_budget(&team, None, &actor)).await?;
+    Ok(Json(team))
+}
+
 async fn create_project(
     State(s): State<Arc<AppState>>,
     h: HeaderMap,
@@ -606,6 +646,10 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/orgs", post(create_org).get(list_orgs))
         .route("/v1/orgs/{org}/teams", post(create_team).get(list_teams))
+        .route(
+            "/v1/teams/{team}/budget",
+            put(set_team_budget).delete(clear_team_budget),
+        )
         .route(
             "/v1/teams/{team}/projects",
             post(create_project).get(list_projects),

@@ -1,6 +1,6 @@
 # 0030: Tenant budgets above key budgets
 
-Status: slices 2, 3 and 4 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
+Status: slices 2 to 5 built (the roadmap item is complete except as listed under slice 4's "not built") (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
 file table, an admission rule, a refusal reason and ledger keys become promises, and it touches the
 spend ledger (0010), which every guarantee in 0027 rests on. It is the third slice of the roadmap
 item "hierarchical budgets, tags, alerts, cost exports" (after 0028 and 0029). Nothing here is
@@ -256,3 +256,26 @@ the lease size is then set by the table, which removes today's last-writer-wins 
   rejection metric carries no `level` label: the signals are the generation bump on a reload that adds
   or changes a table, the ordinary 429, and the usage records. Operators should add a table at a window
   boundary. Either may be added later without changing any contract here.
+
+## As built (slice 5): the control plane
+
+- **Snapshot.** The signed payload's tenant record (`{id, name}`, where the id is the key's team) gains
+  `budget_usd`, `budget_window_secs` and `budget_allow_unpriced`, **written only when the team has a
+  budget**. A data plane that predates the fields refuses a snapshot that has one (the record is
+  `deny_unknown_fields`) and keeps the previous snapshot, so a tenant is never served without its cap; a
+  snapshot with no team budget is byte-identical to before. Upgrade data planes before setting the first
+  team budget.
+- **Data plane.** The snapshot's tenant budgets become the same `tenants` table a file would have
+  (checked by value: a team with no active key is not an error, since the control plane owns teams), so
+  every key of the team gets the tenant level, with the Redis and in-memory ledgers of slices 2 and 3 and
+  the outage rule of slice 4. A file `[tenants]` together with `[control_plane]` is still refused (the
+  control plane is the single source).
+- **Control plane.** `teams.budget_usd`, `budget_window_secs`, `budget_allow_unpriced` (schema version 4,
+  migrated in place from versions 1 to 3 on SQLite and Postgres), `PUT /v1/teams/{team}/budget` (body
+  `{budget_usd, budget_window_secs?, budget_allow_unpriced?}`, validated with the data plane's own bounds)
+  and `DELETE`, both recorded in the history (`team.budget_set`, `team.budget_cleared`); the team list shows
+  the budget. A project has no budget (a key carries only its team to the data plane).
+- Tests: control plane on both backends (bounds, set, change, clear, payload presence and absence, a
+  published snapshot read back by the data plane, history, migration from versions 1, 2 and 3 with the new
+  column in use), the API (400, 404, round trip), and a process test: a team's budget of zero refuses its
+  key, and the next generation with a higher cap serves it.

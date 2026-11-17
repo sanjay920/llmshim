@@ -53,6 +53,15 @@ pub struct Payload {
 pub struct SnapshotTenant {
     pub id: String,
     pub name: String,
+    /// The tenant-level budget over every key of the tenant (design note 0030), written only
+    /// when the team has one. A data plane that predates the field refuses the whole snapshot
+    /// and keeps the previous one, never serving a tenant without its cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_window_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub budget_allow_unpriced: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -171,6 +180,8 @@ pub struct Snapshot {
     pub keys: Vec<GatewayKey>,
     /// How many keys the snapshot lists as revoked or expired (never loaded).
     pub inactive: usize,
+    /// Tenant budgets, by tenant id (the team): the file's `[tenants.<name>]` (note 0030).
+    pub tenants: std::collections::BTreeMap<String, super::config::TenantBudgetConfig>,
 }
 
 /// What a replica remembers of the snapshot it last applied.
@@ -395,6 +406,20 @@ pub fn load_from(
         }
     }
     let (keys, inactive) = to_keys(&payload, now).map_err(refuse)?;
+    let tenants = payload
+        .tenants
+        .iter()
+        .filter_map(|tenant| {
+            Some((
+                tenant.id.clone(),
+                super::config::TenantBudgetConfig {
+                    budget_usd: tenant.budget_usd?,
+                    budget_window_secs: tenant.budget_window_secs,
+                    budget_allow_unpriced: tenant.budget_allow_unpriced,
+                },
+            ))
+        })
+        .collect();
     Ok(Snapshot {
         org: payload.org.clone(),
         generation: payload.generation,
@@ -402,6 +427,7 @@ pub fn load_from(
         signer,
         keys,
         inactive,
+        tenants,
     })
 }
 
