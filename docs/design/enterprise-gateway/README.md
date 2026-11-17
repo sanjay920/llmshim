@@ -65,6 +65,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0029: Key tags on usage records](0029-key-tags.md)
 - [0030: Tenant budgets above key budgets](0030-hierarchical-budgets.md)
 - [0031: Deployments: one name, several targets](0031-deployments.md)
+- [0032: Named instances of hosted providers](0032-provider-instances.md)
 
 ## Roadmap
 
