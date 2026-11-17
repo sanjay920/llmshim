@@ -678,6 +678,10 @@ fn a_model_list_is_checked_stored_copied_on_rotation_and_signed_only_when_set() 
         );
     }
     assert!(f.store.keys(&f.org).unwrap().is_empty());
+    // Exactly 256 entries is allowed.
+    let mut full = NewKey::secret(&f.project, "full");
+    full.allowed_models = Some((0..256).map(|n| format!("openai/m{n}")).collect());
+    f.store.create_key(full, ACTOR).unwrap();
     let mut restricted = NewKey::secret(&f.project, "batch");
     restricted.allowed_models = Some(vec!["openai/gpt-6-luna".into(), "route/cheap".into()]);
     let batch = f.store.create_key(restricted, ACTOR).unwrap();
@@ -761,6 +765,10 @@ fn a_version_1_database_is_migrated_in_place() {
         let mut new = NewKey::secret(&keys[0].project_id, "new");
         new.allowed_models = Some(vec!["openai/*".into()]);
         assert!(store.create_key(new, ACTOR).is_ok());
+        // The version was bumped: opening again does not migrate again.
+        drop(store);
+        let mut again = Store::open_postgres(&url, Some(&schema)).unwrap();
+        assert_eq!(again.keys(&org).unwrap().len(), 2);
         return;
     }
     let directory = dir("migrate");
@@ -790,4 +798,9 @@ fn a_version_1_database_is_migrated_in_place() {
     let mut new = NewKey::secret(&keys[0].project_id, "new");
     new.allowed_models = Some(vec!["openai/*".into()]);
     assert!(store.create_key(new, ACTOR).is_ok());
+    // The version was bumped: a second start does not migrate again (and so does not fail on
+    // the column that now exists).
+    drop(store);
+    let mut again = Store::open(&file).unwrap();
+    assert_eq!(again.keys(&f.1).unwrap().len(), 2);
 }

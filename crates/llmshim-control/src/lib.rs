@@ -515,12 +515,22 @@ impl Store {
                     }
                     1 => {
                         // Version 2 added keys.allowed_models.
-                        connection
-                            .execute_batch(
-                                "BEGIN; ALTER TABLE keys ADD COLUMN allowed_models TEXT; \
-                                 PRAGMA user_version = 2; COMMIT;",
-                            )
-                            .map_err(|e| Error::Database(e.to_string()))?;
+                        // Re-read the version under the write lock: another process starting
+                        // at the same time may have migrated while this one waited.
+                        let db_err = |e: rusqlite::Error| Error::Database(e.to_string());
+                        connection.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
+                        let now: i64 = connection
+                            .query_row("PRAGMA user_version", [], |row| row.get(0))
+                            .map_err(db_err)?;
+                        if now == 1 {
+                            connection
+                                .execute_batch(
+                                    "ALTER TABLE keys ADD COLUMN allowed_models TEXT; \
+                                     PRAGMA user_version = 2;",
+                                )
+                                .map_err(db_err)?;
+                        }
+                        connection.execute_batch("COMMIT").map_err(db_err)?;
                     }
                     SCHEMA_VERSION => {}
                     other => {
@@ -1034,6 +1044,7 @@ fn create_key_in(tx: &mut dyn Exec, new: &NewKey, actor: &str) -> Result<(String
         "key.created",
         &id,
         json!({"project": new.project_id, "name": new.name, "kind": kind,
+               "allowed_cidrs": new.allowed_cidrs, "allowed_models": new.allowed_models,
             "expires_at": new.expires_at}),
     )?;
     Ok((id, secret))
