@@ -322,6 +322,8 @@ mod tests {
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
                 allowed_models: None,
+                key_name: None,
+                tenant_budget: None,
             },
         )])))
     }

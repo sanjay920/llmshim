@@ -689,11 +689,13 @@ fn parse_document(text: &str, format: Format) -> Result<Value, String> {
 }
 
 /// The file as a generic document without what a reload replaces: the `keys`
-/// array, `[providers.*]` and `[routes.*]`.
+/// array, `[tenants.*]`, `[providers.*]` and `[routes.*]`.
 fn document_without_reloadable(text: &str, format: Format) -> Result<Value, String> {
     let mut document = parse_document(text, format)?;
     if let Value::Object(table) = &mut document {
-        for name in ["keys", "providers", "routes"] {
+        // `tenants` (budgets, note 0030) reload with the keys: a tenant's cap is part of
+        // the identity of every key under it.
+        for name in ["keys", "tenants", "providers", "routes"] {
             table.remove(name);
         }
         // A verify key can be added or removed without a restart (0024): the next

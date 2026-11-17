@@ -2849,6 +2849,8 @@ mod tests {
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
                 allowed_models: None,
+                key_name: None,
+                tenant_budget: None,
             },
         );
         let desc = JobDescriptor {
@@ -3440,6 +3442,8 @@ mod tests {
                         budget_window_secs: None,
                         budget_allow_unpriced: false,
                         allowed_models: None,
+                        key_name: None,
+                        tenant_budget: None,
                     },
                 ),
             )
@@ -3706,6 +3710,8 @@ mod tests {
             budget_window_secs: Some(60),
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         };
         let raw_tenant = identity.tenant.clone();
         let prepared = gateway
@@ -5772,6 +5778,8 @@ mod tests {
                         budget_window_secs: None,
                         budget_allow_unpriced: false,
                         allowed_models: None,
+                        key_name: None,
+                        tenant_budget: None,
                     },
                 ),
             )

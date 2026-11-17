@@ -17,21 +17,33 @@ pub(crate) struct BudgetPolicySnapshot {
 
 impl BudgetPolicySnapshot {
     pub(crate) fn from_identity(identity: &crate::gateway::auth::Identity) -> Option<Self> {
-        let budget_usd = identity.budget_usd?;
+        Some(Self::from_parts(
+            identity.budget_usd?,
+            identity.budget_window_secs,
+            identity.budget_allow_unpriced,
+        ))
+    }
+
+    /// A policy from its three settings: the same arithmetic for a key's budget and a
+    /// tenant's (note 0030).
+    pub(crate) fn from_parts(
+        budget_usd: f64,
+        window_secs: Option<u64>,
+        allow_unpriced: bool,
+    ) -> Self {
         let scaled = budget_usd * NANOS_PER_USD;
         let valid = budget_usd.is_finite()
             && budget_usd >= 0.0
             && scaled.is_finite()
             && scaled <= MAX_EXACT_REDIS_NANOS as f64;
-        Some(Self {
+        Self {
             limit_nanos: if valid { scaled.floor() as u64 } else { 0 },
-            window_secs: identity
-                .budget_window_secs
+            window_secs: window_secs
                 .unwrap_or(crate::gateway::quota::DEFAULT_BUDGET_WINDOW_SECS)
                 .max(1),
-            allow_unpriced: identity.budget_allow_unpriced,
+            allow_unpriced,
             valid,
-        })
+        }
     }
 }
 
@@ -483,6 +495,8 @@ mod tests {
             budget_window_secs: Some(0),
             budget_allow_unpriced: true,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         }
     }
 

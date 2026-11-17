@@ -1983,6 +1983,8 @@ mod native_tests {
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
                 allowed_models: None,
+                key_name: None,
+                tenant_budget: None,
             },
         )
     }
@@ -2073,6 +2075,8 @@ mod native_tests {
             budget_window_secs: None,
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         };
         Arc::new(GatewayState {
             router: RouterHandle::from_arc(router),
@@ -2392,6 +2396,8 @@ mod native_tests {
             budget_window_secs: None,
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         };
         Arc::new(GatewayState {
             router: RouterHandle::from_arc(router),
@@ -2656,6 +2662,8 @@ mod native_tests {
             budget_window_secs: Some(window_secs),
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         };
         let mut connection = gateway.connection_for_test().await.unwrap();
         let redis_time: (u64, u64) = redis::cmd("TIME")
@@ -2757,6 +2765,8 @@ mod native_tests {
             budget_window_secs: Some(3_600),
             budget_allow_unpriced: true,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         };
         let state = Arc::new(GatewayState {
             router: RouterHandle::from_arc(router),
@@ -3035,6 +3045,8 @@ mod native_tests {
             budget_window_secs: Some(3600),
             budget_allow_unpriced: allow_unpriced,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         }
     }
 
@@ -4367,6 +4379,8 @@ mod native_tests {
                 budget_window_secs: None,
                 budget_allow_unpriced: false,
                 allowed_models: None,
+                key_name: None,
+                tenant_budget: None,
             };
             Arc::new(GatewayState {
                 router: RouterHandle::from_arc(router),
@@ -5213,6 +5227,8 @@ mod native_tests {
             budget_window_secs: None,
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         };
         // Admitted against A...
         let mut scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
@@ -5360,6 +5376,8 @@ mod native_tests {
             budget_window_secs: None,
             budget_allow_unpriced: false,
             allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
         };
         let admitted = Arc::new(Router::new());
         let mut scope = crate::gateway::attempt::TrustedPolicyScope::from_identity(&identity);
@@ -5624,6 +5642,8 @@ mod request_id_tests {
             budget_window_secs: None,
             budget_allow_unpriced: false,
             allowed_models: Some(vec!["openrouter/anthropic/*".into()]),
+            key_name: None,
+            tenant_budget: None,
         };
         let ask = |payload: Value| {
             request_models_allowed(
