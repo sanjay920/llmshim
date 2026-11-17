@@ -1217,7 +1217,7 @@
       "additionalProperties": {
         "$ref": "#/$defs/TenantBudgetConfig"
       },
-      "description": "Tenant-level budgets (design note 0030): a cap over the spend of every key of a\ntenant, on a counter of its own. A key's own `budget_usd` then caps that key.\nSingle-instance only for now.",
+      "description": "Tenant-level budgets (design note 0030): a cap over the spend of every key of a\ntenant, on a counter of its own. A key's own `budget_usd` then caps that key.",
       "type": "object"
     },
     "upstream": {

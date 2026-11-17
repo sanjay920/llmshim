@@ -1166,7 +1166,8 @@ impl AttemptCoordinator {
         tenant: &str,
         scope: &mut TrustedPolicyScope,
     ) -> Result<(), ()> {
-        if scope.budget.is_none() {
+        // A tenant with a table has fresh counters and no legacy floor (note 0030).
+        if scope.budget.is_none() || scope.tenant_cap.is_some() {
             return Ok(());
         }
         let retained_floor = self.rates.retain_legacy_spend_floor(tenant, scope).await?;
@@ -1709,12 +1710,78 @@ mod redis_rates {
                 budget_next = budget_limit
             end
         end
+        -- A second budget counter (a key's own cap under a tenant cap, note 0030), judged
+        -- here and reserved below in the same call, so a refusal at either level leaves
+        -- both untouched. It has no legacy floor and its own attempt record (KEYS[10]),
+        -- with its own counter's TTL.
+        local level1_enabled = tonumber(ARGV[29]) == 1
+        local level1_next = 0
+        local level1_reservation = 0
+        local level1_total_key = KEYS[9]
+        local level1_freeze_key = KEYS[9] .. 'frozen'
+        local level1_ttl = 1
+        if level1_enabled then
+            local bounded = tonumber(ARGV[30]) == 1
+            local limit = tonumber(ARGV[31])
+            level1_reservation = tonumber(ARGV[32])
+            local window_secs = tonumber(ARGV[33])
+            local retention_secs = tonumber(ARGV[24])
+            local max_retained_attempts = tonumber(ARGV[25])
+            local window_index = math.floor(math.floor(now / 1000) / window_secs)
+            local window_wait = ((window_index + 1) * window_secs * 1000) - now
+            level1_total_key = KEYS[9] .. window_index
+            level1_freeze_key = level1_total_key .. ':frozen'
+            level1_ttl = math.max(1,
+                ((window_index + 1) * window_secs + retention_secs) * 1000 - now)
+            local current = tonumber(redis.call('GET', level1_total_key)) or 0
+            local retained_count = redis.call('ZCARD', KEYS[7])
+            if redis.call('EXISTS', KEYS[8]) == 1 or
+                    redis.call('EXISTS', KEYS[10]) == 1 or
+                    retained_count + 1 >= max_retained_attempts then
+                admitted = 0
+                refusal = 4
+            elseif redis.call('EXISTS', level1_freeze_key) == 1 or limit == 0 then
+                admitted = 0
+                if refusal ~= 4 then refusal = 3 end
+                wait = math.max(wait, window_wait)
+            elseif bounded then
+                if level1_reservation > limit or current > limit - level1_reservation then
+                    admitted = 0
+                    if refusal ~= 4 then refusal = 3 end
+                    wait = math.max(wait, window_wait)
+                else
+                    level1_next = current + level1_reservation
+                end
+            elseif current >= limit then
+                admitted = 0
+                if refusal ~= 4 then refusal = 3 end
+                wait = math.max(wait, window_wait)
+            else
+                level1_reservation = limit - current
+                level1_next = limit
+            end
+        end
         if admitted == 1 then
             for dimension = 1, 4 do
                 local offset = 3 + (dimension - 1) * 4
                 if tonumber(ARGV[offset]) == 1 then
                     balances[dimension] = balances[dimension] - tonumber(ARGV[offset + 3])
                 end
+            end
+            if level1_enabled then
+                redis.call('SET', level1_total_key, level1_next, 'PX', level1_ttl)
+                redis.call('HSET', KEYS[10],
+                    'liability', level1_reservation,
+                    'bounded', ARGV[30],
+                    'observed', -1,
+                    'finalized', 0,
+                    'total_key', level1_total_key,
+                    'freeze_key', level1_freeze_key,
+                    'provider_floor', -1,
+                    'terminal_catalog', -1,
+                    'terminal_provider', -1)
+                redis.call('PEXPIRE', KEYS[10], level1_ttl)
+                redis.call('ZADD', KEYS[7], 'NX', now + level1_ttl, KEYS[10])
             end
             if budget_enabled then
                 redis.call('SET', budget_total_key, budget_next, 'PX', budget_ttl)
@@ -1924,14 +1991,22 @@ mod redis_rates {
             )
         }
 
+        #[cfg(test)]
         pub(super) fn budget_attempt_key(
             scope: &TrustedPolicyScope,
             attempt_id: uuid::Uuid,
         ) -> String {
-            format!(
-                "llmshim:gw:budget:v1:attempt:{}:{attempt_id}",
-                scope.tenant_key
-            )
+            Self::level_attempt_key(&scope.tenant_key, attempt_id)
+        }
+
+        /// A level's counter prefix: for a tenant with no table `ledger_key` is the tenant
+        /// key and this is [`Self::budget_total_prefix`] exactly.
+        pub(super) fn level_prefix(ledger_key: &str, window_secs: u64) -> String {
+            format!("llmshim:gw:budget:v1:{ledger_key}:{window_secs}:")
+        }
+
+        fn level_attempt_key(ledger_key: &str, attempt_id: uuid::Uuid) -> String {
+            format!("llmshim:gw:budget:v1:attempt:{ledger_key}:{attempt_id}")
         }
 
         async fn settle_budget(
@@ -1941,14 +2016,34 @@ mod redis_rates {
             observation: Option<crate::gateway::budget::SpendObservation>,
             finalize: bool,
         ) -> Result<(), ()> {
-            if scope.budget.is_none() {
-                return Ok(());
+            // Each level is its own record with its own counter, settled on its own: a
+            // failure at one keeps that level's liability and does not stop the others.
+            let mut result = Ok(());
+            for (level, (ledger_key, _)) in scope.budget_levels().into_iter().enumerate() {
+                let id = level_attempt_id(attempt_id, level);
+                if self
+                    .settle_one(&ledger_key, id, observation, finalize)
+                    .await
+                    .is_err()
+                {
+                    result = Err(());
+                }
             }
+            result
+        }
+
+        async fn settle_one(
+            &self,
+            ledger_key: &str,
+            attempt_id: uuid::Uuid,
+            observation: Option<crate::gateway::budget::SpendObservation>,
+            finalize: bool,
+        ) -> Result<(), ()> {
             let result: i64 = self
                 .connections
                 .run(|mut connection| async move {
                     self.settle_budget_script
-                        .key(Self::budget_attempt_key(scope, attempt_id))
+                        .key(Self::level_attempt_key(ledger_key, attempt_id))
                         .arg(
                             observation
                                 .and_then(|value| value.amount_nanos)
@@ -2027,6 +2122,25 @@ mod redis_rates {
             attempt_id: uuid::Uuid,
             quote: Option<crate::gateway::budget::BudgetQuote>,
         ) -> Result<(), RateRefusal> {
+            let quotes: Vec<_> = quote.into_iter().collect();
+            self.acquire_levels(provider, scope, permits, attempt_id, &quotes)
+                .await
+        }
+
+        /// One call for every budget counter of the scope (at most two): the script judges
+        /// both before it reserves either (note 0030).
+        async fn acquire_levels(
+            &self,
+            provider: &str,
+            scope: &TrustedPolicyScope,
+            permits: u32,
+            attempt_id: uuid::Uuid,
+            quotes: &[crate::gateway::budget::BudgetQuote],
+        ) -> Result<(), RateRefusal> {
+            let levels = scope.budget_levels();
+            if levels.len() != quotes.len() || levels.len() > 2 {
+                return Err(RateRefusal::Unavailable);
+            }
             let global = self.config.resolve(provider);
             if scope.rpm == Some(0) || scope.tpm == Some(0) {
                 return Err(RateRefusal::Tenant(ZERO_LIMIT_RETRY_AFTER));
@@ -2040,30 +2154,46 @@ mod redis_rates {
                 .key(Self::global_key(provider, "tpm"))
                 .key(Self::tenant_key(scope, provider, "rpm"))
                 .key(Self::tenant_key(scope, provider, "tpm"));
-            match (&scope.budget, quote) {
-                (Some(_), Some(_)) => {
+            match levels.first() {
+                Some((ledger_key, policy)) => {
                     invocation
-                        .key(Self::budget_total_prefix(scope))
-                        .key(Self::budget_attempt_key(scope, attempt_id))
+                        .key(Self::level_prefix(ledger_key, policy.window_secs))
+                        .key(Self::level_attempt_key(ledger_key, attempt_id))
                         .key(&self.accounting_index_key)
                         .key(format!("{}:frozen", self.accounting_index_key));
                 }
-                (None, None) => {
+                None => {
                     invocation
                         .key("llmshim:gw:budget:v1:none")
                         .key(format!("llmshim:gw:budget:v1:none:{attempt_id}"))
                         .key("llmshim:gw:budget:v1:none:index")
                         .key("llmshim:gw:budget:v1:none:index:frozen");
                 }
-                _ => return Err(RateRefusal::Unavailable),
+            }
+            // The second level's counter and attempt record (KEYS[9], KEYS[10]); unused
+            // placeholders when there is no second level.
+            match levels.get(1) {
+                Some((ledger_key, policy)) => {
+                    invocation
+                        .key(Self::level_prefix(ledger_key, policy.window_secs))
+                        .key(Self::level_attempt_key(
+                            ledger_key,
+                            level_attempt_id(attempt_id, 1),
+                        ));
+                }
+                None => {
+                    invocation
+                        .key("llmshim:gw:budget:v1:none:level1")
+                        .key(format!("llmshim:gw:budget:v1:none:level1:{attempt_id}"));
+                }
             }
             invocation.arg(0).arg(KEY_TTL_MS);
             Self::add_dimension(&mut invocation, global.rpm, 1.0);
             Self::add_dimension(&mut invocation, global.tpm, permits.max(1) as f64);
             Self::add_dimension(&mut invocation, scope.rpm, 1.0);
             Self::add_dimension(&mut invocation, scope.tpm, permits.max(1) as f64);
-            match (&scope.budget, quote) {
-                (Some(policy), Some(quote)) => {
+            match levels.first().zip(quotes.first()) {
+                Some(((_, policy), quote)) => {
                     invocation
                         .arg(1)
                         .arg(i32::from(quote.bounded))
@@ -2084,7 +2214,7 @@ mod redis_rates {
                                 .map_or(0_u64, |floor| floor.amount_nanos),
                         );
                 }
-                (None, None) => {
+                None => {
                     invocation
                         .arg(0)
                         .arg(0)
@@ -2097,7 +2227,19 @@ mod redis_rates {
                         .arg(-1)
                         .arg(0);
                 }
-                _ => return Err(RateRefusal::Unavailable),
+            }
+            match levels.get(1).zip(quotes.get(1)) {
+                Some(((_, policy), quote)) => {
+                    invocation
+                        .arg(1)
+                        .arg(i32::from(quote.bounded))
+                        .arg(policy.limit_nanos)
+                        .arg(quote.amount_nanos)
+                        .arg(policy.window_secs);
+                }
+                None => {
+                    invocation.arg(0).arg(0).arg(0).arg(0).arg(1);
+                }
             }
             let (admitted, wait_ms, refusal): (i64, i64, i64) = self
                 .connections
@@ -3820,6 +3962,212 @@ mod tests {
         std::env::var("LLMSHIM_REDIS_URL").ok()
     }
 
+    /// The Redis counter of a scope's `level`-th budget level in the current window.
+    #[cfg(feature = "redis-coordination")]
+    async fn redis_level_total(
+        rates: &RedisAttemptRates,
+        scope: &TrustedPolicyScope,
+        level: usize,
+    ) -> (u64, i64) {
+        use redis::AsyncCommands;
+        let levels = scope.budget_levels();
+        let (ledger_key, policy) = &levels[level];
+        let index = epoch_secs() / policy.window_secs;
+        let key = format!(
+            "{}{index}",
+            RedisAttemptRates::level_prefix(ledger_key, policy.window_secs)
+        );
+        let mut connection = rates.connection().await.unwrap();
+        let total: Option<u64> = connection.get(&key).await.unwrap();
+        let ttl: i64 = connection.pttl(&key).await.unwrap();
+        (total.unwrap_or(0), ttl)
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_two_levels_are_judged_together_and_a_refusal_holds_nothing() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("two-level-{}", uuid::Uuid::new_v4().simple());
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let tenant = format!("t-{}", uuid::Uuid::new_v4().simple());
+        let key_a = two_level(&tenant, &format!("a-{tenant}"), 100, Some(50), 3600);
+        let key_b = two_level(&tenant, &format!("b-{tenant}"), 100, None, 3600);
+        let go = |scope: &TrustedPolicyScope, quotes: Vec<_>| {
+            let scope = scope.clone();
+            let provider = provider.clone();
+            let rates = &rates;
+            async move {
+                rates
+                    .acquire_levels(&provider, &scope, 1, uuid::Uuid::new_v4(), &quotes)
+                    .await
+            }
+        };
+        go(&key_a, vec![quote(30), quote(30)]).await.unwrap();
+        go(&key_a, vec![quote(20), quote(20)]).await.unwrap();
+        assert_eq!(redis_level_total(&rates, &key_a, 0).await.0, 50);
+        assert_eq!(redis_level_total(&rates, &key_a, 1).await.0, 50);
+        // Each counter keeps its own expiry (its window's end plus the retention).
+        assert!(redis_level_total(&rates, &key_a, 0).await.1 > 0);
+        assert!(redis_level_total(&rates, &key_a, 1).await.1 > 0);
+        // The key's own cap refuses; neither counter moved.
+        assert!(matches!(
+            go(&key_a, vec![quote(1), quote(1)]).await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert_eq!(redis_level_total(&rates, &key_a, 0).await.0, 50);
+        assert_eq!(redis_level_total(&rates, &key_a, 1).await.0, 50);
+        // The sibling key has only the tenant level, which the first key already used.
+        go(&key_b, vec![quote(50)]).await.unwrap();
+        assert_eq!(redis_level_total(&rates, &key_b, 0).await.0, 100);
+        // The tenant is full: a refusal there leaves the key's own counter untouched.
+        let key_c = two_level(&tenant, &format!("c-{tenant}"), 100, Some(1000), 3600);
+        assert!(matches!(
+            go(&key_c, vec![quote(1), quote(1)]).await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert_eq!(redis_level_total(&rates, &key_c, 1).await.0, 0);
+        assert_eq!(redis_level_total(&rates, &key_c, 0).await.0, 100);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_settlement_returns_each_levels_own_liability() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("two-level-{}", uuid::Uuid::new_v4().simple());
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let tenant = format!("t-{}", uuid::Uuid::new_v4().simple());
+        let key = two_level(&tenant, &format!("a-{tenant}"), 100, Some(40), 3600);
+        let id = uuid::Uuid::new_v4();
+        let unbounded = crate::gateway::budget::BudgetQuote {
+            amount_nanos: 0,
+            bounded: false,
+        };
+        rates
+            .acquire_levels(&provider, &key, 1, id, &[unbounded, unbounded])
+            .await
+            .unwrap();
+        assert_eq!(redis_level_total(&rates, &key, 0).await.0, 100);
+        assert_eq!(redis_level_total(&rates, &key, 1).await.0, 40);
+        rates
+            .observe_usage(&key, id, inferred_terminal_zero_with(7))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &key,
+                id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        // Each level gives back what it held beyond the final amount, and no more.
+        assert_eq!(redis_level_total(&rates, &key, 0).await.0, 7);
+        assert_eq!(redis_level_total(&rates, &key, 1).await.0, 7);
+        // Settling again changes nothing (the records are finalized).
+        rates
+            .finish(
+                &key,
+                id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(redis_level_total(&rates, &key, 0).await.0, 7);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_racing_requests_never_leave_either_counter_over_its_cap() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("two-level-{}", uuid::Uuid::new_v4().simple());
+        let rates = std::sync::Arc::new(
+            RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap(),
+        );
+        let tenant = format!("t-{}", uuid::Uuid::new_v4().simple());
+        // Tenant cap 150; two keys each capped at 100; every request wants 10.
+        let a = two_level(&tenant, &format!("a-{tenant}"), 150, Some(100), 3600);
+        let b = two_level(&tenant, &format!("b-{tenant}"), 150, Some(100), 3600);
+        let mut tasks = Vec::new();
+        for n in 0..60 {
+            let (rates, provider) = (rates.clone(), provider.clone());
+            let scope = if n % 2 == 0 { a.clone() } else { b.clone() };
+            tasks.push(tokio::spawn(async move {
+                rates
+                    .acquire_levels(
+                        &provider,
+                        &scope,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &[quote(10), quote(10)],
+                    )
+                    .await
+                    .is_ok()
+            }));
+        }
+        let mut admitted = 0;
+        for task in tasks {
+            admitted += u64::from(task.await.unwrap());
+        }
+        let tenant_total = redis_level_total(&rates, &a, 0).await.0;
+        let a_total = redis_level_total(&rates, &a, 1).await.0;
+        let b_total = redis_level_total(&rates, &b, 1).await.0;
+        assert_eq!(tenant_total, admitted * 10, "no reservation was orphaned");
+        assert_eq!(
+            a_total + b_total,
+            tenant_total,
+            "both levels moved together"
+        );
+        assert!(tenant_total <= 150, "{tenant_total}");
+        assert!(a_total <= 100 && b_total <= 100, "{a_total} {b_total}");
+        assert_eq!(tenant_total, 150, "the tenant cap was reached");
+
+        // One key alone, capped below the tenant: only its own cap can stop it.
+        let solo_tenant = format!("t-{}", uuid::Uuid::new_v4().simple());
+        let solo = two_level(
+            &solo_tenant,
+            &format!("s-{solo_tenant}"),
+            1000,
+            Some(80),
+            3600,
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..40 {
+            let (rates, provider, scope) = (rates.clone(), provider.clone(), solo.clone());
+            tasks.push(tokio::spawn(async move {
+                rates
+                    .acquire_levels(
+                        &provider,
+                        &scope,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &[quote(10), quote(10)],
+                    )
+                    .await
+                    .is_ok()
+            }));
+        }
+        let mut ok = 0;
+        for task in tasks {
+            ok += u64::from(task.await.unwrap());
+        }
+        assert_eq!(ok, 8, "the key's own cap admits exactly eight");
+        assert_eq!(redis_level_total(&rates, &solo, 1).await.0, 80);
+        assert_eq!(redis_level_total(&rates, &solo, 0).await.0, 80);
+    }
+
     #[cfg(feature = "redis-coordination")]
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
@@ -3946,6 +4294,17 @@ mod tests {
         let provider = format!("attempt-budget-{}", uuid::Uuid::new_v4().simple());
         let mut tenant = budget_scope(&format!("redis-{}", uuid::Uuid::new_v4()), 100);
         tenant.budget.as_mut().unwrap().window_secs = 1;
+        // Start just after a window boundary, so the three acquires below cannot straddle one
+        // (the window is one second long, and CI is slow enough to notice).
+        loop {
+            let into_window = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_millis());
+            if into_window < 250 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1000 - into_window as u64 + 10)).await;
+        }
         let first = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
         let second = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
         let frozen = budget_scope(&format!("redis-zero-{}", uuid::Uuid::new_v4()), 0);
