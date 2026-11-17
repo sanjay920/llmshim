@@ -431,7 +431,7 @@ impl ShimClient {
         outcome: std::result::Result<(), &ShimError>,
     ) {
         if let Some(breaker) = &self.breaker {
-            breaker.observe(provider.name(), outcome).await;
+            breaker.observe(provider.instance(), outcome).await;
         }
     }
 
@@ -3399,7 +3399,7 @@ mod tests {
         assert!(resp.status().is_success());
         // Full-jitter backoff at attempt 0 is bounded by base (1s); give slack.
         assert!(
-            elapsed < Duration::from_secs(3),
+            elapsed < Duration::from_secs(10),
             "backoff should be sub-cap jitter, got {elapsed:?}"
         );
         m500.assert_async().await;

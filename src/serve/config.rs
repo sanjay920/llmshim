@@ -844,7 +844,21 @@ const HOSTED_NAMES: [&str; 10] = [
 ];
 
 impl ProviderKind {
-    /// The only name a hosted provider may have; `None` for a self-hosted server.
+    /// The API-key hosted kinds, which may be configured more than once under different names
+    /// (design note 0032). The cloud transports keep one fixed name.
+    pub fn supports_instances(self) -> bool {
+        matches!(
+            self,
+            Self::Openai
+                | Self::Anthropic
+                | Self::Gemini
+                | Self::Xai
+                | Self::Cerebras
+                | Self::Openrouter
+        )
+    }
+
+    /// The reserved name of a hosted kind; `None` for a self-hosted server.
     pub fn hosted_name(self) -> Option<&'static str> {
         Some(match self {
             Self::Openai => "openai",
@@ -1722,13 +1736,33 @@ impl ServeConfig {
             if name == "route" {
                 issues.push(Issue::new(&at, "\"route\" is reserved for named routes"));
             }
-            match provider.kind.hosted_name() {
-                Some(expected) if name != expected => issues.push(Issue::new(
+            if name == "deployment" {
+                issues.push(Issue::new(
                     &at,
-                    format!(
-                        "a {expected} provider must be named \"{expected}\" (one per kind for now)"
-                    ),
-                )),
+                    "\"deployment\" is reserved for deployments (deployment/<name> is resolved first, so a provider with this name could never be reached)",
+                ));
+            }
+            match provider.kind.hosted_name() {
+                // An API-key hosted kind may have further named instances (note 0032): any name,
+                // except one reserved for another kind, which must stay that kind's own.
+                Some(expected)
+                    if name != expected
+                        && provider.kind.supports_instances()
+                        && HOSTED_NAMES.contains(&name.as_str()) =>
+                {
+                    issues.push(Issue::new(
+                        &at,
+                        "is the reserved name of another hosted provider; name an instance of this kind differently",
+                    ))
+                }
+                Some(expected) if name != expected && !provider.kind.supports_instances() => {
+                    issues.push(Issue::new(
+                        &at,
+                        format!(
+                            "a {expected} provider must be named \"{expected}\" (one per kind for now)"
+                        ),
+                    ))
+                }
                 None if HOSTED_NAMES.contains(&name.as_str()) => issues.push(Issue::new(
                     &at,
                     "is the name of a hosted provider; name an openai-compatible server differently",
@@ -4776,9 +4810,21 @@ mod tests {
     }
 
     #[test]
-    fn hosted_providers_use_their_own_name_and_servers_may_not_borrow_one() {
+    fn hosted_providers_may_be_named_instances_but_never_borrow_another_kinds_name() {
+        // A further account of an API-key hosted kind: any name that is not reserved (note 0032).
         let renamed = MINIMAL.replace("[providers.openai]", "[providers.openai-eu]");
-        assert!(has(&issues(&renamed), "providers.openai-eu"));
+        assert!(!has(&issues(&renamed), "providers.openai-eu"));
+        // But an OpenAI entry may not take another kind's name.
+        let borrowed_kind = MINIMAL.replace("[providers.openai]", "[providers.anthropic]");
+        assert!(has(&issues(&borrowed_kind), "providers.anthropic"));
+        // `route` and `deployment` can never be reached as provider names.
+        for reserved in ["route", "deployment"] {
+            let named = MINIMAL.replace("[providers.openai]", &format!("[providers.{reserved}]"));
+            assert!(
+                has(&issues(&named), &format!("providers.{reserved}")),
+                "{reserved}"
+            );
+        }
         let borrowed = r#"
             version = 1
             [server]

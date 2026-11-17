@@ -344,7 +344,7 @@ impl UsageRecorder {
         let span = self.spans.as_ref().map(|spans| {
             spans.start(&AttemptBegun {
                 request_id,
-                provider: identity.provider_name(),
+                provider: identity.instance(),
                 model: identity.native_model(),
                 kind: kind_name(identity.kind()),
             })
@@ -357,7 +357,7 @@ impl UsageRecorder {
             tags: credential.and_then(|credential| self.keys.tags(credential)),
             request_id: request_id.map(str::to_owned),
             deployment: deployment.map(str::to_owned),
-            provider: identity.provider_name().to_owned(),
+            provider: identity.instance().to_owned(),
             model: identity.native_model().to_owned(),
             kind: kind_name(identity.kind()),
             started: Instant::now(),

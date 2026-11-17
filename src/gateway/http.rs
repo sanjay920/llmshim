@@ -1179,9 +1179,15 @@ fn build_request(
             .map_err(ApiError::from)?;
         let alias = (req.model.starts_with("route/") || req.model.starts_with("deployment/"))
             .then_some(req.model.as_str());
+        // OpenRouter's own request fields are read by the KIND, so an instance of it is checked too.
+        let kind = snapshot
+            .provider_kind(&provider_key)
+            .unwrap_or(&provider_key)
+            .to_owned();
         if !request_models_allowed(
             identity,
             &provider_key,
+            &kind,
             &model,
             alias,
             &prepared_request.payload,
@@ -1209,7 +1215,9 @@ fn build_request(
             ],
         );
     }
-    let provider_name = prepared_request.target.provider_name.clone();
+    // The lane and the response's provider are the admission identity (note 0032); the kind
+    // stays on `target.provider_name` for what reads vendor behavior.
+    let provider_name = prepared_request.target.instance.clone();
     let budget_model = prepared_request.target.model.clone();
     let permits = estimate_prepared_request_tokens(&prepared_request);
     let gw = GatewayRequest {
@@ -1227,6 +1235,7 @@ fn build_request(
 fn request_models_allowed(
     identity: &crate::gateway::auth::Identity,
     provider_key: &str,
+    kind: &str,
     model: &str,
     alias: Option<&str>,
     payload: &Value,
@@ -1234,14 +1243,14 @@ fn request_models_allowed(
     // Only OpenRouter reads `x-openrouter`: its fallback list names more models than the
     // primary, and a preset is configured upstream and can set the model there, so a
     // restricted key may not send one.
-    let fallbacks_allowed = provider_key != "openrouter"
+    let fallbacks_allowed = kind != "openrouter"
         || (payload.pointer("/x-openrouter/preset").is_none()
             && match payload.pointer("/x-openrouter/models") {
                 None => true,
                 Some(Value::Array(models)) => models.iter().all(|entry| {
                     entry
                         .as_str()
-                        .is_some_and(|entry| identity.permits_model("openrouter", entry, None))
+                        .is_some_and(|entry| identity.permits_model(provider_key, entry, None))
                 }),
                 Some(_) => false,
             });
@@ -5694,6 +5703,7 @@ mod request_id_tests {
             request_models_allowed(
                 &key,
                 "openrouter",
+                "openrouter",
                 "anthropic/claude-haiku-5-5",
                 None,
                 &payload,
@@ -5722,10 +5732,37 @@ mod request_id_tests {
                 ..key.clone()
             },
             "anthropic",
+            "anthropic",
             "claude-haiku-5-5",
             None,
             &json!({"x-openrouter": {"models": ["openai/gpt-6-sol"]}}),
         );
         assert!(other);
+        // A named instance of OpenRouter is still OpenRouter: its fallback list and presets are
+        // checked, and the entries are matched under the instance's own name (note 0032).
+        let instance_key = crate::gateway::auth::Identity {
+            allowed_models: Some(vec!["openrouter-b/anthropic/*".into()]),
+            ..key.clone()
+        };
+        let on_instance = |payload: Value| {
+            request_models_allowed(
+                &instance_key,
+                "openrouter-b",
+                "openrouter",
+                "anthropic/claude-haiku-5-5",
+                None,
+                &payload,
+            )
+        };
+        assert!(on_instance(json!({})));
+        assert!(on_instance(
+            json!({"x-openrouter": {"models": ["anthropic/claude-sonnet-5"]}})
+        ));
+        assert!(!on_instance(
+            json!({"x-openrouter": {"models": ["openai/gpt-6-sol"]}})
+        ));
+        assert!(!on_instance(
+            json!({"x-openrouter": {"preset": "@preset/anything"}})
+        ));
     }
 }

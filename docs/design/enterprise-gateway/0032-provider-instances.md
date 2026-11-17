@@ -1,6 +1,6 @@
 # 0032: Named instances of hosted providers
 
-Status: design, 2026-11-17. A contract note, written before any code (README working rule 3): a relaxed
+Status: slice 2 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a relaxed
 file rule, a defaulted trait method and the meaning of the admission name become promises. It is the
 prerequisite 0031 named for balancing two accounts of one hosted vendor. Nothing here is started.
 
@@ -155,3 +155,40 @@ and each fails a test.
 - Whether `llmshim` the library (not `serve`) should expose instance names on `Router::register`
   directly; today `register(name, provider)` already names the registry key, and `instance()` makes the
   provider agree with it.
+
+## As built (slice 2)
+
+- `Provider::instance()` (defaulted to `name()`); `ReplayTarget.instance` (set by the default
+  `request_replay_target` only when it differs from the kind); `AdmissionTarget.instance` and
+  `AttemptIdentity.instance` beside the kind. Admission readers moved to the instance: the gateway lane and
+  the response's provider (`http.rs`), the proxy's rate key and 429 penalty, the gateway's semaphore and
+  penalty and tenant quota key, the usage record and its span, the client's breaker observation, the whole
+  of `fallback.rs`, the deployment selector's health question, and the library's `LogEntry.provider`, returned
+  stream provider and embeddings model id. Pricing, the budget and token estimators, replay, tool handling and
+  the plan still read the kind.
+- `with_instance` on `OpenAi`, `Anthropic`, `Gemini`, `Xai`, `OpenRouter` and `Cerebras` (a private field),
+  called by `serve` for every hosted entry with the entry's name (equal to the kind for an entry named for it,
+  so existing files are unchanged).
+- The file rule: an API-key hosted kind may have any name except another kind's reserved name; `route` and
+  `deployment` are refused as provider names; the cloud kinds keep their fixed names.
+- `Router::resolve_key` asks the catalog about the kind for an instance key and keeps the instance as the
+  provider key. **No built-in spelling differs from its id today**, so this branch is defensive and its test
+  shows parity only (a catalog row whose name differs from a spelling would exercise it).
+- Tests: process (two `kind = "openai"` entries on two mocks: each account's own limit refuses its second
+  request while the other serves, usage records name the account, both lanes exist, a priced budget works
+  through the second account, a 3:1 deployment over both reaches 6:2, the name rule); unit (resolution, the
+  dispatch target carries the instance only when it differs, one account's open circuit does not skip the
+  other). Mutations that move the semaphore key or the gateway lane back to the kind fail the process test.
+- Not done: the environment form of limits for instances (file-only, as the note says); 0001 and 0022 and 0031
+  are updated by this change.
+
+### Review changes (slice 2)
+
+- The gateway's restricted-key check for OpenRouter's own request fields (`x-openrouter.models`, a preset)
+  reads the **kind** of the provider the request resolved to (`Router::provider_kind`), so a named instance of
+  OpenRouter is checked like the original, and its fallback list is matched under the instance's name.
+- **Not built: `/v1/models`.** The listing is catalog and kind based, so an instance's models are not
+  advertised and a config with only a named instance lists none of its vendor's models; `openai-b/<model>`
+  works when addressed. Listing instance ids is a separate decision (what an instance serves is not known
+  without asking it).
+- A 429 from one instance penalizes that instance's bucket only (pinned by a process test).

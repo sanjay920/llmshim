@@ -103,6 +103,9 @@ pub struct ReplayTarget {
     pub family: Option<ModelFamily>,
     pub wire: WireFormat,
     pub account: Option<String>,
+    /// The admission identity of the provider that will be sent the request, when it differs
+    /// from `provider` (the kind): see `Provider::instance` (design note 0032).
+    pub instance: Option<String>,
 }
 
 impl ReplayTarget {
@@ -120,6 +123,7 @@ impl ReplayTarget {
             family,
             wire,
             account: None,
+            instance: None,
         }
     }
 

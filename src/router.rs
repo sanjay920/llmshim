@@ -235,8 +235,8 @@ impl Router {
         let now = std::time::Instant::now();
         let usable = |target: &str| match self.resolve(target) {
             Ok((provider, _)) => {
-                !self.breaker.should_skip(provider.name())
-                    || self.breaker.probe_due(provider.name(), now)
+                !self.breaker.should_skip(provider.instance())
+                    || self.breaker.probe_due(provider.instance(), now)
             }
             Err(_) => true,
         };
@@ -246,6 +246,12 @@ impl Router {
                 .model
                 .clone(),
         )
+    }
+
+    /// The kind (`Provider::name`) of the provider registered under `key`: what vendor behavior
+    /// applies to it, which for a named instance (note 0032) differs from the key.
+    pub fn provider_kind(&self, key: &str) -> Option<&str> {
+        self.providers.get(key).map(|provider| provider.name())
     }
 
     /// The configured deployment names, in order.
@@ -334,7 +340,7 @@ impl Router {
             // chosen (it would never report, and the target would stay half-open).
             let usable = |target: &str| match self.resolve(target) {
                 Ok((provider, _)) => {
-                    let name = provider.name();
+                    let name = provider.instance();
                     !self.breaker.should_skip(name) || self.breaker.probe_due(name, now)
                 }
                 // A target that no longer resolves is the file's problem, not health.
@@ -343,8 +349,8 @@ impl Router {
             let target = deployment.pick(&usable, crate::deployment::conversation_hash(request));
             // The probe is reserved for the target that was picked, whose request will report it.
             if let Ok((provider, _)) = self.resolve(&target.model) {
-                if self.breaker.should_skip(provider.name()) {
-                    let _ = self.breaker.try_admit_probe(provider.name(), now);
+                if self.breaker.should_skip(provider.instance()) {
+                    let _ = self.breaker.try_admit_probe(provider.instance(), now);
                 }
             }
             let mut expanded = request.clone();
@@ -574,6 +580,22 @@ impl Router {
             retry_after: None,
         })?;
         let requested = self.aliases.get(model).map(String::as_str).unwrap_or(model);
+        // A named instance of a hosted provider (`openai-b/...`, note 0032) has a registry key that
+        // is not the catalog's name for the vendor: ask the catalog about the kind, and keep the
+        // instance as the provider key, so canonical spelling and aliases work for the second
+        // account as they do for the first.
+        if let Some((prefix, rest)) = requested.split_once('/') {
+            if let Some(provider) = self.providers.get(prefix) {
+                let kind = provider.name();
+                if kind != prefix {
+                    if let Some(m) = crate::catalog::resolve(&format!("{kind}/{rest}"))
+                        .filter(|m| m.provider == kind)
+                    {
+                        return Ok((prefix.to_string(), m.name.clone()));
+                    }
+                }
+            }
+        }
         // Deliberately `resolve`, never `lookup_id`: a hit here replaces the
         // returned model name with the catalog's spelling (`m.name`), and
         // that name goes straight onto the wire. `lookup_id` would match a

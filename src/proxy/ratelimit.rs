@@ -1968,6 +1968,7 @@ mod tests {
             payload,
             target: AdmissionTarget {
                 provider_name: provider_name.into(),
+                instance: provider_name.into(),
                 model: model.into(),
                 policy,
             },
@@ -2132,6 +2133,7 @@ mod tests {
         assert_eq!(effective_output_budget(&openai), 128_000);
         let unknown_openai_target = AdmissionTarget {
             provider_name: "openai".into(),
+            instance: "openai".into(),
             model: "gpt-unknown".into(),
             policy: crate::provider::RequestAdmissionPolicy::namespaced(
                 "x-openai",

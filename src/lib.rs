@@ -145,7 +145,7 @@ async fn completion_inner(
         Ok(resp) => {
             if let Some(logger) = logger {
                 logger.log(&LogEntry::from_response(
-                    provider.name(),
+                    provider.instance(),
                     model_str,
                     &resp,
                     timer.elapsed(),
@@ -156,7 +156,7 @@ async fn completion_inner(
         Err(e) => {
             if let Some(logger) = logger {
                 logger.log(&LogEntry::from_error(
-                    provider.name(),
+                    provider.instance(),
                     model_str,
                     &e.to_string(),
                     timer.elapsed(),
@@ -192,7 +192,7 @@ pub async fn embeddings_with_client(
     let response = client
         .embeddings(provider, &model, &embeddings::payload(request))
         .await?;
-    embeddings::parse(provider.name(), &model, request.input.len(), response)
+    embeddings::parse(provider.instance(), &model, request.input.len(), response)
 }
 
 /// Streaming entry point. Returns an SSE stream of OpenAI-format chunks.
@@ -275,7 +275,7 @@ async fn stream_resolved(
         .ok_or(error::ShimError::MissingModel)?;
 
     let (provider, model) = router.resolve_owned(model_str)?;
-    let provider_name = provider.name().to_string();
+    let provider_name = provider.instance().to_string();
     // The breaker observes a single target without refusing it. An explicit
     // dispatch policy still gates every actual stream-open attempt below.
     let stream = match policy_context {

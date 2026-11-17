@@ -1239,7 +1239,7 @@ impl AttemptCoordinator {
                 None,
             ));
         }
-        let provider = attempt.identity().provider_name();
+        let provider = attempt.identity().instance();
         let semaphore = {
             let mut semaphores = self.semaphores.lock().unwrap();
             semaphores
@@ -1440,7 +1440,7 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
                 AttemptEvent::ResponseHeaders { status: 429 } => self
                     .coordinator
                     .rates
-                    .penalize(attempt.provider_name(), self.coordinator.penalty())
+                    .penalize(attempt.instance(), self.coordinator.penalty())
                     .await
                     .map_err(|_| {
                         AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)

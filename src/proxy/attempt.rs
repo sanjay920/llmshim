@@ -39,7 +39,7 @@ impl AttemptPolicy for ProxyAttemptPolicy {
             let permit = self.backpressure.acquire().await.map_err(|_| {
                 AttemptPolicyRefusal::new(AttemptPolicyRefusalKind::CoordinatorUnavailable, None)
             })?;
-            let key = RateKey::provider(attempt.identity().provider_name());
+            let key = RateKey::provider(attempt.identity().instance());
             self.limiter
                 .acquire(&key, super::ratelimit::estimate_attempt_tokens(attempt))
                 .await
@@ -66,10 +66,7 @@ impl AttemptPolicy for ProxyAttemptPolicy {
             match event {
                 AttemptEvent::ResponseHeaders { status: 429 } => {
                     self.limiter
-                        .penalize(
-                            &RateKey::provider(attempt.provider_name()),
-                            penalty_duration(),
-                        )
+                        .penalize(&RateKey::provider(attempt.instance()), penalty_duration())
                         .await;
                     Ok(())
                 }

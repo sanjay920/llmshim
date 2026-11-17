@@ -8,6 +8,9 @@ const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 pub struct Xai {
     pub api_key: String,
     pub base_url: String,
+    /// The registered key of this entry, when it is a named instance of the kind (design note
+    /// 0032); `None` reports the kind as the admission identity.
+    instance: Option<String>,
 }
 
 impl Xai {
@@ -15,7 +18,15 @@ impl Xai {
         Self {
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
+            instance: None,
         }
+    }
+
+    /// Make this entry a named instance of its kind: the admission identity (lane, limits,
+    /// circuit, usage) is `name`, while pricing, replay and tool handling still read the kind.
+    pub fn with_instance(mut self, name: &str) -> Self {
+        self.instance = Some(name.to_owned());
+        self
     }
 
     pub fn with_base_url(mut self, url: String) -> Self {
@@ -220,6 +231,10 @@ impl Provider for Xai {
 
     fn name(&self) -> &str {
         "xai"
+    }
+
+    fn instance(&self) -> &str {
+        self.instance.as_deref().unwrap_or(self.name())
     }
 
     fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
