@@ -63,6 +63,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0027: Bounded admission during a Redis outage](0027-bounded-admission-during-a-redis-outage.md)
 - [0028: Per-key model allowlists](0028-model-allowlists.md)
 - [0029: Key tags on usage records](0029-key-tags.md)
+- [0030: Tenant budgets above key budgets](0030-hierarchical-budgets.md)
 
 ## Roadmap
 
@@ -135,7 +136,8 @@ Later phases (each needs its own design note before work starts)
       bound is on admitted reservations, not spend
 - [x] Per-key model allowlists (0028): `keys[].allowed_models`, 403 before admission; also in control-plane keys and signed snapshots
 - [x] Key tags on usage records (0029): `keys[].tags` onto usage records, also in control-plane keys and snapshots
-- [ ] Hierarchical budgets, alerts, scheduled cost exports
+- [ ] Tenant budgets above key budgets: designed in 0030; not built
+- [ ] Alerts, scheduled cost exports
 - [ ] Deployments and load balancing across credentials and regions
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
 - [ ] Audit log
