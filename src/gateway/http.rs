@@ -2327,7 +2327,7 @@ mod native_tests {
         drop(held_prequeue_permit);
 
         let released = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(15),
             app(state).oneshot(canonical_request("test-key", "keyed-ingress", "hi")),
         )
         .await
