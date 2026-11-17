@@ -98,6 +98,57 @@ pub(crate) fn quote_unbounded(
     }))
 }
 
+/// [`quote`] for speech synthesis (note 0037). The price is fixed by the request: the input's
+/// characters at the catalog's per-character rate for the model (a builtin, trusted row), so the
+/// reservation is exact, and the attempt settles at the same figure. A model with no such rate has no
+/// bound and is refused at every capped level.
+pub(crate) fn quote_speech(
+    policy: Option<&BudgetPolicySnapshot>,
+    attempt: &PreparedAttempt<'_>,
+) -> Result<Option<BudgetQuote>, BudgetPlanError> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if !policy.valid {
+        return Err(BudgetPlanError::Unpriceable);
+    }
+    if policy.limit_nanos == 0 {
+        return Ok(Some(BudgetQuote {
+            amount_nanos: 0,
+            bounded: true,
+        }));
+    }
+    match speech_reservation_nanos(attempt).filter(|amount| *amount <= MAX_EXACT_REDIS_NANOS) {
+        Some(amount_nanos) => Ok(Some(BudgetQuote {
+            amount_nanos,
+            bounded: true,
+        })),
+        None => Err(BudgetPlanError::Unpriceable),
+    }
+}
+
+fn speech_reservation_nanos(attempt: &PreparedAttempt<'_>) -> Option<u64> {
+    let identity = attempt.identity();
+    let row = llmshim_catalog::audio::SPEECH_MODELS.iter().find(|row| {
+        row.provider == identity.provider_name() && row.model == identity.pricing_model()
+    })?;
+    let characters = attempt
+        .native_body()
+        .get("input")?
+        .as_str()?
+        .chars()
+        .count() as u128;
+    let rate_nanos_per_million = (row.usd_per_million_characters * NANOS_PER_USD).ceil();
+    if !rate_nanos_per_million.is_finite() || rate_nanos_per_million < 0.0 {
+        return None;
+    }
+    let numerator = characters.checked_mul(rate_nanos_per_million as u128)?;
+    let nanos = numerator
+        .checked_add(PER_MILLION - 1)?
+        .checked_div(PER_MILLION)?;
+    u64::try_from(nanos).ok()
+}
+
 fn quote_with(
     policy: Option<&BudgetPolicySnapshot>,
     attempt: &PreparedAttempt<'_>,

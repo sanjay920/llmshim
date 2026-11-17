@@ -1281,6 +1281,9 @@ impl AttemptCoordinator {
                 crate::policy::DispatchOperation::Images => {
                     crate::gateway::budget::quote_unbounded(Some(policy))
                 }
+                crate::policy::DispatchOperation::Speech => {
+                    crate::gateway::budget::quote_speech(Some(policy), attempt)
+                }
                 crate::policy::DispatchOperation::Chat => {
                     crate::gateway::budget::quote(Some(policy), attempt)
                 }

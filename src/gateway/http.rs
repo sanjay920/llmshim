@@ -161,6 +161,13 @@ impl Dispatch for RealDispatch {
                 let refusal = policy_context.take_last_refusal();
                 return result.map_err(|error| self.map_err(error, refusal));
             }
+            crate::policy::DispatchOperation::Speech => {
+                let result =
+                    crate::speech_value_with_policy(router.as_ref(), &payload, &policy_context)
+                        .await;
+                let refusal = policy_context.take_last_refusal();
+                return result.map_err(|error| self.map_err(error, refusal));
+            }
             crate::policy::DispatchOperation::Chat => {}
         }
         let result = crate::completion_with_logger_and_policy(
@@ -2020,6 +2027,66 @@ async fn images_generations(
     .into_response())
 }
 
+/// The inbound `POST /v1/audio/speech` body, in OpenAI's shape. `speed` and the other fields ride
+/// along to the adapter, which reads the ones it knows.
+#[derive(serde::Deserialize)]
+struct SpeechBody {
+    model: String,
+    input: String,
+    voice: String,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, Value>,
+}
+
+/// POST /v1/audio/speech — OpenAI-shaped, the audio bytes as the body, admitted as an attempt (note
+/// 0037). Its price is fixed by the request (characters at the catalog rate), so a capped key can use
+/// it when the model has a rate. Local scheduler only.
+async fn audio_speech(
+    State(state): State<Arc<GatewayState>>,
+    installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
+    logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
+    headers: HeaderMap,
+    Json(body): Json<SpeechBody>,
+) -> Result<Response, ApiError> {
+    let permits = (body.input.len() as u64 / 4 + 1).min(u64::from(u32::MAX)) as u32;
+    let mut payload = Value::Object(body.rest);
+    payload["input"] = json!(body.input);
+    payload["voice"] = json!(body.voice);
+    let (value, _provider, _model) = submit_media_call(
+        &state,
+        &headers,
+        installed_prequeue_permit,
+        logical_lifetime,
+        MediaCall {
+            operation: crate::policy::DispatchOperation::Speech,
+            noun: "speech synthesis",
+            model: &body.model,
+            payload,
+            permits,
+        },
+        |provider, model, payload| {
+            crate::audio::validate(payload)?;
+            provider.speech_request(model, payload).map(|_| ())
+        },
+    )
+    .await?;
+    use base64::Engine as _;
+    let audio = base64::engine::general_purpose::STANDARD
+        .decode(value["audio"].as_str().unwrap_or_default())
+        .map_err(|_| {
+            ApiError::from(ShimError::ProviderError {
+                status: 502,
+                body: "invalid speech payload".into(),
+                retry_after: None,
+            })
+        })?;
+    let media_type = value["media_type"]
+        .as_str()
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    Ok(([(axum::http::header::CONTENT_TYPE, media_type)], audio).into_response())
+}
+
 /// OpenAI's list-of-embeddings answer. `base64` packs each vector as little-endian f32, which is
 /// what the OpenAI SDKs ask for by default and decode. Cost rides on `usage`; `null` is unknown.
 fn embeddings_response(
@@ -2449,6 +2516,7 @@ pub(crate) fn app_with_parts(
         .route("/v1/chat/stream", post(chat_stream))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/images/generations", post(images_generations))
+        .route("/v1/audio/speech", post(audio_speech))
         .route("/v1/models", get(list_models))
         .route("/v1/gateway/stats", get(stats))
         .route("/metrics", get(metrics))
@@ -2515,7 +2583,11 @@ async fn admit_ingress_preparation(
     let requires_preparation = request.method() == axum::http::Method::POST
         && (matches!(
             inference_path.as_str(),
-            "/v1/chat" | "/v1/chat/stream" | "/v1/embeddings" | "/v1/images/generations"
+            "/v1/chat"
+                | "/v1/chat/stream"
+                | "/v1/embeddings"
+                | "/v1/images/generations"
+                | "/v1/audio/speech"
         ) || crate::proxy::wire::native_route(&inference_path).is_some());
     if !requires_preparation {
         return next.run(request).await;

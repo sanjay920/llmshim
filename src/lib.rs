@@ -252,6 +252,32 @@ pub(crate) async fn images_value_with_policy(
     Ok(serde_json::json!({"images": images, "usage": usage}))
 }
 
+/// An admitted speech synthesis (note 0037): `payload` is the OpenAI-shaped body with the caller's
+/// `model`. The audio is carried through the dispatcher as base64 beside its media type and the
+/// character count and price, and decoded by the route.
+#[cfg(feature = "gateway")]
+pub(crate) async fn speech_value_with_policy(
+    router: &Router,
+    payload: &Value,
+    policy_context: &DispatchPolicyContext,
+) -> Result<Value> {
+    use base64::Engine as _;
+    let model_str = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(error::ShimError::MissingModel)?;
+    let (provider, model) = router.resolve(model_str)?;
+    let client = bound_client(router)?;
+    let response = client
+        .speech_with_policy(provider, &model, payload, policy_context)
+        .await?;
+    Ok(serde_json::json!({
+        "audio": base64::engine::general_purpose::STANDARD.encode(&response.bytes),
+        "media_type": response.media_type,
+        "usage": response.usage,
+    }))
+}
+
 /// Streaming entry point. Returns an SSE stream of OpenAI-format chunks.
 pub async fn stream(
     router: &Router,

@@ -67,6 +67,97 @@ impl ShimClient {
         result.map_err(DispatchFailure::into_public)
     }
 
+    /// [`Self::speech`] under a trusted attempt policy (note 0037). The binary speech endpoint
+    /// returns no usage, but its price is fixed by the request (characters at the catalog's rate), so
+    /// the attempt is reported with that exact figure and its character count.
+    pub async fn speech_with_policy(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &Value,
+        policy_context: &crate::policy::DispatchPolicyContext,
+    ) -> Result<SpeechResponse> {
+        crate::audio::validate(request)?;
+        let prepared = provider.speech_request(model, request)?;
+        let target = provider.request_replay_target(model, &prepared);
+        let result = async {
+            let super::AttemptResponse {
+                response,
+                mut tracker,
+                attempt_deadline,
+            } = self
+                .send_prepared(
+                    Some(policy_context),
+                    AttemptKind::Completion,
+                    model,
+                    Some(&target),
+                    &prepared,
+                    provider.transport().as_deref(),
+                )
+                .await?;
+            let media_type = media_type(&response).to_owned();
+            let bytes = match body::read(
+                response,
+                self.response_body_limits.success_bytes,
+                self.deadlines.unary_body_idle,
+                attempt_deadline,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    super::finish_invalid_response(
+                        &mut tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
+                    return Err(error.into_dispatch_failure());
+                }
+            };
+            let speech = match provider.speech_response(model, &prepared.body, bytes, &media_type) {
+                Ok(speech) => speech,
+                Err(error) => {
+                    super::finish_invalid_response(
+                        &mut tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
+                    return Err(DispatchFailure::Upstream(error));
+                }
+            };
+            if let Some(tracker) = tracker.as_mut() {
+                // No token counters exist; the characters and their fixed price are the whole bill,
+                // so the counters are complete and the price is the catalog's exact one.
+                let usage = serde_json::json!({
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "input_characters": speech.usage["input_characters"],
+                    "cost_usd": speech.usage["cost_usd"],
+                    "cost_source": super::images::known_cost_source(&speech.usage),
+                });
+                let observed = tracker.usage(&usage, true, true, false);
+                super::bounded_policy(observed, self.deadlines.policy_callback, attempt_deadline)
+                    .await
+                    .map_err(|_| super::coordinator_timeout_observation())?
+                    .map_err(DispatchFailure::PolicyObservation)?;
+            }
+            super::finish_completed_response(
+                &mut tracker,
+                self.deadlines.policy_callback,
+                attempt_deadline,
+            )
+            .await?;
+            Ok(speech)
+        }
+        .await;
+        if let Some(outcome) = Self::breaker_outcome(&result) {
+            self.observe(provider, outcome).await;
+        }
+        result.map_err(DispatchFailure::into_public)
+    }
+
     pub async fn speech(
         &self,
         provider: &dyn Provider,

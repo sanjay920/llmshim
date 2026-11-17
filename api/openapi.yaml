@@ -230,6 +230,38 @@ paths:
               schema: {type: object}
         default:
           description: Error object with preserved HTTP status
+  /v1/audio/speech:
+    post:
+      operationId: audioSpeech
+      summary: OpenAI-shaped speech synthesis (gateway only)
+      description: >-
+        Served by the gateway (`llmshim serve`), not by `llmshim proxy`. The audio bytes are the
+        response body, with the format's media type. `input` is 1 to 4096 characters. Admitted by the
+        same key, allowlist and rate rules as a completion. The price is fixed by the request
+        (characters at the catalog's per-character rate), so a key with a spend cap reserves it
+        exactly; a model with no rate is refused with `unpriceable_under_budget`. A fleet gateway
+        answers 501.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input, voice]
+              properties:
+                model: {type: string, description: Routing id, e.g. openai/tts-1}
+                input: {type: string, minLength: 1, maxLength: 4096}
+                voice: {type: string}
+                response_format: {type: string, enum: [mp3, wav, flac, opus, aac, pcm]}
+                speed: {type: number, minimum: 0.25, maximum: 4}
+      responses:
+        '200':
+          description: Audio bytes
+          content:
+            audio/mpeg:
+              schema: {type: string, format: binary}
+        default:
+          description: Error object with preserved HTTP status
   /v1/messages:
     post:
       operationId: nativeMessages

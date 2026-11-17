@@ -112,7 +112,10 @@ pub(crate) async fn bound_inference_request_json(request: Request, next: Next) -
             && path != "/v1/chat/stream"
             // Only the gateway serves embeddings (note 0035); the proxy has no such route.
             && !(cfg!(feature = "gateway")
-                && matches!(path, "/v1/embeddings" | "/v1/images/generations"))
+                && matches!(
+                    path,
+                    "/v1/embeddings" | "/v1/images/generations" | "/v1/audio/speech"
+                ))
             && native_route(path).is_none())
     {
         return next.run(request).await;
