@@ -617,6 +617,11 @@ impl LocalAttemptRates {
                 window_index,
             };
             let current = state.budget_totals.get(&window_key).copied().unwrap_or(0);
+            // Checked here, before anything is reserved, so that the commit below cannot
+            // fail half way and leave one level held.
+            if current.checked_add(quote.amount_nanos).is_none() {
+                return Err(RateRefusal::Unavailable);
+            }
             let admitted = !state.budget_frozen.contains(&window_key)
                 && policy.limit_nanos != 0
                 && if quote.bounded {
@@ -2245,7 +2250,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "redis-coordination")]
     fn budgeted(name: &str, limit_nanos: u64) -> TrustedPolicyScope {
         let mut scope = scope(name, None, None);
         scope.budget = Some(crate::gateway::budget::BudgetPolicySnapshot {
@@ -2478,6 +2482,94 @@ mod tests {
             authority: crate::gateway::budget::SpendAuthority::Provider,
             terminal_authoritative: true,
         }
+    }
+
+    #[test]
+    fn a_scope_without_a_cap_serializes_as_it_always_did_and_one_with_a_cap_is_version_2() {
+        let plain = budgeted("plain", 100);
+        let value = serde_json::to_value(&plain).unwrap();
+        assert_eq!(value["version"], 1);
+        assert!(value.get("tenant_cap").is_none() && value.get("key_cap_id").is_none());
+        let capped = two_level("t", "key-a", 100, Some(50), 3600);
+        let value = serde_json::to_value(&capped).unwrap();
+        assert_eq!(value["version"], 2);
+        assert!(value.get("tenant_cap").is_some() && value.get("key_cap_id").is_some());
+        // The one counter a table-less tenant has is its own tenant key, as before.
+        let levels = plain.budget_levels();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].0, plain.tenant_key);
+        // A level's attempt id is the attempt's own for the first counter.
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(level_attempt_id(id, 0), id);
+        assert_ne!(level_attempt_id(id, 1), id);
+        assert_ne!(level_attempt_id(id, 1), level_attempt_id(id, 2));
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[test]
+    fn a_tenant_with_a_table_is_not_admitted_in_outage_state() {
+        assert!(two_level("t", "k", 100, Some(5), 3600)
+            .outage_budget()
+            .is_none());
+        assert!(two_level("t", "k", 100, None, 3600)
+            .outage_budget()
+            .is_none());
+        assert!(budgeted("plain", 100).outage_budget().is_some());
+    }
+
+    #[test]
+    fn the_key_cap_counter_follows_the_key_name_not_its_secret() {
+        let identity = |name: &str| crate::gateway::auth::Identity {
+            tenant: "acme".into(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(5.0),
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+            allowed_models: None,
+            key_name: Some(name.into()),
+            tenant_budget: Some(crate::gateway::auth::TenantBudget {
+                budget_usd: 100.0,
+                budget_window_secs: None,
+                budget_allow_unpriced: false,
+            }),
+        };
+        let id = |name: &str| {
+            TrustedPolicyScope::from_identity(&identity(name))
+                .key_cap_id
+                .unwrap()
+        };
+        // The same key (a rotated secret does not appear here at all) keeps its counter;
+        // a different name is a different counter.
+        assert_eq!(id("ci"), id("ci"));
+        assert_ne!(id("ci"), id("ci-2"));
+        assert_eq!(id("ci").len(), 16);
+    }
+
+    #[tokio::test]
+    async fn retention_counts_every_level_of_an_attempt() {
+        let rates = LocalAttemptRates::with_retention(RateLimitConfig::default(), 3);
+        let key = two_level("acme", "key-a", 1000, Some(1000), 3600);
+        let go = || {
+            let key = key.clone();
+            let rates = &rates;
+            async move {
+                rates
+                    .acquire_levels_at_epoch(
+                        "p",
+                        &key,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &[quote(1), quote(1)],
+                        Some(10),
+                    )
+                    .await
+            }
+        };
+        go().await.unwrap(); // two entries
+                             // A second would need four: over the limit of three.
+        assert!(matches!(go().await, Err(RateRefusal::Unavailable)));
     }
 
     /// Only a budgeted key whose attempts are priced and bounded can be

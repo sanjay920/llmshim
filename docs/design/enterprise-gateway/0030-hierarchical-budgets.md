@@ -213,3 +213,4 @@ the lease size is then set by the table, which removes today's last-writer-wins 
   `integration_serve_tenant_budgets` (a key cap refuses its key while the other is served, a full tenant
   cap refuses every key, the no-table behavior unchanged, path validation, a reload of the cap).
 - Outage admission refuses a tenant with a table in this build (`outage_budget` is `None`).
+- `Identity.key_name` and `tenant_budget` are `serde(skip)`: only the `serve` file sets them, never a keys map loaded by the non-`serve` gateway (a key map could otherwise create a tenant cap with no key name and share one key counter).

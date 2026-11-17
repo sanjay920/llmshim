@@ -51,12 +51,12 @@ pub struct Identity {
     /// `prefix/*`, or `route/<name>`. `None` is no restriction.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
-    /// The key's name, which names its own budget counter when its tenant has a
+    /// Set only by the `serve` file (never read from a keys map: `serde(skip)`). The key's name, which names its own budget counter when its tenant has a
     /// tenant-level cap (note 0030). Unset for keys that are not from a `serve` file.
-    #[serde(default)]
+    #[serde(skip)]
     pub key_name: Option<String>,
     /// The tenant's own cap over the spend of every key it has (note 0030).
-    #[serde(default)]
+    #[serde(skip)]
     pub tenant_budget: Option<TenantBudget>,
 }
 
