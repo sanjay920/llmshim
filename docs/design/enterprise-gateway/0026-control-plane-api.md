@@ -37,6 +37,8 @@ All bodies and answers are JSON (`application/json`); ids are the opaque ids of 
 | `GET /v1/orgs` | | 200 `{orgs: [...]}` |
 | `POST /v1/orgs/{org}/teams` | `{name}` | 201 team |
 | `GET /v1/orgs/{org}/teams` | | 200 `{teams: [...]}` |
+| `PUT /v1/teams/{team}/budget` | `{budget_usd, budget_window_secs?, budget_allow_unpriced?}` | 200 team (0030) |
+| `DELETE /v1/teams/{team}/budget` | | 200 team without a budget |
 | `POST /v1/teams/{team}/projects` | `{name}` | 201 project |
 | `GET /v1/teams/{team}/projects` | | 200 `{projects: [...]}` |
 | `POST /v1/projects/{project}/keys` | `{name, credential?, tier?, rpm?, tpm?, budget_usd?, budget_window_secs?, budget_allow_unpriced?, allowed_cidrs?, allowed_models?, tags?, expires_at?}` | 201 `{key, secret}` |

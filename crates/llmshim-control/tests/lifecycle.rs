@@ -736,16 +736,23 @@ fn a_model_list_is_checked_stored_copied_on_rotation_and_signed_only_when_set() 
 /// keys: version 1 had neither model lists nor tags, version 2 had model lists only.
 #[test]
 fn an_older_database_is_migrated_in_place() {
-    for from in [1_i64, 2] {
+    for from in [1_i64, 2, 3] {
         migrate_from(from);
     }
 }
 
 fn migrate_from(from: i64) {
-    let drop_columns = if from == 1 {
-        "ALTER TABLE keys DROP COLUMN allowed_models; ALTER TABLE keys DROP COLUMN tags;"
-    } else {
-        "ALTER TABLE keys DROP COLUMN tags;"
+    // What a database of that version did not have yet: keys.allowed_models (2), keys.tags (3),
+    // and a team's budget (4).
+    let team_columns = "ALTER TABLE teams DROP COLUMN budget_usd; \
+        ALTER TABLE teams DROP COLUMN budget_window_secs; \
+        ALTER TABLE teams DROP COLUMN budget_allow_unpriced;";
+    let drop_columns = match from {
+        1 => format!(
+            "ALTER TABLE keys DROP COLUMN allowed_models; ALTER TABLE keys DROP COLUMN tags; {team_columns}"
+        ),
+        2 => format!("ALTER TABLE keys DROP COLUMN tags; {team_columns}"),
+        _ => team_columns.to_string(),
     };
     let use_new_columns = |store: &mut Store, project: &str| {
         let mut new = NewKey::secret(project, "new");
@@ -774,6 +781,20 @@ fn migrate_from(from: i64) {
         .unwrap();
         drop(raw);
         let mut store = Store::open_postgres(&url, Some(&schema)).unwrap();
+        // The new column works after the migration.
+        let team = store.teams_checked(&org).unwrap().remove(0);
+        assert!(team.budget.is_none());
+        store
+            .set_team_budget(
+                &team.id,
+                Some(llmshim_control::TeamBudget {
+                    budget_usd: 5.0,
+                    budget_window_secs: None,
+                    budget_allow_unpriced: false,
+                }),
+                ACTOR,
+            )
+            .unwrap();
         let keys = store.keys(&org).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].allowed_models, None);
@@ -805,6 +826,20 @@ fn migrate_from(from: i64) {
             .unwrap();
     }
     let mut store = Store::open(&file).unwrap();
+    // The new column works after the migration.
+    let team = store.teams_checked(&org).unwrap().remove(0);
+    assert!(team.budget.is_none());
+    store
+        .set_team_budget(
+            &team.id,
+            Some(llmshim_control::TeamBudget {
+                budget_usd: 5.0,
+                budget_window_secs: None,
+                budget_allow_unpriced: false,
+            }),
+            ACTOR,
+        )
+        .unwrap();
     let keys = store.keys(&org).unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].allowed_models, None);
@@ -896,4 +931,101 @@ fn a_newer_schema_version_is_refused() {
             .unwrap();
     }
     assert!(matches!(Store::open(&file), Err(Error::Invalid(_))));
+}
+
+#[test]
+fn a_teams_budget_is_checked_changed_cleared_recorded_and_signed_only_when_set() {
+    let mut f = fixture();
+    let budget = |usd: f64, window: Option<u64>| llmshim_control::TeamBudget {
+        budget_usd: usd,
+        budget_window_secs: window,
+        budget_allow_unpriced: false,
+    };
+    for bad in [
+        budget(-1.0, None),
+        budget(f64::NAN, None),
+        budget(1e300, None),
+        budget(1.0, Some(0)),
+        budget(1.0, Some(366 * 24 * 3600 + 1)),
+    ] {
+        assert!(
+            matches!(
+                f.store.set_team_budget(&f.team, Some(bad.clone()), ACTOR),
+                Err(Error::Invalid(_))
+            ),
+            "{bad:?}"
+        );
+    }
+    assert!(matches!(
+        f.store
+            .set_team_budget("team_missing", Some(budget(1.0, None)), ACTOR),
+        Err(Error::NotFound(_))
+    ));
+    f.store
+        .create_key(NewKey::secret(&f.project, "ci"), ACTOR)
+        .unwrap();
+    // No budget: the payload's tenant record is exactly what older data planes read.
+    let tenants =
+        |store: &mut Store, org: &str| store.build_payload(org).unwrap()["tenants"][0].clone();
+    let none = tenants(&mut f.store, &f.org);
+    assert!(none.get("budget_usd").is_none());
+    // Set: the record carries it, and the data plane reads it back as a tenant budget.
+    let set = f
+        .store
+        .set_team_budget(&f.team, Some(budget(25.5, Some(3600))), ACTOR)
+        .unwrap();
+    assert_eq!(set.budget.as_ref().unwrap().budget_usd, 25.5);
+    let with = tenants(&mut f.store, &f.org);
+    assert_eq!(with["budget_usd"], 25.5);
+    assert_eq!(with["budget_window_secs"], 3600);
+    assert!(with.get("budget_allow_unpriced").is_none());
+    let directory = dir("team-budget");
+    let (seed, public) = llmshim::serve::snapshot::keygen().unwrap();
+    let published = f.store.publish_snapshot(&f.org, &seed, ACTOR).unwrap();
+    let file = directory.join("snapshot.json");
+    std::fs::write(&file, published.envelope).unwrap();
+    let cp = control_plane(&f.org, &public, &file);
+    let loaded = llmshim::serve::snapshot::load(&cp, None, chrono::Utc::now()).unwrap();
+    let read = &loaded.tenants[&f.team];
+    assert_eq!(
+        (read.budget_usd, read.budget_window_secs),
+        (25.5, Some(3600))
+    );
+    // Cleared: gone again, and both changes are in the history without a secret.
+    let cleared = f.store.set_team_budget(&f.team, None, ACTOR).unwrap();
+    assert!(cleared.budget.is_none());
+    assert!(tenants(&mut f.store, &f.org).get("budget_usd").is_none());
+    let actions: Vec<String> = f
+        .store
+        .history_rows(50)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.action)
+        .collect();
+    assert!(actions.contains(&"team.budget_set".to_string()));
+    assert!(actions.contains(&"team.budget_cleared".to_string()));
+}
+
+/// A stored amount that cannot be a budget stops publishing instead of becoming "no cap".
+#[test]
+fn a_corrupt_stored_team_budget_refuses_to_publish() {
+    if common::postgres_url().is_some() {
+        return; // the same row check runs on both backends; the corruption is made by SQLite here
+    }
+    let directory = dir("corrupt-budget");
+    let file = directory.join("control.db");
+    let (org, team) = {
+        let mut store = Store::open(&file).unwrap();
+        let org = store.create_org("Acme", ACTOR).unwrap();
+        let team = store.create_team(&org.id, "Platform", ACTOR).unwrap();
+        (org.id, team.id)
+    };
+    {
+        let connection = rusqlite::Connection::open(&file).unwrap();
+        connection
+            .execute("UPDATE teams SET budget_usd = 1e999 WHERE id = ?1", [&team])
+            .unwrap();
+    }
+    let mut store = Store::open(&file).unwrap();
+    assert!(matches!(store.build_payload(&org), Err(Error::Invalid(_))));
 }

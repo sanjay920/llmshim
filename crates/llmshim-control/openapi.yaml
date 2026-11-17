@@ -40,6 +40,27 @@ paths:
         '200': {description: Teams}
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/teams/{team}/budget:
+    parameters: [{name: team, in: path, required: true, schema: {type: string}}]
+    put:
+      operationId: setTeamBudget
+      description: 'The cap over every key of the team that the data plane applies as a tenant budget (data-plane note 0030). Carried in the signed snapshot only when set.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TeamBudget'}
+      responses:
+        '200': {description: The team}
+        '400': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    delete:
+      operationId: clearTeamBudget
+      responses:
+        '200': {description: The team, without a budget}
+        '404': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
   /v1/teams/{team}/projects:
     parameters: [{name: team, in: path, required: true, schema: {type: string}}]
     post:
@@ -231,6 +252,14 @@ components:
       properties:
         key: {$ref: '#/components/schemas/Key'}
         secret: {type: [string, 'null'], description: Shown once; null for a certificate or token identity}
+    TeamBudget:
+      type: object
+      required: [budget_usd]
+      additionalProperties: false
+      properties:
+        budget_usd: {type: number}
+        budget_window_secs: {type: integer}
+        budget_allow_unpriced: {type: boolean}
     NewKey:
       type: object
       required: [name]

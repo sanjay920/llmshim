@@ -198,6 +198,74 @@ async fn a_snapshot_keys_tags_are_on_its_usage_records() {
     assert_eq!(of("bravo")["tags"], json!({}));
 }
 
+/// A team's budget in the snapshot is the tenant-level cap over every key of the team (0030):
+/// the key has no budget of its own, and a change of the cap applies with the next snapshot.
+#[tokio::test]
+async fn a_teams_budget_in_the_snapshot_caps_its_keys_and_a_new_generation_changes_it() {
+    let mut upstream = mockito::Server::new_async().await;
+    let mock = upstream
+        .mock("POST", "/responses")
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "id": "resp_1", "object": "response", "status": "completed",
+                "model": "gpt-6-luna",
+                "output": [{"type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "pong", "annotations": []}]}],
+                "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+            })
+            .to_string(),
+        )
+        .expect_at_least(2)
+        .create_async()
+        .await;
+    let plane = Plane::new("snapshot-team-budget");
+    let with_budget = |generation: u64, usd: f64| {
+        let mut p = payload(generation, vec![key("alpha", ALPHA, "active")]);
+        p["tenants"] = json!([{"id": "team_a", "name": "platform", "budget_usd": usd}]);
+        p
+    };
+    plane.write(&with_budget(1, 0.0));
+    let text = plane
+        .config(&upstream.url(), "")
+        .replace("providers.inference", "providers.openai")
+        .replace("kind = \"openai-compatible\"", "kind = \"openai\"");
+    let server = start(&text, "snapshot-team-budget", &[]);
+    let ask = || async {
+        chat(&server, Some(ALPHA), "openai/gpt-6-luna")
+            .await
+            .status()
+            .as_u16()
+    };
+    // The key has no budget; the team's cap of zero refuses it before the provider.
+    assert_eq!(ask().await, 429);
+    // A new generation raises the cap: served.
+    plane.write(&with_budget(2, 100.0));
+    hangup(&server);
+    wait_for_reload(&server, "generation 2", |s| s["generation"] == 1).await;
+    assert_eq!(ask().await, 200);
+    // Lowered to zero it refuses again, and removed altogether it serves again.
+    plane.write(&with_budget(3, 0.0));
+    hangup(&server);
+    wait_for_reload(&server, "generation 3", |s| s["generation"] == 2).await;
+    assert_eq!(ask().await, 429);
+    let mut uncapped = payload(4, vec![key("alpha", ALPHA, "active")]);
+    uncapped["tenants"] = json!([{"id": "team_a", "name": "platform"}]);
+    plane.write(&uncapped);
+    hangup(&server);
+    wait_for_reload(&server, "generation 4", |s| s["generation"] == 3).await;
+    assert_eq!(ask().await, 200);
+    // A cap field without the amount is refused whole, the previous generation serving.
+    let mut partial = payload(5, vec![key("alpha", ALPHA, "active")]);
+    partial["tenants"] = json!([{"id": "team_a", "name": "platform", "budget_window_secs": 60}]);
+    plane.write(&partial);
+    hangup(&server);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(snapshot_status(&server).await["generation"], 4);
+    mock.assert_async().await;
+}
+
 #[tokio::test]
 async fn a_new_generation_applies_on_reload_and_revocation_takes_effect() {
     let (upstream, _mock) = mock(1).await;

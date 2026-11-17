@@ -488,6 +488,25 @@ pub fn tag_value_problem(value: &str) -> Option<&'static str> {
     )
 }
 
+/// The value rules of a tenant budget, shared by the file's table and a snapshot's team record.
+fn check_tenant_budget_values(at: &str, budget: &TenantBudgetConfig, issues: &mut Vec<Issue>) {
+    if !budget.budget_usd.is_finite() || !(0.0..=MAX_BUDGET_USD).contains(&budget.budget_usd) {
+        issues.push(Issue::new(
+            format!("{at}.budget_usd"),
+            format!("must be between 0 and {MAX_BUDGET_USD}"),
+        ));
+    }
+    if budget
+        .budget_window_secs
+        .is_some_and(|secs| !(1..=MAX_BUDGET_WINDOW_SECS).contains(&secs))
+    {
+        issues.push(Issue::new(
+            format!("{at}.budget_window_secs"),
+            format!("must be between 1 and {MAX_BUDGET_WINDOW_SECS} (366 days)"),
+        ));
+    }
+}
+
 fn validate_outage_admission(outage: &OutageAdmission, issues: &mut Vec<Issue>) {
     for (path, value) in [
         (
@@ -1287,9 +1306,15 @@ impl ServeConfig {
             )]);
         }
         self.keys = snapshot.keys.clone();
+        self.tenants = snapshot.tenants.clone();
         let mut issues = Vec::new();
         self.validate_keys(&mut issues);
         self.validate_tenant_limits(&mut issues);
+        // A team's budget is checked by value; a team with no active key is not an error
+        // (the control plane owns teams, and a team may simply have none right now).
+        for (name, budget) in &self.tenants {
+            check_tenant_budget_values(&format!("tenants.{name}"), budget, &mut issues);
+        }
         if issues.is_empty() {
             Ok(Some(snapshot))
         } else {
@@ -2303,7 +2328,7 @@ impl ServeConfig {
         if self.control_plane.is_some() {
             issues.push(Issue::new(
                 "tenants",
-                "tenant budgets are not carried by a control-plane snapshot yet (note 0030)",
+                "tenant budgets come from the control plane's team budgets when [control_plane] is set; remove [tenants] (note 0030)",
             ));
         }
         for (name, budget) in &self.tenants {
@@ -2314,23 +2339,7 @@ impl ServeConfig {
                     "names a tenant that no key uses (a misspelling would cap nothing)",
                 ));
             }
-            if !budget.budget_usd.is_finite()
-                || !(0.0..=MAX_BUDGET_USD).contains(&budget.budget_usd)
-            {
-                issues.push(Issue::new(
-                    format!("{at}.budget_usd"),
-                    format!("must be between 0 and {MAX_BUDGET_USD}"),
-                ));
-            }
-            if budget
-                .budget_window_secs
-                .is_some_and(|secs| !(1..=MAX_BUDGET_WINDOW_SECS).contains(&secs))
-            {
-                issues.push(Issue::new(
-                    format!("{at}.budget_window_secs"),
-                    format!("must be between 1 and {MAX_BUDGET_WINDOW_SECS} (366 days)"),
-                ));
-            }
+            check_tenant_budget_values(&at, budget, issues);
         }
     }
 
