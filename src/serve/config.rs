@@ -466,6 +466,32 @@ impl Reload {
     }
 }
 
+fn validate_outage_admission(outage: &OutageAdmission, issues: &mut Vec<Issue>) {
+    for (path, value) in [
+        (
+            "fleet.outage_admission.spend_lease_fraction",
+            outage.spend_lease_fraction,
+        ),
+        ("fleet.outage_admission.rate_fraction", outage.rate_fraction),
+    ] {
+        if !(value.is_finite() && value > 0.0 && value <= 1.0) {
+            issues.push(Issue::new(path, "must be greater than 0 and at most 1"));
+        }
+    }
+    if !(1..=4096).contains(&outage.max_concurrency) {
+        issues.push(Issue::new(
+            "fleet.outage_admission.max_concurrency",
+            "must be between 1 and 4096",
+        ));
+    }
+    if !(5..=3600).contains(&outage.recover_after_secs) {
+        issues.push(Issue::new(
+            "fleet.outage_admission.recover_after_secs",
+            "must be between 5 and 3600",
+        ));
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -607,6 +633,49 @@ pub struct Fleet {
     /// The Redis URL (`redis://` or `rediss://`), by reference because it can
     /// carry a password.
     pub redis_url: SecretRef,
+    /// Keep serving a bounded amount while Redis is unreachable (design note
+    /// 0027). Off unless this table is present.
+    #[serde(default)]
+    pub outage_admission: Option<OutageAdmission>,
+}
+
+/// Bounded local admission while Redis is unreachable (design note 0027). Each
+/// replica holds a share of its tenants' budgets in advance, in good times,
+/// and spends only that during an outage.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct OutageAdmission {
+    /// Target share (0 to 1) of a tenant's remaining budget window that each
+    /// replica holds as its lease. The fleet holds `1 - (1 - f)^replicas` of it
+    /// back from ordinary admission, whether or not an outage happens.
+    #[serde(default = "default_spend_lease_fraction")]
+    pub spend_lease_fraction: f64,
+    /// Share (0 to 1) of each provider's and tenant's rpm/tpm limits one
+    /// replica may use during an outage; the operator's estimate of
+    /// `1 / replicas`.
+    #[serde(default = "default_outage_rate_fraction")]
+    pub rate_fraction: f64,
+    /// In-flight upstream requests per replica during an outage (1 to 4096).
+    #[serde(default = "default_outage_concurrency")]
+    pub max_concurrency: u32,
+    /// Seconds Redis must answer before the replica leaves the outage path
+    /// (5 to 3600).
+    #[serde(default = "default_recover_after_secs")]
+    pub recover_after_secs: u64,
+}
+
+fn default_spend_lease_fraction() -> f64 {
+    0.05
+}
+fn default_outage_rate_fraction() -> f64 {
+    0.10
+}
+fn default_outage_concurrency() -> u32 {
+    16
+}
+fn default_recover_after_secs() -> u64 {
+    30
 }
 
 /// A second listener for operational endpoints: `/metrics`,
@@ -1356,6 +1425,9 @@ impl ServeConfig {
         self.validate_reload(&mut issues);
         if let Some(fleet) = &self.fleet {
             validate_secret(&fleet.redis_url, "fleet.redis_url", &mut issues);
+            if let Some(outage) = &fleet.outage_admission {
+                validate_outage_admission(outage, &mut issues);
+            }
         }
         self.validate_providers(&mut issues);
         self.validate_limits(&mut issues);
@@ -4293,6 +4365,43 @@ mod tests {
         let inline =
             format!("{MINIMAL}\n[server.tls]\ncert_file = \"/c\"\nkey_file = \"/k\"\nkey = \"x\"");
         assert!(issues(&inline)[0].contains("unknown field"));
+    }
+
+    #[test]
+    fn outage_admission_defaults_and_bounds() {
+        let base = format!("{MINIMAL}\n[fleet]\nredis_url = {{ env = \"REDIS_URL\" }}");
+        let plain = ServeConfig::parse(&base, Format::Toml).unwrap();
+        assert!(plain.fleet.unwrap().outage_admission.is_none());
+        let on = format!("{base}\n[fleet.outage_admission]");
+        let config = ServeConfig::parse(&on, Format::Toml).unwrap();
+        let outage = config.fleet.unwrap().outage_admission.unwrap();
+        assert_eq!(
+            (
+                outage.spend_lease_fraction,
+                outage.rate_fraction,
+                outage.max_concurrency,
+                outage.recover_after_secs
+            ),
+            (0.05, 0.10, 16, 30)
+        );
+        for (line, path) in [
+            ("spend_lease_fraction = 0", "spend_lease_fraction"),
+            ("spend_lease_fraction = 1.5", "spend_lease_fraction"),
+            ("rate_fraction = -0.1", "rate_fraction"),
+            ("max_concurrency = 0", "max_concurrency"),
+            ("max_concurrency = 5000", "max_concurrency"),
+            ("recover_after_secs = 4", "recover_after_secs"),
+            ("recover_after_secs = 4000", "recover_after_secs"),
+        ] {
+            let bad = format!("{base}\n[fleet.outage_admission]\n{line}");
+            let found = issues(&bad);
+            assert!(found.iter().any(|i| i.contains(path)), "{line}: {found:?}");
+        }
+        let unknown = format!("{base}\n[fleet.outage_admission]\nsurprise = 1");
+        assert!(issues(&unknown)[0].contains("unknown field"));
+        // Without [fleet] the table has nowhere to live.
+        let orphan = format!("{MINIMAL}\n[fleet.outage_admission]");
+        assert!(!issues(&orphan).is_empty());
     }
 
     #[test]

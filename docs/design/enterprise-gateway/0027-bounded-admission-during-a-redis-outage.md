@@ -131,8 +131,8 @@ fleet's, not this mode's: it fails as today.
 Each replica holds up to its target, so N replicas holding fraction f of what remains leave the fleet
 `(1 − f)^N` of a tenant's budget: 20 replicas at 0.05 lock about 64 % of it and the rest is what fleet
 admission sees; at 0.05 and 50 replicas, 92 %. A deployment sizes `spend_lease_fraction` as roughly
-`(1 − (1 − reserve)^(1/N))` for the share `reserve` of budget it is willing to hold back, and the
-file's check warns when it cannot know N. This price is paid continuously, whether or not an outage
+`(1 − (1 − reserve)^(1/N))` for the share `reserve` of budget it is willing to hold back (the file
+cannot know N, so the check does not warn). This price is paid continuously, whether or not an outage
 ever happens, which is why the mode is off by default.
 
 ## What it does not do
@@ -206,7 +206,7 @@ outage leaves the mode off. The startup probe still uses `/health`.
    stranding.
 3. **Built** (`LeaseLedger::recover`, still unused outside its tests): recovery: the draw-down and release procedure over synthetic local records, resumable. It lands
    **before** any local admission, because admitting without a way to settle is the unsafe order.
-4. The outage state with hysteresis, the second scheduler, limiter and coordinator, the local
+4. Split in two PRs. **4a built**: the `[fleet.outage_admission]` table with its validation and schema, and the pure state in `src/gateway/outage.rs` (`OutageState` hysteresis, `LocalLeaseAccount` quotes, margin and recovery records), unwired. **4b**: the wiring (and `example.toml`, if one carries `[fleet]`). The outage state with hysteresis, the second scheduler, limiter and coordinator, the local
    admission path, the `[fleet.outage_admission]` table and the idempotency cache.
 5. Status, metrics, `/ready`, the usage field and the 0014 rows.
 
