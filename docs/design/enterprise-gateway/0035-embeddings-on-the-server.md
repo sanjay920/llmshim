@@ -1,6 +1,6 @@
 # 0035: Embeddings on the server
 
-Status: slice 1 built (embeddings only; images and audio are not built).
+Status: slices 1 and 2 built (embeddings only, with a spend bound; images and audio are not built).
 
 ## Decision
 
@@ -30,15 +30,24 @@ observation. There is no second dispatch, auth or queue path (the rule the nativ
 - **Auth and allowlist.** The caller is identified exactly as for chat (401 otherwise). A key with
   `allowed_models` may embed only a listed routing id (403 `model_not_allowed`, before the provider). The
   key's rpm/tpm apply through the same buckets.
-- **Spend.** The reservation model is built for the chat wires: it assumes one request fits in one
-  context window, which a batch of texts does not, so an embeddings attempt has **no enforceable pre-send
-  bound**. A key with a spend cap (its own or its tenant's) is therefore refused with
-  `400 unpriceable_under_budget`, **even with `budget_allow_unpriced`**: an unbounded attempt holds the level's
-  whole remaining allowance until a provider's own bill settles it, embeddings carry none, and the first call
-  would starve the key for the rest of its window (a process test found this: the second call was a 429). A key
-  with no cap is served, and its spend is observed and recorded (billed tokens, catalog price). A bound for
-  embeddings (batch size times the model's input limit, at the input rate) is the next slice; until then a
-  capped key cannot embed.
+- **Spend.** The chat reservation assumes one request fits in one context window, which a batch of
+  texts does not (N texts can be N windows), so an embeddings attempt has its own bound:
+  **the request body's length in bytes, plus 64, as tokens, at the model's input price.** A token covers at
+  least one byte of the text it came from and the body holds every text (escaped, so never shorter), so this
+  is an upper bound on the billed input tokens for any batch and any tokenizer; there is no output. (The
+  first suggestion was the context window times the input price. It is not an upper bound for a batch, and
+  it ignores how much was sent: a one-word request would reserve a whole window.) The price must be
+  **trusted**: from local policy (`~/.config/llmshim/models.toml`, the project's `.llmshim/models.toml`, or
+  `LLMSHIM_CATALOG_PROJECT`) or a verified builtin row, never models.dev, and a model with context-size price
+  tiers has no bound. The builtin rows for the OpenAI and Gemini embedding models carry no price of their
+  own, so an operator who wants a capped key to embed with them sets `[models."openai/text-embedding-3-small".cost]
+  input = <USD per million tokens>` locally. Without a trusted price the key is refused
+  `400 unpriceable_under_budget`, **even with `budget_allow_unpriced`**: an unbounded attempt holds the
+  level's whole remaining allowance until a provider's own bill settles it, embeddings carry none, and the
+  first call would starve the key for the rest of its window (a process test found this: the second call was
+  a 429). With a bound, a cap below the reservation is a 429 before the provider, the attempt reserves what the
+  bound says and settles at the billed tokens' catalog price, and the reservation is released. A key with no
+  cap is served and its spend recorded either way.
 - **Where it runs.** The local scheduler only. With `[fleet]` the answer is `501 not_implemented`: a
   distributed job carries a chat payload, and running an embeddings one as chat would be a wrong answer.
 - **Not built:** images and audio endpoints; chunking or splitting a batch (never: work the caller did not
