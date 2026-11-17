@@ -217,7 +217,7 @@ async fn a_teams_budget_in_the_snapshot_caps_its_keys_and_a_new_generation_chang
             })
             .to_string(),
         )
-        .expect(1)
+        .expect_at_least(2)
         .create_async()
         .await;
     let plane = Plane::new("snapshot-team-budget");
@@ -245,6 +245,24 @@ async fn a_teams_budget_in_the_snapshot_caps_its_keys_and_a_new_generation_chang
     hangup(&server);
     wait_for_reload(&server, "generation 2", |s| s["generation"] == 1).await;
     assert_eq!(ask().await, 200);
+    // Lowered to zero it refuses again, and removed altogether it serves again.
+    plane.write(&with_budget(3, 0.0));
+    hangup(&server);
+    wait_for_reload(&server, "generation 3", |s| s["generation"] == 2).await;
+    assert_eq!(ask().await, 429);
+    let mut uncapped = payload(4, vec![key("alpha", ALPHA, "active")]);
+    uncapped["tenants"] = json!([{"id": "team_a", "name": "platform"}]);
+    plane.write(&uncapped);
+    hangup(&server);
+    wait_for_reload(&server, "generation 4", |s| s["generation"] == 3).await;
+    assert_eq!(ask().await, 200);
+    // A cap field without the amount is refused whole, the previous generation serving.
+    let mut partial = payload(5, vec![key("alpha", ALPHA, "active")]);
+    partial["tenants"] = json!([{"id": "team_a", "name": "platform", "budget_window_secs": 60}]);
+    plane.write(&partial);
+    hangup(&server);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(snapshot_status(&server).await["generation"], 4);
     mock.assert_async().await;
 }
 

@@ -406,6 +406,16 @@ pub fn load_from(
         }
     }
     let (keys, inactive) = to_keys(&payload, now).map_err(refuse)?;
+    // A cap field without the amount is a malformed record, refused: a tenant must never be
+    // served without a cap the issuer meant it to have.
+    if payload.tenants.iter().any(|tenant| {
+        tenant.budget_usd.is_none()
+            && (tenant.budget_window_secs.is_some() || tenant.budget_allow_unpriced)
+    }) {
+        return Err(refuse(Refusal::InvalidContent(
+            "a tenant record sets a budget window or flag without budget_usd".into(),
+        )));
+    }
     let tenants = payload
         .tenants
         .iter()

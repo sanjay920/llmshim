@@ -1005,3 +1005,27 @@ fn a_teams_budget_is_checked_changed_cleared_recorded_and_signed_only_when_set()
     assert!(actions.contains(&"team.budget_set".to_string()));
     assert!(actions.contains(&"team.budget_cleared".to_string()));
 }
+
+/// A stored amount that cannot be a budget stops publishing instead of becoming "no cap".
+#[test]
+fn a_corrupt_stored_team_budget_refuses_to_publish() {
+    if common::postgres_url().is_some() {
+        return; // the same row check runs on both backends; the corruption is made by SQLite here
+    }
+    let directory = dir("corrupt-budget");
+    let file = directory.join("control.db");
+    let (org, team) = {
+        let mut store = Store::open(&file).unwrap();
+        let org = store.create_org("Acme", ACTOR).unwrap();
+        let team = store.create_team(&org.id, "Platform", ACTOR).unwrap();
+        (org.id, team.id)
+    };
+    {
+        let connection = rusqlite::Connection::open(&file).unwrap();
+        connection
+            .execute("UPDATE teams SET budget_usd = 1e999 WHERE id = ?1", [&team])
+            .unwrap();
+    }
+    let mut store = Store::open(&file).unwrap();
+    assert!(matches!(store.build_payload(&org), Err(Error::Invalid(_))));
+}

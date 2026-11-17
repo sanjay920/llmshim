@@ -350,6 +350,16 @@ fn teams_of(tx: &mut dyn Exec, org_id: &str) -> Result<Vec<Team>> {
 fn team_from_row(row: &Row) -> Result<Team> {
     let budget =
         match row.opt_real(4)? {
+            // A stored amount that is not a finite number in range is an error, never "no cap":
+            // JSON would write an infinity as null, and the data plane would read no budget.
+            Some(budget_usd)
+                if !budget_usd.is_finite()
+                    || !(0.0..=llmshim::serve::config::MAX_BUDGET_USD).contains(&budget_usd) =>
+            {
+                return Err(Error::Invalid(
+                    "a stored team budget is not a finite amount in range".into(),
+                ))
+            }
             Some(budget_usd) => Some(TeamBudget {
                 budget_usd,
                 budget_window_secs: row.opt_int(5)?.map(u64::try_from).transpose().map_err(
