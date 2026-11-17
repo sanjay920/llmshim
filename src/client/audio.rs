@@ -352,21 +352,21 @@ mod tests {
                 let mut server = mockito::Server::new_async().await;
                 let provider = OpenAi::new("key".into()).with_base_url(server.url());
                 let mut client = ShimClient::new();
-                // The stalled body sleeps 1.5 s. The deadline under test is 500 ms
+                // The stalled body sleeps 5 s. The deadline under test is 1.5 s
                 // and the other is far beyond it. The total deadline also covers
                 // connecting and the response headers, so a short one (10 ms, then
                 // 150 ms) expired before the body began on a slow runner, which is
-                // a retried failure: two requests, not the one this expects. 500 ms
+                // a retried failure: two requests, not the one this expects. 1.5 s
                 // leaves a margin of seconds-class slowness for the headers.
                 client.deadlines.unary_body_idle = if idle {
-                    Duration::from_millis(500)
+                    Duration::from_millis(1500)
                 } else {
-                    Duration::from_secs(10)
+                    Duration::from_secs(30)
                 };
                 client.deadlines.unary_attempt_total = if idle {
-                    Duration::from_secs(10)
+                    Duration::from_secs(30)
                 } else {
-                    Duration::from_millis(500)
+                    Duration::from_millis(1500)
                 };
                 let mock = server
                     .mock("POST", "/audio/transcriptions")
@@ -381,7 +381,7 @@ mod tests {
                     .with_chunked_body(move |writer| {
                         writer.write_all(if format == "json" { b"{ " } else { b"he" })?;
                         writer.flush()?;
-                        std::thread::sleep(Duration::from_millis(1500));
+                        std::thread::sleep(Duration::from_millis(5000));
                         writer.write_all(if format == "json" {
                             b"\"text\":\"hello\"}"
                         } else {
