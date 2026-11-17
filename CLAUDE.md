@@ -795,6 +795,20 @@ secrets are fingerprinted by digest, so only `{ file }` references rotate (the s
 `provider_unavailable` (`serve` builds only). The Vertex credential-file reload test needs
 `serve-cloud`.
 
+## The control plane (notes 0024, 0026)
+
+`crates/llmshim-control` (`publish = false`, **its own workspace and `Cargo.lock`**, excluded from the
+root workspace so SQLite's C library never enters the root graph; `control-check.yml` proves it) holds
+orgs, teams, projects, the key lifecycle, the change history and signed snapshots, with an axum API
+(`openapi.yaml`, compared with its route table by a test) and the `llmshim-control serve` binary. A key's
+secret is generated there, shown once, and only its SHA-256 is stored. The data plane takes its keys from
+a snapshot with `[control_plane]` (`src/serve/snapshot.rs`; a file, or `source` pulled by
+`snapshot_pull.rs`; it needs `state.policy_dir`): Ed25519, a monotonic generation recorded in `state.policy_dir` (and in memory), the
+organization bound, `expires_at` enforced at request time, a stale age with optional
+`refuse_when_stale`. A pulled snapshot is judged exactly as a load would judge it before it can replace
+the cache. After a root or catalog version bump run `cargo update -p llmshim -p llmshim-catalog` in
+`crates/llmshim-control`.
+
 ## Cloud transports from the `serve` file (note 0020)
 
 `--features serve-cloud` builds Bedrock, Vertex and Azure into `serve`, so `[providers.*]` can

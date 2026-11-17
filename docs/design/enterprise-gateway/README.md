@@ -120,8 +120,14 @@ Phase 0: a production server mode
 
 Later phases (each needs its own design note before work starts)
 
-- [ ] Control plane: organizations, teams, projects, key lifecycle, signed
-      policy snapshots, bounded local spend allowance during a Redis outage
+- [x] Control plane on SQLite (0024, 0026): organizations, teams, projects, key
+      lifecycle (revoke, rotate, limits, expiry), the change history, signed
+      policy snapshots (`snapshot keygen|sign|verify`, `[control_plane]` from a file
+      or pulled from the control plane), the `llmshim-control` server and its
+      OpenAPI document. A separate, unpublished crate with its own lockfile
+- [ ] Control plane on Postgres (0024 slice 4): the store behind one interface
+- [ ] Bounded admission during a Redis outage (a local spend allowance): its own
+      design note first; it is a second admission path, not only a spend rule (0024)
 - [ ] Hierarchical budgets, model allowlists, tags, alerts, cost exports
 - [ ] Deployments and load balancing across credentials and regions
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
