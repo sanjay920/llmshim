@@ -9,12 +9,13 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use rusqlite::{params, Connection, OptionalExtension};
+use db::{i, of, oi, ot, t, Backend, Exec, Row};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub mod api;
+mod db;
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -27,7 +28,7 @@ pub enum Error {
     #[error("{0}")]
     Conflict(String),
     #[error("database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(String),
     #[error("snapshot error: {0}")]
     Snapshot(String),
 }
@@ -178,7 +179,7 @@ pub struct Published {
 }
 
 pub struct Store {
-    conn: Connection,
+    backend: Backend,
 }
 
 fn now() -> String {
@@ -199,17 +200,19 @@ fn valid_label(name: &str) -> bool {
 }
 
 fn display_name(name: &str, what: &str) -> Result<()> {
-    if name.trim().is_empty() || name.len() > 128 {
+    if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
         return Err(Error::Invalid(format!(
-            "{what} must be 1 to 128 characters"
+            "{what} must be 1 to 128 characters, with no control characters"
         )));
     }
     Ok(())
 }
 
 fn actor_check(actor: &str) -> Result<()> {
-    if actor.trim().is_empty() || actor.len() > 128 {
-        return Err(Error::Invalid("actor must be 1 to 128 characters".into()));
+    if actor.trim().is_empty() || actor.len() > 128 || actor.chars().any(char::is_control) {
+        return Err(Error::Invalid(
+            "actor must be 1 to 128 characters, with no control characters".into(),
+        ));
     }
     Ok(())
 }
@@ -231,93 +234,89 @@ const KEY_COLUMNS: &str = "id, org_id, project_id, team_id, name, kind, state, s
     client_san, jwt_table, jwt_subject, expires_at, tier, rpm, tpm, budget_usd, \
     budget_window_secs, budget_allow_unpriced, allowed_cidrs, created_at, revoked_at";
 
-fn bad(column: usize, what: &str) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        column,
-        rusqlite::types::Type::Integer,
-        what.to_string().into(),
-    )
-}
-
-fn key_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<KeyRecord> {
-    let cidrs: Option<String> = row.get(18)?;
+fn key_from_row(row: &Row) -> Result<KeyRecord> {
+    let range = |what: &str| Error::Invalid(format!("a stored {what} is out of range"));
     // Values outside their range, or a corrupt list, are errors: never a wrapped number, and
     // never "no restriction".
-    let allowed_cidrs = match cidrs {
-        Some(text) => Some(
-            serde_json::from_str::<Vec<String>>(&text)
-                .map_err(|_| bad(18, "allowed_cidrs is not a list of strings"))?,
-        ),
+    let allowed_cidrs = match row.opt_text(18)? {
+        Some(text) => Some(serde_json::from_str::<Vec<String>>(&text).map_err(|_| {
+            Error::Invalid("a stored allowed_cidrs is not a list of strings".into())
+        })?),
         None => None,
     };
     Ok(KeyRecord {
-        id: row.get(0)?,
-        org_id: row.get(1)?,
-        project_id: row.get(2)?,
-        team_id: row.get(3)?,
-        name: row.get(4)?,
-        kind: row.get(5)?,
-        state: row.get(6)?,
-        sha256: row.get(7)?,
-        client_san: row.get(8)?,
-        jwt_table: row.get(9)?,
-        jwt_subject: row.get(10)?,
-        expires_at: row.get(11)?,
-        tier: u8::try_from(row.get::<_, i64>(12)?).map_err(|_| bad(12, "tier out of range"))?,
+        id: row.text(0)?,
+        org_id: row.text(1)?,
+        project_id: row.text(2)?,
+        team_id: row.text(3)?,
+        name: row.text(4)?,
+        kind: row.text(5)?,
+        state: row.text(6)?,
+        sha256: row.opt_text(7)?,
+        client_san: row.opt_text(8)?,
+        jwt_table: row.opt_text(9)?,
+        jwt_subject: row.opt_text(10)?,
+        expires_at: row.opt_text(11)?,
+        tier: u8::try_from(row.int(12)?).map_err(|_| range("tier"))?,
         rpm: row
-            .get::<_, Option<i64>>(13)?
+            .opt_int(13)?
             .map(u32::try_from)
             .transpose()
-            .map_err(|_| bad(13, "rpm out of range"))?,
+            .map_err(|_| range("rpm"))?,
         tpm: row
-            .get::<_, Option<i64>>(14)?
+            .opt_int(14)?
             .map(u32::try_from)
             .transpose()
-            .map_err(|_| bad(14, "tpm out of range"))?,
-        budget_usd: row.get(15)?,
+            .map_err(|_| range("tpm"))?,
+        budget_usd: row.opt_real(15)?,
         budget_window_secs: row
-            .get::<_, Option<i64>>(16)?
+            .opt_int(16)?
             .map(u64::try_from)
             .transpose()
-            .map_err(|_| bad(16, "budget_window_secs out of range"))?,
-        budget_allow_unpriced: row.get::<_, i64>(17)? != 0,
+            .map_err(|_| range("budget_window_secs"))?,
+        budget_allow_unpriced: row.int(17)? != 0,
         allowed_cidrs,
-        created_at: row.get(19)?,
-        revoked_at: row.get(20)?,
+        created_at: row.text(19)?,
+        revoked_at: row.opt_text(20)?,
     })
 }
 
-fn key_in(conn: &Connection, id: &str) -> Result<KeyRecord> {
-    conn.query_row(
+fn key_in(tx: &mut dyn Exec, id: &str) -> Result<KeyRecord> {
+    let rows = tx.query(
         &format!("SELECT {KEY_COLUMNS} FROM keys WHERE id = ?1"),
-        [id],
-        key_from_row,
-    )
-    .optional()?
-    .ok_or_else(|| Error::NotFound(format!("keys {id}")))
-}
-
-fn keys_of(conn: &Connection, org_id: &str) -> Result<Vec<KeyRecord>> {
-    let mut statement = conn.prepare(&format!(
-        "SELECT {KEY_COLUMNS} FROM keys WHERE org_id = ?1 ORDER BY rowid"
-    ))?;
-    let rows = statement.query_map([org_id], key_from_row)?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
-}
-
-fn teams_of(conn: &Connection, org_id: &str) -> Result<Vec<Team>> {
-    let mut statement = conn.prepare(
-        "SELECT id, org_id, name, created_at FROM teams WHERE org_id = ?1 ORDER BY rowid",
+        &[t(id)],
     )?;
-    let rows = statement.query_map([org_id], |row| {
+    rows.first()
+        .map(key_from_row)
+        .transpose()?
+        .ok_or_else(|| Error::NotFound(format!("keys {id}")))
+}
+
+fn keys_of(tx: &mut dyn Exec, org_id: &str) -> Result<Vec<KeyRecord>> {
+    tx.query(
+        &format!("SELECT {KEY_COLUMNS} FROM keys WHERE org_id = ?1 ORDER BY seq"),
+        &[t(org_id)],
+    )?
+    .iter()
+    .map(key_from_row)
+    .collect()
+}
+
+fn teams_of(tx: &mut dyn Exec, org_id: &str) -> Result<Vec<Team>> {
+    tx.query(
+        "SELECT id, org_id, name, created_at FROM teams WHERE org_id = ?1 ORDER BY seq",
+        &[t(org_id)],
+    )?
+    .iter()
+    .map(|row| {
         Ok(Team {
-            id: row.get(0)?,
-            org_id: row.get(1)?,
-            name: row.get(2)?,
-            created_at: row.get(3)?,
+            id: row.text(0)?,
+            org_id: row.text(1)?,
+            name: row.text(2)?,
+            created_at: row.text(3)?,
         })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    })
+    .collect()
 }
 
 /// The rules a data plane applies to a key that need no knowledge of its configuration, so a
@@ -375,46 +374,162 @@ fn check_budget(usd: Option<f64>, window: Option<u64>, allow_unpriced: bool) -> 
     Ok(())
 }
 
+/// The next position in a table's creation order (inside a write transaction, so no two rows
+/// share one): the store lists in this order, never by a random id.
+fn next_seq(table: &str) -> String {
+    // `table` is one of four constants at the call sites below.
+    format!("(SELECT COALESCE(MAX(seq), 0) + 1 FROM {table})")
+}
+
+fn history(
+    tx: &mut dyn Exec,
+    actor: &str,
+    action: &str,
+    subject: &str,
+    detail: Value,
+) -> Result<()> {
+    tx.exec(
+        "INSERT INTO history (at, actor, action, subject, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+        &[
+            t(&now()),
+            t(actor),
+            t(action),
+            t(subject),
+            t(&detail.to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn require_in(tx: &mut dyn Exec, table: &str, id: &str) -> Result<()> {
+    // `table` is one of two constants below, never caller text.
+    debug_assert!(matches!(table, "orgs" | "teams"));
+    let rows = tx.query(&format!("SELECT 1 FROM {table} WHERE id = ?1"), &[t(id)])?;
+    if rows.is_empty() {
+        return Err(Error::NotFound(format!("{table} {id}")));
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open (creating if needed) the SQLite database at `path`.
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        Self::from_connection(Connection::open(path)?)
+        let connection =
+            rusqlite::Connection::open(path).map_err(|e| Error::Database(e.to_string()))?;
+        Self::initialize(Backend::Sqlite(connection))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
+        let connection =
+            rusqlite::Connection::open_in_memory().map_err(|e| Error::Database(e.to_string()))?;
+        Self::initialize(Backend::Sqlite(connection))
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        match version {
-            0 => {
-                conn.execute_batch(SCHEMA)?;
-                conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    /// Connect to a Postgres database (a `postgres://` URL). TLS with the web PKI roots unless
+    /// the URL says `sslmode=disable`. The URL, which holds the password, is never part of an
+    /// error. `schema`, when given, is the Postgres schema to use (created if absent): several
+    /// control planes, or a test, can share one database.
+    pub fn open_postgres(url: &str, schema: Option<&str>) -> Result<Self> {
+        Self::open_postgres_with(url, schema, None)
+    }
+
+    /// [`Self::open_postgres`] trusting the PEM certificates in `ca_file` instead of the web PKI
+    /// roots (a private or provider CA).
+    pub fn open_postgres_with(
+        url: &str,
+        schema: Option<&str>,
+        ca_file: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        // The synchronous Postgres client runs its own runtime, which a thread already inside
+        // an async runtime may not start: connect and initialize on a thread of their own.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| Self::open_postgres_here(url, schema, ca_file))
+                .join()
+                .unwrap_or_else(|_| Err(Error::Database("the database thread failed".into())))
+        })
+    }
+
+    fn open_postgres_here(
+        url: &str,
+        schema: Option<&str>,
+        ca_file: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        if let Some(problem) = schema.and_then(db::schema_problem) {
+            return Err(Error::Invalid(problem.into()));
+        }
+        let target = db::PgTarget {
+            url: url.to_string(),
+            ca_file: ca_file.map(std::path::Path::to_path_buf),
+            schema: schema.map(str::to_string),
+        };
+        let client = db::connect_postgres(&target)?;
+        Self::initialize(Backend::Postgres(db::PgClient::new(client, target)))
+    }
+
+    fn initialize(mut backend: Backend) -> Result<Self> {
+        match &mut backend {
+            Backend::Sqlite(connection) => {
+                connection
+                    .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                let version: i64 = connection
+                    .query_row("PRAGMA user_version", [], |row| row.get(0))
+                    .map_err(|e| Error::Database(e.to_string()))?;
+                match version {
+                    0 => {
+                        connection
+                            .execute_batch(&schema(false))
+                            .map_err(|e| Error::Database(e.to_string()))?;
+                        connection
+                            .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+                            .map_err(|e| Error::Database(e.to_string()))?;
+                    }
+                    SCHEMA_VERSION => {}
+                    other => {
+                        return Err(Error::Invalid(format!(
+                            "the database has schema version {other}; this build reads {SCHEMA_VERSION}"
+                        )))
+                    }
+                }
             }
-            SCHEMA_VERSION => {}
-            other => {
-                return Err(Error::Invalid(format!(
-                    "the database has schema version {other}; this build reads {SCHEMA_VERSION}"
-                )))
+            Backend::Postgres(pg) => {
+                // One initializer at a time (two replicas starting together).
+                let mut tx = pg
+                    .client()
+                    .transaction()
+                    .map_err(|_| Error::Database("cannot start a transaction".into()))?;
+                let fail = |_| Error::Database("cannot initialize the schema".into());
+                tx.batch_execute("SELECT pg_advisory_xact_lock(7240002)")
+                    .map_err(fail)?;
+                tx.batch_execute(
+                    "CREATE TABLE IF NOT EXISTS schema_meta (version BIGINT NOT NULL)",
+                )
+                .map_err(fail)?;
+                let rows = tx
+                    .query("SELECT version FROM schema_meta", &[])
+                    .map_err(fail)?;
+                match rows.first().map(|row| row.get::<_, i64>(0)) {
+                    None => {
+                        tx.batch_execute(&schema(true)).map_err(fail)?;
+                        tx.execute("INSERT INTO schema_meta (version) VALUES ($1)", &[&SCHEMA_VERSION])
+                            .map_err(fail)?;
+                    }
+                    Some(SCHEMA_VERSION) => {}
+                    Some(other) => {
+                        return Err(Error::Invalid(format!(
+                            "the database has schema version {other}; this build reads {SCHEMA_VERSION}"
+                        )))
+                    }
+                }
+                tx.commit().map_err(fail)?;
             }
         }
-        Ok(Self { conn })
+        Ok(Self { backend })
     }
 
-    fn history(
-        tx: &rusqlite::Transaction<'_>,
-        actor: &str,
-        action: &str,
-        subject: &str,
-        detail: Value,
-    ) -> Result<()> {
-        tx.execute(
-            "INSERT INTO history (at, actor, action, subject, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![now(), actor, action, subject, detail.to_string()],
-        )?;
-        Ok(())
+    pub fn is_postgres(&self) -> bool {
+        self.backend.is_postgres()
     }
 
     pub fn create_org(&mut self, name: &str, actor: &str) -> Result<Org> {
@@ -425,179 +540,166 @@ impl Store {
             name: name.into(),
             created_at: now(),
         };
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO orgs (id, name, created_at) VALUES (?1, ?2, ?3)",
-            params![org.id, org.name, org.created_at],
-        )?;
-        Self::history(
-            &tx,
-            actor,
-            "org.created",
-            &org.id,
-            json!({"name": org.name}),
-        )?;
-        tx.commit()?;
+        self.backend.transaction(true, |tx| {
+            tx.exec(
+                &format!(
+                    "INSERT INTO orgs (id, name, created_at, seq) VALUES (?1, ?2, ?3, {})",
+                    next_seq("orgs")
+                ),
+                &[t(&org.id), t(&org.name), t(&org.created_at)],
+            )?;
+            history(tx, actor, "org.created", &org.id, json!({"name": org.name}))
+        })?;
         Ok(org)
     }
 
     pub fn create_team(&mut self, org_id: &str, name: &str, actor: &str) -> Result<Team> {
         actor_check(actor)?;
         display_name(name, "the team name")?;
-        self.require("orgs", org_id)?;
         let team = Team {
             id: new_id("team"),
             org_id: org_id.into(),
             name: name.into(),
             created_at: now(),
         };
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO teams (id, org_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![team.id, team.org_id, team.name, team.created_at],
-        )?;
-        Self::history(
-            &tx,
-            actor,
-            "team.created",
-            &team.id,
-            json!({"org": org_id, "name": team.name}),
-        )?;
-        tx.commit()?;
+        self.backend.transaction(true, |tx| {
+            require_in(tx, "orgs", org_id)?;
+            tx.exec(
+                &format!(
+                    "INSERT INTO teams (id, org_id, name, created_at, seq) VALUES (?1, ?2, ?3, ?4, {})",
+                    next_seq("teams")
+                ),
+                &[t(&team.id), t(&team.org_id), t(&team.name), t(&team.created_at)],
+            )?;
+            history(
+                tx,
+                actor,
+                "team.created",
+                &team.id,
+                json!({"org": org_id, "name": team.name}),
+            )
+        })?;
         Ok(team)
     }
 
     pub fn create_project(&mut self, team_id: &str, name: &str, actor: &str) -> Result<Project> {
         actor_check(actor)?;
         display_name(name, "the project name")?;
-        self.require("teams", team_id)?;
         let project = Project {
             id: new_id("proj"),
             team_id: team_id.into(),
             name: name.into(),
             created_at: now(),
         };
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO projects (id, team_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                project.id,
-                project.team_id,
-                project.name,
-                project.created_at
-            ],
-        )?;
-        Self::history(
-            &tx,
-            actor,
-            "project.created",
-            &project.id,
-            json!({"team": team_id, "name": project.name}),
-        )?;
-        tx.commit()?;
+        self.backend.transaction(true, |tx| {
+            require_in(tx, "teams", team_id)?;
+            tx.exec(
+                &format!(
+                    "INSERT INTO projects (id, team_id, name, created_at, seq) VALUES (?1, ?2, ?3, ?4, {})",
+                    next_seq("projects")
+                ),
+                &[t(&project.id), t(&project.team_id), t(&project.name), t(&project.created_at)],
+            )?;
+            history(
+                tx,
+                actor,
+                "project.created",
+                &project.id,
+                json!({"team": team_id, "name": project.name}),
+            )
+        })?;
         Ok(project)
     }
 
-    fn require(&self, table: &str, id: &str) -> Result<()> {
-        let found: Option<i64> = self
-            .conn
-            .query_row(&format!("SELECT 1 FROM {table} WHERE id = ?1"), [id], |r| {
-                r.get(0)
+    pub fn orgs(&mut self) -> Result<Vec<Org>> {
+        self.backend.transaction(false, |tx| {
+            tx.query("SELECT id, name, created_at FROM orgs ORDER BY seq", &[])?
+                .iter()
+                .map(|row| {
+                    Ok(Org {
+                        id: row.text(0)?,
+                        name: row.text(1)?,
+                        created_at: row.text(2)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    pub fn projects(&mut self, team_id: &str) -> Result<Vec<Project>> {
+        self.backend.transaction(false, |tx| {
+            require_in(tx, "teams", team_id)?;
+            tx.query(
+                "SELECT id, team_id, name, created_at FROM projects WHERE team_id = ?1 ORDER BY seq",
+                &[t(team_id)],
+            )?
+            .iter()
+            .map(|row| {
+                Ok(Project {
+                    id: row.text(0)?,
+                    team_id: row.text(1)?,
+                    name: row.text(2)?,
+                    created_at: row.text(3)?,
+                })
             })
-            .optional()?;
-        found
-            .map(|_| ())
-            .ok_or_else(|| Error::NotFound(format!("{table} {id}")))
+            .collect()
+        })
     }
 
-    pub fn orgs(&self) -> Result<Vec<Org>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT id, name, created_at FROM orgs ORDER BY rowid")?;
-        let rows = statement.query_map([], |row| {
-            Ok(Org {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                created_at: row.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    pub fn teams_checked(&mut self, org_id: &str) -> Result<Vec<Team>> {
+        self.backend.transaction(false, |tx| {
+            require_in(tx, "orgs", org_id)?;
+            teams_of(tx, org_id)
+        })
     }
 
-    pub fn projects(&self, team_id: &str) -> Result<Vec<Project>> {
-        require_in(&self.conn, "teams", team_id)?;
-        let mut statement = self.conn.prepare(
-            "SELECT id, team_id, name, created_at FROM projects WHERE team_id = ?1 ORDER BY rowid",
-        )?;
-        let rows = statement.query_map([team_id], |row| {
-            Ok(Project {
-                id: row.get(0)?,
-                team_id: row.get(1)?,
-                name: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    pub fn keys_checked(&mut self, org_id: &str) -> Result<Vec<KeyRecord>> {
+        self.backend.transaction(false, |tx| {
+            require_in(tx, "orgs", org_id)?;
+            keys_of(tx, org_id)
+        })
     }
 
-    pub fn teams_checked(&self, org_id: &str) -> Result<Vec<Team>> {
-        require_in(&self.conn, "orgs", org_id)?;
-        teams_of(&self.conn, org_id)
-    }
-
-    pub fn keys_checked(&self, org_id: &str) -> Result<Vec<KeyRecord>> {
-        require_in(&self.conn, "orgs", org_id)?;
-        keys_of(&self.conn, org_id)
-    }
-
-    pub fn teams(&self, org_id: &str) -> Result<Vec<Team>> {
-        teams_of(&self.conn, org_id)
-    }
-
-    /// A write transaction that takes the database's write lock at once, so what a method
-    /// reads to decide is still true when it writes (two processes cannot both pass the same
-    /// check).
-    fn write(&mut self) -> Result<rusqlite::Transaction<'_>> {
-        Ok(self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?)
+    pub fn teams(&mut self, org_id: &str) -> Result<Vec<Team>> {
+        self.backend.transaction(false, |tx| teams_of(tx, org_id))
     }
 
     /// Create a key in a project. A `Secret` key's secret is returned once; only its SHA-256
     /// is stored.
     pub fn create_key(&mut self, new: NewKey, actor: &str) -> Result<CreatedKey> {
         actor_check(actor)?;
-        let tx = self.write()?;
-        let (id, secret) = create_key_in(&tx, &new, actor)?;
-        let record = key_in(&tx, &id)?;
-        tx.commit()?;
-        Ok(CreatedKey { record, secret })
+        self.backend.transaction(true, |tx| {
+            let (id, secret) = create_key_in(tx, &new, actor)?;
+            Ok(CreatedKey {
+                record: key_in(tx, &id)?,
+                secret,
+            })
+        })
     }
 
-    pub fn key(&self, id: &str) -> Result<KeyRecord> {
-        key_in(&self.conn, id)
+    pub fn key(&mut self, id: &str) -> Result<KeyRecord> {
+        self.backend.transaction(false, |tx| key_in(tx, id))
     }
 
-    pub fn keys(&self, org_id: &str) -> Result<Vec<KeyRecord>> {
-        keys_of(&self.conn, org_id)
+    pub fn keys(&mut self, org_id: &str) -> Result<Vec<KeyRecord>> {
+        self.backend.transaction(false, |tx| keys_of(tx, org_id))
     }
 
     /// Revoke a key. Terminal: its hash stays, so a snapshot can say it is revoked.
     pub fn revoke_key(&mut self, id: &str, actor: &str) -> Result<KeyRecord> {
         actor_check(actor)?;
-        let tx = self.write()?;
-        let record = key_in(&tx, id)?;
-        let changed = tx.execute(
-            "UPDATE keys SET state = 'revoked', revoked_at = ?2 WHERE id = ?1 AND state = 'active'",
-            params![id, now()],
-        )?;
-        if changed != 1 {
-            return Err(Error::Conflict(format!("key {id} is already revoked")));
-        }
-        Self::history(&tx, actor, "key.revoked", id, json!({"name": record.name}))?;
-        let revoked = key_in(&tx, id)?;
-        tx.commit()?;
-        Ok(revoked)
+        self.backend.transaction(true, |tx| {
+            let record = key_in(tx, id)?;
+            let changed = tx.exec(
+                "UPDATE keys SET state = 'revoked', revoked_at = ?2 WHERE id = ?1 AND state = 'active'",
+                &[t(id), t(&now())],
+            )?;
+            if changed != 1 {
+                return Err(Error::Conflict(format!("key {id} is already revoked")));
+            }
+            history(tx, actor, "key.revoked", id, json!({"name": record.name}))?;
+            key_in(tx, id)
+        })
     }
 
     /// Rotate: create a successor with the same project, limits and restrictions under a new
@@ -606,41 +708,37 @@ impl Store {
     /// transaction: a crash leaves no successor without its record.
     pub fn rotate_key(&mut self, id: &str, new_name: &str, actor: &str) -> Result<CreatedKey> {
         actor_check(actor)?;
-        let tx = self.write()?;
-        let old = key_in(&tx, id)?;
-        if old.state == "revoked" {
-            return Err(Error::Conflict("a revoked key cannot be rotated".into()));
-        }
-        if old.kind != "secret" {
-            return Err(Error::Invalid(
-                "only a secret key rotates: a certificate or token identity is the workload's own"
-                    .into(),
-            ));
-        }
-        let successor = NewKey {
-            project_id: old.project_id.clone(),
-            name: new_name.into(),
-            credential: Credential::Secret,
-            tier: old.tier,
-            rpm: old.rpm,
-            tpm: old.tpm,
-            budget_usd: old.budget_usd,
-            budget_window_secs: old.budget_window_secs,
-            budget_allow_unpriced: old.budget_allow_unpriced,
-            allowed_cidrs: old.allowed_cidrs.clone(),
-            expires_at: old.expires_at.clone(),
-        };
-        let (successor_id, secret) = create_key_in(&tx, &successor, actor)?;
-        Self::history(
-            &tx,
-            actor,
-            "key.rotated",
-            id,
-            json!({"successor": successor_id}),
-        )?;
-        let record = key_in(&tx, &successor_id)?;
-        tx.commit()?;
-        Ok(CreatedKey { record, secret })
+        self.backend.transaction(true, |tx| {
+            let old = key_in(tx, id)?;
+            if old.state == "revoked" {
+                return Err(Error::Conflict("a revoked key cannot be rotated".into()));
+            }
+            if old.kind != "secret" {
+                return Err(Error::Invalid(
+                    "only a secret key rotates: a certificate or token identity is the workload's own"
+                        .into(),
+                ));
+            }
+            let successor = NewKey {
+                project_id: old.project_id.clone(),
+                name: new_name.into(),
+                credential: Credential::Secret,
+                tier: old.tier,
+                rpm: old.rpm,
+                tpm: old.tpm,
+                budget_usd: old.budget_usd,
+                budget_window_secs: old.budget_window_secs,
+                budget_allow_unpriced: old.budget_allow_unpriced,
+                allowed_cidrs: old.allowed_cidrs.clone(),
+                expires_at: old.expires_at.clone(),
+            };
+            let (successor_id, secret) = create_key_in(tx, &successor, actor)?;
+            history(tx, actor, "key.rotated", id, json!({"successor": successor_id}))?;
+            Ok(CreatedKey {
+                record: key_in(tx, &successor_id)?,
+                secret,
+            })
+        })
     }
 
     /// Change a key's limits, budget and expiry. Credentials never change in place.
@@ -657,64 +755,68 @@ impl Store {
             }
         }
         check_budget(update.budget_usd, update.budget_window_secs, false)?;
-        let tx = self.write()?;
-        let record = key_in(&tx, id)?;
-        // The unpriced flag is not part of this update: the stored one must still be valid.
-        check_budget(
-            update.budget_usd,
-            update.budget_window_secs,
-            record.budget_allow_unpriced,
-        )?;
-        let changed = tx.execute(
-            "UPDATE keys SET rpm = ?2, tpm = ?3, budget_usd = ?4, budget_window_secs = ?5, expires_at = ?6 WHERE id = ?1 AND state = 'active'",
-            params![
-                id,
-                update.rpm.map(i64::from),
-                update.tpm.map(i64::from),
+        self.backend.transaction(true, |tx| {
+            let record = key_in(tx, id)?;
+            // The unpriced flag is not part of this update: the stored one must still be valid.
+            check_budget(
                 update.budget_usd,
-                update.budget_window_secs.map(|v| v as i64),
-                update.expires_at
-            ],
-        )?;
-        if changed != 1 {
-            return Err(Error::Conflict("a revoked key cannot change".into()));
-        }
-        Self::history(
-            &tx,
-            actor,
-            "key.limits_changed",
-            id,
-            json!({"rpm": update.rpm, "tpm": update.tpm, "budget_usd": update.budget_usd,
-                "budget_window_secs": update.budget_window_secs,
-                "expires_at": update.expires_at}),
-        )?;
-        let updated = key_in(&tx, id)?;
-        tx.commit()?;
-        Ok(updated)
+                update.budget_window_secs,
+                record.budget_allow_unpriced,
+            )?;
+            let changed = tx.exec(
+                "UPDATE keys SET rpm = ?2, tpm = ?3, budget_usd = ?4, budget_window_secs = ?5, expires_at = ?6 WHERE id = ?1 AND state = 'active'",
+                &[
+                    t(id),
+                    oi(update.rpm.map(i64::from)),
+                    oi(update.tpm.map(i64::from)),
+                    of(update.budget_usd),
+                    oi(update.budget_window_secs.map(|v| v as i64)),
+                    ot(update.expires_at.as_deref()),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::Conflict("a revoked key cannot change".into()));
+            }
+            history(
+                tx,
+                actor,
+                "key.limits_changed",
+                id,
+                json!({"rpm": update.rpm, "tpm": update.tpm, "budget_usd": update.budget_usd,
+                    "budget_window_secs": update.budget_window_secs,
+                    "expires_at": update.expires_at}),
+            )?;
+            key_in(tx, id)
+        })
     }
 
-    pub fn history_rows(&self, limit: u32) -> Result<Vec<HistoryRow>> {
-        let mut statement = self.conn.prepare(
-            "SELECT id, at, actor, action, subject, detail FROM history ORDER BY id DESC LIMIT ?1",
-        )?;
-        let rows = statement.query_map([limit], |row| {
-            let detail: String = row.get(5)?;
-            Ok(HistoryRow {
-                id: row.get(0)?,
-                at: row.get(1)?,
-                actor: row.get(2)?,
-                action: row.get(3)?,
-                subject: row.get(4)?,
-                detail: serde_json::from_str(&detail).unwrap_or(Value::Null),
+    pub fn history_rows(&mut self, limit: u32) -> Result<Vec<HistoryRow>> {
+        self.backend.transaction(false, |tx| {
+            tx.query(
+                "SELECT id, at, actor, action, subject, detail FROM history ORDER BY id DESC LIMIT ?1",
+                &[i(i64::from(limit))],
+            )?
+            .iter()
+            .map(|row| {
+                Ok(HistoryRow {
+                    id: row.int(0)?,
+                    at: row.text(1)?,
+                    actor: row.text(2)?,
+                    action: row.text(3)?,
+                    subject: row.text(4)?,
+                    detail: serde_json::from_str(&row.text(5)?).unwrap_or(Value::Null),
+                })
             })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+            .collect()
+        })
     }
 
     /// The payload of the next snapshot of an organization (0024): every key it has, with
     /// its state (`expired` for an active key past its time), and the next generation.
-    pub fn build_payload(&self, org_id: &str) -> Result<Value> {
-        payload_in(&self.conn, org_id)
+    pub fn build_payload(&mut self, org_id: &str) -> Result<Value> {
+        // Under the write lock, like a publish: one consistent view on Postgres, whose reads
+        // are not one snapshot.
+        self.backend.transaction(true, |tx| payload_in(tx, org_id))
     }
 
     /// Build, sign and store the next generation of an organization's snapshot. `seed_b64` is
@@ -729,84 +831,64 @@ impl Store {
         actor: &str,
     ) -> Result<Published> {
         actor_check(actor)?;
-        let tx = self.write()?;
-        let payload = payload_in(&tx, org_id)?;
-        let generation = payload["generation"].as_u64().unwrap_or(0);
-        let envelope =
-            llmshim::serve::snapshot::sign(&payload, seed_b64).map_err(Error::Snapshot)?;
-        match tx.execute(
-            "INSERT INTO snapshots (org_id, generation, payload, envelope, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![org_id, generation as i64, payload.to_string(), envelope, now()],
-        ) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                return Err(Error::Conflict(
-                    "another snapshot took this generation; publish again".into(),
-                ))
-            }
-            Err(other) => return Err(other.into()),
-        }
-        Self::history(
-            &tx,
-            actor,
-            "snapshot.published",
-            org_id,
-            json!({"generation": generation}),
-        )?;
-        tx.commit()?;
-        Ok(Published {
-            generation,
-            envelope,
+        self.backend.transaction(true, |tx| {
+            let payload = payload_in(tx, org_id)?;
+            let generation = payload["generation"].as_u64().unwrap_or(0);
+            let envelope =
+                llmshim::serve::snapshot::sign(&payload, seed_b64).map_err(Error::Snapshot)?;
+            tx.exec(
+                "INSERT INTO snapshots (org_id, generation, payload, envelope, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    t(org_id),
+                    i(generation as i64),
+                    t(&payload.to_string()),
+                    t(&envelope),
+                    t(&now()),
+                ],
+            )
+            .map_err(|error| match error {
+                Error::Conflict(_) => {
+                    Error::Conflict("another snapshot took this generation; publish again".into())
+                }
+                other => other,
+            })?;
+            history(tx, actor, "snapshot.published", org_id, json!({"generation": generation}))?;
+            Ok(Published {
+                generation,
+                envelope,
+            })
         })
     }
 
     /// The most recent published envelope of an organization.
-    pub fn latest_snapshot(&self, org_id: &str) -> Result<Option<Published>> {
-        Ok(self
-            .conn
-            .query_row(
+    pub fn latest_snapshot(&mut self, org_id: &str) -> Result<Option<Published>> {
+        self.backend.transaction(false, |tx| {
+            let rows = tx.query(
                 "SELECT generation, envelope FROM snapshots WHERE org_id = ?1 ORDER BY generation DESC LIMIT 1",
-                [org_id],
-                |row| {
+                &[t(org_id)],
+            )?;
+            rows.first()
+                .map(|row| {
                     Ok(Published {
-                        generation: row.get::<_, i64>(0)? as u64,
-                        envelope: row.get(1)?,
+                        generation: row.int(0)? as u64,
+                        envelope: row.text(1)?,
                     })
-                },
-            )
-            .optional()?)
+                })
+                .transpose()
+        })
     }
 }
 
-fn require_in(conn: &Connection, table: &str, id: &str) -> Result<()> {
-    // `table` is one of two constants below, never caller text.
-    debug_assert!(matches!(table, "orgs" | "teams"));
-    let found: Option<i64> = conn
-        .query_row(&format!("SELECT 1 FROM {table} WHERE id = ?1"), [id], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    found
-        .map(|_| ())
-        .ok_or_else(|| Error::NotFound(format!("{table} {id}")))
-}
-
-fn create_key_in(
-    tx: &rusqlite::Transaction<'_>,
-    new: &NewKey,
-    actor: &str,
-) -> Result<(String, Option<String>)> {
+fn create_key_in(tx: &mut dyn Exec, new: &NewKey, actor: &str) -> Result<(String, Option<String>)> {
     check_fields(new)?;
-    let (org_id, team_id): (String, String) = tx
-        .query_row(
-            "SELECT t.org_id, t.id FROM projects p JOIN teams t ON t.id = p.team_id WHERE p.id = ?1",
-            [&new.project_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?
-        .ok_or_else(|| Error::NotFound(format!("projects {}", new.project_id)))?;
+    let rows = tx.query(
+        "SELECT t.org_id, t.id FROM projects p JOIN teams t ON t.id = p.team_id WHERE p.id = ?1",
+        &[t(&new.project_id)],
+    )?;
+    let (org_id, team_id) = match rows.first() {
+        Some(row) => (row.text(0)?, row.text(1)?),
+        None => return Err(Error::NotFound(format!("projects {}", new.project_id))),
+    };
     let (kind, secret, sha256, san, table, subject) = match &new.credential {
         Credential::Secret => {
             let secret = generate_secret()?;
@@ -854,44 +936,48 @@ fn create_key_in(
     };
     let id = new_id("key");
     let created_at = now();
-    let inserted = tx.execute(
-        &format!("INSERT INTO keys ({KEY_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, NULL)"),
-        params![
-            id,
-            org_id,
-            new.project_id,
-            team_id,
-            new.name,
-            kind,
-            sha256,
-            san,
-            table,
-            subject,
-            new.expires_at,
-            new.tier as i64,
-            new.rpm.map(i64::from),
-            new.tpm.map(i64::from),
-            new.budget_usd,
-            new.budget_window_secs.map(|v| v as i64),
-            new.budget_allow_unpriced as i64,
-            new.allowed_cidrs
-                .as_ref()
-                .map(|c| serde_json::to_string(c).unwrap_or_default()),
-            created_at,
+    let cidrs = new
+        .allowed_cidrs
+        .as_ref()
+        .map(|c| serde_json::to_string(c).unwrap_or_default());
+    tx.exec(
+        &format!(
+            "INSERT INTO keys (id, org_id, project_id, team_id, name, kind, state, sha256, \
+             client_san, jwt_table, jwt_subject, expires_at, tier, rpm, tpm, budget_usd, \
+             budget_window_secs, budget_allow_unpriced, allowed_cidrs, created_at, revoked_at, seq) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+             ?16, ?17, ?18, ?19, NULL, {})",
+            next_seq("keys")
+        ),
+        &[
+            t(&id),
+            t(&org_id),
+            t(&new.project_id),
+            t(&team_id),
+            t(&new.name),
+            t(kind),
+            ot(sha256.as_deref()),
+            ot(san.as_deref()),
+            ot(table.as_deref()),
+            ot(subject.as_deref()),
+            ot(new.expires_at.as_deref()),
+            i(i64::from(new.tier)),
+            oi(new.rpm.map(i64::from)),
+            oi(new.tpm.map(i64::from)),
+            of(new.budget_usd),
+            oi(new.budget_window_secs.map(|v| v as i64)),
+            i(i64::from(new.budget_allow_unpriced)),
+            ot(cidrs.as_deref()),
+            t(&created_at),
         ],
-    );
-    match inserted {
-        Ok(_) => {}
-        Err(rusqlite::Error::SqliteFailure(error, _))
-            if error.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            return Err(Error::Conflict(
-                "a key with this name (or credential) already exists in the organization".into(),
-            ))
-        }
-        Err(other) => return Err(other.into()),
-    }
-    Store::history(
+    )
+    .map_err(|error| match error {
+        Error::Conflict(_) => Error::Conflict(
+            "a key with this name (or credential) already exists in the organization".into(),
+        ),
+        other => other,
+    })?;
+    history(
         tx,
         actor,
         "key.created",
@@ -902,20 +988,23 @@ fn create_key_in(
     Ok((id, secret))
 }
 
-fn payload_in(conn: &Connection, org_id: &str) -> Result<Value> {
-    require_in(conn, "orgs", org_id)?;
-    let generation: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(generation), 0) + 1 FROM snapshots WHERE org_id = ?1",
-        [org_id],
-        |row| row.get(0),
-    )?;
-    let teams: Vec<Value> = teams_of(conn, org_id)?
+fn payload_in(tx: &mut dyn Exec, org_id: &str) -> Result<Value> {
+    require_in(tx, "orgs", org_id)?;
+    let generation = tx
+        .query(
+            "SELECT COALESCE(MAX(generation), 0) + 1 FROM snapshots WHERE org_id = ?1",
+            &[t(org_id)],
+        )?
+        .first()
+        .ok_or_else(|| Error::Database("no row".into()))?
+        .int(0)?;
+    let teams: Vec<Value> = teams_of(tx, org_id)?
         .into_iter()
-        .map(|t| json!({"id": t.id, "name": t.name}))
+        .map(|team| json!({"id": team.id, "name": team.name}))
         .collect();
     let at = chrono::Utc::now();
     let mut keys = Vec::new();
-    for key in keys_of(conn, org_id)? {
+    for key in keys_of(tx, org_id)? {
         let expired = key
             .expires_at
             .as_deref()
@@ -959,17 +1048,26 @@ fn payload_in(conn: &Connection, org_id: &str) -> Result<Value> {
     }))
 }
 
-const SCHEMA: &str = "
+/// The schema, for the SQLite (`pg = false`) or Postgres dialect. `seq` is the creation order,
+/// assigned inside the write transaction.
+fn schema(pg: bool) -> String {
+    let (int, real, autoid) = if pg {
+        ("BIGINT", "DOUBLE PRECISION", "BIGSERIAL PRIMARY KEY")
+    } else {
+        ("INTEGER", "REAL", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    };
+    format!(
+        "
 CREATE TABLE orgs (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL, seq {int} NOT NULL
 );
 CREATE TABLE teams (
     id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id),
-    name TEXT NOT NULL, created_at TEXT NOT NULL
+    name TEXT NOT NULL, created_at TEXT NOT NULL, seq {int} NOT NULL
 );
 CREATE TABLE projects (
     id TEXT PRIMARY KEY, team_id TEXT NOT NULL REFERENCES teams(id),
-    name TEXT NOT NULL, created_at TEXT NOT NULL
+    name TEXT NOT NULL, created_at TEXT NOT NULL, seq {int} NOT NULL
 );
 CREATE TABLE keys (
     id TEXT PRIMARY KEY,
@@ -982,13 +1080,14 @@ CREATE TABLE keys (
     sha256 TEXT UNIQUE,
     client_san TEXT, jwt_table TEXT, jwt_subject TEXT,
     expires_at TEXT,
-    tier INTEGER NOT NULL DEFAULT 0,
-    rpm INTEGER, tpm INTEGER,
-    budget_usd REAL, budget_window_secs INTEGER,
-    budget_allow_unpriced INTEGER NOT NULL DEFAULT 0,
+    tier {int} NOT NULL DEFAULT 0,
+    rpm {int}, tpm {int},
+    budget_usd {real}, budget_window_secs {int},
+    budget_allow_unpriced {int} NOT NULL DEFAULT 0,
     allowed_cidrs TEXT,
     created_at TEXT NOT NULL,
     revoked_at TEXT,
+    seq {int} NOT NULL,
     UNIQUE (org_id, name)
 );
 -- What the data plane refuses as a whole snapshot, refused here (an active identity is one key).
@@ -997,14 +1096,16 @@ CREATE UNIQUE INDEX keys_client_san ON keys (org_id, client_san)
 CREATE UNIQUE INDEX keys_jwt ON keys (org_id, jwt_table, jwt_subject)
     WHERE jwt_table IS NOT NULL AND state = 'active';
 CREATE TABLE history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id {autoid},
     at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
     subject TEXT NOT NULL, detail TEXT NOT NULL
 );
 CREATE TABLE snapshots (
     org_id TEXT NOT NULL REFERENCES orgs(id),
-    generation INTEGER NOT NULL,
+    generation {int} NOT NULL,
     payload TEXT NOT NULL, envelope TEXT NOT NULL, created_at TEXT NOT NULL,
     PRIMARY KEY (org_id, generation)
 );
-";
+"
+    )
+}

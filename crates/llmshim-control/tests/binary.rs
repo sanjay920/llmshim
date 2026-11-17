@@ -220,3 +220,126 @@ fn the_server_serves_over_a_socket_authenticates_and_stops_on_sigterm() {
     };
     assert_eq!(code, Some(0));
 }
+
+#[test]
+fn exactly_one_database_is_named_and_a_url_file_is_owner_only_and_never_echoed() {
+    let directory = dir("pgargs");
+    let token = token_file(&directory, TOKEN, 0o600);
+    let base = [
+        "serve",
+        "--listen",
+        "127.0.0.1:0",
+        "--token-file",
+        token.to_str().unwrap(),
+    ];
+    let with = |extra: &[&str]| {
+        let mut args: Vec<&str> = base.to_vec();
+        args.extend_from_slice(extra);
+        run(&args)
+    };
+    let db = directory.join("c.db");
+    let url = directory.join("url");
+    std::fs::write(
+        &url,
+        "postgres://user:hunter2-secret@127.0.0.1:1/db?sslmode=disable",
+    )
+    .unwrap();
+    std::fs::set_permissions(&url, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(with(&[]).0, Some(2), "neither");
+    assert_eq!(
+        with(&[
+            "--db",
+            db.to_str().unwrap(),
+            "--database-url-file",
+            url.to_str().unwrap()
+        ])
+        .0,
+        Some(2),
+        "both"
+    );
+    assert_eq!(
+        with(&["--db", db.to_str().unwrap(), "--database-schema", "x"]).0,
+        Some(2)
+    );
+    // A readable URL file (it holds the password) is refused.
+    std::fs::set_permissions(&url, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (code, stderr) = with(&["--database-url-file", url.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("owner-only") && !stderr.contains("hunter2"),
+        "{stderr}"
+    );
+    // An unreachable database fails the start and never prints the URL or its password.
+    std::fs::set_permissions(&url, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (code, stderr) = with(&["--database-url-file", url.to_str().unwrap()]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        !stderr.contains("hunter2") && !stderr.contains("127.0.0.1:1"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn the_server_runs_on_postgres_when_one_is_given() {
+    let Some(url) = std::env::var("LLMSHIM_CONTROL_TEST_POSTGRES_URL").ok() else {
+        return;
+    };
+    let directory = dir("pgserve");
+    let token = token_file(&directory, TOKEN, 0o600);
+    let url_file = directory.join("url");
+    std::fs::write(&url_file, &url).unwrap();
+    std::fs::set_permissions(&url_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
+    let start = |label: &str| {
+        let _ = label;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_llmshim-control"))
+            .args([
+                "serve",
+                "--database-url-file",
+                url_file.to_str().unwrap(),
+                "--database-schema",
+                &schema,
+                "--listen",
+                "127.0.0.1:0",
+                "--token-file",
+                token.to_str().unwrap(),
+            ])
+            .env_clear()
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let address = loop {
+            assert!(Instant::now() < deadline, "the server did not start");
+            let line = lines.next().expect("stderr closed").unwrap();
+            if let Some(rest) = line.split("listening on http://").nth(1) {
+                break rest.trim().to_string();
+            }
+        };
+        (child, address)
+    };
+    let (mut first, address) = start("first");
+    let (status, body) = http(
+        &address,
+        "POST",
+        "/v1/orgs",
+        Some(TOKEN),
+        Some(r#"{"name":"Acme"}"#),
+    );
+    assert_eq!(status, 201, "{body}");
+    let _ = Command::new("kill")
+        .args(["-TERM", &first.id().to_string()])
+        .status();
+    assert_eq!(first.wait().unwrap().code(), Some(0));
+    // A second process on the same database sees what the first wrote.
+    let (mut second, address) = start("second");
+    let (status, body) = http(&address, "GET", "/v1/orgs", Some(TOKEN), None);
+    assert_eq!(status, 200);
+    assert!(body.contains("Acme"), "{body}");
+    let _ = Command::new("kill")
+        .args(["-TERM", &second.id().to_string()])
+        .status();
+    assert_eq!(second.wait().unwrap().code(), Some(0));
+}

@@ -1,8 +1,9 @@
+mod common;
+
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use llmshim_control::api::{router, AppState, ROUTES};
-use llmshim_control::Store;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use tower::ServiceExt;
@@ -36,7 +37,7 @@ impl Answer {
 
 impl Api {
     fn new(signing_key_file: Option<PathBuf>) -> Self {
-        let store = Store::open_in_memory().unwrap();
+        let store = common::store();
         Self {
             app: router(AppState::new(store, TOKEN, signing_key_file)),
         }

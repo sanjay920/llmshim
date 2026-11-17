@@ -125,7 +125,7 @@ Later phases (each needs its own design note before work starts)
       policy snapshots (`snapshot keygen|sign|verify`, `[control_plane]` from a file
       or pulled from the control plane), the `llmshim-control` server and its
       OpenAPI document. A separate, unpublished crate with its own lockfile
-- [ ] Control plane on Postgres (0024 slice 4): the store behind one interface
+- [x] Control plane on Postgres (0024 slice 4): one store, two backends; the whole suite runs on both
 - [ ] Bounded admission during a Redis outage (a local spend allowance): its own
       design note first; it is a second admission path, not only a spend rule (0024)
 - [ ] Hierarchical budgets, model allowlists, tags, alerts, cost exports
