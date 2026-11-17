@@ -66,6 +66,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0030: Tenant budgets above key budgets](0030-hierarchical-budgets.md)
 - [0031: Deployments: one name, several targets](0031-deployments.md)
 - [0032: Named instances of hosted providers](0032-provider-instances.md)
+- [0033: Secrets from a secret manager](0033-secret-managers.md)
 
 ## Roadmap
 
@@ -144,7 +145,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
 - [ ] Audit log
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy
-- [ ] Secret-manager integrations
+- [x] Secret-manager integrations (0033): files are the integration (Kubernetes, CSI driver, agents); secret values are one line of at most 64 KiB; no vendor client is linked
 - [ ] Config-registered providers; embeddings, images and audio on the server
 - [ ] Admin UI, SSO and SCIM (not started: they follow the control plane and the
       licensing decision)

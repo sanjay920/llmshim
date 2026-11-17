@@ -283,6 +283,32 @@ surprise = true
     }
 
     #[test]
+    fn a_secret_that_is_present_but_not_one_line_is_a_defect_not_an_absence() {
+        // Status 3 means "not mounted yet" and a pipeline may retry on it; a value with a newline in
+        // it will never get better, so it is status 1 (note 0033) and is never echoed.
+        let path = write("multiline.toml", CONFIG);
+        let output = run(
+            &["serve", "--config", path.to_str().unwrap(), "--check"],
+            &[
+                (
+                    "SERVE_TEST_PROVIDER_KEY",
+                    "provider-line-one\nprovider-line-two",
+                ),
+                ("SERVE_TEST_CALLER_KEY", "a-caller-key-0123456789abc"),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let text = String::from_utf8_lossy(&output.stderr).to_string()
+            + &String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("not a single line"), "{text}");
+        assert!(text.contains("providers."), "{text}");
+        assert!(
+            !text.contains("line-one") && !text.contains("line-two"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn a_secret_that_is_missing_does_not_hide_a_rule_broken_by_another() {
         // keys[0] is present but too short; keys[1] is not provisioned. Both are
         // reported and the status is the defect's, not the absence's.

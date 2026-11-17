@@ -1154,7 +1154,8 @@ mod tests {
         for (value, expected) in [
             ("short", "at least 22 characters"),
             ("has a space inside it 0123", "visible ASCII"),
-            ("\u{feff}admin-token-0123456789", "visible ASCII"),
+            // A byte-order mark is refused earlier, by the shared secret reader (note 0033).
+            ("\u{feff}admin-token-0123456789", "not a single line"),
         ] {
             let issue = admin_token_digest(&config, &with(value)).unwrap_err();
             assert_eq!(issue.path, "admin.token");
