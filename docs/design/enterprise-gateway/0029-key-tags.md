@@ -125,3 +125,10 @@ and records them in the `key.created` history detail. No `PATCH`: a changed labe
 key. Tests: both backends (refusals, storage, rotation, payload presence/absence, a published
 snapshot read back by the data plane), migration from versions 1 and 2, and a process test that a
 snapshot key's tags are on its usage records.
+
+**Upgrading the control plane.** The schema migrates in place when the new binary first opens the
+database. Stop every older `llmshim-control` writer first: an older binary does not read the new
+column, so a snapshot it published afterwards would omit the new field and the data plane would serve
+the key without it (without tags, or, for 0028, without its model list). A newer schema version is
+refused by an older binary and the other way round, so the mixed state is detected at start rather
+than discovered later, except for a writer that was already running when the migration happened.

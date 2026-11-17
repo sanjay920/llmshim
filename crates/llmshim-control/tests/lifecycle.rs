@@ -879,3 +879,21 @@ fn tags_are_checked_stored_copied_on_rotation_and_signed_only_when_present() {
     assert_eq!(served("tagged").tags["product"], "checkout");
     assert!(served("plain").tags.is_empty());
 }
+
+/// A database from a newer build is refused, not read (and not "migrated" backwards).
+#[test]
+fn a_newer_schema_version_is_refused() {
+    if common::postgres_url().is_some() {
+        return; // the version check is the same match on both backends; this runs the SQLite one
+    }
+    let directory = dir("newer");
+    let file = directory.join("control.db");
+    drop(Store::open(&file).unwrap());
+    {
+        let connection = rusqlite::Connection::open(&file).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 99;")
+            .unwrap();
+    }
+    assert!(matches!(Store::open(&file), Err(Error::Invalid(_))));
+}

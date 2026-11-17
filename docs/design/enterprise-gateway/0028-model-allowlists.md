@@ -166,3 +166,10 @@ allowed_models = ["openai/gpt-6-luna", "anthropic/claude-haiku-5-5", "openrouter
   absence, a published snapshot read back by the data plane, an in-place migration from version 1
   (SQLite and Postgres). Data plane (process): a snapshot key with a list is restricted, the key
   beside it is not, and a bad list in generation 2 leaves generation 1 in force.
+
+**Upgrading the control plane.** The schema migrates in place when the new binary first opens the
+database. Stop every older `llmshim-control` writer first: an older binary does not read the new
+column, so a snapshot it published afterwards would omit the new field and the data plane would serve
+the key without it (without tags, or, for 0028, without its model list). A newer schema version is
+refused by an older binary and the other way round, so the mixed state is detected at start rather
+than discovered later, except for a writer that was already running when the migration happened.
