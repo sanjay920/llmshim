@@ -240,3 +240,17 @@ slice, stated now so slice 2's shape allows it:
   payload fails the allowlist test.
 - Still the prerequisite named above: two accounts of one hosted vendor cannot be targets. Failover (slice
   3) and the stats status (slice 4) are not built.
+
+### Review changes (slice 2)
+
+- The selector's health question is **read-only** (`probe_due`); the probe slot is reserved only for the
+  target that was **picked** (`try_admit_probe` after the pick), so a target that is looked at and not
+  chosen is never left half-open. A probe that never reports (its request died before dispatch) is
+  re-offered after one cooldown (`HalfOpen` now records when its probe started; the proxy's fallback
+  chain gets the same recovery).
+- The Responses wire's replay filter **peeks** (`Router::peek_deployment`: no counter advances, no probe
+  reserved) instead of picking, so a request makes one pick. With a stateful strategy the probable target
+  it filters for can differ from the real pick if another request intervenes; a deployment that serves
+  reasoning or tool conversations should use `conversation`, which is deterministic (stated above).
+- A fallback-chain entry that is a deployment resolves what it expanded to (library and proxy users;
+  `serve` has no fallback). Not covered by a test of its own.

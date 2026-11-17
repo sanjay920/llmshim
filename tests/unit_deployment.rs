@@ -104,17 +104,73 @@ fn a_target_past_its_cooldown_is_probed_so_it_can_recover() {
     let breaker = Arc::new(ProviderBreaker::with_config(BreakerConfig {
         window: Duration::from_secs(60),
         trip_threshold: 1,
-        cooldown: Duration::from_millis(0),
+        cooldown: Duration::from_millis(80),
     }));
     let router = router(Strategy::Ordered, breaker.clone());
     breaker.record_failure("east", true, Instant::now());
     assert!(breaker.should_skip("east"));
-    // Ordered prefers east; its cooldown has passed, so the selector admits a probe and sends this
-    // request there, which is what closes the circuit once it succeeds. Without the probe east
-    // would stay open for ever, because nothing else ever reaches it.
+    // Within the cooldown east is skipped.
+    assert_eq!(picked(&router), "west/m");
+    std::thread::sleep(Duration::from_millis(100));
+    // Past it, ordered prefers east and the selector reserves its probe for this request, which
+    // is what closes the circuit once it succeeds. Without the probe east would stay open for
+    // ever, because nothing else ever reaches it.
     assert_eq!(picked(&router), "east/m");
     // The probe slot is taken: until the outcome is reported the next request goes elsewhere.
     assert_eq!(picked(&router), "west/m");
     breaker.record_success("east");
     assert_eq!(picked(&router), "east/m");
+}
+
+#[test]
+fn a_probe_is_reserved_only_for_the_target_that_was_picked() {
+    let breaker = Arc::new(ProviderBreaker::with_config(BreakerConfig {
+        window: Duration::from_secs(60),
+        trip_threshold: 1,
+        cooldown: Duration::from_millis(0),
+    }));
+    // Ordered: the healthy primary is picked every time, while the standby's circuit is open
+    // and past its cooldown. Asking about the standby must not take its probe slot: no request
+    // is ever sent to it, so nothing would report, and it would stay half-open for ever.
+    let router = router(Strategy::Ordered, breaker.clone());
+    breaker.record_failure("west", true, Instant::now());
+    for _ in 0..5 {
+        assert_eq!(picked(&router), "east/m");
+    }
+    assert!(
+        breaker.try_admit_probe("west", Instant::now()),
+        "the standby's probe slot is still free"
+    );
+}
+
+#[test]
+fn a_probe_that_never_reports_is_offered_again_after_a_cooldown() {
+    let breaker = ProviderBreaker::with_config(BreakerConfig {
+        window: Duration::from_secs(60),
+        trip_threshold: 1,
+        cooldown: Duration::from_millis(80),
+    });
+    breaker.record_failure("east", true, Instant::now());
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(breaker.try_admit_probe("east", Instant::now()));
+    // The slot is taken while the probe could still report.
+    assert!(!breaker.try_admit_probe("east", Instant::now()));
+    assert!(!breaker.probe_due("east", Instant::now()));
+    // A request that died before it was dispatched never reports: after a cooldown the slot is
+    // offered again rather than the target staying half-open for ever.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(breaker.probe_due("east", Instant::now()));
+    assert!(breaker.try_admit_probe("east", Instant::now()));
+}
+
+#[test]
+fn peeking_at_a_deployment_does_not_take_a_turn_or_a_probe() {
+    let router = router(Strategy::RoundRobin, Arc::new(ProviderBreaker::new()));
+    let peeked = router.peek_deployment(&request()).unwrap();
+    assert_eq!(peeked, router.peek_deployment(&request()).unwrap());
+    // The real picks still start where the peek said and alternate from there.
+    assert_eq!(picked(&router), peeked);
+    assert_ne!(picked(&router), peeked);
+    // A model that is not a deployment is not peeked.
+    assert_eq!(router.peek_deployment(&json!({"model": "east/m"})), None);
 }

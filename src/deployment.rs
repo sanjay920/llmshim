@@ -81,6 +81,17 @@ impl Deployment {
     /// health is ignored, because refusing locally would only turn an upstream failure into a local
     /// one. `conversation` is a hash of the conversation, used by [`Strategy::Conversation`].
     pub fn pick(&self, usable: &dyn Fn(&str) -> bool, conversation: u64) -> &Target {
+        self.choose(usable, conversation, true)
+    }
+
+    /// The target [`Self::pick`] would choose now, without advancing any state: for a caller that
+    /// needs to know where a request will probably go (a replay filter) and must not consume a
+    /// turn. With a stateful strategy the real pick can differ if another request intervenes.
+    pub fn peek(&self, usable: &dyn Fn(&str) -> bool, conversation: u64) -> &Target {
+        self.choose(usable, conversation, false)
+    }
+
+    fn choose(&self, usable: &dyn Fn(&str) -> bool, conversation: u64, advance: bool) -> &Target {
         let mut flags: Vec<bool> = self.targets.iter().map(|t| usable(&t.model)).collect();
         if !flags.iter().any(|ok| *ok) {
             flags.iter_mut().for_each(|ok| *ok = true);
@@ -94,7 +105,9 @@ impl Deployment {
                     .map(|offset| (state.next + offset) % len)
                     .find(|i| flags[*i])
                     .unwrap_or(0);
-                state.next = (index + 1) % len;
+                if advance {
+                    state.next = (index + 1) % len;
+                }
                 index
             }
             Strategy::Weighted => {
@@ -106,18 +119,23 @@ impl Deployment {
                     .filter(|(_, ok)| **ok)
                     .map(|(t, _)| i64::from(t.weight))
                     .sum();
+                // Work on a copy when only peeking.
+                let mut current = state.current.clone();
                 let mut best: Option<usize> = None;
                 for (i, target) in self.targets.iter().enumerate() {
                     if !flags[i] {
                         continue;
                     }
-                    state.current[i] += i64::from(target.weight);
-                    if best.is_none_or(|b| state.current[i] > state.current[b]) {
+                    current[i] += i64::from(target.weight);
+                    if best.is_none_or(|b| current[i] > current[b]) {
                         best = Some(i);
                     }
                 }
                 let index = best.unwrap_or(0);
-                state.current[index] -= total;
+                current[index] -= total;
+                if advance {
+                    state.current = current;
+                }
                 index
             }
             Strategy::Conversation => {

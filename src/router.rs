@@ -222,6 +222,32 @@ impl Router {
         self
     }
 
+    /// Where a request addressed to a deployment would go now, without picking: no counter
+    /// advances and no probe is reserved. For a caller that must know the probable target before
+    /// the real pick (the Responses wire's replay filter); `None` for a model that is not a
+    /// deployment.
+    pub fn peek_deployment(&self, request: &serde_json::Value) -> Option<String> {
+        let name = request
+            .get("model")?
+            .as_str()?
+            .strip_prefix(DEPLOYMENT_PREFIX)?;
+        let deployment = self.deployments.get(name)?;
+        let now = std::time::Instant::now();
+        let usable = |target: &str| match self.resolve(target) {
+            Ok((provider, _)) => {
+                !self.breaker.should_skip(provider.name())
+                    || self.breaker.probe_due(provider.name(), now)
+            }
+            Err(_) => true,
+        };
+        Some(
+            deployment
+                .peek(&usable, crate::deployment::conversation_hash(request))
+                .model
+                .clone(),
+        )
+    }
+
     /// The configured deployment names, in order.
     pub fn deployment_names(&self) -> Vec<&str> {
         self.deployments.keys().map(String::as_str).collect()
@@ -304,15 +330,23 @@ impl Router {
             // probed (a real request goes through, because an open circuit closes only when a
             // dispatch records a success). Local health only: the shared view is asynchronous.
             let now = std::time::Instant::now();
+            // Read-only: asking about every target must not consume a probe slot for one that is not
+            // chosen (it would never report, and the target would stay half-open).
             let usable = |target: &str| match self.resolve(target) {
                 Ok((provider, _)) => {
                     let name = provider.name();
-                    !self.breaker.should_skip(name) || self.breaker.try_admit_probe(name, now)
+                    !self.breaker.should_skip(name) || self.breaker.probe_due(name, now)
                 }
                 // A target that no longer resolves is the file's problem, not health.
                 Err(_) => true,
             };
             let target = deployment.pick(&usable, crate::deployment::conversation_hash(request));
+            // The probe is reserved for the target that was picked, whose request will report it.
+            if let Ok((provider, _)) = self.resolve(&target.model) {
+                if self.breaker.should_skip(provider.name()) {
+                    let _ = self.breaker.try_admit_probe(provider.name(), now);
+                }
+            }
             let mut expanded = request.clone();
             expanded["model"] = serde_json::json!(target.model);
             return Ok(Cow::Owned(expanded));

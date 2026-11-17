@@ -120,7 +120,13 @@ async fn completion_with_fallback_inner(
             }
         };
 
-        let (provider, model) = match router.resolve(model_str) {
+        // Resolve what the entry expanded to (a route's or a deployment's target), not the name.
+        let resolved = req
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(model_str)
+            .to_string();
+        let (provider, model) = match router.resolve(&resolved) {
             Ok(r) => r,
             Err(e) => {
                 errors.push(format!("{}: {}", model_str, e));

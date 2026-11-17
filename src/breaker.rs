@@ -89,9 +89,19 @@ impl BreakerConfig {
 }
 
 enum TargetState {
-    Closed { failures: VecDeque<Instant> },
-    Open { opened_at: Instant },
-    HalfOpen { opened_at: Instant },
+    Closed {
+        failures: VecDeque<Instant>,
+    },
+    Open {
+        opened_at: Instant,
+    },
+    /// `probe_started` is when the probe slot was reserved: a probe that never reports (its
+    /// request died before it was dispatched) is presumed lost after one cooldown, and the slot
+    /// is offered again instead of the target staying half-open for ever.
+    HalfOpen {
+        opened_at: Instant,
+        probe_started: Instant,
+    },
 }
 
 /// A boxed future, so the shared backend can be async without pulling
@@ -185,16 +195,47 @@ impl ProviderBreaker {
         let Some(state) = targets.get_mut(target) else {
             return false;
         };
-        let TargetState::Open { opened_at } = state else {
-            return false;
-        };
-        if now.saturating_duration_since(*opened_at) < self.cfg.cooldown {
-            return false;
+        match state {
+            TargetState::Open { opened_at } => {
+                if now.saturating_duration_since(*opened_at) < self.cfg.cooldown {
+                    return false;
+                }
+                *state = TargetState::HalfOpen {
+                    opened_at: *opened_at,
+                    probe_started: now,
+                };
+                true
+            }
+            TargetState::HalfOpen {
+                opened_at,
+                probe_started,
+            } => {
+                // A probe that has not reported within a cooldown is presumed lost.
+                if now.saturating_duration_since(*probe_started) < self.cfg.cooldown {
+                    return false;
+                }
+                *state = TargetState::HalfOpen {
+                    opened_at: *opened_at,
+                    probe_started: now,
+                };
+                true
+            }
+            TargetState::Closed { .. } => false,
         }
-        *state = TargetState::HalfOpen {
-            opened_at: *opened_at,
-        };
-        true
+    }
+
+    /// Whether [`Self::try_admit_probe`] would reserve the probe slot now. Read-only, so a
+    /// selector can ask about several targets and reserve only for the one it picks.
+    pub fn probe_due(&self, target: &str, now: Instant) -> bool {
+        match self.lock().get(target) {
+            Some(TargetState::Open { opened_at }) => {
+                now.saturating_duration_since(*opened_at) >= self.cfg.cooldown
+            }
+            Some(TargetState::HalfOpen { probe_started, .. }) => {
+                now.saturating_duration_since(*probe_started) >= self.cfg.cooldown
+            }
+            _ => false,
+        }
     }
 
     /// Close `target` and clear its failure window.
@@ -213,7 +254,7 @@ impl ProviderBreaker {
         let mut targets = self.lock();
 
         if !counts {
-            if let Some(TargetState::HalfOpen { opened_at }) = targets.get(target) {
+            if let Some(TargetState::HalfOpen { opened_at, .. }) = targets.get(target) {
                 let opened_at = *opened_at;
                 targets.insert(target.to_owned(), TargetState::Open { opened_at });
             }
