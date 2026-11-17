@@ -146,12 +146,22 @@ impl Dispatch for RealDispatch {
             .cloned()
             .unwrap_or_else(|| self.router.current());
         // An embeddings call (note 0035) is told apart by the trusted context, never by the body.
-        if policy_context.operation() == crate::policy::DispatchOperation::Embeddings {
-            let result =
-                crate::embeddings_value_with_policy(router.as_ref(), &payload, &policy_context)
-                    .await;
-            let refusal = policy_context.take_last_refusal();
-            return result.map_err(|error| self.map_err(error, refusal));
+        match policy_context.operation() {
+            crate::policy::DispatchOperation::Embeddings => {
+                let result =
+                    crate::embeddings_value_with_policy(router.as_ref(), &payload, &policy_context)
+                        .await;
+                let refusal = policy_context.take_last_refusal();
+                return result.map_err(|error| self.map_err(error, refusal));
+            }
+            crate::policy::DispatchOperation::Images => {
+                let result =
+                    crate::images_value_with_policy(router.as_ref(), &payload, &policy_context)
+                        .await;
+                let refusal = policy_context.take_last_refusal();
+                return result.map_err(|error| self.map_err(error, refusal));
+            }
+            crate::policy::DispatchOperation::Chat => {}
         }
         let result = crate::completion_with_logger_and_policy(
             router.as_ref(),
@@ -1756,17 +1766,33 @@ fn embedding_texts(input: &Value) -> Result<Vec<String>, ApiError> {
     }
 }
 
-/// POST /v1/embeddings — OpenAI-shaped, admitted by the same rate, concurrency, spend and
-/// allowlist rules as a completion (note 0035). Local scheduler only: a fleet answers 501.
-async fn embeddings(
-    State(state): State<Arc<GatewayState>>,
+/// What an admitted non-chat call needs from its route (notes 0035, 0036).
+struct MediaCall<'a> {
+    operation: crate::policy::DispatchOperation,
+    /// "embeddings", "image generation": names the endpoint in the fleet refusal.
+    noun: &'static str,
+    model: &'a str,
+    /// The OpenAI-shaped body to dispatch; `model` is added from `model`.
+    payload: Value,
+    /// A rough size for the token bucket.
+    permits: u32,
+}
+
+/// The one path a non-chat call takes to the dispatcher: authenticate, refuse what a fleet cannot
+/// run, resolve the model (not a route or deployment), apply the key's allowlist, run the route's own
+/// cheap refusals (`precheck`, so a request no provider could accept is a 400 before it queues),
+/// then admit and submit it as an attempt with the operation carried in the trusted policy
+/// context, never the body. Returns the dispatcher's answer and the resolved provider and model.
+async fn submit_media_call(
+    state: &Arc<GatewayState>,
+    headers: &HeaderMap,
     installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
     logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
-    headers: HeaderMap,
-    Json(body): Json<EmbeddingsBody>,
-) -> Result<Response, ApiError> {
-    let prequeue_permit = prequeue_permit(&state, installed_prequeue_permit).await?;
-    let identified_caller = state.keystore.identify_caller(&headers).map_err(|_| {
+    call: MediaCall<'_>,
+    precheck: impl FnOnce(&dyn crate::provider::Provider, &str, &Value) -> Result<(), ShimError>,
+) -> Result<(Value, String, String), ApiError> {
+    let prequeue_permit = prequeue_permit(state, installed_prequeue_permit).await?;
+    let identified_caller = state.keystore.identify_caller(headers).map_err(|_| {
         crate::gateway::metrics::incr(
             crate::gateway::metrics::REJECTED,
             &[("provider", "unknown"), ("reason", "unauthorized")],
@@ -1778,7 +1804,7 @@ async fn embeddings(
             status: StatusCode::NOT_IMPLEMENTED.as_u16(),
             body: json!({
                 "error": {
-                    "message": "embeddings are not available on a fleet gateway",
+                    "message": format!("{} is not available on a fleet gateway", call.noun),
                     "type": "invalid_request_error",
                     "param": null,
                     "code": "not_implemented"
@@ -1788,6 +1814,76 @@ async fn embeddings(
             retry_after: None,
         }));
     }
+    let snapshot = state.router.current();
+    // A route or deployment name is not a model of this kind: it resolves to a chat target (a route
+    // is refused here; `resolve` itself refuses a deployment).
+    if call.model.starts_with("route/") {
+        return Err(invalid_request(
+            "a route is not a model of this kind; address the model itself",
+            "model",
+        ));
+    }
+    let (provider, model) = snapshot.resolve(call.model).map_err(ApiError::from)?;
+    let identity = &identified_caller.identity;
+    if identity.allowed_models.is_some() {
+        let (provider_key, routed) = snapshot.routing_id(call.model).map_err(ApiError::from)?;
+        if !identity.permits_model(&provider_key, &routed, None) {
+            crate::gateway::metrics::incr(
+                crate::gateway::metrics::REJECTED,
+                &[("provider", &provider_key), ("reason", "model_not_allowed")],
+            );
+            return Err(model_not_allowed());
+        }
+    }
+    let mut payload = call.payload;
+    payload["model"] = json!(call.model);
+    precheck(provider, &model, &payload).map_err(ApiError::from)?;
+    let gw = GatewayRequest {
+        provider: provider.instance().to_owned(),
+        tier: identity.tier,
+        permits: call.permits,
+        payload,
+    };
+    #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
+    let mut policy_scope = state
+        .trusted_policy_scope(identity)
+        .await
+        .map_err(|error| gateway_err_to_api(state, error))?;
+    #[cfg(feature = "serve")]
+    if state.attempt_coordinator.records_usage() {
+        policy_scope.attribute(
+            &identified_caller.credential_scope,
+            request_id_of(headers),
+            None,
+        );
+    }
+    state.pin_router(&mut policy_scope, snapshot.clone());
+    policy_scope.set_operation(call.operation);
+    let prepared = state
+        .prepare_submission(gw, policy_scope, false)
+        .map_err(|error| gateway_err_to_api(state, error))?;
+    let submitted = state
+        .submit_prepared(
+            prepared,
+            prequeue_permit,
+            logical_lifetime
+                .as_ref()
+                .map(|axum::Extension(lifetime)| lifetime.deadline()),
+        )
+        .await
+        .map_err(|error| gateway_err_to_api(state, error))?;
+    Ok((submitted.value, provider.instance().to_owned(), model))
+}
+
+/// POST /v1/embeddings — OpenAI-shaped, admitted by the same rate, concurrency, spend and
+/// allowlist rules as a completion (note 0035). Local scheduler only: a fleet answers 501.
+async fn embeddings(
+    State(state): State<Arc<GatewayState>>,
+    installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
+    logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
+    headers: HeaderMap,
+    Json(body): Json<EmbeddingsBody>,
+) -> Result<Response, ApiError> {
     let base64 = match body.encoding_format.as_deref() {
         None | Some("float") => false,
         Some("base64") => true,
@@ -1798,92 +1894,130 @@ async fn embeddings(
             ))
         }
     };
-    let texts = embedding_texts(&body.input)?;
     let request = crate::embeddings::EmbeddingRequest {
         model: body.model.clone(),
-        input: texts,
+        input: embedding_texts(&body.input)?,
         dimensions: body.dimensions,
     };
-    let snapshot = state.router.current();
-    // A route or deployment name is not an embeddings model: it resolves to a chat target (a route
-    // is refused here; `resolve` itself refuses a deployment).
-    if request.model.starts_with("route/") {
-        return Err(invalid_request(
-            "a route is not an embeddings model; address the model itself",
-            "model",
-        ));
-    }
-    let (provider, model) = snapshot.resolve(&request.model).map_err(ApiError::from)?;
-    let identity = &identified_caller.identity;
-    if identity.allowed_models.is_some() {
-        let (provider_key, routed) = snapshot
-            .routing_id(&request.model)
-            .map_err(ApiError::from)?;
-        if !identity.permits_model(&provider_key, &routed, None) {
-            crate::gateway::metrics::incr(
-                crate::gateway::metrics::REJECTED,
-                &[("provider", &provider_key), ("reason", "model_not_allowed")],
-            );
-            return Err(model_not_allowed());
-        }
-    }
-    let mut payload = crate::embeddings::payload(&request);
-    payload["model"] = json!(request.model);
-    // The dispatch's own three refusals, asked here too (cheap, pure, same order) so a request no
-    // provider could accept is a 400 before it queues, not a 502 out of the dispatcher.
-    crate::embeddings::admit_batch(provider, &payload).map_err(ApiError::from)?;
-    provider
-        .transform_embedding_request(&model, &payload)
-        .map_err(ApiError::from)?;
-    crate::embeddings::admit_model(provider, &model, &payload).map_err(ApiError::from)?;
     let permits = request
         .input
         .iter()
         .map(|text| text.len() as u64 / 4 + 1)
         .sum::<u64>()
         .min(u64::from(u32::MAX)) as u32;
-    let gw = GatewayRequest {
-        provider: provider.instance().to_owned(),
-        tier: identity.tier,
-        permits,
-        payload,
-    };
-    #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
-    let mut policy_scope = state
-        .trusted_policy_scope(identity)
-        .await
-        .map_err(|error| gateway_err_to_api(&state, error))?;
-    #[cfg(feature = "serve")]
-    if state.attempt_coordinator.records_usage() {
-        policy_scope.attribute(
-            &identified_caller.credential_scope,
-            request_id_of(&headers),
-            None,
-        );
-    }
-    state.pin_router(&mut policy_scope, snapshot.clone());
-    policy_scope.set_operation(crate::policy::DispatchOperation::Embeddings);
-    let prepared = state
-        .prepare_submission(gw, policy_scope, false)
-        .map_err(|error| gateway_err_to_api(&state, error))?;
-    let submitted = state
-        .submit_prepared(
-            prepared,
-            prequeue_permit,
-            logical_lifetime
-                .as_ref()
-                .map(|axum::Extension(lifetime)| lifetime.deadline()),
-        )
-        .await
-        .map_err(|error| gateway_err_to_api(&state, error))?;
-    let parsed = crate::embeddings::parse(
-        provider.instance(),
-        &model,
-        request.input.len(),
-        submitted.value,
+    let (value, provider, model) = submit_media_call(
+        &state,
+        &headers,
+        installed_prequeue_permit,
+        logical_lifetime,
+        MediaCall {
+            operation: crate::policy::DispatchOperation::Embeddings,
+            noun: "embeddings",
+            model: &request.model,
+            payload: crate::embeddings::payload(&request),
+            permits,
+        },
+        // The dispatch's own three refusals, asked here too (cheap, pure, same order).
+        |provider, model, payload| {
+            crate::embeddings::admit_batch(provider, payload)?;
+            provider.transform_embedding_request(model, payload)?;
+            crate::embeddings::admit_model(provider, model, payload)
+        },
     )
-    .map_err(ApiError::from)?;
+    .await?;
+    let parsed = crate::embeddings::parse(&provider, &model, request.input.len(), value)
+        .map_err(ApiError::from)?;
     Ok(Json(embeddings_response(&body.model, &parsed, base64)).into_response())
+}
+
+/// The inbound `POST /v1/images/generations` body, in OpenAI's shape. The fields the provider
+/// adapter reads (`n`, `size`, `quality`, ...) ride along unchanged; it refuses the rest.
+#[derive(serde::Deserialize)]
+struct ImagesBody {
+    model: String,
+    prompt: String,
+    #[serde(default)]
+    response_format: Option<String>,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, Value>,
+}
+
+/// POST /v1/images/generations — OpenAI-shaped, `b64_json` only, admitted as an attempt (note 0036).
+/// Local scheduler only. A key with a spend cap cannot generate images yet (no enforceable bound).
+async fn images_generations(
+    State(state): State<Arc<GatewayState>>,
+    installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
+    logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
+    headers: HeaderMap,
+    Json(body): Json<ImagesBody>,
+) -> Result<Response, ApiError> {
+    if body
+        .response_format
+        .as_deref()
+        .is_some_and(|format| format != "b64_json")
+    {
+        return Err(invalid_request(
+            "response_format must be b64_json; generated images are not hosted",
+            "response_format",
+        ));
+    }
+    // An image costs the bucket by how many are asked for, not only by the prompt's length.
+    let count = body
+        .rest
+        .get("n")
+        .and_then(Value::as_u64)
+        .map_or(1, |n| n.clamp(1, 10));
+    let mut payload = Value::Object(body.rest);
+    payload["prompt"] = json!(body.prompt);
+    let permits = ((body.prompt.len() as u64 / 4 + 1) * count).min(u64::from(u32::MAX)) as u32;
+    let (value, _provider, _model) = submit_media_call(
+        &state,
+        &headers,
+        installed_prequeue_permit,
+        logical_lifetime,
+        MediaCall {
+            operation: crate::policy::DispatchOperation::Images,
+            noun: "image generation",
+            model: &body.model,
+            payload,
+            permits,
+        },
+        |provider, model, payload| {
+            crate::images::validate(payload)?;
+            provider.image_request(model, payload).map(|_| ())
+        },
+    )
+    .await?;
+    // Move each image out of the answer: they can be tens of megabytes, and copying them again
+    // here is what the route's memory bound would pay for.
+    let mut value = value;
+    let output_format = value["images"][0]["media_type"]
+        .as_str()
+        .and_then(|media| media.strip_prefix("image/"))
+        .map(str::to_owned);
+    let data: Vec<Value> = match value["images"].take() {
+        Value::Array(images) => images
+            .into_iter()
+            .map(|mut image| {
+                let mut entry = json!({"b64_json": image["b64_json"].take()});
+                if let Some(prompt) = image["revised_prompt"].as_str() {
+                    entry["revised_prompt"] = json!(prompt);
+                }
+                entry
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(Json(json!({
+        "created": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default(),
+        "data": data,
+        "output_format": output_format,
+        "usage": value["usage"],
+    }))
+    .into_response())
 }
 
 /// OpenAI's list-of-embeddings answer. `base64` packs each vector as little-endian f32, which is
@@ -2314,6 +2448,7 @@ pub(crate) fn app_with_parts(
         .route("/v1beta/models/{*rest}", post(chat))
         .route("/v1/chat/stream", post(chat_stream))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/images/generations", post(images_generations))
         .route("/v1/models", get(list_models))
         .route("/v1/gateway/stats", get(stats))
         .route("/metrics", get(metrics))
@@ -2380,7 +2515,7 @@ async fn admit_ingress_preparation(
     let requires_preparation = request.method() == axum::http::Method::POST
         && (matches!(
             inference_path.as_str(),
-            "/v1/chat" | "/v1/chat/stream" | "/v1/embeddings"
+            "/v1/chat" | "/v1/chat/stream" | "/v1/embeddings" | "/v1/images/generations"
         ) || crate::proxy::wire::native_route(&inference_path).is_some());
     if !requires_preparation {
         return next.run(request).await;

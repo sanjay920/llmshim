@@ -215,6 +215,43 @@ pub(crate) async fn embeddings_value_with_policy(
         .await
 }
 
+/// An admitted image generation (note 0036): `payload` is the OpenAI-shaped body with the caller's
+/// `model`. The answer is carried through the dispatcher as a JSON value (`images[]` with base64
+/// bytes, media type and revised prompt, and the stamped `usage`) and rendered by the route.
+#[cfg(feature = "gateway")]
+pub(crate) async fn images_value_with_policy(
+    router: &Router,
+    payload: &Value,
+    policy_context: &DispatchPolicyContext,
+) -> Result<Value> {
+    use base64::Engine as _;
+    let model_str = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(error::ShimError::MissingModel)?;
+    let (provider, model) = router.resolve(model_str)?;
+    let client = bound_client(router)?;
+    let response = client
+        .images_with_policy(provider, &model, payload, policy_context)
+        .await?;
+    let images: Vec<Value> = response
+        .images
+        .iter()
+        .map(|image| {
+            serde_json::json!({
+                "b64_json": base64::engine::general_purpose::STANDARD.encode(&image.bytes),
+                "media_type": image.media_type,
+                "revised_prompt": image.revised_prompt,
+            })
+        })
+        .collect();
+    let mut usage = response.usage;
+    if usage.is_object() {
+        usage["cost_source"] = client::images::known_cost_source(&usage);
+    }
+    Ok(serde_json::json!({"images": images, "usage": usage}))
+}
+
 /// Streaming entry point. Returns an SSE stream of OpenAI-format chunks.
 pub async fn stream(
     router: &Router,

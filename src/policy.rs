@@ -25,6 +25,7 @@ pub(crate) enum DispatchOperation {
     #[default]
     Chat,
     Embeddings,
+    Images,
 }
 
 struct DispatchPolicyState {
@@ -66,6 +67,7 @@ impl DispatchPolicyContext {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             x if x == DispatchOperation::Embeddings as u8 => DispatchOperation::Embeddings,
+            x if x == DispatchOperation::Images as u8 => DispatchOperation::Images,
             _ => DispatchOperation::Chat,
         }
     }
