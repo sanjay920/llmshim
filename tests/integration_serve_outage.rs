@@ -504,14 +504,26 @@ mod redis_outage {
         let log = server.stderr.lock().unwrap().join("\n");
         assert!(log.contains("serving budgeted keys from leases"), "{log}");
         // The usage log tells the two admissions apart.
-        let records: Vec<serde_json::Value> = std::fs::read_to_string(&usage_path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        let count = |kind: &str| records.iter().filter(|r| r["admission"] == kind).count();
-        assert!(count("fleet") >= 1, "{records:?}");
-        assert!(count("outage") >= 1, "{records:?}");
+        // The writer is a queue: poll until both kinds are on disk.
+        let read = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&usage_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        };
+        let count = |records: &[serde_json::Value], kind: &str| {
+            records.iter().filter(|r| r["admission"] == kind).count()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while (count(&read(), "fleet") == 0 || count(&read(), "outage") == 0)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let records = read();
+        assert!(count(&records, "fleet") >= 1, "{records:?}");
+        assert!(count(&records, "outage") >= 1, "{records:?}");
         let _ = std::fs::remove_file(&usage_path);
         mock.assert_async().await;
         assert_no_panic(&server.stderr.lock().unwrap());
