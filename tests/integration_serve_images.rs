@@ -225,6 +225,10 @@ async fn usage_that_does_not_classify_its_tokens_is_not_priced_at_the_generic_ra
     assert_eq!(answer.status(), 200);
     let body: Value = answer.json().await.unwrap();
     assert!(body["usage"]["cost_usd"].is_null(), "{body}");
+    // An unknown price is a null source, never a fourth value beside provider, provider_floor and
+    // catalog.
+    assert!(body["usage"]["cost_source"].is_null(), "{body}");
     let records = records_of(&log, 1).await;
     assert!(records[0]["cost_usd"].is_null(), "{records:?}");
+    assert!(records[0]["cost_source"].is_null(), "{records:?}");
 }

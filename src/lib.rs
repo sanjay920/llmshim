@@ -245,7 +245,11 @@ pub(crate) async fn images_value_with_policy(
             })
         })
         .collect();
-    Ok(serde_json::json!({"images": images, "usage": response.usage}))
+    let mut usage = response.usage;
+    if usage.is_object() {
+        usage["cost_source"] = client::images::known_cost_source(&usage);
+    }
+    Ok(serde_json::json!({"images": images, "usage": usage}))
 }
 
 /// Streaming entry point. Returns an SSE stream of OpenAI-format chunks.

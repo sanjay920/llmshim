@@ -14,13 +14,14 @@ second dispatch, auth or queue path. The library already generates images (`llms
 
 - **Request.** `{model, prompt, ...}`. `model` is a routing id (`openai/gpt-image-1`); a route or deployment
   name is a 400. The fields the provider adapter reads (`n` 1 to 10, `size`, `quality`, `background`,
-  `output_format`, `output_compression`, `moderation`, `user` for OpenAI) ride along unchanged and the adapter
-  refuses the rest, by name. `response_format` may only be `b64_json` (or absent): generated images are not
+  `output_format`, `output_compression`, `moderation`, `user` for OpenAI) ride along unchanged; the adapter reads the
+  fields it knows and drops the rest (Gemini ignores `size`, `quality` and `output_format`, so a request that
+  sets them is a 200 with them ignored). `response_format` may only be `b64_json` (or absent): generated images are not
   hosted, so `url` is a 400. A model that is not an image model is refused by the adapter (a 400 before the
   provider, never forwarded to another vendor).
 - **Response.** `{created, data: [{b64_json, revised_prompt?}], output_format, usage}`. `usage` is the
-  provider's counters with `cost_usd` and `cost_source`; **`cost_usd` is `null` when the usage does not split
-  text and image tokens**, because the catalog has one rate per direction, not per modality (the library's own
+  provider's counters with `cost_usd` and `cost_source`; **`cost_usd` and `cost_source` are `null` when the usage
+  does not split text and image tokens** (never a fourth source value), because the catalog has one rate per direction, not per modality (the library's own
   rule, `images::response`).
 - **Refusals before queueing.** The prompt and count, then the adapter's own request refusals, so a request no
   provider could accept is a 400 and never a 502 out of the dispatcher.
@@ -37,6 +38,22 @@ second dispatch, auth or queue path. The library already generates images (`llms
 - **Where it runs.** The local scheduler only; a fleet answers `501 not_implemented`.
 - **Not built:** speech (`/v1/audio/speech`, binary audio out), transcription (`/v1/audio/transcriptions`,
   multipart in), image edits and variations, hosted URLs, streaming, a spend bound, fleet.
+
+### Found in review
+
+- **Content outcomes do not trip the breaker.** A Gemini safety stop, a blocked prompt or a text-only answer
+  (and OpenAI's empty `data`) are the caller's request being declined, and the breaker is shared by every tenant
+  of the provider; under a policy they are reported as invalid responses and as local errors, so three of them
+  cannot open the circuit for everyone. A real 5xx or a transport failure still counts.
+  (`client::images::tests::a_declined_prompt_under_a_policy_...`; the library's own un-policied `images` keeps its
+  older rule.)
+- **No copies of the answer.** The native body is read for counters before the adapter takes it, and the route
+  moves each image's base64 string out of the answer instead of copying it. The images are still decoded and
+  re-encoded once on the way (the library type holds bytes).
+- **The bucket sees `n`.** An image request weighs the prompt's size times the count asked for.
+- **Order of checks.** Body-shape errors (`response_format`, `encoding_format`, `input`) are reported before the
+  fleet refusal and the allowlist, as the request is parsed first; authentication is the ingress layer's and
+  comes before all of them.
 
 ## How it is built
 

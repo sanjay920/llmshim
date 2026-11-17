@@ -18,7 +18,7 @@ use std::time::Duration;
 mod audio;
 mod body;
 mod deadline;
-mod images;
+pub(crate) mod images;
 mod unsent;
 pub use deadline::AttemptDeadlines;
 use unsent::finish_unsent_request;

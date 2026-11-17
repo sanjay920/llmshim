@@ -1961,9 +1961,15 @@ async fn images_generations(
             "response_format",
         ));
     }
+    // An image costs the bucket by how many are asked for, not only by the prompt's length.
+    let count = body
+        .rest
+        .get("n")
+        .and_then(Value::as_u64)
+        .map_or(1, |n| n.clamp(1, 10));
     let mut payload = Value::Object(body.rest);
     payload["prompt"] = json!(body.prompt);
-    let permits = (body.prompt.len() as u64 / 4 + 1).min(u64::from(u32::MAX)) as u32;
+    let permits = ((body.prompt.len() as u64 / 4 + 1) * count).min(u64::from(u32::MAX)) as u32;
     let (value, _provider, _model) = submit_media_call(
         &state,
         &headers,
@@ -1982,24 +1988,26 @@ async fn images_generations(
         },
     )
     .await?;
-    let data: Vec<Value> = value["images"]
-        .as_array()
-        .map(|images| {
-            images
-                .iter()
-                .map(|image| {
-                    let mut entry = json!({"b64_json": image["b64_json"]});
-                    if let Some(prompt) = image["revised_prompt"].as_str() {
-                        entry["revised_prompt"] = json!(prompt);
-                    }
-                    entry
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // Move each image out of the answer: they can be tens of megabytes, and copying them again
+    // here is what the route's memory bound would pay for.
+    let mut value = value;
     let output_format = value["images"][0]["media_type"]
         .as_str()
-        .and_then(|media| media.strip_prefix("image/"));
+        .and_then(|media| media.strip_prefix("image/"))
+        .map(str::to_owned);
+    let data: Vec<Value> = match value["images"].take() {
+        Value::Array(images) => images
+            .into_iter()
+            .map(|mut image| {
+                let mut entry = json!({"b64_json": image["b64_json"].take()});
+                if let Some(prompt) = image["revised_prompt"].as_str() {
+                    entry["revised_prompt"] = json!(prompt);
+                }
+                entry
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     Ok(Json(json!({
         "created": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
