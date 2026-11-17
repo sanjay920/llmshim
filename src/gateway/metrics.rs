@@ -43,6 +43,17 @@ pub const OUTAGE_ADMISSION_ACTIVE: &str = "llmshim_gateway_outage_admission_acti
 /// healthy (gauge) — set at scrape time, summed over tenants.
 pub const OUTAGE_LEASE_NANOS: &str = "llmshim_gateway_outage_lease_nanos";
 
+/// Attributed spend, in millionths of a USD (counter, labels: provider, source). Integer micro-dollars
+/// so the counter is exact; divide by 1e6 for dollars. The labels are the configured provider names
+/// and the closed `cost_source` set; never a tenant, key or model (note 0034).
+pub const COST_MICROUSD: &str = "llmshim_gateway_cost_usd_micros_total";
+/// Attempts whose cost is unknown (counter, label: provider). Unknown is not free: a rising count
+/// means the cost counter under-reports (note 0034).
+pub const COST_UNKNOWN: &str = "llmshim_gateway_cost_unknown_total";
+/// Tokens of finished attempts (counter, labels: provider, kind of `input`, `output`, `cache_read`,
+/// `cache_write`). Input is the prompt total as reported; `reasoning` is inside `output` (note 0034).
+pub const TOKENS: &str = "llmshim_gateway_tokens_total";
+
 /// Upper bounds (ms) for latency histograms — the Prometheus `le` buckets.
 const BUCKETS_MS: &[f64] = &[
     1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0,

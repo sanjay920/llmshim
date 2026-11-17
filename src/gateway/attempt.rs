@@ -5815,6 +5815,23 @@ mod usage_records {
         assert_eq!(record.cost_source.as_deref(), Some("catalog"));
         assert!(record.usage_reported);
         assert_eq!(coordinator.usage.get().unwrap().in_flight(), 0);
+
+        // The spend counters count this record under its provider and source (note 0034): the
+        // price in micro-dollars, the token kinds that are non-zero.
+        #[cfg(feature = "serve")]
+        {
+            let mut counted = record.clone();
+            counted.provider = "spend-unit".into();
+            crate::gateway::usage::count_spend(&counted);
+            let text = crate::gateway::metrics::render();
+            for expected in [
+                "llmshim_gateway_cost_usd_micros_total{provider=\"spend-unit\",source=\"catalog\"} 12300",
+                "llmshim_gateway_tokens_total{kind=\"input\",provider=\"spend-unit\"} 100",
+                "llmshim_gateway_tokens_total{kind=\"cache_write\",provider=\"spend-unit\"} 5",
+            ] {
+                assert!(text.contains(expected), "{expected}\n{text}");
+            }
+        }
     }
 
     #[tokio::test]

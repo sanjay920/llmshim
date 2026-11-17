@@ -67,6 +67,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0031: Deployments: one name, several targets](0031-deployments.md)
 - [0032: Named instances of hosted providers](0032-provider-instances.md)
 - [0033: Secrets from a secret manager](0033-secret-managers.md)
+- [0034: Alerts and cost exports](0034-alerts-and-cost-exports.md)
 
 ## Roadmap
 
@@ -140,7 +141,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Per-key model allowlists (0028): `keys[].allowed_models`, 403 before admission; also in control-plane keys and signed snapshots
 - [x] Key tags on usage records (0029): `keys[].tags` onto usage records, also in control-plane keys and snapshots
 - [ ] Tenant budgets above key budgets (0030): slices 2 to 5 built (file table, single-instance and Redis ledgers, outage interplay for keys with no cap of their own, team budgets through the control plane); a lease for a key's own cap, reload `started_at` and a refusal-level label are not built
-- [ ] Alerts, scheduled cost exports
+- [x] Alerts, scheduled cost exports (0034): alerts are Prometheus rules over new provider-labelled spend counters; exports are the usage log; the gateway sends and schedules nothing
 - [ ] Deployments and load balancing across credentials and regions (0031): built through slice 4 (selection, four strategies, health with probes, allowlist, usage field, non-streaming failover, stats view, two accounts via named instances); streaming failover remains
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
 - [ ] Audit log

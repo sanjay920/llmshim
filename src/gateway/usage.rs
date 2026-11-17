@@ -406,6 +406,8 @@ impl UsageRecorder {
         };
         let span = open.span.take();
         let record = build(id, open, outcome, self.admission);
+        #[cfg(feature = "serve")]
+        count_spend(&record);
         if let Some(span) = span {
             span.end(&record);
         }
@@ -415,6 +417,43 @@ impl UsageRecorder {
     #[cfg(test)]
     pub(crate) fn in_flight(&self) -> usize {
         self.open.lock().unwrap().len()
+    }
+}
+
+/// Feed the spend and token counters (note 0034). Labels are the configured provider name and the
+/// closed `cost_source` set, so the series count is bounded by the file.
+#[cfg(feature = "serve")]
+pub(crate) fn count_spend(record: &UsageRecord) {
+    use super::metrics;
+    let provider = record.provider.as_str();
+    match (record.cost_usd, record.cost_source.as_deref()) {
+        (Some(usd), source) if usd.is_finite() && usd > 0.0 => {
+            let micros = (usd * 1_000_000.0).round() as u64;
+            metrics::add(
+                metrics::COST_MICROUSD,
+                &[
+                    ("provider", provider),
+                    ("source", source.unwrap_or("catalog")),
+                ],
+                micros,
+            );
+        }
+        (Some(_), _) => {}
+        (None, _) => metrics::incr(metrics::COST_UNKNOWN, &[("provider", provider)]),
+    }
+    for (kind, n) in [
+        ("input", record.input_tokens),
+        ("output", record.output_tokens),
+        ("cache_read", record.cache_read_tokens),
+        ("cache_write", record.cache_write_tokens),
+    ] {
+        if n > 0 {
+            metrics::add(
+                metrics::TOKENS,
+                &[("provider", provider), ("kind", kind)],
+                n,
+            );
+        }
     }
 }
 
