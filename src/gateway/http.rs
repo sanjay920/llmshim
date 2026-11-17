@@ -261,15 +261,10 @@ pub(crate) struct OutageParts {
 #[cfg(feature = "redis-coordination")]
 #[async_trait::async_trait]
 impl crate::gateway::outage::SpendSource for crate::gateway::attempt::AttemptCoordinator {
-    async fn spent_nanos(
-        &self,
-        tenant_key: &str,
-        window_secs: u64,
-        window_index: u64,
-    ) -> Option<u64> {
+    async fn spent_nanos(&self, tenant_key: &str, epoch: u32, window_index: u64) -> Option<u64> {
         self.local_budget_total(
-            &crate::gateway::attempt::outage_tenant_key(tenant_key, window_index),
-            window_secs,
+            &crate::gateway::attempt::outage_tenant_key(tenant_key, epoch, window_index),
+            crate::gateway::attempt::OUTAGE_LOCAL_WINDOW_SECS,
         )
         .await
     }
@@ -625,6 +620,13 @@ impl GatewayState {
             #[cfg(feature = "redis-coordination")]
             Backend::Distributed(gateway) => gateway.retune_limits(config.clone()),
         }
+        // The outage path's own limits are this replica's share of the new ones.
+        #[cfg(feature = "redis-coordination")]
+        if let Some(outage) = &self.outage {
+            let share = config.scaled(outage.rate_fraction);
+            outage.scheduler.retune_limits(share.clone());
+            outage.coordinator.retune_limits(share);
+        }
         self.attempt_coordinator.retune_limits(config);
     }
 
@@ -721,12 +723,16 @@ impl GatewayState {
             parts.spend_lease_fraction,
             parts.recover_after_secs.saturating_mul(1000),
         ));
-        let ticker = manager.clone();
+        // The task ends when the gateway state (and with it the manager) is gone.
+        let ticker = Arc::downgrade(&manager);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                ticker.tick(epoch_ms()).await;
+                let Some(manager) = ticker.upgrade() else {
+                    break;
+                };
+                manager.tick(epoch_ms()).await;
             }
         });
         Ok(OutageSide {
@@ -755,6 +761,7 @@ impl GatewayState {
         let view = policy_scope
             .outage_view(
                 admission.held_nanos,
+                admission.epoch,
                 admission.window_index,
                 outage.rate_fraction,
             )
@@ -776,7 +783,7 @@ impl GatewayState {
         let _ = stream;
         #[cfg(feature = "redis-coordination")]
         if let Some(outage) = &self.outage {
-            if outage.manager.in_outage() {
+            if outage.manager.routes_locally() {
                 return self.prepare_outage(outage, req, &policy_scope);
             }
             // Healthy: note the budgeted tenant so a lease is taken for it.
@@ -933,9 +940,19 @@ impl GatewayState {
                 // The guard lives as long as the stream, so recovery waits for it.
                 let (tx, rx) = mpsc::channel(32);
                 tokio::spawn(async move {
-                    while let Some(chunk) = inner.recv().await {
-                        if tx.send(chunk).await.is_err() {
-                            break;
+                    loop {
+                        tokio::select! {
+                            chunk = inner.recv() => match chunk {
+                                Some(chunk) => {
+                                    if tx.send(chunk).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            },
+                            // The client went away: stop relaying at once, so the
+                            // guard is not held for a stalled upstream.
+                            () = tx.closed() => break,
                         }
                     }
                     drop(guard);
@@ -1028,7 +1045,7 @@ impl GatewayState {
     fn outage_active(&self) -> bool {
         self.outage
             .as_ref()
-            .is_some_and(|outage| outage.manager.in_outage())
+            .is_some_and(|outage| outage.manager.routes_locally())
     }
 
     /// Readiness: in-memory mode is always ready; distributed mode requires
@@ -1038,7 +1055,7 @@ impl GatewayState {
         // Service (note 0027); without a lease it is as unready as ever.
         #[cfg(feature = "redis-coordination")]
         if let Some(outage) = &self.outage {
-            if outage.manager.in_outage() {
+            if outage.manager.routes_locally() {
                 return outage.manager.held_nanos() > 0;
             }
         }

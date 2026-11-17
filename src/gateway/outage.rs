@@ -119,18 +119,14 @@ pub(crate) enum LocalRefusal {
 #[async_trait::async_trait]
 pub(crate) trait SpendSource: Send + Sync {
     /// Nanos spent under the lease's local key, or `None` when it cannot be read.
-    async fn spent_nanos(
-        &self,
-        tenant_key: &str,
-        window_secs: u64,
-        window_index: u64,
-    ) -> Option<u64>;
+    async fn spent_nanos(&self, tenant_key: &str, epoch: u32, window_index: u64) -> Option<u64>;
 }
 
 /// What a request admitted locally may draw on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OutageAdmission {
     pub(crate) held_nanos: u64,
+    pub(crate) epoch: u32,
     pub(crate) window_index: u64,
 }
 
@@ -175,6 +171,7 @@ struct Account {
     window_index: u64,
     window_end_ms: u64,
     held_nanos: u64,
+    epoch: u32,
 }
 
 struct Inner {
@@ -232,6 +229,14 @@ impl OutageManager {
         self.inner.lock().unwrap().state.in_outage()
     }
 
+    /// New requests are admitted locally: in outage state and recovery has not
+    /// begun. Once Redis has answered steadily, new requests go back to the
+    /// fleet path while running ones drain.
+    pub(crate) fn routes_locally(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.state.in_outage() && inner.recovering_since_ms.is_none()
+    }
+
     /// Note that this replica serves a budgeted key of the tenant. The lease is
     /// taken on the next tick, not here, so the request path never waits on it.
     pub(crate) fn register(&self, tenant_key: &str, window_secs: u64, limit_nanos: u64) {
@@ -279,6 +284,7 @@ impl OutageManager {
         }
         let admission = OutageAdmission {
             held_nanos: account.held_nanos,
+            epoch: account.epoch,
             window_index: account.window_index,
         };
         inner.in_flight += 1;
@@ -352,6 +358,7 @@ impl OutageManager {
             self.observe(now_ms, ok);
             return;
         }
+        let mut failed = false;
         for ((tenant, window), limit) in due {
             let owner = self.owner();
             let result =
@@ -379,8 +386,12 @@ impl OutageManager {
                 )) => {
                     inner.state.observe(now_ms, true);
                 }
-                Some(Err(LeaseError::Unavailable)) | None => inner.state.observe(now_ms, false),
+                // One tick is one observation, however many tenants are due.
+                Some(Err(LeaseError::Unavailable)) | None => failed = true,
             }
+        }
+        if failed {
+            self.observe(now_ms, false);
         }
         self.enter_outage_if_tripped();
     }
@@ -392,6 +403,7 @@ impl OutageManager {
         if !inner.state.in_outage() || !inner.accounts.is_empty() {
             return;
         }
+        let epoch = inner.epoch;
         let accounts: HashMap<TenantWindow, Account> = inner
             .tracked
             .iter()
@@ -405,6 +417,7 @@ impl OutageManager {
                         window_index: lease.window_index,
                         window_end_ms: lease.window_end_ms,
                         held_nanos: lease.held_nanos,
+                        epoch,
                     },
                 ))
             })
@@ -447,11 +460,7 @@ impl OutageManager {
         for account in &accounts {
             let Some(spent) = self
                 .spend
-                .spent_nanos(
-                    &account.tenant_key,
-                    account.window_secs,
-                    account.window_index,
-                )
+                .spent_nanos(&account.tenant_key, account.epoch, account.window_index)
                 .await
             else {
                 self.observe(now_ms, false);
@@ -505,7 +514,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SpendSource for Spent {
-        async fn spent_nanos(&self, _: &str, _: u64, _: u64) -> Option<u64> {
+        async fn spent_nanos(&self, _: &str, _: u32, _: u64) -> Option<u64> {
             Some(self.0.load(std::sync::atomic::Ordering::SeqCst))
         }
     }
@@ -702,6 +711,8 @@ mod tests {
             manager.admit(now_ms(), &tenant, 3600),
             Err(LocalRefusal::NoLease)
         ));
+        // New requests go back to the fleet path while the running one drains.
+        assert!(manager.in_outage() && !manager.routes_locally());
         drop(guard);
         manager.tick(5_400).await;
         assert!(!manager.in_outage());
