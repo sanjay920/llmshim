@@ -161,7 +161,8 @@ async fn the_key_lifecycle_over_http_shows_a_secret_once_and_records_the_actor()
             &format!("/v1/projects/{project}/keys"),
             Some(
                 json!({"name": "ci", "rpm": 60, "allowed_cidrs": ["10.0.0.0/8"],
-                "allowed_models": ["openai/gpt-6-luna", "openrouter/anthropic/*"]}),
+                "allowed_models": ["openai/gpt-6-luna", "openrouter/anthropic/*"],
+                "tags": {"env": "prod"}}),
             ),
             Some(TOKEN),
             &[("x-llmshim-actor", "alice")],
@@ -179,6 +180,7 @@ async fn the_key_lifecycle_over_http_shows_a_secret_once_and_records_the_actor()
         body["key"]["allowed_models"],
         json!(["openai/gpt-6-luna", "openrouter/anthropic/*"])
     );
+    assert_eq!(body["key"]["tags"], json!({"env": "prod"}));
     let key = body["key"]["id"].as_str().unwrap().to_string();
     assert!(!created.body.contains("sha256"));
 
@@ -271,6 +273,8 @@ async fn bad_input_is_the_apis_own_400_and_missing_things_404() {
         json!({"name": "ok", "allowed_cidrs": ["nope"]}),
         json!({"name": "ok", "allowed_models": []}),
         json!({"name": "ok", "allowed_models": ["not-a-routing-id"]}),
+        json!({"name": "ok", "tags": {"Env": "x"}}),
+        json!({"name": "ok", "tags": {"env": 7}}),
         json!({"name": "ok", "expires_at": "tomorrow"}),
     ] {
         let answer = api.ok("POST", &path, Some(body.clone())).await;

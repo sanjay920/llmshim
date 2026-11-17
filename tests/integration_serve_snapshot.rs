@@ -165,6 +165,39 @@ async fn a_snapshot_key_with_a_model_list_may_call_only_those_models() {
     );
 }
 
+/// A snapshot key's tags reach the usage records it produces (0029); a key without tags has `{}`.
+#[tokio::test]
+async fn a_snapshot_keys_tags_are_on_its_usage_records() {
+    let (upstream, _mock) = mock(1).await;
+    let plane = Plane::new("snapshot-tags");
+    let mut tagged = key("alpha", ALPHA, "active");
+    tagged["tags"] = json!({"env": "prod", "cost_center": "cc-1"});
+    plane.write(&payload(1, vec![tagged, key("bravo", BRAVO, "active")]));
+    let log = plane.dir.0.join("usage.jsonl");
+    let extra = format!("[logging]\nusage_log = \"{}\"\n", log.display());
+    let server = start(&plane.config(&upstream.url(), &extra), "snapshot-tags", &[]);
+    assert_eq!(status_of(&server, ALPHA).await, 200);
+    assert_eq!(status_of(&server, BRAVO).await, 200);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let records = loop {
+        let found: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if found.len() >= 2 || std::time::Instant::now() > deadline {
+            break found;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let of = |name: &str| records.iter().find(|r| r["key"] == name).unwrap().clone();
+    assert_eq!(
+        of("alpha")["tags"],
+        json!({"cost_center": "cc-1", "env": "prod"})
+    );
+    assert_eq!(of("bravo")["tags"], json!({}));
+}
+
 #[tokio::test]
 async fn a_new_generation_applies_on_reload_and_revocation_takes_effect() {
     let (upstream, _mock) = mock(1).await;

@@ -112,3 +112,16 @@ integrations).
 - Tests: `integration_serve_tags` (sorted tags on the wire, an untagged key `{}`, reload change and
   removal, open mode `null`, bad tags by path and the 17-tag cap). Not done: the usage-log recipe is
   in this note only, not run; the snapshot slice (3).
+
+## As built (slice 3): the control plane
+
+Same shape as 0028's slice 3. `SnapshotKey.tags` is written only when a key has tags (an older data
+plane refuses such a snapshot whole and keeps the previous one); the data plane puts them on the key
+it serves, validated by the file's rules. The control plane stores `keys.tags` (JSON text; schema
+version 3, migrated in place from version 1 or 2 on SQLite and Postgres under the same locks as
+0028), validates with the data plane's own `tag_name_problem` / `tag_value_problem` and the 16-tag
+cap, sets them at creation (`tags` in the key body), copies them on rotation, lists them on the key
+and records them in the `key.created` history detail. No `PATCH`: a changed label set is a successor
+key. Tests: both backends (refusals, storage, rotation, payload presence/absence, a published
+snapshot read back by the data plane), migration from versions 1 and 2, and a process test that a
+snapshot key's tags are on its usage records.

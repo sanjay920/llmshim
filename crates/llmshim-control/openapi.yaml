@@ -222,6 +222,7 @@ components:
         budget_allow_unpriced: {type: boolean}
         allowed_cidrs: {type: [array, 'null'], items: {type: string}}
         allowed_models: {type: [array, 'null'], items: {type: string}}
+        tags: {type: object, additionalProperties: {type: string}}
         created_at: {type: string}
         revoked_at: {type: [string, 'null']}
     CreatedKey:
@@ -249,6 +250,7 @@ components:
         budget_allow_unpriced: {type: boolean}
         allowed_cidrs: {type: array, items: {type: string}}
         allowed_models: {type: array, items: {type: string}, description: 'provider/model, prefix/* or route/<name> (data-plane note 0028); set at creation and copied on rotation'}
+        tags: {type: object, additionalProperties: {type: string}, description: 'Labels copied onto the key''s usage records (data-plane note 0029): at most 16, names a-z0-9_ starting with a letter (32), values 1 to 64 printable ASCII; set at creation and copied on rotation'}
         expires_at: {type: string, format: date-time}
     Limits:
       type: object

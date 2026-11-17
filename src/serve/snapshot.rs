@@ -91,6 +91,10 @@ pub struct SnapshotKey {
     /// the previous one: never a key silently unrestricted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_models: Option<Vec<String>>,
+    /// Labels for usage records (design note 0029); written only when the key has any, with
+    /// the same older-data-plane behavior as `allowed_models`: refused whole, never dropped.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tags: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -277,8 +281,7 @@ fn to_keys(
             budget_window_secs: key.budget_window_secs,
             budget_allow_unpriced: key.budget_allow_unpriced,
             allowed_models: key.allowed_models.clone(),
-            // Not carried by the signed format yet (design note 0029, slice 3).
-            tags: Default::default(),
+            tags: key.tags.clone(),
         });
     }
     Ok((keys, inactive))
