@@ -350,6 +350,20 @@ impl LeaseLedger {
     }
 }
 
+impl LeaseLedger {
+    /// One cheap round trip, for the outage state's health observation.
+    pub(crate) async fn ping(&self) -> bool {
+        self.connections
+            .run(|mut connection| async move {
+                redis::cmd("PING")
+                    .query_async::<String>(&mut connection)
+                    .await
+            })
+            .await
+            .is_ok()
+    }
+}
+
 /// What one replica admitted locally against one lease while Redis was out:
 /// the final amount of each attempt, by attempt id.
 #[derive(Clone, Debug)]

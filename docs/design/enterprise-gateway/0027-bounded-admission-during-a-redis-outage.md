@@ -206,7 +206,7 @@ outage leaves the mode off. The startup probe still uses `/health`.
    stranding.
 3. **Built** (`LeaseLedger::recover`, still unused outside its tests): recovery: the draw-down and release procedure over synthetic local records, resumable. It lands
    **before** any local admission, because admitting without a way to settle is the unsafe order.
-4. Split in two PRs. **4a built**: the `[fleet.outage_admission]` table with its validation and schema, and the pure state in `src/gateway/outage.rs` (`OutageState` hysteresis, `LocalLeaseAccount` quotes, margin and recovery records), unwired. **4b**: the wiring (and `example.toml`, if one carries `[fleet]`). The outage state with hysteresis, the second scheduler, limiter and coordinator, the local
+4. Split in two PRs. **4a built**: the `[fleet.outage_admission]` table with its validation and schema, and the pure state in `src/gateway/outage.rs` (`OutageState` hysteresis, `LocalLeaseAccount` quotes, margin and recovery records), unwired. **4b-1 built** (`OutageManager` in `outage.rs`: lease renewal, health ticks, entering outage state with a local account per lease, recovery only after steady health, resume; tested against a real Redis through a cuttable TCP proxy, unwired to requests). **4b-2**: the request path (second scheduler, limiter and coordinator, quotes taken from the attempt coordinator, in-memory idempotency, usage field; and `example.toml`, if one carries `[fleet]`). The outage state with hysteresis, the second scheduler, limiter and coordinator, the local
    admission path, the `[fleet.outage_admission]` table and the idempotency cache.
 5. Status, metrics, `/ready`, the usage field and the 0014 rows.
 
