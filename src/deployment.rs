@@ -24,6 +24,18 @@ pub enum Strategy {
     Conversation,
 }
 
+impl Strategy {
+    /// The name the file uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round_robin",
+            Self::Weighted => "weighted",
+            Self::Ordered => "ordered",
+            Self::Conversation => "conversation",
+        }
+    }
+}
+
 /// One target of a deployment: a concrete `provider/model` and a weight (1 to 1000).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {

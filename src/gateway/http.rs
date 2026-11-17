@@ -1112,6 +1112,11 @@ impl GatewayState {
             "providers": providers,
             "lanes": lanes,
         });
+        // Present only when the file has deployments: each one's targets and their circuits.
+        let deployments = self.router.current().deployment_overview();
+        if !deployments.is_empty() {
+            stats["deployments"] = json!(deployments);
+        }
         // Present only with `[fleet.outage_admission]`; never a tenant's name.
         #[cfg(feature = "redis-coordination")]
         if let Some(outage) = &self.outage {
