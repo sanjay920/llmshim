@@ -42,6 +42,8 @@ pub mod auth;
 mod budget;
 pub mod http;
 pub mod idempotency;
+#[cfg(feature = "redis-coordination")]
+mod lease;
 pub mod metrics;
 pub mod quota;
 pub(crate) mod usage;
