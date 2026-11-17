@@ -207,10 +207,24 @@ enum Backend {
     Distributed(Arc<crate::gateway::distributed::DistributedGateway>),
 }
 
+#[cfg(feature = "redis-coordination")]
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 enum PreparedGatewaySubmission {
     Local {
         request: GatewayRequest,
         policy_scope: crate::gateway::attempt::TrustedPolicyScope,
+    },
+    /// Admitted locally against a lease while Redis is out (note 0027).
+    #[cfg(feature = "redis-coordination")]
+    Outage {
+        request: GatewayRequest,
+        policy_scope: crate::gateway::attempt::TrustedPolicyScope,
+        guard: crate::gateway::outage::InFlight,
     },
     #[cfg(feature = "redis-coordination")]
     Distributed(crate::gateway::distributed::PreparedSubmission),
@@ -220,6 +234,45 @@ struct SubmittedValue {
     value: Value,
     #[cfg(feature = "redis-coordination")]
     lifecycle_reference: Option<crate::gateway::distributed::LifecycleReference>,
+}
+
+/// Bounded local admission while Redis is out (design note 0027): the manager
+/// that holds the leases, and a scheduler and attempt coordinator of its own,
+/// limited to this replica's share.
+#[cfg(feature = "redis-coordination")]
+struct OutageSide {
+    manager: Arc<crate::gateway::outage::OutageManager>,
+    scheduler: Arc<Scheduler>,
+    coordinator: Arc<crate::gateway::attempt::AttemptCoordinator>,
+    rate_fraction: f64,
+}
+
+/// The `[fleet.outage_admission]` settings.
+#[cfg(feature = "redis-coordination")]
+#[derive(Clone, Debug)]
+pub(crate) struct OutageParts {
+    pub spend_lease_fraction: f64,
+    pub rate_fraction: f64,
+    pub max_concurrency: usize,
+    pub recover_after_secs: u64,
+}
+
+/// The local ledger is where recovery reads what a lease spent.
+#[cfg(feature = "redis-coordination")]
+#[async_trait::async_trait]
+impl crate::gateway::outage::SpendSource for crate::gateway::attempt::AttemptCoordinator {
+    async fn spent_nanos(
+        &self,
+        tenant_key: &str,
+        window_secs: u64,
+        window_index: u64,
+    ) -> Option<u64> {
+        self.local_budget_total(
+            &crate::gateway::attempt::outage_tenant_key(tenant_key, window_index),
+            window_secs,
+        )
+        .await
+    }
 }
 
 /// Shared state for the gateway HTTP handlers.
@@ -234,6 +287,8 @@ pub struct GatewayState {
     prequeue_backpressure: Backpressure,
     /// `Retry-After` suggested when a job's queue wait times out.
     overloaded_retry_after: Duration,
+    #[cfg(feature = "redis-coordination")]
+    outage: Option<OutageSide>,
 }
 
 /// Everything the single-instance gateway state is built from. Grouping these
@@ -275,6 +330,8 @@ pub(crate) struct DistributedParts {
     pub usage: Option<crate::gateway::usage::UsageSetup>,
     /// See [`LocalParts::penalty`].
     pub penalty: Option<std::time::Duration>,
+    /// Bounded admission while Redis is out; `None` keeps today's behaviour.
+    pub outage: Option<OutageParts>,
 }
 
 impl LocalParts {
@@ -369,6 +426,8 @@ impl GatewayState {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "redis-coordination")]
+            outage: None,
         })
     }
 
@@ -406,6 +465,7 @@ impl GatewayState {
                     }),
                 usage: None,
                 penalty: None,
+                outage: None,
             },
         )
         .await
@@ -450,6 +510,7 @@ impl GatewayState {
             max_retained_accounting_attempts,
             usage,
             penalty,
+            outage,
         } = parts;
         let router = RouterHandle::new(router.with_breaker(breaker));
         let dispatch = Arc::new(RealDispatch {
@@ -457,6 +518,9 @@ impl GatewayState {
             logger,
             penalty,
         });
+        let dispatch_for_outage = dispatch.clone();
+        let outage_usage = usage.clone();
+        let outage_rate_limits = rate_limits.clone();
         let attempt_coordinator =
             crate::gateway::attempt::AttemptCoordinator::redis_with_retention(
                 redis_url,
@@ -482,6 +546,19 @@ impl GatewayState {
         )
         .await
         .map_err(|e| e.to_string())?;
+        let outage = match outage {
+            Some(parts) => Some(Self::build_outage_side(
+                redis_url,
+                &parts,
+                &config,
+                outage_rate_limits,
+                max_retained_accounting_attempts,
+                outage_usage,
+                penalty,
+                dispatch_for_outage,
+            )?),
+            None => None,
+        };
         Ok(Arc::new(Self {
             router,
             backend: Backend::Distributed(gateway),
@@ -496,6 +573,8 @@ impl GatewayState {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "redis-coordination")]
+            outage,
         }))
     }
 
@@ -573,7 +652,9 @@ impl GatewayState {
         #[cfg(feature = "redis-coordination")]
         let mut policy_scope = policy_scope;
         #[cfg(feature = "redis-coordination")]
-        if identity.budget_usd.is_some() {
+        // The legacy spend floor is Redis state: during an outage the lease, taken
+        // with it counted, stands in for it.
+        if identity.budget_usd.is_some() && !self.outage_active() {
             if let Backend::Distributed(gateway) = &self.backend {
                 let _ = gateway;
                 self.attempt_coordinator
@@ -587,6 +668,104 @@ impl GatewayState {
         Ok(policy_scope)
     }
 
+    /// The local half of bounded outage admission: a manager that holds the
+    /// leases, a scheduler and an attempt coordinator of this replica's share,
+    /// and the task that ticks the manager.
+    #[cfg(feature = "redis-coordination")]
+    #[allow(clippy::too_many_arguments)]
+    fn build_outage_side(
+        redis_url: &str,
+        parts: &OutageParts,
+        config: &GatewayConfig,
+        rate_limits: crate::proxy::ratelimit::RateLimitConfig,
+        max_retained_accounting_attempts: usize,
+        usage: Option<crate::gateway::usage::UsageSetup>,
+        penalty: Option<std::time::Duration>,
+        dispatch: Arc<dyn Dispatch>,
+    ) -> Result<OutageSide, String> {
+        let scaled = rate_limits.scaled(parts.rate_fraction);
+        let mut local_config = config.clone();
+        local_config.max_concurrency_per_provider = parts.max_concurrency;
+        // A short queue: the mode is not a queue, it smooths a burst.
+        local_config.max_queue_depth = parts.max_concurrency;
+        local_config.max_wait = local_config.max_wait.min(Duration::from_secs(1));
+        let limiter: Arc<dyn crate::proxy::ratelimit::RateLimiter> = Arc::new(
+            crate::proxy::ratelimit::InMemoryRateLimiter::new(scaled.clone()),
+        );
+        let scheduler = Scheduler::new(local_config.clone(), limiter, dispatch);
+        let coordinator = crate::gateway::attempt::AttemptCoordinator::local_with_retention(
+            scaled,
+            parts.max_concurrency,
+            local_config.max_wait,
+            max_retained_accounting_attempts,
+            false,
+        );
+        if let Some(setup) = usage {
+            coordinator.set_usage_sink(setup);
+        }
+        if let Some(penalty) = penalty {
+            coordinator.set_penalty(penalty);
+        }
+        let ledger = crate::gateway::lease::LeaseLedger::new(
+            redis_url,
+            crate::gateway::attempt::LATE_SETTLEMENT_RETENTION_SECS,
+            crate::gateway::attempt::REDIS_ACCOUNTING_INDEX_KEY.to_owned(),
+            max_retained_accounting_attempts,
+        )
+        .map_err(|error| error.to_string())?;
+        let replica = uuid::Uuid::new_v4().simple().to_string()[..12].to_owned();
+        let manager = Arc::new(crate::gateway::outage::OutageManager::new(
+            ledger,
+            coordinator.clone(),
+            replica,
+            parts.spend_lease_fraction,
+            parts.recover_after_secs.saturating_mul(1000),
+        ));
+        let ticker = manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                ticker.tick(epoch_ms()).await;
+            }
+        });
+        Ok(OutageSide {
+            manager,
+            scheduler,
+            coordinator,
+            rate_fraction: parts.rate_fraction,
+        })
+    }
+
+    /// Admit a request locally against this replica's lease, or refuse it. Only
+    /// reached in outage state.
+    #[cfg(feature = "redis-coordination")]
+    fn prepare_outage(
+        &self,
+        outage: &OutageSide,
+        req: GatewayRequest,
+        policy_scope: &crate::gateway::attempt::TrustedPolicyScope,
+    ) -> Result<PreparedGatewaySubmission, GatewayError> {
+        let refuse = || GatewayError::Overloaded(self.overloaded_retry_after);
+        let (tenant, window_secs, _) = policy_scope.outage_budget().ok_or_else(refuse)?;
+        let (admission, guard) = outage
+            .manager
+            .admit(epoch_ms(), tenant, window_secs)
+            .map_err(|_| refuse())?;
+        let view = policy_scope
+            .outage_view(
+                admission.held_nanos,
+                admission.window_index,
+                outage.rate_fraction,
+            )
+            .ok_or_else(refuse)?;
+        Ok(PreparedGatewaySubmission::Outage {
+            request: req,
+            policy_scope: view,
+            guard,
+        })
+    }
+
     fn prepare_submission(
         &self,
         req: GatewayRequest,
@@ -595,6 +774,16 @@ impl GatewayState {
     ) -> Result<PreparedGatewaySubmission, GatewayError> {
         #[cfg(not(feature = "redis-coordination"))]
         let _ = stream;
+        #[cfg(feature = "redis-coordination")]
+        if let Some(outage) = &self.outage {
+            if outage.manager.in_outage() {
+                return self.prepare_outage(outage, req, &policy_scope);
+            }
+            // Healthy: note the budgeted tenant so a lease is taken for it.
+            if let Some((tenant, window_secs, limit)) = policy_scope.outage_budget() {
+                outage.manager.register(tenant, window_secs, limit);
+            }
+        }
         match &self.backend {
             Backend::Local(_) => Ok(PreparedGatewaySubmission::Local {
                 request: req,
@@ -638,6 +827,35 @@ impl GatewayState {
                 #[cfg(feature = "redis-coordination")]
                 Backend::Distributed(_) => unreachable!("prepared backend changed"),
             },
+            #[cfg(feature = "redis-coordination")]
+            PreparedGatewaySubmission::Outage {
+                request,
+                policy_scope,
+                guard,
+            } => {
+                let outage = self.outage.as_ref().expect("outage admission was prepared");
+                drop(prequeue_permit);
+                let policy_context = outage.coordinator.context(policy_scope);
+                let value = match logical_deadline {
+                    Some(deadline) => {
+                        outage
+                            .scheduler
+                            .submit_with_policy_deadline(request, policy_context, deadline)
+                            .await
+                    }
+                    None => {
+                        outage
+                            .scheduler
+                            .submit_with_policy(request, policy_context)
+                            .await
+                    }
+                };
+                drop(guard);
+                Ok(SubmittedValue {
+                    value: value?,
+                    lifecycle_reference: None,
+                })
+            }
             #[cfg(feature = "redis-coordination")]
             PreparedGatewaySubmission::Distributed(prepared) => match &self.backend {
                 Backend::Distributed(gateway) => {
@@ -690,6 +908,41 @@ impl GatewayState {
                 Backend::Distributed(_) => unreachable!("prepared backend changed"),
             },
             #[cfg(feature = "redis-coordination")]
+            PreparedGatewaySubmission::Outage {
+                request,
+                policy_scope,
+                guard,
+            } => {
+                let outage = self.outage.as_ref().expect("outage admission was prepared");
+                drop(prequeue_permit);
+                let policy_context = outage.coordinator.context(policy_scope);
+                let mut inner = match logical_deadline {
+                    Some(deadline) => {
+                        outage
+                            .scheduler
+                            .submit_stream_with_policy_deadline(request, policy_context, deadline)
+                            .await
+                    }
+                    None => {
+                        outage
+                            .scheduler
+                            .submit_stream_with_policy(request, policy_context)
+                            .await
+                    }
+                }?;
+                // The guard lives as long as the stream, so recovery waits for it.
+                let (tx, rx) = mpsc::channel(32);
+                tokio::spawn(async move {
+                    while let Some(chunk) = inner.recv().await {
+                        if tx.send(chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    drop(guard);
+                });
+                Ok(rx)
+            }
+            #[cfg(feature = "redis-coordination")]
             PreparedGatewaySubmission::Distributed(prepared) => match &self.backend {
                 Backend::Distributed(gateway) => {
                     let accepted = gateway.accept_prepared(prepared, logical_deadline).await?;
@@ -731,6 +984,12 @@ impl GatewayState {
         &self,
         context: &crate::gateway::idempotency::IdempotencyContext,
     ) -> crate::gateway::idempotency::IdempotencyLookup {
+        // Shared idempotency lives in Redis; during an outage a replica keeps its
+        // own in memory (a retry that reaches another replica can run twice).
+        #[cfg(feature = "redis-coordination")]
+        if self.outage_active() {
+            return self.idempotency.lookup(context);
+        }
         match &self.backend {
             Backend::Local(_) => self.idempotency.lookup(context),
             #[cfg(feature = "redis-coordination")]
@@ -747,6 +1006,11 @@ impl GatewayState {
             &crate::gateway::distributed::LifecycleReference,
         >,
     ) {
+        #[cfg(feature = "redis-coordination")]
+        if self.outage_active() {
+            self.idempotency.store(context, value.clone());
+            return;
+        }
         match &self.backend {
             Backend::Local(_) => self.idempotency.store(context, value.clone()),
             #[cfg(feature = "redis-coordination")]
@@ -760,9 +1024,24 @@ impl GatewayState {
         }
     }
 
+    #[cfg(feature = "redis-coordination")]
+    fn outage_active(&self) -> bool {
+        self.outage
+            .as_ref()
+            .is_some_and(|outage| outage.manager.in_outage())
+    }
+
     /// Readiness: in-memory mode is always ready; distributed mode requires
     /// Redis to answer a PING.
     async fn ready(&self) -> bool {
+        // With outage admission on, a replica serving from its lease stays in the
+        // Service (note 0027); without a lease it is as unready as ever.
+        #[cfg(feature = "redis-coordination")]
+        if let Some(outage) = &self.outage {
+            if outage.manager.in_outage() {
+                return outage.manager.held_nanos() > 0;
+            }
+        }
         match &self.backend {
             Backend::Local(_) => true,
             #[cfg(feature = "redis-coordination")]
@@ -1652,6 +1931,8 @@ mod native_tests {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "redis-coordination")]
+            outage: None,
         })
     }
 
@@ -1702,6 +1983,8 @@ mod native_tests {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "redis-coordination")]
+            outage: None,
         })
     }
 
@@ -2018,6 +2301,8 @@ mod native_tests {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "redis-coordination")]
+            outage: None,
         })
     }
 
@@ -2285,6 +2570,8 @@ mod native_tests {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "redis-coordination")]
+            outage: None,
         };
         let serialized =
             serde_json::to_string(&state.trusted_policy_scope(&identity).await.unwrap()).unwrap();
@@ -2377,6 +2664,8 @@ mod native_tests {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "redis-coordination")]
+            outage: None,
         });
         let application = app(state);
         let mut connection = gateway.connection_for_test().await.unwrap();
@@ -3989,6 +4278,8 @@ mod native_tests {
                     config.max_wait,
                 ),
                 overloaded_retry_after: config.overloaded_retry_after,
+                #[cfg(feature = "redis-coordination")]
+                outage: None,
             })
         };
         let payload = || {

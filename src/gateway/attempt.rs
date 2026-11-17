@@ -14,7 +14,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 const ZERO_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
-const LATE_SETTLEMENT_RETENTION_SECS: u64 = 86_400;
+pub(crate) const LATE_SETTLEMENT_RETENTION_SECS: u64 = 86_400;
 const DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS: usize = 100_000;
 const ACCOUNTING_EXPIRY_CLEANUP_BATCH: usize = 128;
 #[cfg(feature = "redis-coordination")]
@@ -89,6 +89,44 @@ impl TrustedPolicyScope {
         }
     }
 
+    /// The tenant's budget window this scope draws on, if it has a valid budget
+    /// that is priced and bounded before sending (what outage admission, note
+    /// 0027, requires): `(tenant_key, window_secs, limit_nanos)`.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn outage_budget(&self) -> Option<(&str, u64, u64)> {
+        let budget = self.budget.as_ref()?;
+        (budget.valid && !budget.allow_unpriced).then_some((
+            self.tenant_key.as_str(),
+            budget.window_secs,
+            budget.limit_nanos,
+        ))
+    }
+
+    /// The same request as the local outage path sees it: a counter of its own
+    /// per lease (so the local ledger never refills mid-outage), limited to the
+    /// lease, with the tenant's rate limits cut to this replica's share.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn outage_view(
+        &self,
+        held_nanos: u64,
+        window_index: u64,
+        rate_fraction: f64,
+    ) -> Option<Self> {
+        self.outage_budget()?;
+        let share = |limit: Option<u32>| {
+            limit.map(|value| ((f64::from(value) * rate_fraction).ceil() as u32).max(1))
+        };
+        let mut view = self.clone();
+        view.tenant_key = outage_tenant_key(&self.tenant_key, window_index);
+        view.rpm = share(self.rpm);
+        view.tpm = share(self.tpm);
+        view.legacy_spend_floor = None;
+        if let Some(budget) = view.budget.as_mut() {
+            budget.limit_nanos = held_nanos;
+        }
+        Some(view)
+    }
+
     /// Pin the router this request was admitted against (0022).
     pub(crate) fn set_router(&mut self, router: Arc<crate::router::Router>) {
         self.router = Some(router);
@@ -116,6 +154,12 @@ impl TrustedPolicyScope {
     pub(crate) fn is_current(&self) -> bool {
         self.version == 1
     }
+}
+
+/// The local ledger key of one lease's outage spend.
+#[cfg(feature = "redis-coordination")]
+pub(crate) fn outage_tenant_key(tenant_key: &str, window_index: u64) -> String {
+    format!("outage:{tenant_key}:{window_index}")
 }
 
 impl std::fmt::Debug for TrustedPolicyScope {
@@ -161,6 +205,13 @@ trait AttemptRates: Send + Sync {
     ) -> Result<(), RateRefusal>;
 
     async fn penalize(&self, provider: &str, duration: Duration) -> Result<(), ()>;
+
+    /// Nanos charged under a local ledger key, across its windows (outage
+    /// recovery, note 0027). Only the in-memory ledger knows it.
+    #[cfg(feature = "redis-coordination")]
+    async fn local_budget_total(&self, _tenant_key: &str, _window_secs: u64) -> Option<u64> {
+        None
+    }
 
     /// Follow a new set of provider limits (0022). Buckets keep their tokens.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
@@ -607,6 +658,19 @@ fn debit_dimension(
 
 #[async_trait::async_trait]
 impl AttemptRates for LocalAttemptRates {
+    #[cfg(feature = "redis-coordination")]
+    async fn local_budget_total(&self, tenant_key: &str, window_secs: u64) -> Option<u64> {
+        let state = self.state.lock().await;
+        Some(
+            state
+                .budget_totals
+                .iter()
+                .filter(|(key, _)| key.tenant_key == tenant_key && key.window_secs == window_secs)
+                .map(|(_, total)| *total)
+                .sum(),
+        )
+    }
+
     async fn acquire(
         &self,
         provider: &str,
@@ -912,6 +976,17 @@ impl AttemptCoordinator {
     #[cfg(feature = "serve")]
     pub(crate) fn retune_limits(&self, config: RateLimitConfig) {
         self.rates.retune(config);
+    }
+
+    /// What the in-memory ledger holds for a local key (see
+    /// [`AttemptRates::local_budget_total`]); `None` on a Redis-backed one.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) async fn local_budget_total(
+        &self,
+        tenant_key: &str,
+        window_secs: u64,
+    ) -> Option<u64> {
+        self.rates.local_budget_total(tenant_key, window_secs).await
     }
 
     pub(crate) fn context(self: &Arc<Self>, scope: TrustedPolicyScope) -> DispatchPolicyContext {

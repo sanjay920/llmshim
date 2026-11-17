@@ -358,6 +358,129 @@ mod redis_outage {
         assert_no_panic(&server.stderr.lock().unwrap());
     }
 
+    /// A Responses API answer, for the hosted `openai` kind pointed at a mock.
+    fn responses_body(text: &str) -> String {
+        json!({
+            "id": "resp_1", "object": "response", "status": "completed", "model": "gpt-6-luna",
+            "output": [{"type": "message", "id": "msg_1", "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}]}],
+            "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+        })
+        .to_string()
+    }
+
+    /// With `[fleet.outage_admission]` a budgeted key keeps being served from its
+    /// lease while Redis is gone, the replica stays ready, and when Redis returns
+    /// the lease is settled and the fleet path serves again (note 0027).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs Redis: set LLMSHIM_TEST_REDIS_URL"]
+    async fn a_budgeted_key_is_served_from_its_lease_while_redis_is_gone() {
+        let target = std::env::var("LLMSHIM_TEST_REDIS_URL").expect("set LLMSHIM_TEST_REDIS_URL");
+        let id = uuid::Uuid::new_v4().simple();
+        let tenant = format!("tenant-{id}");
+        // A priced model, so an attempt's cost is bounded before it is sent.
+        let model = "openai/gpt-6-luna";
+
+        let mut upstream = mockito::Server::new_async().await;
+        let mock = upstream
+            .mock("POST", "/responses")
+            .with_header("content-type", "application/json")
+            .with_body(responses_body("pong"))
+            .expect_at_least(3)
+            .create_async()
+            .await;
+
+        let proxy = RedisProxy::start(&target).await;
+        let redis_through_proxy = format!("redis://{}", proxy.address);
+        let extra = "budget_usd = 100.0\n[fleet]\nredis_url = { env = \"SERVE_E2E_REDIS_URL\" }\n\
+                     [fleet.outage_admission]\nspend_lease_fraction = 0.5\nrecover_after_secs = 5";
+        let text = config(&upstream.url(), extra)
+            .replace("providers.inference", "providers.openai")
+            .replace("kind = \"openai-compatible\"", "kind = \"openai\"")
+            .replace("tenant = \"platform\"", &format!("tenant = \"{tenant}\""));
+        let mut server = start(
+            &text,
+            "outage-admission",
+            &[("SERVE_E2E_REDIS_URL", redis_through_proxy.as_str())],
+        );
+        let base = server.base.clone();
+        let client = client();
+        let ask = || async {
+            client
+                .post(format!("{base}/v1/chat/completions"))
+                .bearer_auth(CALLER_KEY)
+                .json(&json!({"model": model, "max_tokens": 50,
+                    "messages": [{"role": "user", "content": "ping"}]}))
+                .send()
+                .await
+        };
+
+        // Healthy: served through the fleet. That registers the tenant, and a
+        // lease follows within a tick or two.
+        assert_eq!(ask().await.unwrap().status(), 200);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        proxy.cut();
+        // Wait for the replica to notice (three failed probes).
+        let noticed = std::time::Instant::now();
+        let mut served = None;
+        let mut last = String::new();
+        while noticed.elapsed() < Duration::from_secs(40) {
+            if let Ok(response) = ask().await {
+                if response.status() == 200 {
+                    served = Some(noticed.elapsed());
+                    break;
+                }
+                last = format!(
+                    "{} {}",
+                    response.status(),
+                    response.text().await.unwrap_or_default()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        eprintln!("last refusal: {last}");
+        let served = served.expect("a budgeted key is served from its lease during the outage");
+        eprintln!("served from the lease {served:?} after Redis was cut");
+        assert_eq!(
+            status(&client, &base, "/ready").await,
+            200,
+            "a replica serving from its lease stays in the Service"
+        );
+        assert!(server.child.try_wait().unwrap().is_none());
+
+        proxy.restore();
+        let recovering = std::time::Instant::now();
+        let settled = |server: &harness::Server| {
+            server
+                .stderr
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("leases settled"))
+        };
+        // Requests keep being served (locally, then through the fleet) while
+        // the lease is settled; no restart is needed.
+        while !settled(&server) && recovering.elapsed() < Duration::from_secs(90) {
+            assert_eq!(ask().await.unwrap().status(), 200);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(
+            settled(&server),
+            "the lease was settled after Redis returned"
+        );
+        assert_eq!(
+            ask().await.unwrap().status(),
+            200,
+            "served on the fleet path again"
+        );
+        let log = server.stderr.lock().unwrap().join("\n");
+        assert!(log.contains("serving budgeted keys from leases"), "{log}");
+        mock.assert_async().await;
+        assert_no_panic(&server.stderr.lock().unwrap());
+    }
+
     /// Redis goes away while a request is already with the provider. The caller
     /// is not left waiting for an answer that can no longer be delivered, the
     /// replica stays up, and the next request after Redis returns is served.

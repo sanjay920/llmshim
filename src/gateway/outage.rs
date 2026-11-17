@@ -5,6 +5,7 @@
 
 use std::collections::VecDeque;
 
+use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -105,142 +106,42 @@ impl OutageState {
 pub(crate) enum LocalRefusal {
     /// Within [`WINDOW_MARGIN_MS`] of the window's end (or past it).
     WindowMargin,
-    /// The quote exceeds what the lease has left.
-    Exhausted,
-    /// This attempt id already holds a reservation.
-    Duplicate,
-    /// No lease is held for this tenant, or the replica is not in outage state.
+    /// No lease is held for this tenant, the replica is not in outage state, or
+    /// recovery has begun.
     NoLease,
 }
 
-/// One replica's in-memory account of one lease while Redis is out. Every
-/// attempt (each retry, repair and fallback included) reserves its own quote
-/// before it is sent, and a quote above the unspent lease is refused, so the
-/// quotes admitted never exceed the lease: the bound of note 0027. It is a
-/// bound on quotes; a provider can still bill above one, and recovery charges
-/// the excess.
-#[derive(Debug)]
-pub(crate) struct LocalLeaseAccount {
-    tenant_key: String,
-    window_secs: u64,
-    window_index: u64,
-    window_end_ms: u64,
-    held_nanos: u64,
-    reserved_nanos: u64,
-    attempts: Vec<Attempt>,
-    index: std::collections::HashMap<uuid::Uuid, usize>,
-}
-
-#[derive(Debug)]
-struct Attempt {
-    id: uuid::Uuid,
-    quote: u64,
-    /// The amount to charge: the quote until the attempt reports a final one.
-    charge: u64,
-    cancelled: bool,
-    /// Reported final (or cancelled): no longer in flight.
-    done: bool,
-}
-
-impl LocalLeaseAccount {
-    pub(crate) fn new(
-        tenant_key: String,
+/// Where the local ledger says how much a lease has spent. The quote bound is
+/// the local ledger's: each attempt (every retry, repair and fallback) reserves
+/// its own quote against a budget equal to the lease before it is sent
+/// (`TrustedPolicyScope::outage_view`), so the quotes admitted never exceed the
+/// lease. This is only what recovery charges.
+#[async_trait::async_trait]
+pub(crate) trait SpendSource: Send + Sync {
+    /// Nanos spent under the lease's local key, or `None` when it cannot be read.
+    async fn spent_nanos(
+        &self,
+        tenant_key: &str,
         window_secs: u64,
         window_index: u64,
-        window_end_ms: u64,
-        held_nanos: u64,
-    ) -> Self {
-        Self {
-            tenant_key,
-            window_secs,
-            window_index,
-            window_end_ms,
-            held_nanos,
-            reserved_nanos: 0,
-            attempts: Vec::new(),
-            index: std::collections::HashMap::new(),
-        }
-    }
+    ) -> Option<u64>;
+}
 
-    pub(crate) fn unspent_nanos(&self) -> u64 {
-        self.held_nanos - self.reserved_nanos
-    }
+/// What a request admitted locally may draw on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutageAdmission {
+    pub(crate) held_nanos: u64,
+    pub(crate) window_index: u64,
+}
 
-    /// Reserve an attempt's quote, or refuse. `now_ms` is the replica's own
-    /// clock in epoch milliseconds.
-    pub(crate) fn reserve(
-        &mut self,
-        now_ms: u64,
-        attempt: uuid::Uuid,
-        quote_nanos: u64,
-    ) -> Result<(), LocalRefusal> {
-        if now_ms.saturating_add(WINDOW_MARGIN_MS) >= self.window_end_ms {
-            return Err(LocalRefusal::WindowMargin);
-        }
-        if self.index.contains_key(&attempt) {
-            return Err(LocalRefusal::Duplicate);
-        }
-        if quote_nanos > self.unspent_nanos() {
-            return Err(LocalRefusal::Exhausted);
-        }
-        self.reserved_nanos += quote_nanos;
-        self.index.insert(attempt, self.attempts.len());
-        self.attempts.push(Attempt {
-            id: attempt,
-            quote: quote_nanos,
-            charge: quote_nanos,
-            cancelled: false,
-            done: false,
-        });
-        Ok(())
-    }
+/// Held while a locally admitted request runs, so recovery can wait for it.
+pub(crate) struct InFlight(Option<std::sync::Arc<OutageManager>>);
 
-    /// Attempts reserved and not yet finished or cancelled.
-    pub(crate) fn in_flight(&self) -> usize {
-        self.attempts.iter().filter(|a| !a.done).count()
-    }
-
-    /// An attempt that was never sent gives its quote back.
-    pub(crate) fn cancel(&mut self, attempt: uuid::Uuid) {
-        if let Some(a) = self
-            .index
-            .get(&attempt)
-            .and_then(|i| self.attempts.get_mut(*i))
-            .filter(|a| !a.cancelled)
-        {
-            a.cancelled = true;
-            a.done = true;
-            self.reserved_nanos -= a.quote;
-        }
-    }
-
-    /// Record an attempt's final amount for recovery. The reservation is kept
-    /// as it was: a lease is spent once, never refilled mid-outage.
-    pub(crate) fn finish(&mut self, attempt: uuid::Uuid, final_nanos: u64) {
-        if let Some(a) = self
-            .index
-            .get(&attempt)
-            .and_then(|i| self.attempts.get_mut(*i))
-            .filter(|a| !a.cancelled)
-        {
-            a.charge = final_nanos;
-            a.done = true;
-        }
-    }
-
-    /// What recovery draws: each attempt that was sent, at its final amount (its
-    /// quote when it never reported one).
-    pub(crate) fn to_local_lease(&self) -> LocalLease {
-        LocalLease {
-            tenant_key: self.tenant_key.clone(),
-            window_secs: self.window_secs,
-            window_index: self.window_index,
-            attempts: self
-                .attempts
-                .iter()
-                .filter(|a| !a.cancelled)
-                .map(|a| (a.id, a.charge))
-                .collect(),
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some(manager) = self.0.take() {
+            let mut inner = manager.inner.lock().unwrap();
+            inner.in_flight = inner.in_flight.saturating_sub(1);
         }
     }
 }
@@ -248,16 +149,16 @@ impl LocalLeaseAccount {
 /// A (tenant, window length) a replica serves budgeted keys of.
 type TenantWindow = (String, u64);
 
-/// A deadline for each Redis call the manager makes, so a Redis that is slow
-/// rather than gone still counts as a failure.
-/// How long recovery waits for in-flight local attempts before drawing them at
-/// their quote.
+/// How long recovery waits for in-flight local requests before drawing what the
+/// local ledger holds.
 const RECOVERY_DRAIN_MS: u64 = 60_000;
 
-/// One recovery pass may draw many attempts one by one; it gets longer than a
-/// single call, and a pass cut short resumes on the next tick.
+/// One recovery pass draws one record per lease; it gets longer than a single
+/// call, and a pass cut short resumes on the next tick.
 const RECOVERY_DEADLINE: Duration = Duration::from_secs(60);
 
+/// A deadline for each Redis call the manager makes, so a Redis that is slow
+/// rather than gone still counts as a failure.
 const CALL_DEADLINE: Duration = Duration::from_secs(2);
 
 struct Tracked {
@@ -266,11 +167,23 @@ struct Tracked {
     last_renewed_ms: Option<u64>,
 }
 
+/// A lease as the outage began, held in memory.
+#[derive(Clone, Debug)]
+struct Account {
+    tenant_key: String,
+    window_secs: u64,
+    window_index: u64,
+    window_end_ms: u64,
+    held_nanos: u64,
+}
+
 struct Inner {
     state: OutageState,
     tracked: HashMap<TenantWindow, Tracked>,
     /// Filled when the replica enters outage state, from the last lease it held.
-    accounts: HashMap<TenantWindow, LocalLeaseAccount>,
+    accounts: HashMap<TenantWindow, Account>,
+    /// Local requests running now.
+    in_flight: usize,
     /// Recovery has begun: no more local admission, even if Redis drops again,
     /// because the leases may already be released.
     recovering_since_ms: Option<u64>,
@@ -279,11 +192,11 @@ struct Inner {
     epoch: u32,
 }
 
-/// Keeps leases while Redis is healthy, notices an outage, holds the local
-/// accounts, and settles them on recovery (design note 0027). It owns no
-/// request path: slice 4c asks it to reserve and to report.
+/// Keeps leases while Redis is healthy, notices an outage, holds the leases,
+/// and settles them on recovery (design note 0027).
 pub(crate) struct OutageManager {
     ledger: LeaseLedger,
+    spend: std::sync::Arc<dyn SpendSource>,
     replica: String,
     fraction: f64,
     renew_every_ms: u64,
@@ -293,12 +206,14 @@ pub(crate) struct OutageManager {
 impl OutageManager {
     pub(crate) fn new(
         ledger: LeaseLedger,
+        spend: std::sync::Arc<dyn SpendSource>,
         replica: String,
         fraction: f64,
         recover_after_ms: u64,
     ) -> Self {
         Self {
             ledger,
+            spend,
             replica: replica.replace(':', "_"),
             fraction,
             renew_every_ms: 10_000,
@@ -306,6 +221,7 @@ impl OutageManager {
                 state: OutageState::new(recover_after_ms),
                 tracked: HashMap::new(),
                 accounts: HashMap::new(),
+                in_flight: 0,
                 recovering_since_ms: None,
                 epoch: 0,
             }),
@@ -331,68 +247,53 @@ impl OutageManager {
             });
     }
 
-    /// Reserve a local attempt's quote against the tenant's lease. Only while
-    /// the replica is in outage state, and only against a lease it held when the
-    /// outage began.
-    pub(crate) fn reserve(
-        &self,
+    /// Stop leasing for tenants not in `keep` (a reload removed them).
+    pub(crate) fn retain_tenants(&self, keep: impl Fn(&str) -> bool) {
+        self.inner
+            .lock()
+            .unwrap()
+            .tracked
+            .retain(|(tenant, _), _| keep(tenant));
+    }
+
+    /// Admit a request locally against the tenant's lease: only in outage
+    /// state, before recovery has begun, with a lease held when the outage
+    /// began, and not within the window margin. The guard must live as long as
+    /// the request runs.
+    pub(crate) fn admit(
+        self: &std::sync::Arc<Self>,
         now_ms: u64,
         tenant_key: &str,
         window_secs: u64,
-        attempt: uuid::Uuid,
-        quote_nanos: u64,
-    ) -> Result<(), LocalRefusal> {
+    ) -> Result<(OutageAdmission, InFlight), LocalRefusal> {
         let mut inner = self.inner.lock().unwrap();
         if !inner.state.in_outage() || inner.recovering_since_ms.is_some() {
             return Err(LocalRefusal::NoLease);
         }
-        match inner
+        let account = inner
             .accounts
-            .get_mut(&(tenant_key.to_string(), window_secs))
-        {
-            Some(account) => account.reserve(now_ms, attempt, quote_nanos),
-            None => Err(LocalRefusal::NoLease),
+            .get(&(tenant_key.to_string(), window_secs))
+            .ok_or(LocalRefusal::NoLease)?;
+        if now_ms.saturating_add(WINDOW_MARGIN_MS) >= account.window_end_ms {
+            return Err(LocalRefusal::WindowMargin);
         }
+        let admission = OutageAdmission {
+            held_nanos: account.held_nanos,
+            window_index: account.window_index,
+        };
+        inner.in_flight += 1;
+        Ok((admission, InFlight(Some(self.clone()))))
     }
 
-    pub(crate) fn cancel(&self, tenant_key: &str, window_secs: u64, attempt: uuid::Uuid) {
-        if let Some(a) = self
-            .inner
-            .lock()
-            .unwrap()
-            .accounts
-            .get_mut(&(tenant_key.to_string(), window_secs))
-        {
-            a.cancel(attempt);
-        }
-    }
-
-    pub(crate) fn finish(
-        &self,
-        tenant_key: &str,
-        window_secs: u64,
-        attempt: uuid::Uuid,
-        final_nanos: u64,
-    ) {
-        if let Some(a) = self
-            .inner
-            .lock()
-            .unwrap()
-            .accounts
-            .get_mut(&(tenant_key.to_string(), window_secs))
-        {
-            a.finish(attempt, final_nanos);
-        }
-    }
-
-    /// The unspent lease, summed over tenants, for status (never a name).
-    pub(crate) fn unspent_nanos(&self) -> u64 {
+    /// The lease this replica holds, summed over tenants, for status (never a
+    /// name). Zero once recovery has begun.
+    pub(crate) fn held_nanos(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         if inner.state.in_outage() {
             if inner.recovering_since_ms.is_some() {
                 return 0;
             }
-            inner.accounts.values().map(|a| a.unspent_nanos()).sum()
+            inner.accounts.values().map(|a| a.held_nanos).sum()
         } else {
             inner
                 .tracked
@@ -413,6 +314,23 @@ impl OutageManager {
             self.tick_outage(now_ms).await;
         } else {
             self.tick_healthy(now_ms).await;
+        }
+    }
+
+    fn owner(&self) -> String {
+        format!("{}.{}", self.replica, self.inner.lock().unwrap().epoch)
+    }
+
+    fn observe(&self, now_ms: u64, ok: bool) {
+        let was = {
+            let mut inner = self.inner.lock().unwrap();
+            let was = inner.state.in_outage();
+            inner.state.observe(now_ms, ok);
+            was
+        };
+        self.enter_outage_if_tripped();
+        if !was && self.in_outage() {
+            eprintln!("outage admission: Redis unreachable, serving budgeted keys from leases");
         }
     }
 
@@ -451,8 +369,8 @@ impl OutageManager {
                     }
                     inner.state.observe(now_ms, true);
                 }
-                // Not a Redis failure: the fleet is refusing, or this lease is
-                // closing. Keep the old lease; it is still a valid reservation.
+                // Not a Redis failure: the fleet is refusing, or the call was
+                // malformed. Keep the old lease; it is still a valid reservation.
                 Some(Err(
                     LeaseError::Refused
                     | LeaseError::Closing
@@ -467,36 +385,27 @@ impl OutageManager {
         self.enter_outage_if_tripped();
     }
 
-    fn owner(&self) -> String {
-        format!("{}.{}", self.replica, self.inner.lock().unwrap().epoch)
-    }
-
-    fn observe(&self, now_ms: u64, ok: bool) {
-        self.inner.lock().unwrap().state.observe(now_ms, ok);
-        self.enter_outage_if_tripped();
-    }
-
-    /// On the transition into outage state, turn each lease held into a local
-    /// account. A tenant with no lease has no account and is refused.
+    /// On the transition into outage state, turn each lease held into an
+    /// account. A tenant with no lease has none and is refused.
     fn enter_outage_if_tripped(&self) {
         let mut inner = self.inner.lock().unwrap();
         if !inner.state.in_outage() || !inner.accounts.is_empty() {
             return;
         }
-        let accounts: HashMap<TenantWindow, LocalLeaseAccount> = inner
+        let accounts: HashMap<TenantWindow, Account> = inner
             .tracked
             .iter()
             .filter_map(|((tenant, window), t)| {
                 let lease = t.lease?;
                 Some((
                     (tenant.clone(), *window),
-                    LocalLeaseAccount::new(
-                        tenant.clone(),
-                        *window,
-                        lease.window_index,
-                        lease.window_end_ms,
-                        lease.held_nanos,
-                    ),
+                    Account {
+                        tenant_key: tenant.clone(),
+                        window_secs: *window,
+                        window_index: lease.window_index,
+                        window_end_ms: lease.window_end_ms,
+                        held_nanos: lease.held_nanos,
+                    },
                 ))
             })
             .collect();
@@ -514,7 +423,7 @@ impl OutageManager {
         if !ok {
             return;
         }
-        let records: Vec<LocalLease> = {
+        let accounts: Vec<Account> = {
             let mut inner = self.inner.lock().unwrap();
             // Settle only after Redis has answered steadily, so a flapping
             // Redis keeps local admission on its leases.
@@ -525,30 +434,50 @@ impl OutageManager {
                 inner.recovering_since_ms = Some(now_ms);
             }
             let since = inner.recovering_since_ms.unwrap_or(now_ms);
-            // In-flight attempts get a bound to finish; past it they are drawn
-            // at their quote, as a fleet attempt that times out is.
-            let waiting = inner.accounts.values().any(|a| a.in_flight() > 0)
-                && now_ms.saturating_sub(since) < RECOVERY_DRAIN_MS;
-            if waiting {
+            // Running requests get a bound to finish; past it the lease is
+            // drawn at what the local ledger holds, as a fleet attempt that
+            // times out is settled at its reservation.
+            if inner.in_flight > 0 && now_ms.saturating_sub(since) < RECOVERY_DRAIN_MS {
                 return;
             }
-            inner
-                .accounts
-                .values()
-                .map(|a| a.to_local_lease())
-                .collect()
+            inner.accounts.values().cloned().collect()
         };
+        let owner = self.owner();
+        let mut records = Vec::with_capacity(accounts.len());
+        for account in &accounts {
+            let Some(spent) = self
+                .spend
+                .spent_nanos(
+                    &account.tenant_key,
+                    account.window_secs,
+                    account.window_index,
+                )
+                .await
+            else {
+                self.observe(now_ms, false);
+                return;
+            };
+            // One record per lease, with an id the same lease always gets, so a
+            // pass that stops part-way and runs again draws it once.
+            let digest = sha2::Sha256::digest(
+                format!("{owner}:{}:{}", account.tenant_key, account.window_index).as_bytes(),
+            );
+            let mut bytes = [0_u8; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            let id = uuid::Uuid::from_bytes(bytes);
+            records.push(LocalLease {
+                tenant_key: account.tenant_key.clone(),
+                window_secs: account.window_secs,
+                window_index: account.window_index,
+                attempts: vec![(id, spent)],
+            });
+        }
         let complete = if records.is_empty() {
             true
         } else {
-            let owner = self.owner();
-            match tokio::time::timeout(RECOVERY_DEADLINE, self.ledger.recover(&owner, &records))
+            tokio::time::timeout(RECOVERY_DEADLINE, self.ledger.recover(&owner, &records))
                 .await
-                .ok()
-            {
-                Some(report) => report.complete(),
-                None => false,
-            }
+                .is_ok_and(|report| report.complete())
         };
         if !complete {
             // Redis answers a ping but not the settlement: not healthy.
@@ -556,10 +485,11 @@ impl OutageManager {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
-        if inner.state.try_resume(now_ms, complete) {
+        if inner.state.try_resume(now_ms, true) {
             inner.accounts.clear();
             inner.recovering_since_ms = None;
             inner.epoch += 1;
+            eprintln!("outage admission: Redis is back, leases settled");
         }
     }
 }
@@ -567,9 +497,40 @@ impl OutageManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
-    fn id() -> uuid::Uuid {
-        uuid::Uuid::new_v4()
+    /// A spend source the test sets.
+    #[derive(Default)]
+    struct Spent(std::sync::atomic::AtomicU64);
+
+    #[async_trait::async_trait]
+    impl SpendSource for Spent {
+        async fn spent_nanos(&self, _: &str, _: u64, _: u64) -> Option<u64> {
+            Some(self.0.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    fn manager(
+        via: &str,
+        index: &str,
+        spent: &Arc<Spent>,
+        recover_after_ms: u64,
+    ) -> Arc<OutageManager> {
+        let ledger = LeaseLedger::new(via, 60, index.into(), 1000).unwrap();
+        Arc::new(OutageManager::new(
+            ledger,
+            spent.clone(),
+            "r:1".into(),
+            0.1,
+            recover_after_ms,
+        ))
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 
     #[test]
@@ -618,61 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn quotes_never_exceed_the_lease() {
-        let mut a = LocalLeaseAccount::new("t".into(), 3600, 7, 10_000_000, 100);
-        let mut admitted = 0;
-        for q in [30, 30, 30, 30, 5, 5, 10] {
-            if a.reserve(0, id(), q).is_ok() {
-                admitted += q;
-            }
-        }
-        assert!(admitted <= 100);
-        assert_eq!(admitted, 100);
-        assert_eq!(a.unspent_nanos(), 0);
-        assert_eq!(a.reserve(0, id(), 1), Err(LocalRefusal::Exhausted));
-    }
-
-    #[test]
-    fn nothing_is_admitted_inside_the_window_margin() {
-        let end = 3_600_000;
-        let mut a = LocalLeaseAccount::new("t".into(), 3600, 0, end, 100);
-        assert!(a.reserve(end - WINDOW_MARGIN_MS - 1, id(), 1).is_ok());
-        assert_eq!(
-            a.reserve(end - WINDOW_MARGIN_MS, id(), 1),
-            Err(LocalRefusal::WindowMargin)
-        );
-        assert_eq!(a.reserve(end + 5, id(), 1), Err(LocalRefusal::WindowMargin));
-    }
-
-    #[test]
-    fn a_cancelled_attempt_gives_its_quote_back_and_is_not_drawn() {
-        let mut a = LocalLeaseAccount::new("t".into(), 3600, 0, 10_000_000, 10);
-        let (x, y) = (id(), id());
-        a.reserve(0, x, 6).unwrap();
-        assert_eq!(a.reserve(0, y, 6), Err(LocalRefusal::Exhausted));
-        a.cancel(x);
-        a.cancel(x);
-        assert_eq!(a.unspent_nanos(), 10);
-        a.reserve(0, y, 6).unwrap();
-        let rec = a.to_local_lease();
-        assert_eq!(rec.attempts, vec![(y, 6)]);
-    }
-
-    #[test]
-    fn recovery_charges_the_final_amount_and_the_quote_when_none_was_reported() {
-        let mut a = LocalLeaseAccount::new("t".into(), 3600, 3, 10_000_000, 100);
-        let (x, y) = (id(), id());
-        a.reserve(0, x, 40).unwrap();
-        a.reserve(0, y, 40).unwrap();
-        a.finish(x, 55);
-        let rec = a.to_local_lease();
-        assert_eq!(rec.attempts, vec![(x, 55), (y, 40)]);
-        assert_eq!((rec.window_index, rec.window_secs), (3, 3600));
-        // A final above the quote does not refill or enlarge the lease mid-outage.
-        assert_eq!(a.unspent_nanos(), 20);
-    }
-
-    #[test]
     fn silence_is_not_health() {
         let mut s = OutageState::new(30_000);
         for t in [0, 1, 2] {
@@ -680,15 +586,6 @@ mod tests {
         }
         s.observe(1_000, true);
         assert!(!s.try_resume(60_000, true), "one answer long ago");
-    }
-
-    #[test]
-    fn an_attempt_id_reserves_once() {
-        let mut a = LocalLeaseAccount::new("t".into(), 3600, 0, 10_000_000, 100);
-        let x = id();
-        a.reserve(0, x, 40).unwrap();
-        assert_eq!(a.reserve(0, x, 40), Err(LocalRefusal::Duplicate));
-        assert_eq!(a.unspent_nanos(), 60);
     }
 
     /// A TCP forwarder to Redis that a test can cut and restore.
@@ -746,6 +643,14 @@ mod tests {
         ledger.counter(tenant, window, index).await
     }
 
+    async fn into_outage(manager: &Arc<OutageManager>, proxy: &Proxy) {
+        proxy.cut();
+        for t in [2_000, 3_000, 4_000] {
+            manager.tick(t).await;
+        }
+        assert!(manager.in_outage());
+    }
+
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn an_outage_is_served_from_the_lease_and_settled_on_recovery() {
@@ -754,71 +659,63 @@ mod tests {
         };
         let proxy = Proxy::start(&url).await;
         let via = format!("redis://{}", proxy.address);
+        let spent = Arc::new(Spent::default());
         let index = format!("llmshim:gw:test-index:{}", uuid::Uuid::new_v4().simple());
-        let ledger = LeaseLedger::new(&via, 60, index, 1000).unwrap();
-        let manager = OutageManager::new(ledger, "r1".into(), 0.1, 100);
+        let manager = manager(&via, &index, &spent, 100);
         let tenant = format!("outage-{}", uuid::Uuid::new_v4().simple());
         manager.register(&tenant, 3600, 1_000_000_000);
 
         // Healthy: a lease is taken, and nothing is admitted locally.
         manager.tick(1_000).await;
-        assert_eq!(manager.unspent_nanos(), 100_000_000);
-        assert_eq!(
-            manager.reserve(1_000, &tenant, 3600, id(), 1),
+        assert_eq!(manager.held_nanos(), 100_000_000);
+        assert!(matches!(
+            manager.admit(now_ms(), &tenant, 3600),
             Err(LocalRefusal::NoLease)
-        );
-        let now_epoch_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let window = now_epoch_ms / 1000 / 3600;
+        ));
+        let window = now_ms() / 1000 / 3600;
         assert_eq!(counter_at(&url, &tenant, 3600, window).await, 100_000_000);
 
         // Redis goes away: three failed probes trip the outage state.
-        proxy.cut();
-        for t in [2_000, 3_000, 4_000] {
+        into_outage(&manager, &proxy).await;
+
+        // Admitted against the lease; a tenant with no lease is refused.
+        let (admission, guard) = manager.admit(now_ms(), &tenant, 3600).unwrap();
+        assert_eq!(admission.held_nanos, 100_000_000);
+        assert!(matches!(
+            manager.admit(now_ms(), "other", 3600),
+            Err(LocalRefusal::NoLease)
+        ));
+        // The local ledger says 115M was spent: 15M over the lease.
+        spent
+            .0
+            .store(115_000_000, std::sync::atomic::Ordering::SeqCst);
+
+        // Redis returns; a request is still running, so recovery waits.
+        proxy.restore();
+        for t in [5_000, 5_050, 5_300] {
             manager.tick(t).await;
         }
         assert!(manager.in_outage());
-
-        // Served from the lease until it is spent; never beyond it.
-        let (first, second, third) = (id(), id(), id());
-        manager
-            .reserve(now_epoch_ms, &tenant, 3600, first, 60_000_000)
-            .unwrap();
-        manager
-            .reserve(now_epoch_ms, &tenant, 3600, second, 40_000_000)
-            .unwrap();
-        assert_eq!(
-            manager.reserve(now_epoch_ms, &tenant, 3600, third, 1),
-            Err(LocalRefusal::Exhausted)
-        );
-        // A tenant with no lease is refused.
-        assert_eq!(
-            manager.reserve(now_epoch_ms, "other", 3600, id(), 1),
+        assert_eq!(counter_at(&url, &tenant, 3600, window).await, 100_000_000);
+        // Nothing new is admitted once recovery has begun.
+        assert!(matches!(
+            manager.admit(now_ms(), &tenant, 3600),
             Err(LocalRefusal::NoLease)
-        );
-        manager.finish(&tenant, 3600, first, 70_000_000);
-        manager.finish(&tenant, 3600, second, 45_000_000);
-
-        // Redis returns: after steady health the leases are drawn and released.
-        proxy.restore();
-        for t in [5_000, 5_050, 5_300, 5_400] {
-            manager.tick(t).await;
-        }
+        ));
+        drop(guard);
+        manager.tick(5_400).await;
         assert!(!manager.in_outage());
+        manager.tick(5_500).await;
         // 115M spent (100M of lease plus 15M of excess), nothing held back from the
-        // old lease. Back on the fleet path the replica took a new lease of what
-        // remains in the same window (10 % of 885M), so a second outage is covered.
-        let fresh = manager.unspent_nanos();
+        // old lease; the replica took a new one (10 % of what remains, 885M).
+        let fresh = manager.held_nanos();
         assert_eq!(fresh, 88_500_000);
         assert_eq!(
             counter_at(&url, &tenant, 3600, window).await,
             115_000_000 + fresh
         );
         manager.tick(20_000).await;
-        assert_eq!(manager.unspent_nanos(), fresh, "renewal holds the target");
-        assert!(!manager.in_outage());
+        assert_eq!(manager.held_nanos(), fresh, "renewal holds the target");
     }
 
     #[tokio::test]
@@ -829,74 +726,78 @@ mod tests {
         };
         let proxy = Proxy::start(&url).await;
         let via = format!("redis://{}", proxy.address);
-        let ledger = LeaseLedger::new(&via, 60, "idx-flap".into(), 1000).unwrap();
-        let manager = OutageManager::new(ledger, "r1".into(), 0.1, 30_000);
+        let spent = Arc::new(Spent::default());
+        let manager = manager(&via, "idx-flap", &spent, 30_000);
         let tenant = format!("flap-{}", uuid::Uuid::new_v4().simple());
         manager.register(&tenant, 3600, 1_000_000_000);
         manager.tick(1_000).await;
-        proxy.cut();
-        for t in [2_000, 3_000, 4_000] {
-            manager.tick(t).await;
-        }
-        assert!(manager.in_outage());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        into_outage(&manager, &proxy).await;
         let mut t = 5_000;
+        let mut guards = Vec::new();
         for _ in 0..4 {
             proxy.restore();
             manager.tick(t).await;
             proxy.cut();
             manager.tick(t + 1_000).await;
             t += 10_000;
-            // Still on the lease: the first reserve of each round fits.
-            manager
-                .reserve(now, &tenant, 3600, id(), 10_000_000)
-                .unwrap();
+            guards.push(manager.admit(now_ms(), &tenant, 3600).unwrap());
         }
         assert!(manager.in_outage());
-        // Nothing was drawn: the lease is still whole in Redis.
-        let window = now / 1000 / 3600;
+        let window = now_ms() / 1000 / 3600;
         assert_eq!(counter_at(&url, &tenant, 3600, window).await, 100_000_000);
     }
 
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
-    async fn nothing_is_admitted_once_recovery_has_begun() {
+    async fn nothing_is_admitted_inside_the_window_margin() {
         let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
             return;
         };
         let proxy = Proxy::start(&url).await;
         let via = format!("redis://{}", proxy.address);
-        let ledger = LeaseLedger::new(&via, 60, "idx-rec".into(), 1000).unwrap();
-        let manager = OutageManager::new(ledger, "r:1".into(), 0.1, 100);
-        let tenant = format!("rec-{}", uuid::Uuid::new_v4().simple());
+        let spent = Arc::new(Spent::default());
+        let manager = manager(&via, "idx-margin", &spent, 100);
+        let tenant = format!("margin-{}", uuid::Uuid::new_v4().simple());
         manager.register(&tenant, 3600, 1_000_000_000);
         manager.tick(1_000).await;
-        proxy.cut();
-        for t in [2_000, 3_000, 4_000] {
+        into_outage(&manager, &proxy).await;
+        let window_end = (now_ms() / 1000 / 3600 + 1) * 3600 * 1000;
+        assert!(manager
+            .admit(window_end - WINDOW_MARGIN_MS - 1, &tenant, 3600)
+            .is_ok());
+        assert_eq!(
+            manager
+                .admit(window_end - WINDOW_MARGIN_MS, &tenant, 3600)
+                .err(),
+            Some(LocalRefusal::WindowMargin)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn a_second_outage_in_the_same_window_has_its_own_lease() {
+        let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
+            return;
+        };
+        let proxy = Proxy::start(&url).await;
+        let via = format!("redis://{}", proxy.address);
+        let spent = Arc::new(Spent::default());
+        let manager = manager(&via, "idx-second", &spent, 100);
+        let tenant = format!("second-{}", uuid::Uuid::new_v4().simple());
+        manager.register(&tenant, 3600, 1_000_000_000);
+        manager.tick(1_000).await;
+        into_outage(&manager, &proxy).await;
+        proxy.restore();
+        for t in [5_000, 5_300] {
             manager.tick(t).await;
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let held = id();
-        manager
-            .reserve(now, &tenant, 3600, held, 10_000_000)
-            .unwrap();
-        proxy.restore();
-        manager.tick(5_000).await;
-        manager.tick(5_300).await; // steady, but an attempt is in flight: draining
-        assert_eq!(
-            manager.reserve(now, &tenant, 3600, id(), 1),
-            Err(LocalRefusal::NoLease)
-        );
-        assert_eq!(manager.unspent_nanos(), 0);
-        assert!(manager.in_outage());
-        manager.finish(&tenant, 3600, held, 10_000_000);
         manager.tick(5_400).await;
         assert!(!manager.in_outage());
+        proxy.cut();
+        for t in [30_000, 31_000, 32_000] {
+            manager.tick(t).await;
+        }
+        assert!(manager.in_outage());
+        assert!(manager.admit(now_ms(), &tenant, 3600).is_ok());
     }
 }
