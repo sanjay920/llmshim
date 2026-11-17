@@ -39,7 +39,8 @@ const TOP_UP_LUA: &str = r#"
     local ttl = math.max(1, window_end + retention_secs * 1000 - now)
     local total_key = KEYS[1] .. window_index
     local lease_key = KEYS[2] .. window_index .. ':' .. ARGV[1]
-    if redis.call('HGET', lease_key, 'state') == 'closing' then
+    if redis.call('HGET', lease_key, 'state') == 'closing' or
+            redis.call('EXISTS', lease_key .. ':closed') == 1 then
         return {-2}
     end
     if redis.call('EXISTS', KEYS[4]) == 1 or
@@ -72,13 +73,16 @@ const TOP_UP_LUA: &str = r#"
 
 /// Charge one locally admitted attempt to the lease, once per attempt id.
 /// KEYS[1] lease, KEYS[2] draws, KEYS[3] counter; ARGV: attempt id, amount, max_exact.
-/// Returns {held, excess} or {-2} when this attempt was drawn already.
-/// A missing lease is {-1}.
+/// Returns {held, excess}, or {-2, excess} when this attempt was drawn already
+/// (the excess charged then). An attempt with no lease to draw on (it expired,
+/// was released, or was never taken) is charged to the counter in full as excess,
+/// so a spend is never dropped.
 const DRAW_LUA: &str = r#"
-    if redis.call('HEXISTS', KEYS[2], ARGV[1]) == 1 then return {-2} end
-    if redis.call('EXISTS', KEYS[1]) == 0 then return {-1} end
+    local prior = redis.call('HGET', KEYS[2], ARGV[1])
+    if prior then return {-2, tonumber(prior)} end
     local amount = tonumber(ARGV[2])
     local max_exact = tonumber(ARGV[3])
+    local has_lease = redis.call('EXISTS', KEYS[1]) == 1
     local held = tonumber(redis.call('HGET', KEYS[1], 'held')) or 0
     local excess = 0
     if amount <= held then
@@ -90,17 +94,21 @@ const DRAW_LUA: &str = r#"
         if total > max_exact - excess then
             total = max_exact
             redis.call('SET', KEYS[3] .. ':frozen', 1,
-                'PX', math.max(1, redis.call('PTTL', KEYS[1])))
+                'PX', math.max(1, redis.call('PTTL', KEYS[3]), tonumber(ARGV[4]) * 1000))
         else
             total = total + excess
         end
         local counter_ttl = redis.call('PTTL', KEYS[3])
-        if counter_ttl < 0 then counter_ttl = math.max(1, redis.call('PTTL', KEYS[1])) end
+        if counter_ttl < 0 then
+            counter_ttl = math.max(1, redis.call('PTTL', KEYS[1]))
+            if not has_lease then counter_ttl = tonumber(ARGV[4]) * 1000 end
+        end
         redis.call('SET', KEYS[3], total, 'PX', counter_ttl)
     end
-    redis.call('HSET', KEYS[1], 'held', held, 'state', 'closing')
-    redis.call('HSET', KEYS[2], ARGV[1], amount)
-    redis.call('PEXPIRE', KEYS[2], math.max(1, redis.call('PTTL', KEYS[1])))
+    if has_lease then redis.call('HSET', KEYS[1], 'held', held, 'state', 'closing') end
+    redis.call('HSET', KEYS[2], ARGV[1], excess)
+    redis.call('PEXPIRE', KEYS[2], math.max(1, redis.call('PTTL', KEYS[1]),
+        redis.call('PTTL', KEYS[3]), tonumber(ARGV[4]) * 1000))
     return {held, excess}
 "#;
 
@@ -109,12 +117,17 @@ const DRAW_LUA: &str = r#"
 const RELEASE_LUA: &str = r#"
     if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
     local held = tonumber(redis.call('HGET', KEYS[1], 'held')) or 0
+    local returned = 0
     if redis.call('EXISTS', KEYS[2]) == 1 then
         local total = tonumber(redis.call('GET', KEYS[2])) or 0
         redis.call('SET', KEYS[2], math.max(0, total - held), 'KEEPTTL')
+        returned = held
     end
+    -- A tombstone for the rest of the lease's life, so a late renewal cannot
+    -- take a new lease for this replica and window.
+    redis.call('SET', KEYS[1] .. ':closed', 1, 'PX', math.max(1, redis.call('PTTL', KEYS[1])))
     redis.call('DEL', KEYS[1])
-    return held
+    return returned
 "#;
 
 /// A replica's lease for one (tenant, window).
@@ -143,7 +156,8 @@ pub(crate) struct Draw {
     pub(crate) held_nanos: u64,
     /// Nanos charged to the counter beyond the lease.
     pub(crate) excess_nanos: u64,
-    /// False when this attempt id had been drawn before and nothing changed.
+    /// False when this attempt id had been drawn before and nothing changed
+    /// (`excess_nanos` is then what the first draw charged).
     pub(crate) applied: bool,
 }
 
@@ -270,16 +284,16 @@ impl LeaseLedger {
                     .arg(attempt_id.to_string())
                     .arg(amount_nanos.min(MAX_EXACT))
                     .arg(MAX_EXACT)
+                    .arg(self.retention_secs)
                     .invoke_async(&mut connection)
                     .await
             })
             .await
             .map_err(|_| LeaseError::Unavailable)?;
         match reply.as_slice() {
-            [-1] => Err(LeaseError::Missing),
-            [-2] => Ok(Draw {
+            [-2, excess] if *excess >= 0 => Ok(Draw {
                 held_nanos: 0,
-                excess_nanos: 0,
+                excess_nanos: *excess as u64,
                 applied: false,
             }),
             [held, excess] if *held >= 0 && *excess >= 0 => Ok(Draw {
@@ -333,6 +347,99 @@ impl LeaseLedger {
             .await
             .unwrap()
             .unwrap_or(0)
+    }
+}
+
+/// What one replica admitted locally against one lease while Redis was out:
+/// the final amount of each attempt, by attempt id.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalLease {
+    pub(crate) tenant_key: String,
+    pub(crate) window_secs: u64,
+    pub(crate) window_index: u64,
+    pub(crate) attempts: Vec<(uuid::Uuid, u64)>,
+}
+
+/// How far a recovery got.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecoveryReport {
+    /// Leases fully drawn and released (or already gone).
+    pub(crate) settled: usize,
+    /// Leases left for a later pass because Redis failed part-way.
+    pub(crate) pending: usize,
+    /// Nanos charged beyond the leases (settlement above the reservation), for
+    /// every attempt of this pass's leases, including ones drawn in an earlier pass.
+    pub(crate) excess_nanos: u64,
+    /// Nanos given back to the counters.
+    pub(crate) released_nanos: u64,
+}
+
+impl RecoveryReport {
+    pub(crate) fn complete(&self) -> bool {
+        self.pending == 0
+    }
+}
+
+impl LeaseLedger {
+    /// Settle every local lease: draw each attempt (idempotent per attempt id),
+    /// then release the remainder. Safe to repeat after any interruption: a
+    /// pass that stopped part-way is resumed by running it again with the same
+    /// records, and nothing is charged twice. A lease whose Redis calls fail is
+    /// left whole and counted as pending; the others still proceed.
+    pub(crate) async fn recover(&self, replica: &str, leases: &[LocalLease]) -> RecoveryReport {
+        let mut report = RecoveryReport::default();
+        let mut seen = std::collections::HashSet::new();
+        for lease in leases {
+            if !seen.insert((&lease.tenant_key, lease.window_secs, lease.window_index)) {
+                continue;
+            }
+            let mut excess = 0;
+            let mut ok = true;
+            for (attempt, amount) in &lease.attempts {
+                match self
+                    .draw(
+                        &lease.tenant_key,
+                        replica,
+                        lease.window_secs,
+                        lease.window_index,
+                        *attempt,
+                        *amount,
+                    )
+                    .await
+                {
+                    Ok(draw) => excess += draw.excess_nanos,
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                report.pending += 1;
+                report.excess_nanos += excess;
+                continue;
+            }
+            match self
+                .release(
+                    &lease.tenant_key,
+                    replica,
+                    lease.window_secs,
+                    lease.window_index,
+                )
+                .await
+            {
+                Ok(returned) => report.released_nanos += returned,
+                Err(LeaseError::Missing) => {}
+                Err(_) => {
+                    report.pending += 1;
+                    report.excess_nanos += excess;
+                    continue;
+                }
+            }
+            report.settled += 1;
+            report.excess_nanos += excess;
+        }
+        report
     }
 }
 
@@ -578,5 +685,132 @@ mod tests {
             l.top_up(&tenant(), "a:draws", WINDOW, LIMIT, 0.1).await,
             Err(LeaseError::Unavailable)
         );
+    }
+
+    fn local(t: &str, index: u64, amounts: &[u64]) -> LocalLease {
+        LocalLease {
+            tenant_key: t.to_string(),
+            window_secs: WINDOW,
+            window_index: index,
+            attempts: amounts.iter().map(|a| (uuid::Uuid::new_v4(), *a)).collect(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn recovery_draws_then_releases_and_a_repeat_changes_nothing() {
+        let Some(l) = ledger() else { return };
+        let t = tenant();
+        let lease = l.top_up(&t, "a", WINDOW, LIMIT, 0.1).await.unwrap();
+        let records = [local(&t, lease.window_index, &[20_000_000, 90_000_000])];
+        let report = l.recover("a", &records).await;
+        assert!(report.complete());
+        assert_eq!(report.excess_nanos, 10_000_000);
+        assert_eq!(report.released_nanos, 0);
+        // 110M spent: 100M of lease plus 10M excess; nothing is held back.
+        assert_eq!(l.counter(&t, WINDOW, lease.window_index).await, 110_000_000);
+        let again = l.recover("a", &records).await;
+        assert!(again.complete());
+        assert_eq!(l.counter(&t, WINDOW, lease.window_index).await, 110_000_000);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn an_interrupted_recovery_resumes_to_the_uninterrupted_result() {
+        let Some(l) = ledger() else { return };
+        let (a, b) = (tenant(), tenant());
+        let la = l.top_up(&a, "r", WINDOW, LIMIT, 0.1).await.unwrap();
+        let lb = l.top_up(&b, "r", WINDOW, LIMIT, 0.1).await.unwrap();
+        let ra = local(&a, la.window_index, &[10_000_000, 30_000_000, 5_000_000]);
+        let rb = local(&b, lb.window_index, &[10_000_000, 30_000_000, 5_000_000]);
+        // A: stopped after the first draw (what a dropped connection leaves).
+        l.draw(
+            &a,
+            "r",
+            WINDOW,
+            la.window_index,
+            ra.attempts[0].0,
+            ra.attempts[0].1,
+        )
+        .await
+        .unwrap();
+        let resumed = l.recover("r", std::slice::from_ref(&ra)).await;
+        // B: never interrupted.
+        let whole = l.recover("r", std::slice::from_ref(&rb)).await;
+        assert!(resumed.complete() && whole.complete());
+        assert_eq!(
+            l.counter(&a, WINDOW, la.window_index).await,
+            l.counter(&b, WINDOW, lb.window_index).await
+        );
+        assert_eq!(l.counter(&a, WINDOW, la.window_index).await, 45_000_000);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn recovery_with_redis_down_leaves_everything_pending() {
+        let Some(l) = ledger() else { return };
+        let dead = LeaseLedger::new("redis://127.0.0.1:1", 60, "idx".into(), 10).unwrap();
+        let t = tenant();
+        let lease = l.top_up(&t, "a", WINDOW, LIMIT, 0.1).await.unwrap();
+        let records = [local(&t, lease.window_index, &[1_000_000])];
+        let report = dead.recover("a", &records).await;
+        assert_eq!((report.pending, report.settled), (1, 0));
+        // Nothing moved, and the real ledger still finishes it.
+        assert_eq!(l.counter(&t, WINDOW, lease.window_index).await, 100_000_000);
+        assert!(l.recover("a", &records).await.complete());
+        assert_eq!(l.counter(&t, WINDOW, lease.window_index).await, 1_000_000);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn an_attempt_with_no_lease_is_charged_in_full_not_dropped() {
+        let Some(l) = ledger() else { return };
+        let t = tenant();
+        let lease = l.top_up(&t, "a", WINDOW, LIMIT, 0.1).await.unwrap();
+        let first = local(&t, lease.window_index, &[10_000_000]);
+        assert!(l
+            .recover("a", std::slice::from_ref(&first))
+            .await
+            .complete());
+        // The lease is released; a later attempt appended to the records still counts.
+        let mut grown = first.clone();
+        grown.attempts.push((uuid::Uuid::new_v4(), 7_000_000));
+        let report = l.recover("a", &[grown]).await;
+        assert_eq!(report.excess_nanos, 7_000_000);
+        assert_eq!(l.counter(&t, WINDOW, lease.window_index).await, 17_000_000);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn a_released_lease_cannot_be_taken_again_for_that_window() {
+        let Some(l) = ledger() else { return };
+        let t = tenant();
+        let lease = l.top_up(&t, "a", WINDOW, LIMIT, 0.1).await.unwrap();
+        l.recover("a", &[local(&t, lease.window_index, &[1])]).await;
+        assert_eq!(
+            l.top_up(&t, "a", WINDOW, LIMIT, 0.1).await,
+            Err(LeaseError::Closing)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn the_report_keeps_excess_across_an_interrupted_pass() {
+        let Some(l) = ledger() else { return };
+        let t = tenant();
+        let lease = l.top_up(&t, "a", WINDOW, LIMIT, 0.1).await.unwrap();
+        let rec = local(&t, lease.window_index, &[150_000_000]);
+        l.draw(
+            &t,
+            "a",
+            WINDOW,
+            lease.window_index,
+            rec.attempts[0].0,
+            150_000_000,
+        )
+        .await
+        .unwrap();
+        let report = l.recover("a", &[rec.clone(), rec]).await;
+        assert_eq!((report.settled, report.excess_nanos), (1, 50_000_000));
     }
 }
