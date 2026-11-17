@@ -17,8 +17,12 @@ One JSON line per provider **attempt**, when the attempt ends:
  "http_status":null,"duration_ms":812,"input_tokens":1000,"output_tokens":500,
  "reasoning_tokens":null,"uncached_input_tokens":1000,"cache_read_tokens":0,
  "cache_write_tokens":0,"cost_usd":0.00035,"cost_source":"catalog","usage_reported":true,
- "admission":"fleet"}
+ "admission":"fleet","tags":{"cost_center":"cc-4417","env":"prod"}}
 ```
+
+`tags` are the key's operator-chosen labels (`[[keys]] tags`, note 0029), names sorted: `{}` for a
+named key with none, `null` exactly when `key` is `null`. They are resolved when the attempt is
+admitted, with the key's name, and are labels only: nothing admits, limits or routes on them.
 
 `admission` is `"fleet"` for an attempt admitted the ordinary way and `"outage"`
 for one admitted on a replica-owned spend lease while Redis was unreachable

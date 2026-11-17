@@ -1,6 +1,6 @@
 # 0029: Key tags on usage records
 
-Status: design, 2026-11-17. A contract note, written before any code (README working rule 3): a
+Status: slice 2 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
 `[[keys]]` field and a usage-record field become promises. It is the second slice of the roadmap
 item "hierarchical budgets, model allowlists, tags, alerts, cost exports" (after 0028). Nothing here
 is started.
@@ -99,3 +99,16 @@ integrations).
   hierarchical budgets, where the levels are decided once.
 - Free-form (non-string) values and per-request tags supplied by the caller: a caller-supplied tag
   would be unauthenticated data in a billing record, so it needs its own trust decision.
+
+## As built (slice 2)
+
+- `keys[].tags` (`BTreeMap`, so names are sorted), validated by path (`keys[0].tags.Env`; more than 16
+  is `keys[0].tags`); `KeyNames` holds a second table, `add_tags`, and `tags(credential)` is `None`
+  exactly when `name(credential)` is; the usage recorder reads name and tags together at `begin`.
+- Reload: `key_names.add` and `add_tags` run before the fingerprint comparison, so a tags-only change
+  applies without a new generation (who may call is unchanged); a test waits for it by asking.
+- A unit test pins the fields of the scope that crosses Redis, so a key's name or tags cannot start to
+  travel without a decision; the open-mode record has `key: null, tags: null`.
+- Tests: `integration_serve_tags` (sorted tags on the wire, an untagged key `{}`, reload change and
+  removal, open mode `null`, bad tags by path and the 17-tag cap). Not done: the usage-log recipe is
+  in this note only, not run; the snapshot slice (3).

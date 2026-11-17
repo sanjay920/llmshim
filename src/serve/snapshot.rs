@@ -277,6 +277,8 @@ fn to_keys(
             budget_window_secs: key.budget_window_secs,
             budget_allow_unpriced: key.budget_allow_unpriced,
             allowed_models: key.allowed_models.clone(),
+            // Not carried by the signed format yet (design note 0029, slice 3).
+            tags: Default::default(),
         });
     }
     Ok((keys, inactive))

@@ -188,6 +188,7 @@ pub async fn build_app(
     };
     let tenants = TenantNames::new(config.keys.iter().map(|key| key.tenant.clone()));
     let key_names = KeyNames::new(super::keys::key_names(config, env));
+    key_names.add_tags(super::keys::key_tags(config, env));
 
     let router = build_router(config, env, &mut issues);
 

@@ -2099,6 +2099,35 @@ mod tests {
         scope
     }
 
+    /// What crosses Redis with a job is a fixed set of fields: a key's name and its tags
+    /// (note 0029) are resolved by each replica from its own configuration and never
+    /// travel. A new field here must be a decision, not an accident.
+    #[test]
+    fn the_scope_that_crosses_redis_carries_no_key_name_or_tags() {
+        let mut scope = scope("fields", Some(1), Some(1));
+        scope.attribute("a-credential-scope-0123456789abcdef", Some("req-1"));
+        let value = serde_json::to_value(&scope).unwrap();
+        let mut found: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            [
+                "credential",
+                "request_id",
+                "rpm",
+                "tenant_key",
+                "tpm",
+                "version"
+            ]
+        );
+        assert!(!value.to_string().contains("tag"));
+    }
+
     /// Only a budgeted key whose attempts are priced and bounded can be
     /// admitted on a lease: no budget, an unpriced allowance or an invalid one
     /// is refused before any request is built (note 0027).
