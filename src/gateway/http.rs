@@ -703,7 +703,7 @@ impl GatewayState {
             false,
         );
         if let Some(setup) = usage {
-            coordinator.set_usage_sink(setup);
+            coordinator.set_outage_usage_sink(setup);
         }
         if let Some(penalty) = penalty {
             coordinator.set_penalty(penalty);
@@ -994,6 +994,19 @@ impl GatewayState {
                 depth as i64,
             );
         }
+        #[cfg(feature = "redis-coordination")]
+        if let Some(outage) = &self.outage {
+            metrics::gauge_set(
+                metrics::OUTAGE_ADMISSION_ACTIVE,
+                &[],
+                i64::from(outage.manager.routes_locally()),
+            );
+            metrics::gauge_set(
+                metrics::OUTAGE_LEASE_NANOS,
+                &[],
+                i64::try_from(outage.manager.held_nanos()).unwrap_or(i64::MAX),
+            );
+        }
     }
 
     /// Cached response for a credential-, route-, and request-bound key.
@@ -1091,12 +1104,22 @@ impl GatewayState {
             }
             lanes.push(lane);
         }
-        json!({
+        #[cfg_attr(not(feature = "redis-coordination"), allow(unused_mut))]
+        let mut stats = json!({
             "mode": mode,
             "auth_enforced": self.keystore.is_enforced(),
             "providers": providers,
             "lanes": lanes,
-        })
+        });
+        // Present only with `[fleet.outage_admission]`; never a tenant's name.
+        #[cfg(feature = "redis-coordination")]
+        if let Some(outage) = &self.outage {
+            stats["outage_admission"] = json!({
+                "active": outage.manager.routes_locally(),
+                "lease_nanos": outage.manager.held_nanos(),
+            });
+        }
+        stats
     }
 }
 

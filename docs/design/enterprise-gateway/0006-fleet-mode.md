@@ -76,8 +76,10 @@ each other's jobs.
 
 - **Redis outage.** The authenticated gateway's spend and rate coordination fails
   closed when Redis is unavailable, as documented for `gateway-redis`: requests
-  are refused rather than admitted without accounting. A bounded local
-  allowance for degraded operation is a roadmap item.
+  are refused rather than admitted without accounting. With
+  `[fleet.outage_admission]` (0027) a replica instead serves budgeted keys from a
+  spend lease it took while Redis was healthy, at a fixed share of the rate
+  limits, and settles it on recovery; without the table nothing changes.
 - **One Redis per environment.** Queues, rate buckets, health and the spend
   index are keyed by provider name and tenant only, with no fleet or environment
   prefix. Two fleets (staging and production, say) that share a Redis and a

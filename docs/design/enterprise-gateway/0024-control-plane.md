@@ -204,7 +204,7 @@ never in the database.
   reservations, not spend (unpriced and underestimated reservations settle later, 0010);
   a replica that dies strands its lease; leases cross window boundaries; and a usage-log
   field for lease-admitted requests is a 0010 contract change. It needs its own note,
-  after the snapshot work, with 0006 and 0014.
+  after the snapshot work, with 0006 and 0014. (Built: see 0027.)
 - Hierarchical budgets, model allowlists, tags, alerts and cost exports (the next roadmap
   item; they attach to the project and team of this note and to the snapshot as new
   versioned fields).

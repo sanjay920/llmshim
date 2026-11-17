@@ -391,11 +391,13 @@ mod redis_outage {
             .create_async()
             .await;
 
+        let usage_path = std::env::temp_dir().join(format!("llmshim-usage-{id}.jsonl"));
         let proxy = RedisProxy::start(&target).await;
         let redis_through_proxy = format!("redis://{}", proxy.address);
+        let logging = format!("\n[logging]\nusage_log = \"{}\"\n", usage_path.display());
         let extra = "budget_usd = 100.0\n[fleet]\nredis_url = { env = \"SERVE_E2E_REDIS_URL\" }\n\
                      [fleet.outage_admission]\nspend_lease_fraction = 0.5\nrecover_after_secs = 5";
-        let text = config(&upstream.url(), extra)
+        let text = (config(&upstream.url(), extra) + &logging)
             .replace("providers.inference", "providers.openai")
             .replace("kind = \"openai-compatible\"", "kind = \"openai\"")
             .replace("tenant = \"platform\"", &format!("tenant = \"{tenant}\""));
@@ -448,6 +450,30 @@ mod redis_outage {
             200,
             "a replica serving from its lease stays in the Service"
         );
+        // Status and metrics say so, without naming a tenant.
+        let stats: serde_json::Value = client
+            .get(format!("{base}/v1/gateway/stats"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stats["outage_admission"]["active"], true, "{stats}");
+        assert!(stats["outage_admission"]["lease_nanos"].as_u64().unwrap() > 0);
+        assert!(!stats.to_string().contains(&tenant));
+        let metrics = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            metrics.contains("llmshim_gateway_outage_admission_active 1"),
+            "{metrics}"
+        );
         assert!(server.child.try_wait().unwrap().is_none());
 
         proxy.restore();
@@ -477,6 +503,16 @@ mod redis_outage {
         );
         let log = server.stderr.lock().unwrap().join("\n");
         assert!(log.contains("serving budgeted keys from leases"), "{log}");
+        // The usage log tells the two admissions apart.
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(&usage_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let count = |kind: &str| records.iter().filter(|r| r["admission"] == kind).count();
+        assert!(count("fleet") >= 1, "{records:?}");
+        assert!(count("outage") >= 1, "{records:?}");
+        let _ = std::fs::remove_file(&usage_path);
         mock.assert_async().await;
         assert_no_panic(&server.stderr.lock().unwrap());
     }

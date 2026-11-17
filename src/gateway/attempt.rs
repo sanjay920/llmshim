@@ -1163,6 +1163,15 @@ impl AttemptCoordinator {
             .set(crate::gateway::usage::UsageRecorder::new(setup));
     }
 
+    /// [`Self::set_usage_sink`] for the local outage path: its records carry
+    /// `admission: "outage"` (note 0027).
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn set_outage_usage_sink(&self, setup: crate::gateway::usage::UsageSetup) {
+        let _ = self
+            .usage
+            .set(crate::gateway::usage::UsageRecorder::new(setup).with_admission("outage"));
+    }
+
     fn note_usage(
         &self,
         attempt_id: uuid::Uuid,
@@ -2088,6 +2097,30 @@ mod tests {
             valid: true,
         });
         scope
+    }
+
+    /// Only a budgeted key whose attempts are priced and bounded can be
+    /// admitted on a lease: no budget, an unpriced allowance or an invalid one
+    /// is refused before any request is built (note 0027).
+    #[cfg(feature = "redis-coordination")]
+    #[test]
+    fn only_a_priced_budgeted_key_has_an_outage_view() {
+        assert!(budgeted("ok", 100).outage_view(10, 0, 1, 1.0).is_some());
+        assert!(scope("none", None, None)
+            .outage_view(10, 0, 1, 1.0)
+            .is_none());
+        let mut unpriced = budgeted("unpriced", 100);
+        unpriced.budget.as_mut().unwrap().allow_unpriced = true;
+        assert!(unpriced.outage_view(10, 0, 1, 1.0).is_none());
+        let mut invalid = budgeted("invalid", 100);
+        invalid.budget.as_mut().unwrap().valid = false;
+        assert!(invalid.outage_view(10, 0, 1, 1.0).is_none());
+        // The tenant's rate limits are this replica's share.
+        let mut limited = budgeted("rate", 100);
+        limited.rpm = Some(100);
+        limited.tpm = Some(1000);
+        let view = limited.outage_view(10, 0, 1, 0.1).unwrap();
+        assert_eq!((view.rpm, view.tpm), (Some(10), Some(100)));
     }
 
     /// A later outage in the same window starts from an empty local ledger: the

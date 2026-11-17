@@ -90,6 +90,9 @@ pub struct UsageRecord {
     pub cost_source: Option<String>,
     /// Whether the provider reported any usage for this attempt.
     pub usage_reported: bool,
+    /// `"fleet"` for an attempt admitted the ordinary way, `"outage"` for one
+    /// admitted on a replica-owned lease while Redis was unreachable (0027).
+    pub admission: &'static str,
 }
 
 /// Receives a record when an attempt ends. Called inline on the response path:
@@ -259,6 +262,7 @@ pub(crate) struct UsageRecorder {
     tenants: TenantNames,
     keys: KeyNames,
     open: Mutex<HashMap<uuid::Uuid, Open>>,
+    admission: &'static str,
 }
 
 impl UsageRecorder {
@@ -269,7 +273,16 @@ impl UsageRecorder {
             tenants: setup.tenants,
             keys: setup.keys,
             open: Mutex::new(HashMap::new()),
+            admission: "fleet",
         }
+    }
+
+    /// The admission every record of this recorder carries (`"outage"` for
+    /// the local outage path, note 0027).
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn with_admission(mut self, admission: &'static str) -> Self {
+        self.admission = admission;
+        self
     }
 
     /// An attempt was admitted and is about to be sent. `tenant_key`,
@@ -342,7 +355,7 @@ impl UsageRecorder {
             return;
         };
         let span = open.span.take();
-        let record = build(id, open, outcome);
+        let record = build(id, open, outcome, self.admission);
         if let Some(span) = span {
             span.end(&record);
         }
@@ -403,7 +416,12 @@ fn settle(open: &Open, finalizes: bool) -> (Option<f64>, Option<String>) {
     )
 }
 
-fn build(id: uuid::Uuid, open: Open, outcome: AttemptOutcome) -> UsageRecord {
+fn build(
+    id: uuid::Uuid,
+    open: Open,
+    outcome: AttemptOutcome,
+    admission: &'static str,
+) -> UsageRecord {
     let (cost_usd, cost_source) = settle(&open, may_finalize(outcome));
     let (outcome, http_status) = outcome_parts(outcome);
     let usage = open.usage.as_ref();
@@ -438,6 +456,7 @@ fn build(id: uuid::Uuid, open: Open, outcome: AttemptOutcome) -> UsageRecord {
         cost_usd,
         cost_source,
         usage_reported: usage.is_some(),
+        admission,
     }
 }
 

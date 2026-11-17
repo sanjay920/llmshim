@@ -16,8 +16,15 @@ One JSON line per provider **attempt**, when the attempt ends:
  "key":"checkout","request_id":"gw-3f9a1c0b7e42-12","provider":"openai","model":"gpt-6-luna","kind":"completion","outcome":"completed",
  "http_status":null,"duration_ms":812,"input_tokens":1000,"output_tokens":500,
  "reasoning_tokens":null,"uncached_input_tokens":1000,"cache_read_tokens":0,
- "cache_write_tokens":0,"cost_usd":0.00035,"cost_source":"catalog","usage_reported":true}
+ "cache_write_tokens":0,"cost_usd":0.00035,"cost_source":"catalog","usage_reported":true,
+ "admission":"fleet"}
 ```
+
+`admission` is `"fleet"` for an attempt admitted the ordinary way and `"outage"`
+for one admitted on a replica-owned spend lease while Redis was unreachable
+(`[fleet.outage_admission]`, 0027). A consumer that ignores unknown fields is
+unaffected; one that totals spend can total both, and may separate the second to
+see what an outage cost.
 
 `outcome` is `completed`, `http_failure` (with `http_status`),
 `transport_failure`, `invalid_response`, `stream_failure` or `abandoned`.
