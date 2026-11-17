@@ -79,6 +79,25 @@ pub(crate) fn quote_embeddings(
     quote_with(policy, attempt, true)
 }
 
+/// [`quote`] for an operation with no enforceable pre-send bound at all (image generation, note
+/// 0036): the output's size is the model's to choose, so any capped level refuses it, with or
+/// without `budget_allow_unpriced` (an unbounded attempt would hold the level's whole allowance
+/// until a provider bill that never comes).
+pub(crate) fn quote_unbounded(
+    policy: Option<&BudgetPolicySnapshot>,
+) -> Result<Option<BudgetQuote>, BudgetPlanError> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if !policy.valid || policy.limit_nanos != 0 {
+        return Err(BudgetPlanError::Unpriceable);
+    }
+    Ok(Some(BudgetQuote {
+        amount_nanos: 0,
+        bounded: true,
+    }))
+}
+
 fn quote_with(
     policy: Option<&BudgetPolicySnapshot>,
     attempt: &PreparedAttempt<'_>,

@@ -3,6 +3,112 @@ use crate::{error::Result, images::ImageResponse, provider::Provider};
 use serde_json::Value;
 
 impl ShimClient {
+    /// [`Self::images`] under a trusted attempt policy (note 0036): the attempt is admitted by the
+    /// policy (rate, concurrency, spend) before it is sent and reported to it as it ends, as a
+    /// completion is.
+    pub async fn images_with_policy(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &Value,
+        policy_context: &crate::policy::DispatchPolicyContext,
+    ) -> Result<ImageResponse> {
+        crate::images::validate(request)?;
+        let prepared = provider.image_request(model, request)?;
+        let target = provider.request_replay_target(model, &prepared);
+        let result = async {
+            let super::AttemptResponse {
+                response,
+                mut tracker,
+                attempt_deadline,
+            } = self
+                .send_prepared(
+                    Some(policy_context),
+                    AttemptKind::Completion,
+                    model,
+                    Some(&target),
+                    &prepared,
+                    provider.transport().as_deref(),
+                )
+                .await?;
+            let mut body = match body::read_json(
+                response,
+                self.response_body_limits.success_bytes,
+                self.deadlines.unary_body_idle,
+                attempt_deadline,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(error) => {
+                    super::finish_invalid_response(
+                        &mut tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
+                    return Err(error.into_dispatch_failure());
+                }
+            };
+            if provider.name() == "openai"
+                && body.is_object()
+                && body.get("output_format").is_none()
+            {
+                if let Some(format) = prepared.body.get("output_format") {
+                    body["output_format"] = format.clone();
+                }
+            }
+            let images = match provider.image_response(model, body.clone()) {
+                Ok(images) => images,
+                Err(error) => {
+                    super::finish_invalid_response(
+                        &mut tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
+                    return Err(DispatchFailure::Upstream(error));
+                }
+            };
+            // The counters come from the native body, normalized for its wire; the price is the
+            // image response's own, which applies a rate only to fully classified usage and is
+            // null when unknown. The generic per-direction stamp would price image tokens at the
+            // text rate.
+            if let Some(tracker) = tracker.as_mut() {
+                if let Some(mut observation) =
+                    crate::usage::normalize_native_response_usage_observation(&target, &body)
+                {
+                    for key in ["cost_usd", "cost_source"] {
+                        observation.usage[key] =
+                            images.usage.get(key).cloned().unwrap_or(Value::Null);
+                    }
+                    let usage = tracker.usage(
+                        &observation.usage,
+                        observation.terminal,
+                        observation.counters_complete,
+                        observation.explicit_zero,
+                    );
+                    super::bounded_policy(usage, self.deadlines.policy_callback, attempt_deadline)
+                        .await
+                        .map_err(|_| super::coordinator_timeout_observation())?
+                        .map_err(DispatchFailure::PolicyObservation)?;
+                }
+            }
+            super::finish_completed_response(
+                &mut tracker,
+                self.deadlines.policy_callback,
+                attempt_deadline,
+            )
+            .await?;
+            Ok(images)
+        }
+        .await;
+        if let Some(outcome) = Self::breaker_outcome(&result) {
+            self.observe(provider, outcome).await;
+        }
+        result.map_err(DispatchFailure::into_public)
+    }
+
     pub async fn images(
         &self,
         provider: &dyn Provider,

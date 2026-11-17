@@ -1274,10 +1274,16 @@ impl AttemptCoordinator {
         // that cannot be priced is refused unless every level allows it.
         let mut quotes = Vec::new();
         for (_, policy) in scope.budget_levels() {
-            let quote = if scope.operation == crate::policy::DispatchOperation::Embeddings {
-                crate::gateway::budget::quote_embeddings(Some(policy), attempt)
-            } else {
-                crate::gateway::budget::quote(Some(policy), attempt)
+            let quote = match scope.operation {
+                crate::policy::DispatchOperation::Embeddings => {
+                    crate::gateway::budget::quote_embeddings(Some(policy), attempt)
+                }
+                crate::policy::DispatchOperation::Images => {
+                    crate::gateway::budget::quote_unbounded(Some(policy))
+                }
+                crate::policy::DispatchOperation::Chat => {
+                    crate::gateway::budget::quote(Some(policy), attempt)
+                }
             }
             .map_err(|_| AttemptPolicyRefusal::new(AttemptPolicyRefusalKind::Unpriceable, None))?;
             quotes.extend(quote);

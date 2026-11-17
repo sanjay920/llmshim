@@ -198,6 +198,38 @@ paths:
               schema: {type: object}
         default:
           description: Error object with preserved HTTP status
+  /v1/images/generations:
+    post:
+      operationId: imageGenerations
+      summary: OpenAI-shaped image generation (gateway only)
+      description: >-
+        Served by the gateway (`llmshim serve`), not by `llmshim proxy`. `b64_json` only
+        (`response_format: url` is refused). Provider fields (`n`, `size`, `quality`,
+        `output_format`, ...) pass through to the adapter. Admitted by the same key, allowlist and
+        rate rules as a completion. A key with a spend cap is refused with
+        `unpriceable_under_budget` (there is no bound on an image's size), with or without
+        `budget_allow_unpriced`. A fleet gateway answers 501. `usage.cost_usd` is `null` when the
+        usage does not split text and image tokens.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, prompt]
+              properties:
+                model: {type: string, description: Routing id, e.g. openai/gpt-image-1}
+                prompt: {type: string}
+                n: {type: integer, minimum: 1, maximum: 10}
+                response_format: {type: string, enum: [b64_json]}
+      responses:
+        '200':
+          description: Generated images as base64
+          content:
+            application/json:
+              schema: {type: object}
+        default:
+          description: Error object with preserved HTTP status
   /v1/messages:
     post:
       operationId: nativeMessages
