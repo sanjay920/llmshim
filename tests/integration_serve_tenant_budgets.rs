@@ -187,7 +187,16 @@ fn a_table_is_checked_by_path() {
         "[tenants.platform]\nbudget_usd = 1.0\n[fleet]\nredis_url = { env = \"R\" }",
     );
     let (code, text) = check(&fleet, "tb-fleet");
-    assert_eq!(code, Some(0), "{text}");
+    if cfg!(feature = "serve-redis") {
+        assert_eq!(code, Some(0), "{text}");
+    } else {
+        // Without the Redis build the only complaint is the missing feature, never the tables.
+        assert_eq!(code, Some(1), "{text}");
+        assert!(
+            text.contains("serve-redis") && !text.contains("tenants"),
+            "{text}"
+        );
+    }
     // A good table passes.
     let (code, text) = check(
         &render(
