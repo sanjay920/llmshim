@@ -392,6 +392,7 @@ mod tests {
             budget_usd: Some(budget),
             budget_window_secs: Some(3600),
             budget_allow_unpriced: false,
+            allowed_models: None,
         }
     }
 
@@ -493,6 +494,7 @@ mod tests {
             budget_usd: None,
             budget_window_secs: None,
             budget_allow_unpriced: false,
+            allowed_models: None,
         };
         assert!(cap.check(&free, "anthropic", UNPRICED).await.is_ok());
         assert!(!SpendCap::is_unpriced_under_cap(
@@ -526,6 +528,7 @@ mod tests {
             budget_usd: None,
             budget_window_secs: None,
             budget_allow_unpriced: false,
+            allowed_models: None,
         };
         for _ in 0..100 {
             cap.record(&uncapped, Some(1_000.0)).await;

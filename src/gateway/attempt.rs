@@ -3994,6 +3994,7 @@ mod tests {
             budget_usd: Some(0.000_000_1),
             budget_window_secs: Some(3_600),
             budget_allow_unpriced: false,
+            allowed_models: None,
         };
         let mut connection = rates.connection().await.unwrap();
         let redis_time: (u64, u64) = redis::cmd("TIME")
@@ -4129,6 +4130,7 @@ mod tests {
                 budget_usd: Some(0.000_000_1),
                 budget_window_secs: Some(3_600),
                 budget_allow_unpriced: false,
+                allowed_models: None,
             };
             let mut connection = rates.connection().await.unwrap();
             let redis_time: (u64, u64) = redis::cmd("TIME")
@@ -4271,6 +4273,7 @@ mod tests {
             budget_usd: Some(0.000_000_1),
             budget_window_secs: Some(1),
             budget_allow_unpriced: false,
+            allowed_models: None,
         };
         let scope = TrustedPolicyScope::from_identity(&identity);
         let mut connection = rates.connection().await.unwrap();
@@ -4354,6 +4357,7 @@ mod tests {
             budget_usd: Some(0.000_000_1),
             budget_window_secs: Some(3_600),
             budget_allow_unpriced: false,
+            allowed_models: None,
         };
         let blocked_identity = identity_for(format!("origin-blocked-{namespace}"));
         let blocked_legacy_key =
@@ -5212,6 +5216,7 @@ mod usage_records {
             budget_usd: None,
             budget_window_secs: None,
             budget_allow_unpriced: false,
+            allowed_models: None,
         });
         let json = serde_json::to_string(&scope).unwrap();
         assert!(!json.contains("payments"), "{json}");

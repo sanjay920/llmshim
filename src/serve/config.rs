@@ -1101,6 +1101,13 @@ pub struct GatewayKey {
     /// Admit requests whose cost cannot be bounded before sending.
     #[serde(default)]
     pub budget_allow_unpriced: bool,
+    /// The models this key may call (design note 0028): exact routing ids
+    /// (`openai/gpt-6-luna`, as `GET /v1/models` lists them), `provider/*`
+    /// prefixes, or `route/<name>`. A request for any other model is refused
+    /// with 403 `model_not_allowed` before anything is reserved or queued. Omit
+    /// it for no restriction; an empty list is refused.
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
 }
 
 /// A named route: `route/<name>` resolves to `model` with default settings.
@@ -2287,6 +2294,25 @@ impl ServeConfig {
                 for (n, cidr) in cidrs.iter().enumerate() {
                     if let Err(message) = super::allowlist::Cidr::parse(cidr) {
                         issues.push(Issue::new(format!("{at}.allowed_cidrs[{n}]"), message));
+                    }
+                }
+            }
+            if let Some(models) = &key.allowed_models {
+                if models.is_empty() {
+                    issues.push(Issue::new(
+                        format!("{at}.allowed_models"),
+                        "is empty, which would refuse every request; omit it for no restriction",
+                    ));
+                }
+                if models.len() > 256 {
+                    issues.push(Issue::new(
+                        format!("{at}.allowed_models"),
+                        "has more than 256 entries",
+                    ));
+                }
+                for (n, entry) in models.iter().enumerate() {
+                    if let Some(problem) = crate::gateway::auth::model_entry_problem(entry) {
+                        issues.push(Issue::new(format!("{at}.allowed_models[{n}]"), problem));
                     }
                 }
             }

@@ -1,6 +1,6 @@
 # 0028: Per-key model allowlists
 
-Status: design, 2026-11-17. A contract note, written before any code (README working rule 3): a
+Status: slice 2 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
 `[[keys]]` field, a refusal and a failure row each become promises. It is the first slice of the
 roadmap item "hierarchical budgets, model allowlists, tags, alerts, cost exports"; the others are
 separate notes. It changes nothing until it is built. Nothing here is started.
@@ -128,3 +128,20 @@ allowed_models = ["openai/gpt-6-luna", "anthropic/claude-haiku-5-5", "openrouter
   authenticate, which changes who may discover the list.
 - Deny lists (`denied_models`), and tenant-level lists above keys: they belong with hierarchical
   budgets, where the tenant/team/project levels are decided once.
+
+## As built (slice 2)
+
+- `keys[].allowed_models` in `serve` files; `Identity.allowed_models`; the check is
+  `request_models_allowed` in `build_request` (`gateway/http.rs`), matching the routing id from
+  `Router::routing_id` (the resolution's own provider key and model, not the pricing name), the
+  `route/<name>` the request addressed, and every `x-openrouter.models` entry of the final payload.
+- A prefix is a **final `/*`** only (`inference/fam/*`; `inference/fam-*` is refused), and `route/*`
+  admits routes and never a model.
+- The answer is `403` with `type: permission_error`, `code: model_not_allowed`, `param: model`; on the
+  proxy's own wires the type is dropped by their flattening, the code stays.
+- Tests: `integration_serve_models` (exact, prefix, route, every entry point and streaming, reload,
+  refused files by path; the mock upstream is not reached by a refused request), unit tests for
+  matching and for the OpenRouter fallback list. The check removed fails five of them.
+- `x-openrouter.preset` is refused for a restricted key on OpenRouter (a preset is configured upstream and can set the model; whether it can override is unverified, so it fails closed), and the `x-openrouter` checks apply only to requests that resolve to OpenRouter.
+- Not covered by a process test: `client_san` and `jwt` keys carrying a list (their identities are built with the same code path, reviewed by reading), and the OpenRouter rules end to end (unit-tested on the payload).
+- Not built: carrying the field in a control-plane snapshot (slice 3).

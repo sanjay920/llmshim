@@ -73,6 +73,7 @@ pub fn build_key_store(
                 budget_usd: key.budget_usd,
                 budget_window_secs: key.budget_window_secs,
                 budget_allow_unpriced: key.budget_allow_unpriced,
+                allowed_models: key.allowed_models.clone(),
             };
             if peers
                 .insert(jwt_workload(&binding.table, &binding.subject), identity)
@@ -94,6 +95,7 @@ pub fn build_key_store(
                 budget_usd: key.budget_usd,
                 budget_window_secs: key.budget_window_secs,
                 budget_allow_unpriced: key.budget_allow_unpriced,
+                allowed_models: key.allowed_models.clone(),
             };
             if peers
                 .insert(super::config::canonical_san(san), identity)
@@ -145,6 +147,7 @@ pub fn build_key_store(
             budget_usd: key.budget_usd,
             budget_window_secs: key.budget_window_secs,
             budget_allow_unpriced: key.budget_allow_unpriced,
+            allowed_models: key.allowed_models.clone(),
         };
         if identities.insert(digest, identity).is_some() {
             issues.push(Issue {

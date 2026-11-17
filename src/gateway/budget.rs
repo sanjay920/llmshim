@@ -482,6 +482,7 @@ mod tests {
             budget_usd: Some(budget_usd),
             budget_window_secs: Some(0),
             budget_allow_unpriced: true,
+            allowed_models: None,
         }
     }
 
