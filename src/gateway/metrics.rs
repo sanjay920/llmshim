@@ -43,11 +43,11 @@ pub const OUTAGE_ADMISSION_ACTIVE: &str = "llmshim_gateway_outage_admission_acti
 /// healthy (gauge) — set at scrape time, summed over tenants.
 pub const OUTAGE_LEASE_NANOS: &str = "llmshim_gateway_outage_lease_nanos";
 
-/// Attributed spend, in millionths of a USD (counter, labels: provider, source). Integer micro-dollars
-/// so the counter is exact; divide by 1e6 for dollars. The labels are the configured provider names
+/// Attributed spend, in billionths of a USD (counter, labels: provider, source). Integer nano-dollars
+/// so the counter is exact to a nanodollar per attempt; divide by 1e9 for dollars. The labels are the configured provider names
 /// and the closed `cost_source` set; never a tenant, key or model (note 0034).
-pub const COST_MICROUSD: &str = "llmshim_gateway_cost_usd_micros_total";
-/// Attempts whose cost is unknown (counter, label: provider). Unknown is not free: a rising count
+pub const COST_NANOUSD: &str = "llmshim_gateway_cost_usd_nanos_total";
+/// Completed or usage-reporting attempts whose cost is unknown (counter, label: provider). Unknown is not free: a rising count
 /// means the cost counter under-reports (note 0034).
 pub const COST_UNKNOWN: &str = "llmshim_gateway_cost_unknown_total";
 /// Tokens of finished attempts (counter, labels: provider, kind of `input`, `output`, `cache_read`,

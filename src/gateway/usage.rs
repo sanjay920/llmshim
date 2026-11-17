@@ -428,18 +428,23 @@ pub(crate) fn count_spend(record: &UsageRecord) {
     let provider = record.provider.as_str();
     match (record.cost_usd, record.cost_source.as_deref()) {
         (Some(usd), source) if usd.is_finite() && usd > 0.0 => {
-            let micros = (usd * 1_000_000.0).round() as u64;
+            let nanos = (usd * 1_000_000_000.0).round() as u64;
             metrics::add(
-                metrics::COST_MICROUSD,
+                metrics::COST_NANOUSD,
                 &[
                     ("provider", provider),
                     ("source", source.unwrap_or("catalog")),
                 ],
-                micros,
+                nanos,
             );
         }
         (Some(_), _) => {}
-        (None, _) => metrics::incr(metrics::COST_UNKNOWN, &[("provider", provider)]),
+        // An attempt that never reached the model (a refusal, a transport failure, an abandoned
+        // call that saw no usage) cost nothing: it is not an under-report.
+        (None, _) if record.usage_reported || record.outcome == "completed" => {
+            metrics::incr(metrics::COST_UNKNOWN, &[("provider", provider)])
+        }
+        (None, _) => {}
     }
     for (kind, n) in [
         ("input", record.input_tokens),

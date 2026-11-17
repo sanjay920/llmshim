@@ -5817,15 +5817,44 @@ mod usage_records {
         assert_eq!(coordinator.usage.get().unwrap().in_flight(), 0);
 
         // The spend counters count this record under its provider and source (note 0034): the
-        // price in micro-dollars, the token kinds that are non-zero.
+        // price in nano-dollars, the token kinds that are non-zero.
         #[cfg(feature = "serve")]
         {
             let mut counted = record.clone();
             counted.provider = "spend-unit".into();
             crate::gateway::usage::count_spend(&counted);
             let text = crate::gateway::metrics::render();
+            // `finish` itself fed the counters, under the recorder's own provider name.
+            assert!(
+                text.contains("llmshim_gateway_cost_usd_nanos_total{provider=\"test-provider\",source=\"catalog\"}"),
+                "{text}"
+            );
+            // A failure that never reached the model is not an under-report.
+            let mut failed = record.clone();
+            failed.provider = "spend-failed".into();
+            failed.cost_usd = None;
+            failed.cost_source = None;
+            failed.usage_reported = false;
+            failed.outcome = "http_failure";
+            crate::gateway::usage::count_spend(&failed);
+            assert!(
+                !crate::gateway::metrics::render()
+                    .contains("llmshim_gateway_cost_unknown_total{provider=\"spend-failed\"}"),
+                "a refused attempt counted as unknown"
+            );
+            failed.outcome = "completed";
+            crate::gateway::usage::count_spend(&failed);
+            assert!(crate::gateway::metrics::render()
+                .contains("llmshim_gateway_cost_unknown_total{provider=\"spend-failed\"} 1"));
+            // Under half a micro-dollar is still counted (nanodollar resolution).
+            let mut tiny = record.clone();
+            tiny.provider = "spend-tiny".into();
+            tiny.cost_usd = Some(0.000_000_3);
+            crate::gateway::usage::count_spend(&tiny);
+            assert!(crate::gateway::metrics::render()
+                .contains("{provider=\"spend-tiny\",source=\"catalog\"} 300"));
             for expected in [
-                "llmshim_gateway_cost_usd_micros_total{provider=\"spend-unit\",source=\"catalog\"} 12300",
+                "llmshim_gateway_cost_usd_nanos_total{provider=\"spend-unit\",source=\"catalog\"} 12300000",
                 "llmshim_gateway_tokens_total{kind=\"input\",provider=\"spend-unit\"} 100",
                 "llmshim_gateway_tokens_total{kind=\"cache_write\",provider=\"spend-unit\"} 5",
             ] {

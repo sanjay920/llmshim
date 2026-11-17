@@ -551,7 +551,7 @@ async fn finished_attempts_feed_token_and_unknown_cost_counters_labelled_by_prov
     );
     // Unknown is not free: no cost series was written for it.
     assert!(
-        !text.contains("llmshim_gateway_cost_usd_micros_total{"),
+        !text.contains("llmshim_gateway_cost_usd_nanos_total{"),
         "{text}"
     );
     // Nothing per tenant, key or model rides on a spend series.
