@@ -1230,7 +1230,12 @@ fn build_request_for(
             return Err(model_not_allowed());
         }
     }
-    if let Some(name) = req.model.strip_prefix("deployment/") {
+    // Counted once per request: a retry is counted by the failover counter instead.
+    if let Some(name) = req
+        .model
+        .strip_prefix("deployment/")
+        .filter(|_| forced.is_none())
+    {
         crate::gateway::metrics::incr(
             crate::gateway::metrics::DEPLOYMENT_SELECTED,
             &[
@@ -1447,6 +1452,7 @@ async fn chat(
     // does not allow the next target, say), the caller gets that failure, not an error about a
     // target they never chose.
     let mut previous: Option<GatewayError> = None;
+    let mut pending_failover: Option<(String, String, String)> = None;
     loop {
         let (provider_name, _budget_model, gw, identified_caller, snapshot) =
             match build_request_for(
@@ -1466,6 +1472,12 @@ async fn chat(
             };
         // Every attempt of one request resolves on the first attempt's router snapshot.
         preselected = Some(snapshot.clone());
+        if let Some((name, from, to)) = pending_failover.take() {
+            crate::gateway::metrics::incr(
+                crate::gateway::metrics::DEPLOYMENT_FAILOVER,
+                &[("deployment", &name), ("from", &from), ("to", &to)],
+            );
+        }
         let identity = &identified_caller.identity;
         let first_attempt = tried.is_empty();
         if first_attempt {
@@ -1496,10 +1508,16 @@ async fn chat(
                 .to_string(),
         );
         #[cfg_attr(not(feature = "serve"), allow(unused_mut))]
-        let mut policy_scope = state
-            .trusted_policy_scope(identity)
-            .await
-            .map_err(|error| gateway_err_to_api(&state, error))?;
+        let mut policy_scope = match state.trusted_policy_scope(identity).await {
+            Ok(scope) => scope,
+            Err(error) => {
+                return Err(retry_or(
+                    &state,
+                    &mut previous,
+                    gateway_err_to_api(&state, error),
+                ))
+            }
+        };
         #[cfg(feature = "serve")]
         if state.attempt_coordinator.records_usage() {
             policy_scope.attribute(
@@ -1509,9 +1527,16 @@ async fn chat(
             );
         }
         state.pin_router(&mut policy_scope, snapshot.clone());
-        let prepared_submission = state
-            .prepare_submission(gw, policy_scope, false)
-            .map_err(|error| gateway_err_to_api(&state, error))?;
+        let prepared_submission = match state.prepare_submission(gw, policy_scope, false) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(retry_or(
+                    &state,
+                    &mut previous,
+                    gateway_err_to_api(&state, error),
+                ))
+            }
+        };
 
         // Retry-safety: a repeated Idempotency-Key returns the first result.
         if first_attempt {
@@ -1572,16 +1597,23 @@ async fn chat(
                     return Err(gateway_err_to_api(&state, err));
                 };
                 previous = Some(err);
-                crate::gateway::metrics::incr(
-                    crate::gateway::metrics::DEPLOYMENT_FAILOVER,
-                    &[
-                        ("deployment", name),
-                        ("from", tried.last().map_or("", String::as_str)),
-                        ("to", &target),
-                    ],
-                );
+                // Counted when the retry has been prepared (below), not here: a retry the key may not
+                // make, or that cannot get a permit, is not a failover.
+                pending_failover = Some((
+                    name.to_owned(),
+                    tried.last().cloned().unwrap_or_default(),
+                    target.clone(),
+                ));
                 forced = Some(target);
-                prequeue_permit = Some(prequeue_permit_for_retry(&state).await?);
+                match prequeue_permit_for_retry(&state).await {
+                    Ok(permit) => prequeue_permit = Some(permit),
+                    Err(_) => {
+                        return Err(gateway_err_to_api(
+                            &state,
+                            previous.take().expect("the failure that led to this retry"),
+                        ))
+                    }
+                }
             }
         }
     }
@@ -1599,11 +1631,52 @@ fn retryable_upstream_failure(error: &GatewayError) -> bool {
     if message.starts_with("HTTP error:") {
         return true;
     }
-    message
+    let Some((status, body)) = message
         .strip_prefix("provider error (")
-        .and_then(|rest| rest.split_once(')'))
-        .and_then(|(status, _)| status.parse::<u16>().ok())
-        .is_some_and(|status| matches!(status, 500 | 502 | 503 | 504 | 529))
+        .and_then(|rest| rest.split_once("): "))
+    else {
+        return false;
+    };
+    status
+        .parse::<u16>()
+        .is_ok_and(|status| matches!(status, 500 | 502 | 503 | 504 | 529))
+        && !is_local_diagnostic(body)
+}
+
+/// llmshim's own 5xx diagnostics, raised **after** the provider answered with a success (an answer
+/// that was billed but that cannot be used: an output contract it did not meet, a response shape
+/// or terminal reason that is unsupported, a tool call that does not validate) or by the policy
+/// layer. They say nothing about the target's health, and every target would give the same answer
+/// again, so they are not retried. A new local diagnostic of this kind belongs here.
+fn is_local_diagnostic(body: &str) -> bool {
+    const LOCAL: &[&str] = &[
+        "response did not satisfy the requested output contract",
+        "upstream JSON exceeds complexity limit",
+        "invalid upstream tool call",
+        "invalid upstream response shape",
+        "embeddings response has no data array",
+        "no candidates in response",
+        "no supported terminal",
+        "no output in response",
+        "returned an embeddings response but has no embeddings wire",
+        "attempt policy observation failed",
+        "attempt policy coordinator unavailable",
+    ];
+    LOCAL.iter().any(|known| body.contains(known))
+        || body == crate::derived_response::DERIVED_RESPONSE_ERROR
+}
+
+/// The failure to report when a retry could not even be made: the one that led to the retry, when
+/// there is one (note 0031), otherwise `error` itself.
+fn retry_or(
+    state: &GatewayState,
+    previous: &mut Option<GatewayError>,
+    error: ApiError,
+) -> ApiError {
+    match previous.take() {
+        Some(failure) => gateway_err_to_api(state, failure),
+        None => error,
+    }
 }
 
 /// A fresh preparation permit for a retry (the first attempt's was spent queueing).
@@ -5921,6 +5994,24 @@ mod request_id_tests {
                 "{status}"
             );
         }
+        // llmshim's own 5xx diagnostics, raised after the provider answered and was billed, would
+        // give the same answer on every target: never retried.
+        for body in [
+            "response did not satisfy the requested output contract",
+            "upstream JSON exceeds complexity limit",
+            "invalid upstream tool call: bad arguments",
+            "invalid upstream response shape",
+            "Anthropic response has no supported terminal stop reason",
+            "no candidates in response: {}",
+            "attempt policy observation failed",
+        ] {
+            assert!(!retryable_upstream_failure(&upstream(502, body)), "{body}");
+            assert!(!retryable_upstream_failure(&upstream(503, body)), "{body}");
+        }
+        assert!(!retryable_upstream_failure(&upstream(
+            502,
+            crate::derived_response::DERIVED_RESPONSE_ERROR
+        )));
         // Local conditions are never retried elsewhere.
         for message in [
             "llmshim-rate-limit:5000",

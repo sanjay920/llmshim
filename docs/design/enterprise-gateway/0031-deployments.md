@@ -281,3 +281,20 @@ slice, stated now so slice 2's shape allows it:
 - **Not built:** failover for streaming requests (a failure before the first byte could be retried the same way;
   the stream handler's structure needs its own change), the `/v1/gateway/stats` view of each deployment's targets
   and circuit state (slice 4), and 0014 rows for failover.
+
+### Review changes (slice 3)
+
+- The retry gate **excludes llmshim's own 5xx diagnostics** (`is_local_diagnostic`: an output contract not met,
+  an unsupported response shape or terminal reason, a tool call that does not validate, a complexity limit, the
+  policy layer's observation failure). They are raised after the provider answered and was billed, and every
+  target would answer the same, so retrying them would multiply the cost of a deterministic failure by up to
+  three. The list is of fixed texts in llmshim's own code; a new diagnostic of this kind must be added to it
+  (a provider-originated flag carried through the dispatch error would be sturdier and is the follow-up).
+- The failover counter is incremented when the retry has been **prepared**; a retry that cannot be made (the key's
+  list, a policy-scope or preparation failure, no permit) returns the failure that led to it, and
+  `deployment_selected_total` is counted once per request.
+- Known and accepted: the retry order is file order, so `conversation` affinity does not survive a failover; the
+  wait for a retry's preparation permit is bounded by the queue timeout, not the logical deadline; on the
+  Responses wire the reasoning replay filter ran for the first pick's target (the per-provider transform
+  still drops anything foreign or from another account on the retry target, but the response's
+  `reasoning_dropped` and `controls_dropped` describe the first target).
