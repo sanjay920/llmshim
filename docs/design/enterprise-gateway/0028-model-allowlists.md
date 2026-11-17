@@ -32,8 +32,13 @@ allowed_models = ["openai/gpt-6-luna", "anthropic/claude-haiku-5-5", "openrouter
   case-sensitive and byte-for-byte: no globbing, no regex, no version ranges, so what a prefix
   admits can be read off the file.
 - **What is matched.** The request's model is resolved exactly as the gateway resolves it for
-  dispatch (provider inference from a bare name, aliases, a named route's indirection). The
-  resolved `provider/model` is matched against the list. In addition, a request that addressed a
+  dispatch (provider inference from a bare name, aliases, a named route's indirection), and the
+  **routing id** that results (`provider/model` in the router's canonical spelling, the id
+  `GET /v1/models` lists as `data[].id`, not a pricing or replay name) is matched against the list.
+  Entries are therefore written in canonical form: an alias or a non-canonical spelling in the file
+  never matches and fails closed, and operators copy ids from `/v1/models`. The check is built on
+  the resolution's own provider and model, not on `PreparedRequest.target.model`, which for Azure is
+  the underlying model of a deployment (an entry `azure/prod-chat` names the deployment). In addition, a request that addressed a
   route (`route/<name>`) is admitted when the list names `route/<name>`, so a key can be allowed a
   route without being allowed the model behind it; the model behind it is still the one that runs.
   Naming a model never admits a route that resolves to it: a route is a request alias with
@@ -44,15 +49,26 @@ allowed_models = ["openai/gpt-6-luna", "anthropic/claude-haiku-5-5", "openrouter
   `/v1/responses` facades, unary and streaming), so there is no path around it. In fleet mode the
   check runs on the origin replica; a replayed job is not checked again (the origin's decision is
   the decision).
-- **The refusal** is `403` with
-  `{"error":{"message":"model not allowed for this key","type":"permission_error","param":"model","code":"model_not_allowed"}}`
-  in the gateway's own error shape, rendered natively on the native facades. It names no model and
-  lists nothing (the list is policy, and a caller learns nothing from the answer about what else
-  would pass). Nothing reaches the queue, a limiter or the provider; a refusal is counted in
-  `llmshim_gateway_rejected_total{reason="model_not_allowed"}` and appears in the access log like
-  any 403. No usage record is written, because no attempt was admitted (0010).
-- **Fallback chains** are not a gateway feature (the gateway has no `fallback` field), so there is
-  no second model to check. A route's settings cannot name a model.
+- **The refusal** is `403` with code `model_not_allowed` and the fixed message `model not allowed
+  for this key`. It is built as a provider-style error (`ShimError::ProviderError` with status 403,
+  as the idempotency conflict is), so the proxy's own wires answer
+  `{"error":{"code":"model_not_allowed","message":"..."}}` and the native facades keep the type
+  (`permission_error` on the Anthropic wire, `invalid_request_error`-family on the OpenAI wires
+  as their normalizer maps a 403). It names no model and lists nothing. Two things the caller can
+  still learn, both existing behavior and not new: a resolution failure (an unknown `route/<name>`,
+  an unconfigured provider) is answered before the check, as today, and the unknown-route answer
+  lists route names. Nothing reaches the queue, a limiter or the provider (the prequeue
+  preparation permit has been taken by then, as for any request that fails after it); a refusal is
+  counted in `llmshim_gateway_rejected_total{provider="<resolved provider>",reason="model_not_allowed"}`
+  and appears in the access log like any 403. No usage record is written, because no attempt was admitted (0010).
+- **Fallback chains** are not a gateway feature (the gateway has no `fallback` field). One request
+  field can still name more than one model: OpenRouter's `x-openrouter.models` (its own fallback
+  list, with `route`). For a key with a list, **every** entry of `x-openrouter.models` in the final
+  request, after a route's settings are merged, is matched as `openrouter/<entry>`, and the request
+  is refused if any fails. A prefix such as `openrouter/*` admits OpenRouter's server-selected
+  slugs (`openrouter/auto`, `openrouter/free`), because the choice is made upstream: an operator who
+  needs a bound lists slugs. A route's settings can carry `x-openrouter.models` (an operator
+  wrote them), and the same check applies to the merged request.
 - **Reload.** The list is part of the key and follows the key's reload (0012): a reload takes
   effect for the next request; a request already admitted finishes.
 
@@ -82,11 +98,15 @@ allowed_models = ["openai/gpt-6-luna", "anthropic/claude-haiku-5-5", "openrouter
 
 ## Tests (when built)
 
+- Process: a key with a list, a mock provider; an `x-openrouter.models` entry outside the list is
+  refused while the same request without it is served.
 - Process: a key with a list, a mock provider. An allowed model is served; an unlisted model is
   refused 403 with the fixed body and the mock is **not** called; a key with a budget refuses
   without any ledger movement (the spend counter is untouched in a fleet test); streaming and the
   three native facades refuse the same way; a prefix admits its family and not a lookalike
-  (`openai/*` does not admit `openai-compatible/x`: the separator is part of the prefix); a route
+  (`openai/*` does not admit `openai-compatible/x`: the separator is part of the prefix); an alias
+  or non-canonical spelling in the list never matches; an Azure deployment is matched by its
+  deployment name (`serve-cloud` build); a route
   is admitted by `route/<name>` and the model behind it is refused to the same key.
 - Unit: validation (empty list, `*` placement, whitespace, no `/`, over-long list, duplicate
   entries are accepted and de-duplicated); matching (exact, prefix, route, case).
