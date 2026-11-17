@@ -14,7 +14,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 const ZERO_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
-const LATE_SETTLEMENT_RETENTION_SECS: u64 = 86_400;
+pub(crate) const LATE_SETTLEMENT_RETENTION_SECS: u64 = 86_400;
 const DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS: usize = 100_000;
 const ACCOUNTING_EXPIRY_CLEANUP_BATCH: usize = 128;
 #[cfg(feature = "redis-coordination")]
@@ -89,6 +89,46 @@ impl TrustedPolicyScope {
         }
     }
 
+    /// The tenant's budget window this scope draws on, if it has a valid budget
+    /// that is priced and bounded before sending (what outage admission, note
+    /// 0027, requires): `(tenant_key, window_secs, limit_nanos)`.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn outage_budget(&self) -> Option<(&str, u64, u64)> {
+        let budget = self.budget.as_ref()?;
+        (budget.valid && !budget.allow_unpriced).then_some((
+            self.tenant_key.as_str(),
+            budget.window_secs,
+            budget.limit_nanos,
+        ))
+    }
+
+    /// The same request as the local outage path sees it: a counter of its own
+    /// per lease (so the local ledger never refills mid-outage), limited to the
+    /// lease, with the tenant's rate limits cut to this replica's share.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn outage_view(
+        &self,
+        held_nanos: u64,
+        epoch: u32,
+        window_index: u64,
+        rate_fraction: f64,
+    ) -> Option<Self> {
+        self.outage_budget()?;
+        let share = |limit: Option<u32>| {
+            limit.map(|value| ((f64::from(value) * rate_fraction).ceil() as u32).max(1))
+        };
+        let mut view = self.clone();
+        view.tenant_key = outage_tenant_key(&self.tenant_key, epoch, window_index);
+        view.rpm = share(self.rpm);
+        view.tpm = share(self.tpm);
+        view.legacy_spend_floor = None;
+        if let Some(budget) = view.budget.as_mut() {
+            budget.limit_nanos = held_nanos;
+            budget.window_secs = OUTAGE_LOCAL_WINDOW_SECS;
+        }
+        Some(view)
+    }
+
     /// Pin the router this request was admitted against (0022).
     pub(crate) fn set_router(&mut self, router: Arc<crate::router::Router>) {
         self.router = Some(router);
@@ -117,6 +157,18 @@ impl TrustedPolicyScope {
         self.version == 1
     }
 }
+
+/// The local ledger key of one lease's outage spend.
+#[cfg(feature = "redis-coordination")]
+pub(crate) fn outage_tenant_key(tenant_key: &str, epoch: u32, window_index: u64) -> String {
+    format!("outage:{tenant_key}:{epoch}:{window_index}")
+}
+
+/// The window length of a lease's local ledger: so long that the local clock
+/// never rolls it over, since a lease belongs to one window of the shared
+/// ledger and a retry after that window ends must not get a fresh allowance.
+#[cfg(feature = "redis-coordination")]
+pub(crate) const OUTAGE_LOCAL_WINDOW_SECS: u64 = 315_360_000;
 
 impl std::fmt::Debug for TrustedPolicyScope {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -161,6 +213,13 @@ trait AttemptRates: Send + Sync {
     ) -> Result<(), RateRefusal>;
 
     async fn penalize(&self, provider: &str, duration: Duration) -> Result<(), ()>;
+
+    /// Nanos charged under a local ledger key, across its windows (outage
+    /// recovery, note 0027). Only the in-memory ledger knows it.
+    #[cfg(feature = "redis-coordination")]
+    async fn local_budget_total(&self, _tenant_key: &str, _window_secs: u64) -> Option<u64> {
+        None
+    }
 
     /// Follow a new set of provider limits (0022). Buckets keep their tokens.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
@@ -607,6 +666,19 @@ fn debit_dimension(
 
 #[async_trait::async_trait]
 impl AttemptRates for LocalAttemptRates {
+    #[cfg(feature = "redis-coordination")]
+    async fn local_budget_total(&self, tenant_key: &str, window_secs: u64) -> Option<u64> {
+        let state = self.state.lock().await;
+        Some(
+            state
+                .budget_totals
+                .iter()
+                .filter(|(key, _)| key.tenant_key == tenant_key && key.window_secs == window_secs)
+                .map(|(_, total)| *total)
+                .sum(),
+        )
+    }
+
     async fn acquire(
         &self,
         provider: &str,
@@ -912,6 +984,17 @@ impl AttemptCoordinator {
     #[cfg(feature = "serve")]
     pub(crate) fn retune_limits(&self, config: RateLimitConfig) {
         self.rates.retune(config);
+    }
+
+    /// What the in-memory ledger holds for a local key (see
+    /// [`AttemptRates::local_budget_total`]); `None` on a Redis-backed one.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) async fn local_budget_total(
+        &self,
+        tenant_key: &str,
+        window_secs: u64,
+    ) -> Option<u64> {
+        self.rates.local_budget_total(tenant_key, window_secs).await
     }
 
     pub(crate) fn context(self: &Arc<Self>, scope: TrustedPolicyScope) -> DispatchPolicyContext {
@@ -1992,6 +2075,74 @@ mod tests {
             credential: None,
             request_id: None,
             router: None,
+        }
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    fn budgeted(name: &str, limit_nanos: u64) -> TrustedPolicyScope {
+        let mut scope = scope(name, None, None);
+        scope.budget = Some(crate::gateway::budget::BudgetPolicySnapshot {
+            limit_nanos,
+            window_secs: 3600,
+            allow_unpriced: false,
+            valid: true,
+        });
+        scope
+    }
+
+    /// A later outage in the same window starts from an empty local ledger: the
+    /// spend of the first is charged once, at recovery, and is not counted
+    /// against the second lease (note 0027).
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    async fn each_outage_epoch_has_its_own_local_ledger() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let base = budgeted("epochs", 100);
+        let first = base.outage_view(50, 0, 7, 1.0).unwrap();
+        rates
+            .acquire("p", &first, 1, uuid::Uuid::new_v4(), Some(quote(40)))
+            .await
+            .unwrap();
+        let key = |epoch| outage_tenant_key(&base.tenant_key, epoch, 7);
+        assert_eq!(
+            rates
+                .local_budget_total(&key(0), OUTAGE_LOCAL_WINDOW_SECS)
+                .await,
+            Some(40)
+        );
+        // The second outage's lease is smaller than what the first spent.
+        let second = base.outage_view(30, 1, 7, 1.0).unwrap();
+        rates
+            .acquire("p", &second, 1, uuid::Uuid::new_v4(), Some(quote(20)))
+            .await
+            .expect("not charged for the first outage's spend");
+        assert_eq!(
+            rates
+                .local_budget_total(&key(1), OUTAGE_LOCAL_WINDOW_SECS)
+                .await,
+            Some(20)
+        );
+        // And a request past the lease is refused by the local ledger.
+        assert!(rates
+            .acquire("p", &second, 1, uuid::Uuid::new_v4(), Some(quote(11)))
+            .await
+            .is_err());
+    }
+
+    /// The local ledger never rolls over by the local clock: a retry after the
+    /// lease's window ended cannot take a fresh allowance.
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    async fn a_lease_ledger_does_not_roll_with_the_local_clock() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let view = budgeted("nowrap", 100).outage_view(50, 0, 7, 1.0).unwrap();
+        for epoch_secs in [0_u64, 3_600, 7_200] {
+            let id = uuid::Uuid::new_v4();
+            let result = rates
+                .acquire_at_epoch("p", &view, 1, id, Some(quote(30)), Some(epoch_secs))
+                .await;
+            // 30 fits once; every later "window" still sees it spent.
+            assert_eq!(result.is_ok(), epoch_secs == 0, "{epoch_secs}");
         }
     }
 

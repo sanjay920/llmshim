@@ -105,6 +105,7 @@ pub trait UsageSink: Send + Sync {
 /// storage. A replica names the tenant by hashing each of its own configured
 /// tenants and looking the job's hash up. Replicas of one fleet share a
 /// configuration, so they agree; a tenant a replica does not know is `None`.
+#[derive(Clone)]
 pub struct UsageSetup {
     pub sink: Arc<dyn UsageSink>,
     pub tenants: TenantNames,

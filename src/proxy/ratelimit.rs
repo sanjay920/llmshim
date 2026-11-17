@@ -411,6 +411,28 @@ impl RateLimitConfig {
         }
     }
 
+    /// Every limit multiplied by `fraction` (0 to 1], rounded up, at least 1:
+    /// one replica's share during an outage (design note 0027). An unset
+    /// limit stays unset.
+    #[cfg(all(feature = "gateway", feature = "redis-coordination"))]
+    pub(crate) fn scaled(&self, fraction: f64) -> Self {
+        let scale = |limit: Option<u32>| {
+            limit.map(|value| ((f64::from(value) * fraction).ceil() as u32).max(1))
+        };
+        let part = |limit: &ProviderLimit| ProviderLimit {
+            rpm: scale(limit.rpm),
+            tpm: scale(limit.tpm),
+        };
+        Self {
+            global: part(&self.global),
+            per_provider: self
+                .per_provider
+                .iter()
+                .map(|(name, limit)| (name.clone(), part(limit)))
+                .collect(),
+        }
+    }
+
     /// Config with only global RPM/TPM limits and no per-provider overrides.
     pub fn with_global(rpm: Option<u32>, tpm: Option<u32>) -> Self {
         Self {

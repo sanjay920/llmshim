@@ -380,6 +380,16 @@ pub async fn build_app(
                 max_retained_accounting_attempts: retained,
                 usage,
                 penalty,
+                outage: config.fleet.as_ref().and_then(|fleet| {
+                    fleet.outage_admission.as_ref().map(|outage| {
+                        (
+                            outage.spend_lease_fraction,
+                            outage.rate_fraction,
+                            outage.max_concurrency as usize,
+                            outage.recover_after_secs,
+                        )
+                    })
+                }),
             },
         )
         .await
@@ -983,6 +993,9 @@ struct FleetInputs {
     max_retained_accounting_attempts: usize,
     usage: Option<crate::gateway::usage::UsageSetup>,
     penalty: Option<Duration>,
+    /// `[fleet.outage_admission]`: lease fraction, rate fraction, concurrency,
+    /// seconds of steady health before leaving the outage path.
+    outage: Option<(f64, f64, usize, u64)>,
 }
 
 /// Build the fleet (Redis-backed) state. Without the `serve-redis` feature this
@@ -1007,6 +1020,16 @@ async fn fleet_state(
         max_retained_accounting_attempts: inputs.max_retained_accounting_attempts,
         usage: inputs.usage,
         penalty: inputs.penalty,
+        outage: inputs.outage.map(
+            |(spend_lease_fraction, rate_fraction, max_concurrency, recover_after_secs)| {
+                crate::gateway::http::OutageParts {
+                    spend_lease_fraction,
+                    rate_fraction,
+                    max_concurrency,
+                    recover_after_secs,
+                }
+            },
+        ),
     };
     GatewayState::distributed_unstarted(router, None, url, parts)
         .await
