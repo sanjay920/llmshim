@@ -496,11 +496,180 @@ mod redis_outage {
             settled(&server),
             "the lease was settled after Redis returned"
         );
-        assert_eq!(
-            ask().await.unwrap().status(),
-            200,
-            "served on the fleet path again"
+        let mut again = 0;
+        for _ in 0..30 {
+            again = ask().await.unwrap().status().as_u16();
+            if again == 200 {
+                break;
+            }
+            // The first fleet request after an outage may find a connection that has to be
+            // rebuilt: it is served within a few seconds, with no restart.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert_eq!(again, 200, "served on the fleet path again");
+        let log = server.stderr.lock().unwrap().join("\n");
+        assert!(log.contains("serving budgeted keys from leases"), "{log}");
+        // The usage log tells the two admissions apart.
+        // The writer is a queue: poll until both kinds are on disk.
+        let read = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&usage_path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        };
+        let count = |records: &[serde_json::Value], kind: &str| {
+            records.iter().filter(|r| r["admission"] == kind).count()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while (count(&read(), "fleet") == 0 || count(&read(), "outage") == 0)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let records = read();
+        assert!(count(&records, "fleet") >= 1, "{records:?}");
+        assert!(count(&records, "outage") >= 1, "{records:?}");
+        let _ = std::fs::remove_file(&usage_path);
+        mock.assert_async().await;
+        assert_no_panic(&server.stderr.lock().unwrap());
+    }
+
+    /// A key under a `[tenants.<name>]` cap (and with no cap of its own) keeps being served from its
+    /// lease while Redis is gone, the replica stays ready, and when Redis returns
+    /// the lease is settled and the fleet path serves again (note 0027).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs Redis: set LLMSHIM_TEST_REDIS_URL"]
+    async fn a_key_under_a_tenant_cap_is_served_from_the_tenants_lease_while_redis_is_gone() {
+        let target = std::env::var("LLMSHIM_TEST_REDIS_URL").expect("set LLMSHIM_TEST_REDIS_URL");
+        let id = uuid::Uuid::new_v4().simple();
+        let tenant = format!("tenant-{id}");
+        // A priced model, so an attempt's cost is bounded before it is sent.
+        let model = "openai/gpt-6-luna";
+
+        let mut upstream = mockito::Server::new_async().await;
+        let mock = upstream
+            .mock("POST", "/responses")
+            .with_header("content-type", "application/json")
+            .with_body(responses_body("pong"))
+            .expect_at_least(3)
+            .create_async()
+            .await;
+
+        let usage_path = std::env::temp_dir().join(format!("llmshim-usage-{id}.jsonl"));
+        let proxy = RedisProxy::start(&target).await;
+        let redis_through_proxy = format!("redis://{}", proxy.address);
+        let logging = format!("\n[logging]\nusage_log = \"{}\"\n", usage_path.display());
+        let extra = &format!("[tenants.{tenant}]\nbudget_usd = 100.0\n[fleet]\nredis_url = {{ env = \"SERVE_E2E_REDIS_URL\" }}\n\
+                     [fleet.outage_admission]\nspend_lease_fraction = 0.5\nrecover_after_secs = 5");
+        let text = (config(&upstream.url(), extra) + &logging)
+            .replace("providers.inference", "providers.openai")
+            .replace("kind = \"openai-compatible\"", "kind = \"openai\"")
+            .replace("tenant = \"platform\"", &format!("tenant = \"{tenant}\""));
+        let mut server = start(
+            &text,
+            "outage-admission",
+            &[("SERVE_E2E_REDIS_URL", redis_through_proxy.as_str())],
         );
+        let base = server.base.clone();
+        let client = client();
+        let ask = || async {
+            client
+                .post(format!("{base}/v1/chat/completions"))
+                .bearer_auth(CALLER_KEY)
+                .json(&json!({"model": model, "max_tokens": 50,
+                    "messages": [{"role": "user", "content": "ping"}]}))
+                .send()
+                .await
+        };
+
+        // Healthy: served through the fleet. That registers the tenant, and a
+        // lease follows within a tick or two.
+        assert_eq!(ask().await.unwrap().status(), 200);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        proxy.cut();
+        // Wait for the replica to notice (three failed probes).
+        let noticed = std::time::Instant::now();
+        let mut served = None;
+        let mut last = String::new();
+        while noticed.elapsed() < Duration::from_secs(40) {
+            if let Ok(response) = ask().await {
+                if response.status() == 200 {
+                    served = Some(noticed.elapsed());
+                    break;
+                }
+                last = format!(
+                    "{} {}",
+                    response.status(),
+                    response.text().await.unwrap_or_default()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        eprintln!("last refusal: {last}");
+        let served = served.expect("a budgeted key is served from its lease during the outage");
+        eprintln!("served from the lease {served:?} after Redis was cut");
+        assert_eq!(
+            status(&client, &base, "/ready").await,
+            200,
+            "a replica serving from its lease stays in the Service"
+        );
+        // Status and metrics say so, without naming a tenant.
+        let stats: serde_json::Value = client
+            .get(format!("{base}/v1/gateway/stats"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stats["outage_admission"]["active"], true, "{stats}");
+        assert!(stats["outage_admission"]["lease_nanos"].as_u64().unwrap() > 0);
+        assert!(!stats.to_string().contains(&tenant));
+        let metrics = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            metrics.contains("llmshim_gateway_outage_admission_active 1"),
+            "{metrics}"
+        );
+        assert!(server.child.try_wait().unwrap().is_none());
+
+        proxy.restore();
+        let recovering = std::time::Instant::now();
+        let settled = |server: &harness::Server| {
+            server
+                .stderr
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("leases settled"))
+        };
+        // Requests keep being served (locally, then through the fleet) while
+        // the lease is settled; no restart is needed.
+        while !settled(&server) && recovering.elapsed() < Duration::from_secs(90) {
+            assert_eq!(ask().await.unwrap().status(), 200);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(
+            settled(&server),
+            "the lease was settled after Redis returned"
+        );
+        let mut again = 0;
+        for _ in 0..30 {
+            again = ask().await.unwrap().status().as_u16();
+            if again == 200 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert_eq!(again, 200, "served on the fleet path again");
         let log = server.stderr.lock().unwrap().join("\n");
         assert!(log.contains("serving budgeted keys from leases"), "{log}");
         // The usage log tells the two admissions apart.

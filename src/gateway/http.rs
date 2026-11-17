@@ -754,6 +754,7 @@ impl GatewayState {
     ) -> Result<PreparedGatewaySubmission, GatewayError> {
         let refuse = || GatewayError::Overloaded(self.overloaded_retry_after);
         let (tenant, window_secs, _) = policy_scope.outage_budget().ok_or_else(refuse)?;
+        let tenant = tenant.as_str();
         let (admission, guard) = outage
             .manager
             .admit(epoch_ms(), tenant, window_secs)
@@ -788,7 +789,7 @@ impl GatewayState {
             }
             // Healthy: note the budgeted tenant so a lease is taken for it.
             if let Some((tenant, window_secs, limit)) = policy_scope.outage_budget() {
-                outage.manager.register(tenant, window_secs, limit);
+                outage.manager.register(&tenant, window_secs, limit);
             }
         }
         match &self.backend {

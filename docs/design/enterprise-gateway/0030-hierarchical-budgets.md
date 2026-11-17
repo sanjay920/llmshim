@@ -1,6 +1,6 @@
 # 0030: Tenant budgets above key budgets
 
-Status: slices 2 and 3 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
+Status: slices 2, 3 and 4 built (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
 file table, an admission rule, a refusal reason and ledger keys become promises, and it touches the
 spend ledger (0010), which every guarantee in 0027 rests on. It is the third slice of the roadmap
 item "hierarchical budgets, tags, alerts, cost exports" (after 0028 and 0029). Nothing here is
@@ -238,3 +238,21 @@ the lease size is then set by the table, which removes today's last-writer-wins 
   each counter has its own expiry, per-level settlement including an unbounded attempt and a repeated
   settle, and 60 racing requests over two keys that never leave the tenant counter above its cap, never
   orphan a reservation, and reach the cap. Removing the second level's refusal fails them.
+
+## As built (slice 4): outage interplay
+
+- **A key with no cap of its own under a tenant table is admitted in outage state**, on a lease taken on
+  the **tenant cap's** counter (`tenant-cap:{tenant}`, the name the Redis ledger uses, which the lease
+  code takes as a parameter). The local view of such a request is the ordinary one-counter view of 0027:
+  one local ledger key per lease and epoch, limited to the lease, version 1. `outage_budget()` returns the
+  ledger key, window and limit; `outage_view` builds the view from the tenant cap.
+- **A key with a cap of its own is refused in outage state**, as the note said: it would need a second
+  lease on its own counter. This remains the stated cost.
+- Process test (real Redis, cuttable proxy): a key under a tenant cap is served from the tenant's lease
+  while Redis is gone, `/ready` stays 200, the usage log has `fleet` and `outage` records, and it is served
+  on the fleet path again after recovery (the first fleet request after the outage may be refused once
+  with 503 while the connection is rebuilt, as for any fleet request after an outage; the test polls).
+- **Not built, and reworded:** the reload status does **not** report a table's `started_at`, and the
+  rejection metric carries no `level` label: the signals are the generation bump on a reload that adds
+  or changes a table, the ordinary 429, and the usage records. Operators should add a table at a window
+  boundary. Either may be added later without changing any contract here.
