@@ -612,8 +612,10 @@ async fn ask_stream(base: &str, model: &str) -> reqwest::Response {
 async fn a_stream_that_fails_to_open_is_retried_on_the_next_target() {
     let (east, east_mock) = failing(502, 1).await;
     let (west, west_mock) = streaming(1).await;
+    let dir = tempdir::Dir::new("dep-stream-failover");
+    let log = dir.0.join("usage.jsonl");
     let server = start(
-        &render(&east.url(), &west.url(), ORDERED, "", None),
+        &render(&east.url(), &west.url(), ORDERED, "", Some(&log)),
         "dep-stream-failover",
         &no_client_retries(),
     );
@@ -623,6 +625,24 @@ async fn a_stream_that_fails_to_open_is_retried_on_the_next_target() {
     assert!(text.contains("po") && text.contains("ng"), "{text}");
     east_mock.assert_async().await;
     west_mock.assert_async().await;
+    // One record per attempt, under one request id: the failed open is recorded, not lost.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let records = loop {
+        let found: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        if found.len() >= 2 || std::time::Instant::now() > deadline {
+            break found;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(records.len(), 2, "{records:?}");
+    let by = |p: &str| records.iter().find(|r| r["provider"] == p).unwrap().clone();
+    assert_eq!(by("east")["outcome"], "http_failure");
+    assert_eq!(by("west")["outcome"], "completed");
+    assert_eq!(by("east")["request_id"], by("west")["request_id"]);
     let metrics = reqwest::Client::new()
         .get(format!("{}/metrics", server.admin.clone().unwrap()))
         .bearer_auth(ADMIN_TOKEN)
@@ -663,10 +683,7 @@ async fn a_stream_is_not_retried_for_a_400_or_when_addressed_to_a_target() {
         "dep-stream-concrete",
         &no_client_retries(),
     );
-    assert!(ask_stream(&server.base, "east/m")
-        .await
-        .status()
-        .is_server_error());
+    assert_eq!(ask_stream(&server.base, "east/m").await.status(), 502);
     east_mock.assert_async().await;
     west_mock.assert_async().await;
 }

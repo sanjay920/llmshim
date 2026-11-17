@@ -319,6 +319,13 @@ admission, spend and usage record; the failover metric is counted when the retry
 a retry the key's list does not allow returns the original failure. Streams carry no idempotency key, so
 nothing about replay changes.
 
+**Limits.** Only the local scheduler fails a stream over. With `[fleet]` (the distributed backend) an
+upstream open failure reaches the caller as an error item on the stream, after admission has returned, so
+the handler never sees it as an open failure and does not retry: **streaming failover is not built for a
+fleet**, and a unary request is. For the same reason an error that arrives as the first item of an
+opened stream (a managed stream that fails while buffering, say) is not retried. Both are "not built", not
+refused: a fleet worker would have to report the open outcome before returning the receiver.
+
 Tests: `integration_serve_deployments::a_stream_that_fails_to_open_is_retried_on_the_next_target` (the
 caller gets the second target's stream and the failover series counts it; making the stream handler
 refuse every retry fails it) and `::a_stream_is_not_retried_for_a_400_or_when_addressed_to_a_target`.
