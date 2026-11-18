@@ -370,7 +370,7 @@
         },
         "scope": {
           "$ref": "#/$defs/GuardrailScope",
-          "description": "What the rule is matched against (note 0042's sibling, 0043): the `request` (default), the\nnon-streaming `response`, or `both`. A caller under a rule that reads responses cannot\nstream: a stream cannot be checked after its first byte has gone out, so it is refused."
+          "description": "What the rule is matched against (note 0043): the `request` (default), the\nnon-streaming `response`, or `both`. A caller under a rule that reads responses cannot\nstream: a stream cannot be checked after its first byte has gone out, so it is refused."
         },
         "tenants": {
           "default": null,
@@ -1304,7 +1304,7 @@
       "description": "Run as one replica of a fleet sharing a Redis instance. Without it the\nserver is a single instance with in-process state."
     },
     "guardrails": {
-      "description": "Request guardrails (note 0040): rules that refuse a request whose text matches a pattern,\nbefore anything is reserved, queued or sent. Fixed at start.",
+      "description": "Guardrails (notes 0040 and 0043): rules that refuse a request whose text matches a pattern,\nbefore anything is reserved, queued or sent, or replace an answer that matches. Fixed at start.",
       "items": {
         "$ref": "#/$defs/Guardrail"
       },

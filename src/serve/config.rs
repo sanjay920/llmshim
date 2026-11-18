@@ -152,8 +152,8 @@ pub struct ServeConfig {
     /// snapshot file's content reloads like keys do.
     #[serde(default)]
     pub control_plane: Option<ControlPlane>,
-    /// Request guardrails (note 0040): rules that refuse a request whose text matches a pattern,
-    /// before anything is reserved, queued or sent. Fixed at start.
+    /// Guardrails (notes 0040 and 0043): rules that refuse a request whose text matches a pattern,
+    /// before anything is reserved, queued or sent, or replace an answer that matches. Fixed at start.
     #[serde(default)]
     pub guardrails: Vec<Guardrail>,
 }
@@ -175,7 +175,7 @@ pub struct Guardrail {
     /// matched anywhere in any text of the request (or of the response, per `scope`). 1 to 64, each
     /// at most 1024 characters.
     pub block_if_matches: Vec<String>,
-    /// What the rule is matched against (note 0042's sibling, 0043): the `request` (default), the
+    /// What the rule is matched against (note 0043): the `request` (default), the
     /// non-streaming `response`, or `both`. A caller under a rule that reads responses cannot
     /// stream: a stream cannot be checked after its first byte has gone out, so it is refused.
     #[serde(default)]

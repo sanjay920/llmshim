@@ -184,13 +184,77 @@ impl RequestGuard for Guardrails {
 
     fn first_response_match(&self, tenant: &str, body: &Value) -> Option<String> {
         self.response
-            .first_match(tenant, body)
+            .first_match(tenant, &response_view(body))
             .map(|index| self.names[index].clone())
     }
 
     fn reads_responses(&self, tenant: &str) -> bool {
         self.response.applies_to(tenant)
     }
+}
+
+/// The strings of an answer a rule should read, from the `choices` of a normalized chat response
+/// (note 0043): the message's text, refusal, tool-call names and arguments, and reasoning text. The
+/// answer is shaped by llmshim, so what is skipped is known: signatures and encrypted reasoning
+/// (opaque blobs a pattern would match inside by chance), ids, roles and other structure. The parts
+/// of a content array are joined (a secret split across two parts is one string), and a tool call's
+/// `arguments`, which is JSON text, is parsed so that an escaped secret (`\u0041KIA...`) is read as
+/// the text it decodes to.
+pub(crate) fn response_view(choices: &Value) -> Value {
+    const SKIPPED: [&str; 14] = [
+        "thought_signature",
+        "signature",
+        "encrypted_content",
+        "responses_output",
+        "wire_ids",
+        "id",
+        "item_id",
+        "tool_call_id",
+        "role",
+        "finish_reason",
+        "index",
+        "type",
+        "origin",
+        "redacted_data",
+    ];
+    fn walk(value: &Value) -> Value {
+        match value {
+            Value::Array(items) => {
+                // Content parts: one string, so a split secret is whole.
+                if !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| item.get("text").is_some_and(Value::is_string))
+                {
+                    let joined: String = items
+                        .iter()
+                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                        .collect();
+                    return Value::String(joined);
+                }
+                Value::Array(items.iter().map(walk).collect())
+            }
+            Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (key, item) in map {
+                    if SKIPPED.contains(&key.as_str()) {
+                        continue;
+                    }
+                    let item = match (key.as_str(), item) {
+                        // Tool-call arguments are JSON text: read what it decodes to.
+                        ("arguments", Value::String(text)) => serde_json::from_str::<Value>(text)
+                            .map(|parsed| walk(&parsed))
+                            .unwrap_or_else(|_| Value::String(text.clone())),
+                        _ => walk(item),
+                    };
+                    out.insert(key.clone(), item);
+                }
+                Value::Object(out)
+            }
+            other => other.clone(),
+        }
+    }
+    walk(choices)
 }
 
 #[cfg(test)]
@@ -357,6 +421,51 @@ mod tests {
         );
         // Every tenant is under `either` (it reads responses and names no tenant).
         assert!(guard.reads_responses("platform") && guard.reads_responses("other"));
+    }
+
+    #[test]
+    fn a_response_is_read_as_text_not_as_opaque_blobs_and_split_or_escaped_secrets_are_whole() {
+        let choices = json!([{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {
+                "role": "assistant",
+                // Opaque signature and encrypted blobs are never the answer's text.
+                "reasoning": [{"type": "thinking", "text": "plan", "thought_signature":
+                    {"data": "QUtJQUFCQ0RFRkdISUpLTE1OT1A=AKIAABCDEFGHIJKLMNOP", "origin": "x"}}],
+                "responses_output": [{"encrypted_content": "AKIAABCDEFGHIJKLMNOP"}],
+                "content": [{"type": "text", "text": "the key is AKI"}, {"type": "text", "text": "AABCDEFGHIJKLMNOP"}],
+                "tool_calls": [{"id": "call_AKIAABCDEFGHIJKLMNOP", "function": {
+                    "name": "f", "arguments": "{\"v\":\"\\u0041KIAABCDEFGHIJKLMNOP\"}"}}]
+            }
+        }]);
+        let view = response_view(&choices);
+        let text = view.to_string();
+        // The signature, the encrypted item and the id are gone; the split and escaped secrets are
+        // each whole in the view.
+        assert!(
+            !text.contains("QUtJ") && !text.contains("encrypted") && !text.contains("call_AKIA"),
+            "{text}"
+        );
+        assert!(text.contains("the key is AKIAABCDEFGHIJKLMNOP"), "{text}");
+        assert!(text.contains("AKIAABCDEFGHIJKLMNOP\""), "{text}");
+        let guard = rules(
+            "[[guardrails]]\nname = \"leak\"\nscope = \"response\"\nblock_if_matches = [\"AKIA[0-9A-Z]{16}\"]",
+        );
+        assert_eq!(
+            guard.first_response_match("platform", &view).as_deref(),
+            Some("leak")
+        );
+        // A clean answer that carries a long opaque signature is not blocked by a broad pattern.
+        let broad = rules(
+            "[[guardrails]]\nname = \"long\"\nscope = \"response\"\nblock_if_matches = [\"[A-Za-z0-9]{40}\"]",
+        );
+        let clean = json!([{"message": {"role": "assistant", "content": "hi",
+            "reasoning": [{"thought_signature": {"data": "A".repeat(200)}}]}}]);
+        assert_eq!(
+            broad.first_response_match("platform", &response_view(&clean)),
+            None
+        );
     }
 
     #[test]

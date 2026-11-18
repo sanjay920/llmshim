@@ -1281,6 +1281,21 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
              have no `allowed_residency`: restrict them with `allowed_models` (note 0039)"
         );
     }
+    // With a control plane the tenants come from the snapshot after the file is read, so a guardrail
+    // rule that names a tenant cannot be checked against them (note 0040): a mistyped name never
+    // fires, and for a rule that reads responses the tenant may also stream. Said once.
+    if config.control_plane.is_some()
+        && config.guardrails.iter().any(|rule| {
+            rule.tenants
+                .as_ref()
+                .is_some_and(|tenants| !tenants.is_empty())
+        })
+    {
+        eprintln!(
+            "warning: guardrail rules name tenants, but with [control_plane] the tenants come from the \
+             snapshot and cannot be checked here: a mistyped tenant never fires (note 0040)"
+        );
+    }
     if options.check {
         // Everything that can be checked without creating or starting anything
         // has been: the shape, the secrets and the rules about their values (the

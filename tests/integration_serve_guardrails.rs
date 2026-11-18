@@ -209,7 +209,7 @@ async fn leaking_upstream(calls: usize) -> (mockito::ServerGuard, mockito::Mock)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_answer_that_breaks_a_response_rule_is_replaced_by_a_502_naming_the_rule() {
+async fn an_answer_that_breaks_a_response_rule_is_replaced_by_a_422_naming_the_rule() {
     let (up, mock) = leaking_upstream(1).await;
     let dir = tempdir::Dir::new("guard-response");
     let log = dir.0.join("usage.jsonl");
@@ -227,7 +227,7 @@ async fn an_answer_that_breaks_a_response_rule_is_replaced_by_a_502_naming_the_r
     .await;
     let status = answer.status();
     let text = answer.text().await.unwrap();
-    assert_eq!(status, 502, "{text}");
+    assert_eq!(status, 422, "{text}");
     assert!(
         text.contains("guardrail_blocked_response") && text.contains("no-leak"),
         "{text}"
@@ -299,4 +299,56 @@ async fn a_clean_answer_is_returned_a_request_rule_does_not_read_it_and_a_stream
     .await;
     assert_eq!(passed.status(), 200);
     mock.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_escaped_tool_call_argument_and_every_streaming_route_are_covered() {
+    // A tool call's arguments are JSON text: the secret written with an escape is still read.
+    let mut up = mockito::Server::new_async().await;
+    let _mock = up
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({"id": "c", "object": "chat.completion", "created": 1, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": null,
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                        "name": "f", "arguments": "{\"v\":\"\\u0041KIAABCDEFGHIJKLMNOP\"}"}}]}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}})
+            .to_string(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let server = start(
+        &config(&up.url(), RESPONSE_RULE, None),
+        "guard-escaped",
+        &env(),
+    );
+    let blocked = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "messages": [{"role": "user", "content": "hello"}]}),
+    )
+    .await;
+    assert_eq!(blocked.status(), 422);
+    // Every route that streams is refused to the caller under the rule.
+    for (path, body) in [
+        (
+            "/v1/chat/stream",
+            json!({"model": "p/m", "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": "p/m", "max_tokens": 5, "stream": true,
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model": "p/m", "stream": true, "input": "hi"}),
+        ),
+    ] {
+        let refused = post(&server.base, path, body).await;
+        assert_eq!(refused.status(), 400, "{path}");
+    }
 }

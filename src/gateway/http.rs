@@ -437,7 +437,7 @@ impl GatewayState {
                     &[("provider", provider), ("reason", "guardrail_response")],
                 );
                 return Err(ApiError::from(ShimError::ProviderError {
-                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
                     body: json!({
                         "error": {
                             "message": format!("response blocked by guardrail {rule}"),
@@ -1699,6 +1699,13 @@ async fn chat(
             if let Some(context) = &idempotency_context {
                 match state.idem_lookup(context).await {
                     crate::gateway::idempotency::IdempotencyLookup::Replay(cached_response) => {
+                        // The cache can outlive the configuration (a Redis cache across a restart or
+                        // a rolling update): a replayed answer is judged by today's rules too.
+                        state.check_response_guardrails(
+                            &identity.tenant,
+                            &provider_name,
+                            cached_response.get("choices").unwrap_or(&Value::Null),
+                        )?;
                         return Ok((
                             [("idempotency-replayed", "true")],
                             Json(value_to_response(&cached_response, &provider_name, 0)),
