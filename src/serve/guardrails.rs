@@ -154,6 +154,7 @@ impl Direction {
 /// matches) and one by one (to replace), and what a match becomes.
 struct RedactRule {
     name: String,
+    scope: GuardrailScope,
     tenants: Option<BTreeSet<String>>,
     any: RegexSet,
     each: Vec<Regex>,
@@ -205,6 +206,7 @@ impl Guardrails {
                 })?;
             redactions.push(RedactRule {
                 name: rule.name.clone(),
+                scope: rule.scope,
                 tenants: rule
                     .tenants
                     .as_ref()
@@ -248,13 +250,52 @@ impl RequestGuard for Guardrails {
     }
 
     fn redact(&self, tenant: &str, value: &mut Value) -> Result<Vec<String>, String> {
+        self.redact_with(tenant, GuardrailScope::reads_request, |rule| {
+            redact_leaves(value, rule, true)
+        })
+    }
+
+    fn redact_response(&self, tenant: &str, answer: &mut Value) -> Result<Vec<String>, String> {
+        // The text a caller will read: each choice's message content, refusal and tool calls. The
+        // reasoning, its signatures and the envelope are not touched.
+        self.redact_with(tenant, GuardrailScope::reads_response, |rule| {
+            let mut changed = false;
+            if let Some(Value::Array(choices)) = answer.get_mut("choices") {
+                for choice in choices {
+                    let Some(message) = choice.get_mut("message") else {
+                        continue;
+                    };
+                    for field in ["content", "refusal", "tool_calls"] {
+                        if let Some(part) = message.get_mut(field) {
+                            changed |= redact_leaves(part, rule, true)?;
+                        }
+                    }
+                }
+            }
+            // A transcript (note 0043) is a bare `text`.
+            if let Some(text) = answer.get_mut("text") {
+                changed |= redact_leaves(text, rule, true)?;
+            }
+            Ok(changed)
+        })
+    }
+}
+
+impl Guardrails {
+    /// Run `apply` for each redaction rule that reads this direction and applies to `tenant`: the
+    /// names of the rules that changed something, or the name of the one that would have made a
+    /// text too large.
+    fn redact_with(
+        &self,
+        tenant: &str,
+        reads: fn(GuardrailScope) -> bool,
+        mut apply: impl FnMut(&RedactRule) -> Result<bool, ()>,
+    ) -> Result<Vec<String>, String> {
         let mut applied = Vec::new();
-        for rule in self
-            .redactions
-            .iter()
-            .filter(|rule| rule.tenants.as_ref().is_none_or(|set| set.contains(tenant)))
-        {
-            match redact_leaves(value, rule, true) {
+        for rule in self.redactions.iter().filter(|rule| {
+            reads(rule.scope) && rule.tenants.as_ref().is_none_or(|set| set.contains(tenant))
+        }) {
+            match apply(rule) {
                 Ok(true) => applied.push(rule.name.clone()),
                 Ok(false) => {}
                 Err(()) => return Err(rule.name.clone()),
@@ -708,6 +749,58 @@ mod tests {
         );
         let masked = json!({"messages": [{"role": "user", "content": "key [redacted]"}]});
         assert_eq!(guard.first_match("platform", &masked), None);
+    }
+
+    #[test]
+    fn a_response_redaction_masks_the_text_a_caller_reads_and_nothing_else() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"mask\"\nscope = \"response\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]\nreplacement = \"[x]\"",
+        );
+        let mut answer = json!({
+            "id": "AKIAABCDEFGHIJKLMNOP",
+            "model": "AKIAABCDEFGHIJKLMNOP",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "key AKIAABCDEFGHIJKLMNOP"}],
+                "refusal": "no AKIAABCDEFGHIJKLMNOP",
+                "reasoning": [{"text": "thought AKIAABCDEFGHIJKLMNOP",
+                               "thought_signature": {"data": "AKIAABCDEFGHIJKLMNOP"}}],
+                "tool_calls": [{"id": "call_1", "function": {"name": "f",
+                    "arguments": "{\"k\":\"AKIAABCDEFGHIJKLMNOP\"}"}}]}}],
+            "usage": {"prompt_tokens": 1}
+        });
+        assert_eq!(
+            guard.redact_response("platform", &mut answer).unwrap(),
+            vec!["mask".to_string()]
+        );
+        let message = &answer["choices"][0]["message"];
+        assert_eq!(message["content"][0]["text"], "key [x]");
+        assert_eq!(message["refusal"], "no [x]");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            "{\"k\":\"[x]\"}"
+        );
+        // The envelope, the reasoning and its signature are not the text a caller reads.
+        assert_eq!(answer["id"], "AKIAABCDEFGHIJKLMNOP");
+        assert_eq!(answer["model"], "AKIAABCDEFGHIJKLMNOP");
+        assert_eq!(
+            message["reasoning"][0]["text"],
+            "thought AKIAABCDEFGHIJKLMNOP"
+        );
+        // A transcript is a bare `text`.
+        let mut transcript = json!({"text": "AKIAABCDEFGHIJKLMNOP spoken"});
+        guard.redact_response("platform", &mut transcript).unwrap();
+        assert_eq!(transcript["text"], "[x] spoken");
+        // A response rule is not applied to a request, nor a request rule to a response.
+        let mut request = json!("AKIAABCDEFGHIJKLMNOP");
+        assert!(guard.redact("platform", &mut request).unwrap().is_empty());
+        let both_directions =
+            rules("[[guardrails]]\nname = \"asks\"\nredact_matches = [\"alpha\"]");
+        let mut reply = json!({"choices": [{"message": {"content": "alpha"}}]});
+        assert!(both_directions
+            .redact_response("platform", &mut reply)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -371,7 +371,7 @@
         },
         "redact_matches": {
           "default": [],
-          "description": "Patterns whose matches are **replaced** instead of refusing the request (note 0044): in the\ntext of the request's messages (content, content parts, tool-call arguments) before it is\nsent. Same syntax and limits as `block_if_matches`; request scope only.",
+          "description": "Patterns whose matches are **replaced** instead of refusing the request (note 0044): in the\ntext of the request's messages (content, content parts, tool-call arguments) before it is\nsent, or in a non-streaming answer's text before it is returned (per `scope`, note 0045).\nSame syntax and limits as `block_if_matches`.",
           "items": {
             "type": "string"
           },

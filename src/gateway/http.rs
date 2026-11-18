@@ -347,6 +347,9 @@ pub(crate) trait RequestGuard: Send + Sync {
     /// each match of a redaction rule becomes its replacement. The names of the rules that changed
     /// anything.
     fn redact(&self, tenant: &str, value: &mut Value) -> Result<Vec<String>, String>;
+
+    /// The same for a non-streaming answer (note 0045): its message text, refusal and tool calls.
+    fn redact_response(&self, tenant: &str, answer: &mut Value) -> Result<Vec<String>, String>;
 }
 
 /// Everything the single-instance gateway state is built from. Grouping these
@@ -510,6 +513,42 @@ impl GatewayState {
         }
         #[cfg(not(feature = "serve"))]
         let _ = (headers, req);
+        Ok(())
+    }
+
+    /// Apply the response-scope redaction rules to a non-streaming answer before it is judged,
+    /// cached or returned (note 0045).
+    fn redact_answer(&self, tenant: &str, answer: &mut Value) -> Result<(), ApiError> {
+        #[cfg(feature = "serve")]
+        if let Some(guard) = self.guardrails.get() {
+            let applied = guard.redact_response(tenant, answer).map_err(|rule| {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::REJECTED,
+                    &[("provider", "unknown"), ("reason", "guardrail_response")],
+                );
+                ApiError::from(ShimError::ProviderError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                    body: json!({
+                        "error": {
+                            "message": format!("response blocked by guardrail {rule}"),
+                            "type": "api_error",
+                            "param": null,
+                            "code": "guardrail_blocked_response"
+                        }
+                    })
+                    .to_string(),
+                    retry_after: None,
+                })
+            })?;
+            for rule in applied {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::GUARDRAIL_REDACTIONS,
+                    &[("rule", &rule)],
+                );
+            }
+        }
+        #[cfg(not(feature = "serve"))]
+        let _ = (tenant, answer);
         Ok(())
     }
 
@@ -1756,9 +1795,11 @@ async fn chat(
         if first_attempt {
             if let Some(context) = &idempotency_context {
                 match state.idem_lookup(context).await {
-                    crate::gateway::idempotency::IdempotencyLookup::Replay(cached_response) => {
+                    crate::gateway::idempotency::IdempotencyLookup::Replay(mut cached_response) => {
                         // The cache can outlive the configuration (a Redis cache across a restart or
-                        // a rolling update): a replayed answer is judged by today's rules too.
+                        // a rolling update): a replayed answer is redacted and judged by today's
+                        // rules too.
+                        state.redact_answer(&identity.tenant, &mut cached_response)?;
                         state.check_response_guardrails(
                             &identity.tenant,
                             &provider_name,
@@ -1786,9 +1827,10 @@ async fn chat(
             .submit_prepared(prepared_submission, permit, logical_deadline)
             .await
         {
-            Ok(submitted) => {
-                // A rule that reads responses judges the answer's text before the caller sees it and
-                // before it is cached for a retry (note 0043).
+            Ok(mut submitted) => {
+                // Response redaction first (note 0045), then the response rules judge what is left,
+                // before the answer is cached for a retry or seen by the caller (note 0043).
+                state.redact_answer(&identity.tenant, &mut submitted.value)?;
                 state.check_response_guardrails(
                     &identity.tenant,
                     &provider_name,
@@ -2544,6 +2586,8 @@ async fn audio_transcriptions(
         },
     )
     .await?;
+    let mut value = value;
+    state.redact_answer(&tenant, &mut value)?;
     let text = value["text"].as_str().unwrap_or_default().to_owned();
     // A transcript is text the caller will read: a rule that reads responses judges it (note 0043).
     state.check_response_guardrails(&tenant, &provider, &json!({"text": &text}))?;
