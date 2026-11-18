@@ -328,6 +328,15 @@ pub struct GatewayState {
     guardrails: std::sync::OnceLock<Arc<dyn RequestGuard>>,
 }
 
+/// A filter over the text of one streamed answer (note 0046): `push` takes the next text and returns
+/// what may be sent now (possibly nothing: text is held back so a match across two chunks is seen
+/// whole), and `finish` returns the rest; an `Err` names the rule that cut the stream.
+#[cfg(feature = "serve")]
+pub(crate) trait StreamTextFilter: Send {
+    fn push(&mut self, text: &str) -> Result<String, String>;
+    fn finish(&mut self) -> Result<String, String>;
+}
+
 /// A check run on every request before anything is reserved, queued or sent (note 0040).
 #[cfg(feature = "serve")]
 pub(crate) trait RequestGuard: Send + Sync {
@@ -339,9 +348,9 @@ pub(crate) trait RequestGuard: Send + Sync {
     /// the answer's text breaks for `tenant`.
     fn first_response_match(&self, tenant: &str, body: &Value) -> Option<String>;
 
-    /// Whether any rule reads `tenant`'s responses. Such a caller cannot stream: a stream cannot be
-    /// checked after its first byte has gone out.
-    fn reads_responses(&self, tenant: &str) -> bool;
+    /// The filter a streamed answer's text passes through for `tenant`, if a response rule applies
+    /// (note 0046).
+    fn stream_filter(&self, tenant: &str) -> Option<Box<dyn StreamTextFilter>>;
 
     /// Rewrite the text of `value` (a message's `content` or `tool_calls`) for `tenant` (note 0044):
     /// each match of a redaction rule becomes its replacement. The names of the rules that changed
@@ -559,14 +568,10 @@ impl GatewayState {
         Ok(())
     }
 
-    /// Whether `tenant` is under a rule that reads responses (so it cannot stream).
-    fn reads_responses(&self, tenant: &str) -> bool {
-        #[cfg(feature = "serve")]
-        if let Some(guard) = self.guardrails.get() {
-            return guard.reads_responses(tenant);
-        }
-        let _ = tenant;
-        false
+    /// The filter for `tenant`'s streamed answers, if a response rule applies (note 0046).
+    #[cfg(feature = "serve")]
+    fn stream_filter(&self, tenant: &str) -> Option<Box<dyn StreamTextFilter>> {
+        self.guardrails.get()?.stream_filter(tenant)
     }
 
     /// Refuse a request whose text breaks a guardrail rule (note 0040): 400 `guardrail_blocked`,
@@ -2710,7 +2715,8 @@ async fn chat_stream_inner(
     let mut pending_failover: Option<(String, String, String)> = None;
     // The first item of the stream, when it was read to judge a retry (below): forwarded first.
     let mut first_item: Option<Option<Result<String, GatewayError>>> = None;
-    let mut rx = loop {
+    #[cfg_attr(not(feature = "serve"), allow(unused_variables))]
+    let (mut rx, stream_tenant) = loop {
         let (_provider_name, _budget_model, gw, identified_caller, snapshot) =
             match build_request_for(
                 &state,
@@ -2730,15 +2736,6 @@ async fn chat_stream_inner(
             );
         }
         let identity = identified_caller.identity;
-        // A stream cannot be checked after its first byte has gone out, so a caller under a rule
-        // that reads responses may not stream (note 0043).
-        if state.reads_responses(&identity.tenant) {
-            return invalid_request(
-                "streaming is not available to a caller whose responses are checked by a guardrail",
-                "stream",
-            )
-            .into_response();
-        }
         tried.push(
             gw.payload
                 .get("model")
@@ -2799,7 +2796,7 @@ async fn chat_stream_inner(
             other => other,
         };
         match opened {
-            Ok(rx) => break rx,
+            Ok(rx) => break (rx, identity.tenant.clone()),
             Err(err) => {
                 let Some((name, target)) = failover_target(&req.model, &snapshot, &tried, &err)
                 else {
@@ -2829,6 +2826,12 @@ async fn chat_stream_inner(
     let event_stream = async_stream::stream! {
         let mut identity_sent = false;
         let mut pending = first_item;
+        #[cfg(feature = "serve")]
+        let mut filter = state.stream_filter(&stream_tenant);
+        #[cfg(feature = "serve")]
+        let guard = state.guardrails.get().cloned();
+        #[cfg(feature = "serve")]
+        let mut blocked_by: Option<String> = None;
         loop {
             let next = match pending.take() {
                 Some(first) => first,
@@ -2844,10 +2847,42 @@ async fn chat_stream_inner(
                         }
                     }
                     for event in chunk_to_events(&chunk) {
-                        let event_type = stream_event_type(&event);
-                        if let Ok(data) = serde_json::to_string(&event) {
-                            yield Ok(Event::default().event(event_type).data(data));
+                        // A response rule filters the text as it streams (note 0046): text is held
+                        // back, masked or cut with an error event when a rule matches.
+                        #[cfg(feature = "serve")]
+                        let events = match filter.as_mut() {
+                            Some(filter) => match filter_stream_event(
+                                filter.as_mut(),
+                                guard.as_deref(),
+                                &stream_tenant,
+                                event,
+                            ) {
+                                Ok(events) => events,
+                                Err(rule) => {
+                                    blocked_by = Some(rule);
+                                    break;
+                                }
+                            },
+                            None => vec![event],
+                        };
+                        #[cfg(not(feature = "serve"))]
+                        let events = vec![event];
+                        for event in events {
+                            let event_type = stream_event_type(&event);
+                            if let Ok(data) = serde_json::to_string(&event) {
+                                yield Ok(Event::default().event(event_type).data(data));
+                            }
                         }
+                    }
+                    #[cfg(feature = "serve")]
+                    if let Some(rule) = blocked_by.take() {
+                        let error_event = crate::proxy::error::stream_error(&format!(
+                            "response blocked by guardrail {rule}"
+                        ));
+                        if let Ok(data) = serde_json::to_string(&error_event) {
+                            yield Ok(Event::default().event("error").data(data));
+                        }
+                        break;
                     }
                 }
                 Err(e) => {
@@ -2859,6 +2894,27 @@ async fn chat_stream_inner(
                 }
             }
         }
+        // The text still held back when the stream ends is checked and released (or cut).
+        #[cfg(feature = "serve")]
+        if let Some(filter) = filter.as_mut() {
+            match filter.finish() {
+                Ok(rest) if !rest.is_empty() => {
+                    let event = StreamEvent::Content { text: rest };
+                    if let Ok(data) = serde_json::to_string(&event) {
+                        yield Ok(Event::default().event("content").data(data));
+                    }
+                }
+                Ok(_) => {}
+                Err(rule) => {
+                    let error_event = crate::proxy::error::stream_error(&format!(
+                        "response blocked by guardrail {rule}"
+                    ));
+                    if let Ok(data) = serde_json::to_string(&error_event) {
+                        yield Ok(Event::default().event("error").data(data));
+                    }
+                }
+            }
+        }
     };
 
     // Pin the item type (all yields are `Ok`, so `E` is otherwise ambiguous).
@@ -2866,6 +2922,58 @@ async fn chat_stream_inner(
         s
     }
     Sse::new(pin_item(event_stream)).into_response()
+}
+
+/// One typed stream event through a stream's text filter (note 0046): content text is pushed (and
+/// may come back later, or masked); any other event first flushes the text held back, a complete
+/// tool call is masked and judged whole like an answer's. `Err` is the rule that cut the stream.
+#[cfg(feature = "serve")]
+fn filter_stream_event(
+    filter: &mut dyn StreamTextFilter,
+    guard: Option<&dyn RequestGuard>,
+    tenant: &str,
+    event: StreamEvent,
+) -> Result<Vec<StreamEvent>, String> {
+    match event {
+        StreamEvent::Content { text } => {
+            let released = filter.push(&text)?;
+            Ok(if released.is_empty() {
+                Vec::new()
+            } else {
+                vec![StreamEvent::Content { text: released }]
+            })
+        }
+        other => {
+            let mut out = Vec::new();
+            let rest = filter.finish()?;
+            if !rest.is_empty() {
+                out.push(StreamEvent::Content { text: rest });
+            }
+            let mut other = other;
+            if let (
+                StreamEvent::ToolCall {
+                    name, arguments, ..
+                },
+                Some(guard),
+            ) = (&mut other, guard)
+            {
+                let mut answer = json!({"choices": [{"message": {"tool_calls": [{"function": {
+                    "name": name.clone(), "arguments": arguments.clone()}}]}}]});
+                guard.redact_response(tenant, &mut answer)?;
+                if let Some(rule) = guard.first_response_match(tenant, &answer) {
+                    return Err(rule);
+                }
+                if let Some(masked) = answer
+                    .pointer("/choices/0/message/tool_calls/0/function/arguments")
+                    .and_then(Value::as_str)
+                {
+                    *arguments = masked.to_owned();
+                }
+            }
+            out.push(other);
+            Ok(out)
+        }
+    }
 }
 
 /// SSE `event:` name for a typed [`StreamEvent`].

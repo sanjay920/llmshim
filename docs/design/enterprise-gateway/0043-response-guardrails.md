@@ -39,7 +39,7 @@ block_if_matches = ["AKIA[0-9A-Z]{16}"]
 - **A replayed answer is judged too.** An idempotency cache (Redis, across a restart or a rolling update) can hold
   an answer stored before a rule existed, so a replay is checked with today's rules; a blocked answer is never
   stored.
-- **Streaming is refused to a caller under a response rule.** A stream cannot be checked after its first byte has
+- **Streaming** (0043 refused it to a caller under a response rule; **0046 supersedes that**: streams are filtered as they run). The original reasoning: **Streaming is refused to a caller under a response rule.** A stream cannot be checked after its first byte has
   gone out, and buffering it would end streaming in all but name, so a caller whose tenant has any rule that reads
   responses is refused `400` when it asks for `stream: true` (before anything is sent), on every route that
   streams. Request-only rules never affect streaming. The refusal is explicit rather than a silent unchecked

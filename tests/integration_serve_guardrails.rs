@@ -262,7 +262,7 @@ async fn an_answer_that_breaks_a_response_rule_is_replaced_by_a_422_naming_the_r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_clean_answer_is_returned_a_request_rule_does_not_read_it_and_a_stream_is_refused() {
+async fn a_clean_answer_is_returned_and_a_request_rule_does_not_read_it() {
     // A rule that reads responses leaves a clean answer alone...
     let (up, mock) = chat_upstream(1).await;
     let server = start(
@@ -277,14 +277,6 @@ async fn a_clean_answer_is_returned_a_request_rule_does_not_read_it_and_a_stream
     )
     .await;
     assert_eq!(clean.status(), 200);
-    // ...but the caller under it cannot stream, since a stream cannot be checked after it starts.
-    let streaming = post(
-        &server.base,
-        "/v1/chat/completions",
-        json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": "hello"}]}),
-    )
-    .await;
-    assert_eq!(streaming.status(), 400);
     mock.assert_async().await;
 
     // A request-only rule (the default scope) does not read the answer: the same leaky answer
@@ -302,7 +294,7 @@ async fn a_clean_answer_is_returned_a_request_rule_does_not_read_it_and_a_stream
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_escaped_tool_call_argument_and_every_streaming_route_are_covered() {
+async fn an_escaped_tool_call_argument_in_an_answer_is_read() {
     // A tool call's arguments are JSON text: the secret written with an escape is still read.
     let mut up = mockito::Server::new_async().await;
     let _mock = up
@@ -332,25 +324,6 @@ async fn an_escaped_tool_call_argument_and_every_streaming_route_are_covered() {
     )
     .await;
     assert_eq!(blocked.status(), 422);
-    // Every route that streams is refused to the caller under the rule.
-    for (path, body) in [
-        (
-            "/v1/chat/stream",
-            json!({"model": "p/m", "messages": [{"role": "user", "content": "hi"}]}),
-        ),
-        (
-            "/v1/messages",
-            json!({"model": "p/m", "max_tokens": 5, "stream": true,
-                   "messages": [{"role": "user", "content": "hi"}]}),
-        ),
-        (
-            "/v1/responses",
-            json!({"model": "p/m", "stream": true, "input": "hi"}),
-        ),
-    ] {
-        let refused = post(&server.base, path, body).await;
-        assert_eq!(refused.status(), 400, "{path}");
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -561,14 +534,6 @@ async fn a_response_redaction_rule_masks_the_answer_the_caller_receives() {
         );
     }
     mock.assert_async().await;
-    // The caller under a response rule cannot stream, redaction or not.
-    let streaming = post(
-        &server.base,
-        "/v1/chat/completions",
-        json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": "hello"}]}),
-    )
-    .await;
-    assert_eq!(streaming.status(), 400);
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let usage = loop {
         let usage = std::fs::read_to_string(&log).unwrap_or_default();
@@ -583,4 +548,119 @@ async fn a_response_redaction_rule_masks_the_answer_the_caller_receives() {
         "{usage}"
     );
     assert!(!usage.contains("AKIA"), "{usage}");
+}
+
+fn sse_body(pieces: &[&str]) -> String {
+    let chunk = |delta: String, finish: &str, extra: &str| {
+        format!(
+            "data: {{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\
+             \"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{delta},\
+             \"finish_reason\":{finish}}}]{extra}}}"
+        )
+    };
+    let mut events: Vec<String> = pieces
+        .iter()
+        .enumerate()
+        .map(|(n, piece)| {
+            let delta = if n == 0 {
+                json!({"role": "assistant", "content": piece}).to_string()
+            } else {
+                json!({"content": piece}).to_string()
+            };
+            chunk(delta, "null", "")
+        })
+        .collect();
+    events.push(chunk(
+        "{}".into(),
+        "\"stop\"",
+        ",\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}",
+    ));
+    events.push("data: [DONE]".to_string());
+    events.join("\n\n") + "\n\n"
+}
+
+async fn streaming_upstream(pieces: &[&str]) -> (mockito::ServerGuard, mockito::Mock) {
+    let mut up = mockito::Server::new_async().await;
+    let mock = up
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(sse_body(pieces))
+        .expect(1)
+        .create_async()
+        .await;
+    (up, mock)
+}
+
+async fn stream_text(server: &harness::Server, path: &str, body: Value) -> (u16, String) {
+    let answer = post(&server.base, path, body).await;
+    (answer.status().as_u16(), answer.text().await.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_is_masked_across_chunks_for_every_route_that_streams() {
+    // The key arrives in three pieces; the caller gets the masked text on the engine route, the
+    // streaming route and the native facades, and never any part of the secret.
+    let rule = "[[guardrails]]\nname = \"mask\"\nscope = \"response\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]\nreplacement = \"[hidden]\"";
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        (
+            "/v1/chat/stream",
+            json!({"model": "p/m", "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": "p/m", "max_tokens": 5, "stream": true,
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+    ] {
+        let (up, mock) = streaming_upstream(&["the key is AKIAABC", "DEFGHIJKL", "MNOP, ok"]).await;
+        let server = start(&config(&up.url(), rule, None), "guard-stream-mask", &env());
+        let (status, text) = stream_text(&server, path, body).await;
+        assert_eq!(status, 200, "{path}: {text}");
+        assert!(
+            !text.contains("AKIA") && !text.contains("DEFGH"),
+            "{path}: {text}"
+        );
+        assert!(
+            text.contains("[hidden]") && text.contains("ok"),
+            "{path}: {text}"
+        );
+        mock.assert_async().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_that_breaks_a_blocking_rule_is_cut_with_an_error_event_and_leaks_nothing() {
+    let rule = "[[guardrails]]\nname = \"no-leak\"\nscope = \"response\"\nblock_if_matches = [\"AKIA[0-9A-Z]{16}\"]";
+    let (up, mock) = streaming_upstream(&["the key is AKIAABC", "DEFGHIJKLMNOP"]).await;
+    let server = start(&config(&up.url(), rule, None), "guard-stream-block", &env());
+    let (status, text) = stream_text(
+        &server,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    // The head is out before the match is complete, so the status is 200 and the cut is an event.
+    assert_eq!(status, 200, "{text}");
+    assert!(text.contains("no-leak"), "{text}");
+    assert!(!text.contains("AKIA") && !text.contains("DEFGH"), "{text}");
+    mock.assert_async().await;
+    // A clean stream through a blocking rule is untouched.
+    let (up, mock) = streaming_upstream(&["all ", "clean"]).await;
+    let server = start(&config(&up.url(), rule, None), "guard-stream-clean", &env());
+    let (status, text) = stream_text(
+        &server,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(
+        text.contains("all ") && text.contains("clean") && !text.contains("no-leak"),
+        "{text}"
+    );
+    mock.assert_async().await;
 }

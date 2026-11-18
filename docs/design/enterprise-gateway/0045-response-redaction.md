@@ -36,8 +36,8 @@ replacement = "[hidden]"
 - **Order.** Redaction, then the response blocking rules, then the idempotency cache write and the reply: a cached
   answer is the masked one, and a replayed answer (a cache that outlived a configuration) is masked and judged by
   today's rules.
-- **A caller under a response rule cannot stream** (0043): a stream cannot be rewritten after its first byte, so it
-  is refused 400 before anything is sent. This holds for redaction rules as for blocking ones.
+- **Streaming** is filtered as it runs (0046; 0043 had refused it): a stream's text is held back by 256 bytes, masked and cut
+  as 0046 describes.
 - The bound on growth (four times the text plus 4 KiB), the patterns that match everywhere and the replacement
   rules (no quote, no backslash, not matched by its own patterns) are 0044's, and apply to answers.
 
