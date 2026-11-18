@@ -419,7 +419,7 @@ async fn a_redaction_rule_sends_the_provider_the_masked_text_not_the_secret() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn redaction_and_blocking_compose_and_a_rule_cannot_do_both() {
+async fn redaction_and_blocking_compose_and_a_rule_cannot_do_both_or_neither() {
     // Redact first, then block what is left: the secret is masked, the other pattern still refuses.
     let (up, mock) = chat_upstream(1).await;
     let rules = "[[guardrails]]\nname = \"mask\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]\n\
@@ -446,7 +446,7 @@ async fn redaction_and_blocking_compose_and_a_rule_cannot_do_both() {
     let both = config(
         &up.url(),
         "[[guardrails]]\nname = \"both\"\nblock_if_matches = [\"a\"]\nredact_matches = [\"b\"]\n\
-         [[guardrails]]\nname = \"resp\"\nscope = \"response\"\nredact_matches = [\"c\"]",
+         [[guardrails]]\nname = \"neither\"\nscope = \"response\"",
         None,
     )
     .replace("{DIR}", dir.0.to_str().unwrap());
@@ -470,7 +470,8 @@ async fn redaction_and_blocking_compose_and_a_rule_cannot_do_both() {
         "{text}"
     );
     assert!(
-        text.contains("guardrails[1].scope") && text.contains("request"),
+        text.contains("guardrails[1]")
+            && text.contains("must set block_if_matches or redact_matches"),
         "{text}"
     );
 }
@@ -525,4 +526,61 @@ async fn a_secret_redaction_cannot_reach_is_refused_and_unsafe_rules_are_refused
         text.contains("guardrails[1].replacement") && text.contains("quote"),
         "{text}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_response_redaction_rule_masks_the_answer_the_caller_receives() {
+    let (up, mock) = leaking_upstream(2).await;
+    let dir = tempdir::Dir::new("guard-resp-redact");
+    let log = dir.0.join("usage.jsonl");
+    let rule = "[[guardrails]]\nname = \"mask\"\nscope = \"response\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]\nreplacement = \"[hidden]\"";
+    let server = start(
+        &config(&up.url(), rule, Some(&log)),
+        "guard-resp-redact",
+        &env(),
+    );
+    // The provider's answer leaks a key; the caller gets the masked text with a 200, on the native
+    // facade as on the engine route, and the answer is paid for and recorded as completed.
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            json!({"model": "p/m", "messages": [{"role": "user", "content": "hello"}]}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": "p/m", "max_tokens": 5, "messages": [{"role": "user", "content": "hello"}]}),
+        ),
+    ] {
+        let answer = post(&server.base, path, body).await;
+        let status = answer.status();
+        let text = answer.text().await.unwrap();
+        assert_eq!(status, 200, "{path}: {text}");
+        assert!(
+            text.contains("[hidden]") && !text.contains("AKIA"),
+            "{path}: {text}"
+        );
+    }
+    mock.assert_async().await;
+    // The caller under a response rule cannot stream, redaction or not.
+    let streaming = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": "hello"}]}),
+    )
+    .await;
+    assert_eq!(streaming.status(), 400);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let usage = loop {
+        let usage = std::fs::read_to_string(&log).unwrap_or_default();
+        if usage.lines().count() >= 2 || std::time::Instant::now() > deadline {
+            break usage;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        usage.matches("\"outcome\":\"completed\"").count(),
+        2,
+        "{usage}"
+    );
+    assert!(!usage.contains("AKIA"), "{usage}");
 }

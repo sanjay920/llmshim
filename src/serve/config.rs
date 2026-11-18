@@ -179,7 +179,8 @@ pub struct Guardrail {
     pub block_if_matches: Vec<String>,
     /// Patterns whose matches are **replaced** instead of refusing the request (note 0044): in the
     /// text of the request's messages (content, content parts, tool-call arguments) before it is
-    /// sent. Same syntax and limits as `block_if_matches`; request scope only.
+    /// sent, or in a non-streaming answer's text before it is returned (per `scope`, note 0045).
+    /// Same syntax and limits as `block_if_matches`.
     #[serde(default)]
     pub redact_matches: Vec<String>,
     /// What a redacted match becomes. Default `[redacted]`; at most 64 printable characters.
@@ -1740,12 +1741,6 @@ impl ServeConfig {
                 }
             };
             if field == "redact_matches" {
-                if rule.scope != GuardrailScope::Request {
-                    issues.push(Issue::new(
-                        format!("{at}.scope"),
-                        "must be request for redact_matches: redaction rewrites the request only",
-                    ));
-                }
                 if let Some(text) = &rule.replacement {
                     if text.chars().count() > 64
                         || text

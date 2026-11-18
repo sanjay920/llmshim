@@ -1,6 +1,6 @@
 # 0044: Request redaction
 
-Status: slice 3 of the guardrail pipeline, built (request-side redaction). Response redaction is not built.
+Status: slice 3 of the guardrail pipeline, built (request-side redaction). Response redaction is 0045.
 
 ## Decision
 
@@ -17,9 +17,8 @@ replacement = "[hidden]"                # optional, default "[redacted]"
 ```
 
 - **A rule is a blocker or a redactor, not both** (`block_if_matches` or `redact_matches`; setting both, or
-  neither, is a configuration error by path: use two rules). A redaction rule is **request scope only**: its
-  `scope` must be `request` (the default); redaction rewrites what the provider is sent, and rewriting an answer
-  is not built.
+  neither, is a configuration error by path: use two rules). A redaction rule's `scope` is `request` by default; `response` and `both` are 0045 (which supersedes this note's
+  original request-only restriction).
 - **What is rewritten.** Each match, in the text of the request's **messages**: `content` (a string, or the
   `text` of its parts) and the text of `tool_calls`. A tool call's `arguments` is JSON text: it is **decoded,
   masked and re-encoded**, so a secret written with an escape is found, the result stays valid JSON, and inside it
