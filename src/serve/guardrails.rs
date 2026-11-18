@@ -5,7 +5,7 @@
 //! back-references), so neither a hostile pattern nor hostile text can stall a request. A match
 //! returns the rule's name and nothing else: the pattern and the text it matched are never kept.
 
-use super::config::Guardrail;
+use super::config::{Guardrail, GuardrailScope};
 use crate::gateway::http::RequestGuard;
 use regex::{RegexSet, RegexSetBuilder};
 use serde_json::Value;
@@ -80,36 +80,32 @@ impl Scope {
     }
 }
 
-/// The compiled rules: one set for the rules that apply to everyone and one per tenant that has
-/// rules of its own, so a request is scanned once per scope, not once per rule.
-pub struct Guardrails {
-    names: Vec<String>,
+/// One direction's rules: one set for the rules that apply to everyone and one per tenant that has
+/// rules of its own, so a text is scanned once per scope, not once per rule.
+struct Direction {
     global: Option<Scope>,
     by_tenant: BTreeMap<String, Scope>,
 }
 
-impl Guardrails {
-    /// Compile the file's rules. A failure (a rule set too large to compile together) is reported by
-    /// scope, never by pattern.
-    pub fn build(rules: &[Guardrail]) -> Result<Self, String> {
-        let names = rules.iter().map(|rule| rule.name.clone()).collect();
+impl Direction {
+    fn build(rules: &[(usize, &Guardrail)], direction: &str) -> Result<Self, String> {
         let global_rules: Vec<(usize, &Guardrail)> = rules
             .iter()
-            .enumerate()
+            .copied()
             .filter(|(_, rule)| rule.tenants.is_none())
             .collect();
         let global = Scope::build(&global_rules).map_err(|_| {
-            "the rules for every caller are too large to compile together".to_string()
+            format!("the {direction} rules for every caller are too large to compile together")
         })?;
         let mut tenants = BTreeSet::new();
-        for rule in rules {
+        for (_, rule) in rules {
             tenants.extend(rule.tenants.iter().flatten().cloned());
         }
         let mut by_tenant = BTreeMap::new();
         for tenant in tenants {
             let mine: Vec<(usize, &Guardrail)> = rules
                 .iter()
-                .enumerate()
+                .copied()
                 .filter(|(_, rule)| {
                     rule.tenants
                         .as_ref()
@@ -117,25 +113,23 @@ impl Guardrails {
                 })
                 .collect();
             if let Some(scope) = Scope::build(&mine).map_err(|_| {
-                "the rules for one tenant are too large to compile together".to_string()
+                format!("the {direction} rules for one tenant are too large to compile together")
             })? {
                 by_tenant.insert(tenant, scope);
             }
         }
-        Ok(Self {
-            names,
-            global,
-            by_tenant,
-        })
+        Ok(Self { global, by_tenant })
     }
 
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.global.is_none() && self.by_tenant.is_empty()
     }
-}
 
-impl RequestGuard for Guardrails {
-    fn first_match(&self, tenant: &str, body: &Value) -> Option<String> {
+    fn applies_to(&self, tenant: &str) -> bool {
+        self.global.is_some() || self.by_tenant.contains_key(tenant)
+    }
+
+    fn first_match(&self, tenant: &str, body: &Value) -> Option<usize> {
         let global = self
             .global
             .as_ref()
@@ -145,11 +139,57 @@ impl RequestGuard for Guardrails {
             .get(tenant)
             .and_then(|scope| scope.first_rule(body));
         // The earlier of the two in the file's order.
-        [global, own]
-            .into_iter()
-            .flatten()
-            .min()
+        [global, own].into_iter().flatten().min()
+    }
+}
+
+/// The compiled rules, for requests and for responses.
+pub struct Guardrails {
+    names: Vec<String>,
+    request: Direction,
+    response: Direction,
+}
+
+impl Guardrails {
+    /// Compile the file's rules. A failure (a rule set too large to compile together) is reported by
+    /// scope, never by pattern.
+    pub fn build(rules: &[Guardrail]) -> Result<Self, String> {
+        let names = rules.iter().map(|rule| rule.name.clone()).collect();
+        let indexed: Vec<(usize, &Guardrail)> = rules.iter().enumerate().collect();
+        let reading = |reads: fn(GuardrailScope) -> bool| -> Vec<(usize, &Guardrail)> {
+            indexed
+                .iter()
+                .copied()
+                .filter(|(_, rule)| reads(rule.scope))
+                .collect()
+        };
+        Ok(Self {
+            names,
+            request: Direction::build(&reading(GuardrailScope::reads_request), "request")?,
+            response: Direction::build(&reading(GuardrailScope::reads_response), "response")?,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.request.is_empty() && self.response.is_empty()
+    }
+}
+
+impl RequestGuard for Guardrails {
+    fn first_match(&self, tenant: &str, body: &Value) -> Option<String> {
+        self.request
+            .first_match(tenant, body)
             .map(|index| self.names[index].clone())
+    }
+
+    fn first_response_match(&self, tenant: &str, body: &Value) -> Option<String> {
+        self.response
+            .first_match(tenant, body)
+            .map(|index| self.names[index].clone())
+    }
+
+    fn reads_responses(&self, tenant: &str) -> bool {
+        self.response.applies_to(tenant)
     }
 }
 
@@ -279,6 +319,55 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_rule_reads_the_request_the_response_or_both_and_a_response_rule_marks_its_tenants() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"asks\"\nblock_if_matches = [\"alpha\"]\n\
+             [[guardrails]]\nname = \"answers\"\nscope = \"response\"\ntenants = [\"platform\"]\nblock_if_matches = [\"beta\"]\n\
+             [[guardrails]]\nname = \"either\"\nscope = \"both\"\nblock_if_matches = [\"gamma\"]",
+        );
+        let text = |t: &str| json!({"messages": [{"role": "user", "content": t}]});
+        // A request-only rule reads requests and never responses; a response rule the reverse.
+        assert_eq!(
+            guard.first_match("platform", &text("alpha")).as_deref(),
+            Some("asks")
+        );
+        assert_eq!(guard.first_response_match("platform", &text("alpha")), None);
+        assert_eq!(guard.first_match("platform", &text("beta")), None);
+        assert_eq!(
+            guard
+                .first_response_match("platform", &text("beta"))
+                .as_deref(),
+            Some("answers")
+        );
+        // The response rule is the platform tenant's alone.
+        assert_eq!(guard.first_response_match("other", &text("beta")), None);
+        // `both` reads both directions.
+        assert_eq!(
+            guard.first_match("other", &text("gamma")).as_deref(),
+            Some("either")
+        );
+        assert_eq!(
+            guard
+                .first_response_match("other", &text("gamma"))
+                .as_deref(),
+            Some("either")
+        );
+        // Every tenant is under `either` (it reads responses and names no tenant).
+        assert!(guard.reads_responses("platform") && guard.reads_responses("other"));
+    }
+
+    #[test]
+    fn only_a_request_rule_leaves_a_tenant_free_to_stream() {
+        let guard = rules("[[guardrails]]\nname = \"asks\"\nblock_if_matches = [\"alpha\"]");
+        assert!(!guard.reads_responses("platform"));
+        let scoped = rules(
+            "[[guardrails]]\nname = \"answers\"\nscope = \"response\"\ntenants = [\"platform\"]\nblock_if_matches = [\"beta\"]",
+        );
+        assert!(scoped.reads_responses("platform"));
+        assert!(!scoped.reads_responses("other"));
     }
 
     #[test]

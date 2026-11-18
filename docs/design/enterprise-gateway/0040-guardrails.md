@@ -1,7 +1,7 @@
 # 0040: Request guardrails
 
 Status: slice 1 built (request-side pattern rules). With residency (0039) it is the first half of the roadmap
-item "guardrail pipeline; residency policy". Response-side checks, redaction and external classifiers are not
+item "guardrail pipeline; residency policy". Response-side checks are 0043; redaction and external classifiers are not
 built.
 
 ## The problem
@@ -63,7 +63,7 @@ unchanged; the control plane's lockfile was refreshed.
 
 ## Not built
 
-- **Response guardrails** (checking what the model says) and **streaming** response filters.
+- **Response guardrails** are 0043 (non-streaming chat and transcription); **streaming** response filters are not built.
 - **Redaction** (rewriting instead of refusing) and **allow-lists** (`allow_only`).
 - **External classifiers or moderation APIs** (a network call in the request path, with its own failure modes).
 - Per-key rules (tenant is the scope today), per-route or per-model scoping, and a dry-run mode that counts

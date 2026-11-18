@@ -334,6 +334,14 @@ pub(crate) trait RequestGuard: Send + Sync {
     /// The name of the first rule the request's text breaks for `tenant`, if any. The name is the
     /// operator's own; the pattern and the text matched are never returned.
     fn first_match(&self, tenant: &str, body: &Value) -> Option<String>;
+
+    /// The same for a response (note 0043): the name of the first rule that reads responses and that
+    /// the answer's text breaks for `tenant`.
+    fn first_response_match(&self, tenant: &str, body: &Value) -> Option<String>;
+
+    /// Whether any rule reads `tenant`'s responses. Such a caller cannot stream: a stream cannot be
+    /// checked after its first byte has gone out.
+    fn reads_responses(&self, tenant: &str) -> bool;
 }
 
 /// Everything the single-instance gateway state is built from. Grouping these
@@ -411,6 +419,51 @@ impl GatewayState {
     #[cfg(feature = "serve")]
     pub(crate) fn set_guardrails(&self, guard: Arc<dyn RequestGuard>) {
         let _ = self.guardrails.set(guard);
+    }
+
+    /// Refuse an answer whose text breaks a response rule (note 0043), after the provider has
+    /// answered (and been paid) and before the caller sees it: 502, naming the rule only.
+    fn check_response_guardrails(
+        &self,
+        tenant: &str,
+        provider: &str,
+        answer: &Value,
+    ) -> Result<(), ApiError> {
+        #[cfg(feature = "serve")]
+        if let Some(guard) = self.guardrails.get() {
+            if let Some(rule) = guard.first_response_match(tenant, answer) {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::REJECTED,
+                    &[("provider", provider), ("reason", "guardrail_response")],
+                );
+                return Err(ApiError::from(ShimError::ProviderError {
+                    status: StatusCode::BAD_GATEWAY.as_u16(),
+                    body: json!({
+                        "error": {
+                            "message": format!("response blocked by guardrail {rule}"),
+                            "type": "api_error",
+                            "param": null,
+                            "code": "guardrail_blocked_response"
+                        }
+                    })
+                    .to_string(),
+                    retry_after: None,
+                }));
+            }
+        }
+        #[cfg(not(feature = "serve"))]
+        let _ = (tenant, provider, answer);
+        Ok(())
+    }
+
+    /// Whether `tenant` is under a rule that reads responses (so it cannot stream).
+    fn reads_responses(&self, tenant: &str) -> bool {
+        #[cfg(feature = "serve")]
+        if let Some(guard) = self.guardrails.get() {
+            return guard.reads_responses(tenant);
+        }
+        let _ = tenant;
+        false
     }
 
     /// Refuse a request whose text breaks a guardrail rule (note 0040): 400 `guardrail_blocked`,
@@ -1669,6 +1722,13 @@ async fn chat(
             .await
         {
             Ok(submitted) => {
+                // A rule that reads responses judges the answer's text before the caller sees it and
+                // before it is cached for a retry (note 0043).
+                state.check_response_guardrails(
+                    &identity.tenant,
+                    &provider_name,
+                    submitted.value.get("choices").unwrap_or(&Value::Null),
+                )?;
                 if let Some(context) = &idempotency_context {
                     state
                         .idem_store(
@@ -1883,7 +1943,7 @@ async fn submit_media_call(
     logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
     call: MediaCall<'_>,
     precheck: impl FnOnce(&dyn crate::provider::Provider, &str, &Value) -> Result<(), ShimError>,
-) -> Result<(Value, String, String), ApiError> {
+) -> Result<(Value, String, String, String), ApiError> {
     let prequeue_permit = prequeue_permit(state, installed_prequeue_permit).await?;
     let identified_caller = state.keystore.identify_caller(headers).map_err(|_| {
         crate::gateway::metrics::incr(
@@ -1966,7 +2026,12 @@ async fn submit_media_call(
         )
         .await
         .map_err(|error| gateway_err_to_api(state, error))?;
-    Ok((submitted.value, provider.instance().to_owned(), model))
+    Ok((
+        submitted.value,
+        provider.instance().to_owned(),
+        model,
+        identity.tenant.clone(),
+    ))
 }
 
 /// The most texts one embeddings request may hold on a fleet (note 0041).
@@ -2013,7 +2078,7 @@ async fn embeddings(
         .map(|text| text.len() as u64 / 4 + 1)
         .sum::<u64>()
         .min(u64::from(u32::MAX)) as u32;
-    let (value, provider, model) = submit_media_call(
+    let (value, provider, model, _tenant) = submit_media_call(
         &state,
         &headers,
         installed_prequeue_permit,
@@ -2079,7 +2144,7 @@ async fn images_generations(
     let mut payload = Value::Object(body.rest);
     payload["prompt"] = json!(body.prompt);
     let permits = ((body.prompt.len() as u64 / 4 + 1) * count).min(u64::from(u32::MAX)) as u32;
-    let (value, _provider, _model) = submit_media_call(
+    let (value, _provider, _model, _tenant) = submit_media_call(
         &state,
         &headers,
         installed_prequeue_permit,
@@ -2155,7 +2220,7 @@ async fn audio_speech(
     let mut payload = Value::Object(body.rest);
     payload["input"] = json!(body.input);
     payload["voice"] = json!(body.voice);
-    let (value, _provider, _model) = submit_media_call(
+    let (value, _provider, _model, _tenant) = submit_media_call(
         &state,
         &headers,
         installed_prequeue_permit,
@@ -2373,7 +2438,7 @@ async fn audio_transcriptions(
     payload.insert("filename".into(), json!(filename));
     payload.insert("media_type".into(), json!(media_type));
     drop(bytes);
-    let (value, _provider, _model) = submit_media_call(
+    let (value, provider, _model, tenant) = submit_media_call(
         &state,
         &headers,
         installed_prequeue_permit,
@@ -2415,6 +2480,8 @@ async fn audio_transcriptions(
     )
     .await?;
     let text = value["text"].as_str().unwrap_or_default().to_owned();
+    // A transcript is text the caller will read: a rule that reads responses judges it (note 0043).
+    state.check_response_guardrails(&tenant, &provider, &json!({"text": &text}))?;
     if response_format == "text" {
         return Ok((
             [(
@@ -2540,6 +2607,15 @@ async fn chat_stream_inner(
             );
         }
         let identity = identified_caller.identity;
+        // A stream cannot be checked after its first byte has gone out, so a caller under a rule
+        // that reads responses may not stream (note 0043).
+        if state.reads_responses(&identity.tenant) {
+            return invalid_request(
+                "streaming is not available to a caller whose responses are checked by a guardrail",
+                "stream",
+            )
+            .into_response();
+        }
         tried.push(
             gw.payload
                 .get("model")
