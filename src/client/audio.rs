@@ -9,56 +9,136 @@ impl ShimClient {
         model: &str,
         request: &crate::audio::TranscriptionRequest,
     ) -> Result<crate::audio::TranscriptionResponse> {
+        self.transcription_dispatch(provider, model, request, None)
+            .await
+    }
+
+    /// [`Self::transcription`] under a trusted attempt policy (note 0038): the attempt is admitted
+    /// by the policy before it is sent and reported to it as it ends, with the usage the adapter
+    /// read (tokens or seconds) and its own price (null when unknown).
+    pub async fn transcription_with_policy(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &crate::audio::TranscriptionRequest,
+        policy_context: &crate::policy::DispatchPolicyContext,
+    ) -> Result<crate::audio::TranscriptionResponse> {
+        self.transcription_dispatch(provider, model, request, Some(policy_context))
+            .await
+    }
+
+    async fn transcription_dispatch(
+        &self,
+        provider: &dyn Provider,
+        model: &str,
+        request: &crate::audio::TranscriptionRequest,
+        policy_context: Option<&crate::policy::DispatchPolicyContext>,
+    ) -> Result<crate::audio::TranscriptionResponse> {
         crate::audio::validate_transcription(request)?;
         let upload = provider.transcription_request(model, request)?;
+        let target = policy_context.map(|_| provider.request_replay_target(model, &upload.request));
         let result = async {
-            let attempt = self
+            let super::AttemptResponse {
+                response: upstream,
+                mut tracker,
+                attempt_deadline,
+            } = self
                 .send_prepared_with_body(
-                    None,
+                    policy_context,
                     AttemptKind::Completion,
                     model,
-                    None,
+                    target.as_ref(),
                     &upload.request,
                     None,
                     |builder| Ok(builder.multipart(multipart_form(&upload)?)),
                 )
                 .await?;
-            let response = if upload.request.body["response_format"] == "text" {
-                let media_type = media_type(&attempt.response);
-                if !media_type.eq_ignore_ascii_case("text/plain") {
-                    return Err(DispatchFailure::Upstream(crate::error::provider_error(
-                        502,
-                        "unexpected transcription text media type",
-                    )));
+            let read = async {
+                if upload.request.body["response_format"] == "text" {
+                    let media_type = media_type(&upstream);
+                    if !media_type.eq_ignore_ascii_case("text/plain") {
+                        return Err(DispatchFailure::Upstream(crate::error::provider_error(
+                            502,
+                            "unexpected transcription text media type",
+                        )));
+                    }
+                    let bytes = body::read(
+                        upstream,
+                        self.response_body_limits.success_bytes,
+                        self.deadlines.unary_body_idle,
+                        attempt_deadline,
+                    )
+                    .await
+                    .map_err(body::BodyReadError::into_dispatch_failure)?;
+                    let text = String::from_utf8(bytes).map_err(|_| {
+                        DispatchFailure::Upstream(crate::error::provider_error(
+                            502,
+                            "transcription text is not UTF-8",
+                        ))
+                    })?;
+                    Ok(serde_json::json!({"text": text}))
+                } else {
+                    body::read_json(
+                        upstream,
+                        self.response_body_limits.success_bytes,
+                        self.deadlines.unary_body_idle,
+                        attempt_deadline,
+                    )
+                    .await
+                    .map_err(body::BodyReadError::into_dispatch_failure)
                 }
-                let bytes = body::read(
-                    attempt.response,
-                    self.response_body_limits.success_bytes,
-                    self.deadlines.unary_body_idle,
-                    attempt.attempt_deadline,
-                )
-                .await
-                .map_err(body::BodyReadError::into_dispatch_failure)?;
-                let text = String::from_utf8(bytes).map_err(|_| {
-                    DispatchFailure::Upstream(crate::error::provider_error(
-                        502,
-                        "transcription text is not UTF-8",
-                    ))
-                })?;
-                serde_json::json!({"text": text})
-            } else {
-                body::read_json(
-                    attempt.response,
-                    self.response_body_limits.success_bytes,
-                    self.deadlines.unary_body_idle,
-                    attempt.attempt_deadline,
-                )
-                .await
-                .map_err(body::BodyReadError::into_dispatch_failure)?
+            }
+            .await;
+            let native = match read {
+                Ok(native) => native,
+                Err(error) => {
+                    super::finish_invalid_response(
+                        &mut tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
+                    return Err(error);
+                }
             };
-            provider
-                .transcription_response(model, request, response)
-                .map_err(DispatchFailure::Upstream)
+            let transcript = match provider.transcription_response(model, request, native) {
+                Ok(transcript) => transcript,
+                Err(error) => {
+                    super::finish_invalid_response(
+                        &mut tracker,
+                        self.deadlines.policy_callback,
+                        attempt_deadline,
+                    )
+                    .await?;
+                    return Err(DispatchFailure::Upstream(error));
+                }
+            };
+            if let Some(tracker) = tracker.as_mut() {
+                // The counters are the provider's own (`input_tokens` / `output_tokens`, or only
+                // seconds for a per-minute model); the price is the adapter's, null when unknown.
+                let usage = &transcript.usage;
+                let tokens = |key: &str| usage.get(key).and_then(Value::as_u64);
+                let complete =
+                    tokens("input_tokens").is_some() && tokens("output_tokens").is_some();
+                let frame = serde_json::json!({
+                    "prompt_tokens": tokens("input_tokens").unwrap_or(0),
+                    "completion_tokens": tokens("output_tokens").unwrap_or(0),
+                    "cost_usd": usage.get("cost_usd").cloned().unwrap_or(Value::Null),
+                    "cost_source": super::images::known_cost_source(usage),
+                });
+                let observed = tracker.usage(&frame, true, complete, false);
+                super::bounded_policy(observed, self.deadlines.policy_callback, attempt_deadline)
+                    .await
+                    .map_err(|_| super::coordinator_timeout_observation())?
+                    .map_err(DispatchFailure::PolicyObservation)?;
+            }
+            super::finish_completed_response(
+                &mut tracker,
+                self.deadlines.policy_callback,
+                attempt_deadline,
+            )
+            .await?;
+            Ok(transcript)
         }
         .await;
         if let Some(outcome) = Self::breaker_outcome(&result) {
