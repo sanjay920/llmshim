@@ -474,3 +474,55 @@ async fn redaction_and_blocking_compose_and_a_rule_cannot_do_both() {
         "{text}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_secret_redaction_cannot_reach_is_refused_and_unsafe_rules_are_refused_at_start() {
+    // A redact-only rule masks message text; a secret in a tool description (a passthrough field)
+    // would go out verbatim, so the rule's pattern refuses it instead.
+    let (up, mock) = chat_upstream(0).await;
+    let rule = "[[guardrails]]\nname = \"mask\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]";
+    let server = start(&config(&up.url(), rule, None), "guard-residual", &env());
+    let refused = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "messages": [{"role": "user", "content": "hi"}],
+               "tools": [{"type": "function", "function": {"name": "f", "description": SECRET,
+                   "parameters": {"type": "object", "properties": {}}}}]}),
+    )
+    .await;
+    assert_eq!(refused.status(), 400);
+    mock.assert_async().await;
+    // A pattern that matches the empty string, and a replacement with a quote, are start errors.
+    let dir = tempdir::Dir::new("guard-unsafe");
+    let path = dir.0.join("gateway.toml");
+    let bad = config(
+        &up.url(),
+        "[[guardrails]]\nname = \"empty\"\nredact_matches = [\"x*\"]\n\
+         [[guardrails]]\nname = \"quote\"\nredact_matches = [\"y\"]\nreplacement = \"a\\\"b\"",
+        None,
+    )
+    .replace("{DIR}", dir.0.to_str().unwrap());
+    std::fs::write(&path, bad).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args([
+            "serve",
+            "--check",
+            "--structure-only",
+            "--config",
+            path.to_str().unwrap(),
+        ])
+        .env_clear()
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stderr).to_string()
+        + &String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("guardrails[0].redact_matches[0]") && text.contains("empty string"),
+        "{text}"
+    );
+    assert!(
+        text.contains("guardrails[1].replacement") && text.contains("quote"),
+        "{text}"
+    );
+}

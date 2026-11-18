@@ -1747,10 +1747,15 @@ impl ServeConfig {
                     ));
                 }
                 if let Some(text) = &rule.replacement {
-                    if text.chars().count() > 64 || text.chars().any(char::is_control) {
+                    if text.chars().count() > 64
+                        || text
+                            .chars()
+                            .any(|c| c.is_control() || c == '"' || c == '\\')
+                    {
                         issues.push(Issue::new(
                             format!("{at}.replacement"),
-                            "must be at most 64 printable characters",
+                            "must be at most 64 printable characters, with no quote or backslash \
+                             (it is inserted into JSON text)",
                         ));
                     }
                 }
@@ -1770,11 +1775,31 @@ impl ServeConfig {
                 let at_n = format!("{at}.{field}[{n}]");
                 if pattern.is_empty() || pattern.chars().count() > 1024 {
                     issues.push(Issue::new(at_n, "must be 1 to 1024 characters"));
-                } else if super::guardrails::compile(pattern).is_err() {
-                    issues.push(Issue::new(
-                        at_n,
-                        "is not a valid regular expression, or is too large to compile",
-                    ));
+                } else {
+                    match super::guardrails::compile(pattern) {
+                        Err(_) => issues.push(Issue::new(
+                            at_n,
+                            "is not a valid regular expression, or is too large to compile",
+                        )),
+                        // A pattern that matches nothing at all matches everywhere: it would refuse
+                        // every request, or put the replacement between every character.
+                        Ok(compiled) if compiled.is_match("") => issues.push(Issue::new(
+                            at_n,
+                            "matches the empty string, so it would match everywhere",
+                        )),
+                        Ok(compiled) => {
+                            // A replacement that a pattern of its own rule matches would be redacted
+                            // again by the next rule and refused by the residual check.
+                            if let Some(text) = &rule.replacement {
+                                if field == "redact_matches" && compiled.is_match(text) {
+                                    issues.push(Issue::new(
+                                        format!("{at}.replacement"),
+                                        "is matched by one of the rule's own patterns",
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

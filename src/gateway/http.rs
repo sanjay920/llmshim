@@ -346,7 +346,7 @@ pub(crate) trait RequestGuard: Send + Sync {
     /// Rewrite the text of `value` (a message's `content` or `tool_calls`) for `tenant` (note 0044):
     /// each match of a redaction rule becomes its replacement. The names of the rules that changed
     /// anything.
-    fn redact(&self, tenant: &str, value: &mut Value) -> Vec<String>;
+    fn redact(&self, tenant: &str, value: &mut Value) -> Result<Vec<String>, String>;
 }
 
 /// Everything the single-instance gateway state is built from. Grouping these
@@ -464,18 +464,41 @@ impl GatewayState {
     /// Apply the redaction rules to a request's messages before anything else sees them (note 0044):
     /// the text of each message's content and tool calls, for the caller's tenant. A caller that
     /// does not authenticate is left to be refused by the handler.
-    fn redact_request(&self, headers: &HeaderMap, req: &mut ChatRequest) {
+    fn redact_request(&self, headers: &HeaderMap, req: &mut ChatRequest) -> Result<(), ApiError> {
         #[cfg(feature = "serve")]
         if let Some(guard) = self.guardrails.get() {
             let Ok(caller) = self.keystore.identify_caller(headers) else {
-                return;
+                return Ok(());
             };
             let tenant = &caller.identity.tenant;
+            let too_large = |rule: String| {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::REJECTED,
+                    &[("provider", "unknown"), ("reason", "guardrail")],
+                );
+                ApiError::from(ShimError::ProviderError {
+                    status: StatusCode::BAD_REQUEST.as_u16(),
+                    body: json!({
+                        "error": {
+                            "message": format!("request blocked by guardrail {rule}"),
+                            "type": "invalid_request_error",
+                            "param": null,
+                            "code": "guardrail_blocked"
+                        }
+                    })
+                    .to_string(),
+                    retry_after: None,
+                })
+            };
             let mut applied = std::collections::BTreeSet::new();
             for message in &mut req.messages {
-                applied.extend(guard.redact(tenant, &mut message.content));
+                applied.extend(
+                    guard
+                        .redact(tenant, &mut message.content)
+                        .map_err(too_large)?,
+                );
                 if let Some(calls) = message.tool_calls.as_mut() {
-                    applied.extend(guard.redact(tenant, calls));
+                    applied.extend(guard.redact(tenant, calls).map_err(too_large)?);
                 }
             }
             for rule in applied {
@@ -487,6 +510,7 @@ impl GatewayState {
         }
         #[cfg(not(feature = "serve"))]
         let _ = (headers, req);
+        Ok(())
     }
 
     /// Whether `tenant` is under a rule that reads responses (so it cannot stream).
@@ -1601,7 +1625,7 @@ async fn chat(
     uri: Uri,
     Json(mut req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
-    state.redact_request(&headers, &mut req);
+    state.redact_request(&headers, &mut req)?;
     let preselected = admitted_router.map(|axum::Extension(AdmittedRouter(router))| router);
     let prequeue_permit = prequeue_permit(&state, installed_prequeue_permit).await?;
     if logical_lifetime
@@ -2583,7 +2607,9 @@ async fn chat_stream(
     headers: HeaderMap,
     Json(mut req): Json<ChatRequest>,
 ) -> Response {
-    state.redact_request(&headers, &mut req);
+    if let Err(error) = state.redact_request(&headers, &mut req) {
+        return error.into_response();
+    }
     let prequeue_permit = match prequeue_permit(&state, installed_prequeue_permit).await {
         Ok(permit) => permit,
         Err(error) => return error.into_response(),
