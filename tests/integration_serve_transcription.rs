@@ -269,3 +269,57 @@ async fn a_key_with_a_spend_cap_cannot_transcribe_even_with_the_opt_in() {
         mock.assert_async().await;
     }
 }
+
+/// A multipart body written by hand, so a part can omit its Content-Type as `curl -F file=@a.wav`
+/// does (a typed client always sets one).
+async fn raw_upload(base: &str, file_headers: &str) -> reqwest::Response {
+    let boundary = "llmshimtestboundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{MODEL}\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(
+        format!("--{boundary}\r\n{file_headers}\r\n\r\nRIFF....WAVEfmt \r\n--{boundary}--\r\n")
+            .as_bytes(),
+    );
+    reqwest::Client::new()
+        .post(format!("{base}/v1/audio/transcriptions"))
+        .bearer_auth(CALLER_KEY)
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_part_without_a_usable_content_type_is_served_as_untyped_audio() {
+    let (up, mock) = upstream(2).await;
+    let server = start(&config(&up.url(), "", None), "tr-ctype", &env());
+    // No Content-Type on the part: OpenAI accepts it, so it is not a 502 after queueing.
+    let served = raw_upload(
+        &server.base,
+        "Content-Disposition: form-data; name=\"file\"; filename=\"a.wav\"",
+    )
+    .await;
+    assert_eq!(served.status(), 200, "{}", served.text().await.unwrap());
+    // A type the form parser cannot read is the same as none, not a 502 after queueing.
+    let served_too = raw_upload(
+        &server.base,
+        "Content-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: not a type",
+    )
+    .await;
+    assert_eq!(
+        served_too.status(),
+        200,
+        "{}",
+        served_too.text().await.unwrap()
+    );
+    mock.assert_async().await;
+}

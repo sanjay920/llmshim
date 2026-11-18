@@ -49,8 +49,29 @@ dependency is locked).
 `DispatchOperation::Transcription` and `ShimClient::transcription_with_policy` (new, additive public API; the
 existing `transcription` is the same code with no policy). The upload is read into the library's request, carried
 to the dispatcher as a JSON value (the audio as base64 beside its filename, media type and fields; a fleet never
-sees it), and decoded again for the send. Held in memory a few times at the 25 MB limit: the bucket weighs the
-upload, but the concurrency cap, not the byte count, bounds how many are held at once.
+sees it), and decoded again for the send.
+
+### Memory and slow uploads (found in review)
+
+An upload at the limit is held as the form's bytes, a base64 copy (about 33 MB) and the decoded audio (25 MB),
+and a queued job keeps its copy: the concurrency cap is per provider and does not weigh bytes, so it does not
+bound this. Two bounds do:
+
+- **A pool of 256 MiB for uploads held at once**, taken before the form is read by the size the caller declared
+  (`Content-Length`, or the limit when it declared none), in whole megabytes, and held until the answer is built.
+  When it is spoken for the answer is **503 with Retry-After at once**, never a wait: waiting would hold the
+  upload's connection and permit open. About ten full-size uploads fit, a few hundred megabytes in the worst case.
+- **An idle bound of 30 s on the upload stream.** The logical lifetime is hours and was the only limit on the
+  read, so a caller trickling bytes could hold a preparation permit for all of it. A stall past 30 s between
+  chunks ends the read (a 408 `upload_stalled`); a steady upload is never cut off however long it runs.
+
+The bucket weight is one permit per KiB, capped at 256 so a limiter bucket smaller than the largest upload cannot
+leave it unadmittable. Things still true: the allowlist, the rate limit and the fleet refusal run after the form
+is read (an authenticated caller can make the gateway read an upload it then refuses with a 403), and every multer
+error other than size or a broken stream is one 400 ("malformed").
+
+A part without a Content-Type (curl's `-F file=@a.wav` sends none) or with one the form parser cannot read is
+untyped audio (`application/octet-stream`), as OpenAI accepts it; it was a 502 after queueing in the first draft.
 
 ## Tests
 
@@ -59,4 +80,6 @@ record's counters and exact price ($0.000134 for 14 audio and 5 output tokens); 
 uploads (not multipart, no file, no model, a non-transcription model, a bad language, an empty file, a route,
 `verbose_json`, a non-numeric temperature) are 400 before the provider; an upload one byte over the limit is a
 413 (an unbounded reader fails it); 401, 403 and a zero rpm; capped keys refused with and without the opt-in
-(skipping the refusal fails it). The fleet 501 is not tested (it needs a Redis fleet).
+(skipping the refusal fails it); a part with no usable Content-Type is served; and the stall bound is a unit
+test with paused time (`upload_tests`: a stalled stream ends with `TimedOut`, a steady one of any length does
+not). The 503 from an exhausted pool is not tested (it needs a quarter of a gigabyte of concurrent uploads). The fleet 501 is not tested (it needs a Redis fleet).

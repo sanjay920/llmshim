@@ -2101,6 +2101,52 @@ async fn audio_speech(
     Ok(([(axum::http::header::CONTENT_TYPE, media_type)], audio).into_response())
 }
 
+/// How long a multipart upload may go without sending a byte before it is cut off (note 0038). The
+/// logical lifetime is the only other bound, and it is hours: a caller trickling bytes would hold a
+/// preparation permit for all of it.
+#[cfg(feature = "serve")]
+const UPLOAD_IDLE: Duration = Duration::from_secs(30);
+
+/// `stream` with a bound on the wait for each chunk: a stall longer than `idle` ends it with a
+/// `TimedOut` error instead of waiting for the lifetime.
+#[cfg(feature = "serve")]
+fn idle_bounded<S>(
+    stream: S,
+    idle: Duration,
+) -> impl futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin,
+{
+    use futures::StreamExt as _;
+    futures::stream::unfold(Some(stream), move |state| async move {
+        let mut stream = state?;
+        match tokio::time::timeout(idle, stream.next()).await {
+            Err(_) => Some((
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "upload stalled",
+                )),
+                None,
+            )),
+            Ok(None) => None,
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(stream))),
+            Ok(Some(Err(error))) => Some((Err(std::io::Error::other(error)), None)),
+        }
+    })
+}
+
+/// Megabytes of uploads this process holds at once (note 0038). An upload is held as the form's
+/// bytes, a base64 copy and the decoded audio while it queues and runs, so the count is bounded
+/// here rather than by the concurrency cap, which is per provider and does not weigh bytes.
+#[cfg(feature = "serve")]
+const UPLOAD_POOL_MIB: usize = 256;
+
+#[cfg(feature = "serve")]
+fn upload_pool() -> &'static tokio::sync::Semaphore {
+    static POOL: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| tokio::sync::Semaphore::new(UPLOAD_POOL_MIB))
+}
+
 /// POST /v1/audio/transcriptions — OpenAI's multipart upload (`file`, `model`, and optional
 /// `language`, `prompt`, `response_format`, `temperature`), admitted as an attempt (note 0038). The
 /// upload is read with a hard bound (the library's 25 MB audio limit) before it is queued, and a
@@ -2138,8 +2184,23 @@ async fn audio_transcriptions(
                 .whole_stream(max + 64 * 1024)
                 .per_field(max),
         );
+    // Hold the upload's share of the pool until the answer is built: what the caller declared (or
+    // the limit, when it declared nothing) in whole megabytes. Refused at once when the pool is
+    // spoken for, not queued: waiting would hold the upload's connection and permit open.
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(max + 64 * 1024);
+    let mib = (declared.div_ceil(1024 * 1024)).clamp(1, UPLOAD_POOL_MIB as u64) as u32;
+    let _upload_share = upload_pool()
+        .try_acquire_many(mib)
+        .map_err(|_| ApiError::Overloaded(state.overloaded_retry_after))?;
     let mut form = multer::Multipart::with_constraints(
-        request.into_body().into_data_stream(),
+        idle_bounded(
+            Box::pin(request.into_body().into_data_stream()),
+            UPLOAD_IDLE,
+        ),
         boundary,
         constraints,
     );
@@ -2156,6 +2217,14 @@ async fn audio_transcriptions(
         multer::Error::FieldSizeExceeded { .. } | multer::Error::StreamSizeExceeded { .. } => {
             too_large()
         }
+        // The stream broke or stalled (`idle_bounded`): the caller stopped sending.
+        multer::Error::StreamReadFailed(_) => ApiError::from(ShimError::ProviderError {
+            status: StatusCode::REQUEST_TIMEOUT.as_u16(),
+            body: json!({"error": {"message": "the upload stalled or was interrupted", "type":
+                "invalid_request_error", "param": "file", "code": "upload_stalled"}})
+            .to_string(),
+            retry_after: None,
+        }),
         _ => invalid_request("the multipart upload is malformed", "file"),
     };
     let mut payload = serde_json::Map::new();
@@ -2166,10 +2235,11 @@ async fn audio_transcriptions(
         match name.as_str() {
             "file" => {
                 let filename = field.file_name().unwrap_or("audio").to_owned();
+                // OpenAI accepts a part with no type (curl's `-F file=@a.wav` sends none).
                 let media_type = field
                     .content_type()
                     .map(ToString::to_string)
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| "application/octet-stream".to_owned());
                 let bytes = field.bytes().await.map_err(malformed)?.to_vec();
                 audio = Some((bytes, filename, media_type));
             }
@@ -2203,10 +2273,12 @@ async fn audio_transcriptions(
         .and_then(Value::as_str)
         .unwrap_or("json")
         .to_owned();
-    let permits = (bytes.len() as u64 / 1024 + 1).min(u64::from(u32::MAX)) as u32;
+    // One permit per KiB, capped: a limiter bucket smaller than the largest upload would otherwise
+    // never admit it.
+    let permits = (bytes.len() as u64 / 1024 + 1).min(256) as u32;
     payload.insert(
         "audio_b64".into(),
-        json!(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+        Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
     );
     payload.insert("filename".into(), json!(filename));
     payload.insert("media_type".into(), json!(media_type));
@@ -2237,6 +2309,15 @@ async fn audio_transcriptions(
             request.response_format = text("response_format");
             request.temperature = payload.get("temperature").and_then(Value::as_f64);
             crate::audio::validate_transcription(&request)?;
+            // The part's type is parsed when the form is built, after the job has queued: refuse a
+            // malformed one here.
+            reqwest::multipart::Part::bytes(Vec::new())
+                .mime_str(&request.media_type)
+                .map_err(|_| ShimError::ProviderError {
+                    status: 400,
+                    body: "transcription media type is not a valid media type".into(),
+                    retry_after: None,
+                })?;
             // The adapter's own refusals (a model that does not transcribe, a format it lacks).
             provider.transcription_request(model, &request).map(|_| ())
         },
@@ -2869,6 +2950,42 @@ async fn native_translate(
         .extensions_mut()
         .insert(AdmittedRouter(snapshot.clone()));
     crate::proxy::wire::translate_with_router(request, next, Some(&snapshot)).await
+}
+
+#[cfg(all(test, feature = "serve"))]
+mod upload_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_upload_ends_with_a_timeout_instead_of_waiting_for_the_lifetime() {
+        // One chunk, then silence: the second read is cut off at the idle bound.
+        let source = futures::stream::once(async { Ok(axum::body::Bytes::from_static(b"abc")) })
+            .chain(futures::stream::pending());
+        let mut bounded = Box::pin(idle_bounded(Box::pin(source), Duration::from_secs(30)));
+        assert_eq!(bounded.next().await.unwrap().unwrap().as_ref(), b"abc");
+        let stalled = bounded.next().await.unwrap().unwrap_err();
+        assert_eq!(stalled.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            bounded.next().await.is_none(),
+            "the stream ends after the timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_steady_upload_is_not_cut_off_however_long_it_runs() {
+        // A chunk every 20 s for far longer than the 30 s bound: the bound is per chunk.
+        let source = futures::stream::unfold(0, |n| async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            (n < 5).then(|| (Ok(axum::body::Bytes::from_static(b"x")), n + 1))
+        });
+        let mut bounded = Box::pin(idle_bounded(Box::pin(source), Duration::from_secs(30)));
+        let mut count = 0;
+        while let Some(chunk) = bounded.next().await {
+            chunk.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 5);
+    }
 }
 
 #[cfg(test)]
