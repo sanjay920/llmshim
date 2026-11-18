@@ -39,11 +39,18 @@ exact price and complete counters. The dispatcher returns the audio as base64 be
 (the scheduler carries JSON values); the route decodes it and answers with the bytes. The reservation is
 `budget::quote_speech`.
 
+## Limits
+
+The audio is copied several times on the way (read, base64 for the scheduler's JSON value, decoded for the
+body); a long synthesis holds a few copies in memory, and the bucket weighs the input's length, not the audio's.
+
 ## Tests
 
 `integration_serve_speech` (process): the bytes and content type arrive intact and the record is priced exactly
 ($0.000165 for 11 characters at $15 per million); bad requests (blank input, a non-word voice, a bad format, a
 speed of 9, a non-speech model, a route) are 400 before the provider; 401, 403 and a zero rpm; a cap of 400,000
 nanodollars admits two 165,000-nanodollar calls and refuses the third; one request above the cap is refused
-before the provider. A reservation that ignores the characters, or treating speech as unbounded like images,
+before the provider. `gateway::budget::tests::a_speech_reservation_equals_its_settlement_for_every_allowed_length` compares the
+reservation with the adapter's own settled cost for every length from 1 to 4096 on both models (an integer
+formula fails it); a multibyte input is priced by characters, and `tts-1-hd` by its own rate. A reservation that ignores the characters, or treating speech as unbounded like images,
 each fails two of them. The fleet 501 is not tested (it needs a Redis fleet).

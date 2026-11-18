@@ -189,3 +189,23 @@ async fn one_request_bigger_than_the_cap_is_refused_before_the_provider() {
     );
     mock.assert_async().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn characters_not_bytes_are_priced_and_the_hd_model_has_its_own_rate() {
+    // "héllo wörld" is 11 characters in 13 bytes; tts-1-hd is $30 per million characters.
+    let (up, mock) = upstream(1).await;
+    let dir = tempdir::Dir::new("speech-chars");
+    let log = dir.0.join("usage.jsonl");
+    let server = start(&config(&up.url(), "", Some(&log)), "speech-chars", &env());
+    let answer = speak(
+        &server.base,
+        Some(CALLER_KEY),
+        json!({"model": "openai/tts-1-hd", "input": "héllo wörld", "voice": "alloy"}),
+    )
+    .await;
+    assert_eq!(answer.status(), 200);
+    mock.assert_async().await;
+    let records = records_of(&log, 1).await;
+    let cost = records[0]["cost_usd"].as_f64().expect("priced");
+    assert!((cost - 0.00033).abs() < 1e-12, "{cost}");
+}
