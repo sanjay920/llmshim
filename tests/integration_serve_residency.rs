@@ -93,21 +93,29 @@ async fn a_key_in_one_residency_reaches_its_providers_only_and_the_others_never_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn residency_and_an_allowlist_must_both_admit_and_the_media_routes_obey_it_too() {
-    let (eu, _eu_mock) = chat_upstream(0).await;
+    let (eu, eu_mock) = chat_upstream(1).await;
     let (us, us_mock) = chat_upstream(0).await;
-    let (plain, _plain_mock) = chat_upstream(0).await;
+    let (plain, plain_mock) = chat_upstream(0).await;
     // The list names a provider outside the key's residency: it is the intersection that counts.
     let server = start(
         &config(
             &eu.url(),
             &us.url(),
             &plain.url(),
-            "allowed_residency = [\"eu\"]\nallowed_models = [\"eu_a/m\", \"us_a/m\"]",
+            "allowed_residency = [\"eu\"]\nallowed_models = [\"eu_a/m\", \"us_a/m\", \"route/to_us\"]",
         ),
         "residency-both",
         &env(),
     );
+    assert_eq!(
+        ask(&server.base, "eu_a/m").await.status(),
+        200,
+        "overlap is served"
+    );
     assert_eq!(ask(&server.base, "us_a/m").await.status(), 403);
+    // An alias entry in the list is dropped under residency, so the route it names is not a way
+    // around the labels (it is an unknown route here, and refused either way).
+    assert_ne!(ask(&server.base, "route/to_us").await.status(), 200);
     // The embeddings route asks the same allowlist.
     let embed = reqwest::Client::new()
         .post(format!("{}/v1/embeddings", server.base))
@@ -119,7 +127,9 @@ async fn residency_and_an_allowlist_must_both_admit_and_the_media_routes_obey_it
     assert_eq!(embed.status(), 403);
     let body: Value = embed.json().await.unwrap();
     assert_eq!(body["error"]["code"], "model_not_allowed");
+    eu_mock.assert_async().await;
     us_mock.assert_async().await;
+    plain_mock.assert_async().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

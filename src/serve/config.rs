@@ -2685,7 +2685,7 @@ impl ServeConfig {
                 {
                     issues.push(Issue::new(
                         format!("{at}.allowed_residency"),
-                        "leaves no model this key may call (with allowed_models, no entry names a provider in these regions)",
+                        "leaves no model this key may call (with allowed_models, no entry names a provider in these labels; route/ and deployment/ entries are ignored under residency)",
                     ));
                 }
             }
@@ -4168,6 +4168,37 @@ mod tests {
                 .iter()
                 .any(|issue| issue.contains("providers.eu_a.residency")),
             "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_provider_whose_name_is_a_prefix_of_another_is_not_confused_with_it() {
+        // `eu` is labeled us and `eu_a` is labeled eu: a key in the eu residency gets `eu_a/*` and
+        // never `eu/*`, and an entry `eu/m` does not survive for it (names are compared whole).
+        let text = format!(
+            r#"
+            version = 1
+            [providers.eu]
+            kind = "openai-compatible"
+            base_url = "https://one.example.com/v1"
+            residency = "us"
+            [providers.eu_a]
+            kind = "openai-compatible"
+            base_url = "https://two.example.com/v1"
+            residency = "eu"
+            [[keys]]
+            name = "k"
+            tenant = "t"
+            sha256 = "{}"
+            allowed_residency = ["eu"]
+            allowed_models = ["eu/m", "eu_a/m"]
+            "#,
+            "a".repeat(64)
+        );
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        assert_eq!(
+            config.effective_allowed_models(&config.keys[0]),
+            Some(vec!["eu_a/m".to_string()])
         );
     }
 

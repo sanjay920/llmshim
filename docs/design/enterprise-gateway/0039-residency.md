@@ -49,10 +49,19 @@ fallback list, a deployment's pick) before anything is reserved or queued, with 
 The expansion is part of each identity's fingerprint, so a reload that changes a provider's label (or a key's
 labels) swaps the key store like any other key change.
 
+## Deployments
+
+A deployment is resolved to one target **before** the allowlist is asked, so a restricted key sending
+`deployment/x` is judged by the target that pick lands on: if the deployment mixes labels, the same request
+is sometimes served and sometimes a 403. That is no leak, but it is intermittent; **give a restricted key only
+deployments whose targets are all in its residency**. (A failover retry is judged the same way, and a retry the
+key may not make returns the original failure.)
+
 ## Limits (not built)
 
 - **Control-plane keys and signed snapshots** carry no residency yet; a key managed there can use
-  `allowed_models` only. A snapshot field needs the older-data-plane care 0030 describes (a data plane that
+  `allowed_models` only. Because that leaves such keys unrestricted by labels, `serve` prints a warning at start
+  when `[control_plane]` is set and any provider carries a label. A snapshot field needs the older-data-plane care 0030 describes (a data plane that
   predates a field refuses the whole snapshot).
 - **Tenants** (`[tenants.<name>]`) have no residency; a tenant-wide rule is one `allowed_residency` per key.
 - **Provider-side routing is trusted.** A provider that itself routes to other regions (OpenRouter, a vendor
