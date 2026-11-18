@@ -23,7 +23,7 @@ gateway-redis = ["gateway", "redis-coordination"]
 redis-coordination = ["proxy", "dep:redis"]
 # In development: a config-file-driven server (`llmshim serve`). Off by default
 # and implied by no other feature; see docs/design/enterprise-gateway.
-serve = ["gateway", "dep:multer", "dep:ring", "dep:x509-parser", "dep:tokio-rustls", "dep:schemars"]
+serve = ["gateway", "dep:multer", "dep:regex", "dep:ring", "dep:x509-parser", "dep:tokio-rustls", "dep:schemars"]
 # `serve` with fleet mode: a shared Redis queue, rate limits, spend ledger and
 # provider health across replicas. Needed for the `[fleet]` configuration table.
 serve-redis = ["serve", "gateway-redis"]
@@ -73,6 +73,9 @@ axum = { version = "0.8", features = ["json"], optional = true }
 # Reads the multipart upload of `POST /v1/audio/transcriptions` (note 0038): the parser axum's own
 # `Multipart` is built on, used directly so the proxy and gateway builds do not gain it.
 multer = { version = "3", default-features = false, optional = true }
+# The guardrails' patterns (note 0040): linear-time matching, so a hostile pattern or text cannot
+# stall a request.
+regex = { version = "1", default-features = false, features = ["std", "unicode", "perf"], optional = true }
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"], optional = true }
 rcgen = { version = "0.14", optional = true }

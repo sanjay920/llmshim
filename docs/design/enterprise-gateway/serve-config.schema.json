@@ -353,6 +353,39 @@
       ],
       "type": "object"
     },
+    "Guardrail": {
+      "additionalProperties": false,
+      "description": "One guardrail rule (note 0040): a request whose text matches any of the patterns is refused\nwith 400 `guardrail_blocked`, naming the rule. The pattern and the matched text are never\nechoed, logged or counted.",
+      "properties": {
+        "block_if_matches": {
+          "description": "Regular expressions (Rust `regex` syntax: linear-time, no look-around or back-references),\nmatched anywhere in any text of the request. 1 to 64, each at most 1024 characters.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "Names the rule in the refusal and nowhere else is it exposed: lowercase letters, digits,\n`-` and `_`. Unique.",
+          "type": "string"
+        },
+        "tenants": {
+          "default": null,
+          "description": "The tenants the rule applies to. Omit for every caller.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "block_if_matches"
+      ],
+      "type": "object"
+    },
     "JwtBinding": {
       "additionalProperties": false,
       "description": "A key that authenticates by a verified workload token.",
@@ -1245,6 +1278,13 @@
         }
       ],
       "description": "Run as one replica of a fleet sharing a Redis instance. Without it the\nserver is a single instance with in-process state."
+    },
+    "guardrails": {
+      "description": "Request guardrails (note 0040): rules that refuse a request whose text matches a pattern,\nbefore anything is reserved, queued or sent. Fixed at start.",
+      "items": {
+        "$ref": "#/$defs/Guardrail"
+      },
+      "type": "array"
     },
     "keys": {
       "items": {

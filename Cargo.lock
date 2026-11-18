@@ -1850,6 +1850,7 @@ dependencies = [
  "prost",
  "rcgen",
  "redis",
+ "regex",
  "reqwest",
  "ring",
  "rustls",

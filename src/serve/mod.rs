@@ -15,6 +15,7 @@ mod access_log;
 pub mod allowlist;
 pub mod build;
 pub mod config;
+pub mod guardrails;
 mod jsonl;
 pub mod jwks;
 pub mod jwt;

@@ -1,0 +1,190 @@
+//! Guardrails on `serve` (note 0040): a request whose text matches a rule is refused before
+//! anything is reserved or sent, on every route, from a real process.
+#![cfg(feature = "serve")]
+
+#[path = "support/serve_harness.rs"]
+mod harness;
+
+use harness::{completion, start, tempdir, ADMIN_TOKEN, CALLER_KEY};
+use serde_json::{json, Value};
+use std::time::Duration;
+
+fn config(upstream: &str, guardrails: &str, log: Option<&std::path::Path>) -> String {
+    let logging = log
+        .map(|path| {
+            format!(
+                "[logging]\nusage_log = \"{}\"\naccess_log = \"{}\"\n",
+                path.display(),
+                path.display().to_string().replace("usage", "access")
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"
+        version = 1
+        [server]
+        port = 0
+        [state]
+        receipts_dir = "{{DIR}}/receipts"
+        [providers.p]
+        kind = "openai-compatible"
+        base_url = "{upstream}"
+        [[keys]]
+        name = "ci"
+        tenant = "platform"
+        secret = {{ env = "SERVE_E2E_CALLER_KEY" }}
+        [admin]
+        port = 0
+        token = {{ env = "SERVE_E2E_ADMIN_TOKEN" }}
+        {logging}
+        {guardrails}
+        "#
+    )
+}
+
+fn env() -> [(&'static str, &'static str); 1] {
+    [("SERVE_E2E_ADMIN_TOKEN", ADMIN_TOKEN)]
+}
+
+const RULE: &str = r#"
+    [[guardrails]]
+    name = "cloud-keys"
+    block_if_matches = ["AKIA[0-9A-Z]{16}"]
+"#;
+const SECRET: &str = "my key is AKIAABCDEFGHIJKLMNOP";
+
+async fn chat_upstream(calls: usize) -> (mockito::ServerGuard, mockito::Mock) {
+    let mut up = mockito::Server::new_async().await;
+    let mock = up
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .expect(calls)
+        .create_async()
+        .await;
+    (up, mock)
+}
+
+async fn post(base: &str, path: &str, body: Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}{path}"))
+        .bearer_auth(CALLER_KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_matching_request_is_refused_by_rule_name_and_a_clean_one_is_served() {
+    let (up, mock) = chat_upstream(1).await;
+    let server = start(&config(&up.url(), RULE, None), "guard-chat", &env());
+    let clean = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "messages": [{"role": "user", "content": "hello"}]}),
+    )
+    .await;
+    assert_eq!(clean.status(), 200);
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            json!({"model": "p/m", "messages": [{"role": "user", "content": SECRET}]}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": SECRET}]}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": "p/m", "max_tokens": 5, "system": SECRET,
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        (
+            "/v1/embeddings",
+            json!({"model": "p/m", "input": ["fine", SECRET]}),
+        ),
+    ] {
+        let refused = post(&server.base, path, body.clone()).await;
+        let status = refused.status();
+        let text = refused.text().await.unwrap();
+        assert_eq!(status, 400, "{path}: {text}");
+        assert!(
+            text.contains("guardrail_blocked") || text.contains("cloud-keys"),
+            "{path}: {text}"
+        );
+        // The rule's name, never the pattern or what matched.
+        assert!(!text.contains("AKIA"), "{path}: {text}");
+    }
+    mock.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_request_leaves_no_usage_record_and_is_counted_by_reason() {
+    let (up, mock) = chat_upstream(0).await;
+    let dir = tempdir::Dir::new("guard-log");
+    let log = dir.0.join("usage.jsonl");
+    let server = start(&config(&up.url(), RULE, Some(&log)), "guard-log", &env());
+    let refused = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "messages": [{"role": "user", "content": SECRET}]}),
+    )
+    .await;
+    assert_eq!(refused.status(), 400);
+    let metrics = reqwest::Client::new()
+        .get(format!("{}/metrics", server.admin.clone().unwrap()))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("llmshim_gateway_rejected_total{provider=\"p\",reason=\"guardrail\"} 1"),
+        "{metrics}"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Nothing was sent, so no attempt was recorded; and the matched text is in no log.
+    let usage = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(usage.is_empty(), "{usage}");
+    let access = std::fs::read_to_string(dir.0.join("access.jsonl")).unwrap_or_default();
+    assert!(!access.contains("AKIA"), "{access}");
+    mock.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rule_that_cannot_fire_or_compile_is_refused_at_start_without_echoing_the_pattern() {
+    // The only key belongs to `platform`; a rule for another tenant is a configuration error, not a
+    // rule that silently never fires.
+    let (up, _mock) = chat_upstream(0).await;
+    let dir = tempdir::Dir::new("guard-bad");
+    let path = dir.0.join("gateway.toml");
+    let bad = config(
+        &up.url(),
+        "[[guardrails]]\nname = \"scoped\"\ntenants = [\"nobody\"]\nblock_if_matches = [\"x\"]\n\
+         [[guardrails]]\nname = \"broken\"\nblock_if_matches = [\"(unclosed\"]",
+        None,
+    )
+    .replace("{DIR}", dir.0.to_str().unwrap());
+    std::fs::write(&path, bad).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args([
+            "serve",
+            "--check",
+            "--structure-only",
+            "--config",
+            path.to_str().unwrap(),
+        ])
+        .env_clear()
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stderr).to_string()
+        + &String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("guardrails[0].tenants[0]"), "{text}");
+    assert!(text.contains("guardrails[1].block_if_matches[0]"), "{text}");
+    // The pattern is not echoed.
+    assert!(!text.contains("unclosed"), "{text}");
+}

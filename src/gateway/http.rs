@@ -323,6 +323,17 @@ pub struct GatewayState {
     overloaded_retry_after: Duration,
     #[cfg(feature = "redis-coordination")]
     outage: Option<OutageSide>,
+    /// Request guardrails (note 0040): set once by `serve` from its file, empty otherwise.
+    #[cfg(feature = "serve")]
+    guardrails: std::sync::OnceLock<Arc<dyn RequestGuard>>,
+}
+
+/// A check run on every request before anything is reserved, queued or sent (note 0040).
+#[cfg(feature = "serve")]
+pub(crate) trait RequestGuard: Send + Sync {
+    /// The name of the first rule the request's text breaks for `tenant`, if any. The name is the
+    /// operator's own; the pattern and the text matched are never returned.
+    fn first_match(&self, tenant: &str, body: &Value) -> Option<String>;
 }
 
 /// Everything the single-instance gateway state is built from. Grouping these
@@ -396,6 +407,42 @@ impl LocalParts {
 }
 
 impl GatewayState {
+    /// Install the guardrails (once; a second call is ignored).
+    #[cfg(feature = "serve")]
+    pub(crate) fn set_guardrails(&self, guard: Arc<dyn RequestGuard>) {
+        let _ = self.guardrails.set(guard);
+    }
+
+    /// Refuse a request whose text breaks a guardrail rule (note 0040): 400 `guardrail_blocked`,
+    /// naming the rule and nothing of the pattern or the text, before anything is reserved.
+    fn check_guardrails(&self, tenant: &str, provider: &str, body: &Value) -> Result<(), ApiError> {
+        #[cfg(feature = "serve")]
+        if let Some(guard) = self.guardrails.get() {
+            if let Some(rule) = guard.first_match(tenant, body) {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::REJECTED,
+                    &[("provider", provider), ("reason", "guardrail")],
+                );
+                return Err(ApiError::from(ShimError::ProviderError {
+                    status: StatusCode::BAD_REQUEST.as_u16(),
+                    body: json!({
+                        "error": {
+                            "message": format!("request blocked by guardrail {rule}"),
+                            "type": "invalid_request_error",
+                            "param": null,
+                            "code": "guardrail_blocked"
+                        }
+                    })
+                    .to_string(),
+                    retry_after: None,
+                }));
+            }
+        }
+        #[cfg(not(feature = "serve"))]
+        let _ = (tenant, provider, body);
+        Ok(())
+    }
+
     /// Build in-memory (single-instance) gateway state, reading the rate limiter
     /// and scheduler tuning from the environment (same rate-limit knobs as the
     /// proxy, plus `LLMSHIM_GATEWAY_*`).
@@ -460,6 +507,8 @@ impl GatewayState {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "serve")]
+            guardrails: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -607,6 +656,8 @@ impl GatewayState {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "serve")]
+            guardrails: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage,
         }))
@@ -1239,6 +1290,13 @@ fn build_request_for(
         None => crate::proxy::convert::prepare_request(&snapshot, req)?,
     };
     let identity = &identified_caller.identity;
+    // The prepared payload is every route's request in the provider's own shape (messages, system,
+    // input, tools), so one scan covers chat, the native facades and the Responses wire.
+    state.check_guardrails(
+        &identity.tenant,
+        &prepared_request.target.instance,
+        &prepared_request.payload,
+    )?;
     if identity.allowed_models.is_some() {
         // The routing id of what the request addressed, once routes and aliases are
         // resolved: what the key's list is matched against (note 0028).
@@ -1858,6 +1916,7 @@ async fn submit_media_call(
     }
     let mut payload = call.payload;
     payload["model"] = json!(call.model);
+    state.check_guardrails(&identity.tenant, provider.instance(), &payload)?;
     precheck(provider, &model, &payload).map_err(ApiError::from)?;
     let gw = GatewayRequest {
         provider: provider.instance().to_owned(),
@@ -3105,6 +3164,8 @@ mod native_tests {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "serve")]
+            guardrails: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -3160,6 +3221,8 @@ mod native_tests {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "serve")]
+            guardrails: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -3481,6 +3544,8 @@ mod native_tests {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "serve")]
+            guardrails: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -3753,6 +3818,8 @@ mod native_tests {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "serve")]
+            guardrails: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         };
@@ -3850,6 +3917,8 @@ mod native_tests {
                 config.max_wait,
             ),
             overloaded_retry_after: config.overloaded_retry_after,
+            #[cfg(feature = "serve")]
+            guardrails: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         });
@@ -5470,6 +5539,8 @@ mod native_tests {
                     config.max_wait,
                 ),
                 overloaded_retry_after: config.overloaded_retry_after,
+                #[cfg(feature = "serve")]
+                guardrails: Default::default(),
                 #[cfg(feature = "redis-coordination")]
                 outage: None,
             })
