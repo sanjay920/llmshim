@@ -74,6 +74,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0038: Transcription on the server](0038-transcription-on-the-server.md)
 - [0039: Residency](0039-residency.md)
 - [0040: Request guardrails](0040-guardrails.md)
+- [0041: Embeddings through a fleet](0041-embeddings-through-a-fleet.md)
 
 ## Roadmap
 
@@ -154,7 +155,7 @@ Later phases (each needs its own design note before work starts)
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy (residency built for file keys, 0039: provider `residency` labels and key `allowed_residency`, enforced through the allowlist; request guardrails built, 0040: regex rules that refuse a request before admission, `regex` under `serve`; response checks, redaction and classifiers are not built)
 - [x] Secret-manager integrations (0033): files are the integration (Kubernetes, CSI driver, agents); secret values are one line of at most 64 KiB; no vendor client is linked
 - [x] Embeddings, images and audio on the server, local scheduler only (a fleet answers 501): embeddings on the server (0035, a spend bound for capped keys with a trusted model price); image generation (0036, local scheduler, capped keys refused); speech (0037, exact price, capped keys work); transcription (0038, multipart upload through `multer`, capped keys refused)
-- [ ] Config-registered providers beyond the existing kinds (an OpenAI-compatible server by `base_url` is built, 0004); embeddings, images and audio through a fleet
+- [ ] Config-registered providers beyond the existing kinds (an OpenAI-compatible server by `base_url` is built, 0004); images, speech and transcription through a fleet (embeddings through a fleet is built, 0041)
 - [ ] Admin UI, SSO and SCIM (not started: they follow the control plane and the
       licensing decision)
 

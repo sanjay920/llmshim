@@ -294,3 +294,108 @@ async fn a_provider_added_by_a_reload_is_served_by_the_replica_from_then_on() {
     assert_eq!(response.status(), 200);
     mock.assert_async().await;
 }
+
+#[tokio::test]
+#[ignore = "needs Redis: set LLMSHIM_TEST_REDIS_URL"]
+async fn embeddings_run_through_the_fleet_and_are_answered_whichever_replica_dispatches() {
+    // The job carries its operation in its scope (note 0041): whichever replica's worker takes it
+    // sends an embeddings call, not a chat completion, and the origin answers its caller.
+    let mut upstream = mockito::Server::new_async().await;
+    let mock = upstream
+        .mock("POST", "/embeddings")
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "data": [{"index": 0, "embedding": [0.5, 0.25]}],
+                "usage": {"prompt_tokens": 3, "total_tokens": 3}
+            })
+            .to_string(),
+        )
+        .expect(4)
+        .create_async()
+        .await;
+    let url = redis_url();
+    let env = [("SERVE_E2E_REDIS_URL", url.as_str())];
+    let names = Names::new();
+    let text = fleet_config(&upstream.url(), &names, "");
+    let a = start(&text, "fleet-emb-a", &env);
+    let b = start(&text, "fleet-emb-b", &env);
+    // Every request is accepted by the replica it is sent to and run by whichever worker of the
+    // fleet takes the job from the shared queue; what this proves is that the operation survives the
+    // trip through Redis (a worker rebuilds its scope from the job's JSON, and a lost operation
+    // would have called `/chat/completions`, which the mock does not serve), not which replica ran it.
+    for server in [&a, &b, &a, &b] {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/embeddings", server.base))
+            .bearer_auth(CALLER_KEY)
+            .json(&serde_json::json!({"model": names.model(), "input": ["hello"]}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["data"][0]["embedding"], serde_json::json!([0.5, 0.25]));
+        assert_eq!(body["usage"]["prompt_tokens"], 3);
+    }
+    // A batch whose answer could pass the fleet's terminal limit is refused before it is sent.
+    let too_many: Vec<String> = (0..513).map(|n| format!("text {n}")).collect();
+    let refused = reqwest::Client::new()
+        .post(format!("{}/v1/embeddings", a.base))
+        .bearer_auth(CALLER_KEY)
+        .json(&serde_json::json!({"model": names.model(), "input": too_many}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+#[ignore = "needs Redis: set LLMSHIM_TEST_REDIS_URL"]
+async fn the_other_media_routes_still_answer_501_on_a_fleet() {
+    // Images, speech and transcription carry megabytes: not through Redis (note 0041).
+    let upstream = mockito::Server::new_async().await;
+    let url = redis_url();
+    let env = [("SERVE_E2E_REDIS_URL", url.as_str())];
+    let names = Names::new();
+    let a = start(
+        &fleet_config(&upstream.url(), &names, ""),
+        "fleet-501",
+        &env,
+    );
+    for (path, body) in [
+        (
+            "/v1/images/generations",
+            serde_json::json!({"model": names.model(), "prompt": "a cat"}),
+        ),
+        (
+            "/v1/audio/speech",
+            serde_json::json!({"model": names.model(), "input": "hi", "voice": "alloy"}),
+        ),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("{}{path}", a.base))
+            .bearer_auth(CALLER_KEY)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 501, "{path}");
+    }
+    let upload = reqwest::multipart::Form::new()
+        .text("model", names.model())
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"abc".to_vec()).file_name("a.wav"),
+        );
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/audio/transcriptions", a.base))
+        .bearer_auth(CALLER_KEY)
+        .multipart(upload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 501, "transcription");
+}
