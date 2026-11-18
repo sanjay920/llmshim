@@ -301,7 +301,7 @@ slice, stated now so slice 2's shape allows it:
 
 `/v1/gateway/stats` (admin listener) gains a `deployments` array, present only when the file has
 deployments: each entry is `{name, strategy, targets: [{model, weight, circuit}]}`. `circuit` is
-`closed`, `open` or `half_open`: what this replica's breaker has seen of the account the target is sent to
+`closed`, `open` or `half_open` (or `unknown` for a target whose provider cannot be resolved, which a catalog failure also reports): what this replica's breaker has seen of the account the target is sent to
 (the provider instance, 0032); a fleet's shared health is not consulted, so replicas can differ. It carries no
 key, URL, tenant or credential, only the file's own model strings. Process test: three 502s from the first
 target show it `open`; pinning `state_name` to `closed` fails it.

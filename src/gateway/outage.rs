@@ -674,10 +674,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn an_outage_is_served_from_the_lease_and_settled_on_recovery() {
-        clear_of_the_window_end().await;
+        // Redis first: a run without it must not sleep for nothing.
         let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
             return;
         };
+        clear_of_the_window_end().await;
         let proxy = Proxy::start(&url).await;
         let via = format!("redis://{}", proxy.address);
         let spent = Arc::new(Spent::default());
@@ -744,10 +745,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn a_flapping_redis_keeps_local_admission_on_the_lease_and_settles_nothing() {
-        clear_of_the_window_end().await;
+        // Redis first: a run without it must not sleep for nothing.
         let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
             return;
         };
+        clear_of_the_window_end().await;
         let proxy = Proxy::start(&url).await;
         let via = format!("redis://{}", proxy.address);
         let spent = Arc::new(Spent::default());
@@ -774,10 +776,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn nothing_is_admitted_inside_the_window_margin() {
-        clear_of_the_window_end().await;
+        // Redis first: a run without it must not sleep for nothing.
         let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
             return;
         };
+        clear_of_the_window_end().await;
         let proxy = Proxy::start(&url).await;
         let via = format!("redis://{}", proxy.address);
         let spent = Arc::new(Spent::default());
@@ -801,10 +804,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires LLMSHIM_REDIS_URL"]
     async fn a_second_outage_in_the_same_window_has_its_own_lease() {
-        clear_of_the_window_end().await;
+        // Redis first: a run without it must not sleep for nothing.
         let Ok(url) = std::env::var("LLMSHIM_REDIS_URL") else {
             return;
         };
+        clear_of_the_window_end().await;
         let proxy = Proxy::start(&url).await;
         let via = format!("redis://{}", proxy.address);
         let spent = Arc::new(Spent::default());

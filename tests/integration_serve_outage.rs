@@ -262,6 +262,21 @@ mod redis_outage {
             .unwrap_or(0)
     }
 
+    /// The budgeted tests use the default 24-hour spend window, which ends at 00:00 UTC, and a lease
+    /// is refused inside the last 30 s of its window (`WINDOW_MARGIN_MS`): started within three
+    /// minutes of midnight they would see that refusal, not the behaviour under test. Wait it out.
+    async fn clear_of_midnight() {
+        const DAY_SECS: u64 = 24 * 60 * 60;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let to_midnight = DAY_SECS - now % DAY_SECS;
+        if to_midnight < 180 {
+            tokio::time::sleep(std::time::Duration::from_secs(to_midnight + 2)).await;
+        }
+    }
+
     // Multi-threaded: `start` blocks this thread until the replica prints its
     // banner, and the replica needs the proxy (a task of this runtime) to reach
     // Redis before it can.
@@ -379,6 +394,7 @@ mod redis_outage {
     #[ignore = "needs Redis: set LLMSHIM_TEST_REDIS_URL"]
     async fn a_budgeted_key_is_served_from_its_lease_while_redis_is_gone() {
         let target = std::env::var("LLMSHIM_TEST_REDIS_URL").expect("set LLMSHIM_TEST_REDIS_URL");
+        clear_of_midnight().await;
         let id = uuid::Uuid::new_v4().simple();
         let tenant = format!("tenant-{id}");
         // A priced model, so an attempt's cost is bounded before it is sent.
@@ -544,6 +560,7 @@ mod redis_outage {
     #[ignore = "needs Redis: set LLMSHIM_TEST_REDIS_URL"]
     async fn a_key_under_a_tenant_cap_is_served_from_the_tenants_lease_while_redis_is_gone() {
         let target = std::env::var("LLMSHIM_TEST_REDIS_URL").expect("set LLMSHIM_TEST_REDIS_URL");
+        clear_of_midnight().await;
         let id = uuid::Uuid::new_v4().simple();
         let tenant = format!("tenant-{id}");
         // A priced model, so an attempt's cost is bounded before it is sent.
