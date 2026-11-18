@@ -49,7 +49,7 @@ block_if_matches = ["AKIA[0-9A-Z]{16}"]
 
 ## Not built
 
-- **Redaction** (rewriting the answer), **streaming filters** (cutting a stream when a pattern appears, after
+- **Redaction of answers** (request redaction is 0044), **streaming filters** (cutting a stream when a pattern appears, after
   bytes have gone out), **external classifiers** and moderation APIs.
 - Response checks for the Responses wire's and the native facades' *streaming* shapes (they stream, so a caller
   under a rule cannot use them), for images and for speech.

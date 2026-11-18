@@ -172,9 +172,19 @@ pub struct Guardrail {
     #[serde(default)]
     pub tenants: Option<Vec<String>>,
     /// Regular expressions (Rust `regex` syntax: linear-time, no look-around or back-references),
-    /// matched anywhere in any text of the request (or of the response, per `scope`). 1 to 64, each
-    /// at most 1024 characters.
+    /// matched anywhere in any text of the request (or of the response, per `scope`); a match
+    /// refuses the request. 1 to 64, each at most 1024 characters. A rule sets this or
+    /// `redact_matches`, not both.
+    #[serde(default)]
     pub block_if_matches: Vec<String>,
+    /// Patterns whose matches are **replaced** instead of refusing the request (note 0044): in the
+    /// text of the request's messages (content, content parts, tool-call arguments) before it is
+    /// sent. Same syntax and limits as `block_if_matches`; request scope only.
+    #[serde(default)]
+    pub redact_matches: Vec<String>,
+    /// What a redacted match becomes. Default `[redacted]`; at most 64 printable characters.
+    #[serde(default)]
+    pub replacement: Option<String>,
     /// What the rule is matched against (note 0043): the `request` (default), the
     /// non-streaming `response`, or `both`. A caller under a rule that reads responses cannot
     /// stream: a stream cannot be checked after its first byte has gone out, so it is refused.
@@ -1708,21 +1718,88 @@ impl ServeConfig {
                     }
                 }
             }
-            if rule.block_if_matches.is_empty() || rule.block_if_matches.len() > 64 {
+            let (field, patterns) = match (
+                rule.block_if_matches.is_empty(),
+                rule.redact_matches.is_empty(),
+            ) {
+                (false, true) => ("block_if_matches", &rule.block_if_matches),
+                (true, false) => ("redact_matches", &rule.redact_matches),
+                (true, true) => {
+                    issues.push(Issue::new(
+                        &at,
+                        "must set block_if_matches or redact_matches",
+                    ));
+                    continue;
+                }
+                (false, false) => {
+                    issues.push(Issue::new(
+                        &at,
+                        "sets both block_if_matches and redact_matches: use two rules",
+                    ));
+                    continue;
+                }
+            };
+            if field == "redact_matches" {
+                if rule.scope != GuardrailScope::Request {
+                    issues.push(Issue::new(
+                        format!("{at}.scope"),
+                        "must be request for redact_matches: redaction rewrites the request only",
+                    ));
+                }
+                if let Some(text) = &rule.replacement {
+                    if text.chars().count() > 64
+                        || text
+                            .chars()
+                            .any(|c| c.is_control() || c == '"' || c == '\\')
+                    {
+                        issues.push(Issue::new(
+                            format!("{at}.replacement"),
+                            "must be at most 64 printable characters, with no quote or backslash \
+                             (it is inserted into JSON text)",
+                        ));
+                    }
+                }
+            } else if rule.replacement.is_some() {
                 issues.push(Issue::new(
-                    format!("{at}.block_if_matches"),
+                    format!("{at}.replacement"),
+                    "belongs to redact_matches",
+                ));
+            }
+            if patterns.len() > 64 {
+                issues.push(Issue::new(
+                    format!("{at}.{field}"),
                     "must hold 1 to 64 patterns",
                 ));
             }
-            for (n, pattern) in rule.block_if_matches.iter().enumerate() {
-                let at_n = format!("{at}.block_if_matches[{n}]");
+            for (n, pattern) in patterns.iter().enumerate() {
+                let at_n = format!("{at}.{field}[{n}]");
                 if pattern.is_empty() || pattern.chars().count() > 1024 {
                     issues.push(Issue::new(at_n, "must be 1 to 1024 characters"));
-                } else if super::guardrails::compile(pattern).is_err() {
-                    issues.push(Issue::new(
-                        at_n,
-                        "is not a valid regular expression, or is too large to compile",
-                    ));
+                } else {
+                    match super::guardrails::compile(pattern) {
+                        Err(_) => issues.push(Issue::new(
+                            at_n,
+                            "is not a valid regular expression, or is too large to compile",
+                        )),
+                        // A pattern that matches nothing at all matches everywhere: it would refuse
+                        // every request, or put the replacement between every character.
+                        Ok(compiled) if compiled.is_match("") => issues.push(Issue::new(
+                            at_n,
+                            "matches the empty string, so it would match everywhere",
+                        )),
+                        Ok(compiled) => {
+                            // A replacement that a pattern of its own rule matches would be redacted
+                            // again by the next rule and refused by the residual check.
+                            if let Some(text) = &rule.replacement {
+                                if field == "redact_matches" && compiled.is_match(text) {
+                                    issues.push(Issue::new(
+                                        format!("{at}.replacement"),
+                                        "is matched by one of the rule's own patterns",
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

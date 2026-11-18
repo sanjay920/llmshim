@@ -358,7 +358,8 @@
       "description": "One guardrail rule (note 0040): a request whose text matches any of the patterns is refused\nwith 400 `guardrail_blocked`, naming the rule. The pattern and the matched text are never\nechoed, logged or counted.",
       "properties": {
         "block_if_matches": {
-          "description": "Regular expressions (Rust `regex` syntax: linear-time, no look-around or back-references),\nmatched anywhere in any text of the request (or of the response, per `scope`). 1 to 64, each\nat most 1024 characters.",
+          "default": [],
+          "description": "Regular expressions (Rust `regex` syntax: linear-time, no look-around or back-references),\nmatched anywhere in any text of the request (or of the response, per `scope`); a match\nrefuses the request. 1 to 64, each at most 1024 characters. A rule sets this or\n`redact_matches`, not both.",
           "items": {
             "type": "string"
           },
@@ -367,6 +368,22 @@
         "name": {
           "description": "Names the rule in the refusal and nowhere else is it exposed: lowercase letters, digits,\n`-` and `_`. Unique.",
           "type": "string"
+        },
+        "redact_matches": {
+          "default": [],
+          "description": "Patterns whose matches are **replaced** instead of refusing the request (note 0044): in the\ntext of the request's messages (content, content parts, tool-call arguments) before it is\nsent. Same syntax and limits as `block_if_matches`; request scope only.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "replacement": {
+          "default": null,
+          "description": "What a redacted match becomes. Default `[redacted]`; at most 64 printable characters.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "scope": {
           "$ref": "#/$defs/GuardrailScope",
@@ -385,8 +402,7 @@
         }
       },
       "required": [
-        "name",
-        "block_if_matches"
+        "name"
       ],
       "type": "object"
     },

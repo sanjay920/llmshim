@@ -7,7 +7,7 @@
 
 use super::config::{Guardrail, GuardrailScope};
 use crate::gateway::http::RequestGuard;
-use regex::{RegexSet, RegexSetBuilder};
+use regex::{Regex, RegexSet, RegexSetBuilder};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -38,7 +38,14 @@ impl Scope {
         let mut patterns = Vec::new();
         let mut rule_of_pattern = Vec::new();
         for (index, rule) in rules {
-            for pattern in &rule.block_if_matches {
+            // A redaction rule's patterns also refuse: redaction rewrites the message text only, and
+            // a match left anywhere else (a tool description, a passthrough field) must not go out
+            // (note 0044).
+            for pattern in rule
+                .block_if_matches
+                .iter()
+                .chain(rule.redact_matches.iter())
+            {
                 patterns.push(pattern.as_str());
                 rule_of_pattern.push(*index);
             }
@@ -143,11 +150,22 @@ impl Direction {
     }
 }
 
+/// A redaction rule (note 0044): the patterns, compiled both as a set (to skip a text no pattern
+/// matches) and one by one (to replace), and what a match becomes.
+struct RedactRule {
+    name: String,
+    tenants: Option<BTreeSet<String>>,
+    any: RegexSet,
+    each: Vec<Regex>,
+    replacement: String,
+}
+
 /// The compiled rules, for requests and for responses.
 pub struct Guardrails {
     names: Vec<String>,
     request: Direction,
     response: Direction,
+    redactions: Vec<RedactRule>,
 }
 
 impl Guardrails {
@@ -163,15 +181,52 @@ impl Guardrails {
                 .filter(|(_, rule)| reads(rule.scope))
                 .collect()
         };
+        let mut redactions = Vec::new();
+        for rule in rules.iter().filter(|rule| !rule.redact_matches.is_empty()) {
+            let any = RegexSetBuilder::new(&rule.redact_matches)
+                .size_limit(SET_SIZE_LIMIT)
+                .build()
+                .map_err(|_| {
+                    format!(
+                        "redaction rule {} has patterns that do not compile",
+                        rule.name
+                    )
+                })?;
+            let each = rule
+                .redact_matches
+                .iter()
+                .map(|pattern| compile(pattern))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    format!(
+                        "redaction rule {} has a pattern that does not compile",
+                        rule.name
+                    )
+                })?;
+            redactions.push(RedactRule {
+                name: rule.name.clone(),
+                tenants: rule
+                    .tenants
+                    .as_ref()
+                    .map(|tenants| tenants.iter().cloned().collect()),
+                any,
+                each,
+                replacement: rule
+                    .replacement
+                    .clone()
+                    .unwrap_or_else(|| "[redacted]".to_owned()),
+            });
+        }
         Ok(Self {
             names,
             request: Direction::build(&reading(GuardrailScope::reads_request), "request")?,
             response: Direction::build(&reading(GuardrailScope::reads_response), "response")?,
+            redactions,
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.request.is_empty() && self.response.is_empty()
+        self.request.is_empty() && self.response.is_empty() && self.redactions.is_empty()
     }
 }
 
@@ -190,6 +245,98 @@ impl RequestGuard for Guardrails {
 
     fn reads_responses(&self, tenant: &str) -> bool {
         self.response.applies_to(tenant)
+    }
+
+    fn redact(&self, tenant: &str, value: &mut Value) -> Result<Vec<String>, String> {
+        let mut applied = Vec::new();
+        for rule in self
+            .redactions
+            .iter()
+            .filter(|rule| rule.tenants.as_ref().is_none_or(|set| set.contains(tenant)))
+        {
+            match redact_leaves(value, rule, true) {
+                Ok(true) => applied.push(rule.name.clone()),
+                Ok(false) => {}
+                Err(()) => return Err(rule.name.clone()),
+            }
+        }
+        Ok(applied)
+    }
+}
+
+/// Keys whose strings are structure, not the message's text: never rewritten (a replaced id or tool
+/// name would break the request), and `data` / `file_data`, which carry encoded files.
+const REDACT_SKIPPED: [&str; 7] = [
+    "id",
+    "type",
+    "name",
+    "role",
+    "tool_call_id",
+    "data",
+    "file_data",
+];
+
+/// A text may grow to at most this many times its length plus a constant by redaction: a pattern
+/// that matches a single character with a long replacement, applied by several patterns in turn,
+/// would otherwise multiply a request's size.
+const REDACT_GROWTH: usize = 4;
+const REDACT_GROWTH_SLACK: usize = 4096;
+
+/// Replace every match of `rule` in the string leaves of `value`; whether anything changed, or the
+/// rule's name if it would have made a text too large.
+fn redact_leaves(value: &mut Value, rule: &RedactRule, structural: bool) -> Result<bool, ()> {
+    match value {
+        Value::String(text) => {
+            // An encoded file (any `data:` URI) is not text.
+            if text.starts_with("data:") || !rule.any.is_match(text) {
+                return Ok(false);
+            }
+            let limit = text.len() * REDACT_GROWTH + REDACT_GROWTH_SLACK;
+            let mut current = std::mem::take(text);
+            for pattern in &rule.each {
+                current = pattern
+                    .replace_all(&current, regex::NoExpand(&rule.replacement))
+                    .into_owned();
+                if current.len() > limit {
+                    return Err(());
+                }
+            }
+            *text = current;
+            Ok(true)
+        }
+        Value::Array(items) => {
+            // Every item is visited: this is not `any`, which would stop at the first change.
+            let mut changed = false;
+            for item in items {
+                changed |= redact_leaves(item, rule, structural)?;
+            }
+            Ok(changed)
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for (key, item) in map.iter_mut() {
+                if structural && REDACT_SKIPPED.contains(&key.as_str()) {
+                    continue;
+                }
+                // A tool call's `arguments` is JSON text: read it as JSON, so a match is replaced in
+                // the decoded text (never across an escape) and the result stays valid JSON. Inside
+                // it every key is the caller's data, not structure.
+                if key == "arguments" {
+                    if let Value::String(text) = item {
+                        if let Ok(mut parsed) = serde_json::from_str::<Value>(text) {
+                            if redact_leaves(&mut parsed, rule, false)? {
+                                *text = parsed.to_string();
+                                changed = true;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                changed |= redact_leaves(item, rule, structural)?;
+            }
+            Ok(changed)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -466,6 +613,114 @@ mod tests {
             broad.first_response_match("platform", &response_view(&clean)),
             None
         );
+    }
+
+    #[test]
+    fn redaction_rewrites_message_text_and_never_structure() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"mask\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\", \"secret-[0-9]+\"]\nreplacement = \"[x]\"",
+        );
+        let mut content = json!([
+            {"type": "text", "text": "key AKIAABCDEFGHIJKLMNOP and secret-42 twice secret-7"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AKIAABCDEFGHIJKLMNOP"}},
+            {"type": "text", "text": "clean"}
+        ]);
+        assert_eq!(
+            guard.redact("platform", &mut content).unwrap(),
+            vec!["mask".to_string()]
+        );
+        assert_eq!(content[0]["text"], "key [x] and [x] twice [x]");
+        // An inline image is left alone, and so is a clean part.
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,AKIAABCDEFGHIJKLMNOP"
+        );
+        assert_eq!(content[2]["text"], "clean");
+        // Tool-call arguments are text, but the call's id, type and function name are structure.
+        let mut calls = json!([{"id": "secret-1", "type": "function", "function": {
+            "name": "secret-2", "arguments": "{\"k\":\"AKIAABCDEFGHIJKLMNOP\"}"}}]);
+        assert_eq!(
+            guard.redact("platform", &mut calls).unwrap(),
+            vec!["mask".to_string()]
+        );
+        assert_eq!(calls[0]["id"], "secret-1");
+        assert_eq!(calls[0]["function"]["name"], "secret-2");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"k\":\"[x]\"}");
+        // Nothing to redact: nothing reported.
+        let mut clean = json!("hello");
+        assert!(guard.redact("platform", &mut clean).unwrap().is_empty());
+        // A replacement that looks like a regex group reference is inserted literally.
+        let literal = rules(
+            "[[guardrails]]\nname = \"m\"\nredact_matches = [\"(a)\"]\nreplacement = \"$1$1\"",
+        );
+        let mut text = json!("a");
+        literal.redact("platform", &mut text).unwrap();
+        assert_eq!(text, "$1$1");
+    }
+
+    #[test]
+    fn redaction_keeps_tool_arguments_valid_json_and_leaves_files_and_structure_inside_them() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"mask\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]\nreplacement = \"[x]\"",
+        );
+        // The arguments are decoded, masked and re-encoded: an escaped secret is found and the text
+        // stays JSON. Inside them a key named `name` or `id` is the caller's data, not structure.
+        let mut calls = json!([{"function": {"name": "f", "arguments":
+            "{\"v\":\"\\u0041KIAABCDEFGHIJKLMNOP\",\"name\":\"AKIAABCDEFGHIJKLMNOP\",\"id\":\"AKIAABCDEFGHIJKLMNOP\"}"}}]);
+        assert_eq!(
+            guard.redact("platform", &mut calls).unwrap(),
+            vec!["mask".to_string()]
+        );
+        let arguments: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"v": "[x]", "name": "[x]", "id": "[x]"}));
+        // Any data URI and a file's `data` field are encoded files, never text.
+        let mut files = json!([
+            {"type": "file", "file": {"file_data": "data:application/pdf;base64,AKIAABCDEFGHIJKLMNOP"}},
+            {"type": "input_audio", "input_audio": {"data": "AKIAABCDEFGHIJKLMNOP", "format": "wav"}}
+        ]);
+        assert!(guard.redact("platform", &mut files).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_redaction_that_would_multiply_a_text_is_refused_not_applied() {
+        // One pattern for every character, a long replacement, three rules in a row: the text would
+        // grow by 60x per pass, far past the bound.
+        let guard = rules(
+            "[[guardrails]]\nname = \"blow\"\nredact_matches = [\"a\", \"b\", \"c\"]\n\
+             replacement = \"0123456789012345678901234567890123456789012345678901234567890123\"",
+        );
+        let mut text = json!("abc".repeat(5000));
+        assert_eq!(guard.redact("platform", &mut text), Err("blow".to_string()));
+    }
+
+    #[test]
+    fn a_redaction_rules_patterns_also_refuse_what_redaction_could_not_reach() {
+        // The rule masks message text; a match anywhere else (a tool description in a passthrough
+        // field) is refused rather than sent (note 0044).
+        let guard =
+            rules("[[guardrails]]\nname = \"mask\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]");
+        let elsewhere =
+            json!({"tools": [{"function": {"description": "key AKIAABCDEFGHIJKLMNOP"}}]});
+        assert_eq!(
+            guard.first_match("platform", &elsewhere).as_deref(),
+            Some("mask")
+        );
+        let masked = json!({"messages": [{"role": "user", "content": "key [redacted]"}]});
+        assert_eq!(guard.first_match("platform", &masked), None);
+    }
+
+    #[test]
+    fn a_redaction_rule_for_one_tenant_leaves_the_others_text_alone() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"mask\"\ntenants = [\"platform\"]\nredact_matches = [\"hunter2\"]",
+        );
+        let mut mine = json!("pw hunter2");
+        let mut theirs = json!("pw hunter2");
+        assert_eq!(guard.redact("platform", &mut mine).unwrap().len(), 1);
+        assert!(guard.redact("other", &mut theirs).unwrap().is_empty());
+        assert_eq!(mine, "pw [redacted]");
+        assert_eq!(theirs, "pw hunter2");
     }
 
     #[test]
