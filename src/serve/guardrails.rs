@@ -28,24 +28,29 @@ pub(crate) fn compile(pattern: &str) -> Result<regex::Regex, regex::Error> {
 }
 
 /// One compiled set over the patterns of several rules, and which rule each pattern belongs to.
+#[derive(Clone)]
 struct Scope {
     set: RegexSet,
     rule_of_pattern: Vec<usize>,
 }
 
 impl Scope {
-    fn build(rules: &[(usize, &Guardrail)]) -> Result<Option<Self>, regex::Error> {
+    fn build(
+        rules: &[(usize, &Guardrail)],
+        include_redact: bool,
+    ) -> Result<Option<Self>, regex::Error> {
         let mut patterns = Vec::new();
         let mut rule_of_pattern = Vec::new();
         for (index, rule) in rules {
             // A redaction rule's patterns also refuse: redaction rewrites the message text only, and
             // a match left anywhere else (a tool description, a passthrough field) must not go out
             // (note 0044).
-            for pattern in rule
-                .block_if_matches
-                .iter()
-                .chain(rule.redact_matches.iter())
-            {
+            let redact: &[String] = if include_redact {
+                &rule.redact_matches
+            } else {
+                &[]
+            };
+            for pattern in rule.block_if_matches.iter().chain(redact.iter()) {
                 patterns.push(pattern.as_str());
                 rule_of_pattern.push(*index);
             }
@@ -60,6 +65,15 @@ impl Scope {
             set,
             rule_of_pattern,
         }))
+    }
+
+    /// The first rule (in the file's order) a plain text breaks, or `None`.
+    fn first_rule_text(&self, text: &str) -> Option<usize> {
+        self.set
+            .matches(text)
+            .iter()
+            .map(|pattern| self.rule_of_pattern[pattern])
+            .min()
     }
 
     /// The first rule (in the file's order) any text under `value` breaks, or `None`.
@@ -99,13 +113,17 @@ struct Direction {
 }
 
 impl Direction {
-    fn build(rules: &[(usize, &Guardrail)], direction: &str) -> Result<Self, String> {
+    fn build(
+        rules: &[(usize, &Guardrail)],
+        direction: &str,
+        include_redact: bool,
+    ) -> Result<Self, String> {
         let global_rules: Vec<(usize, &Guardrail)> = rules
             .iter()
             .copied()
             .filter(|(_, rule)| rule.tenants.is_none())
             .collect();
-        let global = Scope::build(&global_rules).map_err(|_| {
+        let global = Scope::build(&global_rules, include_redact).map_err(|_| {
             format!("the {direction} rules for every caller are too large to compile together")
         })?;
         let mut tenants = BTreeSet::new();
@@ -123,7 +141,7 @@ impl Direction {
                         .is_some_and(|list| list.contains(&tenant))
                 })
                 .collect();
-            if let Some(scope) = Scope::build(&mine).map_err(|_| {
+            if let Some(scope) = Scope::build(&mine, include_redact).map_err(|_| {
                 format!("the {direction} rules for one tenant are too large to compile together")
             })? {
                 by_tenant.insert(tenant, scope);
@@ -134,10 +152,6 @@ impl Direction {
 
     fn is_empty(&self) -> bool {
         self.global.is_none() && self.by_tenant.is_empty()
-    }
-
-    fn applies_to(&self, tenant: &str) -> bool {
-        self.global.is_some() || self.by_tenant.contains_key(tenant)
     }
 
     fn first_match(&self, tenant: &str, body: &Value, files: bool) -> Option<usize> {
@@ -156,6 +170,7 @@ impl Direction {
 
 /// A redaction rule (note 0044): the patterns, compiled both as a set (to skip a text no pattern
 /// matches) and one by one (to replace), and what a match becomes.
+#[derive(Clone)]
 struct RedactRule {
     name: String,
     scope: GuardrailScope,
@@ -170,6 +185,7 @@ pub struct Guardrails {
     names: Vec<String>,
     request: Direction,
     response: Direction,
+    stream_blocks: Direction,
     redactions: Vec<RedactRule>,
 }
 
@@ -225,8 +241,15 @@ impl Guardrails {
         }
         Ok(Self {
             names,
-            request: Direction::build(&reading(GuardrailScope::reads_request), "request")?,
-            response: Direction::build(&reading(GuardrailScope::reads_response), "response")?,
+            request: Direction::build(&reading(GuardrailScope::reads_request), "request", true)?,
+            response: Direction::build(&reading(GuardrailScope::reads_response), "response", true)?,
+            // What a stream is checked against as it runs: the blocking patterns only, since its
+            // redaction patterns are applied to the text as it is released (note 0046).
+            stream_blocks: Direction::build(
+                &reading(GuardrailScope::reads_response),
+                "response stream",
+                false,
+            )?,
             redactions,
         })
     }
@@ -249,8 +272,35 @@ impl RequestGuard for Guardrails {
             .map(|index| self.names[index].clone())
     }
 
-    fn reads_responses(&self, tenant: &str) -> bool {
-        self.response.applies_to(tenant)
+    fn stream_filter(
+        &self,
+        tenant: &str,
+    ) -> Option<Box<dyn crate::gateway::http::StreamTextFilter>> {
+        let redactions: Vec<RedactRule> = self
+            .redactions
+            .iter()
+            .filter(|rule| {
+                rule.scope.reads_response()
+                    && rule.tenants.as_ref().is_none_or(|set| set.contains(tenant))
+            })
+            .cloned()
+            .collect();
+        let scopes: Vec<Scope> = [
+            self.stream_blocks.global.clone(),
+            self.stream_blocks.by_tenant.get(tenant).cloned(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if scopes.is_empty() && redactions.is_empty() {
+            return None;
+        }
+        Some(Box::new(StreamFilter {
+            names: self.names.clone(),
+            scopes,
+            redactions,
+            held: String::new(),
+        }))
     }
 
     fn redact(&self, tenant: &str, value: &mut Value) -> Result<Vec<String>, String> {
@@ -306,6 +356,110 @@ impl Guardrails {
             }
         }
         Ok(applied)
+    }
+}
+
+/// How many bytes of streamed text are held back so a match that straddles two chunks is seen
+/// whole (note 0046). A match longer than this can leak its first bytes before it is seen.
+const STREAM_HOLDBACK: usize = 256;
+
+/// The most text a stream may hold back. A redaction pattern that can match an arbitrarily long run
+/// keeps the start of a match unreleased until it ends; past this the stream is cut (fail closed)
+/// rather than held, and rescanned, without bound.
+const STREAM_HELD_MAX: usize = 64 * 1024;
+
+/// The filter a streamed answer's text passes through (note 0046): response blocking rules cut the
+/// stream when they match, response redaction rules mask what they match, and text is released only
+/// once it is `STREAM_HOLDBACK` bytes behind the newest.
+struct StreamFilter {
+    names: Vec<String>,
+    scopes: Vec<Scope>,
+    redactions: Vec<RedactRule>,
+    held: String,
+}
+
+impl StreamFilter {
+    /// The rule a match of the held text breaks, if any.
+    fn check(&self) -> Result<(), String> {
+        let found = self
+            .scopes
+            .iter()
+            .filter_map(|scope| scope.first_rule_text(&self.held))
+            .min();
+        match found {
+            Some(index) => Err(self.names[index].clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// `text` with every match of every redaction rule replaced (bounded in growth).
+    fn redact(&self, text: String) -> Result<String, String> {
+        let mut text = text;
+        for rule in &self.redactions {
+            if !rule.any.is_match(&text) {
+                continue;
+            }
+            let limit = text.len() * REDACT_GROWTH + REDACT_GROWTH_SLACK;
+            for pattern in &rule.each {
+                text = pattern
+                    .replace_all(&text, regex::NoExpand(&rule.replacement))
+                    .into_owned();
+                if text.len() > limit {
+                    return Err(rule.name.clone());
+                }
+            }
+        }
+        Ok(text)
+    }
+}
+
+impl crate::gateway::http::StreamTextFilter for StreamFilter {
+    fn push(&mut self, text: &str) -> Result<String, String> {
+        self.held.push_str(text);
+        // Whatever the outcome of a cut, nothing held is ever released afterwards.
+        if let Err(rule) = self.check() {
+            self.held.clear();
+            return Err(rule);
+        }
+        let mut end = self.held.len().saturating_sub(STREAM_HOLDBACK);
+        while !self.held.is_char_boundary(end) {
+            end -= 1;
+        }
+        // Never release the start of a match that the cut would split: it waits for the rest.
+        let mut straddling: Option<String> = None;
+        loop {
+            let before = end;
+            for rule in &self.redactions {
+                for pattern in &rule.each {
+                    for found in pattern.find_iter(&self.held) {
+                        if found.start() < end && end < found.end() {
+                            end = found.start();
+                            straddling = Some(rule.name.clone());
+                        }
+                    }
+                }
+            }
+            if end == before {
+                break;
+            }
+        }
+        if self.held.len() > STREAM_HELD_MAX {
+            // A match that will not end: cut the stream rather than hold it without bound.
+            self.held.clear();
+            return Err(
+                straddling.unwrap_or_else(|| self.names.first().cloned().unwrap_or_default())
+            );
+        }
+        let ready: String = self.held.drain(..end).collect();
+        self.redact(ready).inspect_err(|_| self.held.clear())
+    }
+
+    fn finish(&mut self) -> Result<String, String> {
+        // Judge the held text, and empty it either way: after a cut nothing is ever released.
+        let outcome = self.check();
+        let rest = std::mem::take(&mut self.held);
+        outcome?;
+        self.redact(rest)
     }
 }
 
@@ -622,7 +776,9 @@ mod tests {
             Some("either")
         );
         // Every tenant is under `either` (it reads responses and names no tenant).
-        assert!(guard.reads_responses("platform") && guard.reads_responses("other"));
+        assert!(
+            guard.stream_filter("platform").is_some() && guard.stream_filter("other").is_some()
+        );
     }
 
     #[test]
@@ -905,6 +1061,104 @@ mod tests {
         assert_eq!(reply["choices"][0]["message"]["content"], "pw [redacted]");
     }
 
+    /// Feed `chunks` through a tenant's stream filter: everything it released, or the rule that cut.
+    fn streamed(guard: &Guardrails, tenant: &str, chunks: &[&str]) -> Result<String, String> {
+        let mut filter = guard.stream_filter(tenant).expect("a rule applies");
+        let mut out = String::new();
+        for chunk in chunks {
+            out.push_str(&filter.push(chunk)?);
+        }
+        out.push_str(&filter.finish()?);
+        Ok(out)
+    }
+
+    #[test]
+    fn a_streamed_secret_split_across_chunks_is_masked_whole_and_the_text_is_otherwise_unchanged() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"mask\"\nscope = \"response\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]\nreplacement = \"[x]\"",
+        );
+        // The key arrives in four pieces, with plenty of text around it: nothing of it is released
+        // before it is whole, and the rest comes out exactly as sent.
+        let pad = "lorem ipsum ".repeat(60);
+        let chunks = [
+            pad.as_str(),
+            "the key is AK",
+            "IAABCD",
+            "EFGHIJKL",
+            "MNOP and done",
+            pad.as_str(),
+        ];
+        let out = streamed(&guard, "platform", &chunks).unwrap();
+        assert!(!out.contains("AKIA") && !out.contains("AK"), "{out}");
+        assert_eq!(
+            out,
+            format!("{pad}the key is [x] and done{pad}"),
+            "masked in place, everything else untouched"
+        );
+        // A short stream (less than the holdback) is released at the end, masked.
+        assert_eq!(
+            streamed(&guard, "platform", &["AKIAABCDEFGHIJKLMNOP"]).unwrap(),
+            "[x]"
+        );
+        // Multibyte text is cut only at character boundaries.
+        let wide = "é".repeat(400);
+        assert_eq!(
+            streamed(&guard, "platform", &[wide.as_str()]).unwrap(),
+            wide
+        );
+    }
+
+    #[test]
+    fn a_streamed_match_of_a_blocking_rule_cuts_the_stream_before_the_secret_is_sent() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"leak\"\nscope = \"response\"\nblock_if_matches = [\"AKIA[0-9A-Z]{16}\"]",
+        );
+        let mut filter = guard.stream_filter("platform").unwrap();
+        let pad = "lorem ipsum ".repeat(60);
+        let mut released = filter.push(&pad).unwrap();
+        released.push_str(&filter.push("key AKIAABC").unwrap());
+        // The match completes in the next chunk: the stream is cut, and none of the key was released.
+        assert_eq!(filter.push("DEFGHIJKLMNOP").unwrap_err(), "leak");
+        assert!(!released.contains("AKIA"), "{released}");
+        // A clean stream passes and the held text is released at the end.
+        assert_eq!(
+            streamed(&guard, "platform", &["all ", "clean"]).unwrap(),
+            "all clean"
+        );
+    }
+
+    #[test]
+    fn a_cut_stream_releases_nothing_afterwards_and_a_match_that_never_ends_is_cut_not_held() {
+        let blocker = rules(
+            "[[guardrails]]\nname = \"leak\"\nscope = \"response\"\nblock_if_matches = [\"AKIA[0-9A-Z]{16}\"]",
+        );
+        let mut filter = blocker.stream_filter("platform").unwrap();
+        assert_eq!(filter.push("key AKIAABCDEFGHIJKLMNOP").unwrap_err(), "leak");
+        // The held text was discarded with the cut: finishing is empty, not a second error and not a
+        // flush of what was held.
+        assert_eq!(filter.finish().unwrap(), "");
+        // A redaction pattern that can match an unbounded run keeps a match open: past the cap the
+        // stream is cut, naming the rule, instead of holding and rescanning without bound.
+        let greedy = rules(
+            "[[guardrails]]\nname = \"run\"\nscope = \"response\"\nredact_matches = [\"[A-Za-z0-9+/=]{40,}\"]",
+        );
+        let mut filter = greedy.stream_filter("platform").unwrap();
+        let mut cut = None;
+        for _ in 0..1000 {
+            match filter.push(&"A".repeat(512)) {
+                Ok(released) => {
+                    assert!(released.is_empty(), "nothing of an open match is released")
+                }
+                Err(rule) => {
+                    cut = Some(rule);
+                    break;
+                }
+            }
+        }
+        assert_eq!(cut.as_deref(), Some("run"));
+        assert_eq!(filter.finish().unwrap(), "");
+    }
+
     #[test]
     fn a_redaction_rule_for_one_tenant_leaves_the_others_text_alone() {
         let guard = rules(
@@ -921,12 +1175,12 @@ mod tests {
     #[test]
     fn only_a_request_rule_leaves_a_tenant_free_to_stream() {
         let guard = rules("[[guardrails]]\nname = \"asks\"\nblock_if_matches = [\"alpha\"]");
-        assert!(!guard.reads_responses("platform"));
+        assert!(guard.stream_filter("platform").is_none());
         let scoped = rules(
             "[[guardrails]]\nname = \"answers\"\nscope = \"response\"\ntenants = [\"platform\"]\nblock_if_matches = [\"beta\"]",
         );
-        assert!(scoped.reads_responses("platform"));
-        assert!(!scoped.reads_responses("other"));
+        assert!(scoped.stream_filter("platform").is_some());
+        assert!(scoped.stream_filter("other").is_none());
     }
 
     #[test]
