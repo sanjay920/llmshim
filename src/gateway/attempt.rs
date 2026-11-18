@@ -77,10 +77,15 @@ pub(crate) struct TrustedPolicyScope {
     /// that crosses Redis is run by another replica on that replica's router.
     #[serde(skip)]
     router: Option<Arc<crate::router::Router>>,
-    /// What the request is (note 0035). Never serialized: only the local backend runs an
-    /// operation other than chat, and a job that crossed Redis is chat.
-    #[serde(skip)]
+    /// What the request is (note 0035). Serialized only when it is not chat, and then `version` is
+    /// 3: a replica that predates the field refuses the job (it accepts versions 1 and 2) instead
+    /// of running an embeddings call as chat (note 0041).
+    #[serde(default, skip_serializing_if = "is_chat")]
     operation: crate::policy::DispatchOperation,
+}
+
+fn is_chat(operation: &crate::policy::DispatchOperation) -> bool {
+    *operation == crate::policy::DispatchOperation::Chat
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -131,6 +136,10 @@ impl TrustedPolicyScope {
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub(crate) fn set_operation(&mut self, operation: crate::policy::DispatchOperation) {
         self.operation = operation;
+        if operation != crate::policy::DispatchOperation::Chat {
+            // The version that carries the field (note 0041); it includes everything version 2 has.
+            self.version = 3;
+        }
     }
 
     /// The tenant's budget window this scope draws on, if it has a valid budget
@@ -240,7 +249,7 @@ impl TrustedPolicyScope {
 
     #[cfg(feature = "redis-coordination")]
     pub(crate) fn is_current(&self) -> bool {
-        matches!(self.version, 1 | 2)
+        matches!(self.version, 1..=3)
     }
 }
 
@@ -1246,7 +1255,7 @@ impl AttemptCoordinator {
         attempt: &PreparedAttempt<'_>,
         scope: &TrustedPolicyScope,
     ) -> Result<(), AttemptPolicyRefusal> {
-        if !matches!(scope.version, 1 | 2) {
+        if !matches!(scope.version, 1..=3) {
             return Err(AttemptPolicyRefusal::new(
                 AttemptPolicyRefusalKind::CoordinatorUnavailable,
                 None,
@@ -2675,6 +2684,26 @@ mod tests {
             authority: crate::gateway::budget::SpendAuthority::Provider,
             terminal_authoritative: true,
         }
+    }
+
+    #[test]
+    fn an_embeddings_scope_is_version_3_with_its_operation_and_a_chat_scope_is_unchanged() {
+        // Older replicas accept versions 1 and 2 only, so a job whose operation they do not know
+        // is refused by them instead of run as chat (note 0041); a chat job has no new field.
+        let chat = serde_json::to_value(scope("operation", None, None)).unwrap();
+        assert_eq!(chat["version"], 1);
+        assert!(chat.get("operation").is_none(), "{chat}");
+        let mut embeddings = scope("operation", None, None);
+        embeddings.set_operation(crate::policy::DispatchOperation::Embeddings);
+        let value = serde_json::to_value(&embeddings).unwrap();
+        assert_eq!(value["version"], 3);
+        assert_eq!(value["operation"], "Embeddings");
+        let back: TrustedPolicyScope = serde_json::from_value(value).unwrap();
+        assert_eq!(back.operation, crate::policy::DispatchOperation::Embeddings);
+        assert_eq!(back.version, 3);
+        // A scope that has no operation field (every job written before this) reads as chat.
+        let old: TrustedPolicyScope = serde_json::from_value(chat).unwrap();
+        assert_eq!(old.operation, crate::policy::DispatchOperation::Chat);
     }
 
     #[test]

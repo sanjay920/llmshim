@@ -20,7 +20,7 @@ pub struct DispatchPolicyContext {
 
 /// The kind of call an admitted request makes.
 #[cfg_attr(not(feature = "gateway"), allow(dead_code))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum DispatchOperation {
     #[default]
     Chat,

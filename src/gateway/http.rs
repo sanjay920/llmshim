@@ -1850,6 +1850,9 @@ struct MediaCall<'a> {
     operation: crate::policy::DispatchOperation,
     /// "embeddings", "image generation": names the endpoint in the fleet refusal.
     noun: &'static str,
+    /// Whether a fleet can run it: its request and its answer are small enough to travel through
+    /// Redis, and its operation is carried in the job's scope (note 0041).
+    fleet: bool,
     model: &'a str,
     /// The OpenAI-shaped body to dispatch; `model` is added from `model`.
     payload: Value,
@@ -1878,7 +1881,7 @@ async fn submit_media_call(
         );
         ApiError::Unauthorized
     })?;
-    if !matches!(state.backend, Backend::Local(_)) {
+    if !call.fleet && !matches!(state.backend, Backend::Local(_)) {
         return Err(ApiError::from(ShimError::ProviderError {
             status: StatusCode::NOT_IMPLEMENTED.as_u16(),
             body: json!({
@@ -1993,6 +1996,7 @@ async fn embeddings(
         MediaCall {
             operation: crate::policy::DispatchOperation::Embeddings,
             noun: "embeddings",
+            fleet: true,
             model: &request.model,
             payload: crate::embeddings::payload(&request),
             permits,
@@ -2058,6 +2062,7 @@ async fn images_generations(
         MediaCall {
             operation: crate::policy::DispatchOperation::Images,
             noun: "image generation",
+            fleet: false,
             model: &body.model,
             payload,
             permits,
@@ -2133,6 +2138,7 @@ async fn audio_speech(
         MediaCall {
             operation: crate::policy::DispatchOperation::Speech,
             noun: "speech synthesis",
+            fleet: false,
             model: &body.model,
             payload,
             permits,
@@ -2350,6 +2356,7 @@ async fn audio_transcriptions(
         MediaCall {
             operation: crate::policy::DispatchOperation::Transcription,
             noun: "transcription",
+            fleet: false,
             model: &model,
             payload: Value::Object(payload),
             permits,

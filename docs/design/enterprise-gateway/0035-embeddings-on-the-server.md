@@ -58,10 +58,10 @@ observation. There is no second dispatch, auth or queue path (the rule the nativ
   that adds more than a few special tokens per text could bill above the bound; settlement then raises the
   liability past the reservation instead of failing. A batch whose reservation exceeds the exact-counter
   ceiling is a 400 `unpriceable_under_budget`, not a 429.
-- **Where it runs.** The local scheduler only. With `[fleet]` the answer is `501 not_implemented`: a
-  distributed job carries a chat payload, and running an embeddings one as chat would be a wrong answer.
+- **Where it runs.** The local scheduler, and since note 0041 a fleet too (the job's scope carries the
+  operation, version 3). Images, speech and transcription still answer `501` with `[fleet]`.
 - **Not built:** images and audio endpoints; chunking or splitting a batch (never: work the caller did not
-  ask for); base64 for non-f32; idempotency keys for embeddings; embeddings through a fleet.
+  ask for); base64 for non-f32; idempotency keys for embeddings.
 
 ### Token accounting on the OpenAI wires (found in review)
 
