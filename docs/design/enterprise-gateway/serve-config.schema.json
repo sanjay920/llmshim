@@ -229,6 +229,17 @@
             "null"
           ]
         },
+        "allowed_residency": {
+          "default": null,
+          "description": "Residency (design note 0039): the residency labels whose providers this key may use. A provider\ncarries a `residency` label; the key may call only providers whose label is listed, and a\nprovider with no label is outside every region. Combined with `allowed_models`, both must\nadmit the request. Omit it for no restriction; an empty list, or a region no provider\ncarries, is refused.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "budget_allow_unpriced": {
           "default": false,
           "description": "Admit requests whose cost cannot be bounded before sending.",
@@ -634,6 +645,14 @@
         "region": {
           "default": null,
           "description": "Bedrock and Vertex: the cloud region (Vertex also takes `global`, `us`,\n`eu`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "residency": {
+          "default": null,
+          "description": "Where this provider's models run, as an opaque label (design note 0039):\n`[a-z][a-z0-9_-]{0,31}`. A key's `allowed_residency` is matched against it. Nothing about the\nlabel is checked against the provider's real location: it is the operator's statement.\n(`region` is the cloud API's own region for Bedrock and Vertex, a different thing.)",
           "type": [
             "string",
             "null"
