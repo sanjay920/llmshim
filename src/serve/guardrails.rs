@@ -63,10 +63,10 @@ impl Scope {
     }
 
     /// The first rule (in the file's order) any text under `value` breaks, or `None`.
-    fn first_rule(&self, value: &Value) -> Option<usize> {
+    fn first_rule(&self, value: &Value, files: bool) -> Option<usize> {
         match value {
             Value::String(text) => {
-                if MEDIA_PREFIXES.iter().any(|prefix| text.starts_with(prefix)) {
+                if files && MEDIA_PREFIXES.iter().any(|prefix| text.starts_with(prefix)) {
                     return None;
                 }
                 self.set
@@ -75,12 +75,16 @@ impl Scope {
                     .map(|pattern| self.rule_of_pattern[pattern])
                     .min()
             }
-            Value::Array(items) => items.iter().find_map(|item| self.first_rule(item)),
+            Value::Array(items) => items.iter().find_map(|item| self.first_rule(item, files)),
             // Keys are the caller's text too (a tool-call argument object, a schema), so they are
             // matched as well as the values.
             Value::Object(map) => map.iter().find_map(|(key, item)| {
-                self.first_rule(&Value::String(key.clone()))
-                    .or_else(|| (key != BULK_KEY).then(|| self.first_rule(item)).flatten())
+                self.first_rule(&Value::String(key.clone()), files)
+                    .or_else(|| {
+                        (key != BULK_KEY)
+                            .then(|| self.first_rule(item, files))
+                            .flatten()
+                    })
             }),
             _ => None,
         }
@@ -136,15 +140,15 @@ impl Direction {
         self.global.is_some() || self.by_tenant.contains_key(tenant)
     }
 
-    fn first_match(&self, tenant: &str, body: &Value) -> Option<usize> {
+    fn first_match(&self, tenant: &str, body: &Value, files: bool) -> Option<usize> {
         let global = self
             .global
             .as_ref()
-            .and_then(|scope| scope.first_rule(body));
+            .and_then(|scope| scope.first_rule(body, files));
         let own = self
             .by_tenant
             .get(tenant)
-            .and_then(|scope| scope.first_rule(body));
+            .and_then(|scope| scope.first_rule(body, files));
         // The earlier of the two in the file's order.
         [global, own].into_iter().flatten().min()
     }
@@ -235,13 +239,13 @@ impl Guardrails {
 impl RequestGuard for Guardrails {
     fn first_match(&self, tenant: &str, body: &Value) -> Option<String> {
         self.request
-            .first_match(tenant, body)
+            .first_match(tenant, body, true)
             .map(|index| self.names[index].clone())
     }
 
     fn first_response_match(&self, tenant: &str, body: &Value) -> Option<String> {
         self.response
-            .first_match(tenant, &response_view(body))
+            .first_match(tenant, &response_view(body), false)
             .map(|index| self.names[index].clone())
     }
 
@@ -251,7 +255,7 @@ impl RequestGuard for Guardrails {
 
     fn redact(&self, tenant: &str, value: &mut Value) -> Result<Vec<String>, String> {
         self.redact_with(tenant, GuardrailScope::reads_request, |rule| {
-            redact_leaves(value, rule, true)
+            redact_leaves(value, rule, true, true)
         })
     }
 
@@ -265,16 +269,16 @@ impl RequestGuard for Guardrails {
                     let Some(message) = choice.get_mut("message") else {
                         continue;
                     };
-                    for field in ["content", "refusal", "tool_calls"] {
+                    for field in ["content", "refusal", "tool_calls", "responses_output"] {
                         if let Some(part) = message.get_mut(field) {
-                            changed |= redact_leaves(part, rule, true)?;
+                            changed |= redact_leaves(part, rule, true, false)?;
                         }
                     }
                 }
             }
             // A transcript (note 0043) is a bare `text`.
             if let Some(text) = answer.get_mut("text") {
-                changed |= redact_leaves(text, rule, true)?;
+                changed |= redact_leaves(text, rule, true, false)?;
             }
             Ok(changed)
         })
@@ -307,15 +311,19 @@ impl Guardrails {
 
 /// Keys whose strings are structure, not the message's text: never rewritten (a replaced id or tool
 /// name would break the request), and `data` / `file_data`, which carry encoded files.
-const REDACT_SKIPPED: [&str; 7] = [
+const REDACT_SKIPPED: [&str; 8] = [
     "id",
     "type",
     "name",
     "role",
     "tool_call_id",
-    "data",
-    "file_data",
+    "encrypted_content",
+    "thought_signature",
+    "signature",
 ];
+
+/// Encoded-file fields of a request: never text. (An answer has none, so they are not skipped there.)
+const REDACT_FILE_KEYS: [&str; 2] = ["data", "file_data"];
 
 /// A text may grow to at most this many times its length plus a constant by redaction: a pattern
 /// that matches a single character with a long replacement, applied by several patterns in turn,
@@ -325,11 +333,16 @@ const REDACT_GROWTH_SLACK: usize = 4096;
 
 /// Replace every match of `rule` in the string leaves of `value`; whether anything changed, or the
 /// rule's name if it would have made a text too large.
-fn redact_leaves(value: &mut Value, rule: &RedactRule, structural: bool) -> Result<bool, ()> {
+fn redact_leaves(
+    value: &mut Value,
+    rule: &RedactRule,
+    structural: bool,
+    files: bool,
+) -> Result<bool, ()> {
     match value {
         Value::String(text) => {
             // An encoded file (any `data:` URI) is not text.
-            if text.starts_with("data:") || !rule.any.is_match(text) {
+            if (files && text.starts_with("data:")) || !rule.any.is_match(text) {
                 return Ok(false);
             }
             let limit = text.len() * REDACT_GROWTH + REDACT_GROWTH_SLACK;
@@ -349,14 +362,17 @@ fn redact_leaves(value: &mut Value, rule: &RedactRule, structural: bool) -> Resu
             // Every item is visited: this is not `any`, which would stop at the first change.
             let mut changed = false;
             for item in items {
-                changed |= redact_leaves(item, rule, structural)?;
+                changed |= redact_leaves(item, rule, structural, files)?;
             }
             Ok(changed)
         }
         Value::Object(map) => {
             let mut changed = false;
             for (key, item) in map.iter_mut() {
-                if structural && REDACT_SKIPPED.contains(&key.as_str()) {
+                if structural
+                    && (REDACT_SKIPPED.contains(&key.as_str())
+                        || (files && REDACT_FILE_KEYS.contains(&key.as_str())))
+                {
                     continue;
                 }
                 // A tool call's `arguments` is JSON text: read it as JSON, so a match is replaced in
@@ -365,7 +381,7 @@ fn redact_leaves(value: &mut Value, rule: &RedactRule, structural: bool) -> Resu
                 if key == "arguments" {
                     if let Value::String(text) = item {
                         if let Ok(mut parsed) = serde_json::from_str::<Value>(text) {
-                            if redact_leaves(&mut parsed, rule, false)? {
+                            if redact_leaves(&mut parsed, rule, false, files)? {
                                 *text = parsed.to_string();
                                 changed = true;
                             }
@@ -373,7 +389,7 @@ fn redact_leaves(value: &mut Value, rule: &RedactRule, structural: bool) -> Resu
                         }
                     }
                 }
-                changed |= redact_leaves(item, rule, structural)?;
+                changed |= redact_leaves(item, rule, structural, files)?;
             }
             Ok(changed)
         }
@@ -389,11 +405,10 @@ fn redact_leaves(value: &mut Value, rule: &RedactRule, structural: bool) -> Resu
 /// `arguments`, which is JSON text, is parsed so that an escaped secret (`\u0041KIA...`) is read as
 /// the text it decodes to.
 pub(crate) fn response_view(choices: &Value) -> Value {
-    const SKIPPED: [&str; 14] = [
+    const SKIPPED: [&str; 13] = [
         "thought_signature",
         "signature",
         "encrypted_content",
-        "responses_output",
         "wire_ids",
         "id",
         "item_id",
@@ -408,17 +423,16 @@ pub(crate) fn response_view(choices: &Value) -> Value {
     fn walk(value: &Value) -> Value {
         match value {
             Value::Array(items) => {
-                // Content parts: one string, so a split secret is whole.
-                if !items.is_empty()
-                    && items
-                        .iter()
-                        .all(|item| item.get("text").is_some_and(Value::is_string))
-                {
-                    let joined: String = items
-                        .iter()
-                        .filter_map(|item| item.get("text").and_then(Value::as_str))
-                        .collect();
-                    return Value::String(joined);
+                // Content parts: the text of every part is joined into one string, so a secret split
+                // across two is whole, whatever else the array holds.
+                let texts: Vec<&str> = items
+                    .iter()
+                    .filter_map(|item| item.get("text").and_then(Value::as_str))
+                    .collect();
+                if texts.len() >= 2 {
+                    let mut view = vec![Value::String(texts.concat())];
+                    view.extend(items.iter().map(walk));
+                    return Value::Array(view);
                 }
                 Value::Array(items.iter().map(walk).collect())
             }
@@ -801,6 +815,94 @@ mod tests {
             .redact_response("platform", &mut reply)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn an_answer_is_never_exempt_because_it_starts_like_a_file_and_readable_output_items_are_read()
+    {
+        let guard = rules(
+            "[[guardrails]]\nname = \"mask\"\nscope = \"response\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]\nreplacement = \"[x]\"",
+        );
+        // A model that begins its answer `data:image/...` is not carrying a file: the exemption is for
+        // requests, and an answer has no such thing.
+        let mut answer = json!({"choices": [{"message": {
+            "content": "data:image/png, key AKIAABCDEFGHIJKLMNOP",
+            "tool_calls": [{"function": {"name": "f", "arguments": "data:text/plain AKIAABCDEFGHIJKLMNOP"}}],
+            "responses_output": [
+                {"type": "web_search_call", "action": {"query": "AKIAABCDEFGHIJKLMNOP"}},
+                {"type": "reasoning", "encrypted_content": "AKIAABCDEFGHIJKLMNOP"}]}}]});
+        assert_eq!(
+            guard.redact_response("platform", &mut answer).unwrap(),
+            vec!["mask".to_string()]
+        );
+        let message = &answer["choices"][0]["message"];
+        assert_eq!(message["content"], "data:image/png, key [x]");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            "data:text/plain [x]"
+        );
+        // The readable output item is masked; the opaque encrypted one is not text.
+        assert_eq!(message["responses_output"][0]["action"]["query"], "[x]");
+        assert_eq!(
+            message["responses_output"][1]["encrypted_content"],
+            "AKIAABCDEFGHIJKLMNOP"
+        );
+        // Judged as an answer too: a `data:image/` start does not hide a match from a blocking rule.
+        let blocker = rules(
+            "[[guardrails]]\nname = \"leak\"\nscope = \"response\"\nblock_if_matches = [\"AKIA[0-9A-Z]{16}\"]",
+        );
+        let raw = json!([{"message": {"content": "data:image/png, key AKIAABCDEFGHIJKLMNOP"}}]);
+        assert_eq!(
+            blocker.first_response_match("platform", &raw).as_deref(),
+            Some("leak")
+        );
+        // And a request's inline image is still exempt (the same text, as a request).
+        let request = json!({"messages": [{"content": [{"type": "image_url", "image_url": {
+            "url": "data:image/png;base64,AKIAABCDEFGHIJKLMNOP"}}]}]});
+        let request_blocker =
+            rules("[[guardrails]]\nname = \"leak\"\nblock_if_matches = [\"AKIA[0-9A-Z]{16}\"]");
+        assert_eq!(request_blocker.first_match("platform", &request), None);
+    }
+
+    #[test]
+    fn a_secret_split_across_parts_is_refused_even_beside_a_part_that_is_not_text() {
+        let blocker = rules(
+            "[[guardrails]]\nname = \"leak\"\nscope = \"response\"\nblock_if_matches = [\"AKIA[0-9A-Z]{16}\"]",
+        );
+        let split = json!([{"message": {"content": [
+            {"type": "text", "text": "key AKI"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+            {"type": "text", "text": "AABCDEFGHIJKLMNOP"}]}}]);
+        assert_eq!(
+            blocker.first_response_match("platform", &split).as_deref(),
+            Some("leak")
+        );
+    }
+
+    #[test]
+    fn a_response_redaction_that_would_grow_the_answer_too_far_is_refused_and_both_scope_reads_both(
+    ) {
+        let blow = rules(
+            "[[guardrails]]\nname = \"blow\"\nscope = \"response\"\nredact_matches = [\"a\", \"b\", \"c\"]\n\
+             replacement = \"0123456789012345678901234567890123456789012345678901234567890123\"",
+        );
+        let mut answer = json!({"choices": [{"message": {"content": "abc".repeat(5000)}}]});
+        assert_eq!(
+            blow.redact_response("platform", &mut answer),
+            Err("blow".to_string())
+        );
+        let both = rules(
+            "[[guardrails]]\nname = \"mask\"\nscope = \"both\"\nredact_matches = [\"hunter2\"]",
+        );
+        let mut request = json!("pw hunter2");
+        let mut reply = json!({"choices": [{"message": {"content": "pw hunter2"}}]});
+        assert_eq!(both.redact("platform", &mut request).unwrap().len(), 1);
+        assert_eq!(
+            both.redact_response("platform", &mut reply).unwrap().len(),
+            1
+        );
+        assert_eq!(request, "pw [redacted]");
+        assert_eq!(reply["choices"][0]["message"]["content"], "pw [redacted]");
     }
 
     #[test]

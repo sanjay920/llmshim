@@ -19,10 +19,13 @@ replacement = "[hidden]"
 - `scope` is `request` (the default, 0044), `response`, or `both` (the same patterns in both directions).
 - A response rule rewrites the **text a caller will read** in a non-streaming answer, after the provider has
   answered and been paid and **before the answer is judged, cached or returned**: each choice's message `content`
-  (a string or the `text` of its parts), `refusal` and `tool_calls` (the arguments are decoded, masked and
-  re-encoded as in 0044), and a transcript's `text`. **Not touched:** the envelope (`id`, `model`, usage), the
-  reasoning and its signatures, structure keys (`id`, `type`, `name`, `role`) and encoded files, and an image's
-  revised prompt.
+  (a string or the `text` of its parts), `refusal`, `tool_calls` (the arguments are decoded, masked and
+  re-encoded as in 0044), the readable items of `responses_output` (a `web_search_call`'s query, a tool-search
+  output), and a transcript's `text`. **Not touched:** the envelope (`id`, `model`, usage), the reasoning and its
+  signatures, opaque encrypted items (`encrypted_content`), structure keys (`id`, `type`, `name`, `role`), and an
+  image's revised prompt. **An answer is never exempt for starting like a file:** the `data:` and `data` /
+  `file_data` exemptions of 0044 are for requests, which carry encoded files; an answer that begins
+  `data:image/png, key AKIA...` is masked (and judged) like any other text.
 - **The answer is masked, not refused, with a 200**; the attempt is recorded as completed with its tokens and cost;
   the rewrite is counted by rule name (`llmshim_gateway_guardrail_redactions_total{rule}`, the same counter as
   requests) and nothing about the matched text is logged.
@@ -37,6 +40,28 @@ replacement = "[hidden]"
   is refused 400 before anything is sent. This holds for redaction rules as for blocking ones.
 - The bound on growth (four times the text plus 4 KiB), the patterns that match everywhere and the replacement
   rules (no quote, no backslash, not matched by its own patterns) are 0044's, and apply to answers.
+
+## Found in review
+
+- A model answer beginning `data:image/...` was skipped by both the rewrite and the check (the exemption was
+  written for requests): a prompt-injected or quirky model could carry a secret out under that prefix. The
+  exemption now applies to requests only.
+- `responses_output` was skipped by both, yet the Responses facade copies its `web_search_call` and tool-search
+  items to the caller. Its readable items are now masked and judged; only encrypted content is skipped.
+- A secret split across content parts is refused when the array also holds a non-text part (the parts' text is
+  joined whatever else the array holds); masking is per part, so such a split passes the rewrite and is caught by
+  the residual check, which refuses it.
+- The growth overflow has its own refusal (`422 guardrail_redaction_too_large`, reason `guardrail_redaction`, the
+  provider's label), not the block's.
+
+## Known limits
+
+- **Errors are not cached.** A refusal after the provider answered returns before the idempotency write, so a retry
+  with the same key pays for the call again (0043's block has the same property).
+- **The growth bound compounds** across rules: four times the text per rule, as on the request side.
+- **Signed thinking.** A masked answer is what a caller sends back as history, and the native facades issue replay
+  receipts from the answer. On models that bind thinking signatures to the conversation prefix a changed assistant
+  turn may fail its check on the next turn. Not traced and not tested; mask the user's side, or accept the 400.
 
 ## Not built
 

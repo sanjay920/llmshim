@@ -518,22 +518,29 @@ impl GatewayState {
 
     /// Apply the response-scope redaction rules to a non-streaming answer before it is judged,
     /// cached or returned (note 0045).
-    fn redact_answer(&self, tenant: &str, answer: &mut Value) -> Result<(), ApiError> {
+    fn redact_answer(
+        &self,
+        tenant: &str,
+        provider: &str,
+        answer: &mut Value,
+    ) -> Result<(), ApiError> {
         #[cfg(feature = "serve")]
         if let Some(guard) = self.guardrails.get() {
             let applied = guard.redact_response(tenant, answer).map_err(|rule| {
                 crate::gateway::metrics::incr(
                     crate::gateway::metrics::REJECTED,
-                    &[("provider", "unknown"), ("reason", "guardrail_response")],
+                    &[("provider", provider), ("reason", "guardrail_redaction")],
                 );
                 ApiError::from(ShimError::ProviderError {
                     status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
                     body: json!({
                         "error": {
-                            "message": format!("response blocked by guardrail {rule}"),
+                            "message": format!(
+                                "response could not be redacted within the size bound (guardrail {rule})"
+                            ),
                             "type": "api_error",
                             "param": null,
-                            "code": "guardrail_blocked_response"
+                            "code": "guardrail_redaction_too_large"
                         }
                     })
                     .to_string(),
@@ -548,7 +555,7 @@ impl GatewayState {
             }
         }
         #[cfg(not(feature = "serve"))]
-        let _ = (tenant, answer);
+        let _ = (tenant, provider, answer);
         Ok(())
     }
 
@@ -1799,7 +1806,11 @@ async fn chat(
                         // The cache can outlive the configuration (a Redis cache across a restart or
                         // a rolling update): a replayed answer is redacted and judged by today's
                         // rules too.
-                        state.redact_answer(&identity.tenant, &mut cached_response)?;
+                        state.redact_answer(
+                            &identity.tenant,
+                            &provider_name,
+                            &mut cached_response,
+                        )?;
                         state.check_response_guardrails(
                             &identity.tenant,
                             &provider_name,
@@ -1830,7 +1841,7 @@ async fn chat(
             Ok(mut submitted) => {
                 // Response redaction first (note 0045), then the response rules judge what is left,
                 // before the answer is cached for a retry or seen by the caller (note 0043).
-                state.redact_answer(&identity.tenant, &mut submitted.value)?;
+                state.redact_answer(&identity.tenant, &provider_name, &mut submitted.value)?;
                 state.check_response_guardrails(
                     &identity.tenant,
                     &provider_name,
@@ -2587,7 +2598,7 @@ async fn audio_transcriptions(
     )
     .await?;
     let mut value = value;
-    state.redact_answer(&tenant, &mut value)?;
+    state.redact_answer(&tenant, &provider, &mut value)?;
     let text = value["text"].as_str().unwrap_or_default().to_owned();
     // A transcript is text the caller will read: a rule that reads responses judges it (note 0043).
     state.check_response_guardrails(&tenant, &provider, &json!({"text": &text}))?;
