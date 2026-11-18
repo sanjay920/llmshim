@@ -1,6 +1,6 @@
 # 0030: Tenant budgets above key budgets
 
-Status: slices 2 to 5 built (the roadmap item is complete except as listed under slice 4's "not built") (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
+Status: slices 2 to 5 built; the leftovers were closed without building (see "Closed without building" at the end) (2026-11-17; see the end). A contract note, written before any code (README working rule 3): a
 file table, an admission rule, a refusal reason and ledger keys become promises, and it touches the
 spend ledger (0010), which every guarantee in 0027 rests on. It is the third slice of the roadmap
 item "hierarchical budgets, tags, alerts, cost exports" (after 0028 and 0029). Nothing here is
@@ -57,7 +57,7 @@ budget_usd = 50.0             # this key's own cap, its own counter
   in the window in force**: what the tenant's keys spent earlier in that window is counted at neither
   level, and keys that had no `budget_usd` (previously unlimited) become limited by the tenant cap from
   that moment. An operator adds a table at a window boundary to avoid a one-window over-allowance, and
-  the reload status reports each table's `started_at`. Changing a table's `budget_window_secs` starts a
+  the reload status was to report each table's `started_at` (not built: see "Closed without building"). Changing a table's `budget_window_secs` starts a
   fresh counter the same way. This is documented in the file's reference and in the reload answer, and
   it is the price of never reinterpreting an existing counter.
 - **A key's cap needs the key's identity at admission.** The policy scope (which crosses Redis to the
@@ -280,7 +280,7 @@ the lease size is then set by the table, which removes today's last-writer-wins 
   column in use), the API (400, 404, round trip), and a process test: a team's budget of zero refuses its
   key, and the next generation with a higher cap serves it.
 
-## Closed without building (2026-11-18)
+## Closed without building (2026-11-17)
 
 Three leftovers of slices 2 to 5 were weighed and **not built**; none is a safety gap, and each costs more than it
 returns.
@@ -294,7 +294,9 @@ returns.
   that from the generation bump and the 429s, and the usage records carry the timestamps. A status field would
   repeat what the records say.
 - **A refusal-level label** (`level: tenant|key` on the 429's metadata and on `rejected_total`). The local ledger
-  knows which level refused, but the Redis ledger's script returns one refusal code for "a budget"; adding the level
-  changes that script's return, the fleet's wire with it, and some thirty pattern matches in the tests, to name in a
+  sees each level's verdict in a loop but keeps only the longest wait, and the Redis ledger's script returns one
+  refusal code for "a budget"; adding the level
+  changes that script's return, the fleet's wire with it, and the thirty or so `RateRefusal::Budget` matches in
+  `attempt.rs` (production and tests), to name in a
   label what the usage records and the tenant's own configuration already say. Revisit if an operator needs it to
   tell a tenant cap from a key cap in an alert.

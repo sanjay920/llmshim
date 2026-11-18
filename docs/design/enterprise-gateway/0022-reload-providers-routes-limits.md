@@ -162,7 +162,7 @@ whichever replica asks meanwhile). A control plane that distributes configuratio
   pool; needs its own drain rule).
 - Reloading `limits.max_concurrency` (a semaphore resized under load; needs the lanes'
   permits accounted for).
-- Config-registered providers beyond the existing kinds: **decided against** (2026-11-18). A provider is a kind plus a `base_url`: any endpoint that speaks a wire llmshim has (OpenAI Chat Completions, the Responses API, Anthropic Messages, Gemini, and the cloud transports) is registered with the kind of that wire and its address, and a wire it does not have is a library adapter with its own translation and tests, which a configuration file cannot supply.
+- Config-registered providers beyond the existing kinds: **decided against** (2026-11-17). A provider is a kind plus a `base_url`: any endpoint that speaks a wire llmshim has (OpenAI Chat Completions, the Responses API, Anthropic Messages, Gemini, and the cloud transports) is registered with the kind of that wire and its address (`base_url`; `region` or `endpoint` for the cloud kinds, which refuse `base_url`), and a wire it does not have is a library adapter with its own translation and tests, which a configuration file cannot supply.
 - The proxy (`llmshim proxy`) keeps its own router and does not reload: its
   `AppState.router` is a public field, and nothing in this note changes it.
 
