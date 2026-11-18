@@ -399,3 +399,81 @@ async fn the_other_media_routes_still_answer_501_on_a_fleet() {
         .unwrap();
     assert_eq!(response.status(), 501, "transcription");
 }
+
+fn stream_body() -> String {
+    let chunk = |delta: &str, finish: &str, extra: &str| {
+        format!(
+            "data: {{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\
+             \"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{delta},\
+             \"finish_reason\":{finish}}}]{extra}}}"
+        )
+    };
+    [
+        chunk(r#"{"role":"assistant","content":"po"}"#, "null", ""),
+        chunk(
+            r#"{"content":"ng"}"#,
+            r#""stop""#,
+            r#","usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}"#,
+        ),
+        "data: [DONE]".to_string(),
+    ]
+    .join("\n\n")
+        + "\n\n"
+}
+
+#[tokio::test]
+#[ignore = "needs Redis: set LLMSHIM_TEST_REDIS_URL"]
+async fn a_stream_that_fails_to_open_on_a_fleet_is_retried_on_the_next_target() {
+    // On a fleet the open failure is an error item after admission has returned (note 0042); the
+    // handler reads the first item of a deployment stream and retries on the next target.
+    let mut east = mockito::Server::new_async().await;
+    let east_mock = east
+        .mock("POST", "/chat/completions")
+        .with_status(502)
+        .with_header("content-type", "application/json")
+        .with_body("{\"error\":{\"message\":\"nope\"}}")
+        .expect(2)
+        .create_async()
+        .await;
+    let mut west = mockito::Server::new_async().await;
+    let west_mock = west
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "text/event-stream")
+        .with_body(stream_body())
+        .expect(2)
+        .create_async()
+        .await;
+    let url = redis_url();
+    let env = [("SERVE_E2E_REDIS_URL", url.as_str())];
+    let names = Names::new();
+    let second = format!("{}-west", names.provider);
+    let text = format!(
+        "{}\n[providers.{second}]\nkind = \"openai-compatible\"\nbase_url = \"{}\"\n\
+         [deployments.chat]\nstrategy = \"ordered\"\n\
+         targets = [{{ model = \"{}\" }}, {{ model = \"{second}/test-model\" }}]\n\
+         [upstream]\nmax_retries = 0\n",
+        fleet_config(&east.url(), &names, ""),
+        west.url(),
+        names.model(),
+    );
+    let a = start(&text, "fleet-stream-a", &env);
+    let b = start(&text, "fleet-stream-b", &env);
+    for server in [&a, &b] {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", server.base))
+            .bearer_auth(CALLER_KEY)
+            .json(
+                &serde_json::json!({"model": "deployment/chat", "stream": true,
+                "messages": [{"role": "user", "content": "ping"}]}),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("po") && body.contains("ng"), "{body}");
+        assert!(!body.contains("error"), "{body}");
+    }
+    east_mock.assert_async().await;
+    west_mock.assert_async().await;
+}

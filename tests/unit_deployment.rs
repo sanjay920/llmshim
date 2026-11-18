@@ -174,3 +174,30 @@ fn peeking_at_a_deployment_does_not_take_a_turn_or_a_probe() {
     // A model that is not a deployment is not peeked.
     assert_eq!(router.peek_deployment(&json!({"model": "east/m"})), None);
 }
+
+#[test]
+fn asking_whether_a_target_is_untried_never_reserves_its_probe() {
+    // Asked of every deployment stream, including the ones that succeed (note 0042): the next
+    // target's circuit is open and past its cooldown, and no request is ever sent to it, so a probe
+    // taken here would never be reported and its recovery would stall.
+    let breaker = Arc::new(ProviderBreaker::with_config(BreakerConfig {
+        window: Duration::from_secs(60),
+        trip_threshold: 1,
+        cooldown: Duration::from_millis(400),
+    }));
+    let router = router(Strategy::Ordered, breaker.clone());
+    breaker.record_failure("west", true, Instant::now());
+    // Past the cooldown, so the probe is due; a reserved one is not re-offered until another cooldown.
+    std::thread::sleep(Duration::from_millis(450));
+    let tried = vec!["east/m".to_string()];
+    for _ in 0..5 {
+        assert!(router.deployment_has_untried_target("chat", &tried));
+    }
+    assert!(
+        breaker.try_admit_probe("west", Instant::now()),
+        "the probe slot is still free"
+    );
+    // Every target tried, or no such deployment: nothing is untried.
+    assert!(!router.deployment_has_untried_target("chat", &["east/m".into(), "west/m".into()]));
+    assert!(!router.deployment_has_untried_target("nope", &[]));
+}

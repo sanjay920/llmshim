@@ -1731,6 +1731,17 @@ fn failover_target<'a>(
         .map(|target| (name, target))
 }
 
+/// Whether a request addressed to a deployment still has a target it has not tried and may try
+/// (the same bound as `failover_target`, without a failure to classify). It must not reserve a
+/// circuit probe: it is asked of every deployment stream, including the ones that succeed, and a
+/// probe taken for a target that is then never tried would stall that target's recovery.
+fn untried_deployment_target(model: &str, snapshot: &Router, tried: &[String]) -> bool {
+    model.strip_prefix("deployment/").is_some_and(|name| {
+        tried.len() < snapshot.deployment_target_count(name).min(3)
+            && snapshot.deployment_has_untried_target(name, tried)
+    })
+}
+
 /// Whether a failed attempt says nothing about the request, so another target may be tried: a 5xx
 /// from the provider or a transport failure (note 0031). A 429 and every local refusal (the
 /// caller's own limits and budget, a policy refusal, an overload) are not: they are not the
@@ -2507,6 +2518,8 @@ async fn chat_stream_inner(
     let mut prequeue_permit = Some(prequeue_permit);
     let mut previous: Option<GatewayError> = None;
     let mut pending_failover: Option<(String, String, String)> = None;
+    // The first item of the stream, when it was read to judge a retry (below): forwarded first.
+    let mut first_item: Option<Option<Result<String, GatewayError>>> = None;
     let mut rx = loop {
         let (_provider_name, _budget_model, gw, identified_caller, snapshot) =
             match build_request_for(
@@ -2563,10 +2576,30 @@ async fn chat_stream_inner(
         let permit = prequeue_permit
             .take()
             .expect("a preparation permit is held for every attempt");
-        match state
+        let opened = state
             .submit_stream_prepared(prepared_submission, permit, logical_deadline)
-            .await
-        {
+            .await;
+        // A deployment stream with targets left to try is judged by its first item as well as by the
+        // open (note 0042): on a fleet the open failure arrives as an error item after admission has
+        // returned, and a managed stream can fail while it buffers; nothing has reached the caller
+        // yet, so either is retried exactly as a failed open is. Any other first item is forwarded.
+        let opened = match opened {
+            Ok(mut rx) if untried_deployment_target(&req.model, &snapshot, &tried) => {
+                match rx.recv().await {
+                    Some(Err(err))
+                        if failover_target(&req.model, &snapshot, &tried, &err).is_some() =>
+                    {
+                        Err(err)
+                    }
+                    first => {
+                        first_item = Some(first);
+                        Ok(rx)
+                    }
+                }
+            }
+            other => other,
+        };
+        match opened {
             Ok(rx) => break rx,
             Err(err) => {
                 let Some((name, target)) = failover_target(&req.model, &snapshot, &tried, &err)
@@ -2596,7 +2629,13 @@ async fn chat_stream_inner(
 
     let event_stream = async_stream::stream! {
         let mut identity_sent = false;
-        while let Some(item) = rx.recv().await {
+        let mut pending = first_item;
+        loop {
+            let next = match pending.take() {
+                Some(first) => first,
+                None => rx.recv().await,
+            };
+            let Some(item) = next else { break };
             match item {
                 Ok(chunk) => {
                     if responses_identity && !identity_sent {

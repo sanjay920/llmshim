@@ -291,6 +291,18 @@ impl Router {
             .map_or(0, |deployment| deployment.targets().len())
     }
 
+    /// Whether a request to `deployment/<name>` has a target it has not tried. A pure lookup: unlike
+    /// [`Self::deployment_retry_target`] it never reserves a circuit probe, so it can be asked on
+    /// the success path (note 0042).
+    pub fn deployment_has_untried_target(&self, name: &str, tried: &[String]) -> bool {
+        self.deployments.get(name).is_some_and(|deployment| {
+            deployment
+                .targets()
+                .iter()
+                .any(|target| !tried.contains(&target.model))
+        })
+    }
+
     /// The target a failed request to `deployment/<name>` should try next: the first target, in
     /// file order, that has not been tried, preferring one whose circuit is not open, and reserving
     /// the probe slot for the one chosen (note 0031's failover). `None` when every target has been
