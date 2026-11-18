@@ -26,6 +26,7 @@ pub(crate) enum DispatchOperation {
     Chat,
     Embeddings,
     Images,
+    Speech,
 }
 
 struct DispatchPolicyState {
@@ -68,6 +69,7 @@ impl DispatchPolicyContext {
         {
             x if x == DispatchOperation::Embeddings as u8 => DispatchOperation::Embeddings,
             x if x == DispatchOperation::Images as u8 => DispatchOperation::Images,
+            x if x == DispatchOperation::Speech as u8 => DispatchOperation::Speech,
             _ => DispatchOperation::Chat,
         }
     }

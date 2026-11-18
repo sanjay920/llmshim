@@ -98,6 +98,58 @@ pub(crate) fn quote_unbounded(
     }))
 }
 
+/// [`quote`] for speech synthesis (note 0037). The price is fixed by the request: the input's
+/// characters at the catalog's per-character rate for the model (a builtin, trusted row), so the
+/// reservation is exact, and the attempt settles at the same figure. A model with no such rate has no
+/// bound and is refused at every capped level.
+pub(crate) fn quote_speech(
+    policy: Option<&BudgetPolicySnapshot>,
+    attempt: &PreparedAttempt<'_>,
+) -> Result<Option<BudgetQuote>, BudgetPlanError> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if !policy.valid {
+        return Err(BudgetPlanError::Unpriceable);
+    }
+    if policy.limit_nanos == 0 {
+        return Ok(Some(BudgetQuote {
+            amount_nanos: 0,
+            bounded: true,
+        }));
+    }
+    match speech_reservation_nanos(attempt).filter(|amount| *amount <= MAX_EXACT_REDIS_NANOS) {
+        Some(amount_nanos) => Ok(Some(BudgetQuote {
+            amount_nanos,
+            bounded: true,
+        })),
+        None => Err(BudgetPlanError::Unpriceable),
+    }
+}
+
+fn speech_reservation_nanos(attempt: &PreparedAttempt<'_>) -> Option<u64> {
+    let identity = attempt.identity();
+    let row = llmshim_catalog::audio::SPEECH_MODELS.iter().find(|row| {
+        row.provider == identity.provider_name() && row.model == identity.pricing_model()
+    })?;
+    let characters = attempt
+        .native_body()
+        .get("input")?
+        .as_str()?
+        .chars()
+        .count();
+    speech_cost_nanos(characters, row.usd_per_million_characters)
+}
+
+/// What `speech_response` will report for `characters` at `usd_per_million_characters`, in the
+/// nanodollars the ledger settles it at: the same f64 expression and the same rounding up as
+/// `observed_cost_nanos`, so a reservation is never a nanodollar below its settlement (an integer
+/// formula here was, for 75 of the 4096 allowed lengths).
+fn speech_cost_nanos(characters: usize, usd_per_million_characters: f64) -> Option<u64> {
+    let cost_usd = characters as f64 * usd_per_million_characters / 1_000_000.0;
+    observed_cost_nanos(&serde_json::json!({ "cost_usd": cost_usd }))
+}
+
 fn quote_with(
     policy: Option<&BudgetPolicySnapshot>,
     attempt: &PreparedAttempt<'_>,
@@ -619,6 +671,32 @@ mod tests {
             observed_cost_nanos(&serde_json::json!({"cost_usd": "unknown"})),
             None
         );
+    }
+
+    #[test]
+    fn a_speech_reservation_equals_its_settlement_for_every_allowed_length() {
+        use crate::provider::Provider;
+        let provider = crate::providers::openai::OpenAi::new("key".into());
+        for model in ["tts-1", "tts-1-hd"] {
+            let rate = llmshim_catalog::audio::SPEECH_MODELS
+                .iter()
+                .find(|row| row.model == model)
+                .unwrap()
+                .usd_per_million_characters;
+            for characters in 1..=4096_usize {
+                // The adapter's own answer for this input, settled as the ledger settles a cost.
+                let request =
+                    serde_json::json!({"input": "x".repeat(characters), "voice": "alloy"});
+                let response = provider
+                    .speech_response(model, &request, vec![1], "audio/mpeg")
+                    .unwrap();
+                assert_eq!(
+                    speech_cost_nanos(characters, rate),
+                    observed_cost_nanos(&response.usage),
+                    "{characters} characters on {model}"
+                );
+            }
+        }
     }
 
     #[test]
