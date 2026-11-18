@@ -27,6 +27,16 @@ handler reads the first item before it sends the response head:
 A request that did not address a deployment, or whose targets are all tried, is not read ahead: the response head
 goes out as soon as the stream is accepted, as before. A stream whose first byte has been sent is never retried.
 
+**A side effect to avoid.** Whether a deployment stream has an untried target is asked of every such stream,
+including the ones that succeed, so it is a pure lookup (`Router::deployment_has_untried_target`) and never the
+retry selection, which reserves the next target's circuit probe: a probe taken for a target that is then never
+tried would stall its recovery (found in review; `unit_deployment` pins it).
+
+**Statuses.** A retry that cannot be made after a retryable first-item error (the key's list refuses the next
+target, no permit) returns the original failure as an HTTP error response (5xx), as a failed open on a single
+instance always did; on a fleet that case used to be a 200 with an SSE `error` event. A non-retryable first-item
+error is still forwarded as an SSE `error` event on a 200.
+
 The cost is that a deployment stream's response head waits for the first item (the first token's latency, which the
 caller would wait for anyway) when a retry is possible; a caller that relied on seeing headers before any token from
 a deployment stream sees them with the first event instead.
@@ -42,5 +52,6 @@ a deployment stream sees them with the first event instead.
 `integration_serve_fleet::a_stream_that_fails_to_open_on_a_fleet_is_retried_on_the_next_target` (two replicas and a
 Redis): an ordered deployment whose first target answers 502 and whose second streams; both replicas' requests
 get the second target's stream with no error event, and each target is hit twice. Not reading the first item
-fails it. The single-instance stream tests of 0031 (`integration_serve_deployments`) pass unchanged: the
+fails it. `unit_deployment::asking_whether_a_target_is_untried_never_reserves_its_probe` pins the pure lookup (routing it
+through the selector fails it). The single-instance stream tests of 0031 (`integration_serve_deployments`) pass unchanged: the
 open-failure path is the same code.

@@ -1732,11 +1732,13 @@ fn failover_target<'a>(
 }
 
 /// Whether a request addressed to a deployment still has a target it has not tried and may try
-/// (the same bound as `failover_target`, without a failure to classify).
+/// (the same bound as `failover_target`, without a failure to classify). It must not reserve a
+/// circuit probe: it is asked of every deployment stream, including the ones that succeed, and a
+/// probe taken for a target that is then never tried would stall that target's recovery.
 fn untried_deployment_target(model: &str, snapshot: &Router, tried: &[String]) -> bool {
     model.strip_prefix("deployment/").is_some_and(|name| {
         tried.len() < snapshot.deployment_target_count(name).min(3)
-            && snapshot.deployment_retry_target(name, tried).is_some()
+            && snapshot.deployment_has_untried_target(name, tried)
     })
 }
 
