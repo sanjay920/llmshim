@@ -278,6 +278,46 @@ pub(crate) async fn speech_value_with_policy(
     }))
 }
 
+/// An admitted transcription (note 0038). `payload` is the upload as the dispatcher carries it:
+/// the caller's `model`, the audio as base64 (`audio_b64`) with its `filename` and `media_type`, and
+/// the optional `language`, `prompt`, `response_format` and `temperature`. The answer is `{text, usage}`.
+#[cfg(feature = "serve")]
+pub(crate) async fn transcription_value_with_policy(
+    router: &Router,
+    payload: &Value,
+    policy_context: &DispatchPolicyContext,
+) -> Result<Value> {
+    use base64::Engine as _;
+    let model_str = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(error::ShimError::MissingModel)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload["audio_b64"].as_str().unwrap_or_default())
+        .map_err(|_| error::provider_error(400, "invalid audio payload"))?;
+    let text = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_owned);
+    let mut request = audio::TranscriptionRequest::new(
+        model_str,
+        bytes,
+        text("filename").unwrap_or_default(),
+        text("media_type").unwrap_or_default(),
+    );
+    request.language = text("language");
+    request.prompt = text("prompt");
+    request.response_format = text("response_format");
+    request.temperature = payload.get("temperature").and_then(Value::as_f64);
+    let (provider, model) = router.resolve(model_str)?;
+    let client = bound_client(router)?;
+    let response = client
+        .transcription_with_policy(provider, &model, &request, policy_context)
+        .await?;
+    let mut usage = response.usage;
+    if usage.is_object() {
+        usage["cost_source"] = client::images::known_cost_source(&usage);
+    }
+    Ok(serde_json::json!({"text": response.text, "usage": usage}))
+}
+
 /// Streaming entry point. Returns an SSE stream of OpenAI-format chunks.
 pub async fn stream(
     router: &Router,

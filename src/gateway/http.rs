@@ -168,6 +168,20 @@ impl Dispatch for RealDispatch {
                 let refusal = policy_context.take_last_refusal();
                 return result.map_err(|error| self.map_err(error, refusal));
             }
+            #[cfg(feature = "serve")]
+            crate::policy::DispatchOperation::Transcription => {
+                let result = crate::transcription_value_with_policy(
+                    router.as_ref(),
+                    &payload,
+                    &policy_context,
+                )
+                .await;
+                let refusal = policy_context.take_last_refusal();
+                return result.map_err(|error| self.map_err(error, refusal));
+            }
+            // Only `serve` has the route that makes one; the others never carry the marker.
+            #[cfg(not(feature = "serve"))]
+            crate::policy::DispatchOperation::Transcription => {}
             crate::policy::DispatchOperation::Chat => {}
         }
         let result = crate::completion_with_logger_and_policy(
@@ -2087,6 +2101,242 @@ async fn audio_speech(
     Ok(([(axum::http::header::CONTENT_TYPE, media_type)], audio).into_response())
 }
 
+/// How long a multipart upload may go without sending a byte before it is cut off (note 0038). The
+/// logical lifetime is the only other bound, and it is hours: a caller trickling bytes would hold a
+/// preparation permit for all of it.
+#[cfg(feature = "serve")]
+const UPLOAD_IDLE: Duration = Duration::from_secs(30);
+
+/// `stream` with a bound on the wait for each chunk: a stall longer than `idle` ends it with a
+/// `TimedOut` error instead of waiting for the lifetime.
+#[cfg(feature = "serve")]
+fn idle_bounded<S>(
+    stream: S,
+    idle: Duration,
+) -> impl futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin,
+{
+    use futures::StreamExt as _;
+    futures::stream::unfold(Some(stream), move |state| async move {
+        let mut stream = state?;
+        match tokio::time::timeout(idle, stream.next()).await {
+            Err(_) => Some((
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "upload stalled",
+                )),
+                None,
+            )),
+            Ok(None) => None,
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(stream))),
+            Ok(Some(Err(error))) => Some((Err(std::io::Error::other(error)), None)),
+        }
+    })
+}
+
+/// Megabytes of uploads this process holds at once (note 0038). An upload is held as the form's
+/// bytes, a base64 copy and the decoded audio while it queues and runs, so the count is bounded
+/// here rather than by the concurrency cap, which is per provider and does not weigh bytes.
+#[cfg(feature = "serve")]
+const UPLOAD_POOL_MIB: usize = 256;
+
+#[cfg(feature = "serve")]
+fn upload_pool() -> &'static tokio::sync::Semaphore {
+    static POOL: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| tokio::sync::Semaphore::new(UPLOAD_POOL_MIB))
+}
+
+/// POST /v1/audio/transcriptions — OpenAI's multipart upload (`file`, `model`, and optional
+/// `language`, `prompt`, `response_format`, `temperature`), admitted as an attempt (note 0038). The
+/// upload is read with a hard bound (the library's 25 MB audio limit) before it is queued, and a
+/// capped key cannot transcribe (no bound on audio length). Local scheduler only.
+#[cfg(feature = "serve")]
+async fn audio_transcriptions(
+    State(state): State<Arc<GatewayState>>,
+    installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
+    logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+) -> Result<Response, ApiError> {
+    use base64::Engine as _;
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let boundary = multer::parse_boundary(content_type)
+        .map_err(|_| invalid_request("a multipart/form-data upload is required", "file"))?;
+    let max = crate::audio::MAX_TRANSCRIPTION_BYTES as u64;
+    let constraints = multer::Constraints::new()
+        .allowed_fields(vec![
+            "file",
+            "model",
+            "language",
+            "prompt",
+            "response_format",
+            "temperature",
+            // Read and ignored: an SDK may send them and the adapter does not use them.
+            "timestamp_granularities[]",
+            "stream",
+        ])
+        .size_limit(
+            multer::SizeLimit::new()
+                .whole_stream(max + 64 * 1024)
+                .per_field(max),
+        );
+    // Hold the upload's share of the pool until the answer is built: what the caller declared (or
+    // the limit, when it declared nothing) in whole megabytes. Refused at once when the pool is
+    // spoken for, not queued: waiting would hold the upload's connection and permit open.
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(max + 64 * 1024);
+    let mib = (declared.div_ceil(1024 * 1024)).clamp(1, UPLOAD_POOL_MIB as u64) as u32;
+    let _upload_share = upload_pool()
+        .try_acquire_many(mib)
+        .map_err(|_| ApiError::Overloaded(state.overloaded_retry_after))?;
+    let mut form = multer::Multipart::with_constraints(
+        idle_bounded(
+            Box::pin(request.into_body().into_data_stream()),
+            UPLOAD_IDLE,
+        ),
+        boundary,
+        constraints,
+    );
+    let too_large = || {
+        ApiError::from(ShimError::ProviderError {
+            status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+            body: json!({"error": {"message": "the upload is too large", "type":
+                "invalid_request_error", "param": "file", "code": "request_too_large"}})
+            .to_string(),
+            retry_after: None,
+        })
+    };
+    let malformed = |error: multer::Error| match error {
+        multer::Error::FieldSizeExceeded { .. } | multer::Error::StreamSizeExceeded { .. } => {
+            too_large()
+        }
+        // The stream broke or stalled (`idle_bounded`): the caller stopped sending.
+        multer::Error::StreamReadFailed(_) => ApiError::from(ShimError::ProviderError {
+            status: StatusCode::REQUEST_TIMEOUT.as_u16(),
+            body: json!({"error": {"message": "the upload stalled or was interrupted", "type":
+                "invalid_request_error", "param": "file", "code": "upload_stalled"}})
+            .to_string(),
+            retry_after: None,
+        }),
+        _ => invalid_request("the multipart upload is malformed", "file"),
+    };
+    let mut payload = serde_json::Map::new();
+    let mut model = None;
+    let mut audio: Option<(Vec<u8>, String, String)> = None;
+    while let Some(field) = form.next_field().await.map_err(malformed)? {
+        let name = field.name().unwrap_or_default().to_owned();
+        match name.as_str() {
+            "file" => {
+                let filename = field.file_name().unwrap_or("audio").to_owned();
+                // OpenAI accepts a part with no type (curl's `-F file=@a.wav` sends none).
+                let media_type = field
+                    .content_type()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "application/octet-stream".to_owned());
+                let bytes = field.bytes().await.map_err(malformed)?.to_vec();
+                audio = Some((bytes, filename, media_type));
+            }
+            "model" => model = Some(field.text().await.map_err(malformed)?),
+            "language" | "prompt" | "response_format" => {
+                payload.insert(name, json!(field.text().await.map_err(malformed)?));
+            }
+            "temperature" => {
+                let text = field.text().await.map_err(malformed)?;
+                let value = text
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|_| invalid_request("temperature must be a number", "temperature"))?;
+                payload.insert(name, json!(value));
+            }
+            _ => {
+                let _ = field.bytes().await.map_err(malformed)?;
+            }
+        }
+    }
+    let model = model.ok_or_else(|| invalid_request("model is required", "model"))?;
+    let (bytes, filename, media_type) =
+        audio.ok_or_else(|| invalid_request("file is required", "file"))?;
+    // The size bound is the reader's (413); an empty file is refused here, before it queues, since the
+    // route's pre-check below sees a one-byte stand-in rather than the audio.
+    if bytes.is_empty() {
+        return Err(invalid_request("file must not be empty", "file"));
+    }
+    let response_format = payload
+        .get("response_format")
+        .and_then(Value::as_str)
+        .unwrap_or("json")
+        .to_owned();
+    // One permit per KiB, capped: a limiter bucket smaller than the largest upload would otherwise
+    // never admit it.
+    let permits = (bytes.len() as u64 / 1024 + 1).min(256) as u32;
+    payload.insert(
+        "audio_b64".into(),
+        Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+    );
+    payload.insert("filename".into(), json!(filename));
+    payload.insert("media_type".into(), json!(media_type));
+    drop(bytes);
+    let (value, _provider, _model) = submit_media_call(
+        &state,
+        &headers,
+        installed_prequeue_permit,
+        logical_lifetime,
+        MediaCall {
+            operation: crate::policy::DispatchOperation::Transcription,
+            noun: "transcription",
+            model: &model,
+            payload: Value::Object(payload),
+            permits,
+        },
+        |provider, model, payload| {
+            // The same checks the dispatch makes, on the request as the library will see it.
+            let text = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_owned);
+            let mut request = crate::audio::TranscriptionRequest::new(
+                model,
+                vec![0],
+                text("filename").unwrap_or_default(),
+                text("media_type").unwrap_or_default(),
+            );
+            request.language = text("language");
+            request.prompt = text("prompt");
+            request.response_format = text("response_format");
+            request.temperature = payload.get("temperature").and_then(Value::as_f64);
+            crate::audio::validate_transcription(&request)?;
+            // The part's type is parsed when the form is built, after the job has queued: refuse a
+            // malformed one here.
+            reqwest::multipart::Part::bytes(Vec::new())
+                .mime_str(&request.media_type)
+                .map_err(|_| ShimError::ProviderError {
+                    status: 400,
+                    body: "transcription media type is not a valid media type".into(),
+                    retry_after: None,
+                })?;
+            // The adapter's own refusals (a model that does not transcribe, a format it lacks).
+            provider.transcription_request(model, &request).map(|_| ())
+        },
+    )
+    .await?;
+    let text = value["text"].as_str().unwrap_or_default().to_owned();
+    if response_format == "text" {
+        return Ok((
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            text,
+        )
+            .into_response());
+    }
+    Ok(Json(json!({"text": text, "usage": value["usage"]})).into_response())
+}
+
 /// OpenAI's list-of-embeddings answer. `base64` packs each vector as little-endian f32, which is
 /// what the OpenAI SDKs ask for by default and decode. Cost rides on `usage`; `null` is unknown.
 fn embeddings_response(
@@ -2494,6 +2744,18 @@ fn app_with_origin_policy_and_deadlines(
     )
 }
 
+/// The routes only `serve` has (a build without it must not gain them): the transcription upload,
+/// whose multipart reader is a `serve`-only dependency (note 0038).
+#[cfg(feature = "serve")]
+fn with_serve_routes(routes: axum::Router<Arc<GatewayState>>) -> axum::Router<Arc<GatewayState>> {
+    routes.route("/v1/audio/transcriptions", post(audio_transcriptions))
+}
+
+#[cfg(not(feature = "serve"))]
+fn with_serve_routes(routes: axum::Router<Arc<GatewayState>>) -> axum::Router<Arc<GatewayState>> {
+    routes
+}
+
 /// Build the gateway application from every input it needs, reading nothing
 /// from the environment. The `app*` functions above are this with
 /// environment-derived values.
@@ -2507,7 +2769,7 @@ pub(crate) fn app_with_parts(
         gateway: state.clone(),
         deadlines: logical_deadlines,
     };
-    axum::Router::new()
+    let routes = axum::Router::new()
         .route("/v1/chat", post(chat))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/messages", post(chat))
@@ -2521,7 +2783,8 @@ pub(crate) fn app_with_parts(
         .route("/v1/gateway/stats", get(stats))
         .route("/metrics", get(metrics))
         .route("/health", get(health))
-        .route("/ready", get(ready))
+        .route("/ready", get(ready));
+    with_serve_routes(routes)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             native_translate,
@@ -2588,7 +2851,9 @@ async fn admit_ingress_preparation(
                 | "/v1/embeddings"
                 | "/v1/images/generations"
                 | "/v1/audio/speech"
-        ) || crate::proxy::wire::native_route(&inference_path).is_some());
+        ) || crate::proxy::wire::native_route(&inference_path).is_some()
+            // Only `serve` has the upload route (note 0038).
+            || (cfg!(feature = "serve") && inference_path == "/v1/audio/transcriptions"));
     if !requires_preparation {
         return next.run(request).await;
     }
@@ -2685,6 +2950,42 @@ async fn native_translate(
         .extensions_mut()
         .insert(AdmittedRouter(snapshot.clone()));
     crate::proxy::wire::translate_with_router(request, next, Some(&snapshot)).await
+}
+
+#[cfg(all(test, feature = "serve"))]
+mod upload_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_upload_ends_with_a_timeout_instead_of_waiting_for_the_lifetime() {
+        // One chunk, then silence: the second read is cut off at the idle bound.
+        let source = futures::stream::once(async { Ok(axum::body::Bytes::from_static(b"abc")) })
+            .chain(futures::stream::pending());
+        let mut bounded = Box::pin(idle_bounded(Box::pin(source), Duration::from_secs(30)));
+        assert_eq!(bounded.next().await.unwrap().unwrap().as_ref(), b"abc");
+        let stalled = bounded.next().await.unwrap().unwrap_err();
+        assert_eq!(stalled.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            bounded.next().await.is_none(),
+            "the stream ends after the timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_steady_upload_is_not_cut_off_however_long_it_runs() {
+        // A chunk every 20 s for far longer than the 30 s bound: the bound is per chunk.
+        let source = futures::stream::unfold(0, |n| async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            (n < 5).then(|| (Ok(axum::body::Bytes::from_static(b"x")), n + 1))
+        });
+        let mut bounded = Box::pin(idle_bounded(Box::pin(source), Duration::from_secs(30)));
+        let mut count = 0;
+        while let Some(chunk) = bounded.next().await {
+            chunk.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 5);
+    }
 }
 
 #[cfg(test)]

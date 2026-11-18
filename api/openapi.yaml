@@ -262,6 +262,41 @@ paths:
               schema: {type: string, format: binary}
         default:
           description: Error object with preserved HTTP status
+  /v1/audio/transcriptions:
+    post:
+      operationId: audioTranscriptions
+      summary: OpenAI-shaped audio transcription (`llmshim serve` only)
+      description: >-
+        Served by `llmshim serve` only (not by `llmshim proxy` or a gateway built without `serve`).
+        A `multipart/form-data` upload with `file` (at most 25,000,000 bytes: larger is a 413 while it
+        streams in), `model`, and optionally `language`, `prompt`, `response_format` (`json` or `text`)
+        and `temperature`. Admitted by the same key, allowlist and rate rules as a completion. A key with
+        a spend cap is refused with `unpriceable_under_budget` (the audio's length is not bounded by its
+        bytes), with or without `budget_allow_unpriced`. A fleet gateway answers 501.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, model]
+              properties:
+                file: {type: string, format: binary}
+                model: {type: string, description: Routing id, e.g. openai/gpt-4o-transcribe}
+                language: {type: string}
+                prompt: {type: string}
+                response_format: {type: string, enum: [json, text]}
+                temperature: {type: number}
+      responses:
+        '200':
+          description: The transcript
+          content:
+            application/json:
+              schema: {type: object}
+            text/plain:
+              schema: {type: string}
+        default:
+          description: Error object with preserved HTTP status
   /v1/messages:
     post:
       operationId: nativeMessages

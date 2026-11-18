@@ -1278,7 +1278,10 @@ impl AttemptCoordinator {
                 crate::policy::DispatchOperation::Embeddings => {
                     crate::gateway::budget::quote_embeddings(Some(policy), attempt)
                 }
-                crate::policy::DispatchOperation::Images => {
+                // Transcription's size is the audio's length, which the bytes do not bound (they are
+                // compressed): no enforceable bound, like images (note 0038).
+                crate::policy::DispatchOperation::Images
+                | crate::policy::DispatchOperation::Transcription => {
                     crate::gateway::budget::quote_unbounded(Some(policy))
                 }
                 crate::policy::DispatchOperation::Speech => {
