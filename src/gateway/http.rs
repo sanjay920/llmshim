@@ -1958,6 +1958,9 @@ async fn submit_media_call(
     Ok((submitted.value, provider.instance().to_owned(), model))
 }
 
+/// The most texts one embeddings request may hold on a fleet (note 0041).
+const FLEET_MAX_EMBEDDING_TEXTS: usize = 512;
+
 /// POST /v1/embeddings — OpenAI-shaped, admitted by the same rate, concurrency, spend and
 /// allowlist rules as a completion (note 0035). Local scheduler only: a fleet answers 501.
 async fn embeddings(
@@ -1982,6 +1985,17 @@ async fn embeddings(
         input: embedding_texts(&body.input)?,
         dimensions: body.dimensions,
     };
+    // On a fleet the answer travels through Redis, whose terminal limit (64 MiB by default) a big
+    // batch of wide vectors would pass after being paid for upstream: refuse such a batch before it
+    // is sent (note 0041). 512 texts at the widest model (3072 dimensions) is about 20 MB of JSON.
+    if !matches!(state.backend, Backend::Local(_))
+        && request.input.len() > FLEET_MAX_EMBEDDING_TEXTS
+    {
+        return Err(invalid_request(
+            "an embeddings request on a fleet gateway holds at most 512 texts",
+            "input",
+        ));
+    }
     let permits = request
         .input
         .iter()
