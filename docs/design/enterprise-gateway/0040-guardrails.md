@@ -31,11 +31,21 @@ block_if_matches = ["AKIA[0-9A-Z]{16}", "-----BEGIN [A-Z ]*PRIVATE KEY-----"]
   facade, streaming, and the four media routes. **Not scanned:** structural keys (`model`, `role`, `type`, `id`,
   `tool_call_id`, `call_id`, `finish_reason`), a string beginning `data:` (an inline image or audio), the
   transcription audio itself, and the *response*.
+- **Cost.** All the patterns that apply to a caller are compiled into **one set per scope** (one for the rules
+  that apply to everyone, one per tenant that has rules of its own), so a request is scanned once per scope in a
+  single pass rather than once per rule; the earliest rule in the file that matches is the one named. The scan runs
+  on the request's own task and is not offloaded: its work is bounded by the request size (2 MiB on every route
+  that parses JSON) and the combined set, and a unit test pins a 2 MiB near-match against 512 patterns at well
+  under a second. The set is built at start; a combination too large to compile together (64 MiB for a scope) is a
+  configuration error by scope.
 - **Patterns** are Rust `regex` syntax: matching is linear in the text, with no look-around or back-references,
   so neither a hostile pattern nor hostile text can stall a request. A pattern is compiled once at start under a
   1 MiB size limit. There are 1 to 64 patterns per rule, each at most 1024 characters, and at most 64 rules.
 - **`tenants`** names tenants that some key belongs to; a tenant that is not any key's is a configuration error
-  (a rule that silently never fires is a mistake). Unset applies to every caller.
+  (a rule that silently never fires is a mistake). **With `[control_plane]` the keys, and so the tenants, come from
+  the signed snapshot after the file is read, so this cannot be checked** and a rule for a tenant the snapshot does
+  not have never fires (the same silence the check prevents); write the tenant as `[tenants.<name>]` or check the
+  snapshot. Unset applies to every caller.
 - **Fixed at start.** A reload that changes `[[guardrails]]` is refused by path like any section a reload does
   not replace. Rules are never edited under traffic.
 - **Fail closed on configuration.** A pattern that does not compile, a duplicate or malformed name, an empty rule

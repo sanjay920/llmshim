@@ -9,92 +9,147 @@ use super::config::Guardrail;
 use crate::gateway::http::RequestGuard;
 use regex::{RegexSet, RegexSetBuilder};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-/// The most memory a compiled pattern set may take.
-const SIZE_LIMIT: usize = 1 << 20;
+/// The most memory one compiled pattern may take, and the most all the rules' patterns together
+/// may take (a shared set is built once per scope, not once per rule).
+const PATTERN_SIZE_LIMIT: usize = 1 << 20;
+const SET_SIZE_LIMIT: usize = 64 << 20;
 
-/// Keys whose strings are structure or bulk data, never the caller's text: scanning them would
-/// match identifiers, or megabytes of base64 audio.
-const SKIPPED_KEYS: [&str; 8] = [
-    "model",
-    "role",
-    "type",
-    "id",
-    "tool_call_id",
-    "call_id",
-    "audio_b64",
-    "finish_reason",
-];
+/// The only string leaves that are not the caller's text: bulk media. `audio_b64` is a
+/// transcription's audio, and an inline image, audio or video is not something a pattern can match.
+const BULK_KEY: &str = "audio_b64";
+const MEDIA_PREFIXES: [&str; 3] = ["data:image/", "data:audio/", "data:video/"];
 
 pub(crate) fn compile(pattern: &str) -> Result<regex::Regex, regex::Error> {
     regex::RegexBuilder::new(pattern)
-        .size_limit(SIZE_LIMIT)
+        .size_limit(PATTERN_SIZE_LIMIT)
         .build()
 }
 
-struct Rule {
-    name: String,
-    tenants: Option<BTreeSet<String>>,
-    patterns: RegexSet,
+/// One compiled set over the patterns of several rules, and which rule each pattern belongs to.
+struct Scope {
+    set: RegexSet,
+    rule_of_pattern: Vec<usize>,
 }
 
-/// The compiled rules.
+impl Scope {
+    fn build(rules: &[(usize, &Guardrail)]) -> Result<Option<Self>, regex::Error> {
+        let mut patterns = Vec::new();
+        let mut rule_of_pattern = Vec::new();
+        for (index, rule) in rules {
+            for pattern in &rule.block_if_matches {
+                patterns.push(pattern.as_str());
+                rule_of_pattern.push(*index);
+            }
+        }
+        if patterns.is_empty() {
+            return Ok(None);
+        }
+        let set = RegexSetBuilder::new(&patterns)
+            .size_limit(SET_SIZE_LIMIT)
+            .build()?;
+        Ok(Some(Self {
+            set,
+            rule_of_pattern,
+        }))
+    }
+
+    /// The first rule (in the file's order) any text under `value` breaks, or `None`.
+    fn first_rule(&self, value: &Value) -> Option<usize> {
+        match value {
+            Value::String(text) => {
+                if MEDIA_PREFIXES.iter().any(|prefix| text.starts_with(prefix)) {
+                    return None;
+                }
+                self.set
+                    .matches(text)
+                    .iter()
+                    .map(|pattern| self.rule_of_pattern[pattern])
+                    .min()
+            }
+            Value::Array(items) => items.iter().find_map(|item| self.first_rule(item)),
+            // Keys are the caller's text too (a tool-call argument object, a schema), so they are
+            // matched as well as the values.
+            Value::Object(map) => map.iter().find_map(|(key, item)| {
+                self.first_rule(&Value::String(key.clone()))
+                    .or_else(|| (key != BULK_KEY).then(|| self.first_rule(item)).flatten())
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// The compiled rules: one set for the rules that apply to everyone and one per tenant that has
+/// rules of its own, so a request is scanned once per scope, not once per rule.
 pub struct Guardrails {
-    rules: Vec<Rule>,
+    names: Vec<String>,
+    global: Option<Scope>,
+    by_tenant: BTreeMap<String, Scope>,
 }
 
 impl Guardrails {
-    /// Compile the file's rules. Validation has already checked them; a failure here (a build
-    /// assembled by hand) is reported by rule name, never by pattern.
+    /// Compile the file's rules. A failure (a rule set too large to compile together) is reported by
+    /// scope, never by pattern.
     pub fn build(rules: &[Guardrail]) -> Result<Self, String> {
-        let mut compiled = Vec::with_capacity(rules.len());
+        let names = rules.iter().map(|rule| rule.name.clone()).collect();
+        let global_rules: Vec<(usize, &Guardrail)> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.tenants.is_none())
+            .collect();
+        let global = Scope::build(&global_rules).map_err(|_| {
+            "the rules for every caller are too large to compile together".to_string()
+        })?;
+        let mut tenants = BTreeSet::new();
         for rule in rules {
-            let patterns = RegexSetBuilder::new(&rule.block_if_matches)
-                .size_limit(SIZE_LIMIT)
-                .build()
-                .map_err(|_| {
-                    format!(
-                        "guardrail {} has a pattern that does not compile",
-                        rule.name
-                    )
-                })?;
-            compiled.push(Rule {
-                name: rule.name.clone(),
-                tenants: rule
-                    .tenants
-                    .as_ref()
-                    .map(|tenants| tenants.iter().cloned().collect()),
-                patterns,
-            });
+            tenants.extend(rule.tenants.iter().flatten().cloned());
         }
-        Ok(Self { rules: compiled })
+        let mut by_tenant = BTreeMap::new();
+        for tenant in tenants {
+            let mine: Vec<(usize, &Guardrail)> = rules
+                .iter()
+                .enumerate()
+                .filter(|(_, rule)| {
+                    rule.tenants
+                        .as_ref()
+                        .is_some_and(|list| list.contains(&tenant))
+                })
+                .collect();
+            if let Some(scope) = Scope::build(&mine).map_err(|_| {
+                "the rules for one tenant are too large to compile together".to_string()
+            })? {
+                by_tenant.insert(tenant, scope);
+            }
+        }
+        Ok(Self {
+            names,
+            global,
+            by_tenant,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
-    }
-}
-
-/// Whether any text under `value` matches `set`, skipping structural keys and `data:` URLs.
-fn text_matches(value: &Value, set: &RegexSet) -> bool {
-    match value {
-        Value::String(text) => !text.starts_with("data:") && set.is_match(text),
-        Value::Array(items) => items.iter().any(|item| text_matches(item, set)),
-        Value::Object(map) => map
-            .iter()
-            .any(|(key, item)| !SKIPPED_KEYS.contains(&key.as_str()) && text_matches(item, set)),
-        _ => false,
+        self.global.is_none() && self.by_tenant.is_empty()
     }
 }
 
 impl RequestGuard for Guardrails {
     fn first_match(&self, tenant: &str, body: &Value) -> Option<String> {
-        self.rules
-            .iter()
-            .filter(|rule| rule.tenants.as_ref().is_none_or(|set| set.contains(tenant)))
-            .find(|rule| text_matches(body, &rule.patterns))
-            .map(|rule| rule.name.clone())
+        let global = self
+            .global
+            .as_ref()
+            .and_then(|scope| scope.first_rule(body));
+        let own = self
+            .by_tenant
+            .get(tenant)
+            .and_then(|scope| scope.first_rule(body));
+        // The earlier of the two in the file's order.
+        [global, own]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|index| self.names[index].clone())
     }
 }
 
@@ -158,10 +213,72 @@ mod tests {
         ] {
             assert!(guard.first_match("platform", &body).is_some(), "{body}");
         }
-        // A model id that happens to match, and an inline image, are not the caller's text.
-        let structural = json!({"model": "gpt-secret", "messages": [{"role": "user", "content": [
+        // An inline image is bulk media, not the caller's text.
+        let image = json!({"messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,hunter2hunter2"}}]}]});
-        assert_eq!(guard.first_match("platform", &structural), None);
+        assert_eq!(guard.first_match("platform", &image), None);
+        // Everything else is the caller's: a model, a role or a type that carries the text, a
+        // field named `id` or `type` inside a tool input or schema, and object keys.
+        for body in [
+            json!({"model": "gpt-secret", "messages": []}),
+            json!({"messages": [{"role": "hunter2", "content": "x"}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "hunter2", "text": "x"}]}]}),
+            json!({"messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "input": {"id": "hunter2"}}]}]}),
+            json!({"tools": [{"function": {"parameters": {"properties": {"id": {
+                "type": "string", "description": "hunter2"}}}}}]}),
+            json!({"tools": [{"function": {"parameters": {"properties": {"hunter2": {}}}}}]}),
+        ] {
+            assert!(guard.first_match("platform", &body).is_some(), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_request_is_scanned_once_per_scope_and_the_earliest_rule_in_the_file_is_named() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"first\"\ntenants = [\"platform\"]\nblock_if_matches = [\"alpha\"]\n\
+             [[guardrails]]\nname = \"second\"\nblock_if_matches = [\"beta\"]",
+        );
+        let both = json!({"messages": [{"role": "user", "content": "beta and alpha"}]});
+        // Both rules match; the one earlier in the file is named, whichever scope holds it.
+        assert_eq!(
+            guard.first_match("platform", &both).as_deref(),
+            Some("first")
+        );
+        assert_eq!(guard.first_match("other", &both).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn the_worst_case_scan_is_bounded() {
+        // 16 rules of 32 patterns against two megabytes of text that nearly matches: the whole scan
+        // is a single pass of one combined set, not 64 of them.
+        let mut text = format!(
+            "version = 1\n[providers.p]\nkind = \"openai-compatible\"\nbase_url = \"https://x.example.com/v1\"\n\
+             [[keys]]\nname = \"k\"\ntenant = \"platform\"\nsha256 = \"{}\"\n",
+            "a".repeat(64)
+        );
+        for rule in 0..16 {
+            let patterns: Vec<String> = (0..32)
+                .map(|n| format!("\"(a|b)*x{rule}y{n}[0-9]{{3}}z\""))
+                .collect();
+            text.push_str(&format!(
+                "[[guardrails]]\nname = \"r{rule}\"\nblock_if_matches = [{}]\n",
+                patterns.join(", ")
+            ));
+        }
+        let config =
+            super::super::config::ServeConfig::parse(&text, super::super::config::Format::Toml)
+                .unwrap();
+        let guard = Guardrails::build(&config.guardrails).unwrap();
+        let big = json!({"messages": [{"role": "user", "content": "ab".repeat(1 << 20)}]});
+        let started = std::time::Instant::now();
+        assert_eq!(guard.first_match("platform", &big), None);
+        // A generous bound, for a loaded CI runner: the point is seconds, not minutes.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -1632,6 +1632,18 @@ impl ServeConfig {
     /// The guardrail rules (note 0040): names, counts, and that every pattern compiles within the
     /// engine's size limit. A pattern is never echoed in an issue.
     fn validate_guardrails(&self, issues: &mut Vec<Issue>) {
+        let before = issues.len();
+        self.validate_guardrail_rules(issues);
+        // The rules compile together as they will at start (one set per scope shares a size
+        // budget), so a combination that does not fit is refused here, not when serving begins.
+        if issues.len() == before && !self.guardrails.is_empty() {
+            if let Err(message) = super::guardrails::Guardrails::build(&self.guardrails) {
+                issues.push(Issue::new("guardrails", message));
+            }
+        }
+    }
+
+    fn validate_guardrail_rules(&self, issues: &mut Vec<Issue>) {
         let mut seen = std::collections::BTreeSet::new();
         if self.guardrails.len() > 64 {
             issues.push(Issue::new("guardrails", "has more than 64 rules"));
@@ -1653,8 +1665,11 @@ impl ServeConfig {
                         "must list 1 to 64 tenants; omit it for every caller",
                     ));
                 }
+                // With a control plane the keys, and so the tenants, come from the signed snapshot
+                // after the file is read: they cannot be checked here (note 0040).
                 for (n, tenant) in tenants.iter().enumerate() {
-                    if !self.keys.iter().any(|key| &key.tenant == tenant)
+                    if self.control_plane.is_none()
+                        && !self.keys.iter().any(|key| &key.tenant == tenant)
                         && !self.tenants.contains_key(tenant)
                     {
                         issues.push(Issue::new(
