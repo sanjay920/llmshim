@@ -319,7 +319,7 @@ admission, spend and usage record; the failover metric is counted when the retry
 a retry the key's list does not allow returns the original failure. Streams carry no idempotency key, so
 nothing about replay changes.
 
-**Limits.** Only the local scheduler fails a stream over. With `[fleet]` (the distributed backend) an
+**Limits (superseded by 0042, which retries on a fleet and on a first-item error).** Only the local scheduler failed a stream over. With `[fleet]` (the distributed backend) an
 upstream open failure reaches the caller as an error item on the stream, after admission has returned, so
 the handler never sees it as an open failure and does not retry: **streaming failover is not built for a
 fleet**, and a unary request is. For the same reason an error that arrives as the first item of an

@@ -75,6 +75,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0039: Residency](0039-residency.md)
 - [0040: Request guardrails](0040-guardrails.md)
 - [0041: Embeddings through a fleet](0041-embeddings-through-a-fleet.md)
+- [0042: Streaming failover through a fleet](0042-fleet-streaming-failover.md)
 
 ## Roadmap
 
@@ -149,7 +150,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Key tags on usage records (0029): `keys[].tags` onto usage records, also in control-plane keys and snapshots
 - [x] Tenant budgets above key budgets (0030): built (file table, single-instance and Redis ledgers, outage interplay for keys with no cap of their own, team budgets through the control plane). Three leftovers were closed **without building**, with reasons, in 0030's "Closed without building": a lease for a key's own cap, the reload `started_at`, a refusal-level label
 - [x] Alerts, scheduled cost exports (0034): alerts are Prometheus rules over new provider-labelled spend counters; exports are the usage log; the gateway sends and schedules nothing
-- [x] Deployments and load balancing across credentials and regions (0031): built through slice 4 (selection, four strategies, health with probes, allowlist, usage field, non-streaming failover, stats view, two accounts via named instances, streaming failover before the first byte on a single instance; not in a fleet)
+- [x] Deployments and load balancing across credentials and regions (0031): built through slice 4 (selection, four strategies, health with probes, allowlist, usage field, non-streaming failover, stats view, two accounts via named instances, streaming failover before the first byte, on a single instance and, since 0042, through a fleet)
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
 - [ ] Audit log
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy (residency built for file keys, 0039: provider `residency` labels and key `allowed_residency`, enforced through the allowlist; request guardrails built, 0040: regex rules that refuse a request before admission, `regex` under `serve`; response checks, redaction and classifiers are not built)
