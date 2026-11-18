@@ -664,3 +664,71 @@ async fn a_stream_that_breaks_a_blocking_rule_is_cut_with_an_error_event_and_lea
     );
     mock.assert_async().await;
 }
+
+/// The text a caller would assemble from an OpenAI-shaped SSE body: the `delta.content` pieces
+/// joined, and how many error chunks there were.
+fn assembled(body: &str) -> (String, usize) {
+    let mut text = String::new();
+    let mut errors = 0;
+    for line in body.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        if value.get("error").is_some() {
+            errors += 1;
+        }
+        if let Some(piece) = value["choices"][0]["delta"]["content"].as_str() {
+            text.push_str(piece);
+        }
+    }
+    (text, errors)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_stream_releases_masked_text_in_pieces_and_a_cut_is_one_error_with_no_secret() {
+    let rule = "[[guardrails]]\nname = \"mask\"\nscope = \"response\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]\nreplacement = \"[x]\"";
+    // More than the hold-back before and after the key, in many chunks: text is released while the
+    // stream runs, the key (split in two) is masked whole, and the concatenated text is exact. The
+    // multibyte text must survive being cut only at character boundaries.
+    let pad_a = "é lorem ipsum ".repeat(40);
+    let pad_b = "ünïcode dolor sit ".repeat(40);
+    let (up, mock) =
+        streaming_upstream(&[&pad_a, "key AKIAABC", "DEFGHIJKLMNOP end ", &pad_b]).await;
+    let server = start(&config(&up.url(), rule, None), "guard-stream-long", &env());
+    let (status, body) = stream_text(
+        &server,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (text, errors) = assembled(&body);
+    assert_eq!(errors, 0, "{body}");
+    assert_eq!(text, format!("{pad_a}key [x] end {pad_b}"), "{body}");
+    mock.assert_async().await;
+
+    // A blocking rule: exactly one error event, no text after it, and no part of the key in any
+    // `content` delta (the concatenation, not the whole body, is what a caller reads).
+    let block = "[[guardrails]]\nname = \"no-leak\"\nscope = \"response\"\nblock_if_matches = [\"AKIA[0-9A-Z]{16}\"]";
+    let (up, mock) =
+        streaming_upstream(&[&pad_a, "key AKIAABC", "DEFGHIJKLMNOP", " more text"]).await;
+    let server = start(&config(&up.url(), block, None), "guard-stream-cut", &env());
+    let (status, body) = stream_text(
+        &server,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (text, errors) = assembled(&body);
+    assert_eq!(errors, 1, "{body}");
+    assert!(
+        !text.contains("AKIA") && !text.contains("more text"),
+        "{text}"
+    );
+    assert!(body.contains("no-leak"), "{body}");
+    mock.assert_async().await;
+}

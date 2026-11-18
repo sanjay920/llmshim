@@ -33,6 +33,27 @@ byte has gone out. A caller that needs streaming had to leave the gateway. Strea
 - Patterns, growth bound (four times the text plus 4 KiB per released piece), replacement rules, tenant scoping and
   the not-echoed rules are 0040, 0044 and 0045's.
 
+## Found in review
+
+- **One error, and nothing after a cut.** A cut (a blocking match, a redaction that would grow too far, or an upstream
+  error) drops the text still held back; the held text is **released only when the stream ends by itself**. The first
+  draft flushed after a cut, which sent a second error event and up to 256 bytes of text after the first.
+- **The held text is bounded.** A redaction pattern that can match an arbitrarily long run (`[A-Za-z0-9+/=]{40,}`)
+  keeps the start of a match unreleased until it ends, and the filter rescans what it holds on every chunk. The held
+  text is therefore capped at **64 KiB**: past it the stream is cut, naming the rule, instead of holding and
+  rescanning without bound. (`StreamFilter::check` scans the held text in place, without copying it.)
+- The process tests assemble the `delta.content` pieces a caller reads, not the body as a whole (a secret released
+  in two pieces would not appear in a body search): a long multibyte stream is masked exactly, and a cut is one error
+  with no secret and no text after it.
+
+## Known limits
+
+- **Redaction is applied to each released piece on its own**, so a pattern with `^`, `$`, `\b` or `(?m)` behaves at
+  the edge of a piece as it would at the edge of a text.
+- A block match longer than the hold-back can leak its first bytes (above). The upstream-error flush path (an error
+  chunk from the provider while text is held) is by construction a cut, and is covered by the unit test of a cut
+  stream, not by a process test.
+
 ## Not built
 
 - **External classifiers** and moderation APIs (a network call in the request path).
@@ -47,4 +68,4 @@ when the match completes and none of the key had been released; a clean stream p
 for exactly the tenants under a response rule. `integration_serve_guardrails` (process, a streaming provider mock):
 the masked text reaches the caller on the engine route, `/v1/chat/stream` and `/v1/messages`, never any part of the
 secret; a streamed leak under a blocking rule is cut with the rule's name and leaks nothing, while a clean stream is
-untouched. Sending the stream unfiltered, or setting the hold-back to zero, fails them.
+untouched. Sending the stream unfiltered, or setting the hold-back to zero, fails them. `::a_cut_stream_releases_nothing_afterwards_and_a_match_that_never_ends_is_cut_not_held` pins the review's two findings (an unbounded run is cut at the cap, a cut leaves nothing held), and `integration_serve_guardrails::a_long_stream_releases_masked_text_in_pieces_and_a_cut_is_one_error_with_no_secret` the exact assembled text and the single error.

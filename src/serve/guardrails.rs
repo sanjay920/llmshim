@@ -67,6 +67,15 @@ impl Scope {
         }))
     }
 
+    /// The first rule (in the file's order) a plain text breaks, or `None`.
+    fn first_rule_text(&self, text: &str) -> Option<usize> {
+        self.set
+            .matches(text)
+            .iter()
+            .map(|pattern| self.rule_of_pattern[pattern])
+            .min()
+    }
+
     /// The first rule (in the file's order) any text under `value` breaks, or `None`.
     fn first_rule(&self, value: &Value, files: bool) -> Option<usize> {
         match value {
@@ -354,6 +363,11 @@ impl Guardrails {
 /// whole (note 0046). A match longer than this can leak its first bytes before it is seen.
 const STREAM_HOLDBACK: usize = 256;
 
+/// The most text a stream may hold back. A redaction pattern that can match an arbitrarily long run
+/// keeps the start of a match unreleased until it ends; past this the stream is cut (fail closed)
+/// rather than held, and rescanned, without bound.
+const STREAM_HELD_MAX: usize = 64 * 1024;
+
 /// The filter a streamed answer's text passes through (note 0046): response blocking rules cut the
 /// stream when they match, response redaction rules mask what they match, and text is released only
 /// once it is `STREAM_HOLDBACK` bytes behind the newest.
@@ -367,11 +381,10 @@ struct StreamFilter {
 impl StreamFilter {
     /// The rule a match of the held text breaks, if any.
     fn check(&self) -> Result<(), String> {
-        let held = Value::String(self.held.clone());
         let found = self
             .scopes
             .iter()
-            .filter_map(|scope| scope.first_rule(&held, false))
+            .filter_map(|scope| scope.first_rule_text(&self.held))
             .min();
         match found {
             Some(index) => Err(self.names[index].clone()),
@@ -403,12 +416,17 @@ impl StreamFilter {
 impl crate::gateway::http::StreamTextFilter for StreamFilter {
     fn push(&mut self, text: &str) -> Result<String, String> {
         self.held.push_str(text);
-        self.check()?;
+        // Whatever the outcome of a cut, nothing held is ever released afterwards.
+        if let Err(rule) = self.check() {
+            self.held.clear();
+            return Err(rule);
+        }
         let mut end = self.held.len().saturating_sub(STREAM_HOLDBACK);
         while !self.held.is_char_boundary(end) {
             end -= 1;
         }
         // Never release the start of a match that the cut would split: it waits for the rest.
+        let mut straddling: Option<String> = None;
         loop {
             let before = end;
             for rule in &self.redactions {
@@ -416,6 +434,7 @@ impl crate::gateway::http::StreamTextFilter for StreamFilter {
                     for found in pattern.find_iter(&self.held) {
                         if found.start() < end && end < found.end() {
                             end = found.start();
+                            straddling = Some(rule.name.clone());
                         }
                     }
                 }
@@ -424,13 +443,22 @@ impl crate::gateway::http::StreamTextFilter for StreamFilter {
                 break;
             }
         }
+        if self.held.len() > STREAM_HELD_MAX {
+            // A match that will not end: cut the stream rather than hold it without bound.
+            self.held.clear();
+            return Err(
+                straddling.unwrap_or_else(|| self.names.first().cloned().unwrap_or_default())
+            );
+        }
         let ready: String = self.held.drain(..end).collect();
-        self.redact(ready)
+        self.redact(ready).inspect_err(|_| self.held.clear())
     }
 
     fn finish(&mut self) -> Result<String, String> {
-        self.check()?;
+        // Judge the held text, and empty it either way: after a cut nothing is ever released.
+        let outcome = self.check();
         let rest = std::mem::take(&mut self.held);
+        outcome?;
         self.redact(rest)
     }
 }
@@ -1097,6 +1125,38 @@ mod tests {
             streamed(&guard, "platform", &["all ", "clean"]).unwrap(),
             "all clean"
         );
+    }
+
+    #[test]
+    fn a_cut_stream_releases_nothing_afterwards_and_a_match_that_never_ends_is_cut_not_held() {
+        let blocker = rules(
+            "[[guardrails]]\nname = \"leak\"\nscope = \"response\"\nblock_if_matches = [\"AKIA[0-9A-Z]{16}\"]",
+        );
+        let mut filter = blocker.stream_filter("platform").unwrap();
+        assert_eq!(filter.push("key AKIAABCDEFGHIJKLMNOP").unwrap_err(), "leak");
+        // The held text was discarded with the cut: finishing is empty, not a second error and not a
+        // flush of what was held.
+        assert_eq!(filter.finish().unwrap(), "");
+        // A redaction pattern that can match an unbounded run keeps a match open: past the cap the
+        // stream is cut, naming the rule, instead of holding and rescanning without bound.
+        let greedy = rules(
+            "[[guardrails]]\nname = \"run\"\nscope = \"response\"\nredact_matches = [\"[A-Za-z0-9+/=]{40,}\"]",
+        );
+        let mut filter = greedy.stream_filter("platform").unwrap();
+        let mut cut = None;
+        for _ in 0..1000 {
+            match filter.push(&"A".repeat(512)) {
+                Ok(released) => {
+                    assert!(released.is_empty(), "nothing of an open match is released")
+                }
+                Err(rule) => {
+                    cut = Some(rule);
+                    break;
+                }
+            }
+        }
+        assert_eq!(cut.as_deref(), Some("run"));
+        assert_eq!(filter.finish().unwrap(), "");
     }
 
     #[test]

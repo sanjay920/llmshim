@@ -2832,12 +2832,21 @@ async fn chat_stream_inner(
         let guard = state.guardrails.get().cloned();
         #[cfg(feature = "serve")]
         let mut blocked_by: Option<String> = None;
+        // Whether the stream ended by itself: only then is the text still held back released.
+        #[cfg(feature = "serve")]
+        let mut clean_end = false;
         loop {
             let next = match pending.take() {
                 Some(first) => first,
                 None => rx.recv().await,
             };
-            let Some(item) = next else { break };
+            let Some(item) = next else {
+                #[cfg(feature = "serve")]
+                {
+                    clean_end = true;
+                }
+                break;
+            };
             match item {
                 Ok(chunk) => {
                     if responses_identity && !identity_sent {
@@ -2894,9 +2903,10 @@ async fn chat_stream_inner(
                 }
             }
         }
-        // The text still held back when the stream ends is checked and released (or cut).
+        // The text still held back when the stream ends by itself is checked and released (or cut).
+        // After an error or a cut nothing more is sent: the held text is dropped.
         #[cfg(feature = "serve")]
-        if let Some(filter) = filter.as_mut() {
+        if let (true, Some(filter)) = (clean_end, filter.as_mut()) {
             match filter.finish() {
                 Ok(rest) if !rest.is_empty() => {
                     let event = StreamEvent::Content { text: rest };
