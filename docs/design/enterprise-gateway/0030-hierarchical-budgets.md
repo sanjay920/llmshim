@@ -279,3 +279,22 @@ the lease size is then set by the table, which removes today's last-writer-wins 
   published snapshot read back by the data plane, history, migration from versions 1, 2 and 3 with the new
   column in use), the API (400, 404, round trip), and a process test: a team's budget of zero refuses its
   key, and the next generation with a higher cap serves it.
+
+## Closed without building (2026-11-18)
+
+Three leftovers of slices 2 to 5 were weighed and **not built**; none is a safety gap, and each costs more than it
+returns.
+
+- **A lease for a key's own cap in an outage.** A key that has its own cap under a tenant cap is refused in outage
+  state (a second lease would be needed). The refusal is a fail-closed 503, never an over-spend, and the key is
+  served again on recovery. Building it means a second lease counter, a second epoch and a second settlement path
+  through `OutageManager` for a configuration (two caps on one key) that a tenant table makes unnecessary: cap the
+  tenant, or cap the key, not both, if an outage must not refuse it.
+- **Reload `started_at`.** A reload that adds or changes a tenant table starts its window then; operators learn
+  that from the generation bump and the 429s, and the usage records carry the timestamps. A status field would
+  repeat what the records say.
+- **A refusal-level label** (`level: tenant|key` on the 429's metadata and on `rejected_total`). The local ledger
+  knows which level refused, but the Redis ledger's script returns one refusal code for "a budget"; adding the level
+  changes that script's return, the fleet's wire with it, and some thirty pattern matches in the tests, to name in a
+  label what the usage records and the tenant's own configuration already say. Revisit if an operator needs it to
+  tell a tenant cap from a key cap in an alert.

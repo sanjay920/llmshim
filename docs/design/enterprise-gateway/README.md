@@ -147,7 +147,7 @@ Later phases (each needs its own design note before work starts)
       bound is on admitted reservations, not spend
 - [x] Per-key model allowlists (0028): `keys[].allowed_models`, 403 before admission; also in control-plane keys and signed snapshots
 - [x] Key tags on usage records (0029): `keys[].tags` onto usage records, also in control-plane keys and snapshots
-- [ ] Tenant budgets above key budgets (0030): slices 2 to 5 built (file table, single-instance and Redis ledgers, outage interplay for keys with no cap of their own, team budgets through the control plane); a lease for a key's own cap, reload `started_at` and a refusal-level label are not built
+- [x] Tenant budgets above key budgets (0030): built (file table, single-instance and Redis ledgers, outage interplay for keys with no cap of their own, team budgets through the control plane). Three leftovers were closed **without building**, with reasons, in 0030's "Closed without building": a lease for a key's own cap, the reload `started_at`, a refusal-level label
 - [x] Alerts, scheduled cost exports (0034): alerts are Prometheus rules over new provider-labelled spend counters; exports are the usage log; the gateway sends and schedules nothing
 - [x] Deployments and load balancing across credentials and regions (0031): built through slice 4 (selection, four strategies, health with probes, allowlist, usage field, non-streaming failover, stats view, two accounts via named instances, streaming failover before the first byte on a single instance; not in a fleet)
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
@@ -155,7 +155,8 @@ Later phases (each needs its own design note before work starts)
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy (residency built for file keys, 0039: provider `residency` labels and key `allowed_residency`, enforced through the allowlist; request guardrails built, 0040: regex rules that refuse a request before admission, `regex` under `serve`; response checks, redaction and classifiers are not built)
 - [x] Secret-manager integrations (0033): files are the integration (Kubernetes, CSI driver, agents); secret values are one line of at most 64 KiB; no vendor client is linked
 - [x] Embeddings, images and audio on the server, local scheduler only (a fleet answers 501): embeddings on the server (0035, a spend bound for capped keys with a trusted model price); image generation (0036, local scheduler, capped keys refused); speech (0037, exact price, capped keys work); transcription (0038, multipart upload through `multer`, capped keys refused)
-- [ ] Config-registered providers beyond the existing kinds (an OpenAI-compatible server by `base_url` is built, 0004); images, speech and transcription through a fleet (embeddings through a fleet is built, 0041)
+- [x] Config-registered providers: **decided, no further kinds** (0022). An endpoint that speaks a wire llmshim has is `base_url` on that kind (`openai-compatible`, or `base_url` on `openai`, `anthropic`, `gemini`, `xai`, `cerebras`, `openrouter`); a wire it lacks is a library adapter, not a configuration
+- [ ] Images, speech and transcription through a fleet (embeddings through a fleet is built, 0041)
 - [ ] Admin UI, SSO and SCIM (not started: they follow the control plane and the
       licensing decision)
 
