@@ -188,3 +188,167 @@ async fn a_rule_that_cannot_fire_or_compile_is_refused_at_start_without_echoing_
     // The pattern is not echoed.
     assert!(!text.contains("unclosed"), "{text}");
 }
+
+const RESPONSE_RULE: &str = r#"
+    [[guardrails]]
+    name = "no-leak"
+    scope = "response"
+    block_if_matches = ["AKIA[0-9A-Z]{16}"]
+"#;
+
+async fn leaking_upstream(calls: usize) -> (mockito::ServerGuard, mockito::Mock) {
+    let mut up = mockito::Server::new_async().await;
+    let mock = up
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(completion(SECRET))
+        .expect(calls)
+        .create_async()
+        .await;
+    (up, mock)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_that_breaks_a_response_rule_is_replaced_by_a_422_naming_the_rule() {
+    let (up, mock) = leaking_upstream(1).await;
+    let dir = tempdir::Dir::new("guard-response");
+    let log = dir.0.join("usage.jsonl");
+    let server = start(
+        &config(&up.url(), RESPONSE_RULE, Some(&log)),
+        "guard-response",
+        &env(),
+    );
+    // The request itself is fine under a response-only rule, so it goes to the provider.
+    let answer = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "messages": [{"role": "user", "content": "hello"}]}),
+    )
+    .await;
+    let status = answer.status();
+    let text = answer.text().await.unwrap();
+    assert_eq!(status, 422, "{text}");
+    assert!(
+        text.contains("guardrail_blocked_response") && text.contains("no-leak"),
+        "{text}"
+    );
+    // Naming the rule, never what matched.
+    assert!(!text.contains("AKIA"), "{text}");
+    mock.assert_async().await;
+    // The provider answered and was paid, so the attempt is recorded; the secret is in no log.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let usage = loop {
+        let usage = std::fs::read_to_string(&log).unwrap_or_default();
+        if !usage.is_empty() || std::time::Instant::now() > deadline {
+            break usage;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(usage.contains("\"outcome\":\"completed\""), "{usage}");
+    assert!(!usage.contains("AKIA"), "{usage}");
+    let metrics = reqwest::Client::new()
+        .get(format!("{}/metrics", server.admin.clone().unwrap()))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("reason=\"guardrail_response\"} 1"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clean_answer_is_returned_a_request_rule_does_not_read_it_and_a_stream_is_refused() {
+    // A rule that reads responses leaves a clean answer alone...
+    let (up, mock) = chat_upstream(1).await;
+    let server = start(
+        &config(&up.url(), RESPONSE_RULE, None),
+        "guard-response-ok",
+        &env(),
+    );
+    let clean = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "messages": [{"role": "user", "content": "hello"}]}),
+    )
+    .await;
+    assert_eq!(clean.status(), 200);
+    // ...but the caller under it cannot stream, since a stream cannot be checked after it starts.
+    let streaming = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "stream": true, "messages": [{"role": "user", "content": "hello"}]}),
+    )
+    .await;
+    assert_eq!(streaming.status(), 400);
+    mock.assert_async().await;
+
+    // A request-only rule (the default scope) does not read the answer: the same leaky answer
+    // passes, and streaming is unaffected.
+    let (up, mock) = leaking_upstream(1).await;
+    let server = start(&config(&up.url(), RULE, None), "guard-request-only", &env());
+    let passed = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "messages": [{"role": "user", "content": "hello"}]}),
+    )
+    .await;
+    assert_eq!(passed.status(), 200);
+    mock.assert_async().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_escaped_tool_call_argument_and_every_streaming_route_are_covered() {
+    // A tool call's arguments are JSON text: the secret written with an escape is still read.
+    let mut up = mockito::Server::new_async().await;
+    let _mock = up
+        .mock("POST", "/chat/completions")
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({"id": "c", "object": "chat.completion", "created": 1, "model": "m",
+                "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": null,
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                        "name": "f", "arguments": "{\"v\":\"\\u0041KIAABCDEFGHIJKLMNOP\"}"}}]}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}})
+            .to_string(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let server = start(
+        &config(&up.url(), RESPONSE_RULE, None),
+        "guard-escaped",
+        &env(),
+    );
+    let blocked = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "messages": [{"role": "user", "content": "hello"}]}),
+    )
+    .await;
+    assert_eq!(blocked.status(), 422);
+    // Every route that streams is refused to the caller under the rule.
+    for (path, body) in [
+        (
+            "/v1/chat/stream",
+            json!({"model": "p/m", "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": "p/m", "max_tokens": 5, "stream": true,
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model": "p/m", "stream": true, "input": "hi"}),
+        ),
+    ] {
+        let refused = post(&server.base, path, body).await;
+        assert_eq!(refused.status(), 400, "{path}");
+    }
+}

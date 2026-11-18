@@ -5,7 +5,7 @@
 //! back-references), so neither a hostile pattern nor hostile text can stall a request. A match
 //! returns the rule's name and nothing else: the pattern and the text it matched are never kept.
 
-use super::config::Guardrail;
+use super::config::{Guardrail, GuardrailScope};
 use crate::gateway::http::RequestGuard;
 use regex::{RegexSet, RegexSetBuilder};
 use serde_json::Value;
@@ -80,36 +80,32 @@ impl Scope {
     }
 }
 
-/// The compiled rules: one set for the rules that apply to everyone and one per tenant that has
-/// rules of its own, so a request is scanned once per scope, not once per rule.
-pub struct Guardrails {
-    names: Vec<String>,
+/// One direction's rules: one set for the rules that apply to everyone and one per tenant that has
+/// rules of its own, so a text is scanned once per scope, not once per rule.
+struct Direction {
     global: Option<Scope>,
     by_tenant: BTreeMap<String, Scope>,
 }
 
-impl Guardrails {
-    /// Compile the file's rules. A failure (a rule set too large to compile together) is reported by
-    /// scope, never by pattern.
-    pub fn build(rules: &[Guardrail]) -> Result<Self, String> {
-        let names = rules.iter().map(|rule| rule.name.clone()).collect();
+impl Direction {
+    fn build(rules: &[(usize, &Guardrail)], direction: &str) -> Result<Self, String> {
         let global_rules: Vec<(usize, &Guardrail)> = rules
             .iter()
-            .enumerate()
+            .copied()
             .filter(|(_, rule)| rule.tenants.is_none())
             .collect();
         let global = Scope::build(&global_rules).map_err(|_| {
-            "the rules for every caller are too large to compile together".to_string()
+            format!("the {direction} rules for every caller are too large to compile together")
         })?;
         let mut tenants = BTreeSet::new();
-        for rule in rules {
+        for (_, rule) in rules {
             tenants.extend(rule.tenants.iter().flatten().cloned());
         }
         let mut by_tenant = BTreeMap::new();
         for tenant in tenants {
             let mine: Vec<(usize, &Guardrail)> = rules
                 .iter()
-                .enumerate()
+                .copied()
                 .filter(|(_, rule)| {
                     rule.tenants
                         .as_ref()
@@ -117,25 +113,23 @@ impl Guardrails {
                 })
                 .collect();
             if let Some(scope) = Scope::build(&mine).map_err(|_| {
-                "the rules for one tenant are too large to compile together".to_string()
+                format!("the {direction} rules for one tenant are too large to compile together")
             })? {
                 by_tenant.insert(tenant, scope);
             }
         }
-        Ok(Self {
-            names,
-            global,
-            by_tenant,
-        })
+        Ok(Self { global, by_tenant })
     }
 
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.global.is_none() && self.by_tenant.is_empty()
     }
-}
 
-impl RequestGuard for Guardrails {
-    fn first_match(&self, tenant: &str, body: &Value) -> Option<String> {
+    fn applies_to(&self, tenant: &str) -> bool {
+        self.global.is_some() || self.by_tenant.contains_key(tenant)
+    }
+
+    fn first_match(&self, tenant: &str, body: &Value) -> Option<usize> {
         let global = self
             .global
             .as_ref()
@@ -145,12 +139,122 @@ impl RequestGuard for Guardrails {
             .get(tenant)
             .and_then(|scope| scope.first_rule(body));
         // The earlier of the two in the file's order.
-        [global, own]
-            .into_iter()
-            .flatten()
-            .min()
+        [global, own].into_iter().flatten().min()
+    }
+}
+
+/// The compiled rules, for requests and for responses.
+pub struct Guardrails {
+    names: Vec<String>,
+    request: Direction,
+    response: Direction,
+}
+
+impl Guardrails {
+    /// Compile the file's rules. A failure (a rule set too large to compile together) is reported by
+    /// scope, never by pattern.
+    pub fn build(rules: &[Guardrail]) -> Result<Self, String> {
+        let names = rules.iter().map(|rule| rule.name.clone()).collect();
+        let indexed: Vec<(usize, &Guardrail)> = rules.iter().enumerate().collect();
+        let reading = |reads: fn(GuardrailScope) -> bool| -> Vec<(usize, &Guardrail)> {
+            indexed
+                .iter()
+                .copied()
+                .filter(|(_, rule)| reads(rule.scope))
+                .collect()
+        };
+        Ok(Self {
+            names,
+            request: Direction::build(&reading(GuardrailScope::reads_request), "request")?,
+            response: Direction::build(&reading(GuardrailScope::reads_response), "response")?,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.request.is_empty() && self.response.is_empty()
+    }
+}
+
+impl RequestGuard for Guardrails {
+    fn first_match(&self, tenant: &str, body: &Value) -> Option<String> {
+        self.request
+            .first_match(tenant, body)
             .map(|index| self.names[index].clone())
     }
+
+    fn first_response_match(&self, tenant: &str, body: &Value) -> Option<String> {
+        self.response
+            .first_match(tenant, &response_view(body))
+            .map(|index| self.names[index].clone())
+    }
+
+    fn reads_responses(&self, tenant: &str) -> bool {
+        self.response.applies_to(tenant)
+    }
+}
+
+/// The strings of an answer a rule should read, from the `choices` of a normalized chat response
+/// (note 0043): the message's text, refusal, tool-call names and arguments, and reasoning text. The
+/// answer is shaped by llmshim, so what is skipped is known: signatures and encrypted reasoning
+/// (opaque blobs a pattern would match inside by chance), ids, roles and other structure. The parts
+/// of a content array are joined (a secret split across two parts is one string), and a tool call's
+/// `arguments`, which is JSON text, is parsed so that an escaped secret (`\u0041KIA...`) is read as
+/// the text it decodes to.
+pub(crate) fn response_view(choices: &Value) -> Value {
+    const SKIPPED: [&str; 14] = [
+        "thought_signature",
+        "signature",
+        "encrypted_content",
+        "responses_output",
+        "wire_ids",
+        "id",
+        "item_id",
+        "tool_call_id",
+        "role",
+        "finish_reason",
+        "index",
+        "type",
+        "origin",
+        "redacted_data",
+    ];
+    fn walk(value: &Value) -> Value {
+        match value {
+            Value::Array(items) => {
+                // Content parts: one string, so a split secret is whole.
+                if !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| item.get("text").is_some_and(Value::is_string))
+                {
+                    let joined: String = items
+                        .iter()
+                        .filter_map(|item| item.get("text").and_then(Value::as_str))
+                        .collect();
+                    return Value::String(joined);
+                }
+                Value::Array(items.iter().map(walk).collect())
+            }
+            Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (key, item) in map {
+                    if SKIPPED.contains(&key.as_str()) {
+                        continue;
+                    }
+                    let item = match (key.as_str(), item) {
+                        // Tool-call arguments are JSON text: read what it decodes to.
+                        ("arguments", Value::String(text)) => serde_json::from_str::<Value>(text)
+                            .map(|parsed| walk(&parsed))
+                            .unwrap_or_else(|_| Value::String(text.clone())),
+                        _ => walk(item),
+                    };
+                    out.insert(key.clone(), item);
+                }
+                Value::Object(out)
+            }
+            other => other.clone(),
+        }
+    }
+    walk(choices)
 }
 
 #[cfg(test)]
@@ -279,6 +383,100 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_rule_reads_the_request_the_response_or_both_and_a_response_rule_marks_its_tenants() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"asks\"\nblock_if_matches = [\"alpha\"]\n\
+             [[guardrails]]\nname = \"answers\"\nscope = \"response\"\ntenants = [\"platform\"]\nblock_if_matches = [\"beta\"]\n\
+             [[guardrails]]\nname = \"either\"\nscope = \"both\"\nblock_if_matches = [\"gamma\"]",
+        );
+        let text = |t: &str| json!({"messages": [{"role": "user", "content": t}]});
+        // A request-only rule reads requests and never responses; a response rule the reverse.
+        assert_eq!(
+            guard.first_match("platform", &text("alpha")).as_deref(),
+            Some("asks")
+        );
+        assert_eq!(guard.first_response_match("platform", &text("alpha")), None);
+        assert_eq!(guard.first_match("platform", &text("beta")), None);
+        assert_eq!(
+            guard
+                .first_response_match("platform", &text("beta"))
+                .as_deref(),
+            Some("answers")
+        );
+        // The response rule is the platform tenant's alone.
+        assert_eq!(guard.first_response_match("other", &text("beta")), None);
+        // `both` reads both directions.
+        assert_eq!(
+            guard.first_match("other", &text("gamma")).as_deref(),
+            Some("either")
+        );
+        assert_eq!(
+            guard
+                .first_response_match("other", &text("gamma"))
+                .as_deref(),
+            Some("either")
+        );
+        // Every tenant is under `either` (it reads responses and names no tenant).
+        assert!(guard.reads_responses("platform") && guard.reads_responses("other"));
+    }
+
+    #[test]
+    fn a_response_is_read_as_text_not_as_opaque_blobs_and_split_or_escaped_secrets_are_whole() {
+        let choices = json!([{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {
+                "role": "assistant",
+                // Opaque signature and encrypted blobs are never the answer's text.
+                "reasoning": [{"type": "thinking", "text": "plan", "thought_signature":
+                    {"data": "QUtJQUFCQ0RFRkdISUpLTE1OT1A=AKIAABCDEFGHIJKLMNOP", "origin": "x"}}],
+                "responses_output": [{"encrypted_content": "AKIAABCDEFGHIJKLMNOP"}],
+                "content": [{"type": "text", "text": "the key is AKI"}, {"type": "text", "text": "AABCDEFGHIJKLMNOP"}],
+                "tool_calls": [{"id": "call_AKIAABCDEFGHIJKLMNOP", "function": {
+                    "name": "f", "arguments": "{\"v\":\"\\u0041KIAABCDEFGHIJKLMNOP\"}"}}]
+            }
+        }]);
+        let view = response_view(&choices);
+        let text = view.to_string();
+        // The signature, the encrypted item and the id are gone; the split and escaped secrets are
+        // each whole in the view.
+        assert!(
+            !text.contains("QUtJ") && !text.contains("encrypted") && !text.contains("call_AKIA"),
+            "{text}"
+        );
+        assert!(text.contains("the key is AKIAABCDEFGHIJKLMNOP"), "{text}");
+        assert!(text.contains("AKIAABCDEFGHIJKLMNOP\""), "{text}");
+        let guard = rules(
+            "[[guardrails]]\nname = \"leak\"\nscope = \"response\"\nblock_if_matches = [\"AKIA[0-9A-Z]{16}\"]",
+        );
+        assert_eq!(
+            guard.first_response_match("platform", &view).as_deref(),
+            Some("leak")
+        );
+        // A clean answer that carries a long opaque signature is not blocked by a broad pattern.
+        let broad = rules(
+            "[[guardrails]]\nname = \"long\"\nscope = \"response\"\nblock_if_matches = [\"[A-Za-z0-9]{40}\"]",
+        );
+        let clean = json!([{"message": {"role": "assistant", "content": "hi",
+            "reasoning": [{"thought_signature": {"data": "A".repeat(200)}}]}}]);
+        assert_eq!(
+            broad.first_response_match("platform", &response_view(&clean)),
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_request_rule_leaves_a_tenant_free_to_stream() {
+        let guard = rules("[[guardrails]]\nname = \"asks\"\nblock_if_matches = [\"alpha\"]");
+        assert!(!guard.reads_responses("platform"));
+        let scoped = rules(
+            "[[guardrails]]\nname = \"answers\"\nscope = \"response\"\ntenants = [\"platform\"]\nblock_if_matches = [\"beta\"]",
+        );
+        assert!(scoped.reads_responses("platform"));
+        assert!(!scoped.reads_responses("other"));
     }
 
     #[test]

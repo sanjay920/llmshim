@@ -152,8 +152,8 @@ pub struct ServeConfig {
     /// snapshot file's content reloads like keys do.
     #[serde(default)]
     pub control_plane: Option<ControlPlane>,
-    /// Request guardrails (note 0040): rules that refuse a request whose text matches a pattern,
-    /// before anything is reserved, queued or sent. Fixed at start.
+    /// Guardrails (notes 0040 and 0043): rules that refuse a request whose text matches a pattern,
+    /// before anything is reserved, queued or sent, or replace an answer that matches. Fixed at start.
     #[serde(default)]
     pub guardrails: Vec<Guardrail>,
 }
@@ -172,8 +172,37 @@ pub struct Guardrail {
     #[serde(default)]
     pub tenants: Option<Vec<String>>,
     /// Regular expressions (Rust `regex` syntax: linear-time, no look-around or back-references),
-    /// matched anywhere in any text of the request. 1 to 64, each at most 1024 characters.
+    /// matched anywhere in any text of the request (or of the response, per `scope`). 1 to 64, each
+    /// at most 1024 characters.
     pub block_if_matches: Vec<String>,
+    /// What the rule is matched against (note 0043): the `request` (default), the
+    /// non-streaming `response`, or `both`. A caller under a rule that reads responses cannot
+    /// stream: a stream cannot be checked after its first byte has gone out, so it is refused.
+    #[serde(default)]
+    pub scope: GuardrailScope,
+}
+
+/// What a guardrail rule reads (note 0043).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailScope {
+    /// The request's text, before anything is sent (0040).
+    #[default]
+    Request,
+    /// The model's answer, before it is returned.
+    Response,
+    /// Both.
+    Both,
+}
+
+impl GuardrailScope {
+    pub(crate) fn reads_request(self) -> bool {
+        matches!(self, Self::Request | Self::Both)
+    }
+
+    pub(crate) fn reads_response(self) -> bool {
+        matches!(self, Self::Response | Self::Both)
+    }
 }
 
 /// Where a replica pulls its snapshot from (0024, 0026): `GET {url}/v1/orgs/{org}/snapshot`.

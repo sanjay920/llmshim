@@ -76,6 +76,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0040: Request guardrails](0040-guardrails.md)
 - [0041: Embeddings through a fleet](0041-embeddings-through-a-fleet.md)
 - [0042: Streaming failover through a fleet](0042-fleet-streaming-failover.md)
+- [0043: Response guardrails](0043-response-guardrails.md)
 
 ## Roadmap
 
@@ -153,7 +154,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Deployments and load balancing across credentials and regions (0031): built through slice 4 (selection, four strategies, health with probes, allowlist, usage field, non-streaming failover, stats view, two accounts via named instances, streaming failover before the first byte, on a single instance and, since 0042, through a fleet)
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
 - [ ] Audit log
-- [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy (residency built for file keys, 0039: provider `residency` labels and key `allowed_residency`, enforced through the allowlist; request guardrails built, 0040: regex rules that refuse a request before admission, `regex` under `serve`; response checks, redaction and classifiers are not built)
+- [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy (residency built for file keys, 0039: provider `residency` labels and key `allowed_residency`, enforced through the allowlist; request guardrails built, 0040: regex rules that refuse a request before admission, `regex` under `serve`; response checks built in 0043 for non-streaming chat and transcription, a caller under a response rule cannot stream; redaction, streaming filters and classifiers are not built)
 - [x] Secret-manager integrations (0033): files are the integration (Kubernetes, CSI driver, agents); secret values are one line of at most 64 KiB; no vendor client is linked
 - [x] Embeddings, images and audio on the server, local scheduler only (a fleet answers 501): embeddings on the server (0035, a spend bound for capped keys with a trusted model price); image generation (0036, local scheduler, capped keys refused); speech (0037, exact price, capped keys work); transcription (0038, multipart upload through `multer`, capped keys refused)
 - [x] Config-registered providers: **decided, no further kinds** (0022). An endpoint that speaks a wire llmshim has is `base_url` on that kind (`openai-compatible`, or `base_url` on `openai`, `anthropic`, `gemini`, `xai`, `cerebras`, `openrouter`); a wire it lacks is a library adapter, not a configuration
