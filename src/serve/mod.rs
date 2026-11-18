@@ -13,6 +13,7 @@
 
 mod access_log;
 pub mod allowlist;
+pub mod audit;
 pub mod build;
 pub mod config;
 pub mod guardrails;

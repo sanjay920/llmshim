@@ -595,6 +595,14 @@
             "null"
           ]
         },
+        "audit_log": {
+          "default": null,
+          "description": "The audit log (note 0047): an append-only, hash-chained record of what changed the running\ngateway (start, stop, every configuration reload, applied or refused) and who or what did it.\nAn absolute file path (created owner-only and continued across restarts; a symbolic link or a\nfile whose last record is damaged is refused); not `\"stdout\"`, since a chain needs a file.\nCheck it with `llmshim audit verify <file>`. Never holds a secret, a prompt or a completion.\nOff when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "usage_log": {
           "default": null,
           "description": "One JSON line per provider attempt when it ends: tenant, key name, the\nrequest id (the one in the access log), provider, model, outcome, tokens\nand USD cost. Per attempt, not per request: a retry or a fallback is a\nseparate charge, and the attempts of a request share its id. For showback\nand chargeback; sum `cost_usd` per tenant or key, treating `null` as\nunknown. Same targets as `access_log`.",

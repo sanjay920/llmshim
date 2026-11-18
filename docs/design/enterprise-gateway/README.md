@@ -80,6 +80,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0044: Request redaction](0044-request-redaction.md)
 - [0045: Response redaction](0045-response-redaction.md)
 - [0046: Streaming guardrails](0046-streaming-guardrails.md)
+- [0047: The audit log](0047-audit-log.md)
 
 ## Roadmap
 
@@ -156,7 +157,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Alerts, scheduled cost exports (0034): alerts are Prometheus rules over new provider-labelled spend counters; exports are the usage log; the gateway sends and schedules nothing
 - [x] Deployments and load balancing across credentials and regions (0031): built through slice 4 (selection, four strategies, health with probes, allowlist, usage field, non-streaming failover, stats view, two accounts via named instances, streaming failover before the first byte, on a single instance and, since 0042, through a fleet)
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
-- [ ] Audit log
+- [ ] Audit log (0047): the gateway's hash-chained local log (`[logging] audit_log`, `llmshim audit verify`) built; the control plane's change history chain described, not built; no export
 - [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy (residency built for file keys, 0039: provider `residency` labels and key `allowed_residency`, enforced through the allowlist; request guardrails built, 0040: regex rules that refuse a request before admission, `regex` under `serve`; response checks built in 0043 for non-streaming chat and transcription, a caller under a response rule cannot stream; request redaction built in 0044 and response redaction in 0045; streaming filters in 0046; external classifiers are not built)
 - [x] Secret-manager integrations (0033): files are the integration (Kubernetes, CSI driver, agents); secret values are one line of at most 64 KiB; no vendor client is linked
 - [x] Embeddings, images and audio on the server, local scheduler only (a fleet answers 501): embeddings on the server (0035, a spend bound for capped keys with a trusted model price); image generation (0036, local scheduler, capped keys refused); speech (0037, exact price, capped keys work); transcription (0038, multipart upload through `multer`, capped keys refused)

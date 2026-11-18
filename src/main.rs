@@ -1066,6 +1066,25 @@ async fn pull_loop(
     }
 }
 
+/// `llmshim audit verify <FILE>` (note 0047).
+#[cfg(feature = "serve")]
+fn cmd_audit(options: &cli::AuditOptions) -> i32 {
+    let file = options.file.as_deref().unwrap_or_default();
+    match llmshim::serve::audit::verify(std::path::Path::new(file)) {
+        Ok(verified) => {
+            println!(
+                "{file}: intact, {} record(s), head {}",
+                verified.records, verified.head
+            );
+            0
+        }
+        Err(broken) => {
+            eprintln!("{file}: broken at line {}: {}", broken.line, broken.reason);
+            1
+        }
+    }
+}
+
 /// `llmshim snapshot keygen|sign|verify` (0024). Exit 0 on success, 1 on any failure.
 #[cfg(feature = "serve")]
 fn cmd_snapshot(options: &cli::SnapshotOptions) -> i32 {
@@ -1468,11 +1487,44 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
              listener without authentication; configure [admin] to separate them."
         ),
     }
+    // The audit log's first record of this run (note 0047): refusing to serve when it cannot be
+    // written, since a server that cannot be audited must not run unaudited.
+    if let Some(audit) = &built.audit {
+        let started = audit.record(
+            "server.started",
+            "process",
+            "ok",
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "config_sha256": built.reload.status().config_sha256,
+                "providers": built.providers,
+                "credentials": built.caller_keys,
+                "authenticated": built.authenticated,
+                "snapshot": snapshot.as_ref().map(|snapshot| serde_json::json!({
+                    "org": snapshot.org,
+                    "generation": snapshot.generation,
+                    "signer": snapshot.signer,
+                })),
+            }),
+        );
+        if let Err(message) = started {
+            eprintln!("error: the audit log cannot be written: {message}");
+            return 1;
+        }
+    }
     // One signal stops both listeners.
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let stop_all = stop.clone();
+    let audit_on_stop = built.audit.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
+        if let Some(audit) = audit_on_stop {
+            if let Err(message) =
+                audit.record("server.stopping", "process", "ok", serde_json::json!({}))
+            {
+                eprintln!("error: the audit log could not record the shutdown: {message}");
+            }
+        }
         let _ = stop.send(true);
     });
     let wait_for_stop = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
@@ -1934,6 +1986,8 @@ async fn main() {
         "serve" => std::process::exit(cmd_serve(&options.serve).await),
         #[cfg(feature = "serve")]
         "snapshot" => std::process::exit(cmd_snapshot(&options.snapshot)),
+        #[cfg(feature = "serve")]
+        "audit" => std::process::exit(cmd_audit(&options.audit)),
         "chat" => { /* fall through to chat */ }
         _ => {
             eprintln!("Unknown command: {}\n", cmd);

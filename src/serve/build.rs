@@ -68,6 +68,8 @@ pub struct Built {
     pub reload: ReloadHandles,
     /// The inbound limits the listeners are started with (0021).
     pub listener: ListenerLimits,
+    /// The audit log, when `[logging] audit_log` is set (note 0047).
+    pub audit: Option<Arc<super::audit::AuditLog>>,
 }
 
 /// The limits of the inbound listeners, from `[server]` (0021).
@@ -271,6 +273,24 @@ pub async fn build_app(
                 path: "logging.access_log".into(),
                 message,
             }]);
+        }
+        None => None,
+    };
+
+    // The audit log (note 0047): opened with the other logs, and refusing to start on a log that
+    // cannot be continued safely, since a server that cannot be audited must not run unaudited.
+    let audit = match &config.logging.audit_log {
+        Some(path) => {
+            let instance: String = uuid::Uuid::new_v4().simple().to_string()[..12].to_owned();
+            match super::audit::AuditLog::open(std::path::Path::new(path), &instance) {
+                Ok(log) => Some(Arc::new(log)),
+                Err(message) => {
+                    return Err(vec![Issue {
+                        path: "logging.audit_log".into(),
+                        message,
+                    }]);
+                }
+            }
         }
         None => None,
     };
@@ -495,6 +515,7 @@ pub async fn build_app(
         _ => app,
     };
     let status_clock = clock.clone();
+    let status_audit = audit.clone();
     let (app, admin) = match admin_address {
         Some(admin_address) => {
             // The admin routes never read the key store, but the internal header
@@ -506,8 +527,16 @@ pub async fn build_app(
                         let status = reload_status.snapshot();
                         let snapshot = status_clock.as_ref().map(|clock| clock.status());
                         let jwks = jwks_status.as_ref().map(|jwt| jwt.statuses());
+                        let audit_head = status_audit.as_ref().map(|audit| audit.head());
                         async move {
                             let mut body = serde_json::to_value(status).unwrap_or_default();
+                            // The audit log's head (note 0047), live: the count and the hash to anchor.
+                            if let (Some(object), Some(head)) = (body.as_object_mut(), audit_head) {
+                                object.insert(
+                                    "audit".into(),
+                                    serde_json::to_value(head).unwrap_or_default(),
+                                );
+                            }
                             if let (Some(object), Some(snapshot)) = (body.as_object_mut(), snapshot)
                             {
                                 object.insert(
@@ -591,7 +620,8 @@ pub async fn build_app(
         authenticated,
         admin_authenticated,
         logs: Logs(logs, telemetry),
-        reload,
+        reload: reload.with_audit(audit.clone()),
+        audit,
         listener: ListenerLimits {
             max_connections: config
                 .server

@@ -54,6 +54,10 @@ pub const COST_UNKNOWN: &str = "llmshim_gateway_cost_unknown_total";
 /// `cache_write`). Input is the prompt total as reported; `reasoning` is inside `output` (note 0034).
 pub const TOKENS: &str = "llmshim_gateway_tokens_total";
 
+/// Audit records that could not be written (counter). Any value above zero means the log is missing
+/// events and has stopped taking more (note 0047).
+pub const AUDIT_WRITE_FAILURES: &str = "llmshim_audit_write_failures_total";
+
 /// Requests in which a guardrail redaction rule rewrote text (counter, label: rule). The label is the
 /// operator's rule name, so its cardinality is bounded by the file (note 0044).
 pub const GUARDRAIL_REDACTIONS: &str = "llmshim_gateway_guardrail_redactions_total";

@@ -8,6 +8,14 @@ pub(crate) struct Options {
     pub serve: ServeOptions,
     #[cfg(feature = "serve")]
     pub snapshot: SnapshotOptions,
+    #[cfg(feature = "serve")]
+    pub audit: AuditOptions,
+}
+/// `llmshim audit verify <FILE>` (0047).
+#[cfg(feature = "serve")]
+#[derive(Debug, Default)]
+pub(crate) struct AuditOptions {
+    pub file: Option<String>,
 }
 /// `llmshim snapshot keygen|sign|verify` (0024).
 #[cfg(feature = "serve")]
@@ -145,6 +153,24 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, String> {
             }
         }
         #[cfg(feature = "serve")]
+        "audit" => {
+            let action = tail.first().map(String::as_str).unwrap_or("--help");
+            if is_help(action) {
+                options.help = true;
+            } else if action != "verify" {
+                return Err(format!("unknown audit command: {action}"));
+            } else {
+                match &tail[1..] {
+                    [flag] if is_help(flag) => options.help = true,
+                    [file] if !file.is_empty() && !file.starts_with('-') => {
+                        options.audit.file = Some(file.clone())
+                    }
+                    [] => return Err("audit verify requires a file".into()),
+                    _ => return Err("audit verify takes exactly one file".into()),
+                }
+            }
+        }
+        #[cfg(feature = "serve")]
         "snapshot" => {
             let action = tail.first().map(String::as_str).unwrap_or("--help");
             if is_help(action) {
@@ -271,6 +297,8 @@ pub(crate) fn usage(command: &str) -> Option<&'static str> {
         "gateway"=>"Usage: llmshim gateway [--host <IP>] [--port <PORT>]\n\nCLI options override LLMSHIM_HOST/LLMSHIM_PORT and saved configuration.\n  -h, --help  Print help without starting the server",
         #[cfg(feature = "serve")]
         "serve"=>"Usage: llmshim serve --config <PATH> [--check [--structure-only]]\n       llmshim serve --print-schema\n\nIn development. Runs the gateway from a versioned .toml or .json server configuration.\nReads nothing from the environment except the variables the file names.\n  --check           Validate the file and its secret references, then exit\n  --structure-only  With --check: validate the file's shape and rules only; reads no\n                    secret, certificate or environment variable\n  --print-schema    Print the configuration's JSON Schema, then exit\n  -h, --help        Print help without starting the server\n\nExit status: 0 valid or started and stopped cleanly; 1 the file or a secret's value is\ninvalid, or the server could not start; 2 bad arguments; 3 a referenced secret is not\navailable (unset, empty or unreadable), so the file could not be fully checked here.",
+        #[cfg(feature = "serve")]
+        "audit"=>"Usage: llmshim audit verify <FILE>\n\nIn development (0047). Checks an audit log written with [logging] audit_log: every record\nmatches its own hash and follows the one before it. Exit status: 0 intact (prints the record\ncount and the head hash, which is the value to anchor outside the log); 1 broken at a named\nline; 2 bad arguments. A log whose last records were removed still verifies: compare the head\nwith the one you anchored.",
         #[cfg(feature = "serve")]
         "snapshot"=>"Usage: llmshim snapshot keygen --out <SEED_FILE>\n       llmshim snapshot sign --key-file <SEED_FILE> --in <PAYLOAD.json> --out <SNAPSHOT.json>\n       llmshim snapshot verify --verify-key <ed25519:...> [--verify-key ...] --in <SNAPSHOT.json>\n\nIn development (0024). Policy snapshots for [control_plane]: keygen writes a signing key's\nseed (owner-only) and prints its public key for verify_keys; sign signs a payload document\nwith it; verify checks a snapshot against the given public keys. No network, no server.",
         "chat"=>"Usage: llmshim chat [--log <PATH>]",
