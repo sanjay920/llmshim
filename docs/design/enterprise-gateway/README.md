@@ -72,6 +72,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0036: Image generation on the server](0036-images-on-the-server.md)
 - [0037: Speech synthesis on the server](0037-speech-on-the-server.md)
 - [0038: Transcription on the server](0038-transcription-on-the-server.md)
+- [0039: Residency](0039-residency.md)
 
 ## Roadmap
 
@@ -149,7 +150,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Deployments and load balancing across credentials and regions (0031): built through slice 4 (selection, four strategies, health with probes, allowlist, usage field, non-streaming failover, stats view, two accounts via named instances, streaming failover before the first byte on a single instance; not in a fleet)
 - [x] Workload JWT authentication and per-key IP allowlists (0017; mTLS is 0011)
 - [ ] Audit log
-- [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy
+- [ ] Guardrail pipeline on the existing `AttemptPolicy` hooks; residency policy (residency built for file keys, 0039: provider `residency` labels and key `allowed_residency`, enforced through the allowlist; the guardrail pipeline is not built)
 - [x] Secret-manager integrations (0033): files are the integration (Kubernetes, CSI driver, agents); secret values are one line of at most 64 KiB; no vendor client is linked
 - [x] Embeddings, images and audio on the server, local scheduler only (a fleet answers 501): embeddings on the server (0035, a spend bound for capped keys with a trusted model price); image generation (0036, local scheduler, capped keys refused); speech (0037, exact price, capped keys work); transcription (0038, multipart upload through `multer`, capped keys refused)
 - [ ] Config-registered providers beyond the existing kinds (an OpenAI-compatible server by `base_url` is built, 0004); embeddings, images and audio through a fleet

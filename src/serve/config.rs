@@ -912,6 +912,12 @@ pub struct Provider {
     pub api_key: Option<SecretRef>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Where this provider's models run, as an opaque label (design note 0039):
+    /// `[a-z][a-z0-9_-]{0,31}`. A key's `allowed_residency` is matched against it. Nothing about the
+    /// label is checked against the provider's real location: it is the operator's statement.
+    /// (`region` is the cloud API's own region for Bedrock and Vertex, a different thing.)
+    #[serde(default)]
+    pub residency: Option<String>,
     /// Bedrock: the AWS SDK profile to use. The profile file is trusted operator
     /// input (0020): it may select a role, SSO, a credential source or a
     /// `credential_process`.
@@ -945,6 +951,64 @@ pub struct Provider {
     /// Azure: deployment name to the catalog model it serves. At least one.
     #[serde(default, deserialize_with = "unique_map")]
     pub deployments: BTreeMap<String, String>,
+}
+
+/// Why a residency label is refused, or `None` when it is well formed (note 0039).
+pub(crate) fn residency_label_problem(label: &str) -> Option<&'static str> {
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => {}
+        _ => return Some("must start with a lowercase letter"),
+    }
+    if label.len() > 32
+        || !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Some("must be 1 to 32 characters of a-z, 0-9, `_` and `-`");
+    }
+    None
+}
+
+impl ServeConfig {
+    /// The models a key may call after residency (note 0039): its `allowed_models`, narrowed to the
+    /// providers whose region it allows. Residency is expressed in the allowlist's own terms, so
+    /// every path that checks the allowlist (chat, the media routes, OpenRouter's fallback list,
+    /// deployment picks) enforces it with no second rule:
+    ///
+    /// - with only `allowed_residency`, the key may call every model of each provider in them
+    ///   (`<provider>/*`);
+    /// - with both, an entry survives only if it names a provider in them. A `route/<name>` or
+    ///   `deployment/<name>` entry is dropped: an alias is matched without regard to what it
+    ///   resolves to, so it could carry the request to a provider outside the regions.
+    ///
+    /// A key with no `allowed_residency` keeps its list as written.
+    pub fn effective_allowed_models(&self, key: &GatewayKey) -> Option<Vec<String>> {
+        let Some(regions) = &key.allowed_residency else {
+            return key.allowed_models.clone();
+        };
+        let providers: Vec<&str> = self
+            .providers
+            .iter()
+            .filter(|(_, provider)| {
+                provider
+                    .residency
+                    .as_deref()
+                    .is_some_and(|label| regions.iter().any(|allowed| allowed == label))
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        Some(match &key.allowed_models {
+            None => providers.iter().map(|name| format!("{name}/*")).collect(),
+            Some(models) => models
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .split_once('/')
+                        .is_some_and(|(first, _)| providers.contains(&first))
+                })
+                .cloned()
+                .collect(),
+        })
+    }
 }
 
 /// Where a secret lives. Exactly one field is set; the value never appears in
@@ -1167,6 +1231,13 @@ pub struct GatewayKey {
     /// it for no restriction; an empty list is refused.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
+    /// Residency (design note 0039): the residency labels whose providers this key may use. A provider
+    /// carries a `residency` label; the key may call only providers whose label is listed, and a
+    /// provider with no label is outside every region. Combined with `allowed_models`, both must
+    /// admit the request. Omit it for no restriction; an empty list, or a region no provider
+    /// carries, is refused.
+    #[serde(default)]
+    pub allowed_residency: Option<Vec<String>>,
     /// Labels copied onto every usage record this key produces (design note 0029),
     /// for chargeback by cost center, environment or product: up to 16, names
     /// `[a-z][a-z0-9_]{0,31}`, values 1 to 64 printable ASCII characters. Labels
@@ -1775,6 +1846,11 @@ impl ServeConfig {
                     issues.push(Issue::new(format!("{at}.api_key"), "is required"))
                 }
                 None => {}
+            }
+            if let Some(label) = &provider.residency {
+                if let Some(problem) = residency_label_problem(label) {
+                    issues.push(Issue::new(format!("{at}.residency"), problem));
+                }
             }
             match &provider.base_url {
                 Some(url) => {
@@ -2570,6 +2646,47 @@ impl ServeConfig {
                     if let Some(problem) = crate::gateway::auth::model_entry_problem(entry) {
                         issues.push(Issue::new(format!("{at}.allowed_models[{n}]"), problem));
                     }
+                }
+            }
+            if let Some(regions) = &key.allowed_residency {
+                if regions.is_empty() {
+                    issues.push(Issue::new(
+                        format!("{at}.allowed_residency"),
+                        "is empty, which would refuse every request; omit it for no restriction",
+                    ));
+                }
+                if regions.len() > 32 {
+                    issues.push(Issue::new(
+                        format!("{at}.allowed_residency"),
+                        "has more than 32 entries",
+                    ));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for (n, region) in regions.iter().enumerate() {
+                    let at_n = format!("{at}.allowed_residency[{n}]");
+                    if let Some(problem) = residency_label_problem(region) {
+                        issues.push(Issue::new(at_n, problem));
+                    } else if !seen.insert(region.as_str()) {
+                        issues.push(Issue::new(at_n, "is listed twice"));
+                    } else if !self
+                        .providers
+                        .values()
+                        .any(|p| p.residency.as_deref() == Some(region.as_str()))
+                    {
+                        // A label no provider carries admits nothing: a typo would fail closed
+                        // and silently, so it is an error here.
+                        issues.push(Issue::new(at_n, "is not the residency of any provider"));
+                    }
+                }
+                if !regions.is_empty()
+                    && self
+                        .effective_allowed_models(key)
+                        .is_some_and(|models| models.is_empty())
+                {
+                    issues.push(Issue::new(
+                        format!("{at}.allowed_residency"),
+                        "leaves no model this key may call (with allowed_models, no entry names a provider in these labels; route/ and deployment/ entries are ignored under residency)",
+                    ));
                 }
             }
             if let Some(binding) = &key.jwt {
@@ -3938,6 +4055,151 @@ mod tests {
         assert!(ServeConfig::parse(&open, Format::Toml).is_ok());
         let contradictory = format!("{MINIMAL}\n[server]\nallow_unauthenticated = true");
         assert!(has(&issues(&contradictory), "server.allow_unauthenticated"));
+    }
+
+    const RESIDENCY: &str = r#"
+        version = 1
+        [providers.eu_a]
+        kind = "openai-compatible"
+        base_url = "https://eu-a.example.com/v1"
+        residency = "eu"
+        [providers.eu_b]
+        kind = "openai-compatible"
+        base_url = "https://eu-b.example.com/v1"
+        residency = "eu"
+        [providers.us_a]
+        kind = "openai-compatible"
+        base_url = "https://us-a.example.com/v1"
+        residency = "us"
+        [providers.plain]
+        kind = "openai-compatible"
+        base_url = "https://plain.example.com/v1"
+    "#;
+
+    fn residency_key(extra: &str) -> (ServeConfig, GatewayKey) {
+        let text = format!(
+            "{RESIDENCY}\n[[keys]]\nname = \"k\"\ntenant = \"t\"\nsha256 = \"{}\"\n{extra}\n",
+            "a".repeat(64)
+        );
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        let key = config.keys[0].clone();
+        (config, key)
+    }
+
+    #[test]
+    fn residency_narrows_the_allowlist_to_the_providers_in_the_allowed_labels() {
+        // Only labels: every model of each provider carrying one; an unlabeled provider is outside
+        // every residency.
+        let (config, key) = residency_key("allowed_residency = [\"eu\"]");
+        assert_eq!(
+            config.effective_allowed_models(&key),
+            Some(vec!["eu_a/*".to_string(), "eu_b/*".to_string()])
+        );
+        let (config, key) = residency_key("allowed_residency = [\"eu\", \"us\"]");
+        assert_eq!(
+            config.effective_allowed_models(&key).unwrap().len(),
+            3,
+            "plain carries no label and is never admitted"
+        );
+        // Both: an entry survives only if it names a provider in the labels. An alias entry is
+        // dropped, because it is matched without regard to what it resolves to.
+        let (config, key) = residency_key(
+            "allowed_residency = [\"eu\"]\nallowed_models = [\"eu_a/m\", \"us_a/m\", \"plain/m\", \"eu_b/*\", \"route/x\", \"deployment/y\"]",
+        );
+        assert_eq!(
+            config.effective_allowed_models(&key),
+            Some(vec!["eu_a/m".to_string(), "eu_b/*".to_string()])
+        );
+        // No residency: the list is as written, and none means none.
+        let (config, key) = residency_key("allowed_models = [\"us_a/m\"]");
+        assert_eq!(
+            config.effective_allowed_models(&key),
+            Some(vec!["us_a/m".to_string()])
+        );
+        let (config, key) = residency_key("");
+        assert_eq!(config.effective_allowed_models(&key), None);
+    }
+
+    #[test]
+    fn residency_mistakes_are_refused_by_path_not_left_to_fail_closed() {
+        for (extra, path, fragment) in [
+            (
+                "allowed_residency = []",
+                "keys[0].allowed_residency",
+                "is empty",
+            ),
+            (
+                "allowed_residency = [\"apac\"]",
+                "keys[0].allowed_residency[0]",
+                "not the residency of any provider",
+            ),
+            (
+                "allowed_residency = [\"EU\"]",
+                "keys[0].allowed_residency[0]",
+                "lowercase",
+            ),
+            (
+                "allowed_residency = [\"eu\", \"eu\"]",
+                "keys[0].allowed_residency[1]",
+                "listed twice",
+            ),
+            (
+                "allowed_residency = [\"eu\"]\nallowed_models = [\"us_a/m\"]",
+                "keys[0].allowed_residency",
+                "leaves no model",
+            ),
+        ] {
+            let text = format!(
+                "{RESIDENCY}\n[[keys]]\nname = \"k\"\ntenant = \"t\"\nsha256 = \"{}\"\n{extra}\n",
+                "a".repeat(64)
+            );
+            let found = issues(&text);
+            assert!(
+                found
+                    .iter()
+                    .any(|issue| issue.contains(path) && issue.contains(fragment)),
+                "{extra}: {found:?}"
+            );
+        }
+        // A provider's own label is held to the same rule.
+        let found = issues(&RESIDENCY.replace("residency = \"eu\"", "residency = \"Bad Label\""));
+        assert!(
+            found
+                .iter()
+                .any(|issue| issue.contains("providers.eu_a.residency")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_provider_whose_name_is_a_prefix_of_another_is_not_confused_with_it() {
+        // `eu` is labeled us and `eu_a` is labeled eu: a key in the eu residency gets `eu_a/*` and
+        // never `eu/*`, and an entry `eu/m` does not survive for it (names are compared whole).
+        let text = format!(
+            r#"
+            version = 1
+            [providers.eu]
+            kind = "openai-compatible"
+            base_url = "https://one.example.com/v1"
+            residency = "us"
+            [providers.eu_a]
+            kind = "openai-compatible"
+            base_url = "https://two.example.com/v1"
+            residency = "eu"
+            [[keys]]
+            name = "k"
+            tenant = "t"
+            sha256 = "{}"
+            allowed_residency = ["eu"]
+            allowed_models = ["eu/m", "eu_a/m"]
+            "#,
+            "a".repeat(64)
+        );
+        let config = ServeConfig::parse(&text, Format::Toml).unwrap();
+        assert_eq!(
+            config.effective_allowed_models(&config.keys[0]),
+            Some(vec!["eu_a/m".to_string()])
+        );
     }
 
     #[test]

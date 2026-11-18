@@ -292,6 +292,8 @@ fn to_keys(
             budget_window_secs: key.budget_window_secs,
             budget_allow_unpriced: key.budget_allow_unpriced,
             allowed_models: key.allowed_models.clone(),
+            // Residency is a file key's field (note 0039); the control plane has none yet.
+            allowed_residency: None,
             tags: key.tags.clone(),
         });
     }

@@ -1273,6 +1273,14 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
             return 1;
         }
     };
+    // Residency is a file key's field (note 0039): keys from a control-plane snapshot carry none,
+    // so they are not restricted by the providers' labels. Said once, where an operator will see it.
+    if config.control_plane.is_some() && config.providers.values().any(|p| p.residency.is_some()) {
+        eprintln!(
+            "warning: providers carry `residency` labels, but keys from the control-plane snapshot \
+             have no `allowed_residency`: restrict them with `allowed_models` (note 0039)"
+        );
+    }
     if options.check {
         // Everything that can be checked without creating or starting anything
         // has been: the shape, the secrets and the rules about their values (the

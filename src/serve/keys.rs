@@ -73,7 +73,7 @@ pub fn build_key_store(
                 budget_usd: key.budget_usd,
                 budget_window_secs: key.budget_window_secs,
                 budget_allow_unpriced: key.budget_allow_unpriced,
-                allowed_models: key.allowed_models.clone(),
+                allowed_models: config.effective_allowed_models(key),
                 key_name: key_name_for_cap(config, key),
                 tenant_budget: tenant_budget(config, &key.tenant),
             };
@@ -97,7 +97,7 @@ pub fn build_key_store(
                 budget_usd: key.budget_usd,
                 budget_window_secs: key.budget_window_secs,
                 budget_allow_unpriced: key.budget_allow_unpriced,
-                allowed_models: key.allowed_models.clone(),
+                allowed_models: config.effective_allowed_models(key),
                 key_name: key_name_for_cap(config, key),
                 tenant_budget: tenant_budget(config, &key.tenant),
             };
@@ -151,7 +151,7 @@ pub fn build_key_store(
             budget_usd: key.budget_usd,
             budget_window_secs: key.budget_window_secs,
             budget_allow_unpriced: key.budget_allow_unpriced,
-            allowed_models: key.allowed_models.clone(),
+            allowed_models: config.effective_allowed_models(key),
             key_name: key_name_for_cap(config, key),
             tenant_budget: tenant_budget(config, &key.tenant),
         };
