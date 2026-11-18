@@ -342,6 +342,11 @@ pub(crate) trait RequestGuard: Send + Sync {
     /// Whether any rule reads `tenant`'s responses. Such a caller cannot stream: a stream cannot be
     /// checked after its first byte has gone out.
     fn reads_responses(&self, tenant: &str) -> bool;
+
+    /// Rewrite the text of `value` (a message's `content` or `tool_calls`) for `tenant` (note 0044):
+    /// each match of a redaction rule becomes its replacement. The names of the rules that changed
+    /// anything.
+    fn redact(&self, tenant: &str, value: &mut Value) -> Vec<String>;
 }
 
 /// Everything the single-instance gateway state is built from. Grouping these
@@ -454,6 +459,34 @@ impl GatewayState {
         #[cfg(not(feature = "serve"))]
         let _ = (tenant, provider, answer);
         Ok(())
+    }
+
+    /// Apply the redaction rules to a request's messages before anything else sees them (note 0044):
+    /// the text of each message's content and tool calls, for the caller's tenant. A caller that
+    /// does not authenticate is left to be refused by the handler.
+    fn redact_request(&self, headers: &HeaderMap, req: &mut ChatRequest) {
+        #[cfg(feature = "serve")]
+        if let Some(guard) = self.guardrails.get() {
+            let Ok(caller) = self.keystore.identify_caller(headers) else {
+                return;
+            };
+            let tenant = &caller.identity.tenant;
+            let mut applied = std::collections::BTreeSet::new();
+            for message in &mut req.messages {
+                applied.extend(guard.redact(tenant, &mut message.content));
+                if let Some(calls) = message.tool_calls.as_mut() {
+                    applied.extend(guard.redact(tenant, calls));
+                }
+            }
+            for rule in applied {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::GUARDRAIL_REDACTIONS,
+                    &[("rule", &rule)],
+                );
+            }
+        }
+        #[cfg(not(feature = "serve"))]
+        let _ = (headers, req);
     }
 
     /// Whether `tenant` is under a rule that reads responses (so it cannot stream).
@@ -1566,8 +1599,9 @@ async fn chat(
     admitted_router: Option<axum::Extension<AdmittedRouter>>,
     headers: HeaderMap,
     uri: Uri,
-    Json(req): Json<ChatRequest>,
+    Json(mut req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
+    state.redact_request(&headers, &mut req);
     let preselected = admitted_router.map(|axum::Extension(AdmittedRouter(router))| router);
     let prequeue_permit = prequeue_permit(&state, installed_prequeue_permit).await?;
     if logical_lifetime
@@ -2547,8 +2581,9 @@ async fn chat_stream(
     installed_prequeue_permit: Option<axum::Extension<PrequeuePreparationPermit>>,
     logical_lifetime: Option<axum::Extension<crate::proxy::lifetime::LogicalRequestLifetime>>,
     headers: HeaderMap,
-    Json(req): Json<ChatRequest>,
+    Json(mut req): Json<ChatRequest>,
 ) -> Response {
+    state.redact_request(&headers, &mut req);
     let prequeue_permit = match prequeue_permit(&state, installed_prequeue_permit).await {
         Ok(permit) => permit,
         Err(error) => return error.into_response(),

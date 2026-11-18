@@ -54,6 +54,10 @@ pub const COST_UNKNOWN: &str = "llmshim_gateway_cost_unknown_total";
 /// `cache_write`). Input is the prompt total as reported; `reasoning` is inside `output` (note 0034).
 pub const TOKENS: &str = "llmshim_gateway_tokens_total";
 
+/// Requests in which a guardrail redaction rule rewrote text (counter, label: rule). The label is the
+/// operator's rule name, so its cardinality is bounded by the file (note 0044).
+pub const GUARDRAIL_REDACTIONS: &str = "llmshim_gateway_guardrail_redactions_total";
+
 /// Upper bounds (ms) for latency histograms — the Prometheus `le` buckets.
 const BUCKETS_MS: &[f64] = &[
     1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0,

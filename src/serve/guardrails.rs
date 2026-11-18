@@ -7,7 +7,7 @@
 
 use super::config::{Guardrail, GuardrailScope};
 use crate::gateway::http::RequestGuard;
-use regex::{RegexSet, RegexSetBuilder};
+use regex::{Regex, RegexSet, RegexSetBuilder};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -143,11 +143,22 @@ impl Direction {
     }
 }
 
+/// A redaction rule (note 0044): the patterns, compiled both as a set (to skip a text no pattern
+/// matches) and one by one (to replace), and what a match becomes.
+struct RedactRule {
+    name: String,
+    tenants: Option<BTreeSet<String>>,
+    any: RegexSet,
+    each: Vec<Regex>,
+    replacement: String,
+}
+
 /// The compiled rules, for requests and for responses.
 pub struct Guardrails {
     names: Vec<String>,
     request: Direction,
     response: Direction,
+    redactions: Vec<RedactRule>,
 }
 
 impl Guardrails {
@@ -163,15 +174,52 @@ impl Guardrails {
                 .filter(|(_, rule)| reads(rule.scope))
                 .collect()
         };
+        let mut redactions = Vec::new();
+        for rule in rules.iter().filter(|rule| !rule.redact_matches.is_empty()) {
+            let any = RegexSetBuilder::new(&rule.redact_matches)
+                .size_limit(SET_SIZE_LIMIT)
+                .build()
+                .map_err(|_| {
+                    format!(
+                        "redaction rule {} has patterns that do not compile",
+                        rule.name
+                    )
+                })?;
+            let each = rule
+                .redact_matches
+                .iter()
+                .map(|pattern| compile(pattern))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    format!(
+                        "redaction rule {} has a pattern that does not compile",
+                        rule.name
+                    )
+                })?;
+            redactions.push(RedactRule {
+                name: rule.name.clone(),
+                tenants: rule
+                    .tenants
+                    .as_ref()
+                    .map(|tenants| tenants.iter().cloned().collect()),
+                any,
+                each,
+                replacement: rule
+                    .replacement
+                    .clone()
+                    .unwrap_or_else(|| "[redacted]".to_owned()),
+            });
+        }
         Ok(Self {
             names,
             request: Direction::build(&reading(GuardrailScope::reads_request), "request")?,
             response: Direction::build(&reading(GuardrailScope::reads_response), "response")?,
+            redactions,
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.request.is_empty() && self.response.is_empty()
+        self.request.is_empty() && self.response.is_empty() && self.redactions.is_empty()
     }
 }
 
@@ -190,6 +238,57 @@ impl RequestGuard for Guardrails {
 
     fn reads_responses(&self, tenant: &str) -> bool {
         self.response.applies_to(tenant)
+    }
+
+    fn redact(&self, tenant: &str, value: &mut Value) -> Vec<String> {
+        let mut applied = Vec::new();
+        for rule in self
+            .redactions
+            .iter()
+            .filter(|rule| rule.tenants.as_ref().is_none_or(|set| set.contains(tenant)))
+        {
+            if redact_leaves(value, rule) {
+                applied.push(rule.name.clone());
+            }
+        }
+        applied
+    }
+}
+
+/// Keys whose strings are structure, not the message's text: never rewritten (a replaced id or tool
+/// name would break the request).
+const REDACT_SKIPPED: [&str; 5] = ["id", "type", "name", "role", "tool_call_id"];
+
+/// Replace every match of `rule` in the string leaves of `value`; whether anything changed.
+fn redact_leaves(value: &mut Value, rule: &RedactRule) -> bool {
+    match value {
+        Value::String(text) => {
+            if MEDIA_PREFIXES.iter().any(|prefix| text.starts_with(prefix))
+                || !rule.any.is_match(text)
+            {
+                return false;
+            }
+            let mut current = std::mem::take(text);
+            for pattern in &rule.each {
+                current = pattern
+                    .replace_all(&current, regex::NoExpand(&rule.replacement))
+                    .into_owned();
+            }
+            *text = current;
+            true
+        }
+        Value::Array(items) => {
+            // Every item is visited: this is not `any`, which would stop at the first change.
+            let mut changed = false;
+            for item in items {
+                changed |= redact_leaves(item, rule);
+            }
+            changed
+        }
+        Value::Object(map) => map.iter_mut().fold(false, |changed, (key, item)| {
+            (!REDACT_SKIPPED.contains(&key.as_str()) && redact_leaves(item, rule)) || changed
+        }),
+        _ => false,
     }
 }
 
@@ -466,6 +565,62 @@ mod tests {
             broad.first_response_match("platform", &response_view(&clean)),
             None
         );
+    }
+
+    #[test]
+    fn redaction_rewrites_message_text_and_never_structure() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"mask\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\", \"secret-[0-9]+\"]\nreplacement = \"[x]\"",
+        );
+        let mut content = json!([
+            {"type": "text", "text": "key AKIAABCDEFGHIJKLMNOP and secret-42 twice secret-7"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AKIAABCDEFGHIJKLMNOP"}},
+            {"type": "text", "text": "clean"}
+        ]);
+        assert_eq!(
+            guard.redact("platform", &mut content),
+            vec!["mask".to_string()]
+        );
+        assert_eq!(content[0]["text"], "key [x] and [x] twice [x]");
+        // An inline image is left alone, and so is a clean part.
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,AKIAABCDEFGHIJKLMNOP"
+        );
+        assert_eq!(content[2]["text"], "clean");
+        // Tool-call arguments are text, but the call's id, type and function name are structure.
+        let mut calls = json!([{"id": "secret-1", "type": "function", "function": {
+            "name": "secret-2", "arguments": "{\"k\":\"AKIAABCDEFGHIJKLMNOP\"}"}}]);
+        assert_eq!(
+            guard.redact("platform", &mut calls),
+            vec!["mask".to_string()]
+        );
+        assert_eq!(calls[0]["id"], "secret-1");
+        assert_eq!(calls[0]["function"]["name"], "secret-2");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"k\":\"[x]\"}");
+        // Nothing to redact: nothing reported.
+        let mut clean = json!("hello");
+        assert!(guard.redact("platform", &mut clean).is_empty());
+        // A replacement that looks like a regex group reference is inserted literally.
+        let literal = rules(
+            "[[guardrails]]\nname = \"m\"\nredact_matches = [\"(a)\"]\nreplacement = \"$1$1\"",
+        );
+        let mut text = json!("a");
+        literal.redact("platform", &mut text);
+        assert_eq!(text, "$1$1");
+    }
+
+    #[test]
+    fn a_redaction_rule_for_one_tenant_leaves_the_others_text_alone() {
+        let guard = rules(
+            "[[guardrails]]\nname = \"mask\"\ntenants = [\"platform\"]\nredact_matches = [\"hunter2\"]",
+        );
+        let mut mine = json!("pw hunter2");
+        let mut theirs = json!("pw hunter2");
+        assert_eq!(guard.redact("platform", &mut mine).len(), 1);
+        assert!(guard.redact("other", &mut theirs).is_empty());
+        assert_eq!(mine, "pw [redacted]");
+        assert_eq!(theirs, "pw hunter2");
     }
 
     #[test]

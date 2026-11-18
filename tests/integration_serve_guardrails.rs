@@ -352,3 +352,125 @@ async fn an_escaped_tool_call_argument_and_every_streaming_route_are_covered() {
         assert_eq!(refused.status(), 400, "{path}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redaction_rule_sends_the_provider_the_masked_text_not_the_secret() {
+    let mut up = mockito::Server::new_async().await;
+    // The provider must receive the replacement and never the secret.
+    let masked = up
+        .mock("POST", "/chat/completions")
+        .match_body(mockito::Matcher::Regex(r"my key is \[hidden\]".into()))
+        .with_header("content-type", "application/json")
+        .with_body(completion("pong"))
+        .expect(4)
+        .create_async()
+        .await;
+    let leaked = up
+        .mock("POST", "/chat/completions")
+        .match_body(mockito::Matcher::Regex("AKIA".into()))
+        .with_status(500)
+        .expect(0)
+        .create_async()
+        .await;
+    let rule = "[[guardrails]]\nname = \"mask-keys\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]\nreplacement = \"[hidden]\"";
+    let server = start(&config(&up.url(), rule, None), "guard-redact", &env());
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            json!({"model": "p/m", "messages": [{"role": "user", "content": SECRET}]}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "p/m", "messages": [{"role": "user", "content": [{"type": "text", "text": SECRET}]}]}),
+        ),
+        // The streaming route: the provider's answer is not a stream here, so only what it was
+        // sent is judged (the mock is matched on the masked text).
+        (
+            "/v1/chat/stream",
+            json!({"model": "p/m", "messages": [{"role": "user", "content": SECRET}]}),
+        ),
+        // A native facade: the Anthropic `system` becomes a message, and it is masked too.
+        (
+            "/v1/messages",
+            json!({"model": "p/m", "max_tokens": 5, "system": SECRET,
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+    ] {
+        let answer = post(&server.base, path, body).await;
+        let status = answer.status();
+        let text = answer.text().await.unwrap();
+        assert_eq!(status, 200, "{path}: {text}");
+    }
+    masked.assert_async().await;
+    leaked.assert_async().await;
+    let metrics = reqwest::Client::new()
+        .get(format!("{}/metrics", server.admin.clone().unwrap()))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("llmshim_gateway_guardrail_redactions_total{rule=\"mask-keys\"} 4"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redaction_and_blocking_compose_and_a_rule_cannot_do_both() {
+    // Redact first, then block what is left: the secret is masked, the other pattern still refuses.
+    let (up, mock) = chat_upstream(1).await;
+    let rules = "[[guardrails]]\nname = \"mask\"\nredact_matches = [\"AKIA[0-9A-Z]{16}\"]\n\
+                 [[guardrails]]\nname = \"no-pw\"\nblock_if_matches = [\"hunter2\"]";
+    let server = start(&config(&up.url(), rules, None), "guard-compose", &env());
+    let ok = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "messages": [{"role": "user", "content": SECRET}]}),
+    )
+    .await;
+    assert_eq!(ok.status(), 200);
+    let blocked = post(
+        &server.base,
+        "/v1/chat/completions",
+        json!({"model": "p/m", "messages": [{"role": "user", "content": "pw hunter2"}]}),
+    )
+    .await;
+    assert_eq!(blocked.status(), 400);
+    mock.assert_async().await;
+    // A rule that sets both is refused at start, by path.
+    let dir = tempdir::Dir::new("guard-both");
+    let path = dir.0.join("gateway.toml");
+    let both = config(
+        &up.url(),
+        "[[guardrails]]\nname = \"both\"\nblock_if_matches = [\"a\"]\nredact_matches = [\"b\"]\n\
+         [[guardrails]]\nname = \"resp\"\nscope = \"response\"\nredact_matches = [\"c\"]",
+        None,
+    )
+    .replace("{DIR}", dir.0.to_str().unwrap());
+    std::fs::write(&path, both).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_llmshim"))
+        .args([
+            "serve",
+            "--check",
+            "--structure-only",
+            "--config",
+            path.to_str().unwrap(),
+        ])
+        .env_clear()
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stderr).to_string()
+        + &String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("guardrails[0]") && text.contains("use two rules"),
+        "{text}"
+    );
+    assert!(
+        text.contains("guardrails[1].scope") && text.contains("request"),
+        "{text}"
+    );
+}
