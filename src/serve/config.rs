@@ -152,6 +152,28 @@ pub struct ServeConfig {
     /// snapshot file's content reloads like keys do.
     #[serde(default)]
     pub control_plane: Option<ControlPlane>,
+    /// Request guardrails (note 0040): rules that refuse a request whose text matches a pattern,
+    /// before anything is reserved, queued or sent. Fixed at start.
+    #[serde(default)]
+    pub guardrails: Vec<Guardrail>,
+}
+
+/// One guardrail rule (note 0040): a request whose text matches any of the patterns is refused
+/// with 400 `guardrail_blocked`, naming the rule. The pattern and the matched text are never
+/// echoed, logged or counted.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Guardrail {
+    /// Names the rule in the refusal and nowhere else is it exposed: lowercase letters, digits,
+    /// `-` and `_`. Unique.
+    pub name: String,
+    /// The tenants the rule applies to. Omit for every caller.
+    #[serde(default)]
+    pub tenants: Option<Vec<String>>,
+    /// Regular expressions (Rust `regex` syntax: linear-time, no look-around or back-references),
+    /// matched anywhere in any text of the request. 1 to 64, each at most 1024 characters.
+    pub block_if_matches: Vec<String>,
 }
 
 /// Where a replica pulls its snapshot from (0024, 0026): `GET {url}/v1/orgs/{org}/snapshot`.
@@ -1607,6 +1629,76 @@ impl ServeConfig {
         }
     }
 
+    /// The guardrail rules (note 0040): names, counts, and that every pattern compiles within the
+    /// engine's size limit. A pattern is never echoed in an issue.
+    fn validate_guardrails(&self, issues: &mut Vec<Issue>) {
+        let before = issues.len();
+        self.validate_guardrail_rules(issues);
+        // The rules compile together as they will at start (one set per scope shares a size
+        // budget), so a combination that does not fit is refused here, not when serving begins.
+        if issues.len() == before && !self.guardrails.is_empty() {
+            if let Err(message) = super::guardrails::Guardrails::build(&self.guardrails) {
+                issues.push(Issue::new("guardrails", message));
+            }
+        }
+    }
+
+    fn validate_guardrail_rules(&self, issues: &mut Vec<Issue>) {
+        let mut seen = std::collections::BTreeSet::new();
+        if self.guardrails.len() > 64 {
+            issues.push(Issue::new("guardrails", "has more than 64 rules"));
+        }
+        for (index, rule) in self.guardrails.iter().enumerate() {
+            let at = format!("guardrails[{index}]");
+            if !valid_name(&rule.name) {
+                issues.push(Issue::new(
+                    format!("{at}.name"),
+                    "must be lowercase letters, digits, `-` and `_`",
+                ));
+            } else if !seen.insert(rule.name.as_str()) {
+                issues.push(Issue::new(format!("{at}.name"), "is used by another rule"));
+            }
+            if let Some(tenants) = &rule.tenants {
+                if tenants.is_empty() || tenants.len() > 64 {
+                    issues.push(Issue::new(
+                        format!("{at}.tenants"),
+                        "must list 1 to 64 tenants; omit it for every caller",
+                    ));
+                }
+                // With a control plane the keys, and so the tenants, come from the signed snapshot
+                // after the file is read: they cannot be checked here (note 0040).
+                for (n, tenant) in tenants.iter().enumerate() {
+                    if self.control_plane.is_none()
+                        && !self.keys.iter().any(|key| &key.tenant == tenant)
+                        && !self.tenants.contains_key(tenant)
+                    {
+                        issues.push(Issue::new(
+                            format!("{at}.tenants[{n}]"),
+                            "is not the tenant of any key",
+                        ));
+                    }
+                }
+            }
+            if rule.block_if_matches.is_empty() || rule.block_if_matches.len() > 64 {
+                issues.push(Issue::new(
+                    format!("{at}.block_if_matches"),
+                    "must hold 1 to 64 patterns",
+                ));
+            }
+            for (n, pattern) in rule.block_if_matches.iter().enumerate() {
+                let at_n = format!("{at}.block_if_matches[{n}]");
+                if pattern.is_empty() || pattern.chars().count() > 1024 {
+                    issues.push(Issue::new(at_n, "must be 1 to 1024 characters"));
+                } else if super::guardrails::compile(pattern).is_err() {
+                    issues.push(Issue::new(
+                        at_n,
+                        "is not a valid regular expression, or is too large to compile",
+                    ));
+                }
+            }
+        }
+    }
+
     fn validate(&self) -> Vec<Issue> {
         let mut issues = Vec::new();
         if self.version != VERSION {
@@ -1623,6 +1715,7 @@ impl ServeConfig {
         self.validate_server(&mut issues);
         self.validate_admin(&mut issues);
         self.validate_reload(&mut issues);
+        self.validate_guardrails(&mut issues);
         if let Some(fleet) = &self.fleet {
             validate_secret(&fleet.redis_url, "fleet.redis_url", &mut issues);
             if let Some(outage) = &fleet.outage_admission {
@@ -3853,10 +3946,11 @@ mod tests {
             "control_plane",
             "tenants",
             "deployments",
+            "guardrails",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 17, "a new table needs a line here");
+        assert_eq!(properties.len(), 18, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
     }
 

@@ -408,6 +408,19 @@ pub async fn build_app(
         },
     };
 
+    // Guardrails (note 0040): compiled once, here; a change in the file is refused by a reload.
+    if !config.guardrails.is_empty() {
+        match super::guardrails::Guardrails::build(&config.guardrails) {
+            Ok(guard) => state.set_guardrails(Arc::new(guard)),
+            Err(message) => {
+                return Err(vec![Issue {
+                    path: "guardrails".into(),
+                    message,
+                }])
+            }
+        }
+    }
+
     let admin_authenticated = admin_token.is_some();
     let admin_state = state.clone();
     let allow = super::allowlist::AllowTable::new(super::keys::allowlists(config, env));

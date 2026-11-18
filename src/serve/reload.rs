@@ -1752,4 +1752,17 @@ mod tests {
         assert_eq!(Arc::as_ptr(&fixture.router.current()), before);
         assert_eq!(fixture.reloader.status().router_generation, 0);
     }
+
+    #[test]
+    fn guardrails_are_a_fixed_section_so_a_reload_that_changes_them_is_refused() {
+        // Guardrails are compiled once at start (note 0040): they are not among the sections a
+        // reload replaces, so a file that differs only in them is a change outside the keys,
+        // providers, routes and limits, which a reload refuses by path.
+        let base = "version = 1\n[providers.p]\nkind = \"openai-compatible\"\nbase_url = \"https://x.example.com/v1\"\n";
+        let with = format!("{base}[[guardrails]]\nname = \"r\"\nblock_if_matches = [\"x\"]\n");
+        assert_ne!(
+            document_without_reloadable(base, Format::Toml).unwrap(),
+            document_without_reloadable(&with, Format::Toml).unwrap()
+        );
+    }
 }
