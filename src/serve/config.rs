@@ -175,6 +175,8 @@ pub enum MediaStoreKind {
     S3,
     /// Google Cloud Storage, over its JSON API.
     Gcs,
+    /// Azure Blob Storage, over its REST API.
+    AzureBlob,
 }
 
 /// Where an object store's credentials come from (note 0050): `keys` and `aws` for `s3`, `metadata`,
@@ -195,6 +197,15 @@ pub enum MediaCredentials {
     ServiceAccount,
     /// `gcs`: no authentication, for an emulator or a private endpoint (an `endpoint` is required).
     None,
+    /// `azure-blob`: a SAS token for the container (`sas_token`).
+    Sas,
+    /// `azure-blob`: the storage account's key (`account_key`), Shared Key signing.
+    AccountKey,
+    /// `azure-blob`: Azure AD Workload Identity (AKS): `tenant_id`, `client_id` and the projected
+    /// `federated_token_file`.
+    WorkloadIdentity,
+    /// `azure-blob`: a managed identity, through the instance metadata service.
+    ManagedIdentity,
 }
 
 /// The object store for the media routes of a fleet (note 0050). Objects are sealed (AES-256-GCM, a
@@ -237,6 +248,38 @@ pub struct MediaStore {
     /// `service-account` or `none`, required.
     #[serde(default)]
     pub credentials: Option<MediaCredentials>,
+    /// `azure-blob`: the storage account's name.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// `azure-blob`: the container (it must exist).
+    #[serde(default)]
+    pub container: Option<String>,
+    /// `azure-blob` with `credentials = "sas"`: a SAS token for the container with read, write, delete
+    /// and list, by secret reference (the query string, without the leading `?`).
+    #[serde(default)]
+    pub sas_token: Option<SecretRef>,
+    /// `azure-blob` with `credentials = "account-key"`: the account key (base64), by secret reference.
+    #[serde(default)]
+    pub account_key: Option<SecretRef>,
+    /// `azure-blob` with `credentials = "workload-identity"`: the Entra tenant.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// `azure-blob`: the application (client) id of the workload identity, or of a user-assigned
+    /// managed identity.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// `azure-blob` with `credentials = "workload-identity"`: the service account token the kubelet
+    /// projects (`AZURE_FEDERATED_TOKEN_FILE`), absolute.
+    #[serde(default)]
+    pub federated_token_file: Option<PathBuf>,
+    /// `azure-blob` with `credentials = "workload-identity"`: the Entra authority, for a sovereign cloud
+    /// (default `https://login.microsoftonline.com`).
+    #[serde(default)]
+    pub authority_host: Option<String>,
+    /// `azure-blob` with `credentials = "managed-identity"`: the instance metadata service's origin
+    /// (default `http://169.254.169.254`).
+    #[serde(default)]
+    pub identity_endpoint: Option<String>,
     /// `gcs` with `credentials = "service-account"`: the key file (JSON), absolute. Re-read at each token
     /// fetch, so a rotated key needs no restart.
     #[serde(default)]
@@ -1880,6 +1923,15 @@ impl ServeConfig {
             ("credentials", store.credentials.is_some()),
             ("service_account_file", store.service_account_file.is_some()),
             ("metadata_endpoint", store.metadata_endpoint.is_some()),
+            ("account", store.account.is_some()),
+            ("container", store.container.is_some()),
+            ("sas_token", store.sas_token.is_some()),
+            ("account_key", store.account_key.is_some()),
+            ("tenant_id", store.tenant_id.is_some()),
+            ("client_id", store.client_id.is_some()),
+            ("federated_token_file", store.federated_token_file.is_some()),
+            ("authority_host", store.authority_host.is_some()),
+            ("identity_endpoint", store.identity_endpoint.is_some()),
         ];
         match store.kind {
             MediaStoreKind::File => {
@@ -1964,19 +2016,52 @@ impl ServeConfig {
                 } else if store.allow_insecure_http {
                     bad("allow_insecure_http", "needs an endpoint", issues);
                 }
-                for (field, set) in [
-                    ("service_account_file", store.service_account_file.is_some()),
-                    ("metadata_endpoint", store.metadata_endpoint.is_some()),
+                for (field, set, kind) in [
+                    (
+                        "service_account_file",
+                        store.service_account_file.is_some(),
+                        "gcs",
+                    ),
+                    (
+                        "metadata_endpoint",
+                        store.metadata_endpoint.is_some(),
+                        "gcs",
+                    ),
+                    ("account", store.account.is_some(), "azure-blob"),
+                    ("container", store.container.is_some(), "azure-blob"),
+                    ("sas_token", store.sas_token.is_some(), "azure-blob"),
+                    ("account_key", store.account_key.is_some(), "azure-blob"),
+                    ("tenant_id", store.tenant_id.is_some(), "azure-blob"),
+                    ("client_id", store.client_id.is_some(), "azure-blob"),
+                    (
+                        "federated_token_file",
+                        store.federated_token_file.is_some(),
+                        "azure-blob",
+                    ),
+                    (
+                        "authority_host",
+                        store.authority_host.is_some(),
+                        "azure-blob",
+                    ),
+                    (
+                        "identity_endpoint",
+                        store.identity_endpoint.is_some(),
+                        "azure-blob",
+                    ),
                 ] {
                     if set {
-                        bad(field, "belongs to kind = \"gcs\"", issues);
+                        bad(field, &format!("belongs to kind = \"{kind}\""), issues);
                     }
                 }
                 match store.credentials.unwrap_or(MediaCredentials::Keys) {
                     MediaCredentials::Metadata
                     | MediaCredentials::ServiceAccount
-                    | MediaCredentials::None => {
-                        bad("credentials", "belongs to kind = \"gcs\"", issues);
+                    | MediaCredentials::None
+                    | MediaCredentials::Sas
+                    | MediaCredentials::AccountKey
+                    | MediaCredentials::WorkloadIdentity
+                    | MediaCredentials::ManagedIdentity => {
+                        bad("credentials", "does not belong to kind = \"s3\"", issues);
                     }
                     MediaCredentials::Keys => {
                         for (field, secret) in [
@@ -2015,6 +2100,242 @@ impl ServeConfig {
                 }
             }
             MediaStoreKind::Gcs => self.validate_gcs_store(store, issues),
+            MediaStoreKind::AzureBlob => self.validate_azure_store(store, issues),
+        }
+    }
+
+    /// `[media_store]` of kind `azure-blob` (note 0050, slice 3c).
+    fn validate_azure_store(&self, store: &MediaStore, issues: &mut Vec<Issue>) {
+        let at = "media_store";
+        let bad = |field: &str, message: &str, issues: &mut Vec<Issue>| {
+            issues.push(Issue::new(format!("{at}.{field}"), message.to_owned()));
+        };
+        for (field, set) in [
+            ("path", store.path.is_some()),
+            ("bucket", store.bucket.is_some()),
+            ("region", store.region.is_some()),
+            ("path_style", store.path_style.is_some()),
+            ("access_key_id", store.access_key_id.is_some()),
+            ("secret_access_key", store.secret_access_key.is_some()),
+            ("session_token", store.session_token.is_some()),
+            ("service_account_file", store.service_account_file.is_some()),
+            ("metadata_endpoint", store.metadata_endpoint.is_some()),
+        ] {
+            if set {
+                bad(field, "does not belong to kind = \"azure-blob\"", issues);
+            }
+        }
+        // Azure's rules: an account is 3 to 24 lowercase letters and digits; a container 3 to 63 of
+        // lowercase letters, digits and single hyphens, starting and ending with a letter or digit.
+        match store.account.as_deref() {
+            Some(name)
+                if (3..=24).contains(&name.len())
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) => {}
+            Some(_) => bad(
+                "account",
+                "must be 3 to 24 lowercase letters and digits",
+                issues,
+            ),
+            None => bad("account", "is required for kind = \"azure-blob\"", issues),
+        }
+        let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+        match store.container.as_deref() {
+            Some(name)
+                if (3..=63).contains(&name.len())
+                    && name.bytes().all(|b| alnum(b) || b == b'-')
+                    && name.bytes().next().is_some_and(alnum)
+                    && name.bytes().last().is_some_and(alnum)
+                    && !name.contains("--") => {}
+            Some(_) => bad(
+                "container",
+                "must be 3 to 63 lowercase letters, digits and single hyphens, starting and ending with a letter or digit",
+                issues,
+            ),
+            None => bad("container", "is required for kind = \"azure-blob\"", issues),
+        }
+        if let Some(prefix) = &store.prefix {
+            let ok = prefix.is_empty()
+                || (prefix.len() <= 128
+                    && prefix.ends_with('/')
+                    && !prefix.starts_with('/')
+                    && super::blobstore::valid_name(&format!("{prefix}x")));
+            if !ok {
+                bad(
+                    "prefix",
+                    "must be empty or at most 128 of `A-Za-z0-9._-/`, ending in `/`, not starting with `/`",
+                    issues,
+                );
+            }
+        }
+        if let Some(endpoint) = &store.endpoint {
+            // An emulator's address carries the account in its path, so a path is allowed here.
+            let secure = endpoint.starts_with("https://");
+            let plain = endpoint.starts_with("http://");
+            if !secure && !(plain && store.allow_insecure_http) {
+                bad(
+                    "endpoint",
+                    if plain {
+                        "is plain http: use https, or set allow_insecure_http"
+                    } else {
+                        "must start with https:// (or http:// with allow_insecure_http)"
+                    },
+                    issues,
+                );
+            } else if let Err(problem) = validate_base_url(endpoint) {
+                bad("endpoint", problem, issues);
+            }
+        } else if store.allow_insecure_http {
+            bad("allow_insecure_http", "needs an endpoint", issues);
+        }
+        if store.ca_file.as_ref().is_some_and(|p| !p.has_root()) {
+            bad("ca_file", "must be an absolute path", issues);
+        }
+        let Some(credentials) = store.credentials else {
+            bad(
+                "credentials",
+                "is required for kind = \"azure-blob\": sas, account-key, workload-identity or managed-identity",
+                issues,
+            );
+            return;
+        };
+        let required = |field: &str, set: bool, issues: &mut Vec<Issue>| {
+            if !set {
+                bad(
+                    field,
+                    &format!(
+                        "is required for credentials = \"{}\"",
+                        match credentials {
+                            MediaCredentials::Sas => "sas",
+                            MediaCredentials::AccountKey => "account-key",
+                            MediaCredentials::WorkloadIdentity => "workload-identity",
+                            _ => "managed-identity",
+                        }
+                    ),
+                    issues,
+                );
+            }
+        };
+        // Which of this kind's credential settings each mode takes.
+        let takes = |field: &str| {
+            matches!(
+                (credentials, field),
+                (MediaCredentials::Sas, "sas_token")
+                    | (MediaCredentials::AccountKey, "account_key")
+                    | (
+                        MediaCredentials::WorkloadIdentity,
+                        "tenant_id" | "client_id" | "federated_token_file" | "authority_host"
+                    )
+                    | (
+                        MediaCredentials::ManagedIdentity,
+                        "client_id" | "identity_endpoint"
+                    )
+            )
+        };
+        match credentials {
+            MediaCredentials::Sas
+            | MediaCredentials::AccountKey
+            | MediaCredentials::WorkloadIdentity
+            | MediaCredentials::ManagedIdentity => {}
+            _ => {
+                bad(
+                    "credentials",
+                    "does not belong to kind = \"azure-blob\"",
+                    issues,
+                );
+                return;
+            }
+        }
+        for (field, set) in [
+            ("sas_token", store.sas_token.is_some()),
+            ("account_key", store.account_key.is_some()),
+            ("tenant_id", store.tenant_id.is_some()),
+            ("client_id", store.client_id.is_some()),
+            ("federated_token_file", store.federated_token_file.is_some()),
+            ("authority_host", store.authority_host.is_some()),
+            ("identity_endpoint", store.identity_endpoint.is_some()),
+        ] {
+            if set && !takes(field) {
+                bad(field, "does not belong to this credentials mode", issues);
+            }
+        }
+        match credentials {
+            MediaCredentials::Sas => {
+                required("sas_token", store.sas_token.is_some(), issues);
+                if let Some(secret) = &store.sas_token {
+                    validate_secret(secret, &format!("{at}.sas_token"), issues);
+                }
+            }
+            MediaCredentials::AccountKey => {
+                required("account_key", store.account_key.is_some(), issues);
+                if let Some(secret) = &store.account_key {
+                    validate_secret(secret, &format!("{at}.account_key"), issues);
+                }
+            }
+            MediaCredentials::WorkloadIdentity => {
+                required("tenant_id", store.tenant_id.is_some(), issues);
+                required("client_id", store.client_id.is_some(), issues);
+                required(
+                    "federated_token_file",
+                    store.federated_token_file.is_some(),
+                    issues,
+                );
+                if store
+                    .federated_token_file
+                    .as_ref()
+                    .is_some_and(|p| !p.has_root())
+                {
+                    bad("federated_token_file", "must be an absolute path", issues);
+                }
+                for (field, value) in [
+                    ("tenant_id", &store.tenant_id),
+                    ("client_id", &store.client_id),
+                ] {
+                    if value.as_ref().is_some_and(|v| {
+                        v.is_empty()
+                            || v.len() > 128
+                            || !v
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+                    }) {
+                        bad(
+                            field,
+                            "must be a tenant or application id or a domain name",
+                            issues,
+                        );
+                    }
+                }
+                if let Some(authority) = &store.authority_host {
+                    if let Err(problem) = validate_base_url(authority) {
+                        bad("authority_host", problem, issues);
+                    } else if !authority.starts_with("https://")
+                        && !(authority.starts_with("http://") && authority.contains("127.0.0.1"))
+                    {
+                        bad(
+                            "authority_host",
+                            "must be https (http only to a loopback address)",
+                            issues,
+                        );
+                    }
+                }
+            }
+            MediaCredentials::ManagedIdentity => {
+                if let Some(endpoint) = &store.identity_endpoint {
+                    // The instance metadata service is plain http by design.
+                    if let Err(problem) = validate_base_url(endpoint) {
+                        bad("identity_endpoint", problem, issues);
+                    }
+                }
+                if store.client_id.as_ref().is_some_and(|v| {
+                    v.is_empty()
+                        || v.len() > 128
+                        || !v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                }) {
+                    bad("client_id", "must be an application (client) id", issues);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2031,6 +2352,15 @@ impl ServeConfig {
             ("access_key_id", store.access_key_id.is_some()),
             ("secret_access_key", store.secret_access_key.is_some()),
             ("session_token", store.session_token.is_some()),
+            ("account", store.account.is_some()),
+            ("container", store.container.is_some()),
+            ("sas_token", store.sas_token.is_some()),
+            ("account_key", store.account_key.is_some()),
+            ("tenant_id", store.tenant_id.is_some()),
+            ("client_id", store.client_id.is_some()),
+            ("federated_token_file", store.federated_token_file.is_some()),
+            ("authority_host", store.authority_host.is_some()),
+            ("identity_endpoint", store.identity_endpoint.is_some()),
         ] {
             if set {
                 bad(field, "does not belong to kind = \"gcs\"", issues);
@@ -2086,8 +2416,13 @@ impl ServeConfig {
             return;
         };
         match credentials {
-            MediaCredentials::Keys | MediaCredentials::Aws => {
-                bad("credentials", "belongs to kind = \"s3\"", issues);
+            MediaCredentials::Keys
+            | MediaCredentials::Aws
+            | MediaCredentials::Sas
+            | MediaCredentials::AccountKey
+            | MediaCredentials::WorkloadIdentity
+            | MediaCredentials::ManagedIdentity => {
+                bad("credentials", "does not belong to kind = \"gcs\"", issues);
             }
             MediaCredentials::Metadata => {
                 if store.service_account_file.is_some() {
@@ -3688,6 +4023,8 @@ impl ServeConfig {
                 ("media_store.access_key_id", &store.access_key_id),
                 ("media_store.secret_access_key", &store.secret_access_key),
                 ("media_store.session_token", &store.session_token),
+                ("media_store.sas_token", &store.sas_token),
+                ("media_store.account_key", &store.account_key),
             ]
             .into_iter()
             .filter_map(|(at, secret)| secret.as_ref().map(|secret| (at.to_string(), secret)))
@@ -4982,6 +5319,123 @@ mod tests {
             other("credentials = \"metadata\"\n"),
             ["media_store.credentials"]
         );
+    }
+
+    #[test]
+    fn azure_media_store_settings_are_validated_by_path() {
+        let file = |extra: &str| {
+            format!("{MINIMAL}\n[media_store]\nkind = \"azure-blob\"\naccount = \"llmshimstore\"\ncontainer = \"media\"\n{extra}")
+        };
+        let paths = |extra: &str| -> Vec<String> {
+            ServeConfig::parse(&file(extra), Format::Toml)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|issue| issue.path)
+                .collect()
+        };
+        const WI: &str = "credentials = \"workload-identity\"\ntenant_id = \"11111111-2222-3333-4444-555555555555\"\nclient_id = \"66666666-7777-8888-9999-000000000000\"\nfederated_token_file = \"/var/run/secrets/azure/tokens/azure-identity-token\"\n";
+        for ok in [
+            WI,
+            "credentials = \"sas\"\nsas_token = { file = \"/run/secrets/sas\" }\n",
+            "credentials = \"account-key\"\naccount_key = { env = \"AZ_KEY\" }\n",
+            "credentials = \"managed-identity\"\n",
+            "credentials = \"managed-identity\"\nclient_id = \"66666666-7777-8888-9999-000000000000\"\n",
+            "credentials = \"account-key\"\naccount_key = { env = \"AZ_KEY\" }\nendpoint = \"http://127.0.0.1:10000/devstoreaccount1\"\nallow_insecure_http = true\n",
+            "credentials = \"account-key\"\naccount_key = { env = \"AZ_KEY\" }\nendpoint = \"https://llmshimstore.blob.core.chinacloudapi.cn\"\n",
+        ] {
+            let parsed = ServeConfig::parse(&file(ok), Format::Toml);
+            assert!(parsed.is_ok(), "{ok}: {:?}", parsed.err());
+        }
+        // Credentials are required, and are azure's four.
+        assert_eq!(paths(""), ["media_store.credentials"]);
+        assert_eq!(
+            paths("credentials = \"aws\"\n"),
+            ["media_store.credentials"]
+        );
+        assert_eq!(
+            paths("credentials = \"metadata\"\n"),
+            ["media_store.credentials"]
+        );
+        // Each mode needs its own settings and refuses the others'.
+        assert_eq!(paths("credentials = \"sas\"\n"), ["media_store.sas_token"]);
+        assert_eq!(
+            paths("credentials = \"account-key\"\n"),
+            ["media_store.account_key"]
+        );
+        assert_eq!(
+            paths("credentials = \"workload-identity\"\n"),
+            [
+                "media_store.tenant_id",
+                "media_store.client_id",
+                "media_store.federated_token_file"
+            ]
+        );
+        assert_eq!(
+            paths("credentials = \"sas\"\nsas_token = { env = \"S\" }\naccount_key = { env = \"K\" }\n"),
+            ["media_store.account_key"]
+        );
+        assert_eq!(
+            paths(&format!("{WI}sas_token = {{ env = \"S\" }}\n")),
+            ["media_store.sas_token"]
+        );
+        assert_eq!(
+            paths("credentials = \"managed-identity\"\ntenant_id = \"t\"\n"),
+            ["media_store.tenant_id"]
+        );
+        // The token file is absolute; the authority is https (or loopback http).
+        assert_eq!(
+            paths(&WI.replace("/var/run", "var/run")),
+            ["media_store.federated_token_file"]
+        );
+        assert_eq!(
+            paths(&format!("{WI}authority_host = \"http://login.example\"\n")),
+            ["media_store.authority_host"]
+        );
+        // Names follow Azure's rules; the other kinds' settings do not belong.
+        for (account, container) in [
+            ("AB", "media"),
+            ("has-dash", "media"),
+            ("ok1", "Media"),
+            ("ok1", "a--b"),
+            ("ok1", "-ab"),
+            ("ok1", "ab"),
+        ] {
+            let text = format!("{MINIMAL}\n[media_store]\nkind = \"azure-blob\"\naccount = \"{account}\"\ncontainer = \"{container}\"\ncredentials = \"managed-identity\"\n");
+            assert!(
+                ServeConfig::parse(&text, Format::Toml).is_err(),
+                "{account}/{container}"
+            );
+        }
+        assert_eq!(
+            paths("credentials = \"managed-identity\"\nbucket = \"x\"\n"),
+            ["media_store.bucket"]
+        );
+        assert_eq!(
+            paths("credentials = \"managed-identity\"\nregion = \"us-east-1\"\n"),
+            ["media_store.region"]
+        );
+        assert_eq!(
+            paths("credentials = \"managed-identity\"\nendpoint = \"http://x:1\"\n"),
+            ["media_store.endpoint"]
+        );
+        // And azure's settings do not belong to the other kinds.
+        let s3 = "kind = \"s3\"\nbucket = \"media-bucket\"\nregion = \"us-east-1\"\naccess_key_id = { env = \"K\" }\nsecret_access_key = { env = \"S\" }\n";
+        for (extra, at) in [
+            ("account = \"x\"\n", "media_store.account"),
+            ("container = \"x\"\n", "media_store.container"),
+            ("sas_token = { env = \"S\" }\n", "media_store.sas_token"),
+            ("tenant_id = \"t\"\n", "media_store.tenant_id"),
+            ("credentials = \"sas\"\n", "media_store.credentials"),
+        ] {
+            let issues = ServeConfig::parse(
+                &format!("{MINIMAL}\n[media_store]\n{s3}{extra}"),
+                Format::Toml,
+            )
+            .err()
+            .unwrap_or_default();
+            assert!(issues.iter().any(|i| i.path == at), "{extra}: {issues:?}");
+        }
     }
 
     #[test]

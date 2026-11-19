@@ -1,7 +1,7 @@
 # 0050: Media through a fleet, over an object store
 
-Status: slice 1 (the store), slice 2 (the fleet routes), slice 3a (the AWS credential chain) and slice 3b (Google Cloud
-Storage) built; slices 3c and 3d (Azure Blob, the Helm examples) are described and not built. Written on the owner's instruction to
+Status: slice 1 (the store), slice 2 (the fleet routes), slices 3a (the AWS credential chain), 3b (Google Cloud Storage)
+and 3c (Azure Blob Storage) built; slice 3d (the Helm examples) is described and not built. Written on the owner's instruction to
 start it, with the requirement that it plug into Kubernetes and the native cloud services, not one of them.
 
 ## The problem
@@ -24,7 +24,7 @@ so the bucket (and its credentials, lifecycle and access logs) never sees a call
 
 ```toml
 [media_store]
-kind = "file"                      # file | s3 | gcs  (slice 3c: azure-blob)
+kind = "file"                      # file | s3 | gcs | azure-blob
 max_object_bytes = 67108864        # 64 MiB per object, up to 256 MiB
 ttl_secs = 3600                    # an object older than this is an orphan: the sweeper deletes it
 # kind = "file"
@@ -119,8 +119,7 @@ it cannot change in a running process.
 3. **Cloud identities and native backends**, in four parts:
    - **3a. The AWS credential chain (built).** `credentials = "aws"` on an `s3` store. See below.
    - **3b. Google Cloud Storage**, native (`kind = "gcs"`) (built). See below.
-   - **3c. Azure Blob Storage** (`kind = "azure-blob"`): the Blob REST API with a SAS token, an account key, or an
-     Entra token (workload identity, managed identity). Not built.
+   - **3c. Azure Blob Storage** (`kind = "azure-blob"`) (built). See below.
    - **3d. The Helm chart's examples:** a shared `ReadWriteMany` claim for `file`, a service account annotated for
      IRSA / Workload Identity / Azure Workload Identity, and the media store settings. Not built.
 
@@ -213,6 +212,54 @@ every backend, so the bucket holds ciphertext.
   example `roles/storage.objectUser` plus list, scoped to the bucket. Add a lifecycle rule that deletes the prefix's
   objects after a day as the backstop.
 
+## Slice 3c: Azure Blob Storage
+
+```toml
+[media_store]
+kind = "azure-blob"
+account = "llmshimstore"
+container = "media"                 # must exist
+prefix = "llmshim/"
+credentials = "workload-identity"   # workload-identity | managed-identity | sas | account-key (required)
+tenant_id = "11111111-2222-3333-4444-555555555555"
+client_id = "66666666-7777-8888-9999-000000000000"
+federated_token_file = "/var/run/secrets/azure/tokens/azure-identity-token"
+# credentials = "managed-identity"   # client_id optional (a user-assigned identity)
+# credentials = "sas"                # sas_token = { file = "/run/secrets/media/sas" }
+# credentials = "account-key"        # account_key = { file = "/run/secrets/media/key" }
+# endpoint = "http://127.0.0.1:10000/devstoreaccount1"   # an emulator, a sovereign cloud, a private endpoint
+# allow_insecure_http = true         # for an http endpoint
+```
+
+Four plain HTTP calls on the Blob REST API (`PUT` with `x-ms-blob-type: BlockBlob`, `GET`, `DELETE` with
+`x-ms-delete-snapshots: include`, and `List Blobs` by `marker` for the sweeper), `x-ms-version: 2021-12-02`, no SDK and no
+new dependency, in every `serve` binary. Blob names keep their slashes (virtual directories). The endpoint defaults to
+`https://<account>.blob.core.windows.net`; an emulator's carries the account in its path, so a path is allowed here.
+
+- **`workload-identity`: AKS Azure AD Workload Identity.** The kubelet projects a service account token
+  (`federated_token_file`); the gateway trades it at the Entra token endpoint
+  (`<authority>/<tenant>/oauth2/v2.0/token`, a `client_credentials` grant with the token as a JWT-bearer
+  `client_assertion`, scope `https://storage.azure.com/.default`) for a bearer token. The pod's service account is the Azure
+  identity (the `azure.workload.identity/client-id` annotation and a federated credential on the managed identity); no
+  key or secret is stored. The token file must exist at start and is read again at each fetch (the projected token
+  rotates). `authority_host` selects a sovereign cloud; it must be https (or loopback http).
+- **`managed-identity`:** the instance metadata service (`/metadata/identity/oauth2/token`, header `Metadata: true`,
+  resource `https://storage.azure.com/`; `client_id` selects a user-assigned identity; `identity_endpoint` overrides
+  `http://169.254.169.254`). The metadata service returns the lifetime as a string and Entra as a number; both are read.
+  App Service and Container Apps use a different endpoint and header and are **not built**.
+- **`sas`:** a container SAS token (read, write, delete, list) by secret reference, without the leading `?`; its own
+  escapes survive (decoded once, encoded once) and it rides every request. It is read at each request, so a rotated file
+  needs no restart; an expired SAS is `Denied`.
+- **`account-key`:** the account key (base64) by secret reference; requests are **Shared Key signed** (HMAC-SHA256 with
+  `ring`; the string to sign is pinned by a test against an independently computed signature, and **Azurite verifies
+  it**). A key is an all-powerful, long-lived secret: prefer `workload-identity`.
+- **Tokens** are held, renewed and refused exactly as for GCS and the AWS chain (one fetch at a time, a failure remembered
+  five seconds, a refusal refetches only the token refused and not within five seconds, a 401 or 403 is tried once more).
+  Entra rejecting the identity is `Denied`; a metadata service or Entra that does not answer is `Unavailable`.
+- IAM: the identity needs `Storage Blob Data Contributor` on the container (it lists, writes, reads and deletes).
+  Add a lifecycle management rule that deletes the prefix's blobs after a day as the backstop, and note that with blob
+  **versioning** or **soft delete** on, deleted blobs persist (sealed) until those retention windows end.
+
 ## What the sweeper may delete
 
 Only objects with the **generated shape**, `<8 digits>/<32 lowercase hex>` under the backend's prefix or directory,
@@ -284,6 +331,20 @@ error, not a short list; one longer than ten million objects is not swept.
 - Deduplication, caching or reuse across requests; an object belongs to one request.
 
 ## Tests
+
+Slice 3c (`serve::blobstore::azure::tests`): the Shared Key string to sign has the documented layout (two signatures
+computed independently over the hand-spelled string: a PUT with a body and `x-ms-*` headers, and a listing with sorted
+query parameters); a SAS rides every request with its escapes intact and no `Authorization` header; each failure
+class, a 5xx retried, a 401 or 403 tried once more; a marker-paged listing (names, RFC 1123 dates, an empty
+`<NextMarker />`); workload identity (the form carries the client id, scope, assertion from the file and grant type; the
+bearer is kept across calls; Entra rejecting is `Denied`); a managed identity (the query, `Metadata: true`, a string
+lifetime); bad secrets and settings fail at start without echoing a value; both lifetime forms and a clamp; percent
+decoding. Against a real implementation, **Azurite** (`#[ignore]`d
+`a_real_azure_storage_emulator_verifies_the_shared_key_and_stores_lists_and_sweeps`, run by the pinned-image CI job
+`serve-azure-check`): the Shared Key signature verified by the server, a 3 MB sealed round trip, externalize and
+internalize, delete, a prefixed listing, the sweeper, and a wrong key refused. Not covered: real Entra and the metadata
+service (no tenant to test against; the token requests follow Microsoft's documents and are exercised against mocks of
+them), SAS against the emulator (its signing is the portal's or the SDK's, not ours), and sovereign clouds.
 
 Slice 3b (`serve::blobstore::gcs::tests`, `tokens::tests`): the four calls' paths, queries and bodies, the object name as
 one `%2F` segment; each failure class, a 5xx retried, a 401 tried once more; a paged listing with the page token

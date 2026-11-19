@@ -720,6 +720,26 @@
           "const": "none",
           "description": "`gcs`: no authentication, for an emulator or a private endpoint (an `endpoint` is required).",
           "type": "string"
+        },
+        {
+          "const": "sas",
+          "description": "`azure-blob`: a SAS token for the container (`sas_token`).",
+          "type": "string"
+        },
+        {
+          "const": "account-key",
+          "description": "`azure-blob`: the storage account's key (`account_key`), Shared Key signing.",
+          "type": "string"
+        },
+        {
+          "const": "workload-identity",
+          "description": "`azure-blob`: Azure AD Workload Identity (AKS): `tenant_id`, `client_id` and the projected\n`federated_token_file`.",
+          "type": "string"
+        },
+        {
+          "const": "managed-identity",
+          "description": "`azure-blob`: a managed identity, through the instance metadata service.",
+          "type": "string"
         }
       ]
     },
@@ -738,10 +758,37 @@
           ],
           "description": "`s3` with `credentials = \"keys\"`: the access key id, by secret reference."
         },
+        "account": {
+          "default": null,
+          "description": "`azure-blob`: the storage account's name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "account_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`azure-blob` with `credentials = \"account-key\"`: the account key (base64), by secret reference."
+        },
         "allow_insecure_http": {
           "default": false,
           "description": "`s3`: allow a plain `http://` endpoint. Objects are sealed, but the credentials' signatures\nand the object names still cross the network unprotected.",
           "type": "boolean"
+        },
+        "authority_host": {
+          "default": null,
+          "description": "`azure-blob` with `credentials = \"workload-identity\"`: the Entra authority, for a sovereign cloud\n(default `https://login.microsoftonline.com`).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "bucket": {
           "default": null,
@@ -754,6 +801,22 @@
         "ca_file": {
           "default": null,
           "description": "`s3`: PEM certificates to trust for the endpoint instead of the web PKI roots.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_id": {
+          "default": null,
+          "description": "`azure-blob`: the application (client) id of the workload identity, or of a user-assigned\nmanaged identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "container": {
+          "default": null,
+          "description": "`azure-blob`: the container (it must exist).",
           "type": [
             "string",
             "null"
@@ -773,6 +836,22 @@
         "endpoint": {
           "default": null,
           "description": "`s3`: the service address, `https://host[:port]`. Omit for AWS S3.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "federated_token_file": {
+          "default": null,
+          "description": "`azure-blob` with `credentials = \"workload-identity\"`: the service account token the kubelet\nprojects (`AZURE_FEDERATED_TOKEN_FILE`), absolute.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "identity_endpoint": {
+          "default": null,
+          "description": "`azure-blob` with `credentials = \"managed-identity\"`: the instance metadata service's origin\n(default `http://169.254.169.254`).",
           "type": [
             "string",
             "null"
@@ -831,6 +910,17 @@
             "null"
           ]
         },
+        "sas_token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`azure-blob` with `credentials = \"sas\"`: a SAS token for the container with read, write, delete\nand list, by secret reference (the query string, without the leading `?`)."
+        },
         "secret_access_key": {
           "anyOf": [
             {
@@ -860,6 +950,14 @@
             }
           ],
           "description": "`s3`: a session token for temporary credentials, by secret reference."
+        },
+        "tenant_id": {
+          "default": null,
+          "description": "`azure-blob` with `credentials = \"workload-identity\"`: the Entra tenant.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "ttl_secs": {
           "default": null,
@@ -893,6 +991,11 @@
         {
           "const": "gcs",
           "description": "Google Cloud Storage, over its JSON API.",
+          "type": "string"
+        },
+        {
+          "const": "azure-blob",
+          "description": "Azure Blob Storage, over its REST API.",
           "type": "string"
         }
       ]

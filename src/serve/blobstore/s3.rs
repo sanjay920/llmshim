@@ -15,13 +15,16 @@ const ATTEMPTS: usize = 3;
 
 /// Where one credential comes from. An environment variable cannot change in a running process, so
 /// it is read once; a file is re-read.
-enum Source {
+pub(super) enum Source {
     Fixed(String),
     File(SecretRef),
 }
 
 impl Source {
-    fn new(reference: &SecretRef, env: &dyn Fn(&str) -> Option<String>) -> Result<Self, String> {
+    pub(super) fn new(
+        reference: &SecretRef,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
         if reference.env.is_some() {
             read_secret(reference, env).map(Self::Fixed)
         } else {
@@ -31,7 +34,7 @@ impl Source {
         }
     }
 
-    fn read(&self) -> Result<String, BlobError> {
+    pub(super) fn read(&self) -> Result<String, BlobError> {
         match self {
             Self::Fixed(value) => Ok(value.clone()),
             Self::File(reference) => {
@@ -480,14 +483,14 @@ struct Page {
 }
 
 /// The text between `<tag>` and `</tag>` at or after `from`, and where the closing tag ends.
-fn between<'a>(xml: &'a str, tag: &str, from: usize) -> Option<(&'a str, usize)> {
+pub(super) fn between<'a>(xml: &'a str, tag: &str, from: usize) -> Option<(&'a str, usize)> {
     let open = format!("<{tag}>");
     let start = xml[from..].find(&open)? + from + open.len();
     let end = xml[start..].find(&format!("</{tag}>"))? + start;
     Some((&xml[start..end], end + tag.len() + 3))
 }
 
-fn unescape(text: &str) -> String {
+pub(super) fn unescape(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")

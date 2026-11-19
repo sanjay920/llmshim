@@ -153,3 +153,35 @@ jobs:
           cargo test --locked --features serve --test integration_serve_media_store -- --ignored a_real_gcs 2>&1 | tee gcs.log
           # A filter that matches nothing would pass with zero tests.
           grep -q "1 passed" gcs.log
+
+  # The Azure Blob backend (0050) against Azurite, Microsoft's storage emulator: a server that verifies
+  # the Shared Key signature, which a mock cannot. Started with docker run for its arguments.
+  serve-azure-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Start the emulator
+        run: |
+          docker run -d --name azurite -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite:3.35.0 \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null "http://127.0.0.1:10000/devstoreaccount1" && exit 0
+            sleep 1
+          done
+          docker logs azurite
+          exit 1
+      - name: The store against the emulator
+        env:
+          LLMSHIM_CATALOG_OFFLINE: '1'
+          LLMSHIM_TEST_AZURE_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
+          LLMSHIM_TEST_AZURE_ACCOUNT: devstoreaccount1
+          # The emulator's published development key, not a secret.
+          LLMSHIM_TEST_AZURE_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+        run: |
+          set -o pipefail
+          cargo test --locked --features serve --test integration_serve_media_store -- --ignored a_real_azure 2>&1 | tee azure.log
+          # A filter that matches nothing would pass with zero tests.
+          grep -q "1 passed" azure.log
