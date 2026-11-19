@@ -41,6 +41,21 @@ impl Source {
     }
 }
 
+/// Where the signing credentials come from.
+enum Auth {
+    Keys(Box<KeyAuth>),
+    #[cfg(feature = "bedrock")]
+    Chain(Box<super::aws_chain::AwsChain>),
+}
+
+/// Static keys by reference, re-read once a minute.
+struct KeyAuth {
+    key_id: Source,
+    secret: Source,
+    token: Option<Source>,
+    loaded: Mutex<Option<Loaded>>,
+}
+
 struct Loaded {
     id: String,
     secret: String,
@@ -55,9 +70,12 @@ pub struct S3Settings<'a> {
     pub endpoint: Option<&'a str>,
     pub path_style: Option<bool>,
     pub prefix: &'a str,
-    pub access_key_id: &'a SecretRef,
-    pub secret_access_key: &'a SecretRef,
+    /// Static keys, by reference. `None` for all three when `aws_chain` is set.
+    pub access_key_id: Option<&'a SecretRef>,
+    pub secret_access_key: Option<&'a SecretRef>,
     pub session_token: Option<&'a SecretRef>,
+    /// Use the AWS credential chain (IRSA, Pod Identity, ECS/EC2 roles, ...): `serve-cloud` only.
+    pub aws_chain: bool,
     pub ca_pem: Option<&'a [u8]>,
     pub max_object_bytes: usize,
 }
@@ -71,10 +89,7 @@ pub struct S3Store {
     host: String,
     path_style: bool,
     prefix: String,
-    key_id: Source,
-    secret: Source,
-    token: Option<Source>,
-    loaded: Mutex<Option<Loaded>>,
+    auth: Auth,
     max_object_bytes: usize,
 }
 
@@ -83,6 +98,10 @@ impl S3Store {
         settings: &S3Settings<'_>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
+        Self::from_parts(settings, Self::auth(settings, env)?)
+    }
+
+    fn from_parts(settings: &S3Settings<'_>, auth: Auth) -> Result<Self, String> {
         let (scheme, host, has_endpoint) = match settings.endpoint {
             Some(endpoint) => {
                 let url = reqwest::Url::parse(endpoint)
@@ -128,10 +147,38 @@ impl S3Store {
             host,
             path_style: settings.path_style.unwrap_or(has_endpoint),
             prefix: settings.prefix.to_owned(),
-            key_id: Source::new(settings.access_key_id, env)
-                .map_err(|m| format!("access_key_id: {m}"))?,
-            secret: Source::new(settings.secret_access_key, env)
-                .map_err(|m| format!("secret_access_key: {m}"))?,
+            auth,
+            max_object_bytes: settings.max_object_bytes,
+        };
+        Ok(store)
+    }
+
+    fn auth(
+        settings: &S3Settings<'_>,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Auth, String> {
+        if settings.aws_chain {
+            if settings.access_key_id.is_some()
+                || settings.secret_access_key.is_some()
+                || settings.session_token.is_some()
+            {
+                return Err("keys and the AWS credential chain are exclusive".into());
+            }
+            #[cfg(feature = "bedrock")]
+            return Ok(Auth::Chain(Box::new(super::aws_chain::AwsChain::new(
+                settings.region,
+            ))));
+            #[cfg(not(feature = "bedrock"))]
+            return Err(
+                "the AWS credential chain needs a binary built with --features serve-cloud".into(),
+            );
+        }
+        let (Some(id), Some(secret)) = (settings.access_key_id, settings.secret_access_key) else {
+            return Err("access_key_id and secret_access_key are required".into());
+        };
+        Ok(Auth::Keys(Box::new(KeyAuth {
+            key_id: Source::new(id, env).map_err(|m| format!("access_key_id: {m}"))?,
+            secret: Source::new(secret, env).map_err(|m| format!("secret_access_key: {m}"))?,
             token: settings
                 .session_token
                 .map(|reference| {
@@ -139,23 +186,38 @@ impl S3Store {
                 })
                 .transpose()?,
             loaded: Mutex::new(None),
-            max_object_bytes: settings.max_object_bytes,
-        };
-        Ok(store)
+        })))
     }
 
-    fn credentials(&self) -> Result<(String, String, Option<String>), BlobError> {
-        let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
-        if loaded.as_ref().is_none_or(|l| l.at.elapsed() > REREAD) {
-            *loaded = Some(Loaded {
-                id: self.key_id.read()?,
-                secret: self.secret.read()?,
-                token: self.token.as_ref().map(Source::read).transpose()?,
-                at: Instant::now(),
-            });
+    async fn credentials(&self) -> Result<(String, String, Option<String>), BlobError> {
+        match &self.auth {
+            Auth::Keys(keys) => {
+                let mut loaded = keys.loaded.lock().unwrap_or_else(|e| e.into_inner());
+                if loaded.as_ref().is_none_or(|l| l.at.elapsed() > REREAD) {
+                    *loaded = Some(Loaded {
+                        id: keys.key_id.read()?,
+                        secret: keys.secret.read()?,
+                        token: keys.token.as_ref().map(Source::read).transpose()?,
+                        at: Instant::now(),
+                    });
+                }
+                let l = loaded.as_ref().expect("just set");
+                Ok((l.id.clone(), l.secret.clone(), l.token.clone()))
+            }
+            #[cfg(feature = "bedrock")]
+            Auth::Chain(chain) => chain.get().await,
         }
-        let l = loaded.as_ref().expect("just set");
-        Ok((l.id.clone(), l.secret.clone(), l.token.clone()))
+    }
+
+    /// Forget the credentials held: a refusal may mean they rotated.
+    async fn invalidate(&self) {
+        match &self.auth {
+            Auth::Keys(keys) => {
+                *keys.loaded.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            #[cfg(feature = "bedrock")]
+            Auth::Chain(chain) => chain.invalidate().await,
+        }
     }
 
     /// `(url, host header, canonical path)` of an object, or of the bucket when `name` is empty.
@@ -189,7 +251,7 @@ impl S3Store {
         body: Vec<u8>,
         limit: usize,
     ) -> Result<(u16, Vec<u8>), BlobError> {
-        let (id, secret, token) = self.credentials()?;
+        let (id, secret, token) = self.credentials().await?;
         let mut last = BlobError::Unavailable;
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
@@ -319,7 +381,7 @@ impl S3Store {
         if !matches!(first.0, 401 | 403) {
             return Ok(first);
         }
-        *self.loaded.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.invalidate().await;
         self.call_once(method, name, query, body, limit).await
     }
 }
@@ -483,9 +545,10 @@ mod tests {
                 endpoint: Some(endpoint),
                 path_style: None,
                 prefix,
-                access_key_id: &id,
-                secret_access_key: &key,
+                access_key_id: Some(&id),
+                secret_access_key: Some(&key),
                 session_token: Some(&token),
+                aws_chain: false,
                 ca_pem: None,
                 max_object_bytes: 1 << 20,
             },
@@ -607,9 +670,10 @@ mod tests {
                 endpoint: Some("http://127.0.0.1:9"),
                 path_style: None,
                 prefix: "",
-                access_key_id: &secret("ID"),
-                secret_access_key: &secret("KEY"),
+                access_key_id: Some(&secret("ID")),
+                secret_access_key: Some(&secret("KEY")),
                 session_token: None,
+                aws_chain: false,
                 ca_pem: None,
                 max_object_bytes: 1024,
             },
@@ -676,9 +740,10 @@ mod tests {
                 endpoint: Some(&server.url()),
                 path_style: None,
                 prefix: "",
-                access_key_id: &id,
-                secret_access_key: &key,
+                access_key_id: Some(&id),
+                secret_access_key: Some(&key),
                 session_token: None,
+                aws_chain: false,
                 ca_pem: None,
                 max_object_bytes: 1024,
             },
@@ -686,7 +751,7 @@ mod tests {
         )
         .unwrap();
         // Fill the cache with the old secret, then rotate the file.
-        store.credentials().unwrap();
+        store.credentials().await.unwrap();
         std::fs::write(&path, "new-secret\n").unwrap();
         let refused = server
             .mock("GET", "/media/a/b")
@@ -703,7 +768,7 @@ mod tests {
         assert_eq!(store.get("a/b", 100).await.unwrap(), b"ok");
         refused.assert_async().await;
         accepted.assert_async().await;
-        assert_eq!(store.credentials().unwrap().1, "new-secret");
+        assert_eq!(store.credentials().await.unwrap().1, "new-secret");
         // A refusal that persists is reported once, after one retry, as a class.
         let mut second = mockito::Server::new_async().await;
         let always = second
@@ -719,9 +784,10 @@ mod tests {
                 endpoint: Some(&second.url()),
                 path_style: None,
                 prefix: "",
-                access_key_id: &id,
-                secret_access_key: &secret("KEY"),
+                access_key_id: Some(&id),
+                secret_access_key: Some(&secret("KEY")),
                 session_token: None,
+                aws_chain: false,
                 ca_pem: None,
                 max_object_bytes: 1024,
             },
@@ -784,9 +850,10 @@ mod tests {
                 endpoint: None,
                 path_style: None,
                 prefix: "",
-                access_key_id: &id,
-                secret_access_key: &key,
+                access_key_id: Some(&id),
+                secret_access_key: Some(&key),
                 session_token: None,
+                aws_chain: false,
                 ca_pem: None,
                 max_object_bytes: 1024,
             },
@@ -814,9 +881,10 @@ mod tests {
                 endpoint: Some("http://127.0.0.1:9"),
                 path_style: None,
                 prefix: "",
-                access_key_id: &missing,
-                secret_access_key: &secret("KEY"),
+                access_key_id: Some(&missing),
+                secret_access_key: Some(&secret("KEY")),
                 session_token: None,
+                aws_chain: false,
                 ca_pem: None,
                 max_object_bytes: 1024,
             },

@@ -693,6 +693,21 @@
       },
       "type": "object"
     },
+    "MediaCredentials": {
+      "description": "Where the `s3` backend's credentials come from (note 0050).",
+      "oneOf": [
+        {
+          "const": "keys",
+          "description": "Static keys, by secret reference (`access_key_id`, `secret_access_key`, `session_token`).",
+          "type": "string"
+        },
+        {
+          "const": "aws",
+          "description": "The AWS credential chain: EKS IAM roles for service accounts (IRSA), EKS Pod Identity, ECS task\nroles, the EC2 instance profile, SSO and profile files. Needs a build with `serve-cloud`.",
+          "type": "string"
+        }
+      ]
+    },
     "MediaStore": {
       "additionalProperties": false,
       "description": "The object store for the media routes of a fleet (note 0050). Objects are sealed (AES-256-GCM, a\nkey per object) before they are stored, so the store holds ciphertext only.",
@@ -706,7 +721,7 @@
               "type": "null"
             }
           ],
-          "description": "`s3`: the access key id, by secret reference."
+          "description": "`s3` with `credentials = \"keys\"`: the access key id, by secret reference."
         },
         "allow_insecure_http": {
           "default": false,
@@ -728,6 +743,10 @@
             "string",
             "null"
           ]
+        },
+        "credentials": {
+          "$ref": "#/$defs/MediaCredentials",
+          "description": "`s3`: where the credentials come from: `keys` (default) or `aws` (the AWS credential chain, for a\npod, task or instance role; the key settings are then not allowed)."
         },
         "endpoint": {
           "default": null,

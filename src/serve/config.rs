@@ -175,6 +175,18 @@ pub enum MediaStoreKind {
     S3,
 }
 
+/// Where the `s3` backend's credentials come from (note 0050).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum MediaCredentials {
+    /// Static keys, by secret reference (`access_key_id`, `secret_access_key`, `session_token`).
+    #[default]
+    Keys,
+    /// The AWS credential chain: EKS IAM roles for service accounts (IRSA), EKS Pod Identity, ECS task
+    /// roles, the EC2 instance profile, SSO and profile files. Needs a build with `serve-cloud`.
+    Aws,
+}
+
 /// The object store for the media routes of a fleet (note 0050). Objects are sealed (AES-256-GCM, a
 /// key per object) before they are stored, so the store holds ciphertext only.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -210,7 +222,11 @@ pub struct MediaStore {
     /// `s3`: a key prefix, so one bucket can be shared (letters, digits, `._-/`, ending in `/`).
     #[serde(default)]
     pub prefix: Option<String>,
-    /// `s3`: the access key id, by secret reference.
+    /// `s3`: where the credentials come from: `keys` (default) or `aws` (the AWS credential chain, for a
+    /// pod, task or instance role; the key settings are then not allowed).
+    #[serde(default)]
+    pub credentials: MediaCredentials,
+    /// `s3` with `credentials = "keys"`: the access key id, by secret reference.
     #[serde(default)]
     pub access_key_id: Option<SecretRef>,
     /// `s3`: the secret access key, by secret reference. A file is re-read once a minute.
@@ -1926,17 +1942,38 @@ impl ServeConfig {
                 } else if store.allow_insecure_http {
                     bad("allow_insecure_http", "needs an endpoint", issues);
                 }
-                for (field, secret) in [
-                    ("access_key_id", &store.access_key_id),
-                    ("secret_access_key", &store.secret_access_key),
-                ] {
-                    match secret {
-                        Some(secret) => validate_secret(secret, &format!("{at}.{field}"), issues),
-                        None => bad(field, "is required for kind = \"s3\"", issues),
+                match store.credentials {
+                    MediaCredentials::Keys => {
+                        for (field, secret) in [
+                            ("access_key_id", &store.access_key_id),
+                            ("secret_access_key", &store.secret_access_key),
+                        ] {
+                            match secret {
+                                Some(secret) => {
+                                    validate_secret(secret, &format!("{at}.{field}"), issues)
+                                }
+                                None => bad(
+                                    field,
+                                    "is required for kind = \"s3\" with credentials = \"keys\"",
+                                    issues,
+                                ),
+                            }
+                        }
+                        if let Some(token) = &store.session_token {
+                            validate_secret(token, &format!("{at}.session_token"), issues);
+                        }
                     }
-                }
-                if let Some(token) = &store.session_token {
-                    validate_secret(token, &format!("{at}.session_token"), issues);
+                    MediaCredentials::Aws => {
+                        for (field, set) in [
+                            ("access_key_id", store.access_key_id.is_some()),
+                            ("secret_access_key", store.secret_access_key.is_some()),
+                            ("session_token", store.session_token.is_some()),
+                        ] {
+                            if set {
+                                bad(field, "belongs to credentials = \"keys\"", issues);
+                            }
+                        }
+                    }
                 }
                 if store.ca_file.as_ref().is_some_and(|p| !p.has_root()) {
                     bad("ca_file", "must be an absolute path", issues);
@@ -3498,6 +3535,15 @@ impl ServeConfig {
                 "fleet mode needs a binary built with --features serve-redis",
             ));
         }
+        if self.media_store.as_ref().is_some_and(|store| {
+            store.kind == MediaStoreKind::S3 && store.credentials == MediaCredentials::Aws
+        }) && !cfg!(feature = "serve-cloud")
+        {
+            issues.push(Issue::new(
+                "media_store.credentials",
+                "\"aws\" needs a binary built with --features serve-cloud",
+            ));
+        }
         if !cfg!(feature = "serve-cloud") {
             for (name, provider) in &self.providers {
                 if provider.kind.is_cloud() {
@@ -4580,6 +4626,30 @@ mod tests {
         ] {
             assert_eq!(paths(&format!("{S3}{extra}")), [at], "{extra}");
         }
+        // The AWS credential chain takes none of the key settings.
+        const CHAIN: &str = "kind = \"s3\"\nbucket = \"media-bucket\"\nregion = \"us-east-1\"\ncredentials = \"aws\"\n";
+        let aws = ServeConfig::parse(&file(CHAIN), Format::Toml);
+        assert!(aws.is_ok(), "{:?}", aws.err());
+        assert_eq!(
+            paths(&format!(
+                "{CHAIN}access_key_id = {{ env = \"K\" }}\nsession_token = {{ env = \"T\" }}\n"
+            )),
+            ["media_store.access_key_id", "media_store.session_token"]
+        );
+        assert!(ServeConfig::parse(
+            &file("kind = \"s3\"\ncredentials = \"magic\"\n"),
+            Format::Toml
+        )
+        .is_err());
+        // Without the cloud build, the chain is a defect named by flag.
+        let config = ServeConfig::parse(&file(CHAIN), Format::Toml).unwrap();
+        assert_eq!(
+            config
+                .feature_issues()
+                .iter()
+                .any(|i| i.path == "media_store.credentials"),
+            !cfg!(feature = "serve-cloud")
+        );
         // A bad credential reference is named, never printed.
         assert_eq!(
             paths(&S3.replace("MEDIA_KEY_ID", "lower")),
