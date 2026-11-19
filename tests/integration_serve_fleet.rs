@@ -597,7 +597,7 @@ async fn an_object_in_the_store_is_ciphertext_and_is_gone_when_the_request_ends(
         .mock("POST", "/audio/transcriptions")
         .with_header("content-type", "application/json")
         .with_body_from_request(|_| {
-            std::thread::sleep(std::time::Duration::from_secs(3));
+            std::thread::sleep(std::time::Duration::from_secs(8));
             br#"{"text": "done", "usage": {"type": "tokens", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2}}"#.to_vec()
         })
         .create_async()
@@ -625,7 +625,12 @@ async fn an_object_in_the_store_is_ciphertext_and_is_gone_when_the_request_ends(
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let object = loop {
-        if let Some(path) = files_in(&shared.0).into_iter().next() {
+        // Not a `.tmp-` file: an object is written under that name and renamed when it is whole.
+        if let Some(path) = files_in(&shared.0).into_iter().find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.starts_with(".tmp-"))
+        }) {
             break path;
         }
         assert!(std::time::Instant::now() < deadline, "no object was staged");
@@ -633,22 +638,30 @@ async fn an_object_in_the_store_is_ciphertext_and_is_gone_when_the_request_ends(
     };
     // The job in Redis carries references, not the audio, and is scope version 4 (so a replica that
     // cannot read references refuses it instead of sending one to a provider).
+    // The object is staged just before the job is enqueued, so look until it is there (the
+    // provider is slow, which keeps the job in Redis for the whole wait).
     let found = {
         let mut connection = redis::Client::open(redis_url())
             .unwrap()
             .get_connection()
             .unwrap();
-        let keys: Vec<String> = redis::cmd("KEYS").arg("*").query(&mut connection).unwrap();
-        let mut found = None;
-        for key in keys {
-            let value: Result<String, _> = redis::cmd("GET").arg(&key).query(&mut connection);
-            if let Ok(value) = value {
-                if value.contains("$blob") && value.contains(&names.tenant_hash_marker()) {
-                    found = Some(value);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let keys: Vec<String> = redis::cmd("KEYS").arg("*").query(&mut connection).unwrap();
+            let mut found = None;
+            for key in keys {
+                let value: Result<String, _> = redis::cmd("GET").arg(&key).query(&mut connection);
+                if let Ok(value) = value {
+                    if value.contains("$blob") && value.contains(&names.tenant_hash_marker()) {
+                        found = Some(value);
+                    }
                 }
             }
+            if found.is_some() || std::time::Instant::now() > deadline {
+                break found;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        found
     };
     let job = found.expect("a queued job that carries a reference");
     assert!(job.contains("\"version\":4"), "{job}");
@@ -708,7 +721,12 @@ async fn a_caller_that_disconnects_leaves_no_object_behind() {
             .await;
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while files_in(&shared.0).is_empty() {
+    // Wait for a whole object (a `.tmp-` file is one still being written).
+    while !files_in(&shared.0).iter().any(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| !name.starts_with(".tmp-"))
+    }) {
         assert!(std::time::Instant::now() < deadline, "no object was staged");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
