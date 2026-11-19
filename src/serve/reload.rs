@@ -1879,4 +1879,15 @@ mod tests {
             document_without_reloadable(&with, Format::Toml).unwrap()
         );
     }
+
+    #[test]
+    fn classifiers_are_a_fixed_section_so_a_reload_that_changes_them_is_refused() {
+        // The endpoints and their tokens are resolved once at start (note 0048).
+        let base = "version = 1\n[providers.p]\nkind = \"openai-compatible\"\nbase_url = \"https://x.example.com/v1\"\n";
+        let with = format!("{base}[classifiers.c]\nurl = \"https://c.example.com/check\"\n");
+        assert_ne!(
+            document_without_reloadable(base, Format::Toml).unwrap(),
+            document_without_reloadable(&with, Format::Toml).unwrap()
+        );
+    }
 }

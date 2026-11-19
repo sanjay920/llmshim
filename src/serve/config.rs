@@ -156,6 +156,47 @@ pub struct ServeConfig {
     /// before anything is reserved, queued or sent, or replace an answer that matches. Fixed at start.
     #[serde(default)]
     pub guardrails: Vec<Guardrail>,
+    /// External classifiers (note 0048): HTTP endpoints a guardrail rule's `classifier` names.
+    /// Fixed at start.
+    #[serde(default)]
+    pub classifiers: BTreeMap<String, Classifier>,
+}
+
+/// An external classifier endpoint (note 0048): sent the text of a request or an answer, it
+/// answers `allow` or `block`. Nothing else about the caller is sent.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Classifier {
+    /// The endpoint, `https://...` (plain `http://` needs `allow_insecure_http`). No credentials,
+    /// query or fragment; the path is kept out of every message, log and metric.
+    pub url: String,
+    /// A bearer token for the endpoint, by secret reference. Read at start.
+    #[serde(default)]
+    pub token: Option<SecretRef>,
+    /// The longest one call may take, in milliseconds, 100 to 30000. Defaults to 2000.
+    #[serde(default)]
+    #[schemars(range(min = 100, max = 30000))]
+    pub timeout_ms: Option<u64>,
+    /// The most text sent in one call, in bytes, 1024 to 4194304. More is a failure of the rule,
+    /// never a truncation. Defaults to 262144.
+    #[serde(default)]
+    #[schemars(range(min = 1024, max = 4194304))]
+    pub max_bytes: Option<u64>,
+    /// Allow a plain `http://` url: the text then crosses the network unprotected.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+}
+
+/// What a classifier rule does when its classifier cannot give a verdict (note 0048).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFailure {
+    /// Refuse the request (503): the default.
+    #[default]
+    Block,
+    /// Let the text through and count it.
+    Allow,
 }
 
 /// One guardrail rule (note 0040): a request whose text matches any of the patterns is refused
@@ -191,6 +232,14 @@ pub struct Guardrail {
     /// stream: a stream cannot be checked after its first byte has gone out, so it is refused.
     #[serde(default)]
     pub scope: GuardrailScope,
+    /// Ask the named `[classifiers.*]` endpoint instead of matching patterns (note 0048). A rule
+    /// sets exactly one of `block_if_matches`, `redact_matches` and `classifier`.
+    #[serde(default)]
+    pub classifier: Option<String>,
+    /// For a classifier rule: `block` (default) refuses the request when the classifier cannot
+    /// answer, `allow` lets it through.
+    #[serde(default)]
+    pub on_failure: Option<OnFailure>,
 }
 
 /// What a guardrail rule reads (note 0043).
@@ -1691,7 +1740,58 @@ impl ServeConfig {
         }
     }
 
+    fn validate_classifiers(&self, issues: &mut Vec<Issue>) {
+        if self.classifiers.len() > 16 {
+            issues.push(Issue::new("classifiers", "has more than 16 endpoints"));
+        }
+        for (name, classifier) in &self.classifiers {
+            let at = format!("classifiers.{name}");
+            if !valid_name(name) {
+                issues.push(Issue::new(
+                    &at,
+                    "the name must be lowercase letters, digits, `-` and `_`",
+                ));
+            }
+            let secure = classifier.url.starts_with("https://");
+            let plain = classifier.url.starts_with("http://");
+            if !secure && !(plain && classifier.allow_insecure_http) {
+                issues.push(Issue::new(
+                    format!("{at}.url"),
+                    if plain {
+                        "is plain http: the text would cross the network unprotected; use https, or set allow_insecure_http"
+                    } else {
+                        "must start with https:// (or http:// with allow_insecure_http)"
+                    },
+                ));
+            } else if let Err(problem) = validate_base_url(&classifier.url) {
+                issues.push(Issue::new(format!("{at}.url"), problem));
+            }
+            if let Some(token) = &classifier.token {
+                validate_secret(token, &format!("{at}.token"), issues);
+            }
+            if classifier
+                .timeout_ms
+                .is_some_and(|ms| !(100..=30_000).contains(&ms))
+            {
+                issues.push(Issue::new(
+                    format!("{at}.timeout_ms"),
+                    "must be 100 to 30000",
+                ));
+            }
+            if classifier
+                .max_bytes
+                .is_some_and(|bytes| !(1024..=4_194_304).contains(&bytes))
+            {
+                issues.push(Issue::new(
+                    format!("{at}.max_bytes"),
+                    "must be 1024 to 4194304",
+                ));
+            }
+        }
+    }
+
     fn validate_guardrail_rules(&self, issues: &mut Vec<Issue>) {
+        self.validate_classifiers(issues);
         let mut seen = std::collections::BTreeSet::new();
         if self.guardrails.len() > 64 {
             issues.push(Issue::new("guardrails", "has more than 64 rules"));
@@ -1727,6 +1827,32 @@ impl ServeConfig {
                     }
                 }
             }
+            if let Some(name) = &rule.classifier {
+                if !rule.block_if_matches.is_empty() || !rule.redact_matches.is_empty() {
+                    issues.push(Issue::new(
+                        &at,
+                        "sets classifier together with patterns: use two rules",
+                    ));
+                } else if !self.classifiers.contains_key(name) {
+                    issues.push(Issue::new(
+                        format!("{at}.classifier"),
+                        "names no [classifiers.*] table",
+                    ));
+                }
+                if rule.replacement.is_some() {
+                    issues.push(Issue::new(
+                        format!("{at}.replacement"),
+                        "belongs to redact_matches",
+                    ));
+                }
+                continue;
+            }
+            if rule.on_failure.is_some() {
+                issues.push(Issue::new(
+                    format!("{at}.on_failure"),
+                    "belongs to a classifier rule",
+                ));
+            }
             let (field, patterns) = match (
                 rule.block_if_matches.is_empty(),
                 rule.redact_matches.is_empty(),
@@ -1736,7 +1862,7 @@ impl ServeConfig {
                 (true, true) => {
                     issues.push(Issue::new(
                         &at,
-                        "must set block_if_matches or redact_matches",
+                        "must set block_if_matches, redact_matches or classifier",
                     ));
                     continue;
                 }
@@ -4075,11 +4201,74 @@ mod tests {
             "tenants",
             "deployments",
             "guardrails",
+            "classifiers",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 18, "a new table needs a line here");
+        assert_eq!(properties.len(), 19, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn classifier_rules_and_endpoints_are_validated_by_path() {
+        let file = |extra: &str| format!("{MINIMAL}\n{extra}");
+        let paths = |extra: &str| -> Vec<String> {
+            ServeConfig::parse(&file(extra), Format::Toml)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|issue| issue.path)
+                .collect()
+        };
+        const ENDPOINT: &str = "[classifiers.c]\nurl = \"https://c.example/check\"\n";
+        const RULE: &str = "[[guardrails]]\nname = \"r\"\nclassifier = \"c\"\n";
+        // A well-formed pair loads.
+        assert!(ServeConfig::parse(&file(&format!("{ENDPOINT}{RULE}")), Format::Toml).is_ok());
+        // Each defect is named at its own path.
+        assert_eq!(paths(RULE), ["guardrails[0].classifier"]);
+        assert_eq!(
+            paths(&format!(
+                "[classifiers.c]\nurl = \"http://c.example/x\"\n{RULE}"
+            )),
+            ["classifiers.c.url"]
+        );
+        assert_eq!(
+            paths(&format!(
+                "[classifiers.c]\nurl = \"ftp://c.example\"\n{RULE}"
+            )),
+            ["classifiers.c.url"]
+        );
+        assert_eq!(
+            paths(&format!(
+                "[classifiers.c]\nurl = \"https://u:p@c.example/x\"\n{RULE}"
+            )),
+            ["classifiers.c.url"]
+        );
+        assert_eq!(
+            paths(&format!("{ENDPOINT}timeout_ms = 5\nmax_bytes = 10\n{RULE}")),
+            ["classifiers.c.timeout_ms", "classifiers.c.max_bytes"]
+        );
+        assert_eq!(
+            paths(&format!("{ENDPOINT}token = {{ env = \"lower\" }}\n{RULE}")),
+            ["classifiers.c.token.env"]
+        );
+        // A rule is a classifier or patterns, never both, and on_failure is a classifier's.
+        assert_eq!(
+            paths(&format!("{ENDPOINT}{RULE}block_if_matches = [\"x\"]\n")),
+            ["guardrails[0]"]
+        );
+        assert_eq!(
+            paths("[[guardrails]]\nname = \"r\"\nblock_if_matches = [\"x\"]\non_failure = \"allow\"\n"),
+            ["guardrails[0].on_failure"]
+        );
+        // A rule with neither is refused, naming all three ways.
+        let issues =
+            ServeConfig::parse(&file("[[guardrails]]\nname = \"r\"\n"), Format::Toml).unwrap_err();
+        assert!(
+            issues[0].message.contains("classifier"),
+            "{}",
+            issues[0].message
+        );
     }
 
     #[test]

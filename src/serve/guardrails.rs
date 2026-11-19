@@ -18,8 +18,13 @@ const SET_SIZE_LIMIT: usize = 64 << 20;
 
 /// The only string leaves that are not the caller's text: bulk media. `audio_b64` is a
 /// transcription's audio, and an inline image, audio or video is not something a pattern can match.
-const BULK_KEY: &str = "audio_b64";
+pub(crate) const BULK_KEY: &str = "audio_b64";
 const MEDIA_PREFIXES: [&str; 3] = ["data:image/", "data:audio/", "data:video/"];
+
+/// Whether a string is inline media (an image, audio or video data URI), not text.
+pub(crate) fn is_media(text: &str) -> bool {
+    MEDIA_PREFIXES.iter().any(|prefix| text.starts_with(prefix))
+}
 
 pub(crate) fn compile(pattern: &str) -> Result<regex::Regex, regex::Error> {
     regex::RegexBuilder::new(pattern)

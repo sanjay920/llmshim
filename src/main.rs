@@ -1531,6 +1531,10 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
                 "providers": built.providers,
                 "credentials": built.caller_keys,
                 "authenticated": built.authenticated,
+                "guardrails": llmshim::serve::classifier::audit_summary(
+                    &config.guardrails,
+                    &config.classifiers,
+                ),
                 "snapshot": snapshot.as_ref().map(|snapshot| serde_json::json!({
                     "org": snapshot.org,
                     "generation": snapshot.generation,
