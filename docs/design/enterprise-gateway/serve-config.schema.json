@@ -61,6 +61,56 @@
       },
       "type": "object"
     },
+    "Classifier": {
+      "additionalProperties": false,
+      "description": "An external classifier endpoint (note 0048): sent the text of a request or an answer, it\nanswers `allow` or `block`. Nothing else about the caller is sent.",
+      "properties": {
+        "allow_insecure_http": {
+          "default": false,
+          "description": "Allow a plain `http://` url: the text then crosses the network unprotected.",
+          "type": "boolean"
+        },
+        "max_bytes": {
+          "default": null,
+          "description": "The most text sent in one call, in bytes, 1024 to 4194304. More is a failure of the rule,\nnever a truncation. Defaults to 262144.",
+          "maximum": 4194304,
+          "minimum": 1024,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "timeout_ms": {
+          "default": null,
+          "description": "The longest one call may take, in milliseconds, 100 to 30000. Defaults to 2000.",
+          "maximum": 30000,
+          "minimum": 100,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A bearer token for the endpoint, by secret reference. Read at start."
+        },
+        "url": {
+          "description": "The endpoint, `https://...` (plain `http://` needs `allow_insecure_http`). No credentials,\nquery or fragment; the path is kept out of every message, log and metric.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
     "ControlPlane": {
       "additionalProperties": false,
       "description": "A signed snapshot as the source of caller keys (0024). Needs `state.policy_dir`.",
@@ -365,9 +415,28 @@
           },
           "type": "array"
         },
+        "classifier": {
+          "default": null,
+          "description": "Ask the named `[classifiers.*]` endpoint instead of matching patterns (note 0048). A rule\nsets exactly one of `block_if_matches`, `redact_matches` and `classifier`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "name": {
           "description": "Names the rule in the refusal and nowhere else is it exposed: lowercase letters, digits,\n`-` and `_`. Unique.",
           "type": "string"
+        },
+        "on_failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OnFailure"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For a classifier rule: `block` (default) refuses the request when the classifier cannot\nanswer, `allow` lets it through."
         },
         "redact_matches": {
           "default": [],
@@ -613,6 +682,21 @@
         }
       },
       "type": "object"
+    },
+    "OnFailure": {
+      "description": "What a classifier rule does when its classifier cannot give a verdict (note 0048).",
+      "oneOf": [
+        {
+          "const": "block",
+          "description": "Refuse the request (503): the default.",
+          "type": "string"
+        },
+        {
+          "const": "allow",
+          "description": "Let the text through and count it.",
+          "type": "string"
+        }
+      ]
     },
     "OutageAdmission": {
       "additionalProperties": false,
@@ -1297,6 +1381,13 @@
     "auth": {
       "$ref": "#/$defs/Auth",
       "description": "Other ways a caller proves who it is (0017). Fixed at start: a change is\nrefused by a reload, though a key's `jwt` binding reloads with the key."
+    },
+    "classifiers": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Classifier"
+      },
+      "description": "External classifiers (note 0048): HTTP endpoints a guardrail rule's `classifier` names.\nFixed at start.",
+      "type": "object"
     },
     "control_plane": {
       "anyOf": [

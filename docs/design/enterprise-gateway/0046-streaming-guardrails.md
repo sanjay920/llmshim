@@ -1,7 +1,7 @@
 # 0046: Streaming guardrails
 
 Status: slice 5 of the guardrail pipeline, built. It supersedes 0043's and 0045's refusal to stream for a caller under a
-response rule. External classifiers are not built.
+response rule. External classifiers are 0048.
 
 ## The change
 

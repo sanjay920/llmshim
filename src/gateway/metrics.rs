@@ -62,6 +62,10 @@ pub const AUDIT_WRITE_FAILURES: &str = "llmshim_audit_write_failures_total";
 /// operator's rule name, so its cardinality is bounded by the file (note 0044).
 pub const GUARDRAIL_REDACTIONS: &str = "llmshim_gateway_guardrail_redactions_total";
 
+/// Verdicts of external classifiers (counter, labels: rule, outcome = allow | block | failed_open |
+/// failed_closed). The rule is the operator's name, so its cardinality is bounded by the file (0048).
+pub const GUARDRAIL_CLASSIFIER: &str = "llmshim_gateway_guardrail_classifier_total";
+
 /// Upper bounds (ms) for latency histograms — the Prometheus `le` buckets.
 const BUCKETS_MS: &[f64] = &[
     1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0,

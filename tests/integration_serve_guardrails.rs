@@ -444,7 +444,7 @@ async fn redaction_and_blocking_compose_and_a_rule_cannot_do_both_or_neither() {
     );
     assert!(
         text.contains("guardrails[1]")
-            && text.contains("must set block_if_matches or redact_matches"),
+            && text.contains("must set block_if_matches, redact_matches or classifier"),
         "{text}"
     );
 }

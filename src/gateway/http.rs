@@ -326,6 +326,9 @@ pub struct GatewayState {
     /// Request guardrails (note 0040): set once by `serve` from its file, empty otherwise.
     #[cfg(feature = "serve")]
     guardrails: std::sync::OnceLock<Arc<dyn RequestGuard>>,
+    /// External classifiers (note 0048): set once by `serve`, empty otherwise.
+    #[cfg(feature = "serve")]
+    classifiers: std::sync::OnceLock<Arc<dyn ClassifierGuard>>,
 }
 
 /// A filter over the text of one streamed answer (note 0046): `push` takes the next text and returns
@@ -359,6 +362,30 @@ pub(crate) trait RequestGuard: Send + Sync {
 
     /// The same for a non-streaming answer (note 0045): its message text, refusal and tool calls.
     fn redact_response(&self, tenant: &str, answer: &mut Value) -> Result<Vec<String>, String>;
+}
+
+/// What an external classifier decided about a text (note 0048).
+#[cfg(feature = "serve")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Judgement {
+    /// Every applicable classifier allowed it (or failed open).
+    Pass,
+    /// The named rule's classifier said block.
+    Blocked(String),
+    /// The named rule's classifier could not answer and the rule fails closed.
+    Unavailable(String),
+}
+
+/// The external classifiers (note 0048): a network call in the request path, so apart from the
+/// synchronous [`RequestGuard`].
+#[cfg(feature = "serve")]
+#[async_trait]
+pub(crate) trait ClassifierGuard: Send + Sync {
+    /// Whether `tenant` is under a classifier rule that reads answers, which cannot be streamed.
+    fn reads_responses(&self, tenant: &str) -> bool;
+
+    /// Judge a request's payload, or (with `response`) an answer's `choices` or transcript.
+    async fn judge(&self, tenant: &str, response: bool, body: &Value) -> Judgement;
 }
 
 /// Everything the single-instance gateway state is built from. Grouping these
@@ -436,6 +463,99 @@ impl GatewayState {
     #[cfg(feature = "serve")]
     pub(crate) fn set_guardrails(&self, guard: Arc<dyn RequestGuard>) {
         let _ = self.guardrails.set(guard);
+    }
+
+    /// Install the external classifiers (once; a second call is ignored).
+    #[cfg(feature = "serve")]
+    pub(crate) fn set_classifiers(&self, classifiers: Arc<dyn ClassifierGuard>) {
+        let _ = self.classifiers.set(classifiers);
+    }
+
+    /// Ask the external classifiers about a request payload or an answer (note 0048): a block is
+    /// the regex rule's refusal (400, or 422 for an answer), a classifier that cannot answer under
+    /// a rule that fails closed is 503 `guardrail_unavailable`.
+    async fn classify(
+        &self,
+        tenant: &str,
+        provider: &str,
+        response: bool,
+        body: &Value,
+    ) -> Result<(), ApiError> {
+        #[cfg(feature = "serve")]
+        if let Some(classifiers) = self.classifiers.get() {
+            let refusal = |status: StatusCode, message: String, kind: &str, code: &str| {
+                ApiError::from(ShimError::ProviderError {
+                    status: status.as_u16(),
+                    body: json!({"error": {"message": message, "type": kind,
+                        "param": null, "code": code}})
+                    .to_string(),
+                    retry_after: None,
+                })
+            };
+            let reject = |reason: &str| {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::REJECTED,
+                    &[("provider", provider), ("reason", reason)],
+                );
+            };
+            match classifiers.judge(tenant, response, body).await {
+                Judgement::Pass => {}
+                Judgement::Blocked(rule) if response => {
+                    reject("guardrail_response");
+                    return Err(refusal(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("response blocked by guardrail {rule}"),
+                        "api_error",
+                        "guardrail_blocked_response",
+                    ));
+                }
+                Judgement::Blocked(rule) => {
+                    reject("guardrail");
+                    return Err(refusal(
+                        StatusCode::BAD_REQUEST,
+                        format!("request blocked by guardrail {rule}"),
+                        "invalid_request_error",
+                        "guardrail_blocked",
+                    ));
+                }
+                Judgement::Unavailable(rule) => {
+                    reject("guardrail_unavailable");
+                    return Err(refusal(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("guardrail {rule} could not be evaluated"),
+                        "api_error",
+                        "guardrail_unavailable",
+                    ));
+                }
+            }
+        }
+        #[cfg(not(feature = "serve"))]
+        let _ = (tenant, provider, response, body);
+        Ok(())
+    }
+
+    /// Refuse a stream to a tenant under a classifier rule that reads answers (note 0048): a verdict
+    /// needs the whole text, and text released before it is what the rule exists to prevent.
+    fn refuse_stream_under_classifier(&self, tenant: &str) -> Result<(), ApiError> {
+        #[cfg(feature = "serve")]
+        if self
+            .classifiers
+            .get()
+            .is_some_and(|classifiers| classifiers.reads_responses(tenant))
+        {
+            return Err(ApiError::from(ShimError::ProviderError {
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                body: json!({"error": {
+                    "message": "streaming is not available: a guardrail classifier judges whole answers",
+                    "type": "invalid_request_error", "param": "stream",
+                    "code": "guardrail_stream_refused"}})
+                .to_string(),
+                retry_after: None,
+            }));
+        }
+        #[cfg(not(feature = "serve"))]
+        let _ = tenant;
+        Ok(())
     }
 
     /// Refuse an answer whose text breaks a response rule (note 0043), after the provider has
@@ -670,6 +790,8 @@ impl GatewayState {
             overloaded_retry_after: config.overloaded_retry_after,
             #[cfg(feature = "serve")]
             guardrails: Default::default(),
+            #[cfg(feature = "serve")]
+            classifiers: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -819,6 +941,8 @@ impl GatewayState {
             overloaded_retry_after: config.overloaded_retry_after,
             #[cfg(feature = "serve")]
             guardrails: Default::default(),
+            #[cfg(feature = "serve")]
+            classifiers: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage,
         }))
@@ -1458,6 +1582,9 @@ fn build_request_for(
         &prepared_request.target.instance,
         &prepared_request.payload,
     )?;
+    if req.stream {
+        state.refuse_stream_under_classifier(&identity.tenant)?;
+    }
     if identity.allowed_models.is_some() {
         // The routing id of what the request addressed, once routes and aliases are
         // resolved: what the key's list is matched against (note 0028).
@@ -1746,6 +1873,12 @@ async fn chat(
         let identity = &identified_caller.identity;
         let first_attempt = tried.is_empty();
         if first_attempt {
+            // External classifiers (note 0048), once per request: a failover retry is the same text.
+            state
+                .classify(&identity.tenant, &provider_name, false, &gw.payload)
+                .await?;
+        }
+        if first_attempt {
             idempotency_context = idem_key.as_ref().map(|client_key| {
                 // A deployment's pick is in the payload; fingerprinting that would make a retry that
                 // picks the other target a 409. The caller's own model string stands in for it.
@@ -1821,6 +1954,14 @@ async fn chat(
                             &provider_name,
                             cached_response.get("choices").unwrap_or(&Value::Null),
                         )?;
+                        state
+                            .classify(
+                                &identity.tenant,
+                                &provider_name,
+                                true,
+                                cached_response.get("choices").unwrap_or(&Value::Null),
+                            )
+                            .await?;
                         return Ok((
                             [("idempotency-replayed", "true")],
                             Json(value_to_response(&cached_response, &provider_name, 0)),
@@ -1852,6 +1993,14 @@ async fn chat(
                     &provider_name,
                     submitted.value.get("choices").unwrap_or(&Value::Null),
                 )?;
+                state
+                    .classify(
+                        &identity.tenant,
+                        &provider_name,
+                        true,
+                        submitted.value.get("choices").unwrap_or(&Value::Null),
+                    )
+                    .await?;
                 if let Some(context) = &idempotency_context {
                     state
                         .idem_store(
@@ -2607,6 +2756,9 @@ async fn audio_transcriptions(
     let text = value["text"].as_str().unwrap_or_default().to_owned();
     // A transcript is text the caller will read: a rule that reads responses judges it (note 0043).
     state.check_response_guardrails(&tenant, &provider, &json!({"text": &text}))?;
+    state
+        .classify(&tenant, &provider, true, &json!({"text": &text}))
+        .await?;
     if response_format == "text" {
         return Ok((
             [(
@@ -2736,6 +2888,16 @@ async fn chat_stream_inner(
             );
         }
         let identity = identified_caller.identity;
+        if tried.is_empty() {
+            // External classifiers (note 0048), once per request. A tenant under a rule that reads
+            // answers never gets here: `build_request_for` refused its stream.
+            if let Err(error) = state
+                .classify(&identity.tenant, &_provider_name, false, &gw.payload)
+                .await
+            {
+                return error.into_response();
+            }
+        }
         tried.push(
             gw.payload
                 .get("model")
@@ -3543,6 +3705,8 @@ mod native_tests {
             overloaded_retry_after: config.overloaded_retry_after,
             #[cfg(feature = "serve")]
             guardrails: Default::default(),
+            #[cfg(feature = "serve")]
+            classifiers: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -3600,6 +3764,8 @@ mod native_tests {
             overloaded_retry_after: config.overloaded_retry_after,
             #[cfg(feature = "serve")]
             guardrails: Default::default(),
+            #[cfg(feature = "serve")]
+            classifiers: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -3923,6 +4089,8 @@ mod native_tests {
             overloaded_retry_after: config.overloaded_retry_after,
             #[cfg(feature = "serve")]
             guardrails: Default::default(),
+            #[cfg(feature = "serve")]
+            classifiers: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -4197,6 +4365,8 @@ mod native_tests {
             overloaded_retry_after: config.overloaded_retry_after,
             #[cfg(feature = "serve")]
             guardrails: Default::default(),
+            #[cfg(feature = "serve")]
+            classifiers: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         };
@@ -4296,6 +4466,8 @@ mod native_tests {
             overloaded_retry_after: config.overloaded_retry_after,
             #[cfg(feature = "serve")]
             guardrails: Default::default(),
+            #[cfg(feature = "serve")]
+            classifiers: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         });
@@ -5918,6 +6090,8 @@ mod native_tests {
                 overloaded_retry_after: config.overloaded_retry_after,
                 #[cfg(feature = "serve")]
                 guardrails: Default::default(),
+                #[cfg(feature = "serve")]
+                classifiers: Default::default(),
                 #[cfg(feature = "redis-coordination")]
                 outage: None,
             })

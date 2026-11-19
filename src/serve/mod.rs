@@ -15,6 +15,7 @@ mod access_log;
 pub mod allowlist;
 pub mod audit;
 pub mod build;
+pub mod classifier;
 pub mod config;
 pub mod guardrails;
 mod jsonl;

@@ -441,6 +441,18 @@ pub async fn build_app(
         }
     }
 
+    // External classifiers (note 0048): the endpoints and their tokens are resolved once, here.
+    match super::classifier::Classifiers::build(&config.guardrails, &config.classifiers, env) {
+        Ok(Some(classifiers)) => state.set_classifiers(Arc::new(classifiers)),
+        Ok(None) => {}
+        Err(message) => {
+            return Err(vec![Issue {
+                path: "classifiers".into(),
+                message,
+            }])
+        }
+    }
+
     let admin_authenticated = admin_token.is_some();
     let admin_state = state.clone();
     let allow = super::allowlist::AllowTable::new(super::keys::allowlists(config, env));
