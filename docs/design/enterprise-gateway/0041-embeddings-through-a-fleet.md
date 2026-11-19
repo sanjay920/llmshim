@@ -1,6 +1,6 @@
 # 0041: Embeddings through a fleet
 
-Status: built (embeddings only). Images, speech and transcription still answer `501` on a fleet.
+Status: built (embeddings only). Images, speech and transcription travel through the media object store instead (0050).
 
 ## Decision
 

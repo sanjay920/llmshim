@@ -94,8 +94,8 @@ pub fn from_config(
 
 /// A string at least this long moves to the store.
 pub const THRESHOLD_BYTES: usize = 32 * 1024;
-/// The most objects one job or answer moves.
-pub const MAX_OBJECTS: usize = 4;
+/// The most objects one job or answer moves (an image request may ask for ten images).
+pub const MAX_OBJECTS: usize = 16;
 /// What sealing adds to a plaintext: the authentication tag.
 const TAG_BYTES: usize = 16;
 /// The key of the one-member object that stands for a moved string.
@@ -375,6 +375,11 @@ impl Staged {
         &self.names
     }
 
+    /// Also delete `name` when the request ends: an object another replica made for this request.
+    pub fn track(&mut self, name: String) {
+        self.names.push(name);
+    }
+
     /// Delete every object, best effort: an object that cannot be deleted is left to the sweeper.
     /// Returns how many could not be deleted.
     pub async fn release(self, store: &dyn BlobStore) -> usize {
@@ -385,6 +390,61 @@ impl Staged {
             }
         }
         failed
+    }
+}
+
+/// Deletes what a request staged however the request ends, a dropped future included: the objects of
+/// a caller that disconnected are deleted too, by a task the drop starts. A delete that fails is
+/// left to the sweeper.
+pub struct Cleanup {
+    store: Arc<dyn BlobStore>,
+    staged: Option<Staged>,
+}
+
+impl Cleanup {
+    pub fn new(store: Arc<dyn BlobStore>, staged: Staged) -> Self {
+        Self {
+            store,
+            staged: Some(staged),
+        }
+    }
+
+    pub fn track(&mut self, name: String) {
+        if let Some(staged) = self.staged.as_mut() {
+            staged.track(name);
+        }
+    }
+
+    /// Also delete the objects that `answer` refers to: the worker's, made for this request. Only
+    /// names of the generated shape: a reference-shaped value a hostile provider put in its answer
+    /// cannot name another object for deletion.
+    pub fn track_answer(&mut self, answer: &Value) {
+        for (_, reference) in find_refs(answer) {
+            if is_generated_name(&reference.name) {
+                self.track(reference.name);
+            }
+        }
+    }
+
+    /// Delete now, and report how many deletes failed.
+    pub async fn release(mut self) -> usize {
+        match self.staged.take() {
+            Some(staged) => staged.release(self.store.as_ref()).await,
+            None => 0,
+        }
+    }
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        if let (Some(staged), Ok(runtime)) =
+            (self.staged.take(), tokio::runtime::Handle::try_current())
+        {
+            let store = self.store.clone();
+            runtime.spawn(async move {
+                staged.release(store.as_ref()).await;
+            });
+        }
     }
 }
 
@@ -405,14 +465,24 @@ pub async fn externalize(
         let Some(slot) = value.pointer_mut(&pointer) else {
             continue;
         };
-        let text = slot.as_str().unwrap_or_default().to_owned();
+        // Taken, not copied: the string is replaced by its reference below, and a 25 MB upload's
+        // base64 should not exist twice.
+        let text = match slot.take() {
+            Value::String(text) => text,
+            other => {
+                *slot = other;
+                continue;
+            }
+        };
         match put_sealed(store, prefix, &text).await {
             Ok(reference) => {
                 staged.names.push(reference.name.clone());
                 *slot = reference.to_value();
             }
             Err(error) => {
-                // Nothing of this job may be left behind.
+                // Nothing of this job may be left behind. (The value is not usable after a failure:
+                // earlier strings are references to objects that are deleted here.)
+                *slot = Value::String(text);
                 staged.release(store).await;
                 return Err(error);
             }
@@ -421,13 +491,8 @@ pub async fn externalize(
     Ok(staged)
 }
 
-/// Replace every reference in `value` with the string it stands for. The references found are
-/// returned (the caller deletes the objects when the request ends); `max_total` bounds what is read.
-pub async fn internalize(
-    store: &dyn BlobStore,
-    value: &mut Value,
-    max_total: usize,
-) -> Result<Vec<BlobRef>, BlobError> {
+/// Every reference in `value`, with the JSON pointer where it sits.
+pub fn find_refs(value: &Value) -> Vec<(String, BlobRef)> {
     fn find(value: &Value, at: &mut String, out: &mut Vec<(String, BlobRef)>) {
         if let Some(reference) = BlobRef::from_value(value) {
             out.push((at.clone(), reference));
@@ -454,8 +519,19 @@ pub async fn internalize(
             _ => {}
         }
     }
-    let mut found = Vec::new();
-    find(value, &mut String::new(), &mut found);
+    let mut out = Vec::new();
+    find(value, &mut String::new(), &mut out);
+    out
+}
+
+/// Replace every reference in `value` with the string it stands for. The references found are
+/// returned (the caller deletes the objects when the request ends); `max_total` bounds what is read.
+pub async fn internalize(
+    store: &dyn BlobStore,
+    value: &mut Value,
+    max_total: usize,
+) -> Result<Vec<BlobRef>, BlobError> {
+    let found = find_refs(value);
     if found.len() > MAX_OBJECTS || found.iter().map(|(_, r)| r.len).sum::<usize>() > max_total {
         return Err(BlobError::TooLarge);
     }
@@ -489,6 +565,41 @@ pub async fn sweep(store: &dyn BlobStore, ttl: Duration) -> Result<usize, BlobEr
     }
     Ok(deleted)
 }
+
+/// Sweep `handle`'s store every `every` (after `first`, so a fleet's replicas do not all sweep in the
+/// same second), for as long as the process runs. Each replica sweeps: deletes are idempotent, so
+/// that is only redundant, and one replica's death cannot stop the cleanup. `None` if there is no
+/// runtime to spawn on.
+pub fn spawn_sweeper(
+    handle: Arc<Handle>,
+    first: Duration,
+    every: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    Some(runtime.spawn(async move {
+        tokio::time::sleep(first).await;
+        loop {
+            match sweep(handle.store.as_ref(), handle.ttl).await {
+                Ok(deleted) => {
+                    crate::gateway::metrics::add(
+                        crate::gateway::metrics::MEDIA_SWEPT,
+                        &[],
+                        deleted as u64,
+                    );
+                }
+                Err(error) => crate::gateway::metrics::incr(
+                    crate::gateway::metrics::MEDIA_STORE,
+                    &[("op", "sweep"), ("outcome", error.as_str())],
+                ),
+            }
+            tokio::time::sleep(every).await;
+        }
+    }))
+}
+
+/// The sweeper's pace on a server: every ten minutes, the first pass after up to a minute.
+pub const SWEEP_EVERY: Duration = Duration::from_secs(600);
+pub const SWEEP_FIRST_MAX_SECS: u64 = 60;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -730,8 +841,11 @@ pub(crate) mod tests {
         assert_eq!(store.deleted.lock().unwrap().len(), 1);
         let _ = before;
         // Too many large strings, and one larger than the store takes, are refused whole.
-        let mut many = json!({"a": big('a', 10), "b": big('b', 10), "c": big('c', 10),
-            "d": big('d', 10), "e": big('e', 10)});
+        let mut many = Value::Object(
+            (0..=MAX_OBJECTS)
+                .map(|n| (format!("k{n}"), Value::String(big('a', 10))))
+                .collect(),
+        );
         assert_eq!(
             externalize(&store, "", &mut many, 10).await.err(),
             Some(BlobError::TooLarge)
@@ -802,6 +916,60 @@ pub(crate) mod tests {
         );
         assert!(!shown.contains(&STANDARD.encode(&reference.key)));
         assert!(is_generated_name(&reference.name));
+    }
+
+    #[tokio::test]
+    async fn the_background_sweeper_deletes_an_old_orphan_and_keeps_a_new_one() {
+        let store = Arc::new(Memory::default());
+        let old = format!("20260101/{}", "a".repeat(32));
+        let fresh = format!("20260101/{}", "b".repeat(32));
+        {
+            let mut objects = store.objects.lock().unwrap();
+            objects.insert(
+                old.clone(),
+                (vec![1], SystemTime::now() - Duration::from_secs(7200)),
+            );
+            objects.insert(fresh.clone(), (vec![1], SystemTime::now()));
+        }
+        let handle = Arc::new(Handle {
+            store: store.clone(),
+            ttl: Duration::from_secs(3600),
+        });
+        let task =
+            spawn_sweeper(handle, Duration::ZERO, Duration::from_millis(20)).expect("a runtime");
+        // Bounded by a generous deadline, not by a sleep the test depends on.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while store.objects.lock().unwrap().contains_key(&old) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the orphan was not swept"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(store.objects.lock().unwrap().contains_key(&fresh));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_answer_cannot_name_a_foreign_object_for_deletion() {
+        let store = Arc::new(Memory::default());
+        let ours = put_sealed(store.as_ref(), "", "text").await.unwrap();
+        // A foreign object under the same root, and an answer whose `usage` holds a reference to it.
+        store
+            .objects
+            .lock()
+            .unwrap()
+            .insert("backups/db.tgz".into(), (vec![1], SystemTime::now()));
+        let foreign = BlobRef {
+            name: "backups/db.tgz".into(),
+            ..ours.clone()
+        };
+        let answer = json!({"audio": ours.to_value(), "usage": {"x": foreign.to_value()}});
+        let mut cleanup = Cleanup::new(store.clone(), Staged::default());
+        cleanup.track_answer(&answer);
+        assert_eq!(cleanup.release().await, 0);
+        let left: Vec<String> = store.objects.lock().unwrap().keys().cloned().collect();
+        assert_eq!(left, ["backups/db.tgz"]);
     }
 
     #[test]

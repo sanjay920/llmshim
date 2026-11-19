@@ -17,6 +17,10 @@ pub enum ApiError {
     /// not an upstream failure. Constructed by `serve`.
     #[cfg(feature = "serve")]
     ProviderUnavailable(Duration),
+    /// The media object store could not take or give an object (note 0050) → HTTP 503 +
+    /// `Retry-After`, code `media_store_unavailable`. Constructed by `serve`.
+    #[cfg(feature = "serve")]
+    MediaStoreUnavailable(Duration),
     /// Whole proxy logical request lifetime expired → HTTP 504.
     RequestTimeout,
     /// Missing or invalid API key → HTTP 401. Constructed by the gateway.
@@ -62,6 +66,15 @@ impl IntoResponse for ApiError {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "provider_unavailable",
                     "This replica does not serve the provider; retry after the suggested delay",
+                    retry_after,
+                );
+            }
+            #[cfg(feature = "serve")]
+            ApiError::MediaStoreUnavailable(retry_after) => {
+                return error_with_retry_after(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "media_store_unavailable",
+                    "The media object store is unavailable; retry after the suggested delay",
                     retry_after,
                 );
             }

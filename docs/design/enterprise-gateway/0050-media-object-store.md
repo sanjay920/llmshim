@@ -1,6 +1,6 @@
 # 0050: Media through a fleet, over an object store
 
-Status: slice 1 (the store) built; slices 2 and 3 are described and not built. Written on the owner's instruction to
+Status: slice 1 (the store) and slice 2 (the fleet routes) built; slice 3 is described and not built. Written on the owner's instruction to
 start it, with the requirement that it plug into Kubernetes and the native cloud services, not one of them.
 
 ## The problem
@@ -76,7 +76,7 @@ it cannot change in a running process.
 - **The reference:** `{"$blob": {"v": 1, "key": "...", "len": N, "k": "<key>", "n": "<nonce>"}}`. A reader
   checks `len`, the tag, and the name it asked for, and an object that fails any of them is an error, never partial data.
 - **Bounded.** One object is at most `max_object_bytes` (a `400` before anything is sent for a larger upload), and
-  one job or answer moves at most four objects.
+  one job or answer moves at most sixteen objects (an image request may ask for ten).
 
 ## Lifecycle: nothing outlives its request
 
@@ -112,9 +112,9 @@ it cannot change in a running process.
    the sweep function, `[media_store]` and its validation (`--check` reads and validates; the store is built at start,
    so a wrong path or an unreadable credential fails there), a MinIO-backed CI job (`serve-s3-check`). No route uses it
    yet: a configured `[media_store]` is built and held, nothing more.
-2. **The fleet routes.** The job's scope gains the media operations (scope version 4, with 0041's transition rule),
-   the origin stages and the worker dispatches `images`, `speech` and `transcription`; the `501` becomes a real
-   answer when `[media_store]` is configured (and stays a `501` that names the setting when it is not).
+2. **The fleet routes (built).** With `[fleet]` and `[media_store]`, `POST /v1/images/generations`,
+   `/v1/audio/speech` and `/v1/audio/transcriptions` run through the shared queue like a chat completion. Details in
+   "Slice 2" below.
 3. **Cloud identities and native backends.** The AWS credential chain for `s3` (IRSA, Pod Identity, ECS/EC2),
    `gcs` (workload identity, via `serve-cloud`'s Vertex identity), `azure-blob` (workload identity or SAS, via the
    Azure identity), with `serve-check`-style fixtures; the Helm chart's PVC and service-account examples.
@@ -136,6 +136,51 @@ error, not a short list; one longer than ten million objects is not swept.
 - **A reference holds the key.** `BlobRef`'s `Debug` prints the name and length only; nothing may log the reference
   value itself.
 
+## Slice 2: how the routes use the store
+
+- **Origin.** After authentication, the allowlist, guardrails and classifiers (which see the plaintext) and the
+  route's cheap refusals, the origin replica moves the payload's large strings to the store (an upload's base64 is
+  the one that matters), and enqueues the job. A reference in a *caller's* body is refused `400` before anything is
+  staged: only a replica makes one, so a caller can never name an object. The staged objects are deleted when the
+  call ends **however** it ends: normally, on an error, or because the caller disconnected (a dropped request deletes
+  them from a task its drop starts).
+- **Scope version 4.** **Every** fleet job on these three routes is marked scope **version 4** when the store is in
+  use, small or large: its answer may come back as references, and an older replica that ran it would return the
+  megabytes inline through Redis after the provider was paid. A replica from before this change accepts versions 1 to 3 only, so it **refuses**
+  the job (`503 coordinator unavailable`, the safe failure of 0041) instead of sending a reference to a provider as the
+  caller's data. As in 0041: upgrade every replica before relying on staged media through the fleet.
+- **Worker.** Reads the references back into the payload, calls the provider (the same dispatch, usage record, spend
+  observation and breaker as one instance), and moves the answer's large strings (an image's base64, synthesized
+  audio) to the store, so only references travel back through Redis. A worker with no store (or a store that has lost
+  the object) fails the job `503`, before any provider is called.
+- **Origin again.** Reads the answer's objects, answers the caller, and deletes the request's objects, its own and the
+  worker's.
+- **Refusals and statuses.** No `[media_store]` on a fleet: `501`, naming `[media_store]`. The store cannot take the
+  upload (or a worker cannot read it): `503 media_store_unavailable` with `Retry-After: 30`; nothing was sent to a
+  provider. The upload exceeds `max_object_bytes`: `400`. The store cannot carry the *answer* (a worker cannot put it, or the origin cannot read it back): `502
+  media_store_unavailable` **without** `Retry-After`, because the call was paid for (and is recorded as completed) and a
+  retry would pay again; an answer larger than `max_object_bytes` fails this way every time. The store's own error text and the
+  object names are never in an answer.
+- **One instance ignores it.** A server without `[fleet]` keeps its payloads in memory whatever `[media_store]` says
+  (it has no replica to hand an object to); the store is built and validated, and unused.
+- **The sweeper runs** on every replica of a fleet, every ten minutes (the first pass after up to a minute, so
+  replicas do not sweep in the same second), deleting generated-shape objects older than `ttl_secs`.
+- **Counters.** `llmshim_gateway_media_store_total{op="stage|read|write|delete|sweep",outcome="ok|<class>"}` and
+  `llmshim_gateway_media_store_swept_total`. Both labels are fixed sets.
+
+## Known limits (found in review)
+
+- **Answer objects of an abandoned request** (the origin timed out, or the caller left before the worker answered) are
+  not tracked by the origin, so they wait for the sweeper (up to `ttl_secs` and a pass). A redelivered duplicate run
+  can leave answer objects the same way.
+- **Memory.** A 25 MB upload (33 MB of base64) exists at the origin as the body, the base64 string and the sealed
+  copy at once, and again at the worker. Strings are moved, not copied, into the sealing; chunked sealing would
+  reduce the rest.
+- **Staging precedes admission:** a request that is then refused by a quota or the spend rules still costs a put and
+  a delete. Deletes are sequential and inside the response path.
+- The origin deletes only names of the generated shape that it finds in an answer; a reference-shaped value a
+  hostile provider puts in `usage` cannot name another object for deletion.
+
 ## Not built (and not planned)
 
 - Streaming a large object without holding it in memory: an object is sealed and opened whole (AEAD over a buffer),
@@ -145,6 +190,19 @@ error, not a short list; one longer than ten million objects is not swept.
 - Deduplication, caching or reuse across requests; an object belongs to one request.
 
 ## Tests
+
+Slice 2 (`integration_serve_fleet`, two real replicas, a Redis and a directory they share): all three routes answer
+through the fleet on whichever replica takes the job, with an upload reaching the provider whole (60 KB of a known
+pattern, counted by the mock), a 100 KB audio answer byte for byte and a 60 KB image; the store is empty afterwards
+and the counters show two uploads staged and four answers put; while a request is in flight the object in the store
+is ciphertext (neither the audio nor its base64) under a name of a date and 128 random bits, and the job in Redis
+carries a reference and scope version 4, not the audio; a store that cannot take the upload is `503` with
+`Retry-After` and the provider is called zero times; a reference in a caller's body is `400`; a provider that fails
+leaves nothing behind; a caller that disconnects leaves nothing behind; without `[media_store]` a fleet answers 501
+naming it. Unit tests: a worker restores a payload and moves a large answer, passes a failed call through untouched,
+and a worker that cannot read a reference fails `503` naming no object; a scope with references is version 4 and
+round-trips; the background sweeper deletes an old orphan and keeps a fresh one. A single instance with a store
+configured writes nothing to it (`integration_serve_media_store`).
 
 Slice 1: unit (`serve::blobstore::tests`): SigV4 against the signing examples AWS publishes (the canonical request,
 string to sign and signature of a GET and a PUT), a sealed object opens and any flipped bit, swapped name, wrong

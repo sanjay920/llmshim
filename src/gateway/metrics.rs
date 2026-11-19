@@ -62,6 +62,13 @@ pub const AUDIT_WRITE_FAILURES: &str = "llmshim_audit_write_failures_total";
 /// operator's rule name, so its cardinality is bounded by the file (note 0044).
 pub const GUARDRAIL_REDACTIONS: &str = "llmshim_gateway_guardrail_redactions_total";
 
+/// Calls of the media object store (counter, labels: op = stage | read | write | delete, outcome = ok
+/// or the failure class). Bounded: both labels are fixed sets (note 0050).
+pub const MEDIA_STORE: &str = "llmshim_gateway_media_store_total";
+
+/// Orphaned media objects the sweeper deleted (counter).
+pub const MEDIA_SWEPT: &str = "llmshim_gateway_media_store_swept_total";
+
 /// Verdicts of external classifiers (counter, labels: rule, outcome = allow | block | failed_open |
 /// failed_closed). The rule is the operator's name, so its cardinality is bounded by the file (0048).
 pub const GUARDRAIL_CLASSIFIER: &str = "llmshim_gateway_guardrail_classifier_total";

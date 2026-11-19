@@ -55,6 +55,10 @@ pub struct RealDispatch {
     /// The back-off after an upstream 429 that names no `Retry-After`, when the
     /// file sets one; otherwise `LLMSHIM_PENALTY_SECS` (or 5 s).
     penalty: Option<std::time::Duration>,
+    /// The media object store (note 0050), installed once by `serve`: a worker reads the references
+    /// of a fleet media job from it and puts a large answer in it. Shared with the gateway state.
+    #[cfg(feature = "serve")]
+    media: Arc<std::sync::OnceLock<Arc<crate::serve::blobstore::Handle>>>,
 }
 
 impl RealDispatch {
@@ -68,6 +72,83 @@ impl RealDispatch {
             value["id"] = json!(format!("chat_{}", uuid::Uuid::new_v4().simple()));
         }
         value
+    }
+
+    /// A worker's side of a fleet media job (note 0050): read the references the origin staged back
+    /// into the payload. A reference with no store here, or a store that cannot be read, fails the
+    /// job with the store's own class: nothing was sent to a provider, so nothing was paid.
+    #[cfg(feature = "serve")]
+    async fn media_in(&self, mut payload: Value) -> Result<Value, DispatchError> {
+        if !crate::serve::blobstore::contains_ref(&payload) {
+            return Ok(payload);
+        }
+        let outcome = match self.media.get() {
+            Some(handle) => {
+                let max = handle.store.max_object_bytes() * crate::serve::blobstore::MAX_OBJECTS;
+                crate::serve::blobstore::internalize(handle.store.as_ref(), &mut payload, max)
+                    .await
+                    .map(|_| ())
+            }
+            None => Err(crate::serve::blobstore::BlobError::Unavailable),
+        };
+        match outcome {
+            Ok(()) => {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::MEDIA_STORE,
+                    &[("op", "read"), ("outcome", "ok")],
+                );
+                Ok(payload)
+            }
+            Err(error) => {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::MEDIA_STORE,
+                    &[("op", "read"), ("outcome", error.as_str())],
+                );
+                Err(DispatchError::new("llmshim-media-store-unavailable"))
+            }
+        }
+    }
+
+    /// The other side: a large string of the answer goes to the store and the answer carries a
+    /// reference, so what travels back through Redis is small. The provider has answered and been
+    /// paid (and the attempt recorded) by now; a store that cannot take the answer is the job's
+    /// failure, with the class counted.
+    #[cfg(feature = "serve")]
+    async fn media_out(
+        &self,
+        result: Result<Value, DispatchError>,
+    ) -> Result<Value, DispatchError> {
+        let mut value = result?;
+        let Some(handle) = self.media.get() else {
+            return Ok(value);
+        };
+        match crate::serve::blobstore::externalize(
+            handle.store.as_ref(),
+            "",
+            &mut value,
+            crate::serve::blobstore::THRESHOLD_BYTES,
+        )
+        .await
+        {
+            Ok(staged) => {
+                if !staged.names().is_empty() {
+                    crate::gateway::metrics::incr(
+                        crate::gateway::metrics::MEDIA_STORE,
+                        &[("op", "write"), ("outcome", "ok")],
+                    );
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::MEDIA_STORE,
+                    &[("op", "write"), ("outcome", error.as_str())],
+                );
+                // The provider has answered and been paid: not the "nothing was sent" class, and not
+                // one to retry.
+                Err(DispatchError::new("llmshim-media-store-answer-lost"))
+            }
+        }
     }
 
     fn penalty(&self) -> std::time::Duration {
@@ -155,21 +236,32 @@ impl Dispatch for RealDispatch {
                 return result.map_err(|error| self.map_err(error, refusal));
             }
             crate::policy::DispatchOperation::Images => {
+                #[cfg(feature = "serve")]
+                let payload = self.media_in(payload).await?;
                 let result =
                     crate::images_value_with_policy(router.as_ref(), &payload, &policy_context)
                         .await;
                 let refusal = policy_context.take_last_refusal();
-                return result.map_err(|error| self.map_err(error, refusal));
+                let result = result.map_err(|error| self.map_err(error, refusal));
+                #[cfg(feature = "serve")]
+                let result = self.media_out(result).await;
+                return result;
             }
             crate::policy::DispatchOperation::Speech => {
+                #[cfg(feature = "serve")]
+                let payload = self.media_in(payload).await?;
                 let result =
                     crate::speech_value_with_policy(router.as_ref(), &payload, &policy_context)
                         .await;
                 let refusal = policy_context.take_last_refusal();
-                return result.map_err(|error| self.map_err(error, refusal));
+                let result = result.map_err(|error| self.map_err(error, refusal));
+                #[cfg(feature = "serve")]
+                let result = self.media_out(result).await;
+                return result;
             }
             #[cfg(feature = "serve")]
             crate::policy::DispatchOperation::Transcription => {
+                let payload = self.media_in(payload).await?;
                 let result = crate::transcription_value_with_policy(
                     router.as_ref(),
                     &payload,
@@ -177,7 +269,8 @@ impl Dispatch for RealDispatch {
                 )
                 .await;
                 let refusal = policy_context.take_last_refusal();
-                return result.map_err(|error| self.map_err(error, refusal));
+                let result = result.map_err(|error| self.map_err(error, refusal));
+                return self.media_out(result).await;
             }
             // Only `serve` has the route that makes one; the others never carry the marker.
             #[cfg(not(feature = "serve"))]
@@ -329,6 +422,9 @@ pub struct GatewayState {
     /// External classifiers (note 0048): set once by `serve`, empty otherwise.
     #[cfg(feature = "serve")]
     classifiers: std::sync::OnceLock<Arc<dyn ClassifierGuard>>,
+    /// The media object store (note 0050): set once by `serve`, shared with the dispatcher.
+    #[cfg(feature = "serve")]
+    media_store: Arc<std::sync::OnceLock<Arc<crate::serve::blobstore::Handle>>>,
 }
 
 /// A filter over the text of one streamed answer (note 0046): `push` takes the next text and returns
@@ -463,6 +559,13 @@ impl GatewayState {
     #[cfg(feature = "serve")]
     pub(crate) fn set_guardrails(&self, guard: Arc<dyn RequestGuard>) {
         let _ = self.guardrails.set(guard);
+    }
+
+    /// Install the media object store (once; a second call is ignored): the fleet's images, speech
+    /// and transcription routes need it (note 0050).
+    #[cfg(feature = "serve")]
+    pub(crate) fn set_media_store(&self, handle: Arc<crate::serve::blobstore::Handle>) {
+        let _ = self.media_store.set(handle);
     }
 
     /// Install the external classifiers (once; a second call is ignored).
@@ -759,6 +862,10 @@ impl GatewayState {
             router: router.clone(),
             logger,
             penalty,
+            // One process hands nothing to another replica, so its dispatcher never uses the media
+            // store, whatever `[media_store]` says (note 0050): this slot is never set.
+            #[cfg(feature = "serve")]
+            media: Default::default(),
         });
         let scheduler = Scheduler::new(config.clone(), limiter, dispatch);
         let attempt_coordinator = crate::gateway::attempt::AttemptCoordinator::local_with_retention(
@@ -792,6 +899,8 @@ impl GatewayState {
             guardrails: Default::default(),
             #[cfg(feature = "serve")]
             classifiers: Default::default(),
+            #[cfg(feature = "serve")]
+            media_store: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -879,10 +988,15 @@ impl GatewayState {
             outage,
         } = parts;
         let router = RouterHandle::new(router.with_breaker(breaker));
+        #[cfg(feature = "serve")]
+        let media_slot: Arc<std::sync::OnceLock<Arc<crate::serve::blobstore::Handle>>> =
+            Default::default();
         let dispatch = Arc::new(RealDispatch {
             router: router.clone(),
             logger,
             penalty,
+            #[cfg(feature = "serve")]
+            media: media_slot.clone(),
         });
         let dispatch_for_outage = dispatch.clone();
         let outage_usage = usage.clone();
@@ -943,6 +1057,8 @@ impl GatewayState {
             guardrails: Default::default(),
             #[cfg(feature = "serve")]
             classifiers: Default::default(),
+            #[cfg(feature = "serve")]
+            media_store: media_slot,
             #[cfg(feature = "redis-coordination")]
             outage,
         }))
@@ -1762,6 +1878,14 @@ fn gateway_err_to_api(state: &GatewayState, err: GatewayError) -> ApiError {
                     .unwrap_or(state.overloaded_retry_after),
             )
         }
+        #[cfg(feature = "serve")]
+        GatewayError::Upstream(message) if message == "llmshim-media-store-unavailable" => {
+            media_store_unavailable()
+        }
+        #[cfg(feature = "serve")]
+        GatewayError::Upstream(message) if message == "llmshim-media-store-answer-lost" => {
+            media_answer_lost()
+        }
         GatewayError::Upstream(message) if message == "llmshim-coordinator-unavailable" => {
             ApiError::from(ShimError::ProviderError {
                 status: 503,
@@ -1790,6 +1914,27 @@ fn gateway_err_to_api(state: &GatewayState, err: GatewayError) -> ApiError {
             retry_after: None,
         }),
     }
+}
+
+/// The provider answered and was paid, but the answer could not be put in (or read back from) the media
+/// object store (note 0050): 502, no `Retry-After`, because a retry would pay for the same answer again.
+#[cfg(feature = "serve")]
+fn media_answer_lost() -> ApiError {
+    ApiError::from(ShimError::ProviderError {
+        status: StatusCode::BAD_GATEWAY.as_u16(),
+        body: json!({"error": {
+            "message": "the answer could not be carried through the media object store",
+            "type": "api_error", "param": null, "code": "media_store_unavailable"}})
+        .to_string(),
+        retry_after: None,
+    })
+}
+
+/// The media object store could not take or give an object (note 0050): 503 with `Retry-After`, the
+/// store's class counted and never put in the answer.
+#[cfg(feature = "serve")]
+fn media_store_unavailable() -> ApiError {
+    ApiError::MediaStoreUnavailable(Duration::from_secs(30))
 }
 
 /// POST /v1/chat — enqueue by priority, dispatch when the provider has capacity.
@@ -2193,8 +2338,9 @@ struct MediaCall<'a> {
     operation: crate::policy::DispatchOperation,
     /// "embeddings", "image generation": names the endpoint in the fleet refusal.
     noun: &'static str,
-    /// Whether a fleet can run it: its request and its answer are small enough to travel through
-    /// Redis, and its operation is carried in the job's scope (note 0041).
+    /// Whether a fleet can run it. Embeddings: its request and answer are small enough to travel
+    /// through Redis (note 0041). Images, speech and transcription: their megabytes travel through
+    /// the media object store instead, so a fleet runs them only with `[media_store]` (note 0050).
     fleet: bool,
     model: &'a str,
     /// The OpenAI-shaped body to dispatch; `model` is added from `model`.
@@ -2239,6 +2385,42 @@ async fn submit_media_call(
             retry_after: None,
         }));
     }
+    // The media routes whose payloads are megabytes need the object store on a fleet (note 0050).
+    let on_fleet = !matches!(state.backend, Backend::Local(_));
+    let big_media = matches!(
+        call.operation,
+        crate::policy::DispatchOperation::Images
+            | crate::policy::DispatchOperation::Speech
+            | crate::policy::DispatchOperation::Transcription
+    );
+    #[cfg(feature = "serve")]
+    let media_store = if on_fleet && big_media {
+        state.media_store.get().cloned()
+    } else {
+        None
+    };
+    #[cfg(feature = "serve")]
+    let store_missing = on_fleet && big_media && media_store.is_none();
+    #[cfg(not(feature = "serve"))]
+    let store_missing = on_fleet && big_media;
+    if store_missing {
+        return Err(ApiError::from(ShimError::ProviderError {
+            status: StatusCode::NOT_IMPLEMENTED.as_u16(),
+            body: json!({
+                "error": {
+                    "message": format!(
+                        "{} on a fleet gateway needs a [media_store] (an object store the replicas share)",
+                        call.noun
+                    ),
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "not_implemented"
+                }
+            })
+            .to_string(),
+            retry_after: None,
+        }));
+    }
     let snapshot = state.router.current();
     // A route or deployment name is not a model of this kind: it resolves to a chat target (a route
     // is refused here; `resolve` itself refuses a deployment).
@@ -2270,6 +2452,59 @@ async fn submit_media_call(
     payload["model"] = json!(call.model);
     state.check_guardrails(&identity.tenant, provider.instance(), &payload)?;
     precheck(provider, &model, &payload).map_err(ApiError::from)?;
+    // On a fleet the request's large strings go to the object store and the job carries references
+    // (note 0050). A reference is only ever made by a replica: one in the caller's own body could
+    // name an object, so it is refused. Whatever is staged is deleted however this call ends.
+    #[cfg(feature = "serve")]
+    if big_media && crate::serve::blobstore::contains_ref(&payload) {
+        // On every backend: a single instance would otherwise answer a retriable 503 for it.
+        return Err(invalid_request(
+            "the request carries a media reference, which only a gateway replica may make",
+            "input",
+        ));
+    }
+    #[cfg(feature = "serve")]
+    let mut store_in_use = false;
+    #[cfg(feature = "serve")]
+    let mut cleanup = None;
+    #[cfg(feature = "serve")]
+    if let Some(handle) = &media_store {
+        store_in_use = true;
+        match crate::serve::blobstore::externalize(
+            handle.store.as_ref(),
+            "",
+            &mut payload,
+            crate::serve::blobstore::THRESHOLD_BYTES,
+        )
+        .await
+        {
+            Ok(staged) => {
+                if !staged.names().is_empty() {
+                    crate::gateway::metrics::incr(
+                        crate::gateway::metrics::MEDIA_STORE,
+                        &[("op", "stage"), ("outcome", "ok")],
+                    );
+                }
+                cleanup = Some(crate::serve::blobstore::Cleanup::new(
+                    handle.store.clone(),
+                    staged,
+                ));
+            }
+            Err(error) => {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::MEDIA_STORE,
+                    &[("op", "stage"), ("outcome", error.as_str())],
+                );
+                return Err(match error {
+                    crate::serve::blobstore::BlobError::TooLarge => invalid_request(
+                        "the upload is larger than this gateway's media store takes (max_object_bytes)",
+                        "file",
+                    ),
+                    _ => media_store_unavailable(),
+                });
+            }
+        }
+    }
     let gw = GatewayRequest {
         provider: provider.instance().to_owned(),
         tier: identity.tier,
@@ -2291,6 +2526,12 @@ async fn submit_media_call(
     }
     state.pin_router(&mut policy_scope, snapshot.clone());
     policy_scope.set_operation(call.operation);
+    #[cfg(feature = "serve")]
+    if store_in_use {
+        // Version 4 for every such job, small or large: its answer may come back as references, and a
+        // replica that cannot read them must refuse it, not run it and return megabytes inline.
+        policy_scope.set_media_refs();
+    }
     let prepared = state
         .prepare_submission(gw, policy_scope, false)
         .map_err(|error| gateway_err_to_api(state, error))?;
@@ -2303,7 +2544,53 @@ async fn submit_media_call(
                 .map(|axum::Extension(lifetime)| lifetime.deadline()),
         )
         .await
-        .map_err(|error| gateway_err_to_api(state, error))?;
+        .map_err(|error| gateway_err_to_api(state, error));
+    #[cfg(feature = "serve")]
+    let submitted = {
+        let mut submitted = submitted;
+        if let Some(mut cleanup) = cleanup {
+            if let (Ok(done), Some(handle)) = (submitted.as_mut(), media_store.as_ref()) {
+                // The worker's objects are this request's too: deleted with its own.
+                cleanup.track_answer(&done.value);
+                let max = handle.store.max_object_bytes() * crate::serve::blobstore::MAX_OBJECTS;
+                match crate::serve::blobstore::internalize(
+                    handle.store.as_ref(),
+                    &mut done.value,
+                    max,
+                )
+                .await
+                {
+                    Ok(refs) => {
+                        if !refs.is_empty() {
+                            crate::gateway::metrics::incr(
+                                crate::gateway::metrics::MEDIA_STORE,
+                                &[("op", "read"), ("outcome", "ok")],
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        crate::gateway::metrics::incr(
+                            crate::gateway::metrics::MEDIA_STORE,
+                            &[("op", "read"), ("outcome", error.as_str())],
+                        );
+                        // The provider answered and was paid (the attempt is recorded); the answer
+                        // could not be read back.
+                        submitted = Err(media_answer_lost());
+                    }
+                }
+            }
+            let failed = cleanup.release().await;
+            if failed > 0 {
+                crate::gateway::metrics::add(
+                    crate::gateway::metrics::MEDIA_STORE,
+                    &[("op", "delete"), ("outcome", "failed")],
+                    failed as u64,
+                );
+            }
+        }
+        submitted
+    };
+    let submitted = submitted?;
     Ok((
         submitted.value,
         provider.instance().to_owned(),
@@ -2430,7 +2717,7 @@ async fn images_generations(
         MediaCall {
             operation: crate::policy::DispatchOperation::Images,
             noun: "image generation",
-            fleet: false,
+            fleet: true,
             model: &body.model,
             payload,
             permits,
@@ -2506,7 +2793,7 @@ async fn audio_speech(
         MediaCall {
             operation: crate::policy::DispatchOperation::Speech,
             noun: "speech synthesis",
-            fleet: false,
+            fleet: true,
             model: &body.model,
             payload,
             permits,
@@ -2724,7 +3011,7 @@ async fn audio_transcriptions(
         MediaCall {
             operation: crate::policy::DispatchOperation::Transcription,
             noun: "transcription",
-            fleet: false,
+            fleet: true,
             model: &model,
             payload: Value::Object(payload),
             permits,
@@ -3694,6 +3981,8 @@ mod native_tests {
                 router: RouterHandle::from_arc(router.clone()),
                 logger: None,
                 penalty: None,
+                #[cfg(feature = "serve")]
+                media: Default::default(),
             }),
         );
         let keys = std::collections::HashMap::from([
@@ -3718,6 +4007,8 @@ mod native_tests {
             guardrails: Default::default(),
             #[cfg(feature = "serve")]
             classifiers: Default::default(),
+            #[cfg(feature = "serve")]
+            media_store: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -3743,6 +4034,8 @@ mod native_tests {
                 router: RouterHandle::from_arc(router.clone()),
                 logger: None,
                 penalty: None,
+                #[cfg(feature = "serve")]
+                media: Default::default(),
             }),
         );
         let identity = crate::gateway::auth::Identity {
@@ -3777,6 +4070,8 @@ mod native_tests {
             guardrails: Default::default(),
             #[cfg(feature = "serve")]
             classifiers: Default::default(),
+            #[cfg(feature = "serve")]
+            media_store: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -4102,6 +4397,8 @@ mod native_tests {
             guardrails: Default::default(),
             #[cfg(feature = "serve")]
             classifiers: Default::default(),
+            #[cfg(feature = "serve")]
+            media_store: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         })
@@ -4378,6 +4675,8 @@ mod native_tests {
             guardrails: Default::default(),
             #[cfg(feature = "serve")]
             classifiers: Default::default(),
+            #[cfg(feature = "serve")]
+            media_store: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         };
@@ -4479,6 +4778,8 @@ mod native_tests {
             guardrails: Default::default(),
             #[cfg(feature = "serve")]
             classifiers: Default::default(),
+            #[cfg(feature = "serve")]
+            media_store: Default::default(),
             #[cfg(feature = "redis-coordination")]
             outage: None,
         });
@@ -6063,6 +6364,8 @@ mod native_tests {
                     router: RouterHandle::from_arc(router.clone()),
                     logger: None,
                     penalty: None,
+                    #[cfg(feature = "serve")]
+                    media: Default::default(),
                 }),
             );
             let identity = crate::gateway::auth::Identity {
@@ -6103,6 +6406,8 @@ mod native_tests {
                 guardrails: Default::default(),
                 #[cfg(feature = "serve")]
                 classifiers: Default::default(),
+                #[cfg(feature = "serve")]
+                media_store: Default::default(),
                 #[cfg(feature = "redis-coordination")]
                 outage: None,
             })
@@ -6915,6 +7220,8 @@ mod native_tests {
             router: handle.clone(),
             logger: None,
             penalty: None,
+            #[cfg(feature = "serve")]
+            media: Default::default(),
         };
         let state = configured_state_with_router(Router::new());
         let identity = crate::gateway::auth::Identity {
@@ -7043,6 +7350,8 @@ mod native_tests {
             router: RouterHandle::new(Router::new()),
             logger: None,
             penalty: Some(Duration::from_secs(7)),
+            #[cfg(feature = "serve")]
+            media: Default::default(),
         };
         let error = dispatch
             .dispatch("gone", chat_payload_for("gone/m"))
@@ -7056,6 +7365,139 @@ mod native_tests {
         assert_eq!(response.headers()["retry-after"], "7");
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("provider_unavailable"));
+    }
+
+    #[cfg(feature = "serve")]
+    fn media_dispatch(store: Option<Arc<dyn crate::serve::blobstore::BlobStore>>) -> RealDispatch {
+        let dispatch = RealDispatch {
+            router: RouterHandle::new(Router::new()),
+            logger: None,
+            penalty: None,
+            media: Default::default(),
+        };
+        if let Some(store) = store {
+            let _ = dispatch
+                .media
+                .set(Arc::new(crate::serve::blobstore::Handle {
+                    store,
+                    ttl: Duration::from_secs(3600),
+                }));
+        }
+        dispatch
+    }
+
+    /// The value of a dispatch result, or a panic naming the error (`DispatchError` has no `Debug`).
+    #[cfg(feature = "serve")]
+    fn dispatched<T>(result: Result<T, DispatchError>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("dispatch failed: {}", error.message),
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn a_worker_reads_references_back_and_puts_a_large_answer_in_the_store() {
+        let store = Arc::new(crate::serve::blobstore::tests::Memory::default());
+        let dispatch = media_dispatch(Some(store.clone()));
+        // The origin staged an upload: the worker restores it before the provider is called.
+        let mut payload = json!({"model": "m", "audio_b64": "Q".repeat(40_000), "language": "en"});
+        let original = payload.clone();
+        let staged = crate::serve::blobstore::externalize(
+            store.as_ref(),
+            "",
+            &mut payload,
+            crate::serve::blobstore::THRESHOLD_BYTES,
+        )
+        .await
+        .unwrap();
+        assert_eq!(staged.names().len(), 1);
+        assert_eq!(dispatched(dispatch.media_in(payload).await), original);
+        // A payload with nothing staged is untouched, and costs no read.
+        let small = json!({"model": "m", "input": "hi"});
+        assert_eq!(dispatched(dispatch.media_in(small.clone()).await), small);
+        // A small answer stays; a large one becomes a reference that opens to the same answer.
+        assert_eq!(
+            dispatched(dispatch.media_out(Ok(json!({"text": "hi"}))).await),
+            json!({"text": "hi"})
+        );
+        let answer = json!({"images": [{"b64_json": "Z".repeat(50_000)}], "n": 1});
+        let moved = dispatched(dispatch.media_out(Ok(answer.clone())).await);
+        assert!(!moved.to_string().contains("ZZZZZZZZ"));
+        assert_eq!(crate::serve::blobstore::find_refs(&moved).len(), 1);
+        let mut back = moved.clone();
+        crate::serve::blobstore::internalize(store.as_ref(), &mut back, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(back, answer);
+        // A failed provider call is passed through untouched.
+        let failed = dispatch
+            .media_out(Err(DispatchError::new("provider said no")))
+            .await
+            .unwrap_err();
+        assert_eq!(failed.message, "provider said no");
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn an_answer_the_store_could_not_carry_is_a_502_without_retry_after_because_it_was_paid_for(
+    ) {
+        // The provider answered; the answer is larger than the store takes (or the store is down). A
+        // 503 with Retry-After would invite a second paid call that fails the same way.
+        let store: Arc<dyn crate::serve::blobstore::BlobStore> =
+            Arc::new(crate::serve::blobstore::tests::Memory::default());
+        let dispatch = media_dispatch(Some(store));
+        let too_big = json!({"audio": "A".repeat((1 << 20) + 1)});
+        let error = dispatch.media_out(Ok(too_big)).await.err().unwrap();
+        assert_eq!(error.message, "llmshim-media-store-answer-lost");
+        let state = configured_state_with_router(Router::new());
+        let response =
+            gateway_err_to_api(&state, GatewayError::Upstream(error.message)).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(response.headers().get("retry-after").is_none());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("media_store_unavailable"));
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn a_worker_that_cannot_read_a_reference_fails_the_job_as_503_without_calling_a_provider()
+    {
+        // A reference with no store on this replica (a roll-out in progress, or a misconfigured one).
+        let store = crate::serve::blobstore::tests::Memory::default();
+        let mut payload = json!({"audio_b64": "Q".repeat(40_000)});
+        crate::serve::blobstore::externalize(
+            &store,
+            "",
+            &mut payload,
+            crate::serve::blobstore::THRESHOLD_BYTES,
+        )
+        .await
+        .unwrap();
+        let error = media_dispatch(None)
+            .media_in(payload.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "llmshim-media-store-unavailable");
+        // A store that has lost the object is the same class, and the answer names no object.
+        let empty: Arc<dyn crate::serve::blobstore::BlobStore> =
+            Arc::new(crate::serve::blobstore::tests::Memory::default());
+        let error = media_dispatch(Some(empty))
+            .media_in(payload)
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "llmshim-media-store-unavailable");
+        let state = configured_state_with_router(Router::new());
+        let response =
+            gateway_err_to_api(&state, GatewayError::Upstream(error.message)).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "30");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("media_store_unavailable") && !body.contains("20"),
+            "{body}"
+        );
     }
 
     #[cfg(feature = "serve")]
@@ -7142,6 +7584,8 @@ mod native_tests {
                 )),
                 logger: None,
                 penalty: None,
+                #[cfg(feature = "serve")]
+                media: Default::default(),
             };
             let response = dispatch
                 .dispatch(

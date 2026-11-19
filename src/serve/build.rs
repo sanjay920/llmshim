@@ -459,6 +459,22 @@ pub async fn build_app(
             }])
         }
     };
+    if let Some(handle) = &media_store {
+        state.set_media_store(handle.clone());
+        // A fleet's replicas stage objects for each other's requests, and one that dies mid-request
+        // leaves them behind: every replica sweeps the orphans (note 0050).
+        if config.fleet.is_some() {
+            let first = {
+                use ring::rand::SecureRandom;
+                let mut byte = [0u8; 1];
+                let _ = ring::rand::SystemRandom::new().fill(&mut byte);
+                std::time::Duration::from_secs(
+                    u64::from(byte[0]) % super::blobstore::SWEEP_FIRST_MAX_SECS,
+                )
+            };
+            super::blobstore::spawn_sweeper(handle.clone(), first, super::blobstore::SWEEP_EVERY);
+        }
+    }
     // External classifiers (note 0048): the endpoints and their tokens are resolved once, here.
     match super::classifier::Classifiers::build(&config.guardrails, &config.classifiers, env) {
         Ok(Some(classifiers)) => state.set_classifiers(Arc::new(classifiers)),
