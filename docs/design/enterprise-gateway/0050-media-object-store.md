@@ -1,6 +1,7 @@
 # 0050: Media through a fleet, over an object store
 
-Status: slice 1 (the store) and slice 2 (the fleet routes) built; slice 3 is described and not built. Written on the owner's instruction to
+Status: slice 1 (the store), slice 2 (the fleet routes) and slice 3a (the AWS credential chain) built; slices 3b to 3d
+(Google Cloud Storage, Azure Blob, the Helm examples) are described and not built. Written on the owner's instruction to
 start it, with the requirement that it plug into Kubernetes and the native cloud services, not one of them.
 
 ## The problem
@@ -46,7 +47,7 @@ allow_insecure_http = false
 | One machine, a developer, Compose | `file` | a local directory |
 | Kubernetes, shared volume | `file` | a `ReadWriteMany` PVC (EFS, Filestore, Azure Files, NFS, CephFS) mounted at `path` |
 | Kubernetes, in-cluster object store | `s3` | MinIO, Ceph RGW (Rook), SeaweedFS |
-| AWS | `s3` | S3 with an access key (slice 1); IRSA, EKS Pod Identity, ECS and EC2 roles through the AWS credential chain (slice 3) |
+| AWS | `s3` | S3 with an access key (slice 1), or with `credentials = "aws"` (slice 3a, built): EKS IAM roles for service accounts (IRSA), EKS Pod Identity, ECS task roles, EC2 instance profiles, SSO and profile files, through the AWS credential chain |
 | GCP | `s3` or `gcs` | Cloud Storage's S3-compatible API with HMAC keys is the vendor's documented interoperability path (not tested by us); native `gcs` with workload identity (slice 3) |
 | Azure | `azure-blob` | Blob Storage with workload identity or a SAS token (slice 3); Azure has no S3 API |
 | Elsewhere | `s3` | Cloudflare R2, DigitalOcean Spaces, Backblaze B2, Wasabi, Alibaba OSS: anything that speaks S3 |
@@ -115,9 +116,54 @@ it cannot change in a running process.
 2. **The fleet routes (built).** With `[fleet]` and `[media_store]`, `POST /v1/images/generations`,
    `/v1/audio/speech` and `/v1/audio/transcriptions` run through the shared queue like a chat completion. Details in
    "Slice 2" below.
-3. **Cloud identities and native backends.** The AWS credential chain for `s3` (IRSA, Pod Identity, ECS/EC2),
-   `gcs` (workload identity, via `serve-cloud`'s Vertex identity), `azure-blob` (workload identity or SAS, via the
-   Azure identity), with `serve-check`-style fixtures; the Helm chart's PVC and service-account examples.
+3. **Cloud identities and native backends**, in four parts:
+   - **3a. The AWS credential chain (built).** `credentials = "aws"` on an `s3` store. See below.
+   - **3b. Google Cloud Storage**, native (`kind = "gcs"`): the JSON API with an OAuth token from the metadata
+     server (GKE Workload Identity, GCE) or a service-account file. Not built.
+   - **3c. Azure Blob Storage** (`kind = "azure-blob"`): the Blob REST API with a SAS token, an account key, or an
+     Entra token (workload identity, managed identity). Not built.
+   - **3d. The Helm chart's examples:** a shared `ReadWriteMany` claim for `file`, a service account annotated for
+     IRSA / Workload Identity / Azure Workload Identity, and the media store settings. Not built.
+
+## Slice 3a: the AWS credential chain
+
+```toml
+[media_store]
+kind = "s3"
+bucket = "llmshim-media"
+region = "eu-west-1"
+credentials = "aws"          # no access_key_id, secret_access_key or session_token
+```
+
+With `credentials = "aws"` the store signs with whatever the AWS credential chain finds, in the SDK's own order:
+environment variables; **IRSA** (the projected service account token in `AWS_WEB_IDENTITY_TOKEN_FILE`, traded at STS for
+the role in `AWS_ROLE_ARN`: set by the service account's `eks.amazonaws.com/role-arn` annotation); **EKS Pod Identity and
+ECS task roles** (the container credentials endpoint, `AWS_CONTAINER_CREDENTIALS_FULL_URI` with its authorization token);
+**SSO and profile files**; and the **EC2 instance profile** (IMDS). Nothing needs to be configured in the file beyond
+the region; the Kubernetes or ECS service account or the instance profile carries the identity, with no key in a Secret.
+
+- **Explicit, not ambient.** The provider transports (Bedrock, Vertex, Azure) refuse an ambient identity on purpose:
+  a gateway serves many callers and must not let any of them borrow the host's. The object store is the operator's own
+  infrastructure, where the pod's role is exactly the identity wanted, so the chain is used when, and only when, the
+  file says `credentials = "aws"`. A file that does not say so never consults it.
+- **Built with `serve-cloud`.** It uses the SDK crates that `serve-cloud` links for Bedrock. A build without it refuses
+  the setting by name (`media_store.credentials`, in `--check` and at start), and the default build is unchanged.
+- **Kept until it expires.** Temporary credentials are held until five minutes before they expire (a credential that
+  lives less than that is replaced almost at once); credentials with no expiry (environment or profile keys) are asked
+  for again every minute, so a rotated profile file is seen. A request that the store **refuses** (a revoked or rotated
+  role) drops the credentials it was signed with, **if they are still the ones held and were fetched more than five
+  seconds ago**, and is retried once with a fresh answer, as for key files: a role that simply lacks a permission costs
+  one extra STS or metadata call per five seconds, not one per denied request. A failure to get credentials is
+  remembered for five seconds, so a brown-out of STS or the metadata service is one shared wait, not one per request.
+- **Errors.** No credentials anywhere in the chain is `Denied`; a source that fails or takes more than 30 seconds is
+  `Unavailable`. Neither carries the SDK's message.
+- **No credential I/O at construction:** the chain is built and asked at the first request, so `serve --check` and a
+  start never contact STS or the metadata service.
+- **With a custom `endpoint`** the role's credentials are signed for, and its session token sent to, that endpoint; over
+  `allow_insecure_http` the token crosses the network in clear text, exactly as a `session_token` does. Use it for an
+  S3-compatible service that really takes AWS credentials, over https.
+- IAM: the role needs `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` and (for the sweeper) `s3:ListBucket` on the
+  bucket and prefix. Add a lifecycle rule that expires the prefix after a day as the backstop.
 
 ## What the sweeper may delete
 
@@ -190,6 +236,15 @@ error, not a short list; one longer than ten million objects is not swept.
 - Deduplication, caching or reuse across requests; an object belongs to one request.
 
 ## Tests
+
+Slice 3a (`integration_serve_aws_chain`, in a process of its own because the chain reads the real environment; each test
+sets one world and holds a lock; the sources are mock servers): environment keys; nothing to find is `Denied`; **EKS Pod
+Identity / ECS** (a container credentials endpoint that demands the projected authorization token); the **EC2 instance
+profile** (a metadata service that hands out a session token, a role name and credentials); **IRSA** (the projected
+token traded at a mock STS for `AssumeRoleWithWebIdentity`, the role ARN and token in the request); a credential inside
+its renewal margin is asked for again; a failing source is `Unavailable`; and the store signs with the chain's
+credentials, is refused, drops them, and signs again with the new ones. Not covered: credentials with no expiry are
+kept for a minute (a wait too long for a test), and the SSO and profile-file links are the SDK's own.
 
 Slice 2 (`integration_serve_fleet`, two real replicas, a Redis and a directory they share): all three routes answer
 through the fleet on whichever replica takes the job, with an upload reaching the provider whole (60 KB of a known

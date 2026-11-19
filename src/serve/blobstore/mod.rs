@@ -6,6 +6,8 @@
 //! nothing; deleting the reference is deleting the data. The backends are the [`BlobStore`] trait's:
 //! a directory (`file`) and any S3-compatible service (`s3`).
 
+#[cfg(feature = "bedrock")]
+pub mod aws_chain;
 pub mod file;
 pub mod s3;
 mod sigv4;
@@ -18,7 +20,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime};
 
-use crate::serve::config::{MediaStore, MediaStoreKind};
+use crate::serve::config::{MediaCredentials, MediaStore, MediaStoreKind};
 use std::sync::Arc;
 
 /// The store a server was configured with, and what the sweeper and the callers need beside it.
@@ -70,15 +72,10 @@ pub fn from_config(
                     endpoint: config.endpoint.as_deref(),
                     path_style: config.path_style,
                     prefix: &prefix,
-                    access_key_id: config
-                        .access_key_id
-                        .as_ref()
-                        .ok_or("access_key_id is required")?,
-                    secret_access_key: config
-                        .secret_access_key
-                        .as_ref()
-                        .ok_or("secret_access_key is required")?,
+                    access_key_id: config.access_key_id.as_ref(),
+                    secret_access_key: config.secret_access_key.as_ref(),
                     session_token: config.session_token.as_ref(),
+                    aws_chain: config.credentials == MediaCredentials::Aws,
                     ca_pem: ca.as_deref(),
                     max_object_bytes: max,
                 },

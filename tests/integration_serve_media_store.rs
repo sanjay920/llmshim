@@ -144,6 +144,20 @@ fn check_names_a_bad_store_by_path_and_an_absent_secret_is_status_3() {
         stderr.contains("media_store.region") && !stderr.contains("hunter2"),
         "{stderr}"
     );
+    // The AWS credential chain needs the cloud build: without it a defect naming the flag, with it
+    // a store that can be built (nothing is contacted by --check).
+    let chain =
+        "kind = \"s3\"\nbucket = \"media-bucket\"\nregion = \"us-east-1\"\ncredentials = \"aws\"\n";
+    let (code, stderr, _dir) = check("media-s3-chain", chain, &[]);
+    if cfg!(feature = "serve-cloud") {
+        assert_eq!(code, Some(0), "{stderr}");
+    } else {
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(
+            stderr.contains("serve-cloud") && stderr.contains("media_store.credentials"),
+            "{stderr}"
+        );
+    }
     // A path that cannot be a directory (a file in the way) is refused at start, by path.
     let dir = tempdir::Dir::new("media-file-bad");
     let blocker = dir.0.join("blocker");
