@@ -15,7 +15,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 2000;
 const DEFAULT_MAX_BYTES: usize = 256 * 1024;
 /// The most of a classifier's answer that is read.
 const ANSWER_MAX: usize = 4096;
-/// Calls in flight to one endpoint; over it a call fails at once, by its rule's policy.
+/// Calls in flight to one endpoint by default; over it a call fails at once, by its rule's policy.
 const IN_FLIGHT: usize = 64;
 
 struct Endpoint {
@@ -91,7 +91,9 @@ impl Classifiers {
                         max_bytes: config
                             .max_bytes
                             .map_or(DEFAULT_MAX_BYTES, |bytes| bytes as usize),
-                        slots: Semaphore::new(IN_FLIGHT),
+                        slots: Semaphore::new(
+                            config.max_in_flight.map_or(IN_FLIGHT, |n| n as usize),
+                        ),
                     });
                     endpoints.insert(name, endpoint.clone());
                     endpoint
@@ -264,6 +266,8 @@ impl ClassifierGuard for Classifiers {
         }) {
             let verdict = match text_of(body, rule.endpoint.max_bytes) {
                 None => Err(Failure::Oversize),
+                // Nothing but media or structure: there is no text for a classifier to judge.
+                Some(text) if text.trim().is_empty() => continue,
                 Some(text) => rule.endpoint.ask(&rule.name, direction, text).await,
             };
             let count = |outcome: &str| {
@@ -520,6 +524,25 @@ mod tests {
         drop(held);
         assert_eq!(c.judge("t", false, &json!("x")).await, Judgement::Pass);
         mock.expect(1).assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn the_cap_is_configurable_and_a_text_with_nothing_in_it_is_not_sent() {
+        let (server, mock) = serve(r#"{"verdict":"block"}"#, 200).await;
+        let c = classifiers(
+            &format!("{}/check", server.url()),
+            json!({"scope": "request"}),
+            json!({"allow_insecure_http": true, "max_in_flight": 2}),
+        );
+        assert_eq!(c.rules[0].endpoint.slots.available_permits(), 2);
+        // Only media and keys: no text, so no call and nothing to block.
+        let media = json!({"audio_b64": "QUJD", "input": ["", "  "]});
+        assert_eq!(c.judge("t", false, &media).await, Judgement::Pass);
+        mock.expect(0).assert_async().await;
+        assert_eq!(
+            c.judge("t", false, &json!("words")).await,
+            Judgement::Blocked("mod".into())
+        );
     }
 
     #[tokio::test]

@@ -56,25 +56,28 @@ async fn classifier() -> (mockito::ServerGuard, Vec<mockito::Mock>) {
     let mut server = mockito::Server::new_async().await;
     let leak = server
         .mock("POST", "/secret/path/check")
-        .match_body(Matcher::Regex("platform|caller-key|ci".into()))
+        .match_body(Matcher::Regex(r"platform|caller-key|\bci\b".into()))
         .with_body(r#"{"verdict":"allow"}"#)
         .expect(0)
         .create_async()
         .await;
-    let block = server
+    // One mock decides by content: mockito prefers a mock whose expectation is not yet met, so two
+    // mocks (one per verdict) would stop blocking after the first block.
+    let verdict = server
         .mock("POST", "/secret/path/check")
         .match_header("authorization", format!("Bearer {TOKEN}").as_str())
-        .match_body(Matcher::Regex("BADWORD".into()))
-        .with_body(r#"{"verdict":"block","category":"hate"}"#)
+        .with_body_from_request(|request| {
+            let body = String::from_utf8_lossy(request.body().unwrap()).into_owned();
+            if body.contains("BADWORD") {
+                br#"{"verdict":"block","category":"hate"}"#.to_vec()
+            } else {
+                br#"{"verdict":"allow"}"#.to_vec()
+            }
+        })
+        .expect_at_least(0)
         .create_async()
         .await;
-    let allow = server
-        .mock("POST", "/secret/path/check")
-        .match_header("authorization", format!("Bearer {TOKEN}").as_str())
-        .with_body(r#"{"verdict":"allow"}"#)
-        .create_async()
-        .await;
-    (server, vec![leak, block, allow])
+    (server, vec![leak, verdict])
 }
 
 async fn upstream(text: &str, calls: usize) -> (mockito::ServerGuard, mockito::Mock) {
@@ -293,4 +296,54 @@ async fn the_audit_record_names_the_rule_and_host_and_never_the_path_or_the_toke
         !log.contains("secret/path") && !log.contains(TOKEN),
         "{log}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_media_routes_requests_are_judged_too() {
+    let (classifier, mocks) = classifier().await;
+    let (up, upstream_mock) = upstream("pong", 0).await;
+    let server = start(
+        &config(
+            &format!("{}/secret/path/check", classifier.url()),
+            &up.url(),
+            BOTH,
+        ),
+        "classifier-media",
+        &env(),
+    );
+    for (path, body) in [
+        (
+            "/v1/embeddings",
+            json!({"model": "p/m", "input": ["fine", "a BADWORD"]}),
+        ),
+        (
+            "/v1/images/generations",
+            json!({"model": "p/m", "prompt": "a BADWORD picture"}),
+        ),
+        (
+            "/v1/audio/speech",
+            json!({"model": "p/m", "input": "say a BADWORD", "voice": "alloy"}),
+        ),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!("{}{path}", server.base))
+            .bearer_auth(CALLER_KEY)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, 400, "{path}: {text}");
+        assert!(
+            text.contains("guardrail_blocked") && text.contains("moderation"),
+            "{path}: {text}"
+        );
+        assert!(
+            !text.contains("BADWORD") && !text.contains("hate"),
+            "{path}: {text}"
+        );
+    }
+    upstream_mock.assert_async().await;
+    mocks[0].assert_async().await;
 }
