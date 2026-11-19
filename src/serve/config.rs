@@ -183,6 +183,11 @@ pub struct Classifier {
     #[serde(default)]
     #[schemars(range(min = 1024, max = 4194304))]
     pub max_bytes: Option<u64>,
+    /// Calls in flight to this endpoint, 1 to 1024. Over it a call fails at once, by its rule's
+    /// policy, whether or not the classifier is healthy. Defaults to 64.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 1024))]
+    pub max_in_flight: Option<u64>,
     /// Allow a plain `http://` url: the text then crosses the network unprotected.
     #[serde(default)]
     pub allow_insecure_http: bool,
@@ -1776,6 +1781,15 @@ impl ServeConfig {
                 issues.push(Issue::new(
                     format!("{at}.timeout_ms"),
                     "must be 100 to 30000",
+                ));
+            }
+            if classifier
+                .max_in_flight
+                .is_some_and(|n| !(1..=1024).contains(&n))
+            {
+                issues.push(Issue::new(
+                    format!("{at}.max_in_flight"),
+                    "must be 1 to 1024",
                 ));
             }
             if classifier
@@ -4247,6 +4261,14 @@ mod tests {
         assert_eq!(
             paths(&format!("{ENDPOINT}timeout_ms = 5\nmax_bytes = 10\n{RULE}")),
             ["classifiers.c.timeout_ms", "classifiers.c.max_bytes"]
+        );
+        assert_eq!(
+            paths(&format!("{ENDPOINT}max_in_flight = 0\n{RULE}")),
+            ["classifiers.c.max_in_flight"]
+        );
+        assert_eq!(
+            paths(&format!("{ENDPOINT}max_in_flight = 1025\n{RULE}")),
+            ["classifiers.c.max_in_flight"]
         );
         assert_eq!(
             paths(&format!("{ENDPOINT}token = {{ env = \"lower\" }}\n{RULE}")),

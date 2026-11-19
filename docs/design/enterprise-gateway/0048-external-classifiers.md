@@ -15,6 +15,7 @@ url = "https://classifier.internal.example/check"   # https, or http with allow_
 token = { env = "CLASSIFIER_TOKEN" }                # optional bearer token, by reference
 timeout_ms = 2000                                   # 100 to 30000, default 2000
 max_bytes = 262144                                  # the most text sent, 1 KiB to 4 MiB, default 256 KiB
+max_in_flight = 64                                  # calls at once, 1 to 1024, default 64
 
 [[guardrails]]
 name = "moderation"
@@ -78,8 +79,16 @@ metric label, so a hostile or buggy classifier cannot put text into a response o
 - **Not echoed.** The URL's path and the token are never in a message, a log or a metric (the host only, in the audit
   record). The text goes to the classifier and nowhere else.
 - **The call is bounded.** One shared HTTP client without redirects or ambient proxy, a total timeout per call, at
-  most 4 KiB read from the answer, and a concurrency cap per classifier (64 in flight; over it a call fails at once,
+  most 4 KiB read from the answer, and a concurrency cap per classifier (`max_in_flight`, 64 by default; over it a call fails at once,
   by the rule's policy) so a slow classifier cannot hold every request.
+
+## Follow-up (request classification on the media routes)
+
+The requests of **embeddings, speech, images and transcription** are judged too, from the same payload the regex rules
+scan (the input, the prompt, the options; a transcription's audio is left out like any media). The model name is not part of the text (it is the operator's routing). A text with nothing
+in it (only media, keys or blanks) is **not sent**, request or answer: there is nothing to judge, and no call is made;
+so an empty answer passes even when its rule fails closed and the classifier is down. A transcription upload still
+carries its filename and media type as strings, so it is sent. A transcript is judged as an answer, as before.
 
 ## Known limits
 
@@ -90,16 +99,14 @@ metric label, so a hostile or buggy classifier cannot put text into a response o
   classifier.
 - **The preparation permit is held across the call.** A request is judged while it holds its preparation permit, so
   a slow classifier occupies up to `timeout_ms` per rule of that bounded pool for each admitted request.
-- **A throughput ceiling.** At most 64 calls per endpoint are in flight (not configurable); beyond that a call fails by
+- **A throughput ceiling.** At most `max_in_flight` calls per endpoint (1 to 1024, default 64) are in flight; beyond that a call fails by
   its rule's policy even though the classifier is healthy, so a rule that fails closed refuses a burst. Capacity is
   about 64 divided by the classifier's latency.
 
 ## Not built
 
 - Redaction by a classifier (a verdict is allow or block; rewriting text is the regex rules' job).
-- Classifying streams (above). Request classification covers the chat routes (chat, the native facades, the
-  Responses wire); the requests of embeddings, speech, images and transcription are not sent to a classifier, though a
-  transcript is judged as an answer.
+- Classifying streams (above).
 - Retries of a failed call, caching of verdicts, calling a classifier in parallel.
 - Per-key scope, a dry-run mode, classifier health in `/ready`.
 

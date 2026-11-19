@@ -80,6 +80,16 @@
             "null"
           ]
         },
+        "max_in_flight": {
+          "default": null,
+          "description": "Calls in flight to this endpoint, 1 to 1024. Over it a call fails at once, by its rule's\npolicy, whether or not the classifier is healthy. Defaults to 64.",
+          "maximum": 1024,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "timeout_ms": {
           "default": null,
           "description": "The longest one call may take, in milliseconds, 100 to 30000. Defaults to 2000.",

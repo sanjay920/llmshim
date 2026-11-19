@@ -2261,6 +2261,12 @@ async fn submit_media_call(
         }
     }
     let mut payload = call.payload;
+    // The media routes' requests (embeddings, speech, images, transcription options) are judged too,
+    // before the model name is put in: the model is the operator's routing, not the caller's text
+    // (note 0048).
+    state
+        .classify(&identity.tenant, provider.instance(), false, &payload)
+        .await?;
     payload["model"] = json!(call.model);
     state.check_guardrails(&identity.tenant, provider.instance(), &payload)?;
     precheck(provider, &model, &payload).map_err(ApiError::from)?;
