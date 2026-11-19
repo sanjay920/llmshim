@@ -176,7 +176,13 @@ fn parse_token(body: &[u8]) -> Result<(String, Duration), BlobError> {
             .all(|b| (b'!'..=b'~').contains(&b))
         && token.expires_in > 0;
     usable
-        .then(|| (token.access_token, Duration::from_secs(token.expires_in)))
+        // Clamped: a lifetime of years is a misbehaving endpoint, and is never added to a clock.
+        .then(|| {
+            (
+                token.access_token,
+                Duration::from_secs(token.expires_in.min(24 * 3600)),
+            )
+        })
         .ok_or(BlobError::Unavailable)
 }
 
@@ -223,7 +229,10 @@ impl GcsStore {
                 // Read and checked now, so a wrong path or a key that is not one fails at start.
                 let account = read_account(file)?;
                 account.assertion().map_err(|_| {
-                    "the key file's private_key is not a usable RSA key".to_string()
+                    "the key file's private_key is not a usable RSA key (it must be PKCS8, \
+                     `BEGIN PRIVATE KEY`: convert a PKCS1 `BEGIN RSA PRIVATE KEY` with \
+                     `openssl pkcs8 -topk8 -nocrypt`)"
+                        .to_string()
                 })?;
                 Auth::ServiceAccount {
                     file: file.to_path_buf(),
@@ -259,6 +268,15 @@ impl GcsStore {
                         .await
                         .map_err(|_| BlobError::Unavailable)?;
                     if !response.status().is_success() {
+                        return Err(BlobError::Unavailable);
+                    }
+                    // Only the metadata server sets this: another service answering on that address
+                    // is not one (as Google's own clients check).
+                    if response
+                        .headers()
+                        .get("metadata-flavor")
+                        .is_none_or(|v| v != "Google")
+                    {
                         return Err(BlobError::Unavailable);
                     }
                     parse_token(&read_body(response, 64 * 1024).await?)
@@ -634,6 +652,7 @@ mod tests {
             )
             .match_header("metadata-flavor", "Google")
             .with_header("content-type", "application/json")
+            .with_header("metadata-flavor", "Google")
             .with_body(
                 r#"{"access_token": "ya29.wi-token", "expires_in": 3599, "token_type": "Bearer"}"#,
             )
@@ -686,6 +705,28 @@ mod tests {
         assert_eq!(store.get("a/b", 100).await, Err(BlobError::Unavailable));
         assert_eq!(store.get("a/b", 100).await, Err(BlobError::Unavailable));
         hits.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn an_answer_without_the_metadata_flavor_header_is_not_the_metadata_server() {
+        let mut impostor = mockito::Server::new_async().await;
+        let _answer = impostor
+            .mock("GET", Matcher::Any)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"access_token": "stolen", "expires_in": 3600}"#)
+            .create_async()
+            .await;
+        let store = GcsStore::new(&GcsSettings {
+            bucket: "media",
+            prefix: "",
+            endpoint: Some("http://127.0.0.1:9"),
+            metadata_endpoint: Some(&impostor.url()),
+            credentials: GcsCredentials::Metadata,
+            ca_pem: None,
+            max_object_bytes: 1024,
+        })
+        .unwrap();
+        assert_eq!(store.get("a/b", 100).await, Err(BlobError::Unavailable));
     }
 
     #[tokio::test]

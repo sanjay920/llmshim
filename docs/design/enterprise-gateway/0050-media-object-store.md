@@ -200,6 +200,14 @@ every backend, so the bucket holds ciphertext.
   seconds (a metadata outage is one shared wait), and a 401 forces a refetch only for the token that was refused and
   not within five seconds of fetching it, then the call is tried once more (as for the AWS chain). A rejected service
   account is `Denied`, a metadata server that does not answer is `Unavailable`; neither carries the provider's message.
+- **A metadata answer must say `Metadata-Flavor: Google`** (only the metadata server does), a lifetime is clamped to
+  24 hours whatever the endpoint says, and while one call renews a token that is due but not expired, the others are
+  served the token they hold instead of queuing behind the fetch.
+- The key file must be **PKCS8** (`BEGIN PRIVATE KEY`, what Google issues); a PKCS1 key is refused at start with the
+  `openssl pkcs8 -topk8 -nocrypt` conversion in the message.
+- **Versioned buckets:** deleting an object removes the live generation only, so with object versioning on, the sealed
+  noncurrent generations remain until a lifecycle rule (`daysSinceNoncurrentTime`) removes them. Nothing readable is
+  left (the key is gone with the reference), but the storage is.
 - Built into every `serve` binary: it needs no cloud SDK (`ring`, which `serve` has, signs the JWT).
 - IAM: the identity needs `storage.objects.create`, `get`, `delete` and (for the sweeper) `list` on the bucket, for
   example `roles/storage.objectUser` plus list, scoped to the bucket. Add a lifecycle rule that deletes the prefix's

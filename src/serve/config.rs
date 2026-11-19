@@ -2036,17 +2036,19 @@ impl ServeConfig {
                 bad(field, "does not belong to kind = \"gcs\"", issues);
             }
         }
+        // Google's rules: 3 to 63 characters (up to 222 with dots) of lowercase letters, digits, `-`,
+        // `_` and `.`, starting and ending with a letter or digit.
+        let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
         match store.bucket.as_deref() {
             Some(name)
-                if (3..=222).contains(&name.len())
-                    && name.bytes().all(|b| {
-                        b.is_ascii_lowercase()
-                            || b.is_ascii_digit()
-                            || matches!(b, b'.' | b'-' | b'_')
-                    }) => {}
+                if (3..=if name.contains('.') { 222 } else { 63 }).contains(&name.len())
+                    && name.bytes().all(|b| alnum(b) || matches!(b, b'.' | b'-' | b'_'))
+                    && name.bytes().next().is_some_and(alnum)
+                    && name.bytes().last().is_some_and(alnum) => {}
             Some(_) => bad(
                 "bucket",
-                "must be 3 to 222 of lowercase letters, digits, `.`, `-` and `_`",
+                "must be 3 to 63 characters (222 with dots) of lowercase letters, digits, `-`, `_` and `.`, \
+                 starting and ending with a letter or digit",
                 issues,
             ),
             None => bad("bucket", "is required for kind = \"gcs\"", issues),
@@ -4128,9 +4130,6 @@ fn validate_secret(secret: &SecretRef, at: &str, issues: &mut Vec<Issue>) {
     }
 }
 
-/// A base URL the client can use as given: redirects are disabled, so it must
-/// already be the final endpoint, and it must not smuggle credentials or a
-/// query string.
 /// Why `endpoint` cannot be an object store's address, if it cannot (https, or http with the explicit
 /// opt-in; an origin: no credentials, query, fragment or path).
 fn media_endpoint_problem(endpoint: &str, allow_insecure_http: bool) -> Option<&'static str> {
@@ -4152,6 +4151,9 @@ fn media_endpoint_problem(endpoint: &str, allow_insecure_http: bool) -> Option<&
         .then_some("must be an origin without a path")
 }
 
+/// A base URL the client can use as given: redirects are disabled, so it must
+/// already be the final endpoint, and it must not smuggle credentials or a
+/// query string.
 fn validate_base_url(url: &str) -> Result<(), &'static str> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("must start with https:// or http://");
@@ -4889,6 +4891,14 @@ mod tests {
             Format::Toml
         )
         .is_ok());
+        // Google's bucket naming: no leading or trailing punctuation, 63 characters without dots.
+        for bad in ["-media", "media-", ".media", "ab", &"a".repeat(64)] {
+            assert_eq!(
+                paths(&format!("bucket = \"{bad}\"\ncredentials = \"metadata\"\n")),
+                ["media_store.bucket"],
+                "{bad}"
+            );
+        }
         // Credentials are required, and are gcs's three.
         assert_eq!(
             paths("bucket = \"media-bucket\"\n"),
