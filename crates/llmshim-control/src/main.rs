@@ -12,22 +12,27 @@ use llmshim_control::api::{router, seed_file_problem, token_problem, AppState};
 use llmshim_control::Store;
 use std::path::PathBuf;
 
-const USAGE: &str = "Usage: llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
+const USAGE: &str = "Usage: llmshim-control audit-verify (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         checks the change history's hash chain; exit 1 names the first broken row\n\n       llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
 
 struct Options {
     db: Option<PathBuf>,
     database_url_file: Option<PathBuf>,
     database_schema: Option<String>,
     database_ca_file: Option<PathBuf>,
+    verify: bool,
     listen: String,
     token_file: PathBuf,
     signing_key_file: Option<PathBuf>,
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
-    if args.first().map(String::as_str) != Some("serve") {
-        return Err("the only command is serve".into());
+    if !matches!(
+        args.first().map(String::as_str),
+        Some("serve" | "audit-verify")
+    ) {
+        return Err("the commands are serve and audit-verify".into());
     }
+    let verify = args[0] == "audit-verify";
     let (mut db, mut listen, mut token, mut signing) = (None, None, None, None);
     let (mut url_file, mut schema, mut ca) = (None, None, None);
     let mut at = 1;
@@ -57,13 +62,25 @@ fn parse(args: &[String]) -> Result<Options, String> {
     if (schema.is_some() || ca.is_some()) && url_file.is_none() {
         return Err("--database-schema and --database-ca-file are for --database-url-file".into());
     }
+    if verify && (listen.is_some() || token.is_some() || signing.is_some()) {
+        return Err("audit-verify takes only the database options".into());
+    }
     Ok(Options {
         db,
         database_url_file: url_file,
         database_schema: schema,
         database_ca_file: ca,
-        listen: listen.ok_or("--listen is required")?,
-        token_file: token.ok_or("--token-file is required")?,
+        verify,
+        listen: if verify {
+            String::new()
+        } else {
+            listen.ok_or("--listen is required")?
+        },
+        token_file: if verify {
+            PathBuf::new()
+        } else {
+            token.ok_or("--token-file is required")?
+        },
         signing_key_file: signing,
     })
 }
@@ -106,7 +123,45 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    if options.verify {
+        std::process::exit(audit_verify(&options));
+    }
     std::process::exit(run(options).await);
+}
+
+/// `audit-verify`: read-only on the history (the store's own migration still runs, as for any open),
+/// and never creates a database.
+fn audit_verify(options: &Options) -> i32 {
+    if let Some(db) = &options.db {
+        if !db.exists() {
+            eprintln!("{} does not exist", db.display());
+            return 1;
+        }
+    }
+    let mut store = match open_store(options) {
+        Ok(store) => store,
+        Err(message) => {
+            eprintln!("{message}");
+            return 1;
+        }
+    };
+    match store.verify_history() {
+        Ok(Ok(done)) => {
+            println!(
+                "history: intact, {} chained row(s), {} before the chain, head {}",
+                done.records, done.unchained, done.head
+            );
+            0
+        }
+        Ok(Err(broken)) => {
+            println!("history: broken at row {}: {}", broken.id, broken.reason);
+            1
+        }
+        Err(error) => {
+            eprintln!("cannot read the history: {error}");
+            1
+        }
+    }
 }
 
 /// The store the options name. A Postgres URL holds the password, so its file is owner-only and

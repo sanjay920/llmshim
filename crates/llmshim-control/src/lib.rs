@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 pub mod api;
 mod db;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -189,6 +189,22 @@ pub struct HistoryRow {
     pub action: String,
     pub subject: String,
     pub detail: Value,
+}
+
+/// A history chain that checks out (`verify_history`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryVerified {
+    pub records: u64,
+    /// Rows from before the chain existed, which it cannot vouch for.
+    pub unchained: u64,
+    pub head: String,
+}
+
+/// The first row at which a history chain fails, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryBroken {
+    pub id: i64,
+    pub reason: String,
 }
 
 #[derive(Debug)]
@@ -467,6 +483,28 @@ fn next_seq(table: &str) -> String {
     format!("(SELECT COALESCE(MAX(seq), 0) + 1 FROM {table})")
 }
 
+/// Where a history chain starts: the `prev` of the first chained row.
+pub const HISTORY_GENESIS: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The hash of one history row: SHA-256 over a JSON array of its fields in a fixed order (an
+/// array, so no key order or duplicate key can spell the same row two ways), `detail` as the exact
+/// text that is stored.
+fn history_hash(
+    prev: &str,
+    at: &str,
+    actor: &str,
+    action: &str,
+    subject: &str,
+    detail: &str,
+) -> String {
+    let body = json!([prev, at, actor, action, subject, detail]).to_string();
+    format!("{:x}", Sha256::digest(body.as_bytes()))
+}
+
+/// Append one row to the change history, chained to the row before it (note 0047). Every caller
+/// runs inside a write transaction (one writer at a time, on SQLite and Postgres), so reading the
+/// last hash and inserting the next row cannot interleave with another row.
 fn history(
     tx: &mut dyn Exec,
     actor: &str,
@@ -474,14 +512,26 @@ fn history(
     subject: &str,
     detail: Value,
 ) -> Result<()> {
+    let last = tx.query("SELECT hash FROM history ORDER BY id DESC LIMIT 1", &[])?;
+    let prev = match last.first() {
+        Some(row) => row
+            .opt_text(0)?
+            .unwrap_or_else(|| HISTORY_GENESIS.to_string()),
+        None => HISTORY_GENESIS.to_string(),
+    };
+    let (at, detail) = (now(), detail.to_string());
+    let hash = history_hash(&prev, &at, actor, action, subject, &detail);
     tx.exec(
-        "INSERT INTO history (at, actor, action, subject, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO history (at, actor, action, subject, detail, prev, hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         &[
-            t(&now()),
+            t(&at),
             t(actor),
             t(action),
             t(subject),
-            t(&detail.to_string()),
+            t(&detail),
+            t(&prev),
+            t(&hash),
         ],
     )?;
     Ok(())
@@ -571,7 +621,7 @@ impl Store {
                             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                             .map_err(|e| Error::Database(e.to_string()))?;
                     }
-                    1..=3 => {
+                    1..=4 => {
                         // Version 2 added keys.allowed_models, version 3 keys.tags. Re-read the
                         // version under the write lock: another process starting at the same
                         // time may have migrated while this one waited.
@@ -609,6 +659,18 @@ impl Store {
                                      PRAGMA user_version = 4;",
                                 )
                                 .map_err(db_err)?;
+                            now = 4;
+                        }
+                        if now == 4 {
+                            // Version 5: the history's hash chain (note 0047). Rows written before
+                            // it keep NULL and are the unchained prefix.
+                            connection
+                                .execute_batch(
+                                    "ALTER TABLE history ADD COLUMN prev TEXT; \
+                                     ALTER TABLE history ADD COLUMN hash TEXT; \
+                                     PRAGMA user_version = 5;",
+                                )
+                                .map_err(db_err)?;
                         }
                         connection.execute_batch("COMMIT").map_err(db_err)?;
                     }
@@ -642,7 +704,7 @@ impl Store {
                         tx.execute("INSERT INTO schema_meta (version) VALUES ($1)", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }
-                    Some(version @ (1..=3)) => {
+                    Some(version @ (1..=4)) => {
                         // Version 2 added keys.allowed_models, 3 keys.tags, 4 a team's budget.
                         if version == 1 {
                             tx.batch_execute("ALTER TABLE keys ADD COLUMN allowed_models TEXT")
@@ -652,11 +714,19 @@ impl Store {
                             tx.batch_execute("ALTER TABLE keys ADD COLUMN tags TEXT")
                                 .map_err(fail)?;
                         }
+                        if version <= 3 {
+                            tx.batch_execute(
+                                "ALTER TABLE teams ADD COLUMN budget_usd DOUBLE PRECISION; \
+                                 ALTER TABLE teams ADD COLUMN budget_window_secs BIGINT; \
+                                 ALTER TABLE teams ADD COLUMN budget_allow_unpriced \
+                                     BIGINT NOT NULL DEFAULT 0",
+                            )
+                            .map_err(fail)?;
+                        }
+                        // Version 5: the history's hash chain (note 0047).
                         tx.batch_execute(
-                            "ALTER TABLE teams ADD COLUMN budget_usd DOUBLE PRECISION; \
-                             ALTER TABLE teams ADD COLUMN budget_window_secs BIGINT; \
-                             ALTER TABLE teams ADD COLUMN budget_allow_unpriced \
-                                 BIGINT NOT NULL DEFAULT 0",
+                            "ALTER TABLE history ADD COLUMN prev TEXT; \
+                             ALTER TABLE history ADD COLUMN hash TEXT",
                         )
                         .map_err(fail)?;
                         tx.execute("UPDATE schema_meta SET version = $1", &[&SCHEMA_VERSION])
@@ -1031,6 +1101,60 @@ impl Store {
         })
     }
 
+    /// Check the history's hash chain from its first row (note 0047). Rows from before the chain
+    /// existed (no hash) are counted as `unchained` and must come first; from the first hashed row
+    /// each must carry the hash of the one before it and match its own. The file cannot show a
+    /// removed last row: keep `head` somewhere the database's writer cannot reach.
+    pub fn verify_history(
+        &mut self,
+    ) -> Result<std::result::Result<HistoryVerified, HistoryBroken>> {
+        self.backend.transaction(false, |tx| {
+            let rows = tx.query(
+                "SELECT id, at, actor, action, subject, detail, prev, hash FROM history ORDER BY id",
+                &[],
+            )?;
+            let (mut unchained, mut records) = (0u64, 0u64);
+            let mut head = HISTORY_GENESIS.to_string();
+            for row in &rows {
+                let id = row.int(0)?;
+                let broken = |reason: &str| {
+                    Ok(Err(HistoryBroken {
+                        id,
+                        reason: reason.to_string(),
+                    }))
+                };
+                let (Some(prev), Some(hash)) = (row.opt_text(6)?, row.opt_text(7)?) else {
+                    if records > 0 {
+                        return broken("a row without a hash after chained rows");
+                    }
+                    unchained += 1;
+                    continue;
+                };
+                if prev != head {
+                    return broken("does not follow the row before it (a row was removed or moved)");
+                }
+                let expected = history_hash(
+                    &prev,
+                    &row.text(1)?,
+                    &row.text(2)?,
+                    &row.text(3)?,
+                    &row.text(4)?,
+                    &row.text(5)?,
+                );
+                if hash != expected {
+                    return broken("does not match its own hash (it was altered)");
+                }
+                head = hash;
+                records += 1;
+            }
+            Ok(Ok(HistoryVerified {
+                records,
+                unchained,
+                head,
+            }))
+        })
+    }
+
     /// The payload of the next snapshot of an organization (0024): every key it has, with
     /// its state (`expired` for an active key past its time), and the next generation.
     pub fn build_payload(&mut self, org_id: &str) -> Result<Value> {
@@ -1353,7 +1477,8 @@ CREATE UNIQUE INDEX keys_jwt ON keys (org_id, jwt_table, jwt_subject)
 CREATE TABLE history (
     id {autoid},
     at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
-    subject TEXT NOT NULL, detail TEXT NOT NULL
+    subject TEXT NOT NULL, detail TEXT NOT NULL,
+    prev TEXT, hash TEXT
 );
 CREATE TABLE snapshots (
     org_id TEXT NOT NULL REFERENCES orgs(id),

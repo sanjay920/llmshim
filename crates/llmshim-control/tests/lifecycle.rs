@@ -736,23 +736,28 @@ fn a_model_list_is_checked_stored_copied_on_rotation_and_signed_only_when_set() 
 /// keys: version 1 had neither model lists nor tags, version 2 had model lists only.
 #[test]
 fn an_older_database_is_migrated_in_place() {
-    for from in [1_i64, 2, 3] {
+    for from in [1_i64, 2, 3, 4] {
         migrate_from(from);
     }
 }
 
 fn migrate_from(from: i64) {
     // What a database of that version did not have yet: keys.allowed_models (2), keys.tags (3),
-    // and a team's budget (4).
-    let team_columns = "ALTER TABLE teams DROP COLUMN budget_usd; \
+    // a team's budget (4), and the history's hash chain (5).
+    let chain_columns = "ALTER TABLE history DROP COLUMN prev; \
+        ALTER TABLE history DROP COLUMN hash;";
+    let team_columns = format!(
+        "ALTER TABLE teams DROP COLUMN budget_usd; \
         ALTER TABLE teams DROP COLUMN budget_window_secs; \
-        ALTER TABLE teams DROP COLUMN budget_allow_unpriced;";
+        ALTER TABLE teams DROP COLUMN budget_allow_unpriced; {chain_columns}"
+    );
     let drop_columns = match from {
         1 => format!(
             "ALTER TABLE keys DROP COLUMN allowed_models; ALTER TABLE keys DROP COLUMN tags; {team_columns}"
         ),
         2 => format!("ALTER TABLE keys DROP COLUMN tags; {team_columns}"),
-        _ => team_columns.to_string(),
+        3 => team_columns,
+        _ => chain_columns.to_string(),
     };
     let use_new_columns = |store: &mut Store, project: &str| {
         let mut new = NewKey::secret(project, "new");
