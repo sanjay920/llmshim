@@ -189,8 +189,10 @@ fn role_of(claim: Option<&Value>) -> Option<Role> {
     values.into_iter().filter_map(Role::from_claim).max()
 }
 
-/// `oidc:<sub>` when the subject is a short visible-ASCII string, else a digest of it: a row is never
-/// unreadable, and a subject can never carry a control character into a header or a log line.
+/// `oidc:<sub>` when the subject is a short (at most 100) visible-ASCII string, else `oidc-hash:` and
+/// 16 hex digits of its digest: a row is never unreadable, a subject can never carry a control
+/// character into a header or a log line, and a hashed actor can never equal a plain one (`oidc:` and
+/// `oidc-hash:` differ at the fifth character).
 fn oidc_actor(subject: &str) -> String {
     let plain =
         (1..=100).contains(&subject.len()) && subject.bytes().all(|b| (b'!'..=b'~').contains(&b));
@@ -198,7 +200,7 @@ fn oidc_actor(subject: &str) -> String {
         format!("oidc:{subject}")
     } else {
         let digest = format!("{:x}", Sha256::digest(subject.as_bytes()));
-        format!("oidc:sha256:{}", &digest[..16])
+        format!("oidc-hash:{}", &digest[..16])
     }
 }
 
@@ -244,10 +246,12 @@ mod tests {
         for odd in ["", "has space", "line\nbreak", "ünïcode", &"a".repeat(101)] {
             let actor = oidc_actor(odd);
             assert!(
-                actor.starts_with("oidc:sha256:") && actor.len() == 12 + 16,
+                actor.starts_with("oidc-hash:") && actor.len() == 10 + 16,
                 "{actor}"
             );
         }
         assert_ne!(oidc_actor("a b"), oidc_actor("a c"));
+        // A subject that spells a hashed actor is still a plain one, and a different string.
+        assert!(oidc_actor("sha256:0123456789abcdef").starts_with("oidc:sha256:"));
     }
 }

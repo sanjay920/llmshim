@@ -24,7 +24,7 @@ paths:
   /v1/whoami:
     get:
       operationId: whoami
-      description: The caller's actor, role and how it authenticated (`oidc`, `break_glass` or `shared_token`).
+      description: The caller's actor, role and how it authenticated (`oidc`, `break_glass` or `shared_token`). Any authenticated caller may use it, including a token with no role (`role` is then null).
       responses:
         '200':
           description: The identity
@@ -38,7 +38,6 @@ paths:
                   role: {type: [string, 'null'], enum: [read, key-issuer, admin, null]}
                   via: {type: string, enum: [oidc, break_glass, shared_token]}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
         '503': {$ref: '#/components/responses/Unavailable'}
   /v1/orgs:
     post:

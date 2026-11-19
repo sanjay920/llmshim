@@ -233,6 +233,7 @@ async fn each_role_gets_exactly_its_routes() {
                     (*method != "get" && *method != "delete").then(|| json!({})),
                 )
                 .await;
+            let allowed = allowed || *pattern == "/v1/whoami";
             assert_eq!(
                 answer.status == StatusCode::FORBIDDEN,
                 !allowed,
@@ -250,7 +251,7 @@ async fn each_role_gets_exactly_its_routes() {
 }
 
 #[tokio::test]
-async fn a_token_with_no_role_of_ours_is_authenticated_and_refused_everything() {
+async fn a_token_with_no_role_of_ours_is_authenticated_and_refused_everything_but_whoami() {
     let api = Api::new(true);
     for roles in [
         json!([]),
@@ -268,6 +269,12 @@ async fn a_token_with_no_role_of_ours_is_authenticated_and_refused_everything() 
                     None,
                 )
                 .await;
+            if *pattern == "/v1/whoami" {
+                // The one route any authenticated caller may use: it says the role is none.
+                assert_eq!(answer.status, StatusCode::OK, "{roles}");
+                assert_eq!(answer.body["role"], Value::Null);
+                continue;
+            }
             assert_eq!(
                 answer.status,
                 StatusCode::FORBIDDEN,
@@ -321,7 +328,24 @@ async fn the_actor_is_the_verified_subject_and_never_what_the_caller_typed() {
     assert!(who.body["actor"]
         .as_str()
         .unwrap()
-        .starts_with("oidc:sha256:"));
+        .starts_with("oidc-hash:"));
+}
+
+#[tokio::test]
+async fn a_head_needs_what_the_get_needs() {
+    let api = Api::new(true);
+    let read = api.issuer.token("r", json!(["control:read"]));
+    let none = api.issuer.token("n", json!([]));
+    let head = |token: String| {
+        let api = &api;
+        async move {
+            api.call("HEAD", "/v1/orgs", Some(&token), &[], None)
+                .await
+                .status
+        }
+    };
+    assert_ne!(head(read).await, StatusCode::FORBIDDEN);
+    assert_eq!(head(none).await, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

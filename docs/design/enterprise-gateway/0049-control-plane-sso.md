@@ -38,8 +38,9 @@ issuer's own rules then decide.
 
 With `--sso-config` the actor of every change is **derived from the credential and nothing the caller sends**:
 
-- a verified token: `oidc:<sub>` (the subject, at most 128 characters of visible ASCII; a longer or unusual one is
-  `oidc:sha256:<first 16 hex digits of its digest>`, so a row is never unreadable or a header-injection vector);
+- a verified token: `oidc:<sub>` (the subject, at most 100 characters of visible ASCII; a longer or unusual one is
+  `oidc-hash:<first 16 hex digits of its digest>`, so a row is never unreadable or a header-injection vector, and a
+  hashed actor can never equal a plain one: `oidc:` and `oidc-hash:` differ at the fifth character);
 - the break-glass token: `break-glass`.
 
 `x-llmshim-actor` is **removed from every request** in this mode and replaced with the derived value, so a caller can
@@ -58,12 +59,13 @@ applications grants nothing here, and an unknown value is ignored:
 | `control:admin` | everything: also organizations, teams, projects, team budgets and **publishing a snapshot** |
 
 The highest one wins (admin ⊇ key-issuer ⊇ read). A verified token with none of them is authenticated and **refused
-everything with 403** (`forbidden`, naming the role needed, never the roles held). A route's required role is a
+everything with 403, `whoami` apart** (`forbidden`, naming the role needed, never the roles held). A route's required role is a
 table in the code, and a test fails if a route has none, so a new route cannot ship open. Publishing is admin-only
 because a published snapshot is what the data plane enforces.
 
-`GET /v1/whoami` answers `{"actor", "role", "via"}` (`via`: `oidc` or `break_glass`) for any role: how an operator
-checks what their identity provider's mapping produced.
+`GET /v1/whoami` answers `{"actor", "role", "via"}` (`via`: `oidc` or `break_glass`) for **any authenticated caller,
+including one whose token carries no role** (`role: null`): the one route that needs no role, so an operator whose
+identity provider's mapping produced nothing can see that. A `HEAD` needs what the `GET` does.
 
 ## The shared token
 

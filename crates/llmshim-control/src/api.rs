@@ -80,35 +80,43 @@ impl AppState {
     }
 }
 
-/// The role each route needs under single sign-on (note 0049). A `(method, path)` that is not here
+/// The role each route needs under single sign-on (note 0049); `None` for the one route any
+/// authenticated caller may use (`whoami`: how an operator whose provider's mapping produced no role
+/// can see that). A `(method, path)` that is not here
 /// needs `Admin`, so a route added without a line is closed, not open; a test requires a line for
 /// every entry of [`ROUTES`].
-pub const ROLES: &[(&str, &str, Role)] = &[
-    ("post", "/v1/orgs", Role::Admin),
-    ("get", "/v1/orgs", Role::Read),
-    ("post", "/v1/orgs/{org}/teams", Role::Admin),
-    ("get", "/v1/orgs/{org}/teams", Role::Read),
-    ("put", "/v1/teams/{team}/budget", Role::Admin),
-    ("delete", "/v1/teams/{team}/budget", Role::Admin),
-    ("post", "/v1/teams/{team}/projects", Role::Admin),
-    ("get", "/v1/teams/{team}/projects", Role::Read),
-    ("post", "/v1/projects/{project}/keys", Role::KeyIssuer),
-    ("get", "/v1/orgs/{org}/keys", Role::Read),
-    ("get", "/v1/keys/{key}", Role::Read),
-    ("post", "/v1/keys/{key}/revoke", Role::KeyIssuer),
-    ("post", "/v1/keys/{key}/rotate", Role::KeyIssuer),
-    ("patch", "/v1/keys/{key}/limits", Role::KeyIssuer),
-    ("get", "/v1/whoami", Role::Read),
-    ("get", "/v1/history", Role::Read),
-    ("post", "/v1/orgs/{org}/snapshots", Role::Admin),
-    ("get", "/v1/orgs/{org}/snapshot", Role::Read),
+pub const ROLES: &[(&str, &str, Option<Role>)] = &[
+    ("post", "/v1/orgs", Some(Role::Admin)),
+    ("get", "/v1/orgs", Some(Role::Read)),
+    ("post", "/v1/orgs/{org}/teams", Some(Role::Admin)),
+    ("get", "/v1/orgs/{org}/teams", Some(Role::Read)),
+    ("put", "/v1/teams/{team}/budget", Some(Role::Admin)),
+    ("delete", "/v1/teams/{team}/budget", Some(Role::Admin)),
+    ("post", "/v1/teams/{team}/projects", Some(Role::Admin)),
+    ("get", "/v1/teams/{team}/projects", Some(Role::Read)),
+    ("post", "/v1/projects/{project}/keys", Some(Role::KeyIssuer)),
+    ("get", "/v1/orgs/{org}/keys", Some(Role::Read)),
+    ("get", "/v1/keys/{key}", Some(Role::Read)),
+    ("post", "/v1/keys/{key}/revoke", Some(Role::KeyIssuer)),
+    ("post", "/v1/keys/{key}/rotate", Some(Role::KeyIssuer)),
+    ("patch", "/v1/keys/{key}/limits", Some(Role::KeyIssuer)),
+    ("get", "/v1/whoami", None),
+    ("get", "/v1/history", Some(Role::Read)),
+    ("post", "/v1/orgs/{org}/snapshots", Some(Role::Admin)),
+    ("get", "/v1/orgs/{org}/snapshot", Some(Role::Read)),
 ];
 
-fn required_role(method: &str, path: &str) -> Role {
+fn required_role(method: &str, path: &str) -> Option<Role> {
+    // A HEAD needs what the GET does.
+    let method = if method.eq_ignore_ascii_case("head") {
+        "get"
+    } else {
+        method
+    };
     ROLES
         .iter()
         .find(|(m, p, _)| m.eq_ignore_ascii_case(method) && *p == path)
-        .map_or(Role::Admin, |(_, _, role)| *role)
+        .map_or(Some(Role::Admin), |(_, _, role)| *role)
 }
 
 /// Why `token` cannot be the API token, if it cannot.
@@ -327,15 +335,17 @@ async fn authenticate(
     let needed = match request.extensions().get::<axum::extract::MatchedPath>() {
         Some(path) => required_role(request.method().as_str(), path.as_str()),
         // No route matched: the fallback answers 404, which needs no role.
-        None => Role::Read,
+        None => None,
     };
-    if principal.role.is_none_or(|role| role < needed) {
-        return ApiError::new(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            format!("this needs the {} role", needed.name()),
-        )
-        .into_response();
+    if let Some(needed) = needed {
+        if principal.role.is_none_or(|role| role < needed) {
+            return ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                format!("this needs the {} role", needed.name()),
+            )
+            .into_response();
+        }
     }
     // The actor is visible ASCII by construction; if it were ever not, the request stops here
     // rather than go on to a handler that would read a caller-typed header instead.
@@ -819,8 +829,14 @@ mod tests {
 
     #[test]
     fn a_route_with_no_line_in_the_table_needs_admin() {
-        assert_eq!(required_role("get", "/v1/not-yet-classified"), Role::Admin);
-        assert_eq!(required_role("DELETE", "/v1/orgs"), Role::Admin);
-        assert_eq!(required_role("GET", "/v1/orgs"), Role::Read);
+        assert_eq!(
+            required_role("get", "/v1/not-yet-classified"),
+            Some(Role::Admin)
+        );
+        assert_eq!(required_role("DELETE", "/v1/orgs"), Some(Role::Admin));
+        assert_eq!(required_role("GET", "/v1/orgs"), Some(Role::Read));
+        // A HEAD needs what the GET does; whoami needs no role.
+        assert_eq!(required_role("HEAD", "/v1/orgs"), Some(Role::Read));
+        assert_eq!(required_role("get", "/v1/whoami"), None);
     }
 }
