@@ -85,9 +85,10 @@ metric label, so a hostile or buggy classifier cannot put text into a response o
 ## Follow-up (request classification on the media routes)
 
 The requests of **embeddings, speech, images and transcription** are judged too, from the same payload the regex rules
-scan (the input, the prompt, the options; a transcription's audio is left out like any media). A text with nothing
-in it (only media, keys or blanks) is **not sent**: there is nothing to judge, and no call is made. A transcript is
-judged as an answer, as before.
+scan (the input, the prompt, the options; a transcription's audio is left out like any media). The model name is not part of the text (it is the operator's routing). A text with nothing
+in it (only media, keys or blanks) is **not sent**, request or answer: there is nothing to judge, and no call is made;
+so an empty answer passes even when its rule fails closed and the classifier is down. A transcription upload still
+carries its filename and media type as strings, so it is sent. A transcript is judged as an answer, as before.
 
 ## Known limits
 
