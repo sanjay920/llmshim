@@ -142,6 +142,14 @@ impl TrustedPolicyScope {
         }
     }
 
+    /// Mark the job as one whose payload holds references into the media object store (note 0050):
+    /// version 4, so a replica that cannot read them refuses the job instead of sending a reference
+    /// to a provider as if it were the caller's data.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn set_media_refs(&mut self) {
+        self.version = 4;
+    }
+
     /// The tenant's budget window this scope draws on, if it has a valid budget
     /// that is priced and bounded before sending (what outage admission, note
     /// 0027, requires): `(tenant_key, window_secs, limit_nanos)`.
@@ -249,7 +257,7 @@ impl TrustedPolicyScope {
 
     #[cfg(feature = "redis-coordination")]
     pub(crate) fn is_current(&self) -> bool {
-        matches!(self.version, 1..=3)
+        matches!(self.version, 1..=4)
     }
 }
 
@@ -1255,7 +1263,7 @@ impl AttemptCoordinator {
         attempt: &PreparedAttempt<'_>,
         scope: &TrustedPolicyScope,
     ) -> Result<(), AttemptPolicyRefusal> {
-        if !matches!(scope.version, 1..=3) {
+        if !matches!(scope.version, 1..=4) {
             return Err(AttemptPolicyRefusal::new(
                 AttemptPolicyRefusalKind::CoordinatorUnavailable,
                 None,
@@ -2704,6 +2712,33 @@ mod tests {
         // A scope that has no operation field (every job written before this) reads as chat.
         let old: TrustedPolicyScope = serde_json::from_value(chat).unwrap();
         assert_eq!(old.operation, crate::policy::DispatchOperation::Chat);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn a_scope_with_media_references_is_version_4_and_a_plain_media_scope_stays_3() {
+        // Version 4 is what makes a replica that cannot read references refuse the job (note 0050):
+        // it accepts versions 1 to 3 only, so it never sends a reference to a provider as data.
+        let mut plain = scope("operation", None, None);
+        plain.set_operation(crate::policy::DispatchOperation::Images);
+        let value = serde_json::to_value(&plain).unwrap();
+        assert_eq!(
+            (value["version"].clone(), value["operation"].clone()),
+            (3.into(), "Images".into())
+        );
+        let mut staged = scope("operation", None, None);
+        staged.set_operation(crate::policy::DispatchOperation::Transcription);
+        staged.set_media_refs();
+        let value = serde_json::to_value(&staged).unwrap();
+        assert_eq!(value["version"], 4);
+        let back: TrustedPolicyScope = serde_json::from_value(value).unwrap();
+        assert_eq!(back.version, 4);
+        assert_eq!(
+            back.operation,
+            crate::policy::DispatchOperation::Transcription
+        );
+        #[cfg(feature = "redis-coordination")]
+        assert!(back.is_current());
     }
 
     #[test]

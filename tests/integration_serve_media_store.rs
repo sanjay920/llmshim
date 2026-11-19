@@ -172,3 +172,65 @@ fn check_names_a_bad_store_by_path_and_an_absent_secret_is_status_3() {
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("media_store"), "{stderr}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_single_instance_keeps_its_media_in_memory_and_never_touches_the_store() {
+    // `[media_store]` is for a fleet's media routes (note 0050): one process has no replica to hand
+    // an object to, so the store stays unused even when it is configured.
+    let big = "A".repeat(60_000);
+    let mut upstream = mockito::Server::new_async().await;
+    let images = upstream
+        .mock("POST", "/images/generations")
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({"created": 1, "data": [{"b64_json": big}],
+            "usage": {"input_tokens": 5, "output_tokens": 100}})
+            .to_string(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let shared = tempdir::Dir::new("media-single-store");
+    let text = harness::config(
+        &upstream.url(),
+        "[admin]\nport = 0\ntoken = { env = \"SERVE_E2E_ADMIN_TOKEN\" }",
+    )
+    .replace("kind = \"openai-compatible\"", "kind = \"openai\"")
+    .replace("providers.inference", "providers.openai")
+        + &format!(
+            "\n[media_store]\nkind = \"file\"\npath = \"{}\"\n",
+            shared.0.display()
+        );
+    let server = harness::start(&text, "media-single", &[]);
+    let answer = reqwest::Client::new()
+        .post(format!("{}/v1/images/generations", server.base))
+        .bearer_auth(harness::CALLER_KEY)
+        .json(&json!({"model": "openai/gpt-image-1", "prompt": "a cat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), 200);
+    let body: serde_json::Value = answer.json().await.unwrap();
+    assert_eq!(
+        body["data"][0]["b64_json"].as_str().map(str::len),
+        Some(60_000),
+        "{}",
+        body.to_string().chars().take(300).collect::<String>()
+    );
+    images.assert_async().await;
+    let mut entries = std::fs::read_dir(&shared.0).unwrap();
+    assert!(entries.next().is_none(), "nothing was written to the store");
+    let metrics = reqwest::Client::new()
+        .get(format!("{}/metrics", server.admin.clone().unwrap()))
+        .bearer_auth(harness::ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !metrics.contains("llmshim_gateway_media_store_total"),
+        "{metrics}"
+    );
+}
