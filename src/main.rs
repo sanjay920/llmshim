@@ -688,13 +688,39 @@ async fn cmd_proxy(options: &cli::ServerOptions) -> Result<(), String> {
 /// stops accepting connections and drains in-flight requests before exiting.
 #[cfg(feature = "proxy")]
 async fn shutdown_signal() {
+    shutdown_signal_registered().await
+}
+
+/// The shutdown signals registered NOW, and the future that waits for one. `serve` registers them
+/// before its first audit record, so a SIGTERM can never find the process after "started" and before
+/// anything listens for it (note 0047).
+#[cfg(feature = "proxy")]
+fn shutdown_signal_registered() -> impl std::future::Future<Output = ()> {
     use tokio::signal;
+    // On Unix both SIGINT and SIGTERM are registered here, now, not when the future is first
+    // polled; elsewhere Ctrl-C registers when polled.
+    #[cfg(unix)]
+    let interrupt = signal::unix::signal(signal::unix::SignalKind::interrupt());
+    #[cfg(unix)]
+    let ctrl_c = async move {
+        match interrupt {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => {
+                let _ = signal::ctrl_c().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
     let ctrl_c = async {
         let _ = signal::ctrl_c().await;
     };
     #[cfg(unix)]
-    let terminate = async {
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+    let registered = signal::unix::signal(signal::unix::SignalKind::terminate());
+    #[cfg(unix)]
+    let terminate = async move {
+        match registered {
             Ok(mut s) => {
                 s.recv().await;
             }
@@ -703,11 +729,13 @@ async fn shutdown_signal() {
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
+    async move {
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate => {}
+        }
+        eprintln!("shutdown signal received; draining in-flight requests...");
     }
-    eprintln!("shutdown signal received; draining in-flight requests...");
 }
 
 #[cfg(feature = "gateway")]
@@ -1024,7 +1052,7 @@ async fn pull_loop(
                     let current = reloader.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
                         let env = |name: &str| std::env::var(name).ok();
-                        current.reload(&env)
+                        current.reload_as("control-plane", &env)
                     })
                     .await;
                     match outcome {
@@ -1487,6 +1515,9 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
              listener without authentication; configure [admin] to separate them."
         ),
     }
+    // The shutdown signals are registered before the first audit record, so a SIGTERM can never find
+    // the process after "started" with nothing listening for it (note 0047).
+    let signalled = shutdown_signal_registered();
     // The audit log's first record of this run (note 0047): refusing to serve when it cannot be
     // written, since a server that cannot be audited must not run unaudited.
     if let Some(audit) = &built.audit {
@@ -1516,12 +1547,20 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
     let (stop, stopped) = tokio::sync::watch::channel(false);
     let stop_all = stop.clone();
     let audit_on_stop = built.audit.clone();
+    // Whether a signal asked for the stop: a stop without one is a listener that ended on its own.
+    let signalled_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signalled_flag = signalled_stop.clone();
     tokio::spawn(async move {
-        shutdown_signal().await;
+        signalled.await;
+        signalled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(audit) = audit_on_stop {
             if let Err(message) =
                 audit.record("server.stopping", "process", "ok", serde_json::json!({}))
             {
+                llmshim::gateway::metrics::incr(
+                    llmshim::gateway::metrics::AUDIT_WRITE_FAILURES,
+                    &[],
+                );
                 eprintln!("error: the audit log could not record the shutdown: {message}");
             }
         }
@@ -1606,6 +1645,21 @@ async fn cmd_serve(options: &cli::ServeOptions) -> i32 {
         }
         None => main_server.await,
     };
+    // A listener that ended on its own (a serve error, not a signal) is recorded too, so a start with
+    // no stop in the audit log means the process died without running this (note 0047).
+    if !signalled_stop.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(audit) = &built.audit {
+            let outcome = if result.is_ok() { "ok" } else { "error" };
+            if let Err(message) = audit.record(
+                "server.stopping",
+                "process",
+                outcome,
+                serde_json::json!({"cause": "a listener ended"}),
+            ) {
+                eprintln!("error: the audit log could not record the stop: {message}");
+            }
+        }
+    }
     // The logs queue their lines for writer threads: write what is still queued.
     logs.close();
     match result {

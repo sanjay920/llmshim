@@ -63,27 +63,10 @@ fn verify(path: &Path) -> (Option<i32>, String) {
     )
 }
 
-/// A server is only safe to signal once it answers: its shutdown handler is installed after the
-/// first audit record is written, and a SIGTERM before that takes the signal's default action.
-async fn wait_until_serving(server: &Server) {
-    let admin = server.admin.clone().expect("an [admin] listener");
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let up = reqwest::Client::new()
-            .get(format!("{admin}/health"))
-            .send()
-            .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false);
-        if up || std::time::Instant::now() > deadline {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
+/// SIGTERM straight after the first record: the shutdown signals are registered before "started" is
+/// written, so no wait for the server to answer is needed (a SIGTERM that found no handler would end
+/// the process by the signal, and this assertion on a clean exit would fail).
 async fn stop(server: &mut Server) {
-    wait_until_serving(server).await;
     terminate(server);
     let status = exit_status_within(server, Duration::from_secs(20)).await;
     assert!(status.is_some_and(|s| s.success()), "{status:?}");

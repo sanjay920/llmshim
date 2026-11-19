@@ -196,6 +196,14 @@ impl StatusHandle {
     }
 }
 
+/// At most this many names go into one audit record: a record must stay far below what a restart
+/// can read back (note 0047), and the total beside it says how many there were.
+const AUDIT_NAMES: usize = 100;
+
+fn capped(names: &[String]) -> &[String] {
+    &names[..names.len().min(AUDIT_NAMES)]
+}
+
 /// What one reload did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -337,16 +345,27 @@ impl Reloader {
     /// once. For an operator's signal. Blocking: it reads files, so call it from
     /// a blocking task.
     pub fn reload(&self, env: &dyn Fn(&str) -> Option<String>) -> Outcome {
-        self.run(env, false)
+        self.run(env, false, "operator")
+    }
+
+    /// [`Self::reload`] on behalf of `actor` in the audit log (note 0047): the control-plane puller
+    /// reloads when it has pulled a new snapshot, and that is not an operator's decision.
+    pub fn reload_as(&self, actor: &'static str, env: &dyn Fn(&str) -> Option<String>) -> Outcome {
+        self.run(env, false, actor)
     }
 
     /// [`Self::reload`] for a timer: a change is applied only after two polls in
     /// a row have seen exactly the same one ([`Outcome::Deferred`] until then).
     pub fn poll(&self, env: &dyn Fn(&str) -> Option<String>) -> Outcome {
-        self.run(env, true)
+        self.run(env, true, "poller")
     }
 
-    fn run(&self, env: &dyn Fn(&str) -> Option<String>, debounce: bool) -> Outcome {
+    fn run(
+        &self,
+        env: &dyn Fn(&str) -> Option<String>,
+        debounce: bool,
+        actor: &'static str,
+    ) -> Outcome {
         // One reload at a time; a second caller waits and then sees the first's
         // result as its starting point.
         let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
@@ -402,7 +421,7 @@ impl Reloader {
                 }
             }
         });
-        self.audit_step(&step, debounce);
+        self.audit_step(&step, actor);
         match step {
             Step::Applied {
                 generation,
@@ -423,11 +442,10 @@ impl Reloader {
     /// paths of the settings at fault, never their values or the issues' text. Unchanged and
     /// deferred checks change nothing and are not recorded. A failed write is counted and
     /// reported; the log then takes no more records.
-    fn audit_step(&self, step: &Step, debounce: bool) {
+    fn audit_step(&self, step: &Step, actor: &'static str) {
         let Some(audit) = &self.handles.audit else {
             return;
         };
-        let actor = if debounce { "poller" } else { "operator" };
         let written = match step {
             Step::Applied {
                 generation,
@@ -447,8 +465,10 @@ impl Reloader {
                     "credentials": credentials,
                     "config_sha256": config_sha256,
                     "changes": changes,
-                    "keys_added": keys_added,
-                    "keys_removed": keys_removed,
+                    "keys_added": capped(keys_added),
+                    "keys_added_total": keys_added.len(),
+                    "keys_removed": capped(keys_removed),
+                    "keys_removed_total": keys_removed.len(),
                     "snapshot": snapshot,
                 }),
             ),
@@ -460,7 +480,8 @@ impl Reloader {
                 actor,
                 "rejected",
                 json!({
-                    "paths": issues.iter().map(|issue| issue.path.clone()).collect::<Vec<_>>(),
+                    "paths": capped(&issues.iter().map(|issue| issue.path.clone()).collect::<Vec<_>>()),
+                    "paths_total": issues.len(),
                 }),
             ),
             _ => return,

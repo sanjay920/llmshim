@@ -50,20 +50,28 @@ audit_log = "/var/log/llmshim/audit.jsonl"   # an absolute file path; never "std
   carries the chain on. A symbolic link, a directory, a file that ends in an **incomplete** record (a crash mid-write)
   or whose last record does not match its own hash is **refused at start** (`logging.audit_log`): a server that
   cannot be audited must not run unaudited. Keep the file, run `llmshim audit verify`, and start a new log.
+  The file is opened without following a link, and **one writer per file** is enforced with an exclusive advisory
+  lock held for the process's life: a second gateway on the same path is refused at start. The mode `0600` applies
+  to a file the gateway creates; a file that already exists keeps the permissions the operator gave it.
+- **One spelling.** A line verifies only if it is byte-for-byte what the writer wrote: whitespace, a carriage return,
+  a reordered key or a repeated key (which a JSON parser resolves to its last value) all fail at that line, because
+  the hash is over the parsed record.
 - **Events:**
   - `server.started` (actor `process`): version, the configuration file's SHA-256, the provider names, the credential
     count, whether callers authenticate, and the snapshot in force (org, generation, signer) with `[control_plane]`.
     If it cannot be written the server does not serve.
-  - `server.stopping` (actor `process`): on SIGTERM / Ctrl-C, before the listeners drain.
-  - `config.reloaded` with `outcome: applied` (actor `operator` for a signal, `poller` for the file watcher): the new
+  - `server.stopping` (actor `process`): on SIGTERM / Ctrl-C, before the listeners drain. The signal handlers are
+    registered before `server.started` is written, so a signal in that window is recorded, not fatal. If a listener
+    ends without a signal, a `server.stopping` with `cause: "a listener ended"` is written instead.
+  - `config.reloaded` with `outcome: applied` (actor `operator` for a signal, `poller` for the file watcher, `control-plane` for a pulled snapshot): the new
     generation, the credential count, the file's SHA-256, `changes` (the provider, route and limit changes a reload
-    lists; empty for a keys-only reload), `keys_added` and `keys_removed` **by name**, and the snapshot (org,
+    lists; empty for a keys-only reload), `keys_added` and `keys_removed` **by name** (at most 100 each, with `keys_added_total` / `keys_removed_total`), and the snapshot (org,
     generation, signer). With `outcome: rejected` (the first time a given refusal happens; a repeated one is not
     re-recorded): the **paths** of the settings at fault, never their values or messages. Checks that find nothing
     new, and a change waiting to be seen twice, change nothing and are not recorded.
 - **A failed write** (disk full, permission) is counted (`llmshim_audit_write_failures_total`), reported on stderr, and
   **closes the log**: it takes no more records, because the file may end in half a record and appending after it would
-  corrupt the chain. A reload that was already applied stays applied; the gap is visible as the failure counter and as
+  corrupt the chain; `/v1/serve/config` shows it as `audit.write_failed`. A reload that was already applied stays applied; the gap is visible as the failure counter and as
   the next restart's refusal to continue a damaged log. (A write-ahead design would refuse the reload instead; the
   reload's outcome is not known before it happens, so the record is written after it.)
 - `llmshim audit verify <FILE>`: exit 0 and `intact, N record(s), head <hash>`; exit 1 naming the first broken line and

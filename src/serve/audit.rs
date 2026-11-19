@@ -29,6 +29,8 @@ const TAIL_BYTES: u64 = 1 << 20;
 pub struct Head {
     pub records: u64,
     pub head: String,
+    /// True after a write failed: the log takes no more records (see `AuditLog::record`).
+    pub write_failed: bool,
 }
 
 struct Inner {
@@ -106,6 +108,14 @@ fn parse_record(line: &str) -> Result<Map<String, Value>, String> {
     if text("hash") != Some(digest(&record).as_str()) {
         return Err("does not match its own hash (it was altered)".into());
     }
+    // The line must be exactly what the writer wrote: any other spelling of the same record
+    // (whitespace, a carriage return, a different key order, a duplicated key that a parser would
+    // resolve to its last value) is a different file, and the hash is over the parsed record.
+    if serde_json::to_string(&record).ok().as_deref() != Some(line) {
+        return Err(
+            "is not in the form the log writes (it was reformatted or has a repeated key)".into(),
+        );
+    }
     Ok(record)
 }
 
@@ -127,11 +137,20 @@ impl AuditLog {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            // Owner-only when created (an existing file keeps the permissions its operator gave it),
+            // and never through a link, whatever happens between the check above and this open.
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let mut file = options
             .open(path)
             .map_err(|error| format!("cannot open {}: {}", path.display(), error.kind()))?;
+        // One writer per log: two processes appending to one file would fork the chain.
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|_| {
+            format!(
+                "{} is in use by another process: an audit log has one writer",
+                path.display()
+            )
+        })?;
         let (records, head) = Self::tail(&mut file, path)?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -235,6 +254,7 @@ impl AuditLog {
         Head {
             records: inner.records,
             head: inner.head.clone(),
+            write_failed: inner.poisoned,
         }
     }
 }
@@ -268,7 +288,9 @@ pub fn verify(path: &Path) -> Result<Verified, Broken> {
     }
     let mut records = 0u64;
     let mut head = GENESIS.to_owned();
-    for (index, line) in text.lines().enumerate() {
+    // Split on the newline alone: `str::lines` would also drop a trailing carriage return, and a
+    // line that is not byte-for-byte what the writer wrote must not verify.
+    for (index, line) in text.split_terminator('\n').enumerate() {
         let number = index as u64 + 1;
         let broken = |reason: String| Broken {
             line: number,
@@ -443,6 +465,54 @@ mod tests {
         let probe = temp("field-extra");
         std::fs::write(&probe, format!("{}\n{}\n", lines[0], Value::Object(extra))).unwrap();
         assert_eq!(verify(&probe).unwrap_err().line, 2);
+    }
+
+    #[test]
+    fn a_second_writer_on_the_same_log_is_refused_while_the_first_holds_it() {
+        let path = temp("lock");
+        let first = AuditLog::open(&path, "gw-a").unwrap();
+        let error = AuditLog::open(&path, "gw-b").err().unwrap();
+        assert!(error.contains("one writer"), "{error}");
+        // Once the first closes, the log can be continued.
+        drop(first);
+        assert!(AuditLog::open(&path, "gw-b").is_ok());
+    }
+
+    #[test]
+    fn a_line_must_be_exactly_what_the_writer_wrote() {
+        let path = temp("format");
+        written(&path, 3);
+        let original = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = original.lines().collect();
+        let probe = |second: String| {
+            let probe = temp("format-probe");
+            std::fs::write(&probe, format!("{}\n{}\n{}\n", lines[0], second, lines[2])).unwrap();
+            verify(&probe)
+        };
+        // Whitespace, a carriage return, and a key written twice all parse to the same record, and
+        // none of them is what the log wrote.
+        assert_eq!(probe(lines[1].replacen(",", ", ", 1)).unwrap_err().line, 2);
+        assert_eq!(probe(format!("{}\r", lines[1])).unwrap_err().line, 2);
+        let duplicated = lines[1].replacen(
+            "\"outcome\":\"applied\"",
+            "\"outcome\":\"rejected\",\"outcome\":\"applied\"",
+            1,
+        );
+        assert_ne!(duplicated, lines[1]);
+        assert_eq!(probe(duplicated).unwrap_err().line, 2);
+        // The untouched line still verifies.
+        assert!(probe(lines[1].to_owned()).is_ok());
+    }
+
+    #[test]
+    fn the_head_reports_a_log_that_has_stopped_taking_records() {
+        let path = temp("failed");
+        let log = written(&path, 1);
+        assert!(!log.head().write_failed);
+        log.inner.lock().unwrap().poisoned = true;
+        let head = log.head();
+        assert!(head.write_failed);
+        assert_eq!(head.records, 1);
     }
 
     #[test]
