@@ -35,7 +35,7 @@ impl Source {
         match self {
             Self::Fixed(value) => Ok(value.clone()),
             Self::File(reference) => {
-                read_secret(reference, &|_| None).map_err(|_| BlobError::Denied)
+                read_secret(reference, &|_| None).map_err(|_| BlobError::Unavailable)
             }
         }
     }
@@ -181,7 +181,7 @@ impl S3Store {
         (format!("{}://{}{}", self.scheme, host, path), host, path)
     }
 
-    async fn call(
+    async fn call_once(
         &self,
         method: &str,
         name: &str,
@@ -302,6 +302,28 @@ async fn read_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<
     }
 }
 
+impl S3Store {
+    /// One operation. A refusal (401 or 403) may be a credential that rotated between two files or
+    /// since the cache was filled, so the cache is dropped and the operation tried once more.
+    async fn call(
+        &self,
+        method: &str,
+        name: &str,
+        query: &[(String, String)],
+        body: Vec<u8>,
+        limit: usize,
+    ) -> Result<(u16, Vec<u8>), BlobError> {
+        let first = self
+            .call_once(method, name, query, body.clone(), limit)
+            .await?;
+        if !matches!(first.0, 401 | 403) {
+            return Ok(first);
+        }
+        *self.loaded.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.call_once(method, name, query, body, limit).await
+    }
+}
+
 fn status_error(status: u16) -> BlobError {
     match status {
         401 | 403 => BlobError::Denied,
@@ -349,8 +371,9 @@ impl BlobStore for S3Store {
     async fn list(&self) -> Result<Vec<Listed>, BlobError> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
-        // A hard bound on pages: a bucket that never stops listing is not swept forever.
-        for _ in 0..1000 {
+        // A hard bound on pages (ten million objects): a bucket that never stops listing is not swept
+        // forever.
+        for _ in 0..10_000 {
             let mut query = vec![
                 ("list-type".to_owned(), "2".to_owned()),
                 ("prefix".to_owned(), self.prefix.clone()),
@@ -364,9 +387,11 @@ impl BlobStore for S3Store {
             }
             let page = parse_listing(&String::from_utf8_lossy(&body), &self.prefix);
             out.extend(page.objects);
-            match page.next {
-                Some(next) => token = Some(next),
-                None => return Ok(out),
+            match (page.truncated, page.next) {
+                (_, Some(next)) => token = Some(next),
+                (false, None) => return Ok(out),
+                // Cut, with no way to continue: a partial list is not passed off as the whole.
+                (true, None) => return Err(BlobError::Unavailable),
             }
         }
         Err(BlobError::Unavailable)
@@ -379,6 +404,7 @@ impl BlobStore for S3Store {
 
 struct Page {
     objects: Vec<Listed>,
+    truncated: bool,
     next: Option<String>,
 }
 
@@ -422,7 +448,11 @@ fn parse_listing(xml: &str, prefix: &str) -> Page {
     let next = truncated
         .then(|| between(xml, "NextContinuationToken", 0).map(|(t, _)| unescape(t)))
         .flatten();
-    Page { objects, next }
+    Page {
+        objects,
+        truncated,
+        next,
+    }
 }
 
 #[cfg(test)]
@@ -526,7 +556,8 @@ mod tests {
                 .mock("GET", "/media/a/b")
                 .with_status(status)
                 .with_body("<Error><Message>secret details</Message></Error>")
-                .expect(1)
+                // A refusal is tried once more with freshly read credentials.
+                .expect(if matches!(status, 401 | 403) { 2 } else { 1 })
                 .create_async()
                 .await;
             assert_eq!(store.get("a/b", 100).await, Err(expected), "{status}");
@@ -622,6 +653,102 @@ mod tests {
         assert_eq!(keys, ["20260101/a", "20260102/b"]);
         first.assert_async().await;
         second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_refusal_drops_the_cached_credentials_and_tries_once_more() {
+        // A key file that rotated after the cache was filled: the first signature is refused, the
+        // second, from the re-read file, is accepted.
+        let path = std::env::temp_dir().join(format!("llmshim-s3-rot-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "old-secret\n").unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let (id, key) = (
+            secret("ID"),
+            SecretRef {
+                env: None,
+                file: Some(path.clone()),
+            },
+        );
+        let store = S3Store::new(
+            &S3Settings {
+                bucket: "media",
+                region: "us-east-1",
+                endpoint: Some(&server.url()),
+                path_style: None,
+                prefix: "",
+                access_key_id: &id,
+                secret_access_key: &key,
+                session_token: None,
+                ca_pem: None,
+                max_object_bytes: 1024,
+            },
+            &|_| Some("AKID".to_owned()),
+        )
+        .unwrap();
+        // Fill the cache with the old secret, then rotate the file.
+        store.credentials().unwrap();
+        std::fs::write(&path, "new-secret\n").unwrap();
+        let refused = server
+            .mock("GET", "/media/a/b")
+            .with_status(403)
+            .expect(1)
+            .create_async()
+            .await;
+        let accepted = server
+            .mock("GET", "/media/a/b")
+            .with_status(200)
+            .with_body("ok")
+            .create_async()
+            .await;
+        assert_eq!(store.get("a/b", 100).await.unwrap(), b"ok");
+        refused.assert_async().await;
+        accepted.assert_async().await;
+        assert_eq!(store.credentials().unwrap().1, "new-secret");
+        // A refusal that persists is reported once, after one retry, as a class.
+        let mut second = mockito::Server::new_async().await;
+        let always = second
+            .mock("GET", "/media/a/b")
+            .with_status(403)
+            .expect(2)
+            .create_async()
+            .await;
+        let denied = S3Store::new(
+            &S3Settings {
+                bucket: "media",
+                region: "us-east-1",
+                endpoint: Some(&second.url()),
+                path_style: None,
+                prefix: "",
+                access_key_id: &id,
+                secret_access_key: &secret("KEY"),
+                session_token: None,
+                ca_pem: None,
+                max_object_bytes: 1024,
+            },
+            &|_| Some("v".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(denied.get("a/b", 10).await, Err(BlobError::Denied));
+        always.assert_async().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_is_cut_with_no_way_to_continue_is_an_error_not_a_short_list() {
+        let mut server = mockito::Server::new_async().await;
+        let _cut = server
+            .mock("GET", "/media")
+            .match_query(Matcher::Any)
+            .with_body(
+                "<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>20260101/a</Key>\
+                 <LastModified>2026-01-01T00:00:00Z</LastModified></Contents></ListBucketResult>",
+            )
+            .create_async()
+            .await;
+        assert_eq!(
+            store(&server.url(), "").list().await,
+            Err(BlobError::Unavailable)
+        );
     }
 
     #[test]

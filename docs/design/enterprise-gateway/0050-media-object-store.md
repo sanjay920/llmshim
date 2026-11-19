@@ -56,8 +56,10 @@ SHA256 over a canonical request, written with `ring`, which `serve` already link
 HTTP operations (`PUT`, `GET`, `DELETE`, and a paginated `ListObjectsV2` for the sweeper) on the HTTP client the
 gateway already has. The cloud-identity backends and the AWS credential chain use the SDK crates that `serve-cloud`
 already links for Bedrock, Vertex and Azure, so a build without cloud features stays as lean as it is (0020, 0033).
-Credentials are secret references (`{ env }` or `{ file }`, 0033) and are **re-read at most once a minute**, so a
-rotated key file or a projected Kubernetes secret takes effect without a restart.
+Credentials are secret references (`{ env }` or `{ file }`, 0033): a **file** is re-read at most once a minute (and
+at once after the store refuses a request, since a rotation may have landed between two files), so a rotated key
+file or a projected Kubernetes secret takes effect without a restart; an **environment variable** is read once, as
+it cannot change in a running process.
 
 ## What is stored, and how it is protected
 
@@ -98,7 +100,8 @@ rotated key file or a projected Kubernetes secret takes effect without a restart
   retried on a worker that cannot read either. The provider is never paid for a call whose input was lost.
 - **The answer's objects cannot be read** by the origin: `502`, and the call **was** paid for (it is recorded as completed
   with its tokens and cost, as 0043 records a blocked answer); the objects are left to the sweeper.
-- **Credentials rotate or expire:** re-read once a minute; a `403` from the store is the same `503`, counted by class.
+- **Credentials rotate or expire:** a file is re-read once a minute and after a refusal (one retry); a refusal that
+  persists is the same `503`, counted by class. An unreadable credential file is `Unavailable`, not `Denied`.
 - **The store loses an object:** a read of a missing object is an error naming nothing of the caller's.
 - The store is **not** a queue and holds no state the fleet needs after a request: losing the whole bucket loses
   only requests in flight.
@@ -115,6 +118,23 @@ rotated key file or a projected Kubernetes secret takes effect without a restart
 3. **Cloud identities and native backends.** The AWS credential chain for `s3` (IRSA, Pod Identity, ECS/EC2),
    `gcs` (workload identity, via `serve-cloud`'s Vertex identity), `azure-blob` (workload identity or SAS, via the
    Azure identity), with `serve-check`-style fixtures; the Helm chart's PVC and service-account examples.
+
+## What the sweeper may delete
+
+Only objects with the **generated shape**, `<8 digits>/<32 lowercase hex>` under the backend's prefix or directory,
+and only when older than `ttl_secs`. A bucket (or a directory) shared with anything else loses nothing: its other
+objects are listed and ignored, whatever their age. An S3 listing that is cut off with no continuation token is an
+error, not a short list; one longer than ten million objects is not swept.
+
+## Operating notes
+
+- **One user.** Objects are `0600` and directories `0700`, so every replica of a `file` store must run as the same
+  user (the same `runAsUser`/`fsGroup` in a Deployment does). A store shared between users is a different threat
+  model and needs a different backend.
+- **Local access.** `file` reads and writes follow a symlink the operator (or anyone with write access to the
+  directory) plants inside it; the store's directory must be one only the gateway can write.
+- **A reference holds the key.** `BlobRef`'s `Debug` prints the name and length only; nothing may log the reference
+  value itself.
 
 ## Not built (and not planned)
 

@@ -58,6 +58,12 @@ impl BlobStore for FileStore {
         tokio::task::spawn_blocking(move || {
             let parent = path.parent().ok_or(BlobError::Invalid)?;
             std::fs::create_dir_all(parent).map_err(|e| classify(&e))?;
+            #[cfg(unix)]
+            {
+                // The date directory this write may have made: owner-only, like the objects in it.
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
             let temporary = parent.join(format!(
                 ".tmp-{}",
                 path.file_name().and_then(|n| n.to_str()).unwrap_or("x")
@@ -272,12 +278,23 @@ mod tests {
         let root = dir("sweep");
         let store = FileStore::new(&root, 1024).unwrap();
         let canonical = root.canonicalize().unwrap();
-        store.put("p/20260101/old", b"x".to_vec()).await.unwrap();
+        let (old, orphan, new) = (
+            format!("20260101/{}", "a".repeat(32)),
+            "c".repeat(32),
+            format!("20260101/{}", "b".repeat(32)),
+        );
+        store.put(&old, b"x".to_vec()).await.unwrap();
         // A write that died between create and rename.
-        std::fs::write(canonical.join("p/20260101/.tmp-orphan"), b"x").unwrap();
+        std::fs::write(canonical.join(format!("20260101/.tmp-{orphan}")), b"x").unwrap();
+        // Old, in the same directory, and not ours: never swept.
+        std::fs::write(canonical.join("20260101/notes.txt"), b"x").unwrap();
         // Aged by setting the modification time, not by waiting: no deadline for a loaded machine.
         let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
-        for file in ["p/20260101/old", "p/20260101/.tmp-orphan"] {
+        for file in [
+            old.clone(),
+            format!("20260101/.tmp-{orphan}"),
+            "20260101/notes.txt".to_owned(),
+        ] {
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(canonical.join(file))
@@ -285,15 +302,13 @@ mod tests {
                 .set_modified(two_hours_ago)
                 .unwrap();
         }
-        store.put("p/20260101/new", b"x".to_vec()).await.unwrap();
+        store.put(&new, b"x".to_vec()).await.unwrap();
         let removed = sweep(&store, Duration::from_secs(3600)).await.unwrap();
         assert_eq!(removed, 2);
-        assert!(store.get("p/20260101/new", 10).await.is_ok());
-        assert_eq!(
-            store.get("p/20260101/old", 10).await,
-            Err(BlobError::NotFound)
-        );
-        assert!(!canonical.join("p/20260101/.tmp-orphan").exists());
+        assert!(store.get(&new, 10).await.is_ok());
+        assert_eq!(store.get(&old, 10).await, Err(BlobError::NotFound));
+        assert!(!canonical.join(format!("20260101/.tmp-{orphan}")).exists());
+        assert!(canonical.join("20260101/notes.txt").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

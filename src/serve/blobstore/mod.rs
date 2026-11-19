@@ -166,6 +166,16 @@ pub fn valid_name(name: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+/// Whether `name` has the shape [`new_name`] makes (`<8 digits>/<32 lowercase hex>`): the only
+/// objects the sweeper may delete, so a bucket or directory shared with anything else loses nothing.
+pub fn is_generated_name(name: &str) -> bool {
+    matches!(name.split_once('/'), Some((day, id))
+        if day.len() == 8
+            && day.bytes().all(|b| b.is_ascii_digit())
+            && id.len() == 32
+            && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
 /// `<prefix><UTC date>/<128 random bits, hex>`. A backend adds its own prefix; callers pass `""`.
 pub fn new_name(prefix: &str) -> String {
     let mut random = [0u8; 16];
@@ -225,12 +235,22 @@ fn open(
 }
 
 /// What replaced a moved string: where it is, how long it was, and the key and nonce that open it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BlobRef {
     pub name: String,
     pub len: usize,
     key: Vec<u8>,
     nonce: Vec<u8>,
+}
+
+/// Never prints the key or nonce: with the key, anyone who can read the object can open it.
+impl std::fmt::Debug for BlobRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlobRef")
+            .field("name", &self.name)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BlobRef {
@@ -458,8 +478,10 @@ pub async fn sweep(store: &dyn BlobStore, ttl: Duration) -> Result<usize, BlobEr
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut deleted = 0;
     for object in store.list().await? {
+        // Only what this gateway wrote: the generated shape, never another object that happens to be
+        // old and to live under the same prefix or directory.
         if object.modified < cutoff
-            && valid_name(&object.key)
+            && is_generated_name(&object.key)
             && store.delete(&object.key).await.is_ok()
         {
             deleted += 1;
@@ -748,25 +770,56 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn the_sweeper_deletes_only_what_is_older_than_the_ttl() {
+    async fn the_sweeper_deletes_only_what_is_old_and_ours() {
         let store = Arc::new(Memory::default());
         let old = SystemTime::now() - Duration::from_secs(7200);
-        store
-            .objects
-            .lock()
-            .unwrap()
-            .insert("p/20260101/old".into(), (vec![1], old));
-        store
-            .objects
-            .lock()
-            .unwrap()
-            .insert("p/20260101/new".into(), (vec![1], SystemTime::now()));
+        let ours_old = format!("20260101/{}", "a".repeat(32));
+        let ours_new = format!("20260101/{}", "b".repeat(32));
+        // Old, under the same root, but not an object this gateway wrote: never deleted.
+        let foreign = "backups/db.tgz".to_owned();
+        {
+            let mut objects = store.objects.lock().unwrap();
+            objects.insert(ours_old, (vec![1], old));
+            objects.insert(ours_new.clone(), (vec![1], SystemTime::now()));
+            objects.insert(foreign.clone(), (vec![1], old));
+        }
         assert_eq!(
             sweep(store.as_ref(), Duration::from_secs(3600)).await,
             Ok(1)
         );
         let left: Vec<String> = store.objects.lock().unwrap().keys().cloned().collect();
-        assert_eq!(left, ["p/20260101/new"]);
+        assert_eq!(left, [ours_new, foreign]);
+    }
+
+    #[tokio::test]
+    async fn a_reference_prints_without_its_key() {
+        let store = Memory::default();
+        let reference = put_sealed(&store, "", "text").await.unwrap();
+        let shown = format!("{reference:?}");
+        assert!(
+            shown.contains(&reference.name) && !shown.contains("key") && !shown.contains("nonce"),
+            "{shown}"
+        );
+        assert!(!shown.contains(&STANDARD.encode(&reference.key)));
+        assert!(is_generated_name(&reference.name));
+    }
+
+    #[test]
+    fn only_the_generated_shape_is_one_the_gateway_wrote() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert!(is_generated_name(&format!("20260101/{id}")));
+        for not in [
+            "backups/db.tgz",
+            "20260101/short",
+            "2026010/0123456789abcdef0123456789abcdef",
+            "20260101/0123456789ABCDEF0123456789ABCDEF",
+            "x/20260101/0123456789abcdef0123456789abcdef",
+            "20260101/0123456789abcdef0123456789abcdef/extra",
+            "20260101",
+            "",
+        ] {
+            assert!(!is_generated_name(not), "{not}");
+        }
     }
 
     #[test]
