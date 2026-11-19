@@ -144,7 +144,9 @@ impl RealDispatch {
                     crate::gateway::metrics::MEDIA_STORE,
                     &[("op", "write"), ("outcome", error.as_str())],
                 );
-                Err(DispatchError::new("llmshim-media-store-unavailable"))
+                // The provider has answered and been paid: not the "nothing was sent" class, and not
+                // one to retry.
+                Err(DispatchError::new("llmshim-media-store-answer-lost"))
             }
         }
     }
@@ -1880,6 +1882,10 @@ fn gateway_err_to_api(state: &GatewayState, err: GatewayError) -> ApiError {
         GatewayError::Upstream(message) if message == "llmshim-media-store-unavailable" => {
             media_store_unavailable()
         }
+        #[cfg(feature = "serve")]
+        GatewayError::Upstream(message) if message == "llmshim-media-store-answer-lost" => {
+            media_answer_lost()
+        }
         GatewayError::Upstream(message) if message == "llmshim-coordinator-unavailable" => {
             ApiError::from(ShimError::ProviderError {
                 status: 503,
@@ -1908,6 +1914,20 @@ fn gateway_err_to_api(state: &GatewayState, err: GatewayError) -> ApiError {
             retry_after: None,
         }),
     }
+}
+
+/// The provider answered and was paid, but the answer could not be put in (or read back from) the media
+/// object store (note 0050): 502, no `Retry-After`, because a retry would pay for the same answer again.
+#[cfg(feature = "serve")]
+fn media_answer_lost() -> ApiError {
+    ApiError::from(ShimError::ProviderError {
+        status: StatusCode::BAD_GATEWAY.as_u16(),
+        body: json!({"error": {
+            "message": "the answer could not be carried through the media object store",
+            "type": "api_error", "param": null, "code": "media_store_unavailable"}})
+        .to_string(),
+        retry_after: None,
+    })
 }
 
 /// The media object store could not take or give an object (note 0050): 503 with `Retry-After`, the
@@ -2436,17 +2456,20 @@ async fn submit_media_call(
     // (note 0050). A reference is only ever made by a replica: one in the caller's own body could
     // name an object, so it is refused. Whatever is staged is deleted however this call ends.
     #[cfg(feature = "serve")]
-    let mut staged_any = false;
+    if big_media && crate::serve::blobstore::contains_ref(&payload) {
+        // On every backend: a single instance would otherwise answer a retriable 503 for it.
+        return Err(invalid_request(
+            "the request carries a media reference, which only a gateway replica may make",
+            "input",
+        ));
+    }
+    #[cfg(feature = "serve")]
+    let mut store_in_use = false;
     #[cfg(feature = "serve")]
     let mut cleanup = None;
     #[cfg(feature = "serve")]
     if let Some(handle) = &media_store {
-        if crate::serve::blobstore::contains_ref(&payload) {
-            return Err(invalid_request(
-                "the request carries a media reference, which only a gateway replica may make",
-                "input",
-            ));
-        }
+        store_in_use = true;
         match crate::serve::blobstore::externalize(
             handle.store.as_ref(),
             "",
@@ -2456,8 +2479,7 @@ async fn submit_media_call(
         .await
         {
             Ok(staged) => {
-                staged_any = !staged.names().is_empty();
-                if staged_any {
+                if !staged.names().is_empty() {
                     crate::gateway::metrics::incr(
                         crate::gateway::metrics::MEDIA_STORE,
                         &[("op", "stage"), ("outcome", "ok")],
@@ -2505,8 +2527,9 @@ async fn submit_media_call(
     state.pin_router(&mut policy_scope, snapshot.clone());
     policy_scope.set_operation(call.operation);
     #[cfg(feature = "serve")]
-    if staged_any {
-        // Version 4: a replica that cannot read references refuses the job (note 0050).
+    if store_in_use {
+        // Version 4 for every such job, small or large: its answer may come back as references, and a
+        // replica that cannot read them must refuse it, not run it and return megabytes inline.
         policy_scope.set_media_refs();
     }
     let prepared = state
@@ -2528,9 +2551,7 @@ async fn submit_media_call(
         if let Some(mut cleanup) = cleanup {
             if let (Ok(done), Some(handle)) = (submitted.as_mut(), media_store.as_ref()) {
                 // The worker's objects are this request's too: deleted with its own.
-                for (_, reference) in crate::serve::blobstore::find_refs(&done.value) {
-                    cleanup.track(reference.name);
-                }
+                cleanup.track_answer(&done.value);
                 let max = handle.store.max_object_bytes() * crate::serve::blobstore::MAX_OBJECTS;
                 match crate::serve::blobstore::internalize(
                     handle.store.as_ref(),
@@ -2554,15 +2575,7 @@ async fn submit_media_call(
                         );
                         // The provider answered and was paid (the attempt is recorded); the answer
                         // could not be read back.
-                        submitted = Err(ApiError::from(ShimError::ProviderError {
-                            status: StatusCode::BAD_GATEWAY.as_u16(),
-                            body: json!({"error": {
-                                "message": "the answer could not be read back from the media object store",
-                                "type": "api_error", "param": null,
-                                "code": "media_store_unavailable"}})
-                            .to_string(),
-                            retry_after: None,
-                        }));
+                        submitted = Err(media_answer_lost());
                     }
                 }
             }
@@ -7423,6 +7436,27 @@ mod native_tests {
             .await
             .unwrap_err();
         assert_eq!(failed.message, "provider said no");
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn an_answer_the_store_could_not_carry_is_a_502_without_retry_after_because_it_was_paid_for(
+    ) {
+        // The provider answered; the answer is larger than the store takes (or the store is down). A
+        // 503 with Retry-After would invite a second paid call that fails the same way.
+        let store: Arc<dyn crate::serve::blobstore::BlobStore> =
+            Arc::new(crate::serve::blobstore::tests::Memory::default());
+        let dispatch = media_dispatch(Some(store));
+        let too_big = json!({"audio": "A".repeat((1 << 20) + 1)});
+        let error = dispatch.media_out(Ok(too_big)).await.err().unwrap();
+        assert_eq!(error.message, "llmshim-media-store-answer-lost");
+        let state = configured_state_with_router(Router::new());
+        let response =
+            gateway_err_to_api(&state, GatewayError::Upstream(error.message)).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(response.headers().get("retry-after").is_none());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("media_store_unavailable"));
     }
 
     #[cfg(feature = "serve")]

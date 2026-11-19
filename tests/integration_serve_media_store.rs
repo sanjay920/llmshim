@@ -218,6 +218,16 @@ async fn a_single_instance_keeps_its_media_in_memory_and_never_touches_the_store
         body.to_string().chars().take(300).collect::<String>()
     );
     images.assert_async().await;
+    // A reference in a caller's body is a 400 on every backend, not a retriable 503 from a worker.
+    let forged = reqwest::Client::new()
+        .post(format!("{}/v1/images/generations", server.base))
+        .bearer_auth(harness::CALLER_KEY)
+        .json(&json!({"model": "openai/gpt-image-1", "prompt": "a cat",
+            "extra": {"nested": {"$blob": 1}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), 400);
     let mut entries = std::fs::read_dir(&shared.0).unwrap();
     assert!(entries.next().is_none(), "nothing was written to the store");
     let metrics = reqwest::Client::new()

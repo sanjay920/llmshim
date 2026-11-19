@@ -415,6 +415,17 @@ impl Cleanup {
         }
     }
 
+    /// Also delete the objects that `answer` refers to: the worker's, made for this request. Only
+    /// names of the generated shape: a reference-shaped value a hostile provider put in its answer
+    /// cannot name another object for deletion.
+    pub fn track_answer(&mut self, answer: &Value) {
+        for (_, reference) in find_refs(answer) {
+            if is_generated_name(&reference.name) {
+                self.track(reference.name);
+            }
+        }
+    }
+
     /// Delete now, and report how many deletes failed.
     pub async fn release(mut self) -> usize {
         match self.staged.take() {
@@ -454,14 +465,24 @@ pub async fn externalize(
         let Some(slot) = value.pointer_mut(&pointer) else {
             continue;
         };
-        let text = slot.as_str().unwrap_or_default().to_owned();
+        // Taken, not copied: the string is replaced by its reference below, and a 25 MB upload's
+        // base64 should not exist twice.
+        let text = match slot.take() {
+            Value::String(text) => text,
+            other => {
+                *slot = other;
+                continue;
+            }
+        };
         match put_sealed(store, prefix, &text).await {
             Ok(reference) => {
                 staged.names.push(reference.name.clone());
                 *slot = reference.to_value();
             }
             Err(error) => {
-                // Nothing of this job may be left behind.
+                // Nothing of this job may be left behind. (The value is not usable after a failure:
+                // earlier strings are references to objects that are deleted here.)
+                *slot = Value::String(text);
                 staged.release(store).await;
                 return Err(error);
             }
@@ -927,6 +948,28 @@ pub(crate) mod tests {
         }
         assert!(store.objects.lock().unwrap().contains_key(&fresh));
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_answer_cannot_name_a_foreign_object_for_deletion() {
+        let store = Arc::new(Memory::default());
+        let ours = put_sealed(store.as_ref(), "", "text").await.unwrap();
+        // A foreign object under the same root, and an answer whose `usage` holds a reference to it.
+        store
+            .objects
+            .lock()
+            .unwrap()
+            .insert("backups/db.tgz".into(), (vec![1], SystemTime::now()));
+        let foreign = BlobRef {
+            name: "backups/db.tgz".into(),
+            ..ours.clone()
+        };
+        let answer = json!({"audio": ours.to_value(), "usage": {"x": foreign.to_value()}});
+        let mut cleanup = Cleanup::new(store.clone(), Staged::default());
+        cleanup.track_answer(&answer);
+        assert_eq!(cleanup.release().await, 0);
+        let left: Vec<String> = store.objects.lock().unwrap().keys().cloned().collect();
+        assert_eq!(left, ["backups/db.tgz"]);
     }
 
     #[test]

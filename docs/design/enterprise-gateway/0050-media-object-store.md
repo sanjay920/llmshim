@@ -144,8 +144,9 @@ error, not a short list; one longer than ten million objects is not swept.
   staged: only a replica makes one, so a caller can never name an object. The staged objects are deleted when the
   call ends **however** it ends: normally, on an error, or because the caller disconnected (a dropped request deletes
   them from a task its drop starts).
-- **Scope version 4.** A job whose payload holds references is marked scope **version 4** (a media job without any,
-  a small request, stays version 3). A replica from before this change accepts versions 1 to 3 only, so it **refuses**
+- **Scope version 4.** **Every** fleet job on these three routes is marked scope **version 4** when the store is in
+  use, small or large: its answer may come back as references, and an older replica that ran it would return the
+  megabytes inline through Redis after the provider was paid. A replica from before this change accepts versions 1 to 3 only, so it **refuses**
   the job (`503 coordinator unavailable`, the safe failure of 0041) instead of sending a reference to a provider as the
   caller's data. As in 0041: upgrade every replica before relying on staged media through the fleet.
 - **Worker.** Reads the references back into the payload, calls the provider (the same dispatch, usage record, spend
@@ -156,8 +157,9 @@ error, not a short list; one longer than ten million objects is not swept.
   worker's.
 - **Refusals and statuses.** No `[media_store]` on a fleet: `501`, naming `[media_store]`. The store cannot take the
   upload (or a worker cannot read it): `503 media_store_unavailable` with `Retry-After: 30`; nothing was sent to a
-  provider. The upload exceeds `max_object_bytes`: `400`. The store cannot give the *answer* back: `502
-  media_store_unavailable`, and the call was paid for and is recorded as completed. The store's own error text and the
+  provider. The upload exceeds `max_object_bytes`: `400`. The store cannot carry the *answer* (a worker cannot put it, or the origin cannot read it back): `502
+  media_store_unavailable` **without** `Retry-After`, because the call was paid for (and is recorded as completed) and a
+  retry would pay again; an answer larger than `max_object_bytes` fails this way every time. The store's own error text and the
   object names are never in an answer.
 - **One instance ignores it.** A server without `[fleet]` keeps its payloads in memory whatever `[media_store]` says
   (it has no replica to hand an object to); the store is built and validated, and unused.
@@ -165,6 +167,19 @@ error, not a short list; one longer than ten million objects is not swept.
   replicas do not sweep in the same second), deleting generated-shape objects older than `ttl_secs`.
 - **Counters.** `llmshim_gateway_media_store_total{op="stage|read|write|delete|sweep",outcome="ok|<class>"}` and
   `llmshim_gateway_media_store_swept_total`. Both labels are fixed sets.
+
+## Known limits (found in review)
+
+- **Answer objects of an abandoned request** (the origin timed out, or the caller left before the worker answered) are
+  not tracked by the origin, so they wait for the sweeper (up to `ttl_secs` and a pass). A redelivered duplicate run
+  can leave answer objects the same way.
+- **Memory.** A 25 MB upload (33 MB of base64) exists at the origin as the body, the base64 string and the sealed
+  copy at once, and again at the worker. Strings are moved, not copied, into the sealing; chunked sealing would
+  reduce the rest.
+- **Staging precedes admission:** a request that is then refused by a quota or the spend rules still costs a put and
+  a delete. Deletes are sequential and inside the response path.
+- The origin deletes only names of the generated shape that it finds in an answer; a reference-shaped value a
+  hostile provider puts in `usage` cannot name another object for deletion.
 
 ## Not built (and not planned)
 
