@@ -716,10 +716,19 @@ mod tests {
             .with_body(r#"{"access_token": "stolen", "expires_in": 3600}"#)
             .create_async()
             .await;
+        // The storage API would accept the impostor's token: it must never be sent.
+        let mut api = mockito::Server::new_async().await;
+        let object = api
+            .mock("GET", Matcher::Any)
+            .match_header("authorization", "Bearer stolen")
+            .with_body("data")
+            .expect(0)
+            .create_async()
+            .await;
         let store = GcsStore::new(&GcsSettings {
             bucket: "media",
             prefix: "",
-            endpoint: Some("http://127.0.0.1:9"),
+            endpoint: Some(&api.url()),
             metadata_endpoint: Some(&impostor.url()),
             credentials: GcsCredentials::Metadata,
             ca_pem: None,
@@ -727,6 +736,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(store.get("a/b", 100).await, Err(BlobError::Unavailable));
+        object.assert_async().await;
     }
 
     #[tokio::test]
