@@ -130,11 +130,12 @@ async fn main() {
 }
 
 /// `audit-verify`: read-only on the history (the store's own migration still runs, as for any open),
-/// and never creates a database.
+/// and never creates a SQLite file (a Postgres target is opened like any other, so a mistyped
+/// schema is initialized empty and reports zero rows).
 fn audit_verify(options: &Options) -> i32 {
     if let Some(db) = &options.db {
-        if !db.exists() {
-            eprintln!("{} does not exist", db.display());
+        if std::fs::metadata(db).map_or(true, |m| m.len() == 0) {
+            eprintln!("{} does not exist or is empty", db.display());
             return 1;
         }
     }

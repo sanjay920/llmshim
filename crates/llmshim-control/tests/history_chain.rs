@@ -151,7 +151,7 @@ fn the_audit_verify_command_reports_the_head_names_a_broken_row_and_never_create
     let missing = path.with_file_name("absent.db");
     let (code, _, err) = audit_verify(&["--db", missing.to_str().unwrap()]);
     assert_eq!(code, Some(1));
-    assert!(err.contains("does not exist"), "{err}");
+    assert!(err.contains("does not exist or is empty"), "{err}");
     assert!(!missing.exists());
 
     // Serving options do not belong to it.

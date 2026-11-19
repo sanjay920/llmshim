@@ -94,8 +94,9 @@ previous row's hash, `0`×64 for the first.
   unhashed row after hashed ones is a removed hash and breaks the chain.
 - `llmshim-control audit-verify (--db FILE | --database-url-file FILE …)`: exit 0 and
   `history: intact, N chained row(s), M before the chain, head <hash>`; exit 1 naming the first broken row id; exit 2
-  for bad arguments (it takes only the database options); it never creates a database. Opening a store runs the
+  for bad arguments (it takes only the database options); it never creates a SQLite file (missing or empty is refused). On Postgres the target is opened like any other, so a mistyped `--database-schema` is initialized empty and reports `0 chained row(s)`: check the count against what you expect. Opening a store runs the
   schema migration like any open does.
+- **Upgrade:** stop every old control-plane writer before the first new one starts. A version-4 process still running after the migration inserts rows without a hash, which the verifier reports as `a row without a hash after chained rows`.
 - As for the gateway, a removed **last** row cannot be seen from the database: the printed `head` is the anchor to
   keep elsewhere. Anyone who can rewrite the whole table and recompute the chain can also forge it; the anchor is
   what they cannot reach.
