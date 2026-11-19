@@ -29,6 +29,7 @@ axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 serde_json = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

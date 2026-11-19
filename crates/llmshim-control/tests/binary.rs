@@ -343,3 +343,134 @@ fn the_server_runs_on_postgres_when_one_is_given() {
         .status();
     assert_eq!(second.wait().unwrap().code(), Some(0));
 }
+
+fn issuer_file(directory: &Path, name: &str, body: &str) -> PathBuf {
+    let path = directory.join(name);
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+const ISSUER_FILE: &str = r#"{"issuer":"https://idp.example.test","audience":"llmshim-control",
+    "jwks_url":"http://127.0.0.1:9/jwks.json","algorithms":["RS256"]}"#;
+
+#[test]
+fn the_sso_flags_are_checked_before_serving_and_a_bad_issuer_file_is_not_echoed() {
+    let directory = dir("sso-args");
+    let db = directory.join("c.db");
+    let db = db.to_str().unwrap();
+    let token = token_file(&directory, TOKEN, 0o600);
+    let token = token.to_str().unwrap();
+    let on = issuer_file(&directory, "on.json", ISSUER_FILE);
+    let off = issuer_file(
+        &directory,
+        "off.json",
+        &ISSUER_FILE.replace("\"RS256\"]", "\"RS256\"],\"break_glass\":false"),
+    );
+    let base = ["serve", "--db", db, "--listen", "127.0.0.1:0"];
+    let with = |extra: &[&str]| -> (Option<i32>, String) {
+        let mut args: Vec<&str> = base.to_vec();
+        args.extend_from_slice(extra);
+        run(&args)
+    };
+    // Break-glass on needs the token; off refuses one (never a silent ignore).
+    let (code, err) = with(&["--sso-config", on.to_str().unwrap()]);
+    assert_eq!(
+        (code, err.contains("--token-file is required")),
+        (Some(2), true),
+        "{err}"
+    );
+    let (code, err) = with(&["--sso-config", off.to_str().unwrap(), "--token-file", token]);
+    assert_eq!(
+        (code, err.contains("break_glass")),
+        (Some(2), true),
+        "{err}"
+    );
+    // A bad issuer file is named by file and kind, and its values are not echoed.
+    for (label, body) in [
+        (
+            "unknown field",
+            r#"{"issuer":"i","audience":"a","jwks_url":"https://x.example/k","algorithms":["RS256"],"client_secret":"hunter2-secret"}"#,
+        ),
+        (
+            "symmetric",
+            r#"{"issuer":"i","audience":"a","jwks_url":"https://x.example/k","algorithms":["HS256"]}"#,
+        ),
+        (
+            "plain http",
+            r#"{"issuer":"i","audience":"a","jwks_url":"http://idp.example/k","algorithms":["RS256"]}"#,
+        ),
+        (
+            "empty algorithms",
+            r#"{"issuer":"i","audience":"a","jwks_url":"https://x.example/k","algorithms":[]}"#,
+        ),
+        ("not json", "issuer=hunter2-secret"),
+    ] {
+        let bad = issuer_file(&directory, "bad.json", body);
+        let (code, err) = with(&["--sso-config", bad.to_str().unwrap(), "--token-file", token]);
+        assert_eq!(code, Some(1), "{label}: {err}");
+        assert!(!err.contains("hunter2"), "{label}: {err}");
+    }
+    let (code, _) = with(&[
+        "--sso-config",
+        "/nonexistent/issuer.json",
+        "--token-file",
+        token,
+    ]);
+    assert_eq!(code, Some(1));
+    // audit-verify has no identity provider.
+    let (code, _) = run(&[
+        "audit-verify",
+        "--db",
+        db,
+        "--sso-config",
+        on.to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(2));
+}
+
+#[test]
+fn a_server_with_sso_authenticates_the_shared_token_as_break_glass_and_refuses_a_bad_token() {
+    let directory = dir("sso-serve");
+    let token = token_file(&directory, &format!("{TOKEN}\n"), 0o600);
+    let issuer = issuer_file(&directory, "issuer.json", ISSUER_FILE);
+    let db = directory.join("c.db");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_llmshim-control"))
+        .args([
+            "serve",
+            "--db",
+            db.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--token-file",
+            token.to_str().unwrap(),
+            "--sso-config",
+            issuer.to_str().unwrap(),
+        ])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let address = loop {
+        assert!(Instant::now() < deadline, "the server did not start");
+        let line = lines.next().expect("stderr closed").unwrap();
+        if let Some(rest) = line.split("listening on http://").nth(1) {
+            break rest.trim().to_string();
+        }
+    };
+    assert_eq!(http(&address, "GET", "/v1/whoami", None, None).0, 401);
+    let (status, body) = http(&address, "GET", "/v1/whoami", Some(TOKEN), None);
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("break-glass") && body.contains("\"admin\""),
+        "{body}"
+    );
+    // A token-shaped value that the issuer did not sign (its issuer is not even ours) is a 401,
+    // without the server trying to reach the identity provider.
+    let shaped = "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJ4In0.c2ln";
+    assert_eq!(http(&address, "GET", "/v1/orgs", Some(shaped), None).0, 401);
+    let _ = child.kill();
+    let _ = child.wait();
+}
