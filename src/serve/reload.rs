@@ -28,7 +28,7 @@ use super::keys::build_key_store;
 use crate::gateway::auth::LiveKeys;
 use crate::gateway::usage::{KeyNames, TenantNames};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -56,6 +56,8 @@ pub struct ReloadHandles {
     /// How old the snapshot in force is, with `[control_plane]` (0024).
     pub(crate) clock: Option<super::snapshot::SnapshotClock>,
     pub(crate) status: StatusHandle,
+    /// The audit log, when `[logging] audit_log` is set (note 0047).
+    pub(crate) audit: Option<Arc<super::audit::AuditLog>>,
 }
 
 impl ReloadHandles {
@@ -81,7 +83,14 @@ impl ReloadHandles {
             workers,
             clock,
             status: StatusHandle::default(),
+            audit: None,
         }
+    }
+
+    /// Record what this server changes in `audit` (note 0047).
+    pub(crate) fn with_audit(mut self, audit: Option<Arc<super::audit::AuditLog>>) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// The age and pull state of the snapshot in force, with `[control_plane]`.
@@ -93,6 +102,7 @@ impl ReloadHandles {
     pub fn status(&self) -> ReloadStatus {
         let mut status = self.status.snapshot();
         status.snapshot = self.clock.as_ref().map(|clock| clock.status());
+        status.audit = self.audit.as_ref().map(|audit| audit.head());
         status
     }
 
@@ -162,6 +172,11 @@ pub struct ReloadStatus {
     pub env_secret_providers: Vec<String>,
     /// The policy snapshot in force, with `[control_plane]` (0024); `null` otherwise.
     pub snapshot: Option<super::snapshot::SnapshotStatus>,
+    /// The audit log's head with `[logging] audit_log` (note 0047): how many records it holds and
+    /// the hash the next carries. Anchor it somewhere the log's writer cannot reach: the file alone
+    /// cannot show that records were removed from its end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit: Option<super::audit::Head>,
 }
 
 /// Shared, so the admin listener can report what the reloader did.
@@ -179,6 +194,14 @@ impl StatusHandle {
     fn update(&self, change: impl FnOnce(&mut ReloadStatus)) {
         change(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner));
     }
+}
+
+/// At most this many names go into one audit record: a record must stay far below what a restart
+/// can read back (note 0047), and the total beside it says how many there were.
+const AUDIT_NAMES: usize = 100;
+
+fn capped(names: &[String]) -> &[String] {
+    &names[..names.len().min(AUDIT_NAMES)]
 }
 
 /// What one reload did.
@@ -216,6 +239,8 @@ struct Active {
     /// The snapshot this process applied (0024): a reload never goes behind it,
     /// whatever the floor file on disk says.
     applied: Option<super::snapshot::Floor>,
+    /// The key names in force, to say which a reload added or removed (note 0047).
+    key_names: std::collections::BTreeSet<String>,
 }
 
 /// Reloads `[[keys]]` from the configuration file the server started from.
@@ -262,6 +287,7 @@ impl Reloader {
             enforced: current.is_enforced(),
             last_rejection: None,
             pending: None,
+            key_names: config.keys.iter().map(|key| key.name.clone()).collect(),
             applied: snapshot.map(|snapshot| super::snapshot::Floor {
                 org: snapshot.org.clone(),
                 generation: snapshot.generation,
@@ -300,6 +326,7 @@ impl Reloader {
                 limits_generation: 0,
                 env_secret_providers: active.router.env_form(),
                 snapshot: None,
+                audit: None,
             };
         });
         Ok(Self {
@@ -318,16 +345,27 @@ impl Reloader {
     /// once. For an operator's signal. Blocking: it reads files, so call it from
     /// a blocking task.
     pub fn reload(&self, env: &dyn Fn(&str) -> Option<String>) -> Outcome {
-        self.run(env, false)
+        self.run(env, false, "operator")
+    }
+
+    /// [`Self::reload`] on behalf of `actor` in the audit log (note 0047): the control-plane puller
+    /// reloads when it has pulled a new snapshot, and that is not an operator's decision.
+    pub fn reload_as(&self, actor: &'static str, env: &dyn Fn(&str) -> Option<String>) -> Outcome {
+        self.run(env, false, actor)
     }
 
     /// [`Self::reload`] for a timer: a change is applied only after two polls in
     /// a row have seen exactly the same one ([`Outcome::Deferred`] until then).
     pub fn poll(&self, env: &dyn Fn(&str) -> Option<String>) -> Outcome {
-        self.run(env, true)
+        self.run(env, true, "poller")
     }
 
-    fn run(&self, env: &dyn Fn(&str) -> Option<String>, debounce: bool) -> Outcome {
+    fn run(
+        &self,
+        env: &dyn Fn(&str) -> Option<String>,
+        debounce: bool,
+        actor: &'static str,
+    ) -> Outcome {
         // One reload at a time; a second caller waits and then sees the first's
         // result as its starting point.
         let mut active = self.active.lock().unwrap_or_else(PoisonError::into_inner);
@@ -342,6 +380,7 @@ impl Reloader {
                     config_sha256,
                     changes,
                     env_form,
+                    ..
                 } => {
                     if changes.iter().any(|change| change != "limits") {
                         status.router_generation += 1;
@@ -382,6 +421,7 @@ impl Reloader {
                 }
             }
         });
+        self.audit_step(&step, actor);
         match step {
             Step::Applied {
                 generation,
@@ -394,6 +434,61 @@ impl Reloader {
             Step::Unchanged { .. } => Outcome::Unchanged,
             Step::Deferred => Outcome::Deferred,
             Step::Rejected { issues, repeated } => Outcome::Rejected { issues, repeated },
+        }
+    }
+
+    /// Record what a reload did in the audit log (note 0047): an applied reload with what changed
+    /// and which keys were added or removed by name, and a refused one (the first time) with the
+    /// paths of the settings at fault, never their values or the issues' text. Unchanged and
+    /// deferred checks change nothing and are not recorded. A failed write is counted and
+    /// reported; the log then takes no more records.
+    fn audit_step(&self, step: &Step, actor: &'static str) {
+        let Some(audit) = &self.handles.audit else {
+            return;
+        };
+        let written = match step {
+            Step::Applied {
+                generation,
+                credentials,
+                config_sha256,
+                changes,
+                keys_added,
+                keys_removed,
+                snapshot,
+                ..
+            } => audit.record(
+                "config.reloaded",
+                actor,
+                "applied",
+                json!({
+                    "generation": generation,
+                    "credentials": credentials,
+                    "config_sha256": config_sha256,
+                    "changes": changes,
+                    "keys_added": capped(keys_added),
+                    "keys_added_total": keys_added.len(),
+                    "keys_removed": capped(keys_removed),
+                    "keys_removed_total": keys_removed.len(),
+                    "snapshot": snapshot,
+                }),
+            ),
+            Step::Rejected {
+                issues,
+                repeated: false,
+            } => audit.record(
+                "config.reloaded",
+                actor,
+                "rejected",
+                json!({
+                    "paths": capped(&issues.iter().map(|issue| issue.path.clone()).collect::<Vec<_>>()),
+                    "paths_total": issues.len(),
+                }),
+            ),
+            _ => return,
+        };
+        if let Err(message) = written {
+            crate::gateway::metrics::incr(crate::gateway::metrics::AUDIT_WRITE_FAILURES, &[]);
+            eprintln!("error: the audit log could not record a reload: {message}");
         }
     }
 
@@ -615,12 +710,28 @@ impl Reloader {
         active.router = router;
         active.fingerprint = fingerprint;
         let generation = self.handles.status.snapshot().generation + 1;
+        // Which keys this reload added or removed, by name (never a secret or a digest).
+        let names: std::collections::BTreeSet<String> = loaded
+            .config
+            .keys
+            .iter()
+            .map(|key| key.name.clone())
+            .collect();
+        let keys_added = names.difference(&active.key_names).cloned().collect();
+        let keys_removed = active.key_names.difference(&names).cloned().collect();
+        active.key_names = names;
+        let snapshot = loaded.snapshot.as_ref().map(|snapshot| {
+            json!({"org": snapshot.org, "generation": snapshot.generation, "signer": snapshot.signer})
+        });
         Step::Applied {
             generation,
             credentials,
             config_sha256,
             changes,
             env_form,
+            keys_added,
+            keys_removed,
+            snapshot,
         }
     }
 }
@@ -632,6 +743,9 @@ enum Step {
         config_sha256: String,
         changes: Vec<String>,
         env_form: Vec<String>,
+        keys_added: Vec<String>,
+        keys_removed: Vec<String>,
+        snapshot: Option<Value>,
     },
     Unchanged {
         config_sha256: String,

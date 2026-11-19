@@ -861,6 +861,14 @@ pub struct Logging {
     /// unknown. Same targets as `access_log`.
     #[serde(default)]
     pub usage_log: Option<String>,
+    /// The audit log (note 0047): an append-only, hash-chained record of what changed the running
+    /// gateway (start, stop, every configuration reload, applied or refused) and who or what did it.
+    /// An absolute file path (created owner-only and continued across restarts; a symbolic link or a
+    /// file whose last record is damaged is refused); not `"stdout"`, since a chain needs a file.
+    /// Check it with `llmshim audit verify <file>`. Never holds a secret, a prompt or a completion.
+    /// Off when absent.
+    #[serde(default)]
+    pub audit_log: Option<String>,
 }
 
 /// Which adapter a provider entry uses.
@@ -2292,6 +2300,25 @@ impl ServeConfig {
             }
             if is_file && target.ends_with('/') {
                 issues.push(Issue::new(field, "must name a file, not a directory"));
+            }
+        }
+        if let Some(audit) = &self.logging.audit_log {
+            if !std::path::Path::new(audit).has_root() || audit.ends_with('/') {
+                issues.push(Issue::new(
+                    "logging.audit_log",
+                    "must be an absolute path to a file (a hash chain needs a file, not \"stdout\")",
+                ));
+            }
+            for (field, other) in [
+                ("logging.access_log", &self.logging.access_log),
+                ("logging.usage_log", &self.logging.usage_log),
+            ] {
+                if other.as_deref() == Some(audit.as_str()) {
+                    issues.push(Issue::new(
+                        "logging.audit_log",
+                        format!("must differ from {field}; two logs cannot share a file"),
+                    ));
+                }
             }
         }
         // Two writers on one file would interleave their lines. Both on
