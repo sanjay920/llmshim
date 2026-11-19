@@ -1,7 +1,6 @@
 # 0047: The audit log
 
-Status: slice 1 built (the gateway). Slice 2 (the control plane's change history) is described below and not yet
-built. Written on the owner's instruction to implement it ("implement the audit log to completion").
+Status: built, both slices (the gateway's log; the control plane's chained change history). Written on the owner's instruction to implement it ("implement the audit log to completion").
 
 ## What it is, and what it is not
 
@@ -80,13 +79,29 @@ audit_log = "/var/log/llmshim/audit.jsonl"   # an absolute file path; never "std
   new chain at genesis. The old file's head is the anchor that closes it.
 - **Fixed at start**, like the other `[logging]` settings: a reload cannot change it.
 
-## Slice 2: the control plane (described, not built)
+## Slice 2: the control plane (`llmshim-control audit-verify`)
 
-`crates/llmshim-control` already appends one row to its change history for every mutation (who, what, when, ids,
-never a secret). Slice 2 chains those rows with the same record hashing: `prev_hash` and `hash` columns (a schema
-migration), the chain extended inside the transaction that makes the change (Postgres serialises it through a
-single-row head lock), `llmshim-control audit-verify`, and the head on its status. The rules above (never a secret,
-anchor the head, no export) are the same.
+`crates/llmshim-control` appends one row to its change history for every mutation (who, what, when, ids, never a
+secret). Each row now carries `prev` and `hash` (schema version 5; both nullable, added by an in-place migration on
+SQLite and Postgres). `hash` is SHA-256 over the JSON array `[prev, at, actor, action, subject, detail]` (an array,
+so no key order or repeated key can spell one row two ways; `detail` as the exact stored text); `prev` is the
+previous row's hash, `0`×64 for the first.
+
+- The chain is extended inside the transaction that makes the change. That transaction is already the only writer
+  (SQLite `BEGIN IMMEDIATE`; Postgres `pg_advisory_xact_lock`), so reading the last hash and inserting the next row
+  cannot interleave: no separate head lock was needed.
+- Rows from before the migration have no hash. They are the **unchained prefix**: counted, never vouched for. An
+  unhashed row after hashed ones is a removed hash and breaks the chain.
+- `llmshim-control audit-verify (--db FILE | --database-url-file FILE …)`: exit 0 and
+  `history: intact, N chained row(s), M before the chain, head <hash>`; exit 1 naming the first broken row id; exit 2
+  for bad arguments (it takes only the database options); it never creates a SQLite file (missing or empty is refused). On Postgres the target is opened like any other, so a mistyped `--database-schema` is initialized empty and reports `0 chained row(s)`: check the count against what you expect. Opening a store runs the
+  schema migration like any open does.
+- **Upgrade:** stop every old control-plane writer before the first new one starts. A version-4 process still running after the migration inserts rows without a hash, which the verifier reports as `a row without a hash after chained rows`.
+- As for the gateway, a removed **last** row cannot be seen from the database: the printed `head` is the anchor to
+  keep elsewhere. Anyone who can rewrite the whole table and recompute the chain can also forge it; the anchor is
+  what they cannot reach.
+- No API endpoint and no change to `GET /v1/history` or the OpenAPI document: slice 2 adds the chain and the
+  command only (no export, shipping, query or UI).
 
 ## Not built
 
@@ -108,3 +123,11 @@ write closes the log; the hash does not depend on key order. `integration_serve_
 verify` exit 0 and counting every record, a second run continuing the same chain; an edited record is named by the
 verifier and a damaged log stops a start by path; the path rules. Not calling the audit from a reload, ignoring the
 `prev` link, or leaving `detail` out of the hash each fail a test.
+
+Control plane (`tests/history_chain.rs`, SQLite files and, with `LLMSHIM_CONTROL_TEST_POSTGRES_URL`, Postgres for the
+concurrent writers): every change chains to the one before and a reopened store continues the chain; an edit to any
+one field, a removal in the middle and a forged hash are each named at their row; pre-chain rows are counted and an
+unhashed row after chained ones is refused; two handles writing at once make one chain of 30; the command exits 0
+with the head, 1 with the broken row, never creates a missing database and refuses serving options.
+`lifecycle::an_older_database_is_migrated_in_place` covers the version-4 to 5 migration on both backends. Making `prev`
+constant or leaving `detail` out of the hash fails these tests.
