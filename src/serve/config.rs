@@ -1858,6 +1858,7 @@ impl ServeConfig {
             ("session_token", store.session_token.is_some()),
             ("ca_file", store.ca_file.is_some()),
             ("allow_insecure_http", store.allow_insecure_http),
+            ("credentials", store.credentials != MediaCredentials::Keys),
         ];
         match store.kind {
             MediaStoreKind::File => {
@@ -4641,6 +4642,11 @@ mod tests {
             Format::Toml
         )
         .is_err());
+        // It is an s3 setting: a file store refuses it instead of ignoring it.
+        assert_eq!(
+            paths("kind = \"file\"\npath = \"/m\"\ncredentials = \"aws\"\n"),
+            ["media_store.credentials"]
+        );
         // Without the cloud build, the chain is a defect named by flag.
         let config = ServeConfig::parse(&file(CHAIN), Format::Toml).unwrap();
         assert_eq!(

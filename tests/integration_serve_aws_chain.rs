@@ -106,7 +106,11 @@ async fn pod_identity_and_ecs_roles_read_the_container_credentials_endpoint() {
     // Valid for decades: the second call is the first's, not a second request.
     assert_eq!(chain.get().await.unwrap(), first);
     // A refused signature drops what is held, so the next call asks again: the endpoint's second hit.
-    chain.invalidate().await;
+    // (held for under five seconds, so a refusal does not force a refetch yet)
+    chain.invalidate("AKIDPOD").await;
+    assert_eq!(chain.get().await.unwrap(), first);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    chain.invalidate("AKIDPOD").await;
     assert_eq!(chain.get().await.unwrap(), first);
     endpoint.assert_async().await;
     let _ = std::fs::remove_dir_all(dir);
@@ -233,6 +237,71 @@ async fn a_credential_inside_its_renewal_margin_is_asked_for_again() {
 }
 
 #[tokio::test]
+async fn a_permission_error_does_not_become_a_call_to_sts_per_request_and_a_brown_out_is_one_wait()
+{
+    // A role that lacks a permission: every request is denied. The credentials are fetched once and
+    // kept, not fetched again for each denial.
+    let mut creds = mockito::Server::new_async().await;
+    let endpoint = creds
+        .mock("GET", "/creds")
+        .with_header("content-type", "application/json")
+        .with_body(creds_json("AKIDDENY", "2099-01-01T00:00:00Z"))
+        .expect(1)
+        .create_async()
+        .await;
+    let mut s3 = mockito::Server::new_async().await;
+    let denied = s3
+        .mock("GET", "/media/a/b")
+        .with_status(403)
+        .expect(6)
+        .create_async()
+        .await;
+    let uri = format!("{}/creds", creds.url());
+    let _world = world(&[("AWS_CONTAINER_CREDENTIALS_FULL_URI", uri.as_str())]).await;
+    let config: MediaStore = serde_json::from_value(json!({
+        "kind": "s3", "bucket": "media", "region": "us-east-1", "credentials": "aws",
+        "endpoint": s3.url(), "allow_insecure_http": true,
+    }))
+    .unwrap();
+    let handle = blobstore::from_config(&config, &|_| None).unwrap();
+    for _ in 0..3 {
+        assert_eq!(handle.store.get("a/b", 100).await, Err(BlobError::Denied));
+    }
+    // Six S3 requests (each denied once and retried once), one credential fetch.
+    denied.assert_async().await;
+    endpoint.assert_async().await;
+
+    drop(_world);
+    // A source that fails is remembered for a few seconds: the second call is the first's failure.
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut broken = mockito::Server::new_async().await;
+    let seen = counter.clone();
+    let _hits = broken
+        .mock("GET", "/creds")
+        .with_status(500)
+        .with_body_from_request(move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Vec::new()
+        })
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let uri = format!("{}/creds", broken.url());
+    let _again = world(&[("AWS_CONTAINER_CREDENTIALS_FULL_URI", uri.as_str())]).await;
+    let chain = AwsChain::new("us-east-1");
+    assert_eq!(chain.get().await.unwrap_err(), BlobError::Unavailable);
+    // (The SDK retries a failing endpoint itself, so one failure is several requests.)
+    let after_first = counter.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(after_first >= 1);
+    // The second call is the first's remembered failure: nothing more is asked of the endpoint.
+    assert_eq!(chain.get().await.unwrap_err(), BlobError::Unavailable);
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        after_first
+    );
+}
+
+#[tokio::test]
 async fn a_source_that_fails_is_unavailable_not_denied() {
     let mut server = mockito::Server::new_async().await;
     let _broken = server
@@ -268,6 +337,17 @@ async fn the_store_signs_with_the_chains_credentials_and_signs_again_after_a_ref
         .create_async()
         .await;
     let mut s3 = mockito::Server::new_async().await;
+    let first_ok = s3
+        .mock("GET", "/media/a/b")
+        .match_header(
+            "authorization",
+            mockito::Matcher::Regex("Credential=AKIDOLD/".into()),
+        )
+        .with_status(200)
+        .with_body("before")
+        .expect(1)
+        .create_async()
+        .await;
     let refused = s3
         .mock("GET", "/media/a/b")
         .match_header(
@@ -301,7 +381,12 @@ async fn the_store_signs_with_the_chains_credentials_and_signs_again_after_a_ref
     let handle = blobstore::from_config(&config, &|_| None).unwrap();
     // Constructing the store did no credential I/O.
     assert!(!old.matched_async().await);
+    assert_eq!(handle.store.get("a/b", 100).await.unwrap(), b"before");
+    // The role is rotated some time later: a refusal within five seconds of fetching does not force a
+    // refetch (a missing permission must not become a call to STS per request), so wait that out.
+    tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(handle.store.get("a/b", 100).await.unwrap(), b"fine");
+    first_ok.assert_async().await;
     old.assert_async().await;
     new.assert_async().await;
     refused.assert_async().await;

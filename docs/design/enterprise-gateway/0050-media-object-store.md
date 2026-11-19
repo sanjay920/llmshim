@@ -151,13 +151,36 @@ the region; the Kubernetes or ECS service account or the instance profile carrie
 - **Kept until it expires.** Temporary credentials are held until five minutes before they expire (a credential that
   lives less than that is replaced almost at once); credentials with no expiry (environment or profile keys) are asked
   for again every minute, so a rotated profile file is seen. A request that the store **refuses** (a revoked or rotated
-  role) drops what is held and is retried once with a fresh answer, as for key files.
+  role) drops the credentials it was signed with, **if they are still the ones held and were fetched more than five
+  seconds ago**, and is retried once with a fresh answer, as for key files: a role that simply lacks a permission costs
+  one extra STS or metadata call per five seconds, not one per denied request. A failure to get credentials is
+  remembered for five seconds, so a brown-out of STS or the metadata service is one shared wait, not one per request.
 - **Errors.** No credentials anywhere in the chain is `Denied`; a source that fails or takes more than 30 seconds is
   `Unavailable`. Neither carries the SDK's message.
 - **No credential I/O at construction:** the chain is built and asked at the first request, so `serve --check` and a
   start never contact STS or the metadata service.
+- **With a custom `endpoint`** the role's credentials are signed for, and its session token sent to, that endpoint; over
+  `allow_insecure_http` the token crosses the network in clear text, exactly as a `session_token` does. Use it for an
+  S3-compatible service that really takes AWS credentials, over https.
 - IAM: the role needs `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` and (for the sweeper) `s3:ListBucket` on the
   bucket and prefix. Add a lifecycle rule that expires the prefix after a day as the backstop.
+
+## What the sweeper may delete
+
+Only objects with the **generated shape**, `<8 digits>/<32 lowercase hex>` under the backend's prefix or directory,
+and only when older than `ttl_secs`. A bucket (or a directory) shared with anything else loses nothing: its other
+objects are listed and ignored, whatever their age. An S3 listing that is cut off with no continuation token is an
+error, not a short list; one longer than ten million objects is not swept.
+
+## Operating notes
+
+- **One user.** Objects are `0600` and directories `0700`, so every replica of a `file` store must run as the same
+  user (the same `runAsUser`/`fsGroup` in a Deployment does). A store shared between users is a different threat
+  model and needs a different backend.
+- **Local access.** `file` reads and writes follow a symlink the operator (or anyone with write access to the
+  directory) plants inside it; the store's directory must be one only the gateway can write.
+- **A reference holds the key.** `BlobRef`'s `Debug` prints the name and length only; nothing may log the reference
+  value itself.
 
 ## Slice 2: how the routes use the store
 

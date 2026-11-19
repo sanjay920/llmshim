@@ -13,7 +13,7 @@ use super::BlobError;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_config::provider_config::ProviderConfig;
 use aws_credential_types::provider::{error::CredentialsError, ProvideCredentials};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, OnceCell};
 
 /// How long credentials with no expiry (environment keys, a profile's static keys) are kept before the
@@ -23,17 +23,30 @@ const NO_EXPIRY_KEEP: Duration = Duration::from_secs(60);
 const RENEW_BEFORE: Duration = Duration::from_secs(300);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a failure to get credentials is remembered: a brown-out of STS or the metadata service is
+/// one shared wait, not one 30-second wait per queued request.
+const FAILURE_KEEP: Duration = Duration::from_secs(5);
+/// The soonest a refusal may force the credentials to be fetched again.
+const FORCE_EVERY: Duration = Duration::from_secs(5);
+
 struct Cached {
     id: String,
     secret: String,
     token: Option<String>,
     renew_at: SystemTime,
+    fetched: Instant,
+}
+
+#[derive(Default)]
+struct State {
+    held: Option<Cached>,
+    failed: Option<(Instant, BlobError)>,
 }
 
 pub struct AwsChain {
     config: ProviderConfig,
     provider: OnceCell<DefaultCredentialsChain>,
-    cached: Mutex<Option<Cached>>,
+    cached: Mutex<State>,
 }
 
 impl AwsChain {
@@ -58,17 +71,22 @@ impl AwsChain {
         Self {
             config,
             provider: OnceCell::new(),
-            cached: Mutex::new(None),
+            cached: Mutex::new(State::default()),
         }
     }
 
     /// `(access key id, secret, session token)`. `Denied` when the chain finds no credentials at all,
     /// `Unavailable` when a source failed or timed out; neither carries the SDK's message.
     pub async fn get(&self) -> Result<(String, String, Option<String>), BlobError> {
-        let mut cached = self.cached.lock().await;
-        if let Some(held) = cached.as_ref() {
+        let mut state = self.cached.lock().await;
+        if let Some(held) = state.held.as_ref() {
             if SystemTime::now() < held.renew_at {
                 return Ok((held.id.clone(), held.secret.clone(), held.token.clone()));
+            }
+        }
+        if let Some((at, error)) = state.failed {
+            if at.elapsed() < FAILURE_KEEP {
+                return Err(error);
             }
         }
         let provider = self
@@ -80,16 +98,31 @@ impl AwsChain {
                     .await
             })
             .await;
-        let credentials = tokio::time::timeout(LOAD_TIMEOUT, provider.provide_credentials())
+        let loaded = tokio::time::timeout(LOAD_TIMEOUT, provider.provide_credentials())
             .await
-            .map_err(|_| BlobError::Unavailable)?
-            .map_err(|error| match error {
-                CredentialsError::CredentialsNotLoaded(_) => BlobError::Denied,
-                _ => BlobError::Unavailable,
-            })?;
-        if credentials.access_key_id().is_empty() || credentials.secret_access_key().is_empty() {
-            return Err(BlobError::Denied);
-        }
+            .map_err(|_| BlobError::Unavailable)
+            .and_then(|result| {
+                result.map_err(|error| match error {
+                    CredentialsError::CredentialsNotLoaded(_) => BlobError::Denied,
+                    _ => BlobError::Unavailable,
+                })
+            });
+        let credentials = match loaded {
+            Ok(credentials)
+                if !credentials.access_key_id().is_empty()
+                    && !credentials.secret_access_key().is_empty() =>
+            {
+                credentials
+            }
+            Ok(_) => {
+                state.failed = Some((Instant::now(), BlobError::Denied));
+                return Err(BlobError::Denied);
+            }
+            Err(error) => {
+                state.failed = Some((Instant::now(), error));
+                return Err(error);
+            }
+        };
         let now = SystemTime::now();
         let renew_at = match credentials.expiry() {
             Some(expiry) => expiry
@@ -104,14 +137,26 @@ impl AwsChain {
             secret: credentials.secret_access_key().to_owned(),
             token: credentials.session_token().map(str::to_owned),
             renew_at,
+            fetched: Instant::now(),
         };
         let triple = (held.id.clone(), held.secret.clone(), held.token.clone());
-        *cached = Some(held);
+        state.failed = None;
+        state.held = Some(held);
         Ok(triple)
     }
 
-    /// Forget what is held: the store refused a signature, so the next call asks the chain again.
-    pub async fn invalidate(&self) {
-        *self.cached.lock().await = None;
+    /// Forget what is held, because the store refused a request signed with the credentials whose key
+    /// id is `refused`: only if those are still the ones held (another request may have refreshed
+    /// them already) and were fetched at least five seconds ago (a role that merely lacks a permission
+    /// must not turn every denied request into a call to STS).
+    pub async fn invalidate(&self, refused: &str) {
+        let mut state = self.cached.lock().await;
+        if state
+            .held
+            .as_ref()
+            .is_some_and(|held| held.id == refused && held.fetched.elapsed() >= FORCE_EVERY)
+        {
+            state.held = None;
+        }
     }
 }

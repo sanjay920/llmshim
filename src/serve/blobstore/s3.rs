@@ -209,14 +209,18 @@ impl S3Store {
         }
     }
 
-    /// Forget the credentials held: a refusal may mean they rotated.
-    async fn invalidate(&self) {
+    /// Forget the credentials a refused request was signed with (key id `refused`): a refusal may mean
+    /// they rotated.
+    async fn invalidate(&self, refused: &str) {
         match &self.auth {
             Auth::Keys(keys) => {
-                *keys.loaded.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                let mut loaded = keys.loaded.lock().unwrap_or_else(|e| e.into_inner());
+                if loaded.as_ref().is_some_and(|l| l.id == refused) {
+                    *loaded = None;
+                }
             }
             #[cfg(feature = "bedrock")]
-            Auth::Chain(chain) => chain.invalidate().await,
+            Auth::Chain(chain) => chain.invalidate(refused).await,
         }
     }
 
@@ -375,13 +379,15 @@ impl S3Store {
         body: Vec<u8>,
         limit: usize,
     ) -> Result<(u16, Vec<u8>), BlobError> {
+        // The key id this attempt is signed with (cached, so no second fetch).
+        let used = self.credentials().await?.0;
         let first = self
             .call_once(method, name, query, body.clone(), limit)
             .await?;
         if !matches!(first.0, 401 | 403) {
             return Ok(first);
         }
-        self.invalidate().await;
+        self.invalidate(&used).await;
         self.call_once(method, name, query, body, limit).await
     }
 }
