@@ -258,3 +258,66 @@ async fn a_single_instance_keeps_its_media_in_memory_and_never_touches_the_store
         "{metrics}"
     );
 }
+
+/// The same cycle against a real Google Cloud Storage protocol server: fake-gcs-server in CI
+/// (`LLMSHIM_TEST_GCS_ENDPOINT`, with the bucket `LLMSHIM_TEST_GCS_BUCKET` existing or creatable). It
+/// proves the JSON API's paths and queries, the object-name encoding, the paged listing and the sweeper
+/// against an implementation that is not ours.
+#[tokio::test]
+#[ignore = "needs a GCS emulator (LLMSHIM_TEST_GCS_ENDPOINT)"]
+async fn a_real_gcs_protocol_server_stores_lists_and_sweeps() {
+    let endpoint = setting("LLMSHIM_TEST_GCS_ENDPOINT");
+    let bucket = std::env::var("LLMSHIM_TEST_GCS_BUCKET").unwrap_or_else(|_| "media".into());
+    // The bucket (an emulator creates it on request; an existing one answers 409, which is fine).
+    let _ = reqwest::Client::new()
+        .post(format!("{endpoint}/storage/v1/b?project=test"))
+        .json(&json!({"name": bucket}))
+        .send()
+        .await
+        .unwrap();
+    let prefix = format!("test-{}/", uuid::Uuid::new_v4().simple());
+    let config: MediaStore = serde_json::from_value(json!({
+        "kind": "gcs", "bucket": bucket, "endpoint": endpoint, "allow_insecure_http": true,
+        "credentials": "none", "prefix": prefix,
+    }))
+    .unwrap();
+    let handle = blobstore::from_config(&config, &|_| None).unwrap();
+    let store: &dyn BlobStore = handle.store.as_ref();
+
+    let text = format!("caller audio {}", "A".repeat(3 << 20));
+    let reference = blobstore::put_sealed(store, "", &text).await.unwrap();
+    assert_eq!(
+        blobstore::get_sealed(store, &reference).await.unwrap(),
+        text
+    );
+
+    let original = json!({"audio_b64": "Q".repeat(100_000), "n": 1});
+    let mut value = original.clone();
+    let staged = blobstore::externalize(store, "", &mut value, blobstore::THRESHOLD_BYTES)
+        .await
+        .unwrap();
+    blobstore::internalize(store, &mut value, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(value, original);
+    let names = staged.names().to_vec();
+    assert_eq!(staged.release(store).await, 0);
+    assert_eq!(
+        store.get(&names[0], 1 << 20).await,
+        Err(BlobError::NotFound)
+    );
+
+    let listed = store.list().await.unwrap();
+    assert!(listed.iter().any(|o| o.key == reference.name), "{listed:?}");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        blobstore::sweep(store, Duration::from_secs(1))
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        blobstore::get_sealed(store, &reference).await,
+        Err(BlobError::NotFound)
+    );
+}

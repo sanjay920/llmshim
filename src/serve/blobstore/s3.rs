@@ -352,7 +352,10 @@ impl S3Store {
 }
 
 /// The body, or [`BlobError::TooLarge`] past `limit`, or `Unavailable` if the connection broke.
-async fn read_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, BlobError> {
+pub(super) async fn read_body(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, BlobError> {
     let mut bytes = Vec::new();
     loop {
         match response.chunk().await {
@@ -392,7 +395,7 @@ impl S3Store {
     }
 }
 
-fn status_error(status: u16) -> BlobError {
+pub(super) fn status_error(status: u16) -> BlobError {
     match status {
         401 | 403 => BlobError::Denied,
         404 => BlobError::NotFound,
