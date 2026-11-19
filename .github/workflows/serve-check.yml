@@ -90,3 +90,37 @@ jobs:
           # One at a time: an abandoned replica leaves a lease the others would sweep.
           cargo test --locked --features serve-redis --test integration_serve_outage -- --ignored --test-threads=1
           cargo test --locked --features serve-redis --test integration_serve_tenant_budgets -- --ignored --test-threads=1
+
+  # The media object store (0050) against a server that really verifies SigV4. The image is
+  # Bitnami's MinIO from its legacy repository (the official image is not on Docker Hub); it is
+  # pinned so a moved tag cannot change what is tested.
+  serve-s3-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      minio:
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r3
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin123
+          MINIO_DEFAULT_BUCKETS: media
+        options: >-
+          --health-cmd "curl -fs http://localhost:9000/minio/health/ready"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The store against MinIO
+        env:
+          LLMSHIM_CATALOG_OFFLINE: '1'
+          LLMSHIM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          LLMSHIM_TEST_S3_BUCKET: media
+          LLMSHIM_TEST_S3_KEY_ID: minioadmin
+          LLMSHIM_TEST_S3_SECRET: minioadmin123
+        run: |
+          set -o pipefail
+          cargo test --locked --features serve --test integration_serve_media_store -- --ignored 2>&1 | tee s3.log
+          # A filter that matches nothing would pass with zero tests.
+          grep -q "1 passed" s3.log

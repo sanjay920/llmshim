@@ -14,6 +14,7 @@
 mod access_log;
 pub mod allowlist;
 pub mod audit;
+pub mod blobstore;
 pub mod build;
 pub mod classifier;
 pub mod config;

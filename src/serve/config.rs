@@ -160,6 +160,72 @@ pub struct ServeConfig {
     /// Fixed at start.
     #[serde(default)]
     pub classifiers: BTreeMap<String, Classifier>,
+    /// Where a fleet's media routes keep their large payloads (note 0050). Fixed at start.
+    #[serde(default)]
+    pub media_store: Option<MediaStore>,
+}
+
+/// Which backend `[media_store]` uses (note 0050).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum MediaStoreKind {
+    /// A directory every replica can read and write: a local path or a shared volume.
+    File,
+    /// Any S3-compatible object store.
+    S3,
+}
+
+/// The object store for the media routes of a fleet (note 0050). Objects are sealed (AES-256-GCM, a
+/// key per object) before they are stored, so the store holds ciphertext only.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct MediaStore {
+    pub kind: MediaStoreKind,
+    /// The most one object may hold, in bytes, 1024 to 268435456. Defaults to 64 MiB.
+    #[serde(default)]
+    #[schemars(range(min = 1024, max = 268435456))]
+    pub max_object_bytes: Option<u64>,
+    /// An object older than this many seconds is an orphan the sweeper deletes, 600 to 604800. It
+    /// must outlast the longest request. Defaults to 3600.
+    #[serde(default)]
+    #[schemars(range(min = 600, max = 604800))]
+    pub ttl_secs: Option<u64>,
+    /// `file`: the directory (absolute).
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// `s3`: the bucket.
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// `s3`: the region the requests are signed for (`us-east-1`; `auto` for R2).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// `s3`: the service address, `https://host[:port]`. Omit for AWS S3.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// `s3`: bucket in the path (`host/bucket/key`) rather than the host. Defaults to true with an
+    /// endpoint, false without.
+    #[serde(default)]
+    pub path_style: Option<bool>,
+    /// `s3`: a key prefix, so one bucket can be shared (letters, digits, `._-/`, ending in `/`).
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// `s3`: the access key id, by secret reference.
+    #[serde(default)]
+    pub access_key_id: Option<SecretRef>,
+    /// `s3`: the secret access key, by secret reference. A file is re-read once a minute.
+    #[serde(default)]
+    pub secret_access_key: Option<SecretRef>,
+    /// `s3`: a session token for temporary credentials, by secret reference.
+    #[serde(default)]
+    pub session_token: Option<SecretRef>,
+    /// `s3`: PEM certificates to trust for the endpoint instead of the web PKI roots.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// `s3`: allow a plain `http://` endpoint. Objects are sealed, but the credentials' signatures
+    /// and the object names still cross the network unprotected.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 /// An external classifier endpoint (note 0048): sent the text of a request or an answer, it
@@ -1745,6 +1811,140 @@ impl ServeConfig {
         }
     }
 
+    fn validate_media_store(&self, issues: &mut Vec<Issue>) {
+        let Some(store) = &self.media_store else {
+            return;
+        };
+        let at = "media_store";
+        let bad = |field: &str, message: &str, issues: &mut Vec<Issue>| {
+            issues.push(Issue::new(format!("{at}.{field}"), message.to_owned()));
+        };
+        if store
+            .max_object_bytes
+            .is_some_and(|n| !(1024..=268_435_456).contains(&n))
+        {
+            bad("max_object_bytes", "must be 1024 to 268435456", issues);
+        }
+        if store
+            .ttl_secs
+            .is_some_and(|n| !(600..=604_800).contains(&n))
+        {
+            bad("ttl_secs", "must be 600 to 604800", issues);
+        }
+        let s3_only = [
+            ("bucket", store.bucket.is_some()),
+            ("region", store.region.is_some()),
+            ("endpoint", store.endpoint.is_some()),
+            ("path_style", store.path_style.is_some()),
+            ("prefix", store.prefix.is_some()),
+            ("access_key_id", store.access_key_id.is_some()),
+            ("secret_access_key", store.secret_access_key.is_some()),
+            ("session_token", store.session_token.is_some()),
+            ("ca_file", store.ca_file.is_some()),
+            ("allow_insecure_http", store.allow_insecure_http),
+        ];
+        match store.kind {
+            MediaStoreKind::File => {
+                match &store.path {
+                    Some(path) if path.has_root() => {}
+                    Some(_) => bad("path", "must be an absolute path", issues),
+                    None => bad("path", "is required for kind = \"file\"", issues),
+                }
+                for (field, set) in s3_only {
+                    if set {
+                        bad(field, "belongs to kind = \"s3\"", issues);
+                    }
+                }
+            }
+            MediaStoreKind::S3 => {
+                if store.path.is_some() {
+                    bad("path", "belongs to kind = \"file\"", issues);
+                }
+                match store.bucket.as_deref() {
+                    Some(name)
+                        if (3..=255).contains(&name.len())
+                            && name.bytes().all(|b| {
+                                b.is_ascii_lowercase()
+                                    || b.is_ascii_digit()
+                                    || matches!(b, b'.' | b'-' | b'_')
+                            }) => {}
+                    Some(_) => bad(
+                        "bucket",
+                        "must be 3 to 255 of lowercase letters, digits, `.`, `-` and `_`",
+                        issues,
+                    ),
+                    None => bad("bucket", "is required for kind = \"s3\"", issues),
+                }
+                match store.region.as_deref() {
+                    Some(name)
+                        if (1..=64).contains(&name.len())
+                            && name.bytes().all(|b| {
+                                b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
+                            }) => {}
+                    Some(_) => bad(
+                        "region",
+                        "must be lowercase letters, digits and `-`",
+                        issues,
+                    ),
+                    None => bad("region", "is required for kind = \"s3\"", issues),
+                }
+                if let Some(prefix) = &store.prefix {
+                    let ok = prefix.is_empty()
+                        || (prefix.len() <= 128
+                            && prefix.ends_with('/')
+                            && !prefix.starts_with('/')
+                            && super::blobstore::valid_name(&format!("{prefix}x")));
+                    if !ok {
+                        bad(
+                            "prefix",
+                            "must be empty or at most 128 of `A-Za-z0-9._-/`, ending in `/`, not starting with `/`",
+                            issues,
+                        );
+                    }
+                }
+                if let Some(endpoint) = &store.endpoint {
+                    let secure = endpoint.starts_with("https://");
+                    let plain = endpoint.starts_with("http://");
+                    if !secure && !(plain && store.allow_insecure_http) {
+                        bad(
+                            "endpoint",
+                            if plain {
+                                "is plain http: use https, or set allow_insecure_http"
+                            } else {
+                                "must start with https:// (or http:// with allow_insecure_http)"
+                            },
+                            issues,
+                        );
+                    } else if let Err(problem) = validate_base_url(endpoint) {
+                        bad("endpoint", problem, issues);
+                    } else if endpoint
+                        .split_once("://")
+                        .is_some_and(|(_, rest)| rest.trim_end_matches('/').contains('/'))
+                    {
+                        bad("endpoint", "must be an origin without a path", issues);
+                    }
+                } else if store.allow_insecure_http {
+                    bad("allow_insecure_http", "needs an endpoint", issues);
+                }
+                for (field, secret) in [
+                    ("access_key_id", &store.access_key_id),
+                    ("secret_access_key", &store.secret_access_key),
+                ] {
+                    match secret {
+                        Some(secret) => validate_secret(secret, &format!("{at}.{field}"), issues),
+                        None => bad(field, "is required for kind = \"s3\"", issues),
+                    }
+                }
+                if let Some(token) = &store.session_token {
+                    validate_secret(token, &format!("{at}.session_token"), issues);
+                }
+                if store.ca_file.as_ref().is_some_and(|p| !p.has_root()) {
+                    bad("ca_file", "must be an absolute path", issues);
+                }
+            }
+        }
+    }
+
     fn validate_classifiers(&self, issues: &mut Vec<Issue>) {
         if self.classifiers.len() > 16 {
             issues.push(Issue::new("classifiers", "has more than 16 endpoints"));
@@ -1965,6 +2165,7 @@ impl ServeConfig {
         self.validate_admin(&mut issues);
         self.validate_reload(&mut issues);
         self.validate_guardrails(&mut issues);
+        self.validate_media_store(&mut issues);
         if let Some(fleet) = &self.fleet {
             validate_secret(&fleet.redis_url, "fleet.redis_url", &mut issues);
             if let Some(outage) = &fleet.outage_admission {
@@ -3261,12 +3462,29 @@ impl ServeConfig {
                 .iter()
                 .map(move |(name, secret)| (format!("auth.jwt[{index}].headers.{name}"), secret))
         });
+        let classifiers = self.classifiers.iter().filter_map(|(name, classifier)| {
+            classifier
+                .token
+                .as_ref()
+                .map(|secret| (format!("classifiers.{name}.token"), secret))
+        });
+        let media = self.media_store.iter().flat_map(|store| {
+            [
+                ("media_store.access_key_id", &store.access_key_id),
+                ("media_store.secret_access_key", &store.secret_access_key),
+                ("media_store.session_token", &store.session_token),
+            ]
+            .into_iter()
+            .filter_map(|(at, secret)| secret.as_ref().map(|secret| (at.to_string(), secret)))
+        });
         providers
             .chain(keys)
             .chain(admin)
             .chain(fleet)
             .chain(telemetry)
             .chain(jwks)
+            .chain(classifiers)
+            .chain(media)
             .collect()
     }
 
@@ -4216,10 +4434,11 @@ mod tests {
             "deployments",
             "guardrails",
             "classifiers",
+            "media_store",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 19, "a new table needs a line here");
+        assert_eq!(properties.len(), 20, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
     }
 
@@ -4290,6 +4509,81 @@ mod tests {
             issues[0].message.contains("classifier"),
             "{}",
             issues[0].message
+        );
+    }
+
+    #[test]
+    fn media_store_settings_are_validated_by_path_per_kind() {
+        let file = |extra: &str| format!("{MINIMAL}\n[media_store]\n{extra}");
+        let paths = |extra: &str| -> Vec<String> {
+            ServeConfig::parse(&file(extra), Format::Toml)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|issue| issue.path)
+                .collect()
+        };
+        const S3: &str = "kind = \"s3\"\nbucket = \"media-bucket\"\nregion = \"us-east-1\"\n\
+            access_key_id = { env = \"MEDIA_KEY_ID\" }\nsecret_access_key = { file = \"/run/secrets/media\" }\n";
+        assert!(ServeConfig::parse(
+            &file("kind = \"file\"\npath = \"/var/lib/llmshim/media\"\n"),
+            Format::Toml
+        )
+        .is_ok());
+        assert!(ServeConfig::parse(&file(S3), Format::Toml).is_ok());
+        assert!(ServeConfig::parse(
+            &file(&format!("{S3}endpoint = \"https://minio.media.svc:9000\"\nprefix = \"llmshim/\"\nsession_token = {{ env = \"MEDIA_TOKEN\" }}\n")),
+            Format::Toml
+        )
+        .is_ok());
+        // A file store needs an absolute path and takes none of the S3 settings.
+        assert_eq!(paths("kind = \"file\"\n"), ["media_store.path"]);
+        assert_eq!(
+            paths("kind = \"file\"\npath = \"media\"\n"),
+            ["media_store.path"]
+        );
+        assert_eq!(
+            paths("kind = \"file\"\npath = \"/m\"\nbucket = \"x\"\n"),
+            ["media_store.bucket"]
+        );
+        // An S3 store needs a bucket, a region and both keys, and refuses a path.
+        assert_eq!(
+            paths("kind = \"s3\"\n"),
+            [
+                "media_store.bucket",
+                "media_store.region",
+                "media_store.access_key_id",
+                "media_store.secret_access_key"
+            ]
+        );
+        assert_eq!(paths(&format!("{S3}path = \"/m\"\n")), ["media_store.path"]);
+        for (extra, at) in [
+            ("endpoint = \"http://minio:9000\"\n", "media_store.endpoint"),
+            (
+                "endpoint = \"https://u:p@minio:9000\"\n",
+                "media_store.endpoint",
+            ),
+            (
+                "endpoint = \"https://minio:9000/base\"\n",
+                "media_store.endpoint",
+            ),
+            (
+                "allow_insecure_http = true\n",
+                "media_store.allow_insecure_http",
+            ),
+            ("prefix = \"/abs/\"\n", "media_store.prefix"),
+            ("prefix = \"no-slash\"\n", "media_store.prefix"),
+            ("prefix = \"a/../\"\n", "media_store.prefix"),
+            ("max_object_bytes = 10\n", "media_store.max_object_bytes"),
+            ("ttl_secs = 5\n", "media_store.ttl_secs"),
+            ("ca_file = \"relative.pem\"\n", "media_store.ca_file"),
+        ] {
+            assert_eq!(paths(&format!("{S3}{extra}")), [at], "{extra}");
+        }
+        // A bad credential reference is named, never printed.
+        assert_eq!(
+            paths(&S3.replace("MEDIA_KEY_ID", "lower")),
+            ["media_store.access_key_id.env"]
         );
     }
 

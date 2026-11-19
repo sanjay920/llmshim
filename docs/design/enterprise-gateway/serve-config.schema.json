@@ -693,6 +693,148 @@
       },
       "type": "object"
     },
+    "MediaStore": {
+      "additionalProperties": false,
+      "description": "The object store for the media routes of a fleet (note 0050). Objects are sealed (AES-256-GCM, a\nkey per object) before they are stored, so the store holds ciphertext only.",
+      "properties": {
+        "access_key_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`s3`: the access key id, by secret reference."
+        },
+        "allow_insecure_http": {
+          "default": false,
+          "description": "`s3`: allow a plain `http://` endpoint. Objects are sealed, but the credentials' signatures\nand the object names still cross the network unprotected.",
+          "type": "boolean"
+        },
+        "bucket": {
+          "default": null,
+          "description": "`s3`: the bucket.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ca_file": {
+          "default": null,
+          "description": "`s3`: PEM certificates to trust for the endpoint instead of the web PKI roots.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "default": null,
+          "description": "`s3`: the service address, `https://host[:port]`. Omit for AWS S3.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/MediaStoreKind"
+        },
+        "max_object_bytes": {
+          "default": null,
+          "description": "The most one object may hold, in bytes, 1024 to 268435456. Defaults to 64 MiB.",
+          "maximum": 268435456,
+          "minimum": 1024,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "default": null,
+          "description": "`file`: the directory (absolute).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path_style": {
+          "default": null,
+          "description": "`s3`: bucket in the path (`host/bucket/key`) rather than the host. Defaults to true with an\nendpoint, false without.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "prefix": {
+          "default": null,
+          "description": "`s3`: a key prefix, so one bucket can be shared (letters, digits, `._-/`, ending in `/`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "region": {
+          "default": null,
+          "description": "`s3`: the region the requests are signed for (`us-east-1`; `auto` for R2).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret_access_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`s3`: the secret access key, by secret reference. A file is re-read once a minute."
+        },
+        "session_token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`s3`: a session token for temporary credentials, by secret reference."
+        },
+        "ttl_secs": {
+          "default": null,
+          "description": "An object older than this many seconds is an orphan the sweeper deletes, 600 to 604800. It\nmust outlast the longest request. Defaults to 3600.",
+          "maximum": 604800,
+          "minimum": 600,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "MediaStoreKind": {
+      "description": "Which backend `[media_store]` uses (note 0050).",
+      "oneOf": [
+        {
+          "const": "file",
+          "description": "A directory every replica can read and write: a local path or a shared volume.",
+          "type": "string"
+        },
+        {
+          "const": "s3",
+          "description": "Any S3-compatible object store.",
+          "type": "string"
+        }
+      ]
+    },
     "OnFailure": {
       "description": "What a classifier rule does when its classifier cannot give a verdict (note 0048).",
       "oneOf": [
@@ -1446,6 +1588,17 @@
     },
     "logging": {
       "$ref": "#/$defs/Logging"
+    },
+    "media_store": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MediaStore"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Where a fleet's media routes keep their large payloads (note 0050). Fixed at start."
     },
     "providers": {
       "additionalProperties": {

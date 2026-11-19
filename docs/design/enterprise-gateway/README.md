@@ -83,6 +83,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0047: The audit log](0047-audit-log.md)
 - [0048: External guardrail classifiers](0048-external-classifiers.md)
 - [0049: Single sign-on for the control plane](0049-control-plane-sso.md)
+- [0050: Media through a fleet, over an object store](0050-media-object-store.md)
 
 ## Roadmap
 
@@ -164,7 +165,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Secret-manager integrations (0033): files are the integration (Kubernetes, CSI driver, agents); secret values are one line of at most 64 KiB; no vendor client is linked
 - [x] Embeddings, images and audio on the server, local scheduler only (a fleet answers 501): embeddings on the server (0035, a spend bound for capped keys with a trusted model price); image generation (0036, local scheduler, capped keys refused); speech (0037, exact price, capped keys work); transcription (0038, multipart upload through `multer`, capped keys refused)
 - [x] Config-registered providers: **decided, no further kinds** (0022). An endpoint that speaks a wire llmshim has is `base_url` on that kind (`openai-compatible`, or `base_url` on `openai`, `anthropic`, `gemini`, `xai`, `cerebras`, `openrouter`); a wire it lacks is a library adapter, not a configuration
-- [ ] Images, speech and transcription through a fleet (embeddings through a fleet is built, 0041)
+- [ ] Images, speech and transcription through a fleet (embeddings through a fleet is built, 0041; the object store they will travel over is slice 1 of 0050, built: `[media_store]` with `file` and S3-compatible backends, sealed objects; the routes themselves are slice 2, the cloud identities and native GCS/Azure backends slice 3)
 - [x] SSO for the control plane (0049): OIDC token verification, the verified subject as the actor, three fixed roles, break-glass
 - [ ] Admin UI and SCIM (not started: they follow the control plane and the
       licensing decision)

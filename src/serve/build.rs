@@ -70,6 +70,8 @@ pub struct Built {
     pub listener: ListenerLimits,
     /// The audit log, when `[logging] audit_log` is set (note 0047).
     pub audit: Option<Arc<super::audit::AuditLog>>,
+    /// The media object store, when `[media_store]` is set (note 0050).
+    pub media_store: Option<Arc<super::blobstore::Handle>>,
 }
 
 /// The limits of the inbound listeners, from `[server]` (0021).
@@ -441,6 +443,22 @@ pub async fn build_app(
         }
     }
 
+    // The media object store (note 0050): built here so a wrong path, an unreadable credential or an
+    // unusable CA fails at start and under `--check`, not at the first request.
+    let media_store = match config
+        .media_store
+        .as_ref()
+        .map(|store| super::blobstore::from_config(store, env))
+        .transpose()
+    {
+        Ok(handle) => handle.map(Arc::new),
+        Err(message) => {
+            return Err(vec![Issue {
+                path: "media_store".into(),
+                message,
+            }])
+        }
+    };
     // External classifiers (note 0048): the endpoints and their tokens are resolved once, here.
     match super::classifier::Classifiers::build(&config.guardrails, &config.classifiers, env) {
         Ok(Some(classifiers)) => state.set_classifiers(Arc::new(classifiers)),
@@ -634,6 +652,7 @@ pub async fn build_app(
         logs: Logs(logs, telemetry),
         reload: reload.with_audit(audit.clone()),
         audit,
+        media_store,
         listener: ListenerLimits {
             max_connections: config
                 .server

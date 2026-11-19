@@ -298,7 +298,9 @@ mod tests {
     use super::*;
 
     fn classifiers(url: &str, rule: Value, endpoint: Value) -> Classifiers {
-        let mut table = json!({"url": url});
+        // A wide timeout by default: a test machine under load must not turn a slow answer into a
+        // verdict-less failure; the tests about timeouts set their own.
+        let mut table = json!({"url": url, "timeout_ms": 10000});
         table
             .as_object_mut()
             .unwrap()
