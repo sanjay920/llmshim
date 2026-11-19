@@ -694,16 +694,31 @@
       "type": "object"
     },
     "MediaCredentials": {
-      "description": "Where the `s3` backend's credentials come from (note 0050).",
+      "description": "Where an object store's credentials come from (note 0050): `keys` and `aws` for `s3`, `metadata`,\n`service-account` and `none` for `gcs`.",
       "oneOf": [
         {
           "const": "keys",
-          "description": "Static keys, by secret reference (`access_key_id`, `secret_access_key`, `session_token`).",
+          "description": "`s3`, the default: static keys, by secret reference (`access_key_id`, `secret_access_key`,\n`session_token`).",
           "type": "string"
         },
         {
           "const": "aws",
           "description": "The AWS credential chain: EKS IAM roles for service accounts (IRSA), EKS Pod Identity, ECS task\nroles, the EC2 instance profile, SSO and profile files. Needs a build with `serve-cloud`.",
+          "type": "string"
+        },
+        {
+          "const": "metadata",
+          "description": "`gcs`: the GKE or GCE metadata server (Workload Identity: the pod's service account is the\nGoogle identity).",
+          "type": "string"
+        },
+        {
+          "const": "service-account",
+          "description": "`gcs`: a service-account key file (`service_account_file`).",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "`gcs`: no authentication, for an emulator or a private endpoint (an `endpoint` is required).",
           "type": "string"
         }
       ]
@@ -745,8 +760,15 @@
           ]
         },
         "credentials": {
-          "$ref": "#/$defs/MediaCredentials",
-          "description": "`s3`: where the credentials come from: `keys` (default) or `aws` (the AWS credential chain, for a\npod, task or instance role; the key settings are then not allowed)."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MediaCredentials"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the credentials come from. `s3`: `keys` (default) or `aws` (the AWS credential chain, for a\npod, task or instance role; the key settings are then not allowed). `gcs`: `metadata`,\n`service-account` or `none`, required."
         },
         "endpoint": {
           "default": null,
@@ -766,6 +788,14 @@
           "minimum": 1024,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "metadata_endpoint": {
+          "default": null,
+          "description": "`gcs` with `credentials = \"metadata\"`: the metadata server's origin, for a non-standard one\n(default `http://metadata.google.internal`).",
+          "type": [
+            "string",
             "null"
           ]
         },
@@ -812,6 +842,14 @@
           ],
           "description": "`s3`: the secret access key, by secret reference. A file is re-read once a minute."
         },
+        "service_account_file": {
+          "default": null,
+          "description": "`gcs` with `credentials = \"service-account\"`: the key file (JSON), absolute. Re-read at each token\nfetch, so a rotated key needs no restart.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "session_token": {
           "anyOf": [
             {
@@ -850,6 +888,11 @@
         {
           "const": "s3",
           "description": "Any S3-compatible object store.",
+          "type": "string"
+        },
+        {
+          "const": "gcs",
+          "description": "Google Cloud Storage, over its JSON API.",
           "type": "string"
         }
       ]

@@ -9,8 +9,10 @@
 #[cfg(feature = "bedrock")]
 pub mod aws_chain;
 pub mod file;
+pub mod gcs;
 pub mod s3;
 mod sigv4;
+mod tokens;
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
@@ -75,12 +77,48 @@ pub fn from_config(
                     access_key_id: config.access_key_id.as_ref(),
                     secret_access_key: config.secret_access_key.as_ref(),
                     session_token: config.session_token.as_ref(),
-                    aws_chain: config.credentials == MediaCredentials::Aws,
+                    aws_chain: config.credentials == Some(MediaCredentials::Aws),
                     ca_pem: ca.as_deref(),
                     max_object_bytes: max,
                 },
                 env,
             )?;
+            Ok(Handle {
+                store: Arc::new(store),
+                ttl,
+            })
+        }
+        MediaStoreKind::Gcs => {
+            let ca = config
+                .ca_file
+                .as_ref()
+                .map(|path| {
+                    std::fs::read(path).map_err(|e| {
+                        format!("ca_file: cannot read {}: {}", path.display(), e.kind())
+                    })
+                })
+                .transpose()?;
+            let prefix = config.prefix.clone().unwrap_or_default();
+            let credentials = match config.credentials {
+                Some(MediaCredentials::Metadata) => gcs::GcsCredentials::Metadata,
+                Some(MediaCredentials::ServiceAccount) => gcs::GcsCredentials::ServiceAccount(
+                    config
+                        .service_account_file
+                        .as_deref()
+                        .ok_or("service_account_file is required")?,
+                ),
+                Some(MediaCredentials::None) => gcs::GcsCredentials::None,
+                _ => return Err("credentials must be metadata, service-account or none".into()),
+            };
+            let store = gcs::GcsStore::new(&gcs::GcsSettings {
+                bucket: config.bucket.as_deref().ok_or("bucket is required")?,
+                prefix: &prefix,
+                endpoint: config.endpoint.as_deref(),
+                metadata_endpoint: config.metadata_endpoint.as_deref(),
+                credentials,
+                ca_pem: ca.as_deref(),
+                max_object_bytes: max,
+            })?;
             Ok(Handle {
                 store: Arc::new(store),
                 ttl,

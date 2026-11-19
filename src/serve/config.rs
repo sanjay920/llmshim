@@ -173,18 +173,28 @@ pub enum MediaStoreKind {
     File,
     /// Any S3-compatible object store.
     S3,
+    /// Google Cloud Storage, over its JSON API.
+    Gcs,
 }
 
-/// Where the `s3` backend's credentials come from (note 0050).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+/// Where an object store's credentials come from (note 0050): `keys` and `aws` for `s3`, `metadata`,
+/// `service-account` and `none` for `gcs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum MediaCredentials {
-    /// Static keys, by secret reference (`access_key_id`, `secret_access_key`, `session_token`).
-    #[default]
+    /// `s3`, the default: static keys, by secret reference (`access_key_id`, `secret_access_key`,
+    /// `session_token`).
     Keys,
     /// The AWS credential chain: EKS IAM roles for service accounts (IRSA), EKS Pod Identity, ECS task
     /// roles, the EC2 instance profile, SSO and profile files. Needs a build with `serve-cloud`.
     Aws,
+    /// `gcs`: the GKE or GCE metadata server (Workload Identity: the pod's service account is the
+    /// Google identity).
+    Metadata,
+    /// `gcs`: a service-account key file (`service_account_file`).
+    ServiceAccount,
+    /// `gcs`: no authentication, for an emulator or a private endpoint (an `endpoint` is required).
+    None,
 }
 
 /// The object store for the media routes of a fleet (note 0050). Objects are sealed (AES-256-GCM, a
@@ -222,10 +232,19 @@ pub struct MediaStore {
     /// `s3`: a key prefix, so one bucket can be shared (letters, digits, `._-/`, ending in `/`).
     #[serde(default)]
     pub prefix: Option<String>,
-    /// `s3`: where the credentials come from: `keys` (default) or `aws` (the AWS credential chain, for a
-    /// pod, task or instance role; the key settings are then not allowed).
+    /// Where the credentials come from. `s3`: `keys` (default) or `aws` (the AWS credential chain, for a
+    /// pod, task or instance role; the key settings are then not allowed). `gcs`: `metadata`,
+    /// `service-account` or `none`, required.
     #[serde(default)]
-    pub credentials: MediaCredentials,
+    pub credentials: Option<MediaCredentials>,
+    /// `gcs` with `credentials = "service-account"`: the key file (JSON), absolute. Re-read at each token
+    /// fetch, so a rotated key needs no restart.
+    #[serde(default)]
+    pub service_account_file: Option<PathBuf>,
+    /// `gcs` with `credentials = "metadata"`: the metadata server's origin, for a non-standard one
+    /// (default `http://metadata.google.internal`).
+    #[serde(default)]
+    pub metadata_endpoint: Option<String>,
     /// `s3` with `credentials = "keys"`: the access key id, by secret reference.
     #[serde(default)]
     pub access_key_id: Option<SecretRef>,
@@ -1858,7 +1877,9 @@ impl ServeConfig {
             ("session_token", store.session_token.is_some()),
             ("ca_file", store.ca_file.is_some()),
             ("allow_insecure_http", store.allow_insecure_http),
-            ("credentials", store.credentials != MediaCredentials::Keys),
+            ("credentials", store.credentials.is_some()),
+            ("service_account_file", store.service_account_file.is_some()),
+            ("metadata_endpoint", store.metadata_endpoint.is_some()),
         ];
         match store.kind {
             MediaStoreKind::File => {
@@ -1943,7 +1964,20 @@ impl ServeConfig {
                 } else if store.allow_insecure_http {
                     bad("allow_insecure_http", "needs an endpoint", issues);
                 }
-                match store.credentials {
+                for (field, set) in [
+                    ("service_account_file", store.service_account_file.is_some()),
+                    ("metadata_endpoint", store.metadata_endpoint.is_some()),
+                ] {
+                    if set {
+                        bad(field, "belongs to kind = \"gcs\"", issues);
+                    }
+                }
+                match store.credentials.unwrap_or(MediaCredentials::Keys) {
+                    MediaCredentials::Metadata
+                    | MediaCredentials::ServiceAccount
+                    | MediaCredentials::None => {
+                        bad("credentials", "belongs to kind = \"gcs\"", issues);
+                    }
                     MediaCredentials::Keys => {
                         for (field, secret) in [
                             ("access_key_id", &store.access_key_id),
@@ -1978,6 +2012,147 @@ impl ServeConfig {
                 }
                 if store.ca_file.as_ref().is_some_and(|p| !p.has_root()) {
                     bad("ca_file", "must be an absolute path", issues);
+                }
+            }
+            MediaStoreKind::Gcs => self.validate_gcs_store(store, issues),
+        }
+    }
+
+    /// `[media_store]` of kind `gcs` (note 0050, slice 3b).
+    fn validate_gcs_store(&self, store: &MediaStore, issues: &mut Vec<Issue>) {
+        let at = "media_store";
+        let bad = |field: &str, message: &str, issues: &mut Vec<Issue>| {
+            issues.push(Issue::new(format!("{at}.{field}"), message.to_owned()));
+        };
+        for (field, set) in [
+            ("path", store.path.is_some()),
+            ("region", store.region.is_some()),
+            ("path_style", store.path_style.is_some()),
+            ("access_key_id", store.access_key_id.is_some()),
+            ("secret_access_key", store.secret_access_key.is_some()),
+            ("session_token", store.session_token.is_some()),
+        ] {
+            if set {
+                bad(field, "does not belong to kind = \"gcs\"", issues);
+            }
+        }
+        match store.bucket.as_deref() {
+            Some(name)
+                if (3..=222).contains(&name.len())
+                    && name.bytes().all(|b| {
+                        b.is_ascii_lowercase()
+                            || b.is_ascii_digit()
+                            || matches!(b, b'.' | b'-' | b'_')
+                    }) => {}
+            Some(_) => bad(
+                "bucket",
+                "must be 3 to 222 of lowercase letters, digits, `.`, `-` and `_`",
+                issues,
+            ),
+            None => bad("bucket", "is required for kind = \"gcs\"", issues),
+        }
+        if let Some(prefix) = &store.prefix {
+            let ok = prefix.is_empty()
+                || (prefix.len() <= 128
+                    && prefix.ends_with('/')
+                    && !prefix.starts_with('/')
+                    && super::blobstore::valid_name(&format!("{prefix}x")));
+            if !ok {
+                bad(
+                    "prefix",
+                    "must be empty or at most 128 of `A-Za-z0-9._-/`, ending in `/`, not starting with `/`",
+                    issues,
+                );
+            }
+        }
+        if let Some(endpoint) = &store.endpoint {
+            if let Some(problem) = media_endpoint_problem(endpoint, store.allow_insecure_http) {
+                bad("endpoint", problem, issues);
+            }
+        } else if store.allow_insecure_http {
+            bad("allow_insecure_http", "needs an endpoint", issues);
+        }
+        if store.ca_file.as_ref().is_some_and(|p| !p.has_root()) {
+            bad("ca_file", "must be an absolute path", issues);
+        }
+        let Some(credentials) = store.credentials else {
+            bad(
+                "credentials",
+                "is required for kind = \"gcs\": metadata, service-account or none",
+                issues,
+            );
+            return;
+        };
+        match credentials {
+            MediaCredentials::Keys | MediaCredentials::Aws => {
+                bad("credentials", "belongs to kind = \"s3\"", issues);
+            }
+            MediaCredentials::Metadata => {
+                if store.service_account_file.is_some() {
+                    bad(
+                        "service_account_file",
+                        "belongs to credentials = \"service-account\"",
+                        issues,
+                    );
+                }
+                if let Some(endpoint) = &store.metadata_endpoint {
+                    // The metadata server is plain http by design (a link-local address in a cluster).
+                    match validate_base_url(endpoint) {
+                        Err(problem) => bad("metadata_endpoint", problem, issues),
+                        Ok(())
+                            if endpoint.split_once("://").is_some_and(|(_, rest)| {
+                                rest.trim_end_matches('/').contains('/')
+                            }) =>
+                        {
+                            bad(
+                                "metadata_endpoint",
+                                "must be an origin without a path",
+                                issues,
+                            )
+                        }
+                        Ok(()) => {}
+                    }
+                }
+            }
+            MediaCredentials::ServiceAccount => {
+                match &store.service_account_file {
+                    Some(path) if path.has_root() => {}
+                    Some(_) => bad("service_account_file", "must be an absolute path", issues),
+                    None => bad(
+                        "service_account_file",
+                        "is required for credentials = \"service-account\"",
+                        issues,
+                    ),
+                }
+                if store.metadata_endpoint.is_some() {
+                    bad(
+                        "metadata_endpoint",
+                        "belongs to credentials = \"metadata\"",
+                        issues,
+                    );
+                }
+            }
+            MediaCredentials::None => {
+                if store.endpoint.is_none() {
+                    bad(
+                        "credentials",
+                        "\"none\" needs an endpoint: it is for an emulator or a private endpoint, never for Google's own",
+                        issues,
+                    );
+                }
+                if store.service_account_file.is_some() {
+                    bad(
+                        "service_account_file",
+                        "belongs to credentials = \"service-account\"",
+                        issues,
+                    );
+                }
+                if store.metadata_endpoint.is_some() {
+                    bad(
+                        "metadata_endpoint",
+                        "belongs to credentials = \"metadata\"",
+                        issues,
+                    );
                 }
             }
         }
@@ -3537,7 +3712,7 @@ impl ServeConfig {
             ));
         }
         if self.media_store.as_ref().is_some_and(|store| {
-            store.kind == MediaStoreKind::S3 && store.credentials == MediaCredentials::Aws
+            store.kind == MediaStoreKind::S3 && store.credentials == Some(MediaCredentials::Aws)
         }) && !cfg!(feature = "serve-cloud")
         {
             issues.push(Issue::new(
@@ -3956,6 +4131,27 @@ fn validate_secret(secret: &SecretRef, at: &str, issues: &mut Vec<Issue>) {
 /// A base URL the client can use as given: redirects are disabled, so it must
 /// already be the final endpoint, and it must not smuggle credentials or a
 /// query string.
+/// Why `endpoint` cannot be an object store's address, if it cannot (https, or http with the explicit
+/// opt-in; an origin: no credentials, query, fragment or path).
+fn media_endpoint_problem(endpoint: &str, allow_insecure_http: bool) -> Option<&'static str> {
+    let secure = endpoint.starts_with("https://");
+    let plain = endpoint.starts_with("http://");
+    if !secure && !(plain && allow_insecure_http) {
+        return Some(if plain {
+            "is plain http: use https, or set allow_insecure_http"
+        } else {
+            "must start with https:// (or http:// with allow_insecure_http)"
+        });
+    }
+    if let Err(problem) = validate_base_url(endpoint) {
+        return Some(problem);
+    }
+    endpoint
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.trim_end_matches('/').contains('/'))
+        .then_some("must be an origin without a path")
+}
+
 fn validate_base_url(url: &str) -> Result<(), &'static str> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("must start with https:// or http://");
@@ -4660,6 +4856,121 @@ mod tests {
         assert_eq!(
             paths(&S3.replace("MEDIA_KEY_ID", "lower")),
             ["media_store.access_key_id.env"]
+        );
+    }
+
+    #[test]
+    fn gcs_media_store_settings_are_validated_by_path() {
+        let file = |extra: &str| format!("{MINIMAL}\n[media_store]\nkind = \"gcs\"\n{extra}");
+        let paths = |extra: &str| -> Vec<String> {
+            ServeConfig::parse(&file(extra), Format::Toml)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|issue| issue.path)
+                .collect()
+        };
+        const WI: &str = "bucket = \"media-bucket\"\ncredentials = \"metadata\"\n";
+        assert!(ServeConfig::parse(&file(WI), Format::Toml).is_ok());
+        assert!(ServeConfig::parse(
+            &file(&format!(
+                "{WI}prefix = \"llmshim/\"\nmetadata_endpoint = \"http://169.254.169.254\"\n"
+            )),
+            Format::Toml
+        )
+        .is_ok());
+        assert!(ServeConfig::parse(
+            &file("bucket = \"media-bucket\"\ncredentials = \"service-account\"\nservice_account_file = \"/run/secrets/gcp/key.json\"\n"),
+            Format::Toml
+        )
+        .is_ok());
+        assert!(ServeConfig::parse(
+            &file("bucket = \"media\"\ncredentials = \"none\"\nendpoint = \"http://fake-gcs:4443\"\nallow_insecure_http = true\n"),
+            Format::Toml
+        )
+        .is_ok());
+        // Credentials are required, and are gcs's three.
+        assert_eq!(
+            paths("bucket = \"media-bucket\"\n"),
+            ["media_store.credentials"]
+        );
+        assert_eq!(
+            paths("bucket = \"media-bucket\"\ncredentials = \"aws\"\n"),
+            ["media_store.credentials"]
+        );
+        assert_eq!(
+            paths("bucket = \"media-bucket\"\ncredentials = \"keys\"\n"),
+            ["media_store.credentials"]
+        );
+        // A service account needs its file, absolute; the other modes refuse one.
+        assert_eq!(
+            paths("bucket = \"media-bucket\"\ncredentials = \"service-account\"\n"),
+            ["media_store.service_account_file"]
+        );
+        assert_eq!(
+            paths("bucket = \"media-bucket\"\ncredentials = \"service-account\"\nservice_account_file = \"key.json\"\n"),
+            ["media_store.service_account_file"]
+        );
+        assert_eq!(
+            paths(&format!("{WI}service_account_file = \"/k.json\"\n")),
+            ["media_store.service_account_file"]
+        );
+        // `none` is never for Google's own endpoint.
+        assert_eq!(
+            paths("bucket = \"media-bucket\"\ncredentials = \"none\"\n"),
+            ["media_store.credentials"]
+        );
+        // S3's settings do not belong, and the endpoint and metadata endpoint are origins.
+        assert_eq!(
+            paths(&format!("{WI}region = \"us-east-1\"\n")),
+            ["media_store.region"]
+        );
+        assert_eq!(
+            paths(&format!("{WI}access_key_id = {{ env = \"K\" }}\n")),
+            ["media_store.access_key_id"]
+        );
+        for (extra, at) in [
+            ("endpoint = \"http://x:4443\"\n", "media_store.endpoint"),
+            (
+                "endpoint = \"https://x:4443/base\"\n",
+                "media_store.endpoint",
+            ),
+            (
+                "metadata_endpoint = \"http://x/path\"\n",
+                "media_store.metadata_endpoint",
+            ),
+            ("prefix = \"no-slash\"\n", "media_store.prefix"),
+            (
+                "allow_insecure_http = true\n",
+                "media_store.allow_insecure_http",
+            ),
+        ] {
+            assert_eq!(paths(&format!("{WI}{extra}")), [at], "{extra}");
+        }
+        // And gcs's settings do not belong to the other kinds.
+        let s3 = "kind = \"s3\"\nbucket = \"media-bucket\"\nregion = \"us-east-1\"\naccess_key_id = { env = \"K\" }\nsecret_access_key = { env = \"S\" }\n";
+        let other = |extra: &str| -> Vec<String> {
+            ServeConfig::parse(
+                &format!("{MINIMAL}\n[media_store]\n{s3}{extra}"),
+                Format::Toml,
+            )
+            .err()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| i.path)
+            .collect()
+        };
+        assert_eq!(
+            other("service_account_file = \"/k\"\n"),
+            ["media_store.service_account_file"]
+        );
+        assert_eq!(
+            other("metadata_endpoint = \"http://x\"\n"),
+            ["media_store.metadata_endpoint"]
+        );
+        assert_eq!(
+            other("credentials = \"metadata\"\n"),
+            ["media_store.credentials"]
         );
     }
 

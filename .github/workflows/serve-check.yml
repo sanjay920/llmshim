@@ -121,6 +121,35 @@ jobs:
           LLMSHIM_TEST_S3_SECRET: minioadmin123
         run: |
           set -o pipefail
-          cargo test --locked --features serve --test integration_serve_media_store -- --ignored 2>&1 | tee s3.log
+          cargo test --locked --features serve --test integration_serve_media_store -- --ignored a_real_s3 2>&1 | tee s3.log
           # A filter that matches nothing would pass with zero tests.
           grep -q "1 passed" s3.log
+
+  # The GCS backend (0050) against fake-gcs-server, an implementation of the JSON API that is not
+  # ours. Started with docker run because a service container cannot be given its arguments.
+  serve-gcs-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Start the emulator
+        run: |
+          docker run -d --name gcs -p 4443:4443 fsouza/fake-gcs-server:1.52.2 \
+            -scheme http -port 4443 -backend memory
+          for i in $(seq 1 30); do
+            curl -fs "http://127.0.0.1:4443/storage/v1/b?project=t" >/dev/null && exit 0
+            sleep 1
+          done
+          docker logs gcs
+          exit 1
+      - name: The store against the emulator
+        env:
+          LLMSHIM_CATALOG_OFFLINE: '1'
+          LLMSHIM_TEST_GCS_ENDPOINT: http://127.0.0.1:4443
+          LLMSHIM_TEST_GCS_BUCKET: media
+        run: |
+          set -o pipefail
+          cargo test --locked --features serve --test integration_serve_media_store -- --ignored a_real_gcs 2>&1 | tee gcs.log
+          # A filter that matches nothing would pass with zero tests.
+          grep -q "1 passed" gcs.log

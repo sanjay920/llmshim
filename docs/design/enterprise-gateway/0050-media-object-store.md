@@ -1,7 +1,7 @@
 # 0050: Media through a fleet, over an object store
 
-Status: slice 1 (the store), slice 2 (the fleet routes) and slice 3a (the AWS credential chain) built; slices 3b to 3d
-(Google Cloud Storage, Azure Blob, the Helm examples) are described and not built. Written on the owner's instruction to
+Status: slice 1 (the store), slice 2 (the fleet routes), slice 3a (the AWS credential chain) and slice 3b (Google Cloud
+Storage) built; slices 3c and 3d (Azure Blob, the Helm examples) are described and not built. Written on the owner's instruction to
 start it, with the requirement that it plug into Kubernetes and the native cloud services, not one of them.
 
 ## The problem
@@ -24,7 +24,7 @@ so the bucket (and its credentials, lifecycle and access logs) never sees a call
 
 ```toml
 [media_store]
-kind = "file"                      # file | s3  (slice 3: gcs | azure-blob)
+kind = "file"                      # file | s3 | gcs  (slice 3c: azure-blob)
 max_object_bytes = 67108864        # 64 MiB per object, up to 256 MiB
 ttl_secs = 3600                    # an object older than this is an orphan: the sweeper deletes it
 # kind = "file"
@@ -48,7 +48,7 @@ allow_insecure_http = false
 | Kubernetes, shared volume | `file` | a `ReadWriteMany` PVC (EFS, Filestore, Azure Files, NFS, CephFS) mounted at `path` |
 | Kubernetes, in-cluster object store | `s3` | MinIO, Ceph RGW (Rook), SeaweedFS |
 | AWS | `s3` | S3 with an access key (slice 1), or with `credentials = "aws"` (slice 3a, built): EKS IAM roles for service accounts (IRSA), EKS Pod Identity, ECS task roles, EC2 instance profiles, SSO and profile files, through the AWS credential chain |
-| GCP | `s3` or `gcs` | Cloud Storage's S3-compatible API with HMAC keys is the vendor's documented interoperability path (not tested by us); native `gcs` with workload identity (slice 3) |
+| GCP | `gcs` | Cloud Storage's JSON API (slice 3b, built): GKE Workload Identity or GCE through the metadata server, or a service-account key file. Its S3-compatible API with HMAC keys also works with `s3`, as the vendor documents (not tested by us) |
 | Azure | `azure-blob` | Blob Storage with workload identity or a SAS token (slice 3); Azure has no S3 API |
 | Elsewhere | `s3` | Cloudflare R2, DigitalOcean Spaces, Backblaze B2, Wasabi, Alibaba OSS: anything that speaks S3 |
 
@@ -118,8 +118,7 @@ it cannot change in a running process.
    "Slice 2" below.
 3. **Cloud identities and native backends**, in four parts:
    - **3a. The AWS credential chain (built).** `credentials = "aws"` on an `s3` store. See below.
-   - **3b. Google Cloud Storage**, native (`kind = "gcs"`): the JSON API with an OAuth token from the metadata
-     server (GKE Workload Identity, GCE) or a service-account file. Not built.
+   - **3b. Google Cloud Storage**, native (`kind = "gcs"`) (built). See below.
    - **3c. Azure Blob Storage** (`kind = "azure-blob"`): the Blob REST API with a SAS token, an account key, or an
      Entra token (workload identity, managed identity). Not built.
    - **3d. The Helm chart's examples:** a shared `ReadWriteMany` claim for `file`, a service account annotated for
@@ -164,6 +163,47 @@ the region; the Kubernetes or ECS service account or the instance profile carrie
   S3-compatible service that really takes AWS credentials, over https.
 - IAM: the role needs `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` and (for the sweeper) `s3:ListBucket` on the
   bucket and prefix. Add a lifecycle rule that expires the prefix after a day as the backstop.
+
+## Slice 3b: Google Cloud Storage
+
+```toml
+[media_store]
+kind = "gcs"
+bucket = "llmshim-media"
+prefix = "llmshim/"
+credentials = "metadata"             # metadata | service-account | none (required)
+# credentials = "service-account"
+# service_account_file = "/var/run/secrets/gcp/key.json"
+# endpoint = "http://fake-gcs:4443"  # an emulator or a private endpoint (required with "none")
+# allow_insecure_http = true         # for an http endpoint
+# metadata_endpoint = "http://169.254.169.254"   # a non-standard metadata server
+```
+
+Four plain HTTP calls on the JSON API (`POST /upload/storage/v1/b/<bucket>/o?uploadType=media&name=`, `GET
+.../o/<name>?alt=media`, `DELETE .../o/<name>`, `GET .../o?prefix=&pageToken=` for the sweeper), with the object name
+as one percent-encoded path segment, a bearer token, no SDK and no new dependency. Objects are sealed exactly as for
+every backend, so the bucket holds ciphertext.
+
+- **`metadata`: Workload Identity.** The token comes from the metadata server
+  (`/computeMetadata/v1/instance/service-accounts/default/token` with `Metadata-Flavor: Google`): on GKE with Workload
+  Identity the pod's Kubernetes service account *is* the Google identity (bind it with the
+  `iam.gke.io/gcp-service-account` annotation and the `roles/iam.workloadIdentityUser` binding); on GCE or Cloud Run
+  it is the instance's or service's account. Nothing is configured beyond the bucket, and no key is stored anywhere.
+- **`service-account`: a key file.** The file is JSON, absolute, read and checked **at start** (the type, the
+  `token_uri`, that its RSA key imports) and again at each token fetch, so a rotated key needs no restart. The gateway
+  signs an RS256 JWT (the key's `client_email`, the `token_uri` as audience, the **`devstorage.read_write`** scope only,
+  one hour) and trades it for an access token. The token endpoint must be https (or http to a loopback address, for an
+  emulator). Prefer `metadata`; a key file is a long-lived secret.
+- **`none`: no authentication,** for an emulator or a private endpoint only: it is **refused unless `endpoint` is
+  set**, so it can never point at Google's own API.
+- **Tokens** are held until a minute before they expire, fetched one at a time, a failed fetch is remembered for five
+  seconds (a metadata outage is one shared wait), and a 401 forces a refetch only for the token that was refused and
+  not within five seconds of fetching it, then the call is tried once more (as for the AWS chain). A rejected service
+  account is `Denied`, a metadata server that does not answer is `Unavailable`; neither carries the provider's message.
+- Built into every `serve` binary: it needs no cloud SDK (`ring`, which `serve` has, signs the JWT).
+- IAM: the identity needs `storage.objects.create`, `get`, `delete` and (for the sweeper) `list` on the bucket, for
+  example `roles/storage.objectUser` plus list, scoped to the bucket. Add a lifecycle rule that deletes the prefix's
+  objects after a day as the backstop.
 
 ## What the sweeper may delete
 
@@ -236,6 +276,18 @@ error, not a short list; one longer than ten million objects is not swept.
 - Deduplication, caching or reuse across requests; an object belongs to one request.
 
 ## Tests
+
+Slice 3b (`serve::blobstore::gcs::tests`, `tokens::tests`): the four calls' paths, queries and bodies, the object name as
+one `%2F` segment; each failure class, a 5xx retried, a 401 tried once more; a paged listing with the page token
+encoded; the metadata server (the `Metadata-Flavor` header, one fetch kept across calls, a failure remembered); a
+service account (the form is a JWT-bearer grant, the assertion's header, claims and one-hour life are checked and its
+RS256 signature **verifies against the key's public half**); a bad key file, a wrong type, a plain-http token endpoint,
+and an unusable key all fail at start without echoing the key; `none` refused against Google's endpoint; the token
+answer checked before it enters a header. Against a real protocol implementation, **fake-gcs-server** (`#[ignore]`d
+`a_real_gcs_protocol_server_stores_lists_and_sweeps`, run by the pinned-image CI job `serve-gcs-check`): a 3 MB sealed
+round trip, externalize and internalize, delete, a prefixed listing and the sweeper. Not covered: real Google tokens,
+GKE's metadata server and IAM (no service to test against here); the metadata and token-exchange shapes follow Google's
+published documents and are exercised against mocks of them.
 
 Slice 3a (`integration_serve_aws_chain`, in a process of its own because the chain reads the real environment; each test
 sets one world and holds a lock; the sources are mock servers): environment keys; nothing to find is `Denied`; **EKS Pod
