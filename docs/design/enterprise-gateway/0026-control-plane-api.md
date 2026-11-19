@@ -23,6 +23,7 @@ data plane's request path: a data plane reads the snapshot this API publishes (a
   (1 to 128 visible characters, default `api`), recorded in the change history. It is a label
   the caller asserts, not an authenticated identity: operator identity beyond a token is SSO,
   which is not started. The note says so rather than pretending.
+  *(Superseded when `--sso-config` is given: 0049 derives the actor from a verified OIDC token and adds roles.)*
 - Listening on a non-loopback address without TLS is allowed (a deployment terminates TLS in
   front, as for the data plane's own listener behind a proxy) but the process prints a warning
   line; the control plane's own TLS is a later slice.

@@ -4,14 +4,42 @@ info:
   version: 0.1.0
   description: |
     The control plane's API (design note 0026): organizations, teams, projects, key lifecycle
-    and signed policy snapshots. Every route needs `Authorization: Bearer <token>`. The actor
-    recorded in the change history is the `x-llmshim-actor` header (a label the caller asserts).
-    A secret appears only in the answers to key creation and rotation.
+    and signed policy snapshots. Every route needs `Authorization: Bearer <token>`. A secret
+    appears only in the answers to key creation and rotation.
+
+    Without `--sso-config` the bearer is the one shared token, every holder is an admin, and the
+    actor recorded in the change history is the `x-llmshim-actor` header (a label the caller
+    asserts). With it (design note 0049) the bearer is an OIDC access token from the configured
+    issuer (or, while `break_glass` is on, the shared token, as the actor `break-glass`); the actor
+    is `oidc:<sub>` of the verified token, `x-llmshim-actor` is discarded, and the token's `roles`
+    claim decides what the caller may do: `control:read` (every GET), `control:key-issuer` (and key
+    create, revoke, rotate and limits) or `control:admin` (everything, including organizations,
+    teams, projects, team budgets and publishing a snapshot). A token with none of them is refused
+    with 403 everywhere.
 servers:
   - url: http://127.0.0.1:3100
 security:
   - bearer: []
 paths:
+  /v1/whoami:
+    get:
+      operationId: whoami
+      description: The caller's actor, role and how it authenticated (`oidc`, `break_glass` or `shared_token`).
+      responses:
+        '200':
+          description: The identity
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [actor, role, via]
+                properties:
+                  actor: {type: string}
+                  role: {type: [string, 'null'], enum: [read, key-issuer, admin, null]}
+                  via: {type: string, enum: [oidc, break_glass, shared_token]}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
   /v1/orgs:
     post:
       operationId: createOrg
@@ -20,11 +48,13 @@ paths:
         '201': {description: The organization, content: {application/json: {schema: {$ref: '#/components/schemas/Org'}}}}
         '400': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
     get:
       operationId: listOrgs
       responses:
         '200': {description: Organizations}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/orgs/{org}/teams:
     parameters: [{$ref: '#/components/parameters/org'}]
     post:
@@ -34,12 +64,14 @@ paths:
         '201': {description: The team}
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
     get:
       operationId: listTeams
       responses:
         '200': {description: Teams}
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/teams/{team}/budget:
     parameters: [{name: team, in: path, required: true, schema: {type: string}}]
     put:
@@ -55,12 +87,14 @@ paths:
         '400': {$ref: '#/components/responses/Error'}
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
     delete:
       operationId: clearTeamBudget
       responses:
         '200': {description: The team, without a budget}
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/teams/{team}/projects:
     parameters: [{name: team, in: path, required: true, schema: {type: string}}]
     post:
@@ -70,12 +104,14 @@ paths:
         '201': {description: The project}
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
     get:
       operationId: listProjects
       responses:
         '200': {description: Projects}
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/projects/{project}/keys:
     parameters: [{name: project, in: path, required: true, schema: {type: string}}]
     post:
@@ -92,6 +128,7 @@ paths:
         '404': {$ref: '#/components/responses/Error'}
         '409': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/orgs/{org}/keys:
     parameters: [{$ref: '#/components/parameters/org'}]
     get:
@@ -100,6 +137,7 @@ paths:
         '200': {description: Keys}
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/keys/{key}:
     parameters: [{$ref: '#/components/parameters/key'}]
     get:
@@ -108,6 +146,7 @@ paths:
         '200': {description: The key, content: {application/json: {schema: {$ref: '#/components/schemas/Key'}}}}
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/keys/{key}/revoke:
     parameters: [{$ref: '#/components/parameters/key'}]
     post:
@@ -119,6 +158,7 @@ paths:
         '404': {$ref: '#/components/responses/Error'}
         '409': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/keys/{key}/rotate:
     parameters: [{$ref: '#/components/parameters/key'}]
     post:
@@ -131,6 +171,7 @@ paths:
         '404': {$ref: '#/components/responses/Error'}
         '409': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/keys/{key}/limits:
     parameters: [{$ref: '#/components/parameters/key'}]
     patch:
@@ -147,6 +188,7 @@ paths:
         '404': {$ref: '#/components/responses/Error'}
         '409': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/history:
     get:
       operationId: history
@@ -156,6 +198,7 @@ paths:
         '200': {description: Newest first}
         '400': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/orgs/{org}/snapshots:
     parameters: [{$ref: '#/components/parameters/org'}]
     post:
@@ -168,6 +211,7 @@ paths:
         '500': {$ref: '#/components/responses/Error'}
         '503': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/orgs/{org}/snapshot:
     parameters: [{$ref: '#/components/parameters/org'}]
     get:
@@ -178,6 +222,7 @@ paths:
         '304': {description: Not modified}
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
 components:
   securitySchemes:
     bearer: {type: http, scheme: bearer}
@@ -197,6 +242,18 @@ components:
   responses:
     Error:
       description: An error
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Forbidden:
+      description: The caller is authenticated but its role does not allow this (single sign-on only)
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unavailable:
+      description: The identity provider's keys cannot be fetched (single sign-on only)
+      headers:
+        Retry-After: {schema: {type: string}}
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}

@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 pub mod api;
 mod db;
+pub mod sso;
 
 const SCHEMA_VERSION: i64 = 5;
 

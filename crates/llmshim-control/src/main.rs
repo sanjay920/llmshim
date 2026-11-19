@@ -12,7 +12,7 @@ use llmshim_control::api::{router, seed_file_problem, token_problem, AppState};
 use llmshim_control::Store;
 use std::path::PathBuf;
 
-const USAGE: &str = "Usage: llmshim-control audit-verify (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         checks the change history's hash chain; exit 1 names the first broken row\n\n       llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
+const USAGE: &str = "Usage: llmshim-control audit-verify (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         checks the change history's hash chain; exit 1 names the first broken row\n\n       llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --sso-config        a JSON issuer file (note 0049): verify OIDC access tokens, take the actor from\n                      the verified subject and the role from its `roles` claim (control:read,\n                      control:key-issuer, control:admin). Then --token-file is the break-glass\n                      token, required unless the file sets \"break_glass\": false\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
 
 struct Options {
     db: Option<PathBuf>,
@@ -21,7 +21,8 @@ struct Options {
     database_ca_file: Option<PathBuf>,
     verify: bool,
     listen: String,
-    token_file: PathBuf,
+    token_file: Option<PathBuf>,
+    sso_config: Option<PathBuf>,
     signing_key_file: Option<PathBuf>,
 }
 
@@ -35,6 +36,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let verify = args[0] == "audit-verify";
     let (mut db, mut listen, mut token, mut signing) = (None, None, None, None);
     let (mut url_file, mut schema, mut ca) = (None, None, None);
+    let mut sso = None;
     let mut at = 1;
     while at < args.len() {
         let flag = args[at].as_str();
@@ -53,6 +55,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--listen" => listen = Some(value),
             "--token-file" => token = Some(PathBuf::from(value)),
             "--signing-key-file" => signing = Some(PathBuf::from(value)),
+            "--sso-config" => sso = Some(PathBuf::from(value)),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -62,7 +65,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     if (schema.is_some() || ca.is_some()) && url_file.is_none() {
         return Err("--database-schema and --database-ca-file are for --database-url-file".into());
     }
-    if verify && (listen.is_some() || token.is_some() || signing.is_some()) {
+    if verify && (listen.is_some() || token.is_some() || signing.is_some() || sso.is_some()) {
         return Err("audit-verify takes only the database options".into());
     }
     Ok(Options {
@@ -76,11 +79,14 @@ fn parse(args: &[String]) -> Result<Options, String> {
         } else {
             listen.ok_or("--listen is required")?
         },
-        token_file: if verify {
-            PathBuf::new()
+        // Without an identity provider the one token is the only credential. With one it is the
+        // break-glass token, and whether it is needed depends on the issuer file (read in `run`).
+        token_file: if verify || sso.is_some() {
+            token
         } else {
-            token.ok_or("--token-file is required")?
+            Some(token.ok_or("--token-file is required")?)
         },
+        sso_config: sso,
         signing_key_file: signing,
     })
 }
@@ -219,8 +225,65 @@ fn read_owner_only(path: &std::path::Path) -> Result<String, String> {
         .map_err(|e| format!("cannot read {}: {}", path.display(), e.kind()))
 }
 
+/// The issuer file, as an identity provider (note 0049). Every problem names the file and the
+/// field, never a value.
+fn read_sso(path: &std::path::Path) -> Result<llmshim_control::sso::Sso, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path.display(), e.kind()))?;
+    if bytes.len() > 64 * 1024 {
+        return Err(format!("{} is larger than 64 KiB", path.display()));
+    }
+    let config: llmshim_control::sso::SsoConfig = serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "{} is not a valid issuer file: {}",
+            path.display(),
+            e.classify_name()
+        )
+    })?;
+    llmshim_control::sso::Sso::from_config(&config)
+        .map_err(|message| format!("{}: {message}", path.display()))
+}
+
+trait ClassifyName {
+    fn classify_name(&self) -> &'static str;
+}
+
+impl ClassifyName for serde_json::Error {
+    /// The kind of parse failure, not the error's text (which can quote a value).
+    fn classify_name(&self) -> &'static str {
+        match self.classify() {
+            serde_json::error::Category::Io => "unreadable",
+            serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
+                "not valid JSON"
+            }
+            serde_json::error::Category::Data => "a field is missing, unknown or of the wrong type",
+        }
+    }
+}
+
 async fn run(options: Options) -> i32 {
-    let token = match read_token(&options.token_file) {
+    let sso = match options.sso_config.as_deref().map(read_sso).transpose() {
+        Ok(sso) => sso,
+        Err(message) => {
+            eprintln!("{message}");
+            return 1;
+        }
+    };
+    if let Some(sso) = &sso {
+        // The token is either needed or refused, never silently ignored.
+        match (sso.break_glass(), &options.token_file) {
+            (true, None) => {
+                eprintln!("--token-file is required while the issuer file leaves break_glass on");
+                return 2;
+            }
+            (false, Some(_)) => {
+                eprintln!("--token-file is given but the issuer file sets break_glass to false");
+                return 2;
+            }
+            _ => {}
+        }
+    }
+    let token = match options.token_file.as_deref().map(read_token).transpose() {
         Ok(token) => token,
         Err(message) => {
             eprintln!("{message}");
@@ -261,7 +324,13 @@ async fn run(options: Options) -> i32 {
             "warning: listening on {address} without TLS: put a TLS-terminating proxy in front of it"
         );
     }
-    let state = AppState::new(store, &token, options.signing_key_file);
+    let state = match (sso, token) {
+        (Some(sso), token) => {
+            AppState::with_sso(store, token.as_deref(), options.signing_key_file, sso)
+        }
+        (None, Some(token)) => AppState::new(store, &token, options.signing_key_file),
+        (None, None) => unreachable!("parse requires a token without an issuer file"),
+    };
     eprintln!("llmshim-control listening on http://{address}");
     let shutdown = async {
         #[cfg(unix)]

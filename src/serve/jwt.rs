@@ -345,6 +345,19 @@ fn object(part: &str) -> Option<Map<String, Value>> {
 
 /// Verify `token` against `policy` and `keys` at `now` (seconds since the epoch).
 pub fn verify(token: &str, keys: &KeySet, policy: &Policy, now: u64) -> Result<Verified, Failure> {
+    verify_claims(token, keys, policy, now).map(|(verified, _)| verified)
+}
+
+/// [`verify`], also returning the token's claims. Only a token whose signature and registered claims
+/// checked out gets here, so the claims are as trustworthy as the subject: a caller that reads a
+/// claim of its own (the control plane reads `roles`, note 0049) must read it from this map, never
+/// from the unverified payload.
+pub fn verify_claims(
+    token: &str,
+    keys: &KeySet,
+    policy: &Policy,
+    now: u64,
+) -> Result<(Verified, Map<String, Value>), Failure> {
     if token.len() > MAX_TOKEN_BYTES {
         return Err(Failure::Malformed);
     }
@@ -420,9 +433,10 @@ pub fn verify(token: &str, keys: &KeySet, policy: &Policy, now: u64) -> Result<V
     let subject = text(&claims, "sub")
         .filter(|s| !s.is_empty() && s.len() <= MAX_SUBJECT_BYTES)
         .ok_or(Failure::Claim("sub"))?;
-    Ok(Verified {
+    let verified = Verified {
         subject: subject.to_owned(),
-    })
+    };
+    Ok((verified, claims))
 }
 
 #[cfg(test)]

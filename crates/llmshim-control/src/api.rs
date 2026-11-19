@@ -1,6 +1,7 @@
 //! The control plane's HTTP API (design note 0026): JSON over the store, one bearer token,
 //! secrets only in the answers that create them.
 
+use crate::sso::{Principal, Refusal, Role, Sso, BREAK_GLASS_ACTOR};
 use crate::{Credential, Error, KeyRecord, LimitsUpdate, NewKey, Store};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -32,6 +33,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("post", "/v1/keys/{key}/revoke"),
     ("post", "/v1/keys/{key}/rotate"),
     ("patch", "/v1/keys/{key}/limits"),
+    ("get", "/v1/whoami"),
     ("get", "/v1/history"),
     ("post", "/v1/orgs/{org}/snapshots"),
     ("get", "/v1/orgs/{org}/snapshot"),
@@ -42,8 +44,11 @@ pub const MIN_TOKEN_LEN: usize = 22;
 
 pub struct AppState {
     store: Mutex<Store>,
-    token_digest: [u8; 32],
+    /// The shared token's digest; `None` when SSO is on and break-glass is off.
+    token_digest: Option<[u8; 32]>,
     signing_key_file: Option<PathBuf>,
+    /// The identity provider (note 0049); `None` keeps the one-token behaviour exactly.
+    sso: Option<Sso>,
 }
 
 impl AppState {
@@ -51,10 +56,59 @@ impl AppState {
     pub fn new(store: Store, token: &str, signing_key_file: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             store: Mutex::new(store),
-            token_digest: Sha256::digest(token.as_bytes()).into(),
+            token_digest: Some(Sha256::digest(token.as_bytes()).into()),
             signing_key_file,
+            sso: None,
         })
     }
+
+    /// With single sign-on (note 0049). `token` is the break-glass token: used only if the issuer
+    /// file leaves `break_glass` on, and then as an admin whose actor is `break-glass`.
+    pub fn with_sso(
+        store: Store,
+        token: Option<&str>,
+        signing_key_file: Option<PathBuf>,
+        sso: Sso,
+    ) -> Arc<Self> {
+        let token = token.filter(|_| sso.break_glass());
+        Arc::new(Self {
+            store: Mutex::new(store),
+            token_digest: token.map(|token| Sha256::digest(token.as_bytes()).into()),
+            signing_key_file,
+            sso: Some(sso),
+        })
+    }
+}
+
+/// The role each route needs under single sign-on (note 0049). A `(method, path)` that is not here
+/// needs `Admin`, so a route added without a line is closed, not open; a test requires a line for
+/// every entry of [`ROUTES`].
+pub const ROLES: &[(&str, &str, Role)] = &[
+    ("post", "/v1/orgs", Role::Admin),
+    ("get", "/v1/orgs", Role::Read),
+    ("post", "/v1/orgs/{org}/teams", Role::Admin),
+    ("get", "/v1/orgs/{org}/teams", Role::Read),
+    ("put", "/v1/teams/{team}/budget", Role::Admin),
+    ("delete", "/v1/teams/{team}/budget", Role::Admin),
+    ("post", "/v1/teams/{team}/projects", Role::Admin),
+    ("get", "/v1/teams/{team}/projects", Role::Read),
+    ("post", "/v1/projects/{project}/keys", Role::KeyIssuer),
+    ("get", "/v1/orgs/{org}/keys", Role::Read),
+    ("get", "/v1/keys/{key}", Role::Read),
+    ("post", "/v1/keys/{key}/revoke", Role::KeyIssuer),
+    ("post", "/v1/keys/{key}/rotate", Role::KeyIssuer),
+    ("patch", "/v1/keys/{key}/limits", Role::KeyIssuer),
+    ("get", "/v1/whoami", Role::Read),
+    ("get", "/v1/history", Role::Read),
+    ("post", "/v1/orgs/{org}/snapshots", Role::Admin),
+    ("get", "/v1/orgs/{org}/snapshot", Role::Read),
+];
+
+fn required_role(method: &str, path: &str) -> Role {
+    ROLES
+        .iter()
+        .find(|(m, p, _)| m.eq_ignore_ascii_case(method) && *p == path)
+        .map_or(Role::Admin, |(_, _, role)| *role)
 }
 
 /// Why `token` cannot be the API token, if it cannot.
@@ -194,9 +248,31 @@ fn actor(headers: &HeaderMap) -> ApiResult<String> {
     }
 }
 
+fn unauthorized() -> Response {
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
+}
+
+/// The shared token against what was presented, in constant time: the length of what was
+/// presented does not matter.
+fn matches_shared(digest: &Option<[u8; 32]>, presented: &str) -> bool {
+    let Some(expected) = digest else {
+        return false;
+    };
+    let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+    let mut difference = 0u8;
+    for (a, b) in digest.iter().zip(expected.iter()) {
+        difference |= a ^ b;
+    }
+    !presented.is_empty() && difference == 0
+}
+
 async fn authenticate(
     State(state): State<Arc<AppState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let presented = request
@@ -209,20 +285,70 @@ async fn authenticate(
             scheme.eq_ignore_ascii_case("bearer").then_some(rest)
         })
         .map(str::trim)
-        .unwrap_or("");
-    // Digests compared in constant time: the length of what was presented does not matter.
-    let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
-    let mut difference = 0u8;
-    for (a, b) in digest.iter().zip(state.token_digest.iter()) {
-        difference |= a ^ b;
+        .unwrap_or("")
+        .to_owned();
+    let Some(sso) = &state.sso else {
+        // One token, no identity provider: exactly as before (note 0026).
+        if !matches_shared(&state.token_digest, &presented) {
+            return unauthorized();
+        }
+        return next.run(request).await;
+    };
+    // Single sign-on (note 0049). The actor is derived from the credential below; whatever the
+    // caller put in the header is discarded first, so it can never be read as an identity.
+    request.headers_mut().remove("x-llmshim-actor");
+    let principal = if crate::sso::is_token(&presented) {
+        // Shaped like a token: verified as one and never compared with the shared token.
+        match sso.authenticate(&presented).await {
+            Ok(principal) => principal,
+            Err(Refusal::Unauthorized) => return unauthorized(),
+            Err(Refusal::Unavailable) => {
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": {"code": "unavailable",
+                        "message": "the identity provider's keys are unavailable"}})),
+                )
+                    .into_response();
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+                return response;
+            }
+        }
+    } else if matches_shared(&state.token_digest, &presented) {
+        Principal {
+            actor: BREAK_GLASS_ACTOR.to_owned(),
+            role: Some(Role::Admin),
+            via: "break_glass",
+        }
+    } else {
+        return unauthorized();
+    };
+    let needed = match request.extensions().get::<axum::extract::MatchedPath>() {
+        Some(path) => required_role(request.method().as_str(), path.as_str()),
+        // No route matched: the fallback answers 404, which needs no role.
+        None => Role::Read,
+    };
+    if principal.role.is_none_or(|role| role < needed) {
+        return ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            format!("this needs the {} role", needed.name()),
+        )
+        .into_response();
     }
-    if presented.is_empty() || difference != 0 {
-        let mut response = StatusCode::UNAUTHORIZED.into_response();
-        response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-        return response;
-    }
+    // The actor is visible ASCII by construction; if it were ever not, the request stops here
+    // rather than go on to a handler that would read a caller-typed header instead.
+    let Ok(actor) = HeaderValue::from_str(&principal.actor) else {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "internal error",
+        )
+        .into_response();
+    };
+    request.headers_mut().insert("x-llmshim-actor", actor);
+    request.extensions_mut().insert(principal);
     next.run(request).await
 }
 
@@ -497,6 +623,21 @@ async fn update_limits(
     ))
 }
 
+async fn whoami(
+    headers: HeaderMap,
+    principal: Option<axum::Extension<Principal>>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(match principal {
+        Some(axum::Extension(principal)) => json!({
+            "actor": principal.actor,
+            "role": principal.role.map(Role::name),
+            "via": principal.via,
+        }),
+        // One shared token: every holder is an admin, and the actor is the header's label.
+        None => json!({"actor": actor(&headers)?, "role": "admin", "via": "shared_token"}),
+    }))
+}
+
 async fn history(
     State(s): State<Arc<AppState>>,
     Query(q): Query<HistoryQuery>,
@@ -660,6 +801,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/keys/{key}/revoke", post(revoke_key))
         .route("/v1/keys/{key}/rotate", post(rotate_key))
         .route("/v1/keys/{key}/limits", patch(update_limits))
+        .route("/v1/whoami", get(whoami))
         .route("/v1/history", get(history))
         .route("/v1/orgs/{org}/snapshots", post(publish))
         .route("/v1/orgs/{org}/snapshot", get(latest))
@@ -669,4 +811,16 @@ pub fn router(state: Arc<AppState>) -> Router {
             authenticate,
         ))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_route_with_no_line_in_the_table_needs_admin() {
+        assert_eq!(required_role("get", "/v1/not-yet-classified"), Role::Admin);
+        assert_eq!(required_role("DELETE", "/v1/orgs"), Role::Admin);
+        assert_eq!(required_role("GET", "/v1/orgs"), Role::Read);
+    }
 }
