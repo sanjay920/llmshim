@@ -64,7 +64,8 @@ metric label, so a hostile or buggy classifier cannot put text into a response o
 - **Streams are not classified, and a caller under a response classifier cannot stream.** A verdict needs the whole
   text; holding a stream until it arrives ends streaming in all but name, and releasing text before the verdict is
   the thing the rule exists to prevent. The tenant is refused `400` when it asks for `stream: true` (before anything
-  is sent), on every route that streams, exactly as 0043 refused streaming before 0046. Request-only classifier rules
+  is sent), on every route that streams (`/v1/chat/stream` carries no `stream` flag, so the refusal sits where every stream
+  passes, not on the flag), exactly as 0043 refused streaming before 0046. Request-only classifier rules
   never affect streaming.
 - **What is recorded.** `llmshim_gateway_guardrail_classifier_total{rule,outcome}` with `outcome` one of `allow`,
   `block`, `failed_open`, `failed_closed` (the rule is the operator's name: bounded by the file); a refusal also
@@ -79,6 +80,19 @@ metric label, so a hostile or buggy classifier cannot put text into a response o
 - **The call is bounded.** One shared HTTP client without redirects or ambient proxy, a total timeout per call, at
   most 4 KiB read from the answer, and a concurrency cap per classifier (64 in flight; over it a call fails at once,
   by the rule's policy) so a slow classifier cannot hold every request.
+
+## Known limits
+
+- **Bulk base64 is not text.** Inline `data:` image, audio and video URIs, `audio_b64`, and a long (256 bytes or
+  more) all-base64 string under the key `data`, `file_data` or `b64_json` (a chat `input_audio` or a file part) are
+  left out. A PDF sent as a `data:application/...` URI is judged as text and is likely to exceed `max_bytes`.
+- **Keys are not sent.** The text is values only: the keys of a tool call's argument object never reach the
+  classifier.
+- **The preparation permit is held across the call.** A request is judged while it holds its preparation permit, so
+  a slow classifier occupies up to `timeout_ms` per rule of that bounded pool for each admitted request.
+- **A throughput ceiling.** At most 64 calls per endpoint are in flight (not configurable); beyond that a call fails by
+  its rule's policy even though the classifier is healthy, so a rule that fails closed refuses a burst. Capacity is
+  about 64 divided by the classifier's latency.
 
 ## Not built
 

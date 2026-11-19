@@ -2888,6 +2888,11 @@ async fn chat_stream_inner(
             );
         }
         let identity = identified_caller.identity;
+        // `/v1/chat/stream` streams without `stream: true` in its body, so the refusal is made here,
+        // where every streaming route passes, and not only on the flag (note 0048).
+        if let Err(error) = state.refuse_stream_under_classifier(&identity.tenant) {
+            return error.into_response();
+        }
         if tried.is_empty() {
             // External classifiers (note 0048), once per request. A tenant under a rule that reads
             // answers never gets here: `build_request_for` refused its stream.

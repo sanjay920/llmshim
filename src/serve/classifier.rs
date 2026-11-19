@@ -160,6 +160,18 @@ pub fn audit_summary(rules: &[Guardrail], classifiers: &BTreeMap<String, Classif
     )
 }
 
+/// A long base64 payload under a key that carries one (an `input_audio` or a file part): bulk data, not
+/// text. Short values, other keys and anything with a non-base64 character are text and are judged.
+fn is_blob(key: &str, item: &Value) -> bool {
+    matches!(key, "data" | "file_data" | "b64_json")
+        && item.as_str().is_some_and(|text| {
+            text.len() >= 256
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'\n'))
+        })
+}
+
 /// Every string value of `value` (not its keys), outside inline media, joined with newlines. `None`
 /// when the text is longer than `max` bytes: a classifier that saw part of it has not seen it.
 fn text_of(value: &Value, max: usize) -> Option<String> {
@@ -179,7 +191,9 @@ fn text_of(value: &Value, max: usize) -> Option<String> {
             Value::Array(items) => items.iter().all(|item| walk(item, out, max)),
             Value::Object(map) => map
                 .iter()
-                .filter(|(key, _)| key.as_str() != super::guardrails::BULK_KEY)
+                .filter(|(key, item)| {
+                    key.as_str() != super::guardrails::BULK_KEY && !is_blob(key, item)
+                })
                 .all(|(_, item)| walk(item, out, max)),
             _ => true,
         }
@@ -319,11 +333,16 @@ mod tests {
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
             ]}],
             "audio_b64": "QUJD",
+            "input_audio": {"data": "QUJD".repeat(100), "format": "wav"},
+            "note": {"data": "short text under data"},
         });
         let text = text_of(&body, 1024).unwrap();
         // Every value (an object's members in key order, an array's in order); no key, no media, no
         // audio. Structure such as a role is sent too: a string the model sees is a string judged.
-        assert_eq!(text, "hello\ntext\nimage_url\nuser\n");
+        assert_eq!(
+            text,
+            "wav\nhello\ntext\nimage_url\nuser\nshort text under data\n"
+        );
         assert!(!text.contains("AAAA") && !text.contains("QUJD") && !text.contains("messages"));
         assert_eq!(
             text_of(&body, 10),

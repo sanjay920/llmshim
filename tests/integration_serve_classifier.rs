@@ -230,6 +230,22 @@ async fn a_tenant_under_an_answer_classifier_cannot_stream_but_a_request_only_ru
     );
     upstream_mock.assert_async().await;
 
+    // `/v1/chat/stream` is always a stream and carries no `stream` flag in its body.
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/chat/stream", server.base))
+        .bearer_auth(CALLER_KEY)
+        .json(&json!({"model": "p/m", "messages": [{"role": "user", "content": "hello"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("guardrail_stream_refused"));
+    upstream_mock.assert_async().await;
+
     let request_only = "[[guardrails]]\nname = \"moderation\"\nclassifier = \"mod\"\n";
     let (up, _mock) = upstream("pong", 1).await;
     let free = start(
