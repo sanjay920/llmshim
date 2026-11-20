@@ -167,6 +167,34 @@ pub struct ServeConfig {
     /// (note 0051). Fixed at start.
     #[serde(default)]
     pub usage_export: Option<UsageExport>,
+    /// Prompt-structure capture for the cache debugger (note 0052). A client opts in with `capture =
+    /// "structure"` on its key. Fixed at start.
+    #[serde(default)]
+    pub capture: Option<Capture>,
+}
+
+/// Prompt-structure capture (note 0052, slice 5a): each opted-in client's requests are cut into segments,
+/// each fingerprinted with a keyed hash, and the list rides the usage record to the control plane, which can
+/// then find where a request's cached prefix first differed from the one before. Fingerprints, kinds and sizes
+/// only: none of the prompt.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Capture {
+    /// The deployment secret that keys the fingerprints, by reference: at least 32 characters. The gateways of
+    /// one deployment share it; the control plane never has it, so it can compare fingerprints and never
+    /// compute one. Rotating it is a restart, after which earlier and later requests are not comparable.
+    pub hmac_key: SecretRef,
+}
+
+/// What a client captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureMode {
+    /// Nothing (the default).
+    Off,
+    /// The prompt's segment fingerprints (note 0052, slice 5a).
+    Structure,
 }
 
 /// The push of usage records to the control plane (note 0051). Bounded and fail-open: a full queue drops
@@ -1548,6 +1576,10 @@ pub struct GatewayKey {
     /// only: nothing admits, limits or routes on them.
     #[serde(default)]
     pub tags: std::collections::BTreeMap<String, String>,
+    /// What to capture of this client's prompts for the cache debugger (note 0052): `off` (the default) or
+    /// `structure`. Needs a `[capture]` table. Reloadable with the keys.
+    #[serde(default)]
+    pub capture: Option<CaptureMode>,
 }
 
 /// `[deployments.<name>]`: one name, several targets (design note 0031).
@@ -1922,6 +1954,19 @@ impl ServeConfig {
             if let Err(message) = super::guardrails::Guardrails::build(&self.guardrails) {
                 issues.push(Issue::new("guardrails", message));
             }
+        }
+    }
+
+    fn validate_capture(&self, issues: &mut Vec<Issue>) {
+        let Some(capture) = &self.capture else {
+            return;
+        };
+        validate_secret(&capture.hmac_key, "capture.hmac_key", issues);
+        if self.usage_export.is_none() {
+            issues.push(Issue::new(
+                "capture",
+                "needs [usage_export]: the structure travels with the usage record to the control plane",
+            ));
         }
     }
 
@@ -2780,6 +2825,7 @@ impl ServeConfig {
         self.validate_guardrails(&mut issues);
         self.validate_media_store(&mut issues);
         self.validate_usage_export(&mut issues);
+        self.validate_capture(&mut issues);
         if let Some(fleet) = &self.fleet {
             validate_secret(&fleet.redis_url, "fleet.redis_url", &mut issues);
             if let Some(outage) = &fleet.outage_admission {
@@ -3781,6 +3827,12 @@ impl ServeConfig {
                     }
                 }
             }
+            if key.capture == Some(CaptureMode::Structure) && self.capture.is_none() {
+                issues.push(Issue::new(
+                    format!("{at}.capture"),
+                    "needs a [capture] table with an hmac_key",
+                ));
+            }
             if key.tags.len() > 16 {
                 issues.push(Issue::new(format!("{at}.tags"), "has more than 16 tags"));
             }
@@ -4086,6 +4138,10 @@ impl ServeConfig {
             .usage_export
             .iter()
             .map(|export| ("usage_export.token".to_string(), &export.token));
+        let capture = self
+            .capture
+            .iter()
+            .map(|capture| ("capture.hmac_key".to_string(), &capture.hmac_key));
         let media = self.media_store.iter().flat_map(|store| {
             [
                 ("media_store.access_key_id", &store.access_key_id),
@@ -4105,6 +4161,7 @@ impl ServeConfig {
             .chain(jwks)
             .chain(classifiers)
             .chain(usage_export)
+            .chain(capture)
             .chain(media)
             .collect()
     }
@@ -5087,10 +5144,11 @@ mod tests {
             "classifiers",
             "media_store",
             "usage_export",
+            "capture",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 21, "a new table needs a line here");
+        assert_eq!(properties.len(), 22, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
     }
 
@@ -5162,6 +5220,74 @@ mod tests {
             "{}",
             issues[0].message
         );
+    }
+
+    #[test]
+    fn capture_is_validated_by_path_and_needs_its_secret_and_the_export() {
+        let export = "[usage_export]\nurl = \"https://control.example.com\"\ntoken = { env = \"EXPORT_TOKEN\" }\n";
+        let capture = "[capture]\nhmac_key = { env = \"CAPTURE_KEY\" }\n";
+        let paths = |text: &str| -> Vec<String> {
+            ServeConfig::parse(text, Format::Toml)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|issue| issue.path)
+                .collect()
+        };
+        let keyed = |mode: &str| {
+            MINIMAL.replace(
+                "secret = { env = \"CI_GATEWAY_KEY\" }",
+                &format!("secret = {{ env = \"CI_GATEWAY_KEY\" }}\ncapture = \"{mode}\""),
+            )
+        };
+        // A client captures only with the table and the export both present.
+        assert!(ServeConfig::parse(
+            &format!("{}\n{export}\n{capture}", keyed("structure")),
+            Format::Toml
+        )
+        .is_ok());
+        assert!(ServeConfig::parse(
+            &format!("{}\n{export}\n{capture}", keyed("off")),
+            Format::Toml
+        )
+        .is_ok());
+        assert_eq!(
+            paths(&format!("{}\n{export}", keyed("structure"))),
+            ["keys[0].capture"]
+        );
+        // The table with no export has nowhere to send the structure.
+        assert_eq!(paths(&format!("{MINIMAL}\n{capture}")), ["capture"]);
+        // The secret is a reference, validated like every other.
+        assert_eq!(
+            paths(&format!(
+                "{MINIMAL}\n{export}\n[capture]\nhmac_key = {{ env = \"lower\" }}\n"
+            )),
+            ["capture.hmac_key.env"]
+        );
+        assert_eq!(
+            paths(&format!(
+                "{MINIMAL}\n{export}\n[capture]\nhmac_key = {{}}\n"
+            )),
+            ["capture.hmac_key"]
+        );
+        // Only the two modes exist, and only here: a literal secret or an unknown field is not accepted.
+        assert!(ServeConfig::parse(
+            &format!("{}\n{export}\n{capture}", keyed("payload")),
+            Format::Toml
+        )
+        .is_err());
+        assert!(ServeConfig::parse(
+            &format!("{MINIMAL}\n{export}\n[capture]\nhmac_key = \"a-literal-secret\"\n"),
+            Format::Toml
+        )
+        .is_err());
+        // The secret is listed so `--check` resolves it.
+        let config =
+            ServeConfig::parse(&format!("{MINIMAL}\n{export}\n{capture}"), Format::Toml).unwrap();
+        assert!(config
+            .secret_refs()
+            .iter()
+            .any(|(path, _)| path == "capture.hmac_key"));
     }
 
     #[test]

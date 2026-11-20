@@ -225,6 +225,16 @@ pub fn key_tags(
         .collect()
 }
 
+/// The credential scopes of the keys that capture prompt structure (note 0052). The set a reload replaces.
+pub fn key_capture(config: &ServeConfig, env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    config
+        .keys
+        .iter()
+        .filter(|key| key.capture == Some(super::config::CaptureMode::Structure))
+        .filter_map(|key| credential_scope(key, env))
+        .collect()
+}
+
 /// The workload name a verified token is bound to, in the space the key store
 /// keeps certificate workloads in (`dns:`/`uri:` names), under its own prefix: a
 /// table name has no `:`, so two bindings can never produce the same name.

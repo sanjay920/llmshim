@@ -1334,6 +1334,7 @@ impl AttemptCoordinator {
                 if let Some(recorder) = self.usage.get() {
                     recorder.begin(
                         attempt.identity(),
+                        attempt.native_body(),
                         &scope.tenant_key,
                         scope.credential.as_deref(),
                         scope.request_id.as_deref(),
@@ -5809,6 +5810,7 @@ mod usage_records {
                 "known-credential".to_string(),
                 "checkout".to_string(),
             )]),
+            capture: None,
             spans: None,
         });
         (coordinator, collected)

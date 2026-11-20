@@ -355,7 +355,8 @@ fn every_route_the_page_calls_is_one_the_api_has() {
     }
     let manage = include_str!("../ui/manage.js");
     // The fixed tails the script appends to an id ("/revoke", "/limits"…) are real last segments of routes.
-    let tails: Vec<&str> = manage
+    let both = format!("{manage}{}", include_str!("../ui/app.js"));
+    let tails: Vec<&str> = both
         .split('"')
         .filter(|p| {
             p.len() > 1 && p.starts_with('/') && p[1..].bytes().all(|b| b.is_ascii_lowercase())

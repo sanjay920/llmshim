@@ -55,6 +55,7 @@ const OUTCOMES: [&str; 6] = [
 /// A validated row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewRequest {
+    structure: Option<Vec<crate::structure::Segment>>,
     attempt_id: String,
     ts: String,
     ts_ms: i64,
@@ -196,6 +197,13 @@ impl NewRequest {
                 .ok_or("usage_reported")?,
             admission: text(map, "admission", true)?.ok_or("admission")?,
             tags,
+            // For the cache debugger (note 0052): kept only for a request that names its client, since the
+            // client is what pairs a request with the one before it. A field that is not what a gateway sends
+            // is dropped, never a reason to lose the row's spend.
+            structure: crate::structure::parse(map.get("structure")).filter(|_| {
+                map.get("key")
+                    .is_some_and(|k| k.as_str().is_some_and(|k| !k.is_empty()))
+            }),
         })
     }
 }
@@ -435,7 +443,7 @@ impl Store {
                     i(i64::from(row.usage_reported)), t(&row.admission),
                     ot(row.tags.as_deref()), i(received),
                 ];
-                inserted += tx.exec(
+                let stored = tx.exec(
                     "INSERT INTO requests (attempt_id, ts, ts_ms, day, tenant, key_name, request_id, \
                      deployment, provider, model, kind, outcome, http_status, duration_ms, input_tokens, \
                      output_tokens, reasoning_tokens, uncached_input_tokens, cache_read_tokens, \
@@ -444,6 +452,15 @@ impl Store {
                      ON CONFLICT (attempt_id) DO NOTHING",
                     &params,
                 )?;
+                inserted += stored;
+                // The structure goes in with its row, once: a repeated attempt keeps the first.
+                if let (1, Some(segments), Some(key)) = (stored, &row.structure, &row.key_name) {
+                    tx.exec(
+                        "INSERT INTO request_structure (attempt_id, ts_ms, key_name, provider, model, segments) \
+                         VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT (attempt_id) DO NOTHING",
+                        &[t(&row.attempt_id), i(row.ts_ms), t(key), t(&row.provider), t(&row.model), t(&crate::structure::encode(segments))],
+                    )?;
+                }
             }
             Ok(inserted)
         })?;
@@ -604,9 +621,12 @@ impl Store {
 
     /// Delete rows older than `before_ms`; how many went.
     pub fn purge_requests(&mut self, before_ms: i64) -> Result<u64> {
-        self.backend.transaction(true, |tx| {
+        let gone = self.backend.transaction(true, |tx| {
             tx.exec("DELETE FROM requests WHERE ts_ms < ?1", &[i(before_ms)])
-        })
+        })?;
+        // The structure ages out with its row.
+        self.purge_structure(before_ms)?;
+        Ok(gone)
     }
 }
 

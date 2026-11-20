@@ -26,6 +26,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// Re-exported so a control-plane test can drive the exporter end to end.
+pub use crate::gateway::structure::Segment;
 pub use crate::gateway::usage::{UsageRecord, UsageSink};
 
 /// What `[usage_export]` says.
@@ -350,6 +351,7 @@ mod tests {
             cost_source: Some("provider".into()),
             usage_reported: true,
             admission: "fleet",
+            structure: None,
         }
     }
 

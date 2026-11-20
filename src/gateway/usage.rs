@@ -100,6 +100,11 @@ pub struct UsageRecord {
     /// `"fleet"` for an attempt admitted the ordinary way, `"outage"` for one
     /// admitted on a replica-owned lease while Redis was unreachable (0027).
     pub admission: &'static str,
+    /// The prompt cut into keyed-hash segments, for the cache debugger (note 0052): present only for a
+    /// client whose configuration turns structure capture on, and for a request body the walker understood.
+    /// Hashes, kinds and sizes: none of the prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structure: Option<Vec<crate::gateway::structure::Segment>>,
 }
 
 /// Receives a record when an attempt ends. Called inline on the response path:
@@ -120,10 +125,80 @@ pub struct UsageSetup {
     pub sink: Arc<dyn UsageSink>,
     pub tenants: TenantNames,
     pub keys: KeyNames,
+    /// Prompt-structure capture (note 0052); `None` records no structure for anyone.
+    pub capture: Option<StructureCapture>,
     /// Starts a trace span for each admitted attempt, when something exports
     /// traces. Driven from the same two points as the records.
     pub spans: Option<Arc<dyn AttemptSpans>>,
 }
+
+/// Which clients have structure capture on, and the secret that keys the fingerprints (note 0052).
+///
+/// Clones share one table, so a reload that changes a client's `capture` takes effect for every holder at once;
+/// unlike the names tables it **replaces** the set, because turning capture off must stop it. The secret is fixed
+/// for the process: rotating it is a restart, after which earlier and later fingerprints are not comparable.
+#[derive(Clone)]
+pub struct StructureCapture {
+    key: Arc<Vec<u8>>,
+    clients: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+}
+
+impl StructureCapture {
+    pub fn new(key: Vec<u8>, clients: impl IntoIterator<Item = String>) -> Self {
+        let capture = Self {
+            key: Arc::new(key),
+            clients: Default::default(),
+        };
+        capture.set_clients(clients);
+        capture
+    }
+
+    /// The credentials (whole scope digests or the prefix a policy scope carries) that capture; everyone else
+    /// does not.
+    pub fn set_clients(&self, clients: impl IntoIterator<Item = String>) {
+        let mut set = self.clients.write().unwrap_or_else(|p| p.into_inner());
+        *set = clients
+            .into_iter()
+            .map(|c| credential_prefix(&c).to_owned())
+            .collect();
+    }
+
+    /// The segments of `body` when the credential captures, `None` when it does not (or has none).
+    pub(crate) fn segments(
+        &self,
+        credential: Option<&str>,
+        wire: crate::reasoning::WireFormat,
+        body: &Value,
+    ) -> Option<Vec<crate::gateway::structure::Segment>> {
+        let credential = credential?;
+        if !self
+            .clients
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(credential_prefix(credential))
+        {
+            return None;
+        }
+        let segments = crate::gateway::structure::segments(wire, body, &self.key);
+        #[cfg(feature = "serve")]
+        crate::gateway::metrics::incr(
+            STRUCTURE_CAPTURE,
+            &[(
+                "outcome",
+                if segments.is_some() {
+                    "captured"
+                } else {
+                    "unrecognized"
+                },
+            )],
+        );
+        segments
+    }
+}
+
+/// Structure captures by outcome: `captured`, or `unrecognized` (a body the walker does not understand).
+#[cfg(feature = "serve")]
+pub const STRUCTURE_CAPTURE: &str = "llmshim_structure_capture_total";
 
 /// What is known when an attempt is admitted.
 #[cfg_attr(not(feature = "serve-otel"), allow(dead_code))]
@@ -299,6 +374,7 @@ struct Open {
     max_provider_usd: Option<f64>,
     terminal_provider_usd: Option<f64>,
     terminal_catalog_usd: Option<f64>,
+    structure: Option<Vec<crate::gateway::structure::Segment>>,
 }
 
 /// Tracks attempts in flight and emits one record when each ends.
@@ -309,11 +385,13 @@ pub(crate) struct UsageRecorder {
     keys: KeyNames,
     open: Mutex<HashMap<uuid::Uuid, Open>>,
     admission: &'static str,
+    capture: Option<StructureCapture>,
 }
 
 impl UsageRecorder {
     pub(crate) fn new(setup: UsageSetup) -> Self {
         Self {
+            capture: setup.capture,
             spans: setup.spans,
             sink: setup.sink,
             tenants: setup.tenants,
@@ -332,15 +410,21 @@ impl UsageRecorder {
     }
 
     /// An attempt was admitted and is about to be sent. `tenant_key`,
-    /// `credential` and `request_id` come from the policy scope.
+    /// `credential` and `request_id` come from the policy scope; `native_body` is the request as the
+    /// provider will receive it, read only to fingerprint its structure for a client that opted in.
     pub(crate) fn begin(
         &self,
         identity: &AttemptIdentity,
+        native_body: &Value,
         tenant_key: &str,
         credential: Option<&str>,
         request_id: Option<&str>,
         deployment: Option<&str>,
     ) {
+        let structure = self
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.segments(credential, identity.wire(), native_body));
         let span = self.spans.as_ref().map(|spans| {
             spans.start(&AttemptBegun {
                 request_id,
@@ -365,6 +449,7 @@ impl UsageRecorder {
             max_provider_usd: None,
             terminal_provider_usd: None,
             terminal_catalog_usd: None,
+            structure,
         };
         if let Ok(mut attempts) = self.open.lock() {
             attempts.insert(identity.id(), open);
@@ -553,6 +638,64 @@ fn build(
         cost_source,
         usage_reported: usage.is_some(),
         admission,
+        structure: open.structure,
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use crate::reasoning::WireFormat;
+    use serde_json::json;
+
+    fn body() -> Value {
+        json!({"messages": [{"role": "user", "content": "hello"}]})
+    }
+
+    #[test]
+    fn only_the_listed_credentials_capture_and_a_new_list_replaces_the_old() {
+        let capture = StructureCapture::new(b"k".repeat(32), ["a".repeat(64)]);
+        // A whole scope digest and the prefix a policy scope carries name the same credential.
+        assert!(capture
+            .segments(Some(&"a".repeat(64)), WireFormat::OpenAiChat, &body())
+            .is_some());
+        assert!(capture
+            .segments(Some(&"a".repeat(16)), WireFormat::OpenAiChat, &body())
+            .is_some());
+        assert!(capture
+            .segments(Some(&"b".repeat(64)), WireFormat::OpenAiChat, &body())
+            .is_none());
+        assert!(
+            capture
+                .segments(None, WireFormat::OpenAiChat, &body())
+                .is_none(),
+            "no key, no capture"
+        );
+        // Replacing the set stops the old client at once, for every clone of the handle.
+        let clone = capture.clone();
+        clone.set_clients(["b".repeat(64)]);
+        assert!(capture
+            .segments(Some(&"a".repeat(64)), WireFormat::OpenAiChat, &body())
+            .is_none());
+        assert!(capture
+            .segments(Some(&"b".repeat(64)), WireFormat::OpenAiChat, &body())
+            .is_some());
+        clone.set_clients(Vec::<String>::new());
+        assert!(capture
+            .segments(Some(&"b".repeat(64)), WireFormat::OpenAiChat, &body())
+            .is_none());
+    }
+
+    #[test]
+    fn a_body_the_walker_cannot_read_records_no_structure() {
+        let capture = StructureCapture::new(b"k".repeat(32), ["a".repeat(64)]);
+        assert!(capture
+            .segments(
+                Some(&"a".repeat(64)),
+                WireFormat::OpenAiChat,
+                &json!({"prompt": "x"})
+            )
+            .is_none());
     }
 }
 

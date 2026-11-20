@@ -41,6 +41,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/v1/requests"),
     ("get", "/v1/requests/summary"),
     ("get", "/v1/requests/facets"),
+    ("get", "/v1/requests/misses"),
+    ("get", "/v1/requests/{attempt}/structure"),
     ("post", "/v1/orgs/{org}/snapshots"),
     ("get", "/v1/orgs/{org}/snapshot"),
 ];
@@ -173,6 +175,8 @@ pub const ROLES: &[(&str, &str, Option<Role>)] = &[
     ("get", "/v1/requests", Some(Role::Read)),
     ("get", "/v1/requests/summary", Some(Role::Read)),
     ("get", "/v1/requests/facets", Some(Role::Read)),
+    ("get", "/v1/requests/misses", Some(Role::Read)),
+    ("get", "/v1/requests/{attempt}/structure", Some(Role::Read)),
     ("post", "/v1/orgs/{org}/snapshots", Some(Role::Admin)),
     ("get", "/v1/orgs/{org}/snapshot", Some(Role::Read)),
 ];
@@ -878,6 +882,60 @@ async fn requests_facets(
     Ok(Json(json!(facets)))
 }
 
+/// Where an attempt's prompt first differed from the same client's request before it (note 0052): the stored
+/// segment list (kinds, keyed fingerprints and sizes: no text) and the comparison. A request whose client did not
+/// capture, or whose structure has aged out, is a 404 that says so.
+async fn request_structure(
+    State(s): State<Arc<AppState>>,
+    Path(attempt): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let found = with_store(&s, move |st| {
+        let Some(row) = st.request_structure(&attempt)? else {
+            return Ok(None);
+        };
+        let previous = st.previous_structure(&row)?;
+        Ok(Some((row, previous)))
+    })
+    .await?;
+    let Some((row, previous)) = found else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no_structure",
+            "no prompt structure is stored for this request: its client does not capture it, or it has aged out",
+        ));
+    };
+    let when = |ms: i64| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    };
+    Ok(Json(json!({
+        "attempt_id": row.attempt_id,
+        "segments": row.segments,
+        "previous": previous.as_ref().map(|p| json!({
+            "attempt_id": p.attempt_id,
+            "ts": when(p.ts_ms),
+            "gap_secs": (row.ts_ms - p.ts_ms) / 1000,
+            // Older than the shorter cache lifetime: the entry may have expired whatever the prompt said.
+            "within_short_window": row.ts_ms - p.ts_ms <= crate::structure::SHORT_WINDOW_MS,
+        })),
+        "diff": previous.as_ref().map(|p| crate::structure::diff(&p.segments, &row.segments)),
+    })))
+}
+
+/// Across a window: how consecutive requests of each client relate, and where the changed ones first differ.
+async fn requests_misses(
+    State(s): State<Arc<AppState>>,
+    Query(params): Query<RequestParams>,
+) -> ApiResult<Json<Value>> {
+    let query = params.query()?;
+    let to = query
+        .to_ms
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() + 1);
+    let from = query.from_ms.unwrap_or(to - 7 * 86_400_000);
+    let misses = with_store(&s, move |st| st.structure_misses(from, to)).await?;
+    Ok(Json(json!(misses)))
+}
+
 async fn history(
     State(s): State<Arc<AppState>>,
     Query(q): Query<HistoryQuery>,
@@ -1086,6 +1144,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/requests", get(list_requests))
         .route("/v1/requests/summary", get(requests_summary))
         .route("/v1/requests/facets", get(requests_facets))
+        .route("/v1/requests/misses", get(requests_misses))
+        .route("/v1/requests/{attempt}/structure", get(request_structure))
         .route("/v1/orgs/{org}/snapshots", post(publish))
         .route("/v1/orgs/{org}/snapshot", get(latest))
         .fallback(no_route)

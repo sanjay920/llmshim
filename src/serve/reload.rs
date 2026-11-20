@@ -58,6 +58,8 @@ pub struct ReloadHandles {
     pub(crate) status: StatusHandle,
     /// The audit log, when `[logging] audit_log` is set (note 0047).
     pub(crate) audit: Option<Arc<super::audit::AuditLog>>,
+    /// Which clients capture prompt structure, when `[capture]` is set (note 0052): a reload replaces the set.
+    pub(crate) capture: Option<crate::gateway::usage::StructureCapture>,
 }
 
 impl ReloadHandles {
@@ -84,7 +86,17 @@ impl ReloadHandles {
             clock,
             status: StatusHandle::default(),
             audit: None,
+            capture: None,
         }
+    }
+
+    /// Let a reload change which clients capture prompt structure (note 0052).
+    pub(crate) fn with_capture(
+        mut self,
+        capture: Option<crate::gateway::usage::StructureCapture>,
+    ) -> Self {
+        self.capture = capture;
+        self
     }
 
     /// Record what this server changes in `audit` (note 0047).
@@ -652,6 +664,10 @@ impl Reloader {
         self.handles
             .key_names
             .add_tags(super::keys::key_tags(&loaded.config, env));
+        // Capture, unlike names, is replaced: turning it off for a client must stop it.
+        if let Some(capture) = &self.handles.capture {
+            capture.set_clients(super::keys::key_capture(&loaded.config, env));
+        }
         // Who may call and from where change together or not at all: one
         // fingerprint, one debounce.
         let allowlists = super::keys::allowlists(&loaded.config, env);

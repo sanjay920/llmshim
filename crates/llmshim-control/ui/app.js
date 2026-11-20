@@ -286,15 +286,17 @@ async function viewHome(ctx) {
     const mine = ++generation;
     const win = windowOf(homeRange);
     const from = iso(win.from);
-    const [cur, series, prev, byModel, byKey] = await Promise.all([
+    const [cur, series, prev, byModel, byKey, misses] = await Promise.all([
       api("/v1/requests/summary", { from }),
       api("/v1/requests/summary", { from, group_by: win.mode }),
       api("/v1/requests/summary", { from: iso(win.prevFrom), to: from }),
       api("/v1/requests/summary", { from, group_by: "model" }),
       api("/v1/requests/summary", { from, group_by: "key" }),
+      // Optional: a gateway that captures nothing leaves it empty, and an older control plane has no such route.
+      api("/v1/requests/misses", { from }).catch((e) => { if (e instanceof ApiError && e.status === 401) throw e; return null; }),
     ]);
     if (mine !== generation) return;
-    body.replaceChildren(...homeBody(win, cur.totals, series.groups, prev.totals, byModel.groups, byKey.groups));
+    body.replaceChildren(...homeBody(win, cur.totals, series.groups, prev.totals, byModel.groups, byKey.groups, misses));
   }
   ctx.header("Home", "Spend, cache and reliability across every gateway", segmented(RANGES, homeRange, (v) => { homeRange = v; load().catch(fail); }));
   page.append(body);
@@ -302,7 +304,7 @@ async function viewHome(ctx) {
   return page;
 }
 
-function homeBody(win, t, groups, prev, models, keys) {
+function homeBody(win, t, groups, prev, models, keys, misses) {
   if (!t.attempts) {
     return [h("div", { class: "card" }, emptyState({
       icon: "inbox", title: "No requests in the last " + win.label,
@@ -383,8 +385,33 @@ function homeBody(win, t, groups, prev, models, keys) {
     h("div", { class: "grid-2" }, hero, tiles),
     h("div", { class: "grid-2" }, cacheCard, spendByModel),
     h("div", { class: "grid-eq" }, clients, composition),
+    missesCard(win, misses),
     h("p", { class: "foot" }, "Spend adds only the costs that are known: “est” is a price-list estimate and “≥” a lower bound, and requests with no price are counted, never added as zero. A cache hit is the share of prompt tokens the provider read from its cache, over requests that reported it."),
   ];
+}
+
+const KIND_NAMES = { system: "System prompt", tool: "Tool definitions", user: "User messages", assistant: "Assistant messages", tool_result: "Tool results", image: "Images", other: "Other" };
+
+// Where cache misses start (note 0052): of the consecutive requests of one client, how many changed an earlier part
+// of the prompt, and which part first.
+function missesCard(win, m) {
+  if (!m || !m.pairs) {
+    return card("Why the cache missed", "Needs prompt structure from a gateway",
+      h("p", { class: "muted" }, "A client that captures its prompt's structure shows here where its cached prefix changed between requests, for example “62% of changes began at the system prompt”. Set capture = \"structure\" on the client's key in the gateway's configuration. Only fingerprints and sizes are kept, never the prompt."));
+  }
+  const changedPct = (m.changed * 100) / m.pairs;
+  const kinds = Object.entries(m.changed_by_kind || {}).sort((a, b) => b[1] - a[1]);
+  const body = h("div", { class: "stack" },
+    h("p", {}, h("b", {}, fmtInt(m.changed)), " of ", fmtInt(m.pairs), " consecutive requests (", fmtPct(changedPct), ") changed an earlier part of the prompt than they added to. The other ",
+      fmtInt(m.pairs - m.changed), " only grew the prompt or repeated it, which a provider's cache serves."),
+    kinds.length ? rankBars(kinds.map(([kind, n]) => ({ name: KIND_NAMES[kind] || kind, sub: "first change", display: fmtInt(n) + " · " + fmtPct((n * 100) / m.changed), value: n }))) : null,
+    arr(m.groups).length ? tableOf(["Client", "Model", "Pairs", "Changed", "Usually at"], arr(m.groups).map((g) => {
+      const top = Object.entries(g.changed_by_kind || {}).sort((a, b) => b[1] - a[1])[0];
+      return h("tr", {}, h("td", {}, g.key), h("td", {}, g.model), h("td", { class: "num" }, fmtInt(g.pairs)),
+        h("td", { class: "num" }, fmtInt(g.changed) + " (" + fmtPct(g.pairs ? (g.changed * 100) / g.pairs : 0) + ")"), h("td", {}, top ? KIND_NAMES[top[0]] || top[0] : "—"));
+    }), ["l", "l", "r", "r", "l"]) : null,
+    m.truncated ? h("p", { class: "foot" }, "Covers the earliest part of the window: more captured requests exist than one answer reads.") : null);
+  return card("Why the cache missed", "Where the cached prefix first changed between a client's consecutive requests · last " + win.label, body);
 }
 
 function tile(label, value, note, spark) {
@@ -503,8 +530,52 @@ function showRequest(r) {
         h("dt", {}, "Duration"), h("dd", {}, fmtDur(r.duration_ms)), h("dt", {}, "Kind"), h("dd", {}, r.kind), h("dt", {}, "Usage reported"), h("dd", {}, r.usage_reported ? "yes" : "no"))),
       h("div", { class: "section" }, h("h3", {}, "Who"), h("dl", { class: "kv" },
         h("dt", {}, "Client"), h("dd", {}, r.key || "—"), h("dt", {}, "Tenant"), h("dd", {}, r.tenant || "—"), h("dt", {}, "Tags"), h("dd", {}, tags), h("dt", {}, "Admission"), h("dd", {}, r.admission))),
+      structureSection(r),
       h("div", { class: "section" }, h("h3", {}, "Identifiers"), h("dl", { class: "kv" },
         h("dt", {}, "Request"), h("dd", {}, id(r.request_id, "request id")), h("dt", {}, "Attempt"), h("dd", {}, id(r.attempt_id, "attempt id")), h("dt", {}, "Time"), h("dd", { class: "m" }, r.ts))),
     ],
   });
+}
+
+// The prompt as segments with the first change from the request before it marked (note 0052). Loaded when the
+// panel opens; a client that does not capture, or a structure that has aged out, says so.
+function structureSection(r) {
+  const holder = h("div", {}, skeleton(2));
+  api("/v1/requests/" + encodeURIComponent(r.attempt_id) + "/structure").then((s) => holder.replaceChildren(structureView(s, r)), (error) => {
+    if (error instanceof ApiError && error.status === 401) { showError(error); return; }
+    holder.replaceChildren(h("p", { class: "muted" }, error instanceof ApiError && error.status === 404
+      ? "Not captured. Set capture = \"structure\" on this client's key in the gateway's configuration to see where its prompt changes between requests."
+      : "The prompt structure could not be loaded."));
+  });
+  return h("div", { class: "section" }, h("h3", {}, "Prompt structure"), holder);
+}
+
+function structureView(s, r) {
+  const segs = arr(s.segments), d = s.diff;
+  const common = d ? d.common_segments : segs.length;
+  const relation = d ? d.relation : "no_previous";
+  // One block per run of segments in the same state, as wide as its bytes: up to 2,048 segments stay a readable strip.
+  const stateOf = (i) => (!d ? "plain" : i < common ? "same" : relation === "changed" ? (i === common ? "change" : "after") : "added");
+  const runs = [];
+  segs.forEach((seg, i) => {
+    const state = stateOf(i), last = runs[runs.length - 1];
+    if (last && last.state === state && state !== "change") { last.bytes += seg.bytes; last.count += 1; last.kinds.add(seg.kind); } else runs.push({ state, bytes: seg.bytes, count: 1, kinds: new Set([seg.kind]), first: i });
+  });
+  const total = Math.max(1, runs.reduce((n, x) => n + x.bytes, 0));
+  const strip = h("div", { class: "strip", role: "img", "aria-label": segs.length + " prompt segments" }, runs.map((run) => {
+    const el = h("span", { class: "run " + run.state, title: run.count + " segment" + (run.count === 1 ? "" : "s") + " (" + [...run.kinds].map((k) => KIND_NAMES[k] || k).join(", ") + "), " + fmtCompact(run.bytes) + " bytes, from #" + (run.first + 1) });
+    el.style.flexGrow = String(Math.max(run.bytes, total * 0.004));
+    return el;
+  }));
+  const say = !d ? "No earlier captured request from this client with this model within the hour, so there is nothing to compare it with."
+    : relation === "changed" ? "Matched the previous request for the first " + fmtInt(common) + " of " + fmtInt(d.total_segments) + " segments (" + fmtPct(d.total_bytes ? (d.common_bytes * 100) / d.total_bytes : 0) + " of the prompt's bytes). The first change was at the " + d.first_change.label + ", so everything after it was a different prompt to the provider's cache."
+    : relation === "appended" ? "Only added to the previous request's prompt, which is how a conversation grows. Its shared prefix could have been served from cache."
+    : relation === "identical" ? "The same prompt as the previous request."
+    : "A prefix of the previous request's prompt: it is shorter, with nothing changed.";
+  const gap = s.previous ? "The previous request was " + (s.previous.gap_secs < 90 ? s.previous.gap_secs + " s" : Math.round(s.previous.gap_secs / 60) + " min") + " earlier" + (s.previous.within_short_window ? "." : ", longer than the five minutes a cache entry may last, so it could have expired whatever the prompt said.") : null;
+  const cacheNote = d && relation !== "changed" && r.cache_hit_pct !== null && r.cache_hit_pct < 30 ? "The prompt did not change but the cache hit was low: look at the provider's minimum cacheable length, the cache lifetime and where the cache breakpoints are." : null;
+  return h("div", { class: "stack" }, strip,
+    d ? h("div", { class: "legend" }, h("span", { class: "same" }, h("i"), "Same as before"), relation === "changed" ? h("span", { class: "change" }, h("i"), "First change") : null, relation === "changed" ? h("span", { class: "after" }, h("i"), "After the change") : null, relation === "appended" ? h("span", { class: "added" }, h("i"), "Added") : null) : null,
+    h("p", {}, say), gap ? h("p", { class: "muted" }, gap) : null, cacheNote ? h("p", { class: "muted" }, cacheNote) : null,
+    h("p", { class: "muted" }, "Fingerprints are keyed hashes: they show where the prompt changed, never what it said. Segments by kind: " + Object.entries(segs.reduce((acc, x) => ((acc[x.kind] = (acc[x.kind] || 0) + 1), acc), {})).map(([k, n]) => n + " " + (KIND_NAMES[k] || k).toLowerCase()).join(", ") + "."));
 }
