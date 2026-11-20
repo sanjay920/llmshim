@@ -1,0 +1,63 @@
+:root {
+  color-scheme: light dark;
+  --bg: #fafaf9; --panel: #ffffff; --ink: #1c1917; --muted: #78716c; --line: #e7e5e4;
+  --accent: #2563eb; --ok: #15803d; --bad: #b91c1c; --warn: #b45309; --bar: #93c5fd;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0c0a09; --panel: #1c1917; --ink: #f5f5f4; --muted: #a8a29e; --line: #292524;
+          --accent: #60a5fa; --ok: #4ade80; --bad: #f87171; --warn: #fbbf24; --bar: #1e40af; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 16px; padding: 10px 20px;
+  background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+header[hidden] { display: none; }
+.brand { letter-spacing: .02em; }
+nav { display: flex; gap: 4px; }
+nav a { padding: 6px 12px; border-radius: 6px; color: var(--muted); text-decoration: none; }
+nav a[aria-current="page"] { background: var(--bg); color: var(--ink); font-weight: 600; }
+.spacer { flex: 1; }
+main { max-width: 1400px; margin: 0 auto; padding: 20px; }
+h1 { font-size: 20px; margin: 0 0 16px; }
+h2 { font-size: 14px; margin: 24px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.muted { color: var(--muted); }
+button, select, input { font: inherit; color: inherit; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+button { cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .5; cursor: default; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+.tile .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+.tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.tile .note { color: var(--muted); font-size: 12px; margin-top: 2px; }
+table { width: 100%; border-collapse: collapse; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr.row { cursor: pointer; }
+tbody tr.row:hover { background: var(--bg); }
+.scroll { overflow-x: auto; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); }
+.pill.completed { color: var(--ok); }
+.pill.http_failure, .pill.transport_failure, .pill.invalid_response, .pill.stream_failure { color: var(--bad); }
+.pill.abandoned { color: var(--warn); }
+.est { color: var(--warn); font-size: 12px; margin-left: 4px; }
+.sub { color: var(--muted); font-size: 12px; }
+.bars { display: grid; gap: 4px; }
+.bar { display: grid; grid-template-columns: 90px 1fr 120px; gap: 10px; align-items: center; }
+.bar .track { height: 14px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.bar .fill { height: 100%; background: var(--bar); }
+.bar .amount { text-align: right; font-variant-numeric: tabular-nums; }
+.foot { margin-top: 10px; color: var(--muted); font-size: 12px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 12px 0; }
+dl { display: grid; grid-template-columns: 200px 1fr; gap: 6px 16px; margin: 0; }
+dt { color: var(--muted); } dd { margin: 0; word-break: break-all; }
+.signin { max-width: 420px; margin: 12vh auto; }
+.signin .panel { display: grid; gap: 12px; }
+.signin input { width: 100%; }
+.err { color: var(--bad); }

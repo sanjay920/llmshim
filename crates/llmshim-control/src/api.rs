@@ -56,6 +56,8 @@ pub struct AppState {
     /// The digest of the gateways' ingest token (note 0051), set once. Only `POST /v1/usage/batch`
     /// accepts it, and nothing else accepts the shared token or a person's token there.
     ingest_digest: std::sync::OnceLock<[u8; 32]>,
+    /// The static admin pages and what they are told (note 0051, slice 2).
+    ui: crate::ui::Ui,
 }
 
 impl AppState {
@@ -67,6 +69,7 @@ impl AppState {
             signing_key_file,
             sso: None,
             ingest_digest: Default::default(),
+            ui: crate::ui::Ui::new(None, true),
         })
     }
 
@@ -79,12 +82,14 @@ impl AppState {
         sso: Sso,
     ) -> Arc<Self> {
         let token = token.filter(|_| sso.break_glass());
+        let ui = crate::ui::Ui::new(sso.ui(), sso.break_glass());
         Arc::new(Self {
             store: Mutex::new(store),
             token_digest: token.map(|token| Sha256::digest(token.as_bytes()).into()),
             signing_key_file,
             sso: Some(sso),
             ingest_digest: Default::default(),
+            ui,
         })
     }
 }
@@ -332,6 +337,11 @@ async fn authenticate(
         .map(str::trim)
         .unwrap_or("")
         .to_owned();
+    // The admin pages are public static files (note 0051): a page has to load before anyone can sign in,
+    // and they hold no data. Only `/ui` and what is under it; the API under `/v1` is never reached this way.
+    if is_ui_path(request.uri().path()) {
+        return state.ui.respond(request.method(), request.uri());
+    }
     // The usage push has a credential of its own, in both modes: the ingest token, and nothing but the
     // ingest token. It cannot be used anywhere else, and no other credential works here.
     if request.uri().path() == INGEST_PATH {
@@ -974,7 +984,12 @@ async fn no_route() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "no_such_route", "no such route")
 }
 
-/// The API's router. Every route sits behind the bearer token.
+/// `/ui` and anything under it, exactly: `/uix` and `/ui/../v1/orgs` are not the pages.
+fn is_ui_path(path: &str) -> bool {
+    path == "/ui" || path.starts_with("/ui/")
+}
+
+/// The API's router. Every `/v1` route sits behind the bearer token; `/ui` is the static pages.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/orgs", post(create_org).get(list_orgs))

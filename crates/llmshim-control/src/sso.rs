@@ -34,6 +34,9 @@ pub struct SsoConfig {
     /// Whether the shared `--token-file` token is still accepted (as admin, actor `break-glass`).
     #[serde(default = "yes")]
     pub break_glass: bool,
+    /// The admin UI's browser sign-in (note 0051): a public client's id and the provider's endpoints.
+    #[serde(default)]
+    pub ui: Option<crate::ui::UiOidc>,
 }
 
 fn yes() -> bool {
@@ -91,6 +94,7 @@ pub struct Sso {
     policy: Policy,
     jwks: Arc<Jwks>,
     break_glass: bool,
+    ui: Option<crate::ui::UiOidc>,
 }
 
 impl Sso {
@@ -125,6 +129,9 @@ impl Sso {
             .iter()
             .map(|name| Alg::parse(name).map_err(|message| format!("algorithms: {message}")))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(ui) = &config.ui {
+            ui.validate()?;
+        }
         let settings = Settings {
             refresh: Duration::from_secs(config.jwks_refresh_secs.unwrap_or(300)),
             max_stale: Duration::from_secs(config.jwks_max_stale_secs.unwrap_or(3600)),
@@ -138,7 +145,13 @@ impl Sso {
             },
             jwks: Arc::new(Jwks::new("control-sso", fetch, settings)),
             break_glass: config.break_glass,
+            ui: config.ui.clone(),
         })
+    }
+
+    /// The browser sign-in the admin UI offers, if the issuer file sets one.
+    pub fn ui(&self) -> Option<&crate::ui::UiOidc> {
+        self.ui.as_ref()
     }
 
     /// Whether the shared token is still accepted.
