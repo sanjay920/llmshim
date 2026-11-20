@@ -2309,14 +2309,12 @@ impl ServeConfig {
                 if let Some(authority) = &store.authority_host {
                     if let Err(problem) = validate_base_url(authority) {
                         bad("authority_host", problem, issues);
-                    } else if !authority.starts_with("https://")
-                        && !(authority.starts_with("http://") && authority.contains("127.0.0.1"))
+                    } else if let Some(problem) =
+                        super::blobstore::azure::https_or_loopback(authority)
                     {
-                        bad(
-                            "authority_host",
-                            "must be https (http only to a loopback address)",
-                            issues,
-                        );
+                        // The same predicate the store applies at start, so a file that passes
+                        // `--check` is one the server starts with.
+                        bad("authority_host", problem, issues);
                     }
                 }
             }
@@ -5392,6 +5390,32 @@ mod tests {
             paths(&format!("{WI}authority_host = \"http://login.example\"\n")),
             ["media_store.authority_host"]
         );
+        // The loopback exception is a parsed host, not a substring of the text.
+        for authority in [
+            "http://127.0.0.1.attacker.example",
+            "http://evil.example/127.0.0.1",
+            "http://evil.example:8080",
+        ] {
+            assert_eq!(
+                paths(&format!("{WI}authority_host = \"{authority}\"\n")),
+                ["media_store.authority_host"],
+                "{authority}"
+            );
+        }
+        for authority in [
+            "http://127.0.0.1:9",
+            "http://[::1]:9",
+            "https://login.example",
+        ] {
+            assert!(
+                ServeConfig::parse(
+                    &file(&format!("{WI}authority_host = \"{authority}\"\n")),
+                    Format::Toml
+                )
+                .is_ok(),
+                "{authority}"
+            );
+        }
         // Names follow Azure's rules; the other kinds' settings do not belong.
         for (account, container) in [
             ("AB", "media"),

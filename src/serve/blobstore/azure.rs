@@ -91,7 +91,9 @@ enum Credential {
     Bearer(String),
 }
 
-fn https_or_loopback(uri: &str) -> Option<&'static str> {
+/// Why `uri` cannot be an Entra authority or token endpoint, if it cannot: https, or http only to a
+/// loopback address literal (the config check and the store both use this one).
+pub fn https_or_loopback(uri: &str) -> Option<&'static str> {
     let Ok(url) = reqwest::Url::parse(uri) else {
         return Some("is not a valid URL");
     };
@@ -246,7 +248,15 @@ impl AzureStore {
 
     async fn credential(&self) -> Result<Credential, BlobError> {
         match &self.auth {
-            Auth::Sas(source) => Ok(Credential::Sas(source.read()?)),
+            Auth::Sas(source) => {
+                // Checked at every read, not only at start: a rotation that wrote a truncated or
+                // `?`-prefixed value is refused here instead of being sent and refused by Azure.
+                let sas = source.read()?;
+                match sas_problem(&sas) {
+                    None => Ok(Credential::Sas(sas)),
+                    Some(_) => Err(BlobError::Denied),
+                }
+            }
             Auth::Key(source) => STANDARD
                 .decode(source.read()?.trim())
                 .map(Credential::Key)
@@ -450,6 +460,8 @@ impl AzureStore {
             }
             if matches!(status, 401 | 403) && !refused_once {
                 refused_once = true;
+                // If the retries run out before another answer, the refusal is what is reported.
+                last = BlobError::Denied;
                 if let Some(token) = &bearer {
                     self.invalidate(token).await;
                 }
@@ -612,6 +624,11 @@ impl BlobStore for AzureStore {
             )
             .await?
         {
+            // A blob that is not there is deleted; a container that is not there is a mistake that
+            // must not read as a release.
+            (404, body) if String::from_utf8_lossy(&body).contains("ContainerNotFound") => {
+                Err(BlobError::NotFound)
+            }
             (200 | 202 | 204 | 404, _) => Ok(()),
             (status, _) => Err(status_error(status)),
         }
@@ -1071,6 +1088,78 @@ mod tests {
             &|_| None
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rotated_sas_that_is_not_one_is_refused_without_a_request_and_the_container_must_exist_to_delete(
+    ) {
+        let dir =
+            std::env::temp_dir().join(format!("llmshim-az-sas-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sas");
+        std::fs::write(&file, "sv=2021-12-02&sp=rwdl&sig=abc\n").unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let reached = server
+            .mock("GET", "/media/a/b")
+            .match_query(Matcher::Any)
+            .with_body("data")
+            .expect(1)
+            .create_async()
+            .await;
+        let reference = SecretRef {
+            env: None,
+            file: Some(file.clone()),
+        };
+        let sas_store = store(&server.url(), AzureAuth::Sas(&reference), "");
+        assert_eq!(sas_store.get("a/b", 100).await.unwrap(), b"data");
+        // A rotation that wrote a `?`-prefixed value is refused here, and an empty file is not sent either.
+        std::fs::write(&file, "?sv=2021-12-02&sig=abc\n").unwrap();
+        assert_eq!(sas_store.get("a/b", 100).await, Err(BlobError::Denied));
+        // An empty file is an unreadable credential (as for every secret): unavailable, not sent.
+        std::fs::write(&file, "\n").unwrap();
+        assert_eq!(sas_store.get("a/b", 100).await, Err(BlobError::Unavailable));
+        reached.assert_async().await;
+        let _ = std::fs::remove_dir_all(dir);
+        // A container that is not there makes a delete an error, a blob that is not there does not.
+        let key = secret("KEY");
+        let mut server = mockito::Server::new_async().await;
+        let store = store(&server.url(), AzureAuth::AccountKey(&key), "");
+        let _missing_container = server
+            .mock("DELETE", "/media/a/b")
+            .with_status(404)
+            .with_body("<Error><Code>ContainerNotFound</Code></Error>")
+            .create_async()
+            .await;
+        assert_eq!(store.delete("a/b").await, Err(BlobError::NotFound));
+        let _missing_blob = server
+            .mock("DELETE", "/media/a/c")
+            .with_status(404)
+            .with_body("<Error><Code>BlobNotFound</Code></Error>")
+            .create_async()
+            .await;
+        assert_eq!(store.delete("a/c").await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_server_errors_is_reported_as_a_refusal() {
+        let mut server = mockito::Server::new_async().await;
+        let key = secret("KEY");
+        let store = store(&server.url(), AzureAuth::AccountKey(&key), "");
+        // Two 503s, then a 403 on the last attempt: not "unavailable" (which a caller retries).
+        let flaky = server
+            .mock("GET", "/media/a/b")
+            .with_status(503)
+            .expect(2)
+            .create_async()
+            .await;
+        let refused = server
+            .mock("GET", "/media/a/b")
+            .with_status(403)
+            .create_async()
+            .await;
+        let _ = (&flaky, &refused);
+        let outcome = store.get("a/b", 100).await;
+        assert_eq!(outcome, Err(BlobError::Denied));
     }
 
     #[test]
