@@ -1,6 +1,6 @@
 # 0051: The admin UI
 
-Status: slices 1 (the request ledger and the gateway's `[usage_export]`) and 2 (the UI shell, Home and Requests) built; the other views, payload capture and the other views are described and not
+Status: slices 1 (the request ledger and the gateway's `[usage_export]`), 2 (the UI shell, Home and Requests) and 3 (Clients, Admin and History) built; the other views, payload capture and the other views are described and not
 built. Written on the owner's instruction to start the admin UI, prompted by a screenshot of a proxy's request view: a
 30-day history, one row per request with time, status, model and endpoint, client and route, tokens in and out, cache
 percentage, duration and price, with the footnotes "input tokens include cache" and "API = estimate, not spend".
@@ -54,7 +54,7 @@ payloads. That is a privacy decision of its own and is **not** in the first slic
    across both, on SQLite and Postgres.
 2. **The UI shell and the Requests and Home views (built).** The static pages, sign-in, the request table with filters and a
    detail drawer, the spend and cache summary.
-3. **Clients, Admin and History views.** Keys (create, revoke, rotate, limits), organizations, teams, projects, the change
+3. **Clients, Admin and History views (built).** Keys (create, revoke, rotate, limits), organizations, teams, projects, the change
    history and its chain check, over the API that exists.
 4. **Routes and Providers (read-only).** What each gateway is configured with and its health, from the gateways' admin
    listeners. The configuration stays a file under version control: the UI shows it, it does not edit it.
@@ -103,3 +103,31 @@ payloads. That is a privacy decision of its own and is **not** in the first slic
   no element created from the hostile name.
 - **Not here.** The OIDC redirect is verified by its parts (the validation, the policy, the page's use of PKCE), not
   against a live identity provider: that needs one, and is part of using it.
+
+## Slice 3 as built
+
+- **New API route:** `GET /v1/history/verify` (admin role, one check at a time: a second is a 429, because it reads the whole history under the
+  store's lock) runs the hash-chain check that `audit-verify` runs and answers
+  `{ok: true, records, unchained, head}` or `{ok: false, row, reason}`. It reads the whole history once. The head
+  hash is shown with the instruction to keep a copy where the database's writer cannot reach: the chain alone cannot
+  show that the last rows were removed (0047). Everything else the views do uses routes that already existed.
+- **Where.** `ui/manage.js`, loaded before `app.js` (the page now has exactly these two scripts, both ours; a test
+  pins the list and their order). `api()` gained an optional method and JSON body.
+- **Clients.** Per organization: every key with its project (team / project), state, credential kind, tier, limits,
+  budget, expiry. A detail panel shows every field. With the key-issuer or admin role: create (project, name,
+  credential `secret`, `client_san` or `jwt`, tier, limits, allowed models and addresses, expiry), edit limits (all five
+  named, blank clears one, as the API requires), rotate (a replacement with the same limits; the old key stays until
+  revoked) and revoke (two clicks). A new secret appears **once**, in a panel with a copy button, and is held by
+  nothing else: not the table, not the page's state, not storage.
+- **Admin.** Organizations, their teams and each team's projects and budget. With the admin role: create each, set
+  or clear a team budget (clearing takes two clicks).
+- **History.** The newest 100, 500 or 1000 changes (actor, action, subject, detail) and, for the admin role, a "Check the
+  chain" button (the others are pointed at `audit-verify`).
+  Older rows than 1000 are reached by the API's `limit` only; paging by id is left for when it is asked for.
+- **Roles.** The page asks `whoami` and hides what the role cannot do, but never relies on that: each action is the API
+  call a script would make, and the API refuses it by role (0049). A failed action shows its message beside its form.
+- **Checked** by `tests/ui.rs` (both scripts, headers, hygiene, every `/v1` string in the scripts and every verb the
+  page sends is a route the API has), `history_chain::over_http` (the route reports a good chain, and names the first row
+  of a tampered one), and by driving the page in Chrome: create an organization, team (with a name that is markup),
+  project and budget; create a client and see its secret once; edit limits; rotate; revoke; check the chain; no
+  console error, no dialog, no element made from the markup name.

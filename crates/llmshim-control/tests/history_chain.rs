@@ -195,3 +195,55 @@ fn two_writers_at_once_still_make_one_chain() {
     let done = first.verify_history().unwrap().unwrap();
     assert_eq!(done.records, 30);
 }
+
+mod over_http {
+    //! The same check through `GET /v1/history/verify` (note 0051, slice 3), which the admin UI shows.
+
+    use super::{database, populated, raw};
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use http_body_util::BodyExt;
+    use llmshim_control::api::{router, AppState};
+    use llmshim_control::Store;
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "control-token-0123456789abcdef";
+
+    async fn verify(app: &axum::Router) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/history/verify")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_chain_is_checked_over_the_api_and_a_tampered_row_is_named() {
+        let path = database("http");
+        populated(&path);
+        let app = router(AppState::new(Store::open(&path).unwrap(), TOKEN, None));
+        let good = verify(&app).await;
+        assert_eq!(good["ok"], true);
+        assert_eq!(good["records"], 3);
+        assert_eq!(good["unchained"], 0);
+        assert_eq!(good["head"].as_str().unwrap().len(), 64);
+        raw(
+            &path,
+            "UPDATE history SET actor = 'someone.else' WHERE id = 2",
+        );
+        let bad = verify(&app).await;
+        assert_eq!(bad["ok"], false);
+        assert_eq!(bad["row"], 2);
+        assert!(bad["reason"].as_str().is_some_and(|r| !r.is_empty()));
+        assert!(bad.get("head").is_none());
+    }
+}

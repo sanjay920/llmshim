@@ -61,3 +61,13 @@ dt { color: var(--muted); } dd { margin: 0; word-break: break-all; }
 .signin .panel { display: grid; gap: 12px; }
 .signin input { width: 100%; }
 .err { color: var(--bad); }
+.formgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px 14px; align-items: end; margin-top: 12px; }
+.formgrid > strong, .formgrid > .muted, .formgrid > .err { grid-column: 1 / -1; }
+.field { display: grid; gap: 4px; }
+.field input, .field select { width: 100%; }
+.sub-panel { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; }
+button.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+.secret { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+td.wrap, code.wrap { white-space: normal; word-break: break-all; max-width: 520px; }
+.okc { color: var(--ok); }
+ul { margin: 6px 0; padding-left: 20px; }

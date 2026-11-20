@@ -35,6 +35,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("patch", "/v1/keys/{key}/limits"),
     ("get", "/v1/whoami"),
     ("get", "/v1/history"),
+    ("get", "/v1/history/verify"),
     ("post", "/v1/usage/batch"),
     ("get", "/v1/requests"),
     ("get", "/v1/requests/summary"),
@@ -58,6 +59,27 @@ pub struct AppState {
     ingest_digest: std::sync::OnceLock<[u8; 32]>,
     /// The static admin pages and what they are told (note 0051, slice 2).
     ui: crate::ui::Ui,
+    /// Set while a history chain check runs: it reads the whole history under the store's lock, so one
+    /// at a time (a second asks to try again) and only for the admin role.
+    verifying: std::sync::atomic::AtomicBool,
+}
+
+/// Holds the flag set; clears it when dropped, however the check ends.
+struct Claim<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> Claim<'a> {
+    fn take(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl AppState {
@@ -70,6 +92,7 @@ impl AppState {
             sso: None,
             ingest_digest: Default::default(),
             ui: crate::ui::Ui::new(None, true),
+            verifying: Default::default(),
         })
     }
 
@@ -90,6 +113,7 @@ impl AppState {
             sso: Some(sso),
             ingest_digest: Default::default(),
             ui,
+            verifying: Default::default(),
         })
     }
 }
@@ -134,6 +158,7 @@ pub const ROLES: &[(&str, &str, Option<Role>)] = &[
     ("patch", "/v1/keys/{key}/limits", Some(Role::KeyIssuer)),
     ("get", "/v1/whoami", None),
     ("get", "/v1/history", Some(Role::Read)),
+    ("get", "/v1/history/verify", Some(Role::Admin)),
     ("get", "/v1/requests", Some(Role::Read)),
     ("get", "/v1/requests/summary", Some(Role::Read)),
     ("get", "/v1/requests/facets", Some(Role::Read)),
@@ -856,6 +881,26 @@ async fn history(
     Ok(Json(json!({"history": rows})))
 }
 
+/// Check the change history's hash chain (note 0047) and say so: `ok` with how many rows it vouches for and
+/// the head hash to keep elsewhere, or not `ok` with the first row that fails and why. It reads the whole
+/// history once, as `audit-verify` does.
+async fn history_verify(State(s): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    let Some(_claim) = Claim::take(&s.verifying) else {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "busy",
+            "a history check is already running; try again when it has finished",
+        ));
+    };
+    let checked = with_store(&s, |st| st.verify_history()).await?;
+    Ok(Json(match checked {
+        Ok(good) => {
+            json!({"ok": true, "records": good.records, "unchained": good.unchained, "head": good.head})
+        }
+        Err(broken) => json!({"ok": false, "row": broken.id, "reason": broken.reason}),
+    }))
+}
+
 async fn publish(
     State(s): State<Arc<AppState>>,
     h: HeaderMap,
@@ -1010,6 +1055,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/keys/{key}/limits", patch(update_limits))
         .route("/v1/whoami", get(whoami))
         .route("/v1/history", get(history))
+        .route("/v1/history/verify", get(history_verify))
         .route(
             "/v1/usage/batch",
             post(ingest_usage).layer(axum::extract::DefaultBodyLimit::max(INGEST_BODY_LIMIT)),
@@ -1029,6 +1075,15 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_claim_is_single_flight_and_released_when_dropped() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let first = super::Claim::take(&flag).expect("free");
+        assert!(super::Claim::take(&flag).is_none(), "taken twice");
+        drop(first);
+        assert!(super::Claim::take(&flag).is_some(), "not released");
+    }
+
     use super::*;
 
     #[test]
