@@ -92,7 +92,8 @@ function fmtDur(ms) {
 function fmtUsd(n) {
   if (n === null || n === undefined) return "—";
   if (n === 0) return "$0.00";
-  if (n < 0.01) return "$" + n.toPrecision(2);
+  if (n < 0.0001) return "<$0.0001";
+  if (n < 0.01) return "$" + n.toFixed(4);
   return "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 function fmtUsdCompact(n) {
@@ -104,9 +105,10 @@ function fmtUsdCompact(n) {
   return n === 0 ? "$0" : "$" + n.toFixed(2);
 }
 // Axis ticks share one style: whole dollars, or two decimals when the step is a fraction.
-function fmtUsdAxis(n) {
+function fmtUsdAxis(n, step) {
   if (n >= 1000) return fmtUsdCompact(n);
-  return Number.isInteger(n) ? "$" + n : "$" + n.toFixed(2);
+  const decimals = !step || step >= 1 ? (Number.isInteger(step || 1) ? 0 : 1) : step >= 0.01 ? 2 : step >= 0.001 ? 3 : 4;
+  return "$" + n.toFixed(decimals);
 }
 function fmtTime(iso) {
   const d = new Date(iso);
@@ -170,6 +172,10 @@ const tip = (() => {
 // ---- sheets (slide-over panels) ------------------------------------------------------------
 
 // `sticky` keeps the panel open against Escape and a click outside: a secret is shown here once.
+const sheetStack = [];
+function closeAllSheets() {
+  for (const s of [...sheetStack]) s.close(true);
+}
 function openSheet({ title, subtitle, body, sticky, onclose }) {
   const returnTo = document.activeElement;
   const scrim = h("div", { class: "scrim" });
@@ -178,29 +184,37 @@ function openSheet({ title, subtitle, body, sticky, onclose }) {
   const panel = h("aside", { class: "sheet", role: "dialog", "aria-modal": "true", "aria-label": title, tabindex: "-1" },
     h("div", { class: "sheet-head" }, h("div", { class: "grow" }, h("h2", {}, title), subtitle ? h("div", { class: "sub" }, subtitle) : null), sticky ? null : closeBtn), bodyEl);
   let closed = false;
+  const self = { close: (force) => close(force), setBody(...nodes) { bodyEl.replaceChildren(...nodes); }, element: panel };
   function close(force) {
     if (closed || (sticky && !force)) return;
     closed = true;
     document.removeEventListener("keydown", onKey, true);
+    const at = sheetStack.indexOf(self);
+    if (at >= 0) sheetStack.splice(at, 1);
     scrim.remove(); panel.remove();
     if (returnTo && returnTo.focus && document.contains(returnTo)) returnTo.focus();
     if (onclose) onclose();
   }
   function onKey(e) {
+    // Only the topmost sheet answers the keyboard.
+    if (sheetStack[sheetStack.length - 1] !== self) return;
     if (e.key === "Escape") { e.stopPropagation(); close(); return; }
     if (e.key === "Tab") {
       const f = [...panel.querySelectorAll("button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])")].filter((x) => !x.disabled && !x.hidden && x.offsetParent !== null);
       if (!f.length) return;
       const first = f[0], last = f[f.length - 1];
-      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      if (e.shiftKey && (document.activeElement === first || document.activeElement === panel)) { e.preventDefault(); last.focus(); }
       else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
     }
   }
   scrim.addEventListener("click", () => close());
   document.addEventListener("keydown", onKey, true);
+  sheetStack.push(self);
   document.body.append(scrim, panel);
-  panel.focus();
-  return { close: (force) => close(force), setBody(...nodes) { bodyEl.replaceChildren(...nodes); }, element: panel };
+  // Focus the first control when there is one (a form), the panel itself otherwise (a read-only detail).
+  const firstControl = panel.querySelector(".sheet-body input:not([readonly]), .sheet-body select, .sheet-body textarea");
+  (firstControl || panel).focus();
+  return self;
 }
 
 // ---- small components ----------------------------------------------------------------------
@@ -259,7 +273,7 @@ function niceStep(v) {
 function axisFor(peak, wanted = 4) {
   const step = niceStep(peak / wanted);
   const top = Math.max(step * 2, Math.ceil(peak / step - 1e-9) * step);
-  return { top, ticks: Array.from({ length: Math.round(top / step) + 1 }, (_, i) => i * step) };
+  return { top, step, ticks: Array.from({ length: Math.round(top / step) + 1 }, (_, i) => i * step) };
 }
 function yTicks(max, n) {
   return Array.from({ length: n + 1 }, (_, i) => (max * i) / n);
@@ -282,7 +296,7 @@ function responsive(host, draw) {
 // Columns: <= 24px thick, 4px rounded tops, one baseline, hairline grid, a hover tooltip and a focus tooltip
 // on every column. `data[i] = {label, short, value|null, tipRows: [{label, value}]}`.
 function columnChart({ data, fmtAxis, height = 220, ariaLabel }) {
-  const host = h("div", { class: "chart", role: "img", "aria-label": ariaLabel || "Column chart" });
+  const host = h("div", { class: "chart", role: "group", "aria-label": ariaLabel || "Column chart" });
   const m = { l: 46, r: 6, t: 8, b: 24 };
   return responsive(host, (width) => {
     const w = width, ih = height - m.t - m.b, iw = w - m.l - m.r;
@@ -294,7 +308,7 @@ function columnChart({ data, fmtAxis, height = 220, ariaLabel }) {
     const root = svg("svg", { width: w, height, viewBox: `0 0 ${w} ${height}` });
     for (const t of axis.ticks) {
       root.append(svg("line", { class: "grid", x1: m.l, x2: w - m.r, y1: y(t), y2: y(t) }),
-        svg("text", { class: "axis-text", x: m.l - 8, y: y(t) + 4, "text-anchor": "end" }, fmtAxis(t)));
+        svg("text", { class: "axis-text", x: m.l - 8, y: y(t) + 4, "text-anchor": "end" }, fmtAxis(t, axis.step)));
     }
     const every = Math.max(1, Math.ceil(data.length / Math.max(2, Math.floor(iw / 64))));
     data.forEach((d, i) => {
@@ -325,7 +339,7 @@ function columnChart({ data, fmtAxis, height = 220, ariaLabel }) {
 // A line with a 10% wash under it, an end dot with a surface ring, a crosshair and one tooltip. Gaps (null)
 // break the line. `data[i] = {label, short, value|null, tipRows}`; the axis is 0 to `max`.
 function lineChart({ data, max = 100, fmtAxis, height = 200, ariaLabel }) {
-  const host = h("div", { class: "chart", role: "img", "aria-label": ariaLabel || "Line chart" });
+  const host = h("div", { class: "chart", role: "group", "aria-label": ariaLabel || "Line chart" });
   const m = { l: 40, r: 22, t: 10, b: 24 };
   return responsive(host, (width) => {
     const w = width, ih = height - m.t - m.b, iw = w - m.l - m.r;
@@ -344,13 +358,14 @@ function lineChart({ data, max = 100, fmtAxis, height = 200, ariaLabel }) {
         const pts = run.map(([i, v]) => `${x(i)} ${y(v)}`);
         root.append(svg("path", { class: "area", d: `M${x(run[0][0])} ${m.t + ih}L${pts.join("L")}L${x(run[run.length - 1][0])} ${m.t + ih}Z` }), svg("path", { class: "line", d: "M" + pts.join("L") }));
       }
+      if (run.length === 1) root.append(svg("circle", { class: "dotm", cx: x(run[0][0]), cy: y(run[0][1]), r: 3.5 }));
       run = [];
     };
     data.forEach((d, i) => { if (d.value === null || d.value === undefined) flush(); else { run.push([i, d.value]); last = i; } });
     flush();
     if (last >= 0) root.append(svg("circle", { class: "dotm", cx: x(last), cy: y(data[last].value), r: 4.5 }));
     const cross = svg("line", { class: "xh", y1: m.t, y2: m.t + ih, visibility: "hidden" });
-    const over = svg("rect", { x: m.l, y: m.t, width: iw, height: ih, fill: "transparent", tabindex: "0", "aria-label": "Chart values" });
+    const over = svg("rect", { x: m.l, y: m.t, width: iw, height: ih, fill: "transparent", tabindex: "0", "aria-label": "Chart values. Use the left and right arrow keys to move between points." });
     const at = (e) => {
       const r = over.getBoundingClientRect();
       const i = Math.max(0, Math.min(data.length - 1, Math.round(((e.clientX - r.left) / Math.max(1, r.width)) * n)));
@@ -358,6 +373,20 @@ function lineChart({ data, max = 100, fmtAxis, height = 200, ariaLabel }) {
       tip.show(e.clientX, e.clientY, data[i].label, data[i].tipRows || []);
     };
     over.addEventListener("pointermove", at);
+    // Keyboard: arrows walk the points, so the values are reachable without a pointer.
+    let cursor = data.length - 1;
+    const at2 = (i) => {
+      cursor = Math.max(0, Math.min(data.length - 1, i));
+      cross.setAttribute("x1", x(cursor)); cross.setAttribute("x2", x(cursor)); cross.setAttribute("visibility", "visible");
+      const r = over.getBoundingClientRect();
+      tip.show(r.left + (x(cursor) - m.l) * (r.width / Math.max(1, iw)), r.top + 20, data[cursor].label, data[cursor].tipRows || []);
+    };
+    over.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowLeft") { e.preventDefault(); at2(cursor - 1); }
+      else if (e.key === "ArrowRight") { e.preventDefault(); at2(cursor + 1); }
+    });
+    over.addEventListener("focus", () => at2(cursor));
+    over.addEventListener("blur", () => { cross.setAttribute("visibility", "hidden"); tip.hide(); });
     over.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); tip.hide(); });
     root.append(cross, over);
     return root;

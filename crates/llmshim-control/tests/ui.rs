@@ -290,8 +290,21 @@ fn the_page_never_turns_data_into_markup_and_loads_nothing_from_elsewhere() {
             "document.cookie",
             "window.open",
             "location.href",
+            // The generic helpers accept any attribute: none may carry a style (the policy forbids it) or a script URL.
+            "{ style:",
+            ", style:",
+            "javascript:",
+            "srcdoc",
         ] {
             assert!(!js.contains(forbidden), "{name} contains {forbidden}");
+        }
+        // A link is only ever to a page of this app (`#/…`), never to an address built from data.
+        for piece in js.split("href: ").skip(1) {
+            assert!(
+                piece.starts_with("\"#/"),
+                "{name}: a link that is not a #/ route: {}",
+                &piece[..piece.len().min(24)]
+            );
         }
     }
 }

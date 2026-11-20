@@ -99,6 +99,7 @@ async function finishOidc() {
 }
 
 function renderSignIn(message) {
+  closeAllSheets();
   document.title = "Sign in · llmshim control";
   const oidc = session.config.oidc;
   const input = h("input", { class: "input", type: "password", autocomplete: "off", spellcheck: "false", placeholder: "Paste an access token", "aria-label": "Access token" });
@@ -149,8 +150,15 @@ function renderShell() {
         h("div", { class: "who" }, h("b", { title: who.actor }, String(who.actor || "").replace(/^oidc:/, "")), h("span", {}, String(who.role || "no role").replace("-", " "))),
         h("button", { class: "btn icon ghost", type: "button", title: "Sign out", "aria-label": "Sign out", onclick: signOut }, icon("logout", 16)))),
     h("div", { class: "content" }, h("header", { class: "top", id: "top" }), h("main", { id: "main", tabindex: "-1" }))));
-  const top = $("top");
-  window.addEventListener("scroll", () => top.classList.toggle("scrolled", window.scrollY > 4), { passive: true });
+  scrollWatch();
+}
+
+let scrollWatching = false;
+function scrollWatch() {
+  if (scrollWatching) return;
+  scrollWatching = true;
+  // One listener for the page's life; it finds the current header each time.
+  window.addEventListener("scroll", () => { const t = $("top"); if (t) t.classList.toggle("scrolled", window.scrollY > 4); }, { passive: true });
 }
 
 function setHeader(title, sub, actions) {
@@ -217,7 +225,15 @@ async function start(pasted) {
   await route();
 }
 
-window.addEventListener("hashchange", () => { if (session.token && $("main")) route(); });
+window.addEventListener("hashchange", () => { if (session.token && $("main") && location.hash !== "#main") route(); });
+// "Skip to content" moves focus; it must not change the route.
+document.addEventListener("click", (e) => {
+  const link = e.target.closest && e.target.closest("a.skip");
+  if (!link) return;
+  e.preventDefault();
+  const main = $("main");
+  if (main) main.focus();
+});
 start().catch((error) => {
   $("root").replaceChildren(h("div", { class: "signin-page" }, h("div", { class: "signin" }, h("div", { class: "card" }, h("div", { class: "err" }, "The page could not start: " + (error.message || error))))));
 });
@@ -235,16 +251,23 @@ function windowOf(range) {
   const now = Date.now();
   if (range === "24h") {
     const from = Math.floor(now / HOUR) * HOUR - 23 * HOUR;
-    return { mode: "hour", from, prevFrom: from - 24 * HOUR, label: "24 hours", buckets: Array.from({ length: 24 }, (_, i) => ({ key: String(from / HOUR + i), t: from + i * HOUR })) };
+    const elapsed = now - from;
+    return { mode: "hour", from, prevFrom: from - elapsed, label: "24 hours", buckets: Array.from({ length: 24 }, (_, i) => ({ key: String(from / HOUR + i), t: from + i * HOUR })) };
   }
   const days = range === "30d" ? 30 : 7;
   const from = startOfUtcDay(now) - (days - 1) * DAY;
-  return { mode: "day", from, prevFrom: from - days * DAY, label: days + " days", buckets: Array.from({ length: days }, (_, i) => ({ key: dayKey(from + i * DAY), t: from + i * DAY })) };
+  // The window so far is `days - 1` whole days plus part of today; the one it is compared with is as long.
+  const elapsed = now - from;
+  return { mode: "day", from, prevFrom: from - elapsed, label: days + " days", buckets: Array.from({ length: days }, (_, i) => ({ key: dayKey(from + i * DAY), t: from + i * DAY })) };
 }
 function bucketLabel(win, t) {
   const d = new Date(t);
   return win.mode === "hour"
-    ? { short: d.toLocaleTimeString(undefined, { hour: "numeric" }), full: d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric" }) }
+    ? (() => {
+        // A zone with a half-hour offset must show the minutes, or a bucket is labelled an hour it does not start at.
+        const minute = d.getMinutes() ? { minute: "2-digit" } : {};
+        return { short: d.toLocaleTimeString(undefined, { hour: "numeric", ...minute }), full: d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", ...minute }) };
+      })()
     : { short: d.toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" }), full: d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" }) };
 }
 const iso = (t) => new Date(t).toISOString();
@@ -316,7 +339,7 @@ function homeBody(win, t, groups, prev, models, keys) {
       h("button", { class: "btn small ghost", type: "button", "aria-pressed": "false", onclick: toggleTable }, "Table")),
     h("div", { class: "card-body" },
       h("div", { class: "hero" }, fmtUsd(t.cost_usd)),
-      h("div", { class: "hero-note" }, delta === null ? "No earlier period to compare" : h("span", { class: "delta" }, icon(delta >= 0 ? "arrow" : "arrowdown", 14), (delta >= 0 ? "+" : "−") + Math.abs(Math.round(delta * 100)) + "% vs the previous " + win.label), notes.length ? h("span", { class: "muted dotsep" }, "· " + notes.join(", ")) : null),
+      h("div", { class: "hero-note" }, delta === null ? "No earlier period to compare" : h("span", { class: "delta" }, icon(delta >= 0 ? "arrow" : "arrowdown", 14), (delta >= 0 ? "+" : "−") + Math.abs(Math.round(delta * 100)) + "% vs the period of the same length before"), notes.length ? h("span", { class: "muted dotsep" }, "· " + notes.join(", ")) : null),
       h("div", { id: "spend-view" }, columnChart({ data: costRows, fmtAxis: fmtUsdAxis, height: 290, ariaLabel: "Spend per " + win.mode })),
     ));
   function toggleTable(e) {

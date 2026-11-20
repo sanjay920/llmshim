@@ -179,7 +179,7 @@ async function viewClients(ctx) {
       body.push(h("div", { class: "section" }, h("h3", {}, "Rotate"), rotateForm(k, async (made) => { sheet.close(true); await refresh(); showSecret("New secret for " + made.key.name, where, made.secret); })));
       body.push(h("div", { class: "section" }, h("h3", {}, "Revoke"), h("p", { class: "muted gap-bottom" }, "Stops this client at the next snapshot. It cannot be undone; issue a new client instead."),
         confirmButton("Revoke client", "revoke " + k.name, async () => {
-          try { await send("POST", "/v1/keys/" + enc(k.id) + "/revoke"); sheet.close(true); toast(k.name + " revoked"); await refresh(); } catch (e) { toast(e.message, "bad"); }
+          try { await send("POST", "/v1/keys/" + enc(k.id) + "/revoke"); sheet.close(true); toast(k.name + " revoked"); await refresh(); } catch (e) { if (e instanceof ApiError && e.status === 401) showError(e); else toast(e.message, "bad"); }
         })));
     } else if (!canIssue()) {
       body.push(h("p", { class: "muted" }, "Your role can read clients but not change them."));
@@ -192,11 +192,14 @@ async function viewClients(ctx) {
     const rpm = input({ value: k.rpm ?? "", inputmode: "numeric", placeholder: "No limit" }), tpm = input({ value: k.tpm ?? "", inputmode: "numeric", placeholder: "No limit" });
     const budget = input({ value: k.budget_usd ?? "", inputmode: "decimal", placeholder: "No budget" }), window = input({ value: k.budget_window_secs ?? "", inputmode: "numeric", placeholder: "e.g. 86400" });
     const until = input({ type: "datetime-local", value: k.expires_at ? localInput(k.expires_at) : "" });
+    const untilStart = until.value;
     const box = errorBox();
     return h("form", { class: "form", onsubmit: async (e) => {
       if (await submit(e, box, () => send("PATCH", "/v1/keys/" + enc(k.id) + "/limits", {
         rpm: wholeNumber(rpm.value, "Requests per minute", 1), tpm: wholeNumber(tpm.value, "Tokens per minute", 1), budget_usd: decimal(budget.value, "Budget"),
-        budget_window_secs: wholeNumber(window.value, "Budget window", 1), expires_at: expiry(until.value) }))) await done();
+        budget_window_secs: wholeNumber(window.value, "Budget window", 1),
+        // Untouched, the stored instant is sent back exactly (the input only holds minutes).
+        expires_at: until.value === untilStart ? (k.expires_at ?? null) : expiry(until.value) }))) await done();
     } },
       h("div", { class: "form-row" }, field("Requests per minute", rpm), field("Tokens per minute", tpm)),
       h("div", { class: "form-row" }, field("Budget, USD", budget), field("Budget window, seconds", window)),
@@ -304,7 +307,7 @@ async function viewAdmin(ctx) {
       field("Budget, USD", usd), field("Window, seconds", window, "Spend counts against the budget over this window."),
       h("label", { class: "field" }, h("span", {}, "Unpriced requests"), h("span", { class: "copy-row" }, unpriced, h("span", { class: "muted" }, "Allow requests whose cost the price list cannot compute"))), box,
       h("div", { class: "form-actions" }, t.budget ? confirmButton("Clear budget", "clear it", async () => {
-        try { await send("DELETE", "/v1/teams/" + enc(t.id) + "/budget"); sheet.close(true); toast("Budget cleared"); await reload(); } catch (e) { box.textContent = e.message; }
+        try { await send("DELETE", "/v1/teams/" + enc(t.id) + "/budget"); sheet.close(true); toast("Budget cleared"); await reload(); } catch (e) { if (e instanceof ApiError && e.status === 401) showError(e); else box.textContent = e.message; }
       }) : null, h("button", { class: "btn primary", type: "submit" }, "Save budget")));
     sheet = openSheet({ title: t.name + " budget", subtitle: "Spend across every client of the team", body: [form] });
     usd.focus();
@@ -333,9 +336,12 @@ async function viewHistory(ctx) {
   const fail = showErrorFor(page);
   const result = h("div", {});
   const body = h("div", {});
+  let generation = 0;
 
   async function load() {
+    const mine = ++generation;
     const rows = arr((await api("/v1/history", { limit: historyLimit })).history);
+    if (mine !== generation) return;
     if (!rows.length) { body.replaceChildren(h("div", { class: "card" }, emptyState({ icon: "history", title: "No changes recorded", text: "Creating an organization, a team, a project or a client appears here with who did it." }))); return; }
     body.replaceChildren(h("div", { class: "card" }, tableOf(["When", "Who", "Action", "Subject", "Detail"], rows.map((r) => {
       const detail = r.detail === null || r.detail === undefined ? "" : JSON.stringify(r.detail);
