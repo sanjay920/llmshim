@@ -18,6 +18,7 @@ pub mod api;
 mod db;
 pub mod requests;
 pub mod sso;
+pub mod ui;
 
 const SCHEMA_VERSION: i64 = 6;
 
