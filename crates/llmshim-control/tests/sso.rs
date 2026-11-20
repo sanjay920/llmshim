@@ -11,7 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use http_body_util::BodyExt;
 use llmshim::serve::jwks::Fetch;
-use llmshim_control::api::{router, AppState, ROLES, ROUTES};
+use llmshim_control::api::{router, AppState, INGEST_ROUTES, ROLES, ROUTES};
 use llmshim_control::sso::{Role, Sso, SsoConfig};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
@@ -184,9 +184,18 @@ fn concrete(pattern: &str) -> String {
 #[tokio::test]
 async fn every_route_has_a_required_role_and_only_routes_have_one() {
     for (method, path) in ROUTES {
+        let role = ROLES.iter().any(|(m, p, _)| m == method && p == path);
+        let ingest = INGEST_ROUTES.contains(&(*method, *path));
+        // A route is a role's or the ingest token's, never both and never neither.
         assert!(
-            ROLES.iter().any(|(m, p, _)| m == method && p == path),
-            "{method} {path} has no required role"
+            role != ingest,
+            "{method} {path}: role={role} ingest={ingest}"
+        );
+    }
+    for (method, path) in INGEST_ROUTES {
+        assert!(
+            ROUTES.contains(&(*method, *path)),
+            "{method} {path} is not a route"
         );
     }
     for (method, path, _) in ROLES {
@@ -213,7 +222,7 @@ async fn each_role_gets_exactly_its_routes() {
         (Role::Admin, "control:admin"),
     ] {
         let token = api.issuer.token("alice", json!([value]));
-        for (method, pattern) in ROUTES {
+        for (method, pattern) in ROUTES.iter().filter(|r| !INGEST_ROUTES.contains(*r)) {
             let allowed = if read_routes
                 .iter()
                 .any(|r| r.1 == *pattern && r.0 == *method)
@@ -259,7 +268,7 @@ async fn a_token_with_no_role_of_ours_is_authenticated_and_refused_everything_bu
         json!(null),
     ] {
         let token = api.issuer.token("alice", roles.clone());
-        for (method, pattern) in ROUTES {
+        for (method, pattern) in ROUTES.iter().filter(|r| !INGEST_ROUTES.contains(*r)) {
             let answer = api
                 .call(
                     &method.to_uppercase(),

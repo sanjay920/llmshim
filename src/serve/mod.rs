@@ -29,6 +29,7 @@ pub mod reload;
 pub mod snapshot;
 pub mod snapshot_pull;
 pub(crate) mod telemetry;
+pub mod usage_export;
 
 pub use build::{
     admin_token_digest, build_app, fleet_redis_url, start_fleet_workers, Built, ListenerLimits,

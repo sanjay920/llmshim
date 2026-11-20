@@ -35,6 +35,10 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("patch", "/v1/keys/{key}/limits"),
     ("get", "/v1/whoami"),
     ("get", "/v1/history"),
+    ("post", "/v1/usage/batch"),
+    ("get", "/v1/requests"),
+    ("get", "/v1/requests/summary"),
+    ("get", "/v1/requests/facets"),
     ("post", "/v1/orgs/{org}/snapshots"),
     ("get", "/v1/orgs/{org}/snapshot"),
 ];
@@ -49,6 +53,9 @@ pub struct AppState {
     signing_key_file: Option<PathBuf>,
     /// The identity provider (note 0049); `None` keeps the one-token behaviour exactly.
     sso: Option<Sso>,
+    /// The digest of the gateways' ingest token (note 0051), set once. Only `POST /v1/usage/batch`
+    /// accepts it, and nothing else accepts the shared token or a person's token there.
+    ingest_digest: std::sync::OnceLock<[u8; 32]>,
 }
 
 impl AppState {
@@ -59,6 +66,7 @@ impl AppState {
             token_digest: Some(Sha256::digest(token.as_bytes()).into()),
             signing_key_file,
             sso: None,
+            ingest_digest: Default::default(),
         })
     }
 
@@ -76,7 +84,26 @@ impl AppState {
             token_digest: token.map(|token| Sha256::digest(token.as_bytes()).into()),
             signing_key_file,
             sso: Some(sso),
+            ingest_digest: Default::default(),
         })
+    }
+}
+
+impl AppState {
+    /// Accept this token (at least 22 visible characters) for the gateways' usage push, and for nothing
+    /// else. Set once; a second call is ignored.
+    pub fn set_ingest_token(&self, token: &str) {
+        let _ = self
+            .ingest_digest
+            .set(Sha256::digest(token.as_bytes()).into());
+    }
+
+    /// Delete the request ledger's rows older than `before_ms` (the retention).
+    pub fn purge_requests(&self, before_ms: i64) -> crate::Result<u64> {
+        self.store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .purge_requests(before_ms)
     }
 }
 
@@ -102,9 +129,19 @@ pub const ROLES: &[(&str, &str, Option<Role>)] = &[
     ("patch", "/v1/keys/{key}/limits", Some(Role::KeyIssuer)),
     ("get", "/v1/whoami", None),
     ("get", "/v1/history", Some(Role::Read)),
+    ("get", "/v1/requests", Some(Role::Read)),
+    ("get", "/v1/requests/summary", Some(Role::Read)),
+    ("get", "/v1/requests/facets", Some(Role::Read)),
     ("post", "/v1/orgs/{org}/snapshots", Some(Role::Admin)),
     ("get", "/v1/orgs/{org}/snapshot", Some(Role::Read)),
 ];
+
+/// The routes that take the gateways' ingest token and nothing else (note 0051): they are not in
+/// [`ROLES`], because no person and no role may call them.
+pub const INGEST_ROUTES: &[(&str, &str)] = &[("post", "/v1/usage/batch")];
+
+/// The path of the batch ingest, for the middleware.
+const INGEST_PATH: &str = "/v1/usage/batch";
 
 fn required_role(method: &str, path: &str) -> Option<Role> {
     // A HEAD needs what the GET does.
@@ -295,6 +332,18 @@ async fn authenticate(
         .map(str::trim)
         .unwrap_or("")
         .to_owned();
+    // The usage push has a credential of its own, in both modes: the ingest token, and nothing but the
+    // ingest token. It cannot be used anywhere else, and no other credential works here.
+    if request.uri().path() == INGEST_PATH {
+        // With no ingest token configured nothing can authenticate here: 401, the same answer as a wrong
+        // token, so the route says nothing to a caller without the credential.
+        return match state.ingest_digest.get() {
+            Some(expected) if matches_shared(&Some(*expected), &presented) => {
+                next.run(request).await
+            }
+            _ => unauthorized(),
+        };
+    }
     let Some(sso) = &state.sso else {
         // One token, no identity provider: exactly as before (note 0026).
         if !matches_shared(&state.token_digest, &presented) {
@@ -648,6 +697,139 @@ async fn whoami(
     }))
 }
 
+/// The most a usage batch body may be: 500 records are a few hundred kilobytes.
+const INGEST_BODY_LIMIT: usize = 2 << 20;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IngestBody {
+    records: Vec<Value>,
+}
+
+async fn ingest_usage(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<IngestBody>,
+) -> ApiResult<Json<Value>> {
+    let counts = with_store(&s, move |st| st.ingest_requests(&body.records)).await?;
+    Ok(Json(json!(counts)))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RequestParams {
+    from: Option<String>,
+    to: Option<String>,
+    tenant: Option<String>,
+    key: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    outcome: Option<String>,
+    request_id: Option<String>,
+    min_cost_usd: Option<f64>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+    group_by: Option<String>,
+}
+
+fn bad_param(name: &str, why: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        format!("{name} {why}"),
+    )
+}
+
+impl RequestParams {
+    fn query(&self) -> ApiResult<crate::requests::RequestQuery> {
+        let time = |name: &str, value: &Option<String>| -> ApiResult<Option<i64>> {
+            value
+                .as_deref()
+                .map(|v| {
+                    chrono::DateTime::parse_from_rfc3339(v)
+                        .map(|t| t.timestamp_millis())
+                        .map_err(|_| bad_param(name, "must be an RFC 3339 time"))
+                })
+                .transpose()
+        };
+        for (name, value) in [
+            ("tenant", &self.tenant),
+            ("key", &self.key),
+            ("model", &self.model),
+            ("provider", &self.provider),
+            ("outcome", &self.outcome),
+            ("request_id", &self.request_id),
+        ] {
+            if value
+                .as_deref()
+                .is_some_and(|v| v.is_empty() || v.len() > 256)
+            {
+                return Err(bad_param(name, "must be 1 to 256 characters"));
+            }
+        }
+        if self.min_cost_usd.is_some_and(|c| !c.is_finite() || c < 0.0) {
+            return Err(bad_param("min_cost_usd", "must be a non-negative number"));
+        }
+        let after = match &self.cursor {
+            Some(cursor) => Some(
+                crate::requests::decode_cursor(cursor)
+                    .ok_or_else(|| bad_param("cursor", "is not one this API issued"))?,
+            ),
+            None => None,
+        };
+        let limit = self.limit.unwrap_or(100);
+        if !(1..=500).contains(&limit) {
+            return Err(bad_param("limit", "must be 1 to 500"));
+        }
+        Ok(crate::requests::RequestQuery {
+            from_ms: time("from", &self.from)?,
+            to_ms: time("to", &self.to)?,
+            tenant: self.tenant.clone(),
+            key: self.key.clone(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            outcome: self.outcome.clone(),
+            request_id: self.request_id.clone(),
+            min_cost_usd: self.min_cost_usd,
+            after,
+            limit,
+        })
+    }
+}
+
+async fn list_requests(
+    State(s): State<Arc<AppState>>,
+    Query(params): Query<RequestParams>,
+) -> ApiResult<Json<Value>> {
+    let query = params.query()?;
+    let page = with_store(&s, move |st| st.query_requests(&query)).await?;
+    Ok(Json(json!(page)))
+}
+
+async fn requests_summary(
+    State(s): State<Arc<AppState>>,
+    Query(params): Query<RequestParams>,
+) -> ApiResult<Json<Value>> {
+    let query = params.query()?;
+    let group =
+        match params.group_by.as_deref() {
+            None => None,
+            Some(name) => Some(crate::requests::Group::parse(name).ok_or_else(|| {
+                bad_param("group_by", "must be day, tenant, key, model or provider")
+            })?),
+        };
+    let summary = with_store(&s, move |st| st.requests_summary(&query, group)).await?;
+    Ok(Json(crate::requests::summary_json(&summary)))
+}
+
+async fn requests_facets(
+    State(s): State<Arc<AppState>>,
+    Query(params): Query<RequestParams>,
+) -> ApiResult<Json<Value>> {
+    let query = params.query()?;
+    let facets = with_store(&s, move |st| st.request_facets(query.from_ms)).await?;
+    Ok(Json(json!(facets)))
+}
+
 async fn history(
     State(s): State<Arc<AppState>>,
     Query(q): Query<HistoryQuery>,
@@ -813,6 +995,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/keys/{key}/limits", patch(update_limits))
         .route("/v1/whoami", get(whoami))
         .route("/v1/history", get(history))
+        .route(
+            "/v1/usage/batch",
+            post(ingest_usage).layer(axum::extract::DefaultBodyLimit::max(INGEST_BODY_LIMIT)),
+        )
+        .route("/v1/requests", get(list_requests))
+        .route("/v1/requests/summary", get(requests_summary))
+        .route("/v1/requests/facets", get(requests_facets))
         .route("/v1/orgs/{org}/snapshots", post(publish))
         .route("/v1/orgs/{org}/snapshot", get(latest))
         .fallback(no_route)

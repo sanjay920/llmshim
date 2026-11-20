@@ -15,13 +15,13 @@ const ATTEMPTS: usize = 3;
 
 /// Where one credential comes from. An environment variable cannot change in a running process, so
 /// it is read once; a file is re-read.
-pub(super) enum Source {
+pub(crate) enum Source {
     Fixed(String),
     File(SecretRef),
 }
 
 impl Source {
-    pub(super) fn new(
+    pub(crate) fn new(
         reference: &SecretRef,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Self, String> {
@@ -34,7 +34,7 @@ impl Source {
         }
     }
 
-    pub(super) fn read(&self) -> Result<String, BlobError> {
+    pub(crate) fn read(&self) -> Result<String, BlobError> {
         match self {
             Self::Fixed(value) => Ok(value.clone()),
             Self::File(reference) => {

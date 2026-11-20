@@ -1678,6 +1678,68 @@
         }
       },
       "type": "object"
+    },
+    "UsageExport": {
+      "additionalProperties": false,
+      "description": "The push of usage records to the control plane (note 0051). Bounded and fail-open: a full queue drops\nthe oldest record, an unreachable control plane delays no request.",
+      "properties": {
+        "allow_insecure_http": {
+          "default": false,
+          "description": "Allow a plain `http://` url: the token and the usage records then cross the network unprotected.",
+          "type": "boolean"
+        },
+        "batch_size": {
+          "default": null,
+          "description": "Records per request, 1 to 500. Defaults to 200.",
+          "maximum": 500,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "ca_file": {
+          "default": null,
+          "description": "PEM certificates to trust for the control plane instead of the web PKI roots.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flush_interval_ms": {
+          "default": null,
+          "description": "The longest a record waits for a batch to fill, in milliseconds, 200 to 60000. Defaults to 2000.",
+          "maximum": 60000,
+          "minimum": 200,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "queue_size": {
+          "default": null,
+          "description": "The most records held in memory while the control plane is slow or away, 100 to 1000000; past it\nthe oldest are dropped. Defaults to 10000.",
+          "maximum": 1000000,
+          "minimum": 100,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "token": {
+          "$ref": "#/$defs/SecretRef",
+          "description": "The control plane's ingest token (`llmshim-control serve --ingest-token-file`), by secret\nreference. Read at each batch, so a rotated file needs no restart."
+        },
+        "url": {
+          "description": "The control plane's origin, `https://host[:port]` (plain `http://` needs `allow_insecure_http`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "token"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1808,6 +1870,17 @@
     "upstream": {
       "$ref": "#/$defs/Upstream",
       "description": "How the gateway talks to providers (0021): retries, the connection pool,\nthe proxy policy and every attempt deadline. Fixed at start. `serve` reads\nnone of the `LLMSHIM_*` variables these replace."
+    },
+    "usage_export": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UsageExport"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Push each provider attempt's usage record to a control plane's request ledger, for its UI\n(note 0051). Fixed at start."
     },
     "version": {
       "description": "The schema version. Only 1 exists; another is refused before anything else.",
