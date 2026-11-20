@@ -65,6 +65,91 @@ logging:
   # tokens and USD cost, for showback and chargeback. Empty turns it off.
   usageLog: ""
 
+# The object store a fleet's images, speech and transcription routes carry their megabytes
+# through (note 0050). Needs fleet.enabled: a single instance keeps them in memory and would
+# ignore the store, so the render refuses the combination. Every object is sealed (AES-256-GCM)
+# before it is stored, so the store holds ciphertext only. Pick the kind your platform has:
+#
+#   file        a ReadWriteMany volume every replica mounts (EFS, Filestore, Azure Files, NFS, CephFS)
+#   s3          any S3-compatible service: AWS S3, MinIO or Ceph in the cluster, R2, Spaces, B2.
+#               credentials: aws    the pod's own role (EKS IRSA / Pod Identity, ECS, EC2): no key stored
+#               credentials: keys   an access key from existingSecret
+#   gcs         Google Cloud Storage. credentials: metadata (GKE Workload Identity), service-account
+#               (a key file from a Secret) or none (an emulator)
+#   azure-blob  Azure Blob Storage. credentials: workload-identity (AKS), managed-identity, sas or
+#               account-key
+#
+# Examples for each platform are in ci/. Give the bucket or container a lifecycle rule that expires the
+# prefix after a day as a backstop: the gateway deletes what it stages and sweeps orphans itself.
+mediaStore:
+  enabled: false
+  kind: ""             # file | s3 | gcs | azure-blob
+  prefix: ""           # a key prefix (s3, gcs, azure-blob), ending in "/": share a bucket safely
+  # PEM certificates to trust for the store's endpoint instead of the web PKI roots (a private CA, an
+  # in-cluster MinIO with its own certificate): the path of a file you mount with extraVolumes.
+  caFile: ""
+  maxObjectBytes: 0    # 0 = the gateway's default (64 MiB), up to 268435456
+  ttlSecs: 0           # 0 = the default (3600): an object older than this is an orphan the sweeper deletes
+  file:
+    # An existing ReadWriteMany claim, mounted at /var/lib/llmshim/media in every replica. Objects are
+    # owner-only, so every replica must run as the same user, and that user (uid 65532) must be able to
+    # WRITE the volume: Kubernetes applies fsGroup to block and many CSI volumes but NOT to NFS-style
+    # ones (Filestore, generic NFS, CephFS, EFS without an access point), which are often root-owned
+    # 0755. Use an EFS access point owned by 65532, or chown the export once; the gateway checks that
+    # the directory is writable at start and refuses to start if it is not.
+    claimName: ""
+    # Or have the chart create the claim.
+    persistence:
+      create: false
+      storageClassName: ""
+      size: 10Gi
+  s3:
+    bucket: ""
+    region: ""
+    endpoint: ""            # omit for AWS S3; for MinIO, e.g. https://minio.minio.svc:9000
+    pathStyle: ""           # true or false (a boolean or a string); empty = true with an endpoint, false without
+    allowInsecureHttp: false
+    credentials: keys       # keys | aws
+    # With credentials: keys: the NAMES of variables in existingSecret.
+    accessKeyIdEnv: MEDIA_S3_ACCESS_KEY_ID
+    secretAccessKeyEnv: MEDIA_S3_SECRET_ACCESS_KEY
+    sessionTokenEnv: ""
+    # With credentials: aws (a build with serve-cloud), annotate the service account:
+    #   serviceAccount.annotations: {eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/llmshim-media}
+  gcs:
+    bucket: ""
+    credentials: metadata   # metadata | service-account | none
+    endpoint: ""            # an emulator or a private endpoint (required with none)
+    metadataEndpoint: ""    # a non-standard metadata server (credentials: metadata)
+    allowInsecureHttp: false
+    # With credentials: metadata on GKE, annotate the service account:
+    #   serviceAccount.annotations: {iam.gke.io/gcp-service-account: llmshim-media@PROJECT.iam.gserviceaccount.com}
+    # With credentials: service-account: a Secret holding the key file, mounted read-only at
+    # /etc/llmshim-gcp (not under /etc/llmshim, which is itself a read-only mount).
+    serviceAccountSecret: ""
+    serviceAccountKey: key.json
+  azureBlob:
+    account: ""
+    container: ""
+    credentials: workload-identity   # workload-identity | managed-identity | sas | account-key
+    endpoint: ""                     # an emulator, a sovereign cloud or a private endpoint
+    allowInsecureHttp: false
+    # workload-identity (AKS): the chart labels the pods azure.workload.identity/use and the webhook
+    # projects the token; annotate the service account with the identity's client id:
+    #   serviceAccount.annotations: {azure.workload.identity/client-id: <client id>}
+    tenantId: ""
+    clientId: ""                     # also selects a user-assigned managed identity
+    federatedTokenFile: /var/run/secrets/azure/tokens/azure-identity-token
+    authorityHost: ""                # a sovereign cloud's Entra authority, https
+    identityEndpoint: ""             # managed-identity: a non-standard instance metadata service
+    # sas / account-key: the NAMES of variables in existingSecret.
+    sasEnv: MEDIA_AZURE_SAS_TOKEN
+    accountKeyEnv: MEDIA_AZURE_ACCOUNT_KEY
+
+# More volumes and mounts for the pod: a private CA for an object store's endpoint, a key file.
+extraVolumes: []
+extraVolumeMounts: []
+
 state:
   # Replay receipts. emptyDir loses them on rescheduling; a client that replays
   # through another replica then gets an error. Use a ReadWriteMany claim, or

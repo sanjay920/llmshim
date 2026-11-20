@@ -1,7 +1,7 @@
 # 0050: Media through a fleet, over an object store
 
-Status: slice 1 (the store), slice 2 (the fleet routes), slices 3a (the AWS credential chain), 3b (Google Cloud Storage)
-and 3c (Azure Blob Storage) built; slice 3d (the Helm examples) is described and not built. Written on the owner's instruction to
+Status: built, all of it: slice 1 (the store), slice 2 (the fleet routes), slices 3a (the AWS credential chain), 3b (Google
+Cloud Storage), 3c (Azure Blob Storage) and 3d (the Helm chart's media store settings and platform examples). Written on the owner's instruction to
 start it, with the requirement that it plug into Kubernetes and the native cloud services, not one of them.
 
 ## The problem
@@ -120,8 +120,7 @@ it cannot change in a running process.
    - **3a. The AWS credential chain (built).** `credentials = "aws"` on an `s3` store. See below.
    - **3b. Google Cloud Storage**, native (`kind = "gcs"`) (built). See below.
    - **3c. Azure Blob Storage** (`kind = "azure-blob"`) (built). See below.
-   - **3d. The Helm chart's examples:** a shared `ReadWriteMany` claim for `file`, a service account annotated for
-     IRSA / Workload Identity / Azure Workload Identity, and the media store settings. Not built.
+   - **3d. The Helm chart's media store settings and examples** (built). See below.
 
 ## Slice 3a: the AWS credential chain
 
@@ -259,6 +258,53 @@ new dependency, in every `serve` binary. Blob names keep their slashes (virtual 
 - IAM: the identity needs `Storage Blob Data Contributor` on the container (it lists, writes, reads and deletes).
   Add a lifecycle management rule that deletes the prefix's blobs after a day as the backstop, and note that with blob
   **versioning** or **soft delete** on, deleted blobs persist (sealed) until those retention windows end.
+
+## Slice 3d: the Helm chart
+
+`deploy/helm/llmshim` gains a `mediaStore` block (and `extraVolumes` / `extraVolumeMounts` for a private CA or a key file)
+that writes the `[media_store]` section, mounts what the kind needs, and refuses at **render time** anything that
+would be ignored or fail at start. Seven worked examples live in `deploy/helm/llmshim/ci/media-*.yaml`, one per
+platform, and are what the chart's validation renders.
+
+| Platform | Example | What to set up outside the chart |
+| --- | --- | --- |
+| Any, shared volume | `media-file-rwx.yaml` | a StorageClass that gives `ReadWriteMany` (EFS, Filestore, Azure Files, NFS, CephFS); the chart creates the claim (`persistence.create`) or uses yours (`claimName`) |
+| In-cluster S3 (MinIO, Ceph RGW) | `media-s3-minio.yaml` | the bucket, and an access key in the `existingSecret` |
+| AWS EKS, IRSA | `media-s3-irsa.yaml` | an IAM role with the bucket policy and a trust policy for the service account; the annotation `eks.amazonaws.com/role-arn`; an image built with `serve-cloud` |
+| GKE, Workload Identity | `media-gcs-workload-identity.yaml` | a Google service account with `roles/storage.objectUser` (and list) on the bucket and `roles/iam.workloadIdentityUser` for the Kubernetes service account; the annotation `iam.gke.io/gcp-service-account` |
+| Google, a key file | `media-gcs-service-account.yaml` | a Secret holding the key file (mounted read-only at `/etc/llmshim-gcp`, outside the read-only `/etc/llmshim` mount) |
+| AKS, Workload Identity | `media-azure-workload-identity.yaml` | a managed identity with `Storage Blob Data Contributor` on the container and a federated credential for the service account; the annotation `azure.workload.identity/client-id`; **the chart labels the pods** `azure.workload.identity/use: "true"` so the webhook projects the token |
+| Azure, a SAS | `media-azure-sas.yaml` | a container SAS (read, write, delete, list) in the `existingSecret` |
+
+- **No key in the chart for the cloud identities.** IRSA, GKE and AKS Workload Identity put the identity on the pod's
+  service account (`serviceAccount.annotations`); the chart stores nothing. The `keys` and `sas` examples read from the
+  `existingSecret`, by the *names* of its variables, as every other secret does.
+- **Private CAs and sovereign clouds.** `mediaStore.caFile` names a PEM file you mount with `extraVolumes` /
+  `extraVolumeMounts` (the MinIO example does); `azureBlob.authorityHost`, `azureBlob.identityEndpoint` and
+  `gcs.metadataEndpoint` reach the configuration too. `pathStyle` takes a YAML boolean or a string, and an explicit
+  `false` is emitted (an earlier draft treated it as unset, which silently gave an endpoint path-style addressing).
+- **A shared volume the gateway cannot write.** Kubernetes applies `fsGroup` to block and many CSI volumes but **not** to
+  NFS-style ones (Filestore, generic NFS, CephFS, EFS without an access point), which are often root-owned `0755`; the pod
+  runs as uid 65532. Use an EFS access point owned by 65532, or chown the export once. The gateway now **checks that the
+  directory is writable at start** (a probe file) and refuses to start with a message saying so, instead of starting Ready
+  and failing every request; a directory that already exists keeps its mode (only one the gateway creates is made `0700`).
+- **It needs `fleet.enabled`.** A single instance keeps its media in memory and would ignore the store; the render refuses
+  the combination instead of letting it be a silent no-op.
+- **An existing chart's render does not change.** A render of the default values and of the full example is
+  identical to the chart before this change except for the `helm.sh/chart` label (the chart is 0.2.0), which is not a pod
+  selector or the config checksum: upgrading a release that does not use the media store rolls no pod.
+- **The same validation as the rest of the chart** (`deploy/helm/validate.sh`, the `Helm chart` workflow): each example is
+  linted, rendered, checked against the Kubernetes schemas, fed through `llmshim serve --check` (built with
+  `serve-redis,serve-cloud`), and asserted for what its platform needs (the claim and its access mode, the
+  annotation, the label, the mount, the CA mount); explicit `path_style` booleans, the private and sovereign-cloud
+  settings, and twenty misconfigurations are checked, each refused with the right message. The render refuses what it can
+  see without the server: a store without `fleet.enabled`, a missing kind, bucket, claim or secret, a prefix that does not
+  end in `/` (or is set for `file`), a TTL or object size out of range, `allowInsecureHttp` without an endpoint, a
+  `[media_store]` in the operator's own `config` (a duplicate table), a key file name with a slash. Names that Google
+  and Azure restrict (a bucket, an account, a container) are refused by `serve --check`, which the same validation runs.
+- **Not covered:** a real cluster. Rendering, schema validation and `serve --check` prove the manifests and the
+  configuration are well formed and agree; they cannot prove an IRSA trust policy, a Workload Identity binding or a
+  storage class works. Follow each platform's documentation for those.
 
 ## What the sweeper may delete
 

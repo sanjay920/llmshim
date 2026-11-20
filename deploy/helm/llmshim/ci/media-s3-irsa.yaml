@@ -1,0 +1,27 @@
+# AWS S3 with the pod's own role (EKS IAM roles for service accounts): no key is stored. Needs an image built with serve-cloud.
+# Used by deploy/helm/validate.sh (rendered, schema-checked and fed through `llmshim serve --check`) and
+# as a worked example for this platform: copy it and change the names.
+replicaCount: 3
+existingSecret: llmshim-secrets
+fleet:
+  enabled: true
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/llmshim-media
+mediaStore:
+  enabled: true
+  kind: s3
+  prefix: llmshim/
+  s3:
+    bucket: llmshim-media
+    region: eu-west-1
+    credentials: aws
+config: |
+  [providers.openai]
+  kind = "openai"
+  api_key = { env = "OPENAI_API_KEY" }
+
+  [[keys]]
+  name = "media-example"
+  tenant = "media"
+  secret = { env = "EXAMPLE_GATEWAY_KEY" }

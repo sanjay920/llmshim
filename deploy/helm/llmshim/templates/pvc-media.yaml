@@ -1,0 +1,18 @@
+{{- if and .Values.mediaStore.enabled (eq .Values.mediaStore.kind "file") .Values.mediaStore.file.persistence.create (not .Values.mediaStore.file.claimName) }}
+# The claim every replica mounts for the file media store. It must be ReadWriteMany: the replicas
+# read each other's objects. Pick a storage class that provides it (EFS, Filestore, Azure Files, NFS, CephFS).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "llmshim.mediaClaimName" . }}
+  labels:
+    {{- include "llmshim.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteMany"]
+  {{- with .Values.mediaStore.file.persistence.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.mediaStore.file.persistence.size | quote }}
+{{- end }}

@@ -1,0 +1,38 @@
+# MinIO (or Ceph RGW, SeaweedFS) in the cluster: S3 with path-style addressing and a key from the Secret.
+# Used by deploy/helm/validate.sh (rendered, schema-checked and fed through `llmshim serve --check`) and
+# as a worked example for this platform: copy it and change the names.
+replicaCount: 3
+existingSecret: llmshim-secrets
+fleet:
+  enabled: true
+# The in-cluster MinIO's own certificate: a Secret with ca.crt, mounted outside /etc/llmshim (which is
+# itself a read-only mount), and named by mediaStore.caFile.
+extraVolumes:
+  - name: minio-ca
+    secret:
+      secretName: minio-ca
+extraVolumeMounts:
+  - name: minio-ca
+    mountPath: /etc/llmshim-media-ca
+    readOnly: true
+mediaStore:
+  enabled: true
+  kind: s3
+  prefix: llmshim/
+  caFile: /etc/llmshim-media-ca/ca.crt
+  s3:
+    bucket: llmshim-media
+    region: us-east-1
+    endpoint: https://minio.minio.svc.cluster.local:9000
+    credentials: keys
+    accessKeyIdEnv: MEDIA_S3_ACCESS_KEY_ID        # variables in the llmshim-secrets Secret
+    secretAccessKeyEnv: MEDIA_S3_SECRET_ACCESS_KEY
+config: |
+  [providers.openai]
+  kind = "openai"
+  api_key = { env = "OPENAI_API_KEY" }
+
+  [[keys]]
+  name = "media-example"
+  tenant = "media"
+  secret = { env = "EXAMPLE_GATEWAY_KEY" }

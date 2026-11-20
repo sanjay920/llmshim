@@ -1,0 +1,26 @@
+# Google Cloud Storage with GKE Workload Identity: the pod's service account is the Google identity, no key is stored.
+# Used by deploy/helm/validate.sh (rendered, schema-checked and fed through `llmshim serve --check`) and
+# as a worked example for this platform: copy it and change the names.
+replicaCount: 3
+existingSecret: llmshim-secrets
+fleet:
+  enabled: true
+serviceAccount:
+  annotations:
+    iam.gke.io/gcp-service-account: llmshim-media@my-project.iam.gserviceaccount.com
+mediaStore:
+  enabled: true
+  kind: gcs
+  prefix: llmshim/
+  gcs:
+    bucket: llmshim-media
+    credentials: metadata
+config: |
+  [providers.openai]
+  kind = "openai"
+  api_key = { env = "OPENAI_API_KEY" }
+
+  [[keys]]
+  name = "media-example"
+  tenant = "media"
+  secret = { env = "EXAMPLE_GATEWAY_KEY" }

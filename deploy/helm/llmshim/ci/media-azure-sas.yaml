@@ -1,0 +1,24 @@
+# Azure Blob Storage with a container SAS token from the Secret (where workload identity is not available).
+# Used by deploy/helm/validate.sh (rendered, schema-checked and fed through `llmshim serve --check`) and
+# as a worked example for this platform: copy it and change the names.
+replicaCount: 3
+existingSecret: llmshim-secrets
+fleet:
+  enabled: true
+mediaStore:
+  enabled: true
+  kind: azure-blob
+  azureBlob:
+    account: llmshimstore
+    container: media
+    credentials: sas
+    sasEnv: MEDIA_AZURE_SAS_TOKEN     # a variable in the llmshim-secrets Secret
+config: |
+  [providers.openai]
+  kind = "openai"
+  api_key = { env = "OPENAI_API_KEY" }
+
+  [[keys]]
+  name = "media-example"
+  tenant = "media"
+  secret = { env = "EXAMPLE_GATEWAY_KEY" }
