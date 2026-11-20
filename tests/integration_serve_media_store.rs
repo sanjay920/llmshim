@@ -321,3 +321,97 @@ async fn a_real_gcs_protocol_server_stores_lists_and_sweeps() {
         Err(BlobError::NotFound)
     );
 }
+
+/// The same cycle against **Azurite**, Microsoft's Azure Storage emulator: a server that verifies the
+/// Shared Key signature, which is the part of the Blob backend a mock cannot prove
+/// (`LLMSHIM_TEST_AZURE_ENDPOINT`, `_ACCOUNT`, `_KEY`).
+#[tokio::test]
+#[ignore = "needs Azurite (LLMSHIM_TEST_AZURE_ENDPOINT)"]
+async fn a_real_azure_storage_emulator_verifies_the_shared_key_and_stores_lists_and_sweeps() {
+    use llmshim::serve::blobstore::azure::{AzureAuth, AzureSettings, AzureStore};
+    let endpoint = setting("LLMSHIM_TEST_AZURE_ENDPOINT");
+    let account = setting("LLMSHIM_TEST_AZURE_ACCOUNT");
+    let container = format!("media{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let prefix = format!("t{}/", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let config = |key_env: &str| -> MediaStore {
+        serde_json::from_value(json!({
+            "kind": "azure-blob", "account": account, "container": container,
+            "endpoint": endpoint, "allow_insecure_http": true, "prefix": prefix,
+            "credentials": "account-key", "account_key": {"env": key_env},
+        }))
+        .unwrap()
+    };
+    let env = |name: &str| std::env::var(name).ok();
+    // The container, made once with the account's own key.
+    let creator = AzureStore::new(
+        &AzureSettings {
+            account: &account,
+            container: &container,
+            prefix: "",
+            endpoint: Some(&endpoint),
+            auth: AzureAuth::AccountKey(
+                &serde_json::from_value(json!({"env": "LLMSHIM_TEST_AZURE_KEY"})).unwrap(),
+            ),
+            ca_pem: None,
+            max_object_bytes: 1 << 20,
+        },
+        &env,
+    )
+    .unwrap();
+    creator.create_container_for_tests().await.unwrap();
+
+    let good = blobstore::from_config(&config("LLMSHIM_TEST_AZURE_KEY"), &env).unwrap();
+    let store: &dyn BlobStore = good.store.as_ref();
+    let text = format!("caller audio {}", "A".repeat(3 << 20));
+    let reference = blobstore::put_sealed(store, "", &text).await.unwrap();
+    assert_eq!(
+        blobstore::get_sealed(store, &reference).await.unwrap(),
+        text
+    );
+
+    let original = json!({"audio_b64": "Q".repeat(100_000), "n": 1});
+    let mut value = original.clone();
+    let staged = blobstore::externalize(store, "", &mut value, blobstore::THRESHOLD_BYTES)
+        .await
+        .unwrap();
+    blobstore::internalize(store, &mut value, usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(value, original);
+    let names = staged.names().to_vec();
+    assert_eq!(staged.release(store).await, 0);
+    assert_eq!(
+        store.get(&names[0], 1 << 20).await,
+        Err(BlobError::NotFound)
+    );
+
+    let listed = store.list().await.unwrap();
+    assert!(listed.iter().any(|o| o.key == reference.name), "{listed:?}");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        blobstore::sweep(store, Duration::from_secs(1))
+            .await
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        blobstore::get_sealed(store, &reference).await,
+        Err(BlobError::NotFound)
+    );
+
+    // A wrong key is refused by the emulator's own signature check, as a class and not a message.
+    std::env::set_var(
+        "LLMSHIM_TEST_AZURE_WRONG",
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"not-the-account-key-0123456789",
+        ),
+    );
+    let wrong = blobstore::from_config(&config("LLMSHIM_TEST_AZURE_WRONG"), &env).unwrap();
+    assert_eq!(
+        blobstore::put_sealed(wrong.store.as_ref(), "", "x")
+            .await
+            .err(),
+        Some(BlobError::Denied)
+    );
+}

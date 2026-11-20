@@ -8,6 +8,7 @@
 
 #[cfg(feature = "bedrock")]
 pub mod aws_chain;
+pub mod azure;
 pub mod file;
 pub mod gcs;
 pub mod s3;
@@ -78,6 +79,66 @@ pub fn from_config(
                     secret_access_key: config.secret_access_key.as_ref(),
                     session_token: config.session_token.as_ref(),
                     aws_chain: config.credentials == Some(MediaCredentials::Aws),
+                    ca_pem: ca.as_deref(),
+                    max_object_bytes: max,
+                },
+                env,
+            )?;
+            Ok(Handle {
+                store: Arc::new(store),
+                ttl,
+            })
+        }
+        MediaStoreKind::AzureBlob => {
+            let ca = config
+                .ca_file
+                .as_ref()
+                .map(|path| {
+                    std::fs::read(path).map_err(|e| {
+                        format!("ca_file: cannot read {}: {}", path.display(), e.kind())
+                    })
+                })
+                .transpose()?;
+            let prefix = config.prefix.clone().unwrap_or_default();
+            let need = |value: &Option<String>, name: &str| -> Result<String, String> {
+                value.clone().ok_or_else(|| format!("{name} is required"))
+            };
+            let (tenant, client) = (config.tenant_id.clone(), config.client_id.clone());
+            let token_file = config.federated_token_file.clone();
+            let auth = match config.credentials {
+                Some(MediaCredentials::Sas) => {
+                    azure::AzureAuth::Sas(config.sas_token.as_ref().ok_or("sas_token is required")?)
+                }
+                Some(MediaCredentials::AccountKey) => azure::AzureAuth::AccountKey(
+                    config
+                        .account_key
+                        .as_ref()
+                        .ok_or("account_key is required")?,
+                ),
+                Some(MediaCredentials::WorkloadIdentity) => azure::AzureAuth::WorkloadIdentity {
+                    tenant_id: tenant.as_deref().ok_or("tenant_id is required")?,
+                    client_id: client.as_deref().ok_or("client_id is required")?,
+                    token_file: token_file
+                        .as_deref()
+                        .ok_or("federated_token_file is required")?,
+                    authority: config.authority_host.as_deref(),
+                },
+                Some(MediaCredentials::ManagedIdentity) => azure::AzureAuth::ManagedIdentity {
+                    client_id: client.as_deref(),
+                    endpoint: config.identity_endpoint.as_deref(),
+                },
+                _ => return Err(
+                    "credentials must be sas, account-key, workload-identity or managed-identity"
+                        .into(),
+                ),
+            };
+            let store = azure::AzureStore::new(
+                &azure::AzureSettings {
+                    account: &need(&config.account, "account")?,
+                    container: &need(&config.container, "container")?,
+                    prefix: &prefix,
+                    endpoint: config.endpoint.as_deref(),
+                    auth,
                     ca_pem: ca.as_deref(),
                     max_object_bytes: max,
                 },
