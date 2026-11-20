@@ -1603,6 +1603,13 @@ impl GatewayState {
             "providers": providers,
             "lanes": lanes,
         });
+        // Each provider's circuit and the named routes (their request defaults, scalars only): what the
+        // control plane's status view shows (note 0051).
+        stats["provider_circuits"] = json!(self.router.current().provider_overview());
+        let routes = self.router.current().route_overview();
+        if !routes.is_empty() {
+            stats["routes"] = json!(routes);
+        }
         // Present only when the file has deployments: each one's targets and their circuits.
         let deployments = self.router.current().deployment_overview();
         if !deployments.is_empty() {

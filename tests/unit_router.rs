@@ -528,3 +528,88 @@ fn parse_cerebras_bare_model_and_dedicated_endpoint() {
         ("cerebras".into(), "my-endpoint".into())
     );
 }
+
+#[test]
+fn the_overview_names_routes_and_provider_circuits_and_shows_only_generation_controls() {
+    let long = "x".repeat(65);
+    let router = Router::new()
+        .register("anthropic", Box::new(Anthropic::new("k".into())))
+        .register(
+            "openai",
+            Box::new(llmshim::providers::openai::OpenAi::new("k".into())),
+        )
+        .route(
+            "zeta",
+            route(
+                "openai/gpt-6-luna",
+                &[("max_tokens", serde_json::json!(512))],
+            ),
+        )
+        .route(
+            "alpha",
+            route(
+                "anthropic/claude-haiku-5-5",
+                &[
+                    ("reasoning_effort", serde_json::json!("low")),
+                    ("system", serde_json::json!(long)),
+                    ("user", serde_json::json!("tenant-7")),
+                    ("stop", serde_json::json!(["a", "b"])),
+                    (
+                        "response_format",
+                        serde_json::json!({"type": "json_object"}),
+                    ),
+                    ("stream", serde_json::json!(true)),
+                    ("temperature", serde_json::json!(0.2)),
+                ],
+            ),
+        );
+    let routes = router.route_overview();
+    // Sorted by name, with the model as written.
+    assert_eq!(routes[0]["name"], "alpha");
+    assert_eq!(routes[1]["name"], "zeta");
+    assert_eq!(routes[0]["model"], "anthropic/claude-haiku-5-5");
+    let settings = &routes[0]["settings"];
+    assert_eq!(settings["reasoning_effort"], "low");
+    assert_eq!(settings["stream"], true);
+    assert_eq!(settings["temperature"], 0.2);
+    // Anything that is not a plain generation control is named but never shown, short or not.
+    for hidden in ["system", "user", "stop", "response_format"] {
+        assert_eq!(settings[hidden], "<hidden>", "{hidden}");
+    }
+    let text = serde_json::Value::Array(routes.clone()).to_string();
+    assert!(
+        !text.contains(&long) && !text.contains("tenant-7"),
+        "{text}"
+    );
+    assert_eq!(routes[1]["settings"]["max_tokens"], 512);
+    // A control with a nested or non-scalar value is hidden too.
+    let router = Router::new().route(
+        "odd",
+        route(
+            "openai/gpt-6-luna",
+            &[("reasoning_effort", serde_json::json!({"x": "y"}))],
+        ),
+    );
+    assert_eq!(
+        router.route_overview()[0]["settings"]["reasoning_effort"],
+        "<hidden>"
+    );
+    // Every provider, sorted, with a circuit that starts closed.
+    assert_eq!(
+        router_providers(),
+        vec![
+            serde_json::json!({"provider": "anthropic", "circuit": "closed"}),
+            serde_json::json!({"provider": "openai", "circuit": "closed"}),
+        ]
+    );
+}
+
+fn router_providers() -> Vec<serde_json::Value> {
+    Router::new()
+        .register(
+            "openai",
+            Box::new(llmshim::providers::openai::OpenAi::new("k".into())),
+        )
+        .register("anthropic", Box::new(Anthropic::new("k".into())))
+        .provider_overview()
+}

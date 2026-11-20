@@ -451,6 +451,71 @@ impl Router {
         Ok(Cow::Owned(expanded))
     }
 
+    /// The named routes for a status page: each name, its model and its request defaults. Only a
+    /// well-known generation control (`reasoning_effort`, `max_tokens`, `temperature`, …) is shown, and only
+    /// when it is a bool, a number or a short string; any other default (a `user`, a `system` text, a nested
+    /// object, a list) is named but not shown (`<hidden>`). The stats are served by listeners that may be
+    /// open, so a route's own text is never put on them. Sorted by name.
+    pub fn route_overview(&self) -> Vec<serde_json::Value> {
+        /// Controls whose values are not identifying: enumerations and numbers.
+        const SHOWN: [&str; 12] = [
+            "reasoning_effort",
+            "reasoning_mode",
+            "reasoning_summary",
+            "max_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "seed",
+            "stream",
+            "frequency_penalty",
+            "presence_penalty",
+        ];
+        let mut names: Vec<&String> = self.routes.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let route = &self.routes[name];
+                let settings: serde_json::Map<String, serde_json::Value> = route
+                    .settings
+                    .iter()
+                    .map(|(key, value)| {
+                        let shown = match value {
+                            serde_json::Value::Bool(_) | serde_json::Value::Number(_)
+                                if SHOWN.contains(&key.as_str()) =>
+                            {
+                                value.clone()
+                            }
+                            serde_json::Value::String(text)
+                                if SHOWN.contains(&key.as_str()) && text.chars().count() <= 32 =>
+                            {
+                                value.clone()
+                            }
+                            _ => serde_json::json!("<hidden>"),
+                        };
+                        (key.clone(), shown)
+                    })
+                    .collect();
+                serde_json::json!({"name": name, "model": route.model, "settings": settings})
+            })
+            .collect()
+    }
+
+    /// Each registered provider with its circuit (`closed`, `open` or `half_open`) as this process sees it.
+    /// Sorted by key.
+    pub fn provider_overview(&self) -> Vec<serde_json::Value> {
+        let mut keys: Vec<&String> = self.providers.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|key| {
+                let provider = &self.providers[key];
+                serde_json::json!({"provider": key, "circuit": self.breaker.state_name(provider.instance())})
+            })
+            .collect()
+    }
+
     /// Returns the keys of all registered providers.
     pub fn provider_keys(&self) -> Vec<&str> {
         self.providers.keys().map(|s| s.as_str()).collect()

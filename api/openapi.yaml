@@ -635,6 +635,59 @@ components:
               provider: {type: string}
               queue_depth: {type: integer, minimum: 0}
               dead_letter: {type: integer, minimum: 0, description: Distributed mode only}
+        provider_circuits:
+          type: array
+          description: Each provider's circuit (`closed`, `open`, `half_open`) as this process sees it (0051)
+          items:
+            type: object
+            required: [provider, circuit]
+            additionalProperties: false
+            properties:
+              provider: {type: string}
+              circuit: {type: string, enum: [closed, open, half_open]}
+        routes:
+          type: array
+          description: |
+            Present only with named routes (0051). Only a well-known generation control (`reasoning_effort`,
+            `max_tokens`, `temperature`, ...) with a boolean, number or short string value is shown; every other
+            request default is named and its value is `<hidden>`, because these stats are served by listeners
+            that may be open.
+          items:
+            type: object
+            required: [name, model, settings]
+            additionalProperties: false
+            properties:
+              name: {type: string}
+              model: {type: string}
+              settings: {type: object}
+        deployments:
+          type: array
+          description: Present only with deployments (0031).
+          items:
+            type: object
+            required: [name, strategy, targets]
+            additionalProperties: false
+            properties:
+              name: {type: string}
+              strategy: {type: string}
+              targets:
+                type: array
+                items:
+                  type: object
+                  required: [model, weight, circuit]
+                  additionalProperties: false
+                  properties:
+                    model: {type: string}
+                    weight: {type: integer, minimum: 0}
+                    circuit: {type: string, enum: [closed, open, half_open, unknown]}
+        outage_admission:
+          type: object
+          description: Present only with `[fleet.outage_admission]` (0027).
+          required: [active, lease_nanos]
+          additionalProperties: false
+          properties:
+            active: {type: boolean}
+            lease_nanos: {type: integer, minimum: 0}
     ServeConfigStatus:
       type: object
       required: [generation, config_sha256, credentials, loaded_at_epoch_secs, last_check_epoch_secs, in_sync, last_reload, router_generation, limits_generation, env_secret_providers, snapshot]

@@ -36,6 +36,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/v1/whoami"),
     ("get", "/v1/history"),
     ("get", "/v1/history/verify"),
+    ("get", "/v1/gateways"),
     ("post", "/v1/usage/batch"),
     ("get", "/v1/requests"),
     ("get", "/v1/requests/summary"),
@@ -62,6 +63,8 @@ pub struct AppState {
     /// Set while a history chain check runs: it reads the whole history under the store's lock, so one
     /// at a time (a second asks to try again) and only for the admin role.
     verifying: std::sync::atomic::AtomicBool,
+    /// The gateways whose status the UI shows (note 0051, slice 4); set once, at start.
+    gateways: std::sync::OnceLock<crate::gateways::Gateways>,
 }
 
 /// Holds the flag set; clears it when dropped, however the check ends.
@@ -93,6 +96,7 @@ impl AppState {
             ingest_digest: Default::default(),
             ui: crate::ui::Ui::new(None, true),
             verifying: Default::default(),
+            gateways: Default::default(),
         })
     }
 
@@ -114,11 +118,17 @@ impl AppState {
             ingest_digest: Default::default(),
             ui,
             verifying: Default::default(),
+            gateways: Default::default(),
         })
     }
 }
 
 impl AppState {
+    /// Show these gateways' status at `GET /v1/gateways`. Set once; a second call is ignored.
+    pub fn set_gateways(&self, gateways: crate::gateways::Gateways) {
+        let _ = self.gateways.set(gateways);
+    }
+
     /// Accept this token (at least 22 visible characters) for the gateways' usage push, and for nothing
     /// else. Set once; a second call is ignored.
     pub fn set_ingest_token(&self, token: &str) {
@@ -159,6 +169,7 @@ pub const ROLES: &[(&str, &str, Option<Role>)] = &[
     ("get", "/v1/whoami", None),
     ("get", "/v1/history", Some(Role::Read)),
     ("get", "/v1/history/verify", Some(Role::Admin)),
+    ("get", "/v1/gateways", Some(Role::Read)),
     ("get", "/v1/requests", Some(Role::Read)),
     ("get", "/v1/requests/summary", Some(Role::Read)),
     ("get", "/v1/requests/facets", Some(Role::Read)),
@@ -901,6 +912,15 @@ async fn history_verify(State(s): State<Arc<AppState>>) -> ApiResult<Json<Value>
     }))
 }
 
+/// Each configured gateway's status, read from its admin listener (note 0051, slice 4). With no gateways
+/// file the answer says so, and is not an error: the control plane works without it.
+async fn gateways(State(s): State<Arc<AppState>>) -> Json<Value> {
+    match s.gateways.get() {
+        Some(gateways) => Json(gateways.status().await),
+        None => Json(json!({"configured": false, "gateways": []})),
+    }
+}
+
 async fn publish(
     State(s): State<Arc<AppState>>,
     h: HeaderMap,
@@ -1056,6 +1076,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/whoami", get(whoami))
         .route("/v1/history", get(history))
         .route("/v1/history/verify", get(history_verify))
+        .route("/v1/gateways", get(gateways))
         .route(
             "/v1/usage/batch",
             post(ingest_usage).layer(axum::extract::DefaultBodyLimit::max(INGEST_BODY_LIMIT)),

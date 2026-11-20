@@ -350,7 +350,7 @@ async function viewRequests() {
 
 const VIEWS = {
   home: ["Home", viewHome], requests: ["Requests", viewRequests], clients: ["Clients", viewClients],
-  admin: ["Admin", viewAdmin], history: ["History", viewHistory],
+  admin: ["Admin", viewAdmin], gateways: ["Gateways", viewGateways], history: ["History", viewHistory],
 };
 
 // An error from a view the person has already left is not shown over the one they are on.

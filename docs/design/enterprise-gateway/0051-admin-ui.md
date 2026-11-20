@@ -1,6 +1,6 @@
 # 0051: The admin UI
 
-Status: slices 1 (the request ledger and the gateway's `[usage_export]`), 2 (the UI shell, Home and Requests) and 3 (Clients, Admin and History) built; the other views, payload capture and the other views are described and not
+Status: slices 1 (the request ledger and the gateway's `[usage_export]`), 2 (the UI shell, Home and Requests) and 3 (Clients, Admin and History) and 4 (Gateways: routes, providers, circuits, configuration state) built; the other views, payload capture and the other views are described and not
 built. Written on the owner's instruction to start the admin UI, prompted by a screenshot of a proxy's request view: a
 30-day history, one row per request with time, status, model and endpoint, client and route, tokens in and out, cache
 percentage, duration and price, with the footnotes "input tokens include cache" and "API = estimate, not spend".
@@ -56,7 +56,7 @@ payloads. That is a privacy decision of its own and is **not** in the first slic
    detail drawer, the spend and cache summary.
 3. **Clients, Admin and History views (built).** Keys (create, revoke, rotate, limits), organizations, teams, projects, the change
    history and its chain check, over the API that exists.
-4. **Routes and Providers (read-only).** What each gateway is configured with and its health, from the gateways' admin
+4. **Routes and Providers (read-only, built as the Gateways view).** What each gateway is configured with and its health, from the gateways' admin
    listeners. The configuration stays a file under version control: the UI shows it, it does not edit it.
 5. **Payload capture and the cache debugger.** Opt-in capture of a request's payload, sealed and short-lived, a diff of
    consecutive requests' prefixes to show *where* a cache miss began. Needs its own note before any code.
@@ -131,3 +131,36 @@ payloads. That is a privacy decision of its own and is **not** in the first slic
   of a tampered one), and by driving the page in Chrome: create an organization, team (with a name that is markup),
   project and budget; create a client and see its secret once; edit limits; rotate; revoke; check the chain; no
   console error, no dialog, no element made from the markup name.
+
+## Slice 4 as built
+
+- **How the control plane learns about gateways.** `--gateways-file` names each gateway's admin listener (`name`,
+  `admin_url` as an origin, optional `token_file` and `ca_file`, `allow_insecure_http` for a private network). It is the
+  operator's file, not a caller's input, so there is nothing to forge a request through: https unless said otherwise,
+  no credentials, path, query or fragment in the address, a bounded list (64), owner-only token files re-read at every
+  fetch (a rotation needs no restart), redirects not followed, ambient proxies not used. Errors name the entry and the
+  field and never echo a value.
+- **`GET /v1/gateways`** (read role): per gateway, `reachable`, `ready` (from the open `/ready`), the gateway's
+  `/v1/gateway/stats` and `/v1/serve/config`, or an `error` code (`unreachable`, `unauthorized`, `bad_response`,
+  `token_unreadable`). The gateway's own error text is never repeated. A body over 1 MiB is a `bad_response`. One answer
+  is shared for five seconds, one fetch at a time, so any number of viewers is one request per gateway per interval.
+  With no file the answer is `{configured: false}` and the rest of the control plane is unchanged.
+- **Gateway side (root crate, additive).** The admin stats gained `provider_circuits` (each provider's circuit as that
+  process sees it) and `routes` (each named route's model and request defaults). The stats are served by listeners that
+  may be open (without `[admin]` they share the main listener), so a route's own text is never put on them: only a
+  well-known generation control (`reasoning_effort`, `max_tokens`, `temperature` and a few more) with a bool, number or
+  short string is shown, and every other default (a `user`, a `system` text, a list, an object) is named with the value
+  `<hidden>`. `Router::route_overview`
+  and `provider_overview` are new public methods (additive).
+- **The view** (`Gateways`): per gateway its readiness, mode, providers with circuit and queue depth, deployments with
+  each target's weight and circuit, named routes with their defaults, and the configuration state (in sync with its file,
+  generations, credentials in force, file hash, load time, last reload, provider secrets that a reload cannot rotate,
+  snapshot and audit status). It shows the configuration and never changes it: that stays a file under version control.
+- **One gateway per address.** A replica set behind one Service shows whichever replica answers: list each replica (or
+  the headless names) to see each one. A circuit is a process's own view (the fleet's shared view is in Redis).
+- **Checked** by `tests/gateways.rs` (a gateway read with its own token and the answer shared; every failure a code and
+  none carrying the gateway's text or a token; a redirect not followed; a rotated token picked up; the file's validation by
+  entry and field), mutation (following redirects, no cache), `unit_router` (the overview and its masking),
+  `integration_serve_deployments` (a real `serve` process reports provider circuits and routes, long defaults masked), and
+  by running a real `llmshim serve` with its admin listener against a real control plane and the page in Chrome (one
+  gateway read, one unreachable).

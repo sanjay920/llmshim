@@ -211,6 +211,20 @@ paths:
         '200': {description: The result of the check}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
+  /v1/gateways:
+    get:
+      operationId: gateways
+      description: |
+        The status of each gateway listed in `--gateways-file` (design note 0051), read from its admin
+        listener: `/v1/gateway/stats` (providers and their circuits, deployments, named routes, queues),
+        `/v1/serve/config` (the configuration in force, reload state, snapshot) and `/ready`. One answer is shared
+        for five seconds. A gateway that cannot be read has `reachable: false` or an `error` code
+        (`unreachable`, `unauthorized`, `bad_response`, `token_unreadable`), never the gateway's own text. With
+        no gateways file: `{configured: false, gateways: []}`.
+      responses:
+        '200': {description: The gateways' status}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/usage/batch:
     post:
       operationId: ingestUsage
