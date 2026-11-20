@@ -59,13 +59,34 @@ setting that would be ignored or would fail at start never reaches the cluster. 
 [media_store]
 kind = {{ $m.kind | quote }}
 {{- if $m.maxObjectBytes }}
+{{- if or (lt ($m.maxObjectBytes | int64) 1024) (gt ($m.maxObjectBytes | int64) 268435456) }}
+{{- fail "mediaStore.maxObjectBytes must be 1024 to 268435456" }}
+{{- end }}
 max_object_bytes = {{ $m.maxObjectBytes | int64 }}
 {{- end }}
 {{- if $m.ttlSecs }}
+{{- if or (lt ($m.ttlSecs | int64) 600) (gt ($m.ttlSecs | int64) 604800) }}
+{{- fail "mediaStore.ttlSecs must be 600 to 604800" }}
+{{- end }}
 ttl_secs = {{ $m.ttlSecs | int64 }}
 {{- end }}
-{{- if and $m.prefix (ne $m.kind "file") }}
+{{- if contains "[media_store]" $.Values.config }}
+{{- fail "the chart writes [media_store] from mediaStore: remove it from config (or set mediaStore.enabled=false)" }}
+{{- end }}
+{{- if and $m.prefix (eq $m.kind "file") }}
+{{- fail "mediaStore.prefix does not apply to kind file (the claim is the namespace)" }}
+{{- end }}
+{{- if $m.prefix }}
+{{- if not (hasSuffix "/" $m.prefix) }}
+{{- fail "mediaStore.prefix must end in /" }}
+{{- end }}
 prefix = {{ $m.prefix | quote }}
+{{- end }}
+{{- if $m.caFile }}
+{{- if eq $m.kind "file" }}
+{{- fail "mediaStore.caFile does not apply to kind file" }}
+{{- end }}
+ca_file = {{ $m.caFile | quote }}
 {{- end }}
 {{- if eq $m.kind "file" }}
 {{- if not (or $m.file.claimName $m.file.persistence.create) }}
@@ -82,10 +103,14 @@ region = {{ $s.region | quote }}
 {{- if $s.endpoint }}
 endpoint = {{ $s.endpoint | quote }}
 {{- end }}
-{{- if $s.pathStyle }}
+{{- /* A YAML boolean false is a value, not an absence: only an unset or empty string leaves the default. */}}
+{{- if and (not (kindIs "invalid" $s.pathStyle)) (ne (toString $s.pathStyle) "") }}
 path_style = {{ if eq (toString $s.pathStyle) "true" }}true{{ else }}false{{ end }}
 {{- end }}
 {{- if $s.allowInsecureHttp }}
+{{- if not $s.endpoint }}
+{{- fail "mediaStore.s3.allowInsecureHttp needs an endpoint" }}
+{{- end }}
 allow_insecure_http = true
 {{- end }}
 {{- if eq $s.credentials "aws" }}
@@ -112,16 +137,25 @@ bucket = {{ $g.bucket | quote }}
 endpoint = {{ $g.endpoint | quote }}
 {{- end }}
 {{- if $g.allowInsecureHttp }}
+{{- if not $g.endpoint }}
+{{- fail "mediaStore.gcs.allowInsecureHttp needs an endpoint" }}
+{{- end }}
 allow_insecure_http = true
 {{- end }}
 {{- if eq $g.credentials "metadata" }}
 credentials = "metadata"
+{{- if $g.metadataEndpoint }}
+metadata_endpoint = {{ $g.metadataEndpoint | quote }}
+{{- end }}
 {{- else if eq $g.credentials "service-account" }}
 {{- if not $g.serviceAccountSecret }}
 {{- fail "mediaStore.gcs with credentials: service-account needs serviceAccountSecret (a Secret holding the key file)" }}
 {{- end }}
+{{- if or (not $g.serviceAccountKey) (contains "/" $g.serviceAccountKey) (contains ".." $g.serviceAccountKey) }}
+{{- fail "mediaStore.gcs.serviceAccountKey must be a file name in the Secret (no slash)" }}
+{{- end }}
 credentials = "service-account"
-service_account_file = {{ printf "/etc/llmshim/gcp/%s" $g.serviceAccountKey | quote }}
+service_account_file = {{ printf "/etc/llmshim-gcp/%s" $g.serviceAccountKey | quote }}
 {{- else if eq $g.credentials "none" }}
 {{- if not $g.endpoint }}
 {{- fail "mediaStore.gcs with credentials: none needs an endpoint (an emulator): it is never for Google's own" }}
@@ -141,6 +175,9 @@ container = {{ $a.container | quote }}
 endpoint = {{ $a.endpoint | quote }}
 {{- end }}
 {{- if $a.allowInsecureHttp }}
+{{- if not $a.endpoint }}
+{{- fail "mediaStore.azureBlob.allowInsecureHttp needs an endpoint" }}
+{{- end }}
 allow_insecure_http = true
 {{- end }}
 {{- if eq $a.credentials "workload-identity" }}
@@ -151,10 +188,16 @@ credentials = "workload-identity"
 tenant_id = {{ $a.tenantId | quote }}
 client_id = {{ $a.clientId | quote }}
 federated_token_file = {{ $a.federatedTokenFile | quote }}
+{{- if $a.authorityHost }}
+authority_host = {{ $a.authorityHost | quote }}
+{{- end }}
 {{- else if eq $a.credentials "managed-identity" }}
 credentials = "managed-identity"
 {{- if $a.clientId }}
 client_id = {{ $a.clientId | quote }}
+{{- end }}
+{{- if $a.identityEndpoint }}
+identity_endpoint = {{ $a.identityEndpoint | quote }}
 {{- end }}
 {{- else if or (eq $a.credentials "sas") (eq $a.credentials "account-key") }}
 {{- if not .Values.existingSecret }}

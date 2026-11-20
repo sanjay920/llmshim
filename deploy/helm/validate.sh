@@ -79,13 +79,17 @@ has media-file-rwx "mountPath: /var/lib/llmshim/media"
 has media-file-rwx 'path = "/var/lib/llmshim/media"'
 has media-s3-minio 'endpoint = "https://minio.minio.svc.cluster.local:9000"'
 has media-s3-minio 'access_key_id = { env = "MEDIA_S3_ACCESS_KEY_ID" }'
+has media-s3-minio 'ca_file = "/etc/llmshim-media-ca/ca.crt"'
+has media-s3-minio "name: minio-ca"
+has media-s3-minio "mountPath: /etc/llmshim-media-ca"
 has media-s3-irsa "eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/llmshim-media"
 has media-s3-irsa 'credentials = "aws"'
 lacks media-s3-irsa "access_key_id"
 has media-gcs-workload-identity "iam.gke.io/gcp-service-account"
 has media-gcs-workload-identity 'credentials = "metadata"'
 has media-gcs-service-account "name: gcp-service-account"
-has media-gcs-service-account 'service_account_file = "/etc/llmshim/gcp/key.json"'
+has media-gcs-service-account 'service_account_file = "/etc/llmshim-gcp/key.json"'
+has media-gcs-service-account "mountPath: /etc/llmshim-gcp"
 has media-azure-workload-identity 'azure.workload.identity/use: "true"'
 has media-azure-workload-identity "azure.workload.identity/client-id"
 has media-azure-workload-identity 'federated_token_file = "/var/run/secrets/azure/tokens/azure-identity-token"'
@@ -97,6 +101,27 @@ for variant in default full; do
   lacks "$variant" "azure.workload.identity"
   lacks "$variant" "PersistentVolumeClaim"
 done
+
+echo "== path_style: an explicit false is a value, not an absence"
+s3=(--set existingSecret=s --set fleet.enabled=true --set mediaStore.enabled=true --set mediaStore.kind=s3
+    --set mediaStore.s3.bucket=b --set mediaStore.s3.region=r --set mediaStore.s3.endpoint=https://store.example)
+helm template release /charts/llmshim "${s3[@]}" > "$work/ps-unset.yaml"
+helm template release /charts/llmshim "${s3[@]}" --set mediaStore.s3.pathStyle=false > "$work/ps-false.yaml"
+helm template release /charts/llmshim "${s3[@]}" --set-string mediaStore.s3.pathStyle=false > "$work/ps-false-string.yaml"
+helm template release /charts/llmshim "${s3[@]}" --set mediaStore.s3.pathStyle=true > "$work/ps-true.yaml"
+! grep -q "path_style" "$work/ps-unset.yaml"
+grep -q "path_style = false" "$work/ps-false.yaml"
+grep -q "path_style = false" "$work/ps-false-string.yaml"
+grep -q "path_style = true" "$work/ps-true.yaml"
+
+echo "== the settings for private and sovereign clouds reach the configuration"
+az=(--set existingSecret=s --set fleet.enabled=true --set mediaStore.enabled=true --set mediaStore.kind=azure-blob
+    --set mediaStore.azureBlob.account=a --set mediaStore.azureBlob.container=cont
+    --set mediaStore.azureBlob.tenantId=t --set mediaStore.azureBlob.clientId=c)
+helm template release /charts/llmshim "${az[@]}" --set mediaStore.azureBlob.authorityHost=https://login.microsoftonline.us | grep -q 'authority_host = "https://login.microsoftonline.us"'
+helm template release /charts/llmshim "${az[@]}" --set mediaStore.azureBlob.credentials=managed-identity --set mediaStore.azureBlob.identityEndpoint=http://169.254.169.254 | grep -q 'identity_endpoint = "http://169.254.169.254"'
+helm template release /charts/llmshim --set existingSecret=s --set fleet.enabled=true --set mediaStore.enabled=true --set mediaStore.kind=gcs \
+  --set mediaStore.gcs.bucket=b --set mediaStore.gcs.metadataEndpoint=http://169.254.169.254 | grep -q 'metadata_endpoint = "http://169.254.169.254"'
 
 echo "== media store misconfigurations are refused at render time"
 refuse() {
@@ -119,6 +144,14 @@ refuse "needs serviceAccountSecret" "${media[@]}" --set mediaStore.kind=gcs --se
 refuse "credentials: none needs an endpoint" "${media[@]}" --set mediaStore.kind=gcs --set mediaStore.gcs.bucket=b --set mediaStore.gcs.credentials=none
 refuse "needs account and container" "${media[@]}" --set mediaStore.kind=azure-blob
 refuse "needs tenantId and clientId" "${media[@]}" --set mediaStore.kind=azure-blob --set mediaStore.azureBlob.account=a --set mediaStore.azureBlob.container=c
+refuse "mediaStore.prefix must end in /" "${media[@]}" --set mediaStore.kind=s3 --set mediaStore.s3.bucket=b --set mediaStore.s3.region=r --set mediaStore.s3.credentials=aws --set mediaStore.prefix=llmshim
+refuse "mediaStore.prefix does not apply to kind file" "${media[@]}" --set mediaStore.kind=file --set mediaStore.file.claimName=c --set mediaStore.prefix=x/
+refuse "mediaStore.ttlSecs must be" "${media[@]}" --set mediaStore.kind=file --set mediaStore.file.claimName=c --set mediaStore.ttlSecs=30
+refuse "mediaStore.maxObjectBytes must be" "${media[@]}" --set mediaStore.kind=file --set mediaStore.file.claimName=c --set mediaStore.maxObjectBytes=10
+refuse "remove it from config" "${media[@]}" --set mediaStore.kind=file --set mediaStore.file.claimName=c --set-string config='[media_store]'
+refuse "mediaStore.caFile does not apply to kind file" "${media[@]}" --set mediaStore.kind=file --set mediaStore.file.claimName=c --set mediaStore.caFile=/x
+refuse "serviceAccountKey must be a file name" "${media[@]}" --set mediaStore.kind=gcs --set mediaStore.gcs.bucket=b --set mediaStore.gcs.credentials=service-account --set mediaStore.gcs.serviceAccountSecret=k --set mediaStore.gcs.serviceAccountKey=../etc/passwd
+refuse "allowInsecureHttp needs an endpoint" "${media[@]}" --set mediaStore.kind=s3 --set mediaStore.s3.bucket=b --set mediaStore.s3.region=r --set mediaStore.s3.credentials=aws --set mediaStore.s3.allowInsecureHttp=true
 refuse "credentials must be workload-identity" "${media[@]}" --set mediaStore.kind=azure-blob --set mediaStore.azureBlob.account=a --set mediaStore.azureBlob.container=c --set mediaStore.azureBlob.credentials=oauth
 
 echo "== requiring client certificates without TLS is refused"

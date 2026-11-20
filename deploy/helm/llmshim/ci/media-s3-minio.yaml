@@ -5,10 +5,21 @@ replicaCount: 3
 existingSecret: llmshim-secrets
 fleet:
   enabled: true
+# The in-cluster MinIO's own certificate: a Secret with ca.crt, mounted outside /etc/llmshim (which is
+# itself a read-only mount), and named by mediaStore.caFile.
+extraVolumes:
+  - name: minio-ca
+    secret:
+      secretName: minio-ca
+extraVolumeMounts:
+  - name: minio-ca
+    mountPath: /etc/llmshim-media-ca
+    readOnly: true
 mediaStore:
   enabled: true
   kind: s3
   prefix: llmshim/
+  caFile: /etc/llmshim-media-ca/ca.crt
   s3:
     bucket: llmshim-media
     region: us-east-1

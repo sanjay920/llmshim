@@ -15,20 +15,33 @@ pub struct FileStore {
 impl FileStore {
     /// `root` is created (owner-only) if it is not there.
     pub fn new(root: &Path, max_object_bytes: usize) -> Result<Self, String> {
+        // Only a directory this process makes is tightened; one that exists (a mounted volume, an
+        // operator's own) keeps the mode it has: that is the operator's call.
+        #[cfg(unix)]
+        let made = !root.exists();
         std::fs::create_dir_all(root)
             .map_err(|e| format!("cannot create {}: {}", root.display(), e.kind()))?;
         #[cfg(unix)]
-        {
+        if made {
             use std::os::unix::fs::PermissionsExt;
-            // Only a directory this process made is tightened; a mounted volume's mode is the
-            // mount's (a changed mode on a shared volume is the operator's call).
-            if std::fs::read_dir(root).is_ok_and(|mut d| d.next().is_none()) {
-                let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
-            }
+            let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
         }
         let canonical = root
             .canonicalize()
             .map_err(|e| format!("cannot read {}: {}", root.display(), e.kind()))?;
+        // Writable by this process, checked now: a shared volume that is root-owned (NFS-style volumes
+        // ignore fsGroup) would otherwise start fine and fail every request.
+        let probe = canonical.join(format!(".write-check-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&probe, b"x")
+            .and_then(|()| std::fs::remove_file(&probe))
+            .map_err(|e| {
+                format!(
+                    "{} is not writable by this process ({}): a shared volume must be owned by, or \
+                     writable by, the user the gateway runs as",
+                    root.display(),
+                    e.kind()
+                )
+            })?;
         Ok(Self {
             root: canonical,
             max_object_bytes,
@@ -222,6 +235,39 @@ mod tests {
             store.get("p/20260101/a", 1024).await,
             Err(BlobError::NotFound)
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_written_fails_at_start_naming_why() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = dir("readonly");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let error = FileStore::new(&root, 1024).err();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = error.expect("a directory this process cannot write is refused");
+        assert!(
+            error.contains("not writable") && error.contains("shared volume"),
+            "{error}"
+        );
+        // A directory that exists keeps its mode (an operator's, or a mount's); one the gateway makes is 0700.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(FileStore::new(&root, 1024).is_ok());
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o770
+        );
+        let fresh = root.join("made-by-the-gateway");
+        FileStore::new(&fresh, 1024).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // The probe leaves nothing behind in a good one.
+        assert!(FileStore::new(&root, 1024).is_ok());
+        assert_eq!(std::fs::read_dir(&fresh).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
