@@ -284,6 +284,9 @@ pub fn decode_cursor(cursor: &str) -> Option<(i64, String)> {
 /// How a summary is grouped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
+    /// One bucket per UTC hour, named by the whole hours since the epoch (`ts_ms / 3600000`): the page
+    /// turns it into a time, so no zone is chosen here.
+    Hour,
     Day,
     Tenant,
     Key,
@@ -294,6 +297,7 @@ pub enum Group {
 impl Group {
     pub fn parse(name: &str) -> Option<Self> {
         Some(match name {
+            "hour" => Self::Hour,
             "day" => Self::Day,
             "tenant" => Self::Tenant,
             "key" => Self::Key,
@@ -305,6 +309,7 @@ impl Group {
 
     fn column(self) -> &'static str {
         match self {
+            Self::Hour => "CAST(ts_ms / 3600000 AS TEXT)",
             Self::Day => "day",
             Self::Tenant => "tenant",
             Self::Key => "key_name",
@@ -575,7 +580,7 @@ impl Store {
             let mut groups = Vec::new();
             if let Some(group) = group {
                 let column = group.column();
-                let order = if group == Group::Day {
+                let order = if matches!(group, Group::Day | Group::Hour) {
                     format!("{column} DESC")
                 } else {
                     "SUM(cost_usd) IS NULL, SUM(cost_usd) DESC, COUNT(*) DESC".to_owned()

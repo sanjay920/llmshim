@@ -164,3 +164,33 @@ payloads. That is a privacy decision of its own and is **not** in the first slic
   `integration_serve_deployments` (a real `serve` process reports provider circuits and routes, long defaults masked), and
   by running a real `llmshim serve` with its admin listener against a real control plane and the page in Chrome (one
   gateway read, one unreachable).
+
+## The redesign (after slices 1 to 4)
+
+The first pages were functional and plain. This pass rebuilt the look and the interaction, not the contracts: the same
+routes, the same roles, the same data.
+
+- **Shell.** A left navigation (Observe: Home, Requests; Manage: Clients, Organizations, Gateways, History), a page header
+  with the page's own controls, the signed-in person and role at the foot. Light and dark follow the system. Geist and
+  Geist Mono are served from this origin (`/ui/geist.woff2`, `/ui/geist-mono.woff2`, SIL OFL 1.1, licence at
+  `/ui/OFL.txt`); `font-src 'self'` is the only addition to the policy. The pages stay a no-build, three-script set
+  (`kit.js` helpers and charts, `manage.js`, `app.js`).
+- **Home leads with spend.** One hero figure with its change on the previous window of the same length, a column chart
+  (hourly for 24 hours, UTC days for 7 and 30), stat tiles with 12-point trends, a cache-hit line chart, spend by model
+  as ranked bars with each model's cached share, a clients table, and each model's prompt composition (uncached, read
+  from cache, written to cache) as a thin segmented bar. Charts follow the data-visualisation rules the project adopted:
+  one accent, the validated reference palette, 24px columns with 4px rounded tops, hairline grid, a hover and keyboard
+  tooltip on every mark, and a **Table** toggle that shows the same values. Unknown cost is a dash and "no price" in a
+  tooltip, never a zero bar; `est` and `≥` mark estimates and lower bounds.
+- **Requests** keeps one row per attempt, with relative time, a status dot and label, model and provider, client and
+  tenant, tokens in and out, a cache meter and the cost. A request opens a slide-over: the cost as a figure with where
+  the number came from, the prompt split, usage, who, identifiers with copy buttons.
+- **Forms are slide-overs, not inline.** New client, edit limits, rotate, team budgets; a secret is shown in a sheet that
+  Escape and a click outside cannot dismiss, only "I have stored it". Actions say what happened in a toast; failures
+  stay beside the form.
+- **One API addition.** `GET /v1/requests/summary?group_by=hour` buckets by UTC hour, named by the whole hours since the
+  epoch (so the page, not the server, picks the zone).
+- **Checked** by the existing page tests (now three scripts, the font assets with their own cache rule, `font-src`), a new
+  hourly-grouping test on SQLite and Postgres, and by driving the page in Chrome in light and dark: a wrong token says it
+  was not accepted (a stale one says the session ended), hover tooltips, the 24-hour range, filters, creating a client
+  and seeing its secret once (Escape does not close it), revoking, adding a team named like markup, the history check.

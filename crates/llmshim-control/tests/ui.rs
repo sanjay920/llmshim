@@ -79,6 +79,10 @@ async fn the_pages_load_without_a_credential_and_carry_the_security_headers() {
         ("/ui/index.html", "text/html"),
         ("/ui/app.js", "text/javascript"),
         ("/ui/manage.js", "text/javascript"),
+        ("/ui/kit.js", "text/javascript"),
+        ("/ui/geist.woff2", "font/woff2"),
+        ("/ui/geist-mono.woff2", "font/woff2"),
+        ("/ui/OFL.txt", "text/plain"),
         ("/ui/style.css", "text/css"),
         ("/ui/config.json", "application/json"),
     ] {
@@ -93,7 +97,13 @@ async fn the_pages_load_without_a_credential_and_carry_the_security_headers() {
         );
         assert!(!body.is_empty(), "{path}");
         assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{path}");
-        assert_eq!(headers[header::CACHE_CONTROL], "no-store", "{path}");
+        // The pages change with the binary and are never cached; the fonts do not, and may be for a day.
+        let expected = if kind == "font/woff2" {
+            "public, max-age=86400"
+        } else {
+            "no-store"
+        };
+        assert_eq!(headers[header::CACHE_CONTROL], expected, "{path}");
         assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY", "{path}");
         assert_eq!(headers[header::REFERRER_POLICY], "no-referrer", "{path}");
         let csp = headers[header::CONTENT_SECURITY_POLICY].to_str().unwrap();
@@ -230,7 +240,8 @@ fn a_sign_in_that_could_leak_a_code_or_widen_the_policy_is_refused_at_start() {
 fn the_page_never_turns_data_into_markup_and_loads_nothing_from_elsewhere() {
     let index = include_str!("../ui/index.html");
     let scripts = [
-        // In the order the page loads them: manage.js defines the views app.js lists.
+        // In the order the page loads them: kit.js has the helpers, manage.js defines views app.js lists.
+        ("kit.js", include_str!("../ui/kit.js")),
         ("manage.js", include_str!("../ui/manage.js")),
         ("app.js", include_str!("../ui/app.js")),
     ];
@@ -256,8 +267,13 @@ fn the_page_never_turns_data_into_markup_and_loads_nothing_from_elsewhere() {
     let mut all = vec![("index.html", index), ("style.css", css)];
     all.extend(scripts.iter().copied());
     for (name, text) in all {
+        // The SVG namespace is an identifier, not a fetch; any other address is.
+        let without_namespace = text.replace("http://www.w3.org/2000/svg", "");
         for forbidden in ["http://", "https://cdn", "@import", "url(http"] {
-            assert!(!text.contains(forbidden), "{name} contains {forbidden}");
+            assert!(
+                !without_namespace.contains(forbidden),
+                "{name} contains {forbidden}"
+            );
         }
     }
     // Names are typed by callers: they are put on the page as text, never parsed as markup.

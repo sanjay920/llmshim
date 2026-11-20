@@ -286,6 +286,37 @@ fn a_summary_never_adds_an_unknown_cost_as_zero_and_marks_the_estimates() {
 }
 
 #[test]
+fn a_summary_by_hour_names_each_bucket_by_whole_hours_since_the_epoch_newest_first() {
+    let mut store = common::store();
+    store
+        .ingest_requests(&[
+            record("h1", "2026-11-18T10:05:00Z", json!({})),
+            record("h2", "2026-11-18T10:55:00Z", json!({})),
+            record("h3", "2026-11-18T12:00:00Z", json!({})),
+        ])
+        .unwrap();
+    let query = RequestQuery {
+        limit: 100,
+        ..Default::default()
+    };
+    let summary = store.requests_summary(&query, Some(Group::Hour)).unwrap();
+    let hour = |ts: &str| (ms(ts) / 3_600_000).to_string();
+    let groups: Vec<_> = summary
+        .groups
+        .iter()
+        .map(|g| (g.group.clone().unwrap(), g.totals.attempts))
+        .collect();
+    assert_eq!(
+        groups,
+        [
+            (hour("2026-11-18T12:00:00Z"), 1),
+            (hour("2026-11-18T10:00:00Z"), 2)
+        ]
+    );
+    assert_eq!(Group::parse("hour"), Some(Group::Hour));
+}
+
+#[test]
 fn retention_deletes_only_what_is_older_than_the_cutoff() {
     let mut store = common::store();
     store

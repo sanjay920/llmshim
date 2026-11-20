@@ -14,6 +14,12 @@ use serde_json::json;
 const INDEX: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.js");
 const MANAGE_JS: &str = include_str!("../ui/manage.js");
+const KIT_JS: &str = include_str!("../ui/kit.js");
+/// Geist and Geist Mono (SIL Open Font License 1.1, Vercel and basement.studio): the page's type, served from
+/// this origin so nothing is fetched from elsewhere. The licence is served beside them.
+const GEIST: &[u8] = include_bytes!("../ui/fonts/geist.woff2");
+const GEIST_MONO: &[u8] = include_bytes!("../ui/fonts/geist-mono.woff2");
+const FONT_LICENSE: &str = include_str!("../ui/fonts/OFL.txt");
 const STYLE: &str = include_str!("../ui/style.css");
 
 /// The browser's half of single sign-on: a public client doing authorization code with PKCE. Given as
@@ -137,7 +143,7 @@ impl Ui {
         }
         // Own origin for everything; no inline script or style, no framing, no base tag, no form posts.
         let csp = format!(
-            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; \
              connect-src {connect}; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
         );
         let config_json = json!({
@@ -159,12 +165,16 @@ impl Ui {
 
     /// The page, script, style or config for `uri`; `None` for any other path under `/ui`.
     pub fn respond(&self, method: &Method, uri: &Uri) -> Response {
-        let (body, kind): (&str, &'static str) = match uri.path() {
-            "/ui" | "/ui/" | "/ui/index.html" => (INDEX, "text/html; charset=utf-8"),
-            "/ui/app.js" => (APP_JS, "text/javascript; charset=utf-8"),
-            "/ui/manage.js" => (MANAGE_JS, "text/javascript; charset=utf-8"),
-            "/ui/style.css" => (STYLE, "text/css; charset=utf-8"),
-            "/ui/config.json" => (&self.config_json, "application/json"),
+        let (body, kind): (&[u8], &'static str) = match uri.path() {
+            "/ui" | "/ui/" | "/ui/index.html" => (INDEX.as_bytes(), "text/html; charset=utf-8"),
+            "/ui/app.js" => (APP_JS.as_bytes(), "text/javascript; charset=utf-8"),
+            "/ui/kit.js" => (KIT_JS.as_bytes(), "text/javascript; charset=utf-8"),
+            "/ui/manage.js" => (MANAGE_JS.as_bytes(), "text/javascript; charset=utf-8"),
+            "/ui/style.css" => (STYLE.as_bytes(), "text/css; charset=utf-8"),
+            "/ui/geist.woff2" => (GEIST, "font/woff2"),
+            "/ui/geist-mono.woff2" => (GEIST_MONO, "font/woff2"),
+            "/ui/OFL.txt" => (FONT_LICENSE.as_bytes(), "text/plain; charset=utf-8"),
+            "/ui/config.json" => (self.config_json.as_bytes(), "application/json"),
             _ => {
                 return (StatusCode::NOT_FOUND, "not found").into_response();
             }
@@ -176,11 +186,19 @@ impl Ui {
                 .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
             return response;
         }
-        let mut response = (StatusCode::OK, body.to_owned()).into_response();
+        let mut response = (StatusCode::OK, body.to_vec()).into_response();
         let headers = response.headers_mut();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(kind));
-        // The page is small and changes with the binary: never cached, so an upgrade is seen at once.
-        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        // The pages change with the binary: never cached, so an upgrade is seen at once. The fonts do not,
+        // and are the bulk of the bytes: a day.
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(if kind == "font/woff2" {
+                "public, max-age=86400"
+            } else {
+                "no-store"
+            }),
+        );
         headers.insert(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),

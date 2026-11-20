@@ -856,13 +856,15 @@ async fn requests_summary(
     Query(params): Query<RequestParams>,
 ) -> ApiResult<Json<Value>> {
     let query = params.query()?;
-    let group =
-        match params.group_by.as_deref() {
-            None => None,
-            Some(name) => Some(crate::requests::Group::parse(name).ok_or_else(|| {
-                bad_param("group_by", "must be day, tenant, key, model or provider")
-            })?),
-        };
+    let group = match params.group_by.as_deref() {
+        None => None,
+        Some(name) => Some(crate::requests::Group::parse(name).ok_or_else(|| {
+            bad_param(
+                "group_by",
+                "must be hour, day, tenant, key, model or provider",
+            )
+        })?),
+    };
     let summary = with_store(&s, move |st| st.requests_summary(&query, group)).await?;
     Ok(Json(crate::requests::summary_json(&summary)))
 }

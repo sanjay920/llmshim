@@ -301,7 +301,7 @@ paths:
         - {name: outcome, in: query, required: false, schema: {type: string, enum: [completed, http_failure, transport_failure, invalid_response, stream_failure, abandoned]}}
         - {name: request_id, in: query, required: false, schema: {type: string, maxLength: 256}}
         - {name: min_cost_usd, in: query, required: false, schema: {type: number, minimum: 0}}
-        - {name: group_by, in: query, required: false, schema: {type: string, enum: [day, tenant, key, model, provider]}}
+        - {name: group_by, in: query, required: false, schema: {type: string, enum: [hour, day, tenant, key, model, provider]}}
       responses:
         '200': {description: The summary}
         '400': {$ref: '#/components/responses/Error'}
