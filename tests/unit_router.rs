@@ -528,3 +528,67 @@ fn parse_cerebras_bare_model_and_dedicated_endpoint() {
         ("cerebras".into(), "my-endpoint".into())
     );
 }
+
+#[test]
+fn the_overview_names_routes_and_provider_circuits_and_never_carries_a_long_default() {
+    let long = "x".repeat(65);
+    let router = Router::new()
+        .register("anthropic", Box::new(Anthropic::new("k".into())))
+        .register(
+            "openai",
+            Box::new(llmshim::providers::openai::OpenAi::new("k".into())),
+        )
+        .route(
+            "zeta",
+            route(
+                "openai/gpt-6-luna",
+                &[("max_tokens", serde_json::json!(512))],
+            ),
+        )
+        .route(
+            "alpha",
+            route(
+                "anthropic/claude-haiku-5-5",
+                &[
+                    ("reasoning_effort", serde_json::json!("low")),
+                    ("system", serde_json::json!(long)),
+                    ("stop", serde_json::json!(["a", "b"])),
+                    (
+                        "response_format",
+                        serde_json::json!({"type": "json_object"}),
+                    ),
+                    ("stream", serde_json::json!(true)),
+                ],
+            ),
+        );
+    let routes = router.route_overview();
+    // Sorted by name, with the model as written.
+    assert_eq!(routes[0]["name"], "alpha");
+    assert_eq!(routes[1]["name"], "zeta");
+    assert_eq!(routes[0]["model"], "anthropic/claude-haiku-5-5");
+    let settings = &routes[0]["settings"];
+    assert_eq!(settings["reasoning_effort"], "low");
+    assert_eq!(settings["stream"], true);
+    // A long text, a list and an object are named by kind: their content is not on a status page.
+    assert_eq!(settings["system"], "<long text>");
+    assert_eq!(settings["stop"], "<list>");
+    assert_eq!(settings["response_format"], "<object>");
+    assert!(!routes.iter().any(|r| r.to_string().contains(&long)));
+    assert_eq!(routes[1]["settings"]["max_tokens"], 512);
+    // Every provider, sorted, with a circuit that starts closed.
+    let providers = router.provider_overview();
+    assert_eq!(
+        providers,
+        vec![
+            serde_json::json!({"provider": "anthropic", "circuit": "closed"}),
+            serde_json::json!({"provider": "openai", "circuit": "closed"}),
+        ]
+    );
+    // A 64-character default is still shown.
+    let edge = "y".repeat(64);
+    let router = Router::new().route(
+        "edge",
+        route("openai/gpt-6-luna", &[("k", serde_json::json!(edge))]),
+    );
+    assert_eq!(router.route_overview()[0]["settings"]["k"], edge.as_str());
+}

@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 pub mod api;
 mod db;
+pub mod gateways;
 pub mod requests;
 pub mod sso;
 pub mod ui;

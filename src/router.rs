@@ -451,6 +451,54 @@ impl Router {
         Ok(Cow::Owned(expanded))
     }
 
+    /// The named routes for a status page: each name, its model and its request defaults. A scalar
+    /// default (a bool, a number or a string of at most 64 characters) is shown as it is; anything else
+    /// is named by its kind only, so a status endpoint never carries a long instruction or a nested
+    /// object that a route happens to hold. Sorted by name.
+    pub fn route_overview(&self) -> Vec<serde_json::Value> {
+        let mut names: Vec<&String> = self.routes.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let route = &self.routes[name];
+                let settings: serde_json::Map<String, serde_json::Value> = route
+                    .settings
+                    .iter()
+                    .map(|(key, value)| {
+                        let shown = match value {
+                            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                                value.clone()
+                            }
+                            serde_json::Value::String(text) if text.chars().count() <= 64 => {
+                                value.clone()
+                            }
+                            serde_json::Value::String(_) => serde_json::json!("<long text>"),
+                            serde_json::Value::Null => serde_json::Value::Null,
+                            serde_json::Value::Array(_) => serde_json::json!("<list>"),
+                            serde_json::Value::Object(_) => serde_json::json!("<object>"),
+                        };
+                        (key.clone(), shown)
+                    })
+                    .collect();
+                serde_json::json!({"name": name, "model": route.model, "settings": settings})
+            })
+            .collect()
+    }
+
+    /// Each registered provider with its circuit (`closed`, `open` or `half_open`) as this process sees it.
+    /// Sorted by key.
+    pub fn provider_overview(&self) -> Vec<serde_json::Value> {
+        let mut keys: Vec<&String> = self.providers.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .map(|key| {
+                let provider = &self.providers[key];
+                serde_json::json!({"provider": key, "circuit": self.breaker.state_name(provider.instance())})
+            })
+            .collect()
+    }
+
     /// Returns the keys of all registered providers.
     pub fn provider_keys(&self) -> Vec<&str> {
         self.providers.keys().map(|s| s.as_str()).collect()

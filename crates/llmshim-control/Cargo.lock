@@ -1456,6 +1456,7 @@ dependencies = [
  "http-body-util",
  "llmshim",
  "postgres",
+ "reqwest",
  "ring",
  "rusqlite",
  "rustls",

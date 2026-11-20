@@ -8,11 +8,14 @@
 //! Exit status: 0 clean shutdown, 1 it could not start (a file, the address, the database),
 //! 2 bad arguments.
 
-use llmshim_control::api::{router, seed_file_problem, token_problem, AppState};
+use llmshim_control::api::{router, seed_file_problem, AppState};
 use llmshim_control::Store;
 use std::path::PathBuf;
 
-const USAGE: &str = "Usage: llmshim-control audit-verify (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         checks the change history's hash chain; exit 1 names the first broken row\n\n       llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --sso-config        a JSON issuer file (note 0049): verify OIDC access tokens, take the actor from\n                      the verified subject and the role from its `roles` claim (control:read,\n                      control:key-issuer, control:admin). Then --token-file is the break-glass\n                      token, required unless the file sets \"break_glass\": false\n  --ingest-token-file a token (owner-only, a different one from --token-file) that the gateways' usage\n                      push (`[usage_export]`) presents to POST /v1/usage/batch: accepted there and nowhere\n                      else. Without it the push is refused (note 0051)\n  --request-retention-days N  keep the request ledger N days (1 to 3650, default 30)\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
+const USAGE: &str = "Usage: llmshim-control audit-verify (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         checks the change history's hash chain; exit 1 names the first broken row\n\n       llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --sso-config        a JSON issuer file (note 0049): verify OIDC access tokens, take the actor from\n                      the verified subject and the role from its `roles` claim (control:read,\n                      control:key-issuer, control:admin). Then --token-file is the break-glass\n                      token, required unless the file sets \"break_glass\": false\n  --ingest-token-file a token (owner-only, a different one from --token-file) that the gateways' usage\n                      push (`[usage_export]`) presents to POST /v1/usage/batch: accepted there and nowhere\n                      else. Without it the push is refused (note 0051)\n  --gateways-file     a JSON file listing the gateways' admin listeners (name, admin_url, token_file, ca_file)
+                      so the UI can show their providers, circuits, routes and configuration state (note 0051).
+                      Read-only; without it that view says none are configured
+  --request-retention-days N  keep the request ledger N days (1 to 3650, default 30)\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
 
 struct Options {
     db: Option<PathBuf>,
@@ -25,6 +28,7 @@ struct Options {
     sso_config: Option<PathBuf>,
     signing_key_file: Option<PathBuf>,
     ingest_token_file: Option<PathBuf>,
+    gateways_file: Option<PathBuf>,
     request_retention_days: u32,
 }
 
@@ -39,7 +43,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let (mut db, mut listen, mut token, mut signing) = (None, None, None, None);
     let (mut url_file, mut schema, mut ca) = (None, None, None);
     let mut sso = None;
-    let (mut ingest, mut retention) = (None, None);
+    let (mut ingest, mut retention, mut gateways) = (None, None, None);
     let mut at = 1;
     while at < args.len() {
         let flag = args[at].as_str();
@@ -60,6 +64,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--signing-key-file" => signing = Some(PathBuf::from(value)),
             "--sso-config" => sso = Some(PathBuf::from(value)),
             "--ingest-token-file" => ingest = Some(PathBuf::from(value)),
+            "--gateways-file" => gateways = Some(PathBuf::from(value)),
             "--request-retention-days" => {
                 retention = Some(
                     value
@@ -84,6 +89,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             || signing.is_some()
             || sso.is_some()
             || ingest.is_some()
+            || gateways.is_some()
             || retention.is_some())
     {
         return Err("audit-verify takes only the database options".into());
@@ -109,32 +115,13 @@ fn parse(args: &[String]) -> Result<Options, String> {
         sso_config: sso,
         signing_key_file: signing,
         ingest_token_file: ingest,
+        gateways_file: gateways,
         request_retention_days: retention.unwrap_or(30),
     })
 }
 
 fn read_token(path: &std::path::Path) -> Result<String, String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)
-            .map_err(|e| format!("cannot read {}: {}", path.display(), e.kind()))?
-            .permissions()
-            .mode();
-        if mode & 0o077 != 0 {
-            return Err(format!(
-                "{} is readable by group or others; make it owner-only (chmod 600)",
-                path.display()
-            ));
-        }
-    }
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {}", path.display(), e.kind()))?;
-    let token = text.trim().to_string();
-    match token_problem(&token) {
-        None => Ok(token),
-        Some(problem) => Err(format!("the token in {} {problem}", path.display())),
-    }
+    llmshim_control::gateways::read_token_file(path)
 }
 
 #[tokio::main]
@@ -354,6 +341,22 @@ async fn run(options: Options) -> i32 {
         (None, Some(token)) => AppState::new(store, &token, options.signing_key_file),
         (None, None) => unreachable!("parse requires a token without an issuer file"),
     };
+    if let Some(file) = &options.gateways_file {
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("cannot read {}: {}", file.display(), error.kind());
+                return 1;
+            }
+        };
+        match llmshim_control::gateways::Gateways::from_bytes(&bytes) {
+            Ok(gateways) => state.set_gateways(gateways),
+            Err(message) => {
+                eprintln!("{}: {message}", file.display());
+                return 1;
+            }
+        }
+    }
     if let Some(file) = &options.ingest_token_file {
         let ingest = match read_token(file) {
             Ok(token) => token,

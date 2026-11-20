@@ -499,6 +499,42 @@ async fn the_stats_list_each_deployments_targets_and_a_tripped_circuit_shows_as_
     assert_eq!(keys, ["circuit", "model", "weight"]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stats_list_each_provider_circuit_and_the_named_routes_without_long_values() {
+    let (east, _east_mock) = upstream(0).await;
+    let (west, _west_mock) = upstream(0).await;
+    let long = "z".repeat(80);
+    let config = format!(
+        "{}\n[routes.fast]\nmodel = \"east/m\"\n[routes.fast.settings]\nreasoning_effort = \"low\"\nsystem = \"{long}\"\n",
+        render(&east.url(), &west.url(), ORDERED, "", None)
+    );
+    let server = start(&config, "dep-routes", &no_client_retries());
+    let stats: Value = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/gateway/stats",
+            server.admin.clone().expect("an [admin] listener")
+        ))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stats["provider_circuits"],
+        serde_json::json!([
+            {"provider": "east", "circuit": "closed"},
+            {"provider": "west", "circuit": "closed"},
+        ])
+    );
+    assert_eq!(stats["routes"][0]["name"], "fast");
+    assert_eq!(stats["routes"][0]["model"], "east/m");
+    assert_eq!(stats["routes"][0]["settings"]["reasoning_effort"], "low");
+    assert_eq!(stats["routes"][0]["settings"]["system"], "<long text>");
+    assert!(!stats.to_string().contains(&long));
+}
+
 // ---- spend counters (note 0034) --------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
