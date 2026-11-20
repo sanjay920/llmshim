@@ -103,12 +103,13 @@ fn count(
     field: &'static str,
     required: bool,
 ) -> std::result::Result<Option<i64>, &'static str> {
-    // Up to a trillion: far beyond any real request, and well inside an i64 sum.
+    // Up to ten billion: far beyond any real request, and a sum over hundreds of millions of rows still
+    // fits an i64 (SQLite raises on overflow, which would turn /summary into a 500).
     match map.get(field) {
         None | Some(Value::Null) if !required => Ok(None),
         Some(Value::Number(n)) => n
             .as_u64()
-            .filter(|n| *n <= 1_000_000_000_000)
+            .filter(|n| *n <= 10_000_000_000)
             .map(|n| Some(n as i64))
             .ok_or(field),
         _ => Err(field),

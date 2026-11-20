@@ -148,10 +148,18 @@ impl UsageExporter {
         })
     }
 
-    /// Send what is queued (bounded wait), then stop. Call once, after the listeners have stopped.
-    pub fn close(&self) {
+    /// Set the flag and wake the worker. The store and the notify are made under the queue lock: the
+    /// worker checks the flag and starts waiting while holding it, so without the lock the notify could
+    /// land between the check and the wait and be lost.
+    fn signal_close(&self) {
+        let _queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         self.shared.closed.store(true, Ordering::SeqCst);
         self.shared.wake.notify_all();
+    }
+
+    /// Send what is queued (bounded wait), then stop. Call once, after the listeners have stopped.
+    pub fn close(&self) {
+        self.signal_close();
         let worker = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(worker) = worker {
             let deadline = Instant::now() + CLOSE_WAIT;
@@ -299,6 +307,14 @@ fn run(shared: &Shared, sender: &Sender, flush_every: Duration) {
                 }
             }
         }
+    }
+}
+
+impl Drop for UsageExporter {
+    /// A dropped exporter never leaves its worker running: it is asked to stop (it sends what it can
+    /// first) without waiting for it. `close` is still how a server stops it in order.
+    fn drop(&mut self) {
+        self.signal_close();
     }
 }
 
@@ -588,6 +604,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seen.lock().unwrap().concat(), ["c1", "c2", "c3"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_exporter_stops_its_worker_and_sends_what_it_held() {
+        let mut server = mockito::Server::new_async().await;
+        let (seen, _) = ledger(&mut server);
+        let token_ref = token("ingest-token-0123456789abc");
+        // An interval of a minute: only the drop can make the worker send these.
+        let exporter = exporter(&server.url(), &token_ref, 500, 60_000, 1000);
+        exporter.record(&usage("d1"));
+        exporter.record(&usage("d2"));
+        drop(exporter);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.lock().unwrap().concat().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the dropped exporter never flushed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(seen.lock().unwrap().concat(), ["d1", "d2"]);
     }
 
     #[test]

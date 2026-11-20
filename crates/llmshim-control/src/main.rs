@@ -378,7 +378,11 @@ async fn run(options: Options) -> i32 {
             loop {
                 let before = chrono::Utc::now().timestamp_millis() - days * 86_400_000;
                 let state = state.clone();
-                let _ = tokio::task::spawn_blocking(move || state.purge_requests(before)).await;
+                match tokio::task::spawn_blocking(move || state.purge_requests(before)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => eprintln!("request ledger retention purge failed: {error}"),
+                    Err(error) => eprintln!("request ledger retention purge failed: {error}"),
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             }
         });
