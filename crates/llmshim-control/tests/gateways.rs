@@ -343,3 +343,19 @@ fn the_file_is_validated_by_entry_and_field_without_echoing_values() {
     .unwrap();
     assert!(error.contains("owner-only"), "{error}");
 }
+
+#[tokio::test]
+async fn a_status_that_is_not_an_object_is_a_bad_response() {
+    let list = serve(behaviour(None, || {
+        axum::Json(json!(["not", "an", "object"])).into_response()
+    }))
+    .await;
+    let gateways = Gateways::with_cache(
+        &file(json!([{"name": "l", "admin_url": list.origin, "allow_insecure_http": true}])),
+        Duration::ZERO,
+    )
+    .unwrap();
+    let answer = ask(&app(gateways)).await;
+    assert_eq!(answer["gateways"][0]["error"], "bad_response");
+    assert!(answer["gateways"][0].get("stats").is_none());
+}

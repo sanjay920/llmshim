@@ -451,11 +451,27 @@ impl Router {
         Ok(Cow::Owned(expanded))
     }
 
-    /// The named routes for a status page: each name, its model and its request defaults. A scalar
-    /// default (a bool, a number or a string of at most 64 characters) is shown as it is; anything else
-    /// is named by its kind only, so a status endpoint never carries a long instruction or a nested
-    /// object that a route happens to hold. Sorted by name.
+    /// The named routes for a status page: each name, its model and its request defaults. Only a
+    /// well-known generation control (`reasoning_effort`, `max_tokens`, `temperature`, …) is shown, and only
+    /// when it is a bool, a number or a short string; any other default (a `user`, a `system` text, a nested
+    /// object, a list) is named but not shown (`<hidden>`). The stats are served by listeners that may be
+    /// open, so a route's own text is never put on them. Sorted by name.
     pub fn route_overview(&self) -> Vec<serde_json::Value> {
+        /// Controls whose values are not identifying: enumerations and numbers.
+        const SHOWN: [&str; 12] = [
+            "reasoning_effort",
+            "reasoning_mode",
+            "reasoning_summary",
+            "max_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "seed",
+            "stream",
+            "frequency_penalty",
+            "presence_penalty",
+        ];
         let mut names: Vec<&String> = self.routes.keys().collect();
         names.sort();
         names
@@ -467,16 +483,17 @@ impl Router {
                     .iter()
                     .map(|(key, value)| {
                         let shown = match value {
-                            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                            serde_json::Value::Bool(_) | serde_json::Value::Number(_)
+                                if SHOWN.contains(&key.as_str()) =>
+                            {
                                 value.clone()
                             }
-                            serde_json::Value::String(text) if text.chars().count() <= 64 => {
+                            serde_json::Value::String(text)
+                                if SHOWN.contains(&key.as_str()) && text.chars().count() <= 32 =>
+                            {
                                 value.clone()
                             }
-                            serde_json::Value::String(_) => serde_json::json!("<long text>"),
-                            serde_json::Value::Null => serde_json::Value::Null,
-                            serde_json::Value::Array(_) => serde_json::json!("<list>"),
-                            serde_json::Value::Object(_) => serde_json::json!("<object>"),
+                            _ => serde_json::json!("<hidden>"),
                         };
                         (key.clone(), shown)
                     })

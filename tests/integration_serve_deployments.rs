@@ -505,7 +505,7 @@ async fn the_stats_list_each_provider_circuit_and_the_named_routes_without_long_
     let (west, _west_mock) = upstream(0).await;
     let long = "z".repeat(80);
     let config = format!(
-        "{}\n[routes.fast]\nmodel = \"east/m\"\n[routes.fast.settings]\nreasoning_effort = \"low\"\nsystem = \"{long}\"\n",
+        "{}\n[routes.fast]\nmodel = \"east/m\"\n[routes.fast.settings]\nreasoning_effort = \"low\"\nuser = \"{long}\"\n",
         render(&east.url(), &west.url(), ORDERED, "", None)
     );
     let server = start(&config, "dep-routes", &no_client_retries());
@@ -531,7 +531,7 @@ async fn the_stats_list_each_provider_circuit_and_the_named_routes_without_long_
     assert_eq!(stats["routes"][0]["name"], "fast");
     assert_eq!(stats["routes"][0]["model"], "east/m");
     assert_eq!(stats["routes"][0]["settings"]["reasoning_effort"], "low");
-    assert_eq!(stats["routes"][0]["settings"]["system"], "<long text>");
+    assert_eq!(stats["routes"][0]["settings"]["user"], "<hidden>");
     assert!(!stats.to_string().contains(&long));
 }
 

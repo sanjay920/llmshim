@@ -4,8 +4,10 @@
 //! The control plane only **reads**: `GET /v1/gateway/stats`, `GET /v1/serve/config` and `GET /ready` on each
 //! admin listener, with the listener's own bearer token. The addresses are the operator's file, never a
 //! caller's input; redirects are not followed, ambient proxies are not used, a body is capped and every
-//! failure is a short code, never the address, a token or the gateway's own error text. One answer is
-//! shared for a few seconds, so any number of viewers is one request per gateway per interval.
+//! failure is a short code, never the token or the gateway's own error body. A **successful** answer is the
+//! gateway's own status JSON, forwarded as it is (it is built from names, numbers and fixed text, never a
+//! secret value: see `/v1/serve/config`), and must be a JSON object. One answer is shared for a few seconds,
+//! so any number of viewers is one request per gateway per interval.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -298,9 +300,10 @@ fn fetch(target: &Target) -> impl std::future::Future<Output = Value> + Send + '
                 Got::Failed => Err("unreachable"),
                 Got::TooLarge => Err("bad_response"),
                 Got::Body(401 | 403, _) => Err("unauthorized"),
-                Got::Body(200, body) => serde_json::from_slice(body)
-                    .map(Some)
-                    .map_err(|_| "bad_response"),
+                Got::Body(200, body) => match serde_json::from_slice::<Value>(body) {
+                    Ok(value) if value.is_object() => Ok(Some(value)),
+                    _ => Err("bad_response"),
+                },
                 Got::Body(404, _) => Ok(None),
                 Got::Body(_, _) => Err("bad_response"),
             }

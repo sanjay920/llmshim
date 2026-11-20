@@ -419,6 +419,7 @@ async function viewGateways() {
   const refresh = h("button", { type: "button" }, "Refresh");
   view.append(h("div", { class: "filters" }, refresh), body);
 
+  const arr = (x) => (Array.isArray(x) ? x : []);
   const circuitPill = (circuit) => h("span", { class: "pill " + (circuit === "closed" ? "completed" : circuit === "half_open" ? "abandoned" : "http_failure") }, circuit);
   const scalar = (value) => (value === null || value === undefined ? "—" : typeof value === "object" ? JSON.stringify(value) : String(value));
   const table = (heads, rows) => h("div", { class: "scroll" }, h("table", {}, h("thead", {}, h("tr", {}, heads.map((x) => h("th", {}, x)))), h("tbody", {}, rows)));
@@ -428,26 +429,26 @@ async function viewGateways() {
   function gatewayPanel(g) {
     const stats = g.stats || null;
     const cfg = g.config || null;
-    const lanes = new Map(((stats && stats.lanes) || []).map((l) => [l.provider, l]));
+    const lanes = new Map(arr(stats && stats.lanes).map((l) => [l.provider, l]));
     const state = g.error
       ? h("span", { class: "pill http_failure" }, g.error.replace(/_/g, " "))
       : g.ready === true ? h("span", { class: "pill completed" }, "ready") : g.ready === false ? h("span", { class: "pill http_failure" }, "not ready") : h("span", { class: "pill abandoned" }, "unknown");
     const parts = [h("div", { class: "filters" }, h("strong", {}, g.name), h("span", { class: "sub" }, g.url), state, g.reachable === false ? h("span", { class: "muted" }, "cannot be reached") : null)];
     if (stats) {
       parts.push(kv({ mode: stats.mode, "caller auth enforced": stats.auth_enforced }));
-      const circuits = new Map((stats.provider_circuits || []).map((p) => [p.provider, p.circuit]));
-      const names = (stats.providers || []).slice().sort();
+      const circuits = new Map(arr(stats.provider_circuits).map((p) => [p.provider, p.circuit]));
+      const names = arr(stats.providers).slice().sort();
       parts.push(h("h2", {}, "Providers"), names.length ? table(["Provider", "Circuit", "Queued", "Dead-lettered"], names.map((name) => h("tr", {},
         h("td", {}, name), h("td", {}, circuits.has(name) ? circuitPill(circuits.get(name)) : "—"),
         h("td", { class: "num" }, lanes.has(name) ? fmtInt(lanes.get(name).queue_depth) : "—"),
         h("td", { class: "num" }, lanes.has(name) && lanes.get(name).dead_letter !== undefined ? fmtInt(lanes.get(name).dead_letter) : "—")))) : h("p", { class: "muted" }, "None registered."));
-      if ((stats.deployments || []).length) {
-        parts.push(h("h2", {}, "Deployments"), table(["Deployment", "Strategy", "Targets"], stats.deployments.map((d) => h("tr", {},
+      if (arr(stats.deployments).length) {
+        parts.push(h("h2", {}, "Deployments"), table(["Deployment", "Strategy", "Targets"], arr(stats.deployments).map((d) => h("tr", {},
           h("td", {}, d.name), h("td", {}, d.strategy),
-          h("td", {}, d.targets.map((t) => h("div", {}, t.model + " ×" + t.weight + " ", circuitPill(t.circuit))))))));
+          h("td", {}, arr(d.targets).map((t) => h("div", {}, t.model + " ×" + t.weight + " ", circuitPill(t.circuit))))))));
       }
-      if ((stats.routes || []).length) {
-        parts.push(h("h2", {}, "Named routes"), table(["Route", "Model", "Request defaults"], stats.routes.map((r) => h("tr", {},
+      if (arr(stats.routes).length) {
+        parts.push(h("h2", {}, "Named routes"), table(["Route", "Model", "Request defaults"], arr(stats.routes).map((r) => h("tr", {},
           h("td", {}, "route/" + r.name), h("td", {}, r.model),
           h("td", { class: "wrap" }, Object.keys(r.settings || {}).length ? Object.entries(r.settings).map(([k, v]) => k + "=" + scalar(v)).join(", ") : "—")))));
       }
@@ -459,7 +460,7 @@ async function viewGateways() {
         "loaded at": cfg.loaded_at_epoch_secs ? fmtTime(new Date(cfg.loaded_at_epoch_secs * 1000).toISOString()) : null };
       parts.push(h("h2", {}, "Configuration"), kv(sync));
       if (cfg.last_reload) parts.push(h("p", { class: "muted wrap" }, "Last reload: " + clip(JSON.stringify(cfg.last_reload))));
-      if ((cfg.env_secret_providers || []).length) parts.push(h("p", { class: "muted" }, "Provider secrets from the environment (a reload cannot rotate these): " + cfg.env_secret_providers.join(", ")));
+      if (arr(cfg.env_secret_providers).length) parts.push(h("p", { class: "muted" }, "Provider secrets from the environment (a reload cannot rotate these): " + cfg.env_secret_providers.join(", ")));
       if (cfg.snapshot) parts.push(h("p", { class: "muted wrap" }, "Policy snapshot: " + clip(JSON.stringify(cfg.snapshot))));
       if (cfg.audit) parts.push(h("p", { class: "muted wrap" }, "Audit log: " + clip(JSON.stringify(cfg.audit))));
     }
@@ -472,7 +473,13 @@ async function viewGateways() {
       body.replaceChildren(h("p", { class: "muted" }, "No gateways are listed. Start the control plane with --gateways-file naming each gateway's admin listener to see their providers, circuits, routes and configuration state here."));
       return;
     }
-    body.replaceChildren(...answer.gateways.map(gatewayPanel),
+    // One gateway whose answer is not shaped as expected (an older or newer version) must not hide the others.
+    const safePanel = (g) => {
+      try { return gatewayPanel(g); } catch (_) {
+        return h("div", { class: "panel" }, h("strong", {}, scalar(g && g.name)), h("p", { class: "muted" }, "This gateway's status could not be displayed."));
+      }
+    };
+    body.replaceChildren(...arr(answer.gateways).map(safePanel),
       h("p", { class: "foot" }, "Read from each gateway's admin listener " + (answer.fetched_at ? "as of " + fmtTime(answer.fetched_at) : "") + " (shared for a few seconds). A circuit is that process's own view: “open” means calls to that provider are refused until its cooldown ends. The configuration is a file under version control; this page shows it and does not change it."));
   }
   refresh.addEventListener("click", async () => {

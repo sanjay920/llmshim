@@ -146,9 +146,11 @@ payloads. That is a privacy decision of its own and is **not** in the first slic
   is shared for five seconds, one fetch at a time, so any number of viewers is one request per gateway per interval.
   With no file the answer is `{configured: false}` and the rest of the control plane is unchanged.
 - **Gateway side (root crate, additive).** The admin stats gained `provider_circuits` (each provider's circuit as that
-  process sees it) and `routes` (each named route's model and request defaults). A default is shown when it is a
-  scalar (a bool, a number or a string of at most 64 characters) and otherwise named by kind (`<long text>`, `<list>`,
-  `<object>`), so a status endpoint never carries a long instruction a route happens to hold. `Router::route_overview`
+  process sees it) and `routes` (each named route's model and request defaults). The stats are served by listeners that
+  may be open (without `[admin]` they share the main listener), so a route's own text is never put on them: only a
+  well-known generation control (`reasoning_effort`, `max_tokens`, `temperature` and a few more) with a bool, number or
+  short string is shown, and every other default (a `user`, a `system` text, a list, an object) is named with the value
+  `<hidden>`. `Router::route_overview`
   and `provider_overview` are new public methods (additive).
 - **The view** (`Gateways`): per gateway its readiness, mode, providers with circuit and queue depth, deployments with
   each target's weight and circuit, named routes with their defaults, and the configuration state (in sync with its file,

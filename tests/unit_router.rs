@@ -530,7 +530,7 @@ fn parse_cerebras_bare_model_and_dedicated_endpoint() {
 }
 
 #[test]
-fn the_overview_names_routes_and_provider_circuits_and_never_carries_a_long_default() {
+fn the_overview_names_routes_and_provider_circuits_and_shows_only_generation_controls() {
     let long = "x".repeat(65);
     let router = Router::new()
         .register("anthropic", Box::new(Anthropic::new("k".into())))
@@ -552,12 +552,14 @@ fn the_overview_names_routes_and_provider_circuits_and_never_carries_a_long_defa
                 &[
                     ("reasoning_effort", serde_json::json!("low")),
                     ("system", serde_json::json!(long)),
+                    ("user", serde_json::json!("tenant-7")),
                     ("stop", serde_json::json!(["a", "b"])),
                     (
                         "response_format",
                         serde_json::json!({"type": "json_object"}),
                     ),
                     ("stream", serde_json::json!(true)),
+                    ("temperature", serde_json::json!(0.2)),
                 ],
             ),
         );
@@ -569,26 +571,45 @@ fn the_overview_names_routes_and_provider_circuits_and_never_carries_a_long_defa
     let settings = &routes[0]["settings"];
     assert_eq!(settings["reasoning_effort"], "low");
     assert_eq!(settings["stream"], true);
-    // A long text, a list and an object are named by kind: their content is not on a status page.
-    assert_eq!(settings["system"], "<long text>");
-    assert_eq!(settings["stop"], "<list>");
-    assert_eq!(settings["response_format"], "<object>");
-    assert!(!routes.iter().any(|r| r.to_string().contains(&long)));
+    assert_eq!(settings["temperature"], 0.2);
+    // Anything that is not a plain generation control is named but never shown, short or not.
+    for hidden in ["system", "user", "stop", "response_format"] {
+        assert_eq!(settings[hidden], "<hidden>", "{hidden}");
+    }
+    let text = serde_json::Value::Array(routes.clone()).to_string();
+    assert!(
+        !text.contains(&long) && !text.contains("tenant-7"),
+        "{text}"
+    );
     assert_eq!(routes[1]["settings"]["max_tokens"], 512);
-    // Every provider, sorted, with a circuit that starts closed.
-    let providers = router.provider_overview();
+    // A control with a nested or non-scalar value is hidden too.
+    let router = Router::new().route(
+        "odd",
+        route(
+            "openai/gpt-6-luna",
+            &[("reasoning_effort", serde_json::json!({"x": "y"}))],
+        ),
+    );
     assert_eq!(
-        providers,
+        router.route_overview()[0]["settings"]["reasoning_effort"],
+        "<hidden>"
+    );
+    // Every provider, sorted, with a circuit that starts closed.
+    assert_eq!(
+        router_providers(),
         vec![
             serde_json::json!({"provider": "anthropic", "circuit": "closed"}),
             serde_json::json!({"provider": "openai", "circuit": "closed"}),
         ]
     );
-    // A 64-character default is still shown.
-    let edge = "y".repeat(64);
-    let router = Router::new().route(
-        "edge",
-        route("openai/gpt-6-luna", &[("k", serde_json::json!(edge))]),
-    );
-    assert_eq!(router.route_overview()[0]["settings"]["k"], edge.as_str());
+}
+
+fn router_providers() -> Vec<serde_json::Value> {
+    Router::new()
+        .register(
+            "openai",
+            Box::new(llmshim::providers::openai::OpenAi::new("k".into())),
+        )
+        .register("anthropic", Box::new(Anthropic::new("k".into())))
+        .provider_overview()
 }

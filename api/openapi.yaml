@@ -648,8 +648,10 @@ components:
         routes:
           type: array
           description: |
-            Present only with named routes (0051). A request default is shown when it is a scalar (a boolean, a
-            number or a string of at most 64 characters), otherwise as `<long text>`, `<list>` or `<object>`.
+            Present only with named routes (0051). Only a well-known generation control (`reasoning_effort`,
+            `max_tokens`, `temperature`, ...) with a boolean, number or short string value is shown; every other
+            request default is named and its value is `<hidden>`, because these stats are served by listeners
+            that may be open.
           items:
             type: object
             required: [name, model, settings]
