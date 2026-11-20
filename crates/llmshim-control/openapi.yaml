@@ -198,6 +198,18 @@ paths:
         '400': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
+  /v1/history/verify:
+    get:
+      operationId: historyVerify
+      description: |
+        Checks the change history's hash chain (note 0047) from its first row, as `audit-verify` does.
+        `{ok: true, records, unchained, head}` or `{ok: false, row, reason}` naming the first row that fails.
+        The head hash is what to keep where the database's writer cannot reach: a removed last row is
+        invisible to the chain alone.
+      responses:
+        '200': {description: The result of the check}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/usage/batch:
     post:
       operationId: ingestUsage

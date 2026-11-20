@@ -13,6 +13,7 @@ use serde_json::json;
 
 const INDEX: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.js");
+const MANAGE_JS: &str = include_str!("../ui/manage.js");
 const STYLE: &str = include_str!("../ui/style.css");
 
 /// The browser's half of single sign-on: a public client doing authorization code with PKCE. Given as
@@ -161,6 +162,7 @@ impl Ui {
         let (body, kind): (&str, &'static str) = match uri.path() {
             "/ui" | "/ui/" | "/ui/index.html" => (INDEX, "text/html; charset=utf-8"),
             "/ui/app.js" => (APP_JS, "text/javascript; charset=utf-8"),
+            "/ui/manage.js" => (MANAGE_JS, "text/javascript; charset=utf-8"),
             "/ui/style.css" => (STYLE, "text/css; charset=utf-8"),
             "/ui/config.json" => (&self.config_json, "application/json"),
             _ => {

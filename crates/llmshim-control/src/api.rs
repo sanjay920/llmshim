@@ -35,6 +35,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("patch", "/v1/keys/{key}/limits"),
     ("get", "/v1/whoami"),
     ("get", "/v1/history"),
+    ("get", "/v1/history/verify"),
     ("post", "/v1/usage/batch"),
     ("get", "/v1/requests"),
     ("get", "/v1/requests/summary"),
@@ -134,6 +135,7 @@ pub const ROLES: &[(&str, &str, Option<Role>)] = &[
     ("patch", "/v1/keys/{key}/limits", Some(Role::KeyIssuer)),
     ("get", "/v1/whoami", None),
     ("get", "/v1/history", Some(Role::Read)),
+    ("get", "/v1/history/verify", Some(Role::Read)),
     ("get", "/v1/requests", Some(Role::Read)),
     ("get", "/v1/requests/summary", Some(Role::Read)),
     ("get", "/v1/requests/facets", Some(Role::Read)),
@@ -856,6 +858,19 @@ async fn history(
     Ok(Json(json!({"history": rows})))
 }
 
+/// Check the change history's hash chain (note 0047) and say so: `ok` with how many rows it vouches for and
+/// the head hash to keep elsewhere, or not `ok` with the first row that fails and why. It reads the whole
+/// history once, as `audit-verify` does.
+async fn history_verify(State(s): State<Arc<AppState>>) -> ApiResult<Json<Value>> {
+    let checked = with_store(&s, |st| st.verify_history()).await?;
+    Ok(Json(match checked {
+        Ok(good) => {
+            json!({"ok": true, "records": good.records, "unchained": good.unchained, "head": good.head})
+        }
+        Err(broken) => json!({"ok": false, "row": broken.id, "reason": broken.reason}),
+    }))
+}
+
 async fn publish(
     State(s): State<Arc<AppState>>,
     h: HeaderMap,
@@ -1010,6 +1025,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/keys/{key}/limits", patch(update_limits))
         .route("/v1/whoami", get(whoami))
         .route("/v1/history", get(history))
+        .route("/v1/history/verify", get(history_verify))
         .route(
             "/v1/usage/batch",
             post(ingest_usage).layer(axum::extract::DefaultBodyLimit::max(INGEST_BODY_LIMIT)),

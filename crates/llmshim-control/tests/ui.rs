@@ -78,6 +78,7 @@ async fn the_pages_load_without_a_credential_and_carry_the_security_headers() {
         ("/ui/", "text/html"),
         ("/ui/index.html", "text/html"),
         ("/ui/app.js", "text/javascript"),
+        ("/ui/manage.js", "text/javascript"),
         ("/ui/style.css", "text/css"),
         ("/ui/config.json", "application/json"),
     ] {
@@ -228,53 +229,106 @@ fn a_sign_in_that_could_leak_a_code_or_widen_the_policy_is_refused_at_start() {
 #[test]
 fn the_page_never_turns_data_into_markup_and_loads_nothing_from_elsewhere() {
     let index = include_str!("../ui/index.html");
-    let js = include_str!("../ui/app.js");
+    let scripts = [
+        // In the order the page loads them: manage.js defines the views app.js lists.
+        ("manage.js", include_str!("../ui/manage.js")),
+        ("app.js", include_str!("../ui/app.js")),
+    ];
     let css = include_str!("../ui/style.css");
-    // No inline script or style, no event-handler attributes, no other origin.
+    // Only script files of this server, no inline code of any form, no style attribute or element.
+    let elements: Vec<&str> = index.split("<script").skip(1).collect();
+    assert_eq!(elements.len(), scripts.len(), "the script elements");
+    for (element, (name, _)) in elements.iter().zip(&scripts) {
+        let expected = format!("src=\"/ui/{name}\"");
+        assert!(
+            element.trim_start().starts_with(&expected),
+            "{name}: an inline or foreign script"
+        );
+    }
     assert!(
-        !index.contains("<script>") && !index.contains("style="),
-        "inline code in the page"
+        !index.contains("style=") && !index.contains("<style"),
+        "inline style in the page"
     );
     assert!(
         !index.contains("onclick=") && !index.contains("onload="),
         "handler attribute"
     );
-    for (name, text) in [("index.html", index), ("app.js", js), ("style.css", css)] {
+    let mut all = vec![("index.html", index), ("style.css", css)];
+    all.extend(scripts.iter().copied());
+    for (name, text) in all {
         for forbidden in ["http://", "https://cdn", "@import", "url(http"] {
             assert!(!text.contains(forbidden), "{name} contains {forbidden}");
         }
     }
     // Names are typed by callers: they are put on the page as text, never parsed as markup.
-    for forbidden in [
-        "innerHTML",
-        "outerHTML",
-        "insertAdjacentHTML",
-        "document.write",
-        "eval(",
-        "new Function",
-        "setAttribute(\"style\"",
-    ] {
-        assert!(!js.contains(forbidden), "app.js contains {forbidden}");
+    for (name, js) in scripts {
+        for forbidden in [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "eval(",
+            "new Function",
+            "setAttribute(\"style\"",
+            "localStorage",
+            "document.cookie",
+            "window.open",
+            "location.href",
+        ] {
+            assert!(!js.contains(forbidden), "{name} contains {forbidden}");
+        }
     }
-    // The token is held for the tab only.
-    assert!(!js.contains("localStorage") && !js.contains("document.cookie"));
 }
 
 #[test]
 fn every_route_the_page_calls_is_one_the_api_has() {
-    let js = include_str!("../ui/app.js");
-    let mut called = Vec::new();
-    for piece in js.split("api(\"").skip(1) {
-        let path = &piece[..piece.find('"').unwrap()];
-        called.push(path.to_owned());
+    // Every "/v1/…" string in the scripts is a route, or the fixed start of one that takes an id.
+    let mut literals = Vec::new();
+    for js in [
+        include_str!("../ui/app.js"),
+        include_str!("../ui/manage.js"),
+    ] {
+        for piece in js.split("\"/v1/").skip(1) {
+            literals.push(format!("/v1/{}", &piece[..piece.find('"').unwrap()]));
+        }
     }
-    assert!(called.len() >= 5, "found {called:?}");
-    for path in called {
+    assert!(literals.len() >= 12, "found {literals:?}");
+    for path in &literals {
+        assert!(
+            ROUTES.iter().any(|(_, route)| {
+                route == &path.as_str()
+                    || route
+                        .split('{')
+                        .next()
+                        .is_some_and(|start| start == path && route.contains('{'))
+            }),
+            "the page calls {path}, which is not an API route"
+        );
+    }
+    // The calls that change something name a method the API has on that path.
+    for (verb, path) in [
+        ("POST", "/v1/orgs"),
+        ("POST", "/v1/orgs/{org}/teams"),
+        ("PUT", "/v1/teams/{team}/budget"),
+        ("DELETE", "/v1/teams/{team}/budget"),
+        ("POST", "/v1/teams/{team}/projects"),
+        ("POST", "/v1/projects/{project}/keys"),
+        ("POST", "/v1/keys/{key}/revoke"),
+        ("POST", "/v1/keys/{key}/rotate"),
+        ("PATCH", "/v1/keys/{key}/limits"),
+    ] {
         assert!(
             ROUTES
                 .iter()
-                .any(|(method, route)| *method == "get" && *route == path),
-            "the page calls GET {path}, which is not an API route"
+                .any(|(m, r)| m.eq_ignore_ascii_case(verb) && *r == path),
+            "{verb} {path} is not an API route"
+        );
+    }
+    let manage = include_str!("../ui/manage.js");
+    for verb in ["\"POST\"", "\"PUT\"", "\"DELETE\"", "\"PATCH\""] {
+        assert!(
+            manage.contains(&format!("send({verb}")),
+            "the script no longer sends {verb}"
         );
     }
 }

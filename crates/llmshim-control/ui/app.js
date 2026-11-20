@@ -76,12 +76,20 @@ class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
-async function api(path, params) {
+async function api(path, params, send) {
   const url = new URL(path, location.origin);
   for (const [k, v] of Object.entries(params || {})) {
     if (v !== "" && v !== null && v !== undefined) url.searchParams.set(k, v);
   }
-  const response = await fetch(url, { headers: { authorization: "Bearer " + session.token }, cache: "no-store" });
+  const init = { headers: { authorization: "Bearer " + session.token }, cache: "no-store" };
+  if (send) {
+    init.method = send.method;
+    if (send.body !== undefined) {
+      init.headers["content-type"] = "application/json";
+      init.body = JSON.stringify(send.body);
+    }
+  }
+  const response = await fetch(url, init);
   if (response.status === 401) {
     session.token = null;
     throw new ApiError(401, "Your session ended. Sign in again.");
@@ -340,7 +348,10 @@ async function viewRequests() {
 
 // ---- shell ---------------------------------------------------------------------------------
 
-const VIEWS = { home: ["Home", viewHome], requests: ["Requests", viewRequests] };
+const VIEWS = {
+  home: ["Home", viewHome], requests: ["Requests", viewRequests], clients: ["Clients", viewClients],
+  admin: ["Admin", viewAdmin], history: ["History", viewHistory],
+};
 
 // An error from a view the person has already left is not shown over the one they are on.
 function showErrorFor(el) {
