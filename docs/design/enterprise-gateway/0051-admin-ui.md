@@ -106,7 +106,8 @@ payloads. That is a privacy decision of its own and is **not** in the first slic
 
 ## Slice 3 as built
 
-- **New API route:** `GET /v1/history/verify` (read role) runs the hash-chain check that `audit-verify` runs and answers
+- **New API route:** `GET /v1/history/verify` (admin role, one check at a time: a second is a 429, because it reads the whole history under the
+  store's lock) runs the hash-chain check that `audit-verify` runs and answers
   `{ok: true, records, unchained, head}` or `{ok: false, row, reason}`. It reads the whole history once. The head
   hash is shown with the instruction to keep a copy where the database's writer cannot reach: the chain alone cannot
   show that the last rows were removed (0047). Everything else the views do uses routes that already existed.
@@ -120,7 +121,8 @@ payloads. That is a privacy decision of its own and is **not** in the first slic
   nothing else: not the table, not the page's state, not storage.
 - **Admin.** Organizations, their teams and each team's projects and budget. With the admin role: create each, set
   or clear a team budget (clearing takes two clicks).
-- **History.** The newest 100, 500 or 1000 changes (actor, action, subject, detail) and a "Check the chain" button.
+- **History.** The newest 100, 500 or 1000 changes (actor, action, subject, detail) and, for the admin role, a "Check the
+  chain" button (the others are pointed at `audit-verify`).
   Older rows than 1000 are reached by the API's `limit` only; paging by id is left for when it is asked for.
 - **Roles.** The page asks `whoami` and hides what the role cannot do, but never relies on that: each action is the API
   call a script would make, and the API refuses it by role (0049). A failed action shows its message beside its form.

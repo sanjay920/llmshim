@@ -325,6 +325,20 @@ fn every_route_the_page_calls_is_one_the_api_has() {
         );
     }
     let manage = include_str!("../ui/manage.js");
+    // The fixed tails the script appends to an id ("/revoke", "/limits"…) are real last segments of routes.
+    let tails: Vec<&str> = manage
+        .split('"')
+        .filter(|p| {
+            p.len() > 1 && p.starts_with('/') && p[1..].bytes().all(|b| b.is_ascii_lowercase())
+        })
+        .collect();
+    assert!(tails.len() >= 6, "found {tails:?}");
+    for tail in tails {
+        assert!(
+            ROUTES.iter().any(|(_, route)| route.ends_with(tail)),
+            "the script appends {tail}, which ends no route"
+        );
+    }
     for verb in ["\"POST\"", "\"PUT\"", "\"DELETE\"", "\"PATCH\""] {
         assert!(
             manage.contains(&format!("send({verb}")),

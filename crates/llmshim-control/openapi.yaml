@@ -204,7 +204,8 @@ paths:
       description: |
         Checks the change history's hash chain (note 0047) from its first row, as `audit-verify` does.
         `{ok: true, records, unchained, head}` or `{ok: false, row, reason}` naming the first row that fails.
-        The head hash is what to keep where the database's writer cannot reach: a removed last row is
+        Needs the admin role, and runs one at a time (a second call is a 429): it reads the whole history under the
+        store's lock. The head hash is what to keep where the database's writer cannot reach: a removed last row is
         invisible to the chain alone.
       responses:
         '200': {description: The result of the check}

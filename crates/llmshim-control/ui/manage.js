@@ -31,6 +31,21 @@ function expiry(text) {
   if (isNaN(d)) throw new Error("expires must be a date and time");
   return d.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
+// The value a datetime-local input takes for an instant: the person's own clock, to the minute. (`toISOString`
+// is UTC, which the input would read as local time and shift the expiry by the offset on every save.)
+function localInput(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+}
+// Run a form's action with its submit button off, so a double click or a second Enter is one request.
+async function once(event, action) {
+  event.preventDefault();
+  const button = event.submitter;
+  if (button) { if (button.disabled) return; button.disabled = true; }
+  try { await action(); } finally { if (button) button.disabled = false; }
+}
 const list = (text) => text.split(",").map((x) => x.trim()).filter(Boolean);
 
 function field(label, input, hint) {
@@ -55,15 +70,19 @@ async function attempt(box, action) {
 function confirmButton(label, what, action) {
   const button = h("button", { type: "button" }, label);
   let armed = false;
-  button.addEventListener("click", () => {
+  let timer = null;
+  const reset = () => { armed = false; clearTimeout(timer); button.textContent = label; button.classList.remove("danger"); };
+  button.addEventListener("click", async () => {
     if (!armed) {
       armed = true;
       button.textContent = "Confirm: " + what;
       button.classList.add("danger");
-      setTimeout(() => { armed = false; button.textContent = label; button.classList.remove("danger"); }, 6000);
+      timer = setTimeout(reset, 6000);
       return;
     }
-    action();
+    reset();
+    button.disabled = true;
+    try { await action(); } finally { button.disabled = false; }
   });
   return button;
 }
@@ -102,8 +121,31 @@ async function viewClients() {
   const detail = h("div");
   const fail = showErrorFor(view);
 
+  // While a one-time secret is on screen the page keeps it: no refresh, organization change or other
+  // panel may replace it until the person says they have stored it.
+  let holding = false;
   async function load() {
     const mine = org;
+    try {
+      await fetchAll(mine);
+    } catch (error) {
+      // An answer for an organization the person has already left is not shown over the one they are on.
+      if (mine === org) throw error;
+    }
+  }
+  // After a create or rotate: a failed refresh must say so beside the secret, not replace it.
+  async function refresh() {
+    try {
+      await load();
+    } catch (error) {
+      if (holding && !(error instanceof ApiError && error.status === 401)) {
+        body.append(h("p", { class: "err", role: "alert" }, "The list could not be refreshed: " + error.message));
+      } else {
+        fail(error);
+      }
+    }
+  }
+  async function fetchAll(mine) {
     const [teams, list] = await Promise.all([api("/v1/orgs/" + encodeURIComponent(org) + "/teams"), api("/v1/orgs/" + encodeURIComponent(org) + "/keys")]);
     const perTeam = await Promise.all((teams.teams || []).map(async (t) => [t, (await api("/v1/teams/" + encodeURIComponent(t.id) + "/projects")).projects || []]));
     if (mine !== org) return;
@@ -114,7 +156,7 @@ async function viewClients() {
   }
 
   function render() {
-    detail.replaceChildren();
+    if (!holding) detail.replaceChildren();
     const rows = keys.map((k) => h("tr", { class: "row", tabindex: "0", onclick: () => show(k), onkeydown: (e) => { if (e.key === "Enter") show(k); } },
       h("td", {}, k.name), h("td", {}, projects.get(k.project_id) || k.project_id),
       h("td", {}, h("span", { class: "pill " + (k.state === "active" ? "completed" : "http_failure") }, k.state)),
@@ -132,6 +174,7 @@ async function viewClients() {
   }
 
   function show(k) {
+    if (holding) return;
     const box = messageBox();
     const fields = [
       ["Id", k.id], ["Project", projects.get(k.project_id) || k.project_id], ["State", k.state + (k.revoked_at ? " since " + fmtTime(k.revoked_at) : "")],
@@ -161,17 +204,16 @@ async function viewClients() {
     const tpm = h("input", { type: "text", inputmode: "numeric", value: k.tpm ?? "" });
     const budget = h("input", { type: "text", inputmode: "decimal", value: k.budget_usd ?? "" });
     const window = h("input", { type: "text", inputmode: "numeric", value: k.budget_window_secs ?? "" });
-    const until = h("input", { type: "datetime-local", value: k.expires_at ? new Date(k.expires_at).toISOString().slice(0, 16) : "" });
+    const until = h("input", { type: "datetime-local", value: k.expires_at ? localInput(k.expires_at) : "" });
     return h("form", {
-      class: "formgrid", onsubmit: async (e) => {
-        e.preventDefault();
+      class: "formgrid", onsubmit: (e) => once(e, async () => {
         if (await attempt(box, async () => {
           await send("PATCH", "/v1/keys/" + encodeURIComponent(k.id) + "/limits", {
             rpm: wholeNumber(rpm.value, "RPM", 1), tpm: wholeNumber(tpm.value, "TPM", 1), budget_usd: decimal(budget.value, "Budget"),
             budget_window_secs: wholeNumber(window.value, "Budget window", 1), expires_at: expiry(until.value),
           });
         })) await load().catch(fail);
-      },
+      }),
     }, h("strong", {}, "Limits"), h("span", { class: "muted" }, "Blank clears a limit."),
       field("RPM", rpm), field("TPM", tpm), field("Budget, USD", budget), field("Budget window, seconds", window), field("Expires (your time)", until),
       h("button", { type: "submit" }, "Save limits"));
@@ -180,20 +222,22 @@ async function viewClients() {
   function rotateForm(k, box) {
     const name = h("input", { type: "text", value: k.name + "-next", maxlength: "128" });
     return h("form", {
-      class: "formgrid", onsubmit: async (e) => {
-        e.preventDefault();
+      class: "formgrid", onsubmit: (e) => once(e, async () => {
         let made = null;
         if (await attempt(box, async () => { made = await send("POST", "/v1/keys/" + encodeURIComponent(k.id) + "/rotate", { name: name.value.trim() }); })) {
-          await load().catch(fail);
+          // The secret first: nothing that can fail after the key exists may stand between it and the person.
           showSecret("New client " + made.key.name, made.secret);
+          await refresh();
         }
-      },
+      }),
     }, h("strong", {}, "Rotate"), h("span", { class: "muted" }, "Issues a replacement with the same limits; this one stays active until you revoke it."),
       field("Name of the replacement", name), h("button", { type: "submit" }, "Rotate"));
   }
 
   function showSecret(title, secret) {
-    detail.replaceChildren(secret ? secretPanel(title, secret, () => detail.replaceChildren()) : h("div", { class: "panel" }, h("strong", {}, title + " created")));
+    holding = !!secret;
+    orgSelect.disabled = holding;
+    detail.replaceChildren(secret ? secretPanel(title, secret, () => { holding = false; orgSelect.disabled = false; detail.replaceChildren(); }) : h("div", { class: "panel" }, h("strong", {}, title + " created")));
   }
 
   function createForm() {
@@ -217,8 +261,7 @@ async function viewClients() {
     kind.addEventListener("change", syncKind);
     syncKind();
     return h("form", {
-      class: "panel formgrid", onsubmit: async (e) => {
-        e.preventDefault();
+      class: "panel formgrid", onsubmit: (e) => once(e, async () => {
         let made = null;
         if (await attempt(box, async () => {
           const body = {
@@ -230,10 +273,10 @@ async function viewClients() {
           };
           made = await send("POST", "/v1/projects/" + encodeURIComponent(project.value) + "/keys", body);
         })) {
-          await load().catch(fail);
           showSecret("Client " + made.key.name, made.secret);
+          await refresh();
         }
-      },
+      }),
     }, h("strong", {}, "New client"), field("Project", project), field("Name", name), field("Credential", kind), extra,
       field("Tier", tier, "Higher tiers are queued first."), field("RPM", rpm), field("TPM", tpm), field("Budget, USD", budget), field("Budget window, seconds", window),
       field("Allowed models", models), field("Allowed addresses (CIDR)", cidrs), field("Expires (your time)", until),
@@ -245,6 +288,7 @@ async function viewClients() {
   const create = h("div");
   view.append(h("div", { class: "filters" }, orgSelect,
     canIssue() ? h("button", { type: "button", class: "primary", onclick: () => {
+      if (holding) return;
       if (!projects.size) { detail.replaceChildren(h("p", { class: "muted" }, "This organization has no project yet. Create a team and a project in Admin first.")); return; }
       detail.replaceChildren(createForm());
     } }, "New client") : null), body, create, detail);
@@ -286,10 +330,9 @@ async function viewAdmin() {
     const box = messageBox();
     const name = h("input", { type: "text", maxlength: "128", required: true, placeholder: label, "aria-label": label });
     return h("form", {
-      class: "filters", onsubmit: async (e) => {
-        e.preventDefault();
+      class: "filters", onsubmit: (e) => once(e, async () => {
         if (await attempt(box, async () => { await action(name.value.trim()); })) await load().catch(fail);
-      },
+      }),
     }, name, h("button", { type: "submit" }, title), box);
   }
 
@@ -299,8 +342,7 @@ async function viewAdmin() {
     const window = h("input", { type: "text", inputmode: "numeric", value: t.budget && t.budget.budget_window_secs ? t.budget.budget_window_secs : "", placeholder: "window, s", "aria-label": "Window, seconds" });
     const unpriced = h("input", { type: "checkbox", checked: !!(t.budget && t.budget.budget_allow_unpriced) });
     return h("form", {
-      class: "filters", onsubmit: async (e) => {
-        e.preventDefault();
+      class: "filters", onsubmit: (e) => once(e, async () => {
         if (await attempt(box, async () => {
           const amount = decimal(usd.value, "Budget");
           if (amount === null) throw new Error("Enter a budget, or use Clear budget");
@@ -308,7 +350,7 @@ async function viewAdmin() {
             budget_usd: amount, budget_window_secs: wholeNumber(window.value, "Window", 1), budget_allow_unpriced: unpriced.checked,
           });
         })) await load().catch(fail);
-      },
+      }),
     }, usd, window, h("label", { class: "muted" }, unpriced, " allow unpriced"), h("button", { type: "submit" }, "Set budget"),
       t.budget ? confirmButton("Clear budget", "clear the budget of " + t.name, async () => {
         if (await attempt(box, async () => { await send("DELETE", "/v1/teams/" + encodeURIComponent(t.id) + "/budget"); })) await load().catch(fail);
@@ -339,6 +381,7 @@ async function viewHistory() {
   }
 
   const verify = h("button", { type: "button" }, "Check the chain");
+  verify.hidden = !canAdmin();
   verify.addEventListener("click", async () => {
     verify.disabled = true;
     result.replaceChildren(h("p", { class: "muted" }, "Checking…"));
@@ -358,7 +401,7 @@ async function viewHistory() {
   });
   const size = h("select", { "aria-label": "Rows", onchange: (e) => { limit = Number(e.target.value); load().catch(fail); } },
     [100, 500, 1000].map((n) => h("option", { value: n }, "Newest " + n)));
-  view.append(h("div", { class: "filters" }, size, verify), result,
+  view.append(h("div", { class: "filters" }, size, verify, canAdmin() ? null : h("span", { class: "muted" }, "Checking the chain needs the admin role (or `llmshim-control audit-verify` on the server).")), result,
     h("div", { class: "scroll" }, h("table", {}, h("thead", {}, h("tr", {}, h("th", { class: "num" }, "#"), h("th", {}, "Time"), h("th", {}, "Actor"), h("th", {}, "Action"), h("th", {}, "Subject"), h("th", {}, "Detail"))), tbody)),
     h("p", { class: "foot" }, "Every change to organizations, teams, projects and keys is recorded with who made it. Each row carries the hash of the one before it, so an edited or removed row shows at the row where it happened."));
   await load();
