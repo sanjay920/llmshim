@@ -1,0 +1,29 @@
+# Azure Blob Storage with AKS Azure AD Workload Identity: the pod is labelled, the webhook projects the token, no secret is stored.
+# Used by deploy/helm/validate.sh (rendered, schema-checked and fed through `llmshim serve --check`) and
+# as a worked example for this platform: copy it and change the names.
+replicaCount: 3
+existingSecret: llmshim-secrets
+fleet:
+  enabled: true
+serviceAccount:
+  annotations:
+    azure.workload.identity/client-id: 66666666-7777-8888-9999-000000000000
+mediaStore:
+  enabled: true
+  kind: azure-blob
+  prefix: llmshim/
+  azureBlob:
+    account: llmshimstore
+    container: media
+    credentials: workload-identity
+    tenantId: 11111111-2222-3333-4444-555555555555
+    clientId: 66666666-7777-8888-9999-000000000000
+config: |
+  [providers.openai]
+  kind = "openai"
+  api_key = { env = "OPENAI_API_KEY" }
+
+  [[keys]]
+  name = "media-example"
+  tenant = "media"
+  secret = { env = "EXAMPLE_GATEWAY_KEY" }

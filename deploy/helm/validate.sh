@@ -5,7 +5,8 @@
 # server cannot drift apart.
 #
 # Needs docker, openssl and python3. LLMSHIM_BIN is a binary built with
-# `--features serve-redis` (default: target/debug/llmshim).
+# `--features serve-redis,serve-cloud` (default: target/debug/llmshim): serve-cloud because the
+# media store examples include the AWS credential chain.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +22,9 @@ helm() { docker run --rm -v "$here:/charts:ro" "$helm_image" "$@"; }
 echo "== helm lint"
 helm lint /charts/llmshim
 helm lint /charts/llmshim -f /charts/llmshim/ci/full.yaml
+for example in "$chart"/ci/media-*.yaml; do
+  helm lint /charts/llmshim -f "/charts/llmshim/ci/$(basename "$example")"
+done
 
 # A self-signed pair for the TLS variant, and secrets for every reference.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
@@ -29,11 +33,17 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
 export OPENAI_API_KEY=provider-key-openai-0123456789 ANTHROPIC_API_KEY=provider-key-anthropic-0123456789
 export EXAMPLE_GATEWAY_KEY=example-caller-key-0123456789 CHECKOUT_GATEWAY_KEY=checkout-caller-key-0123456789
 export GATEWAY_ADMIN_TOKEN=admin-token-0123456789abcdef REDIS_URL=redis://127.0.0.1:6379/0
+# The media store examples' secrets (their values are never printed).
+export MEDIA_S3_ACCESS_KEY_ID=media-key-id-0123 MEDIA_S3_SECRET_ACCESS_KEY=media-secret-0123456789
+export MEDIA_AZURE_SAS_TOKEN='sv=2021-12-02&sp=rwdl&sig=abc'
 
-for variant in default full; do
+variants=(default full)
+for example in "$chart"/ci/media-*.yaml; do variants+=("$(basename "$example" .yaml)"); done
+
+for variant in "${variants[@]}"; do
   echo "== render [$variant]"
   args=()
-  [ "$variant" = full ] && args=(-f /charts/llmshim/ci/full.yaml)
+  [ "$variant" != default ] && args=(-f "/charts/llmshim/ci/$variant.yaml")
   helm template release /charts/llmshim ${args[@]+"${args[@]}"} > "$work/$variant.yaml"
 
   echo "== kubeconform [$variant]"
@@ -54,10 +64,62 @@ body = body.replace("/etc/llmshim/tls/tls.crt", f"{work}/tls.crt")
 body = body.replace("/etc/llmshim/tls/tls.key", f"{work}/tls.key")
 body = body.replace("/etc/llmshim/tls/ca.crt", f"{work}/tls.crt")
 body = body.replace("/var/lib/llmshim/receipts", f"{work}/receipts")
+body = body.replace("/var/lib/llmshim/media", f"{work}/media")
 open(sys.argv[2], "w").write(body)
 PY
   LLMSHIM_CATALOG_OFFLINE=1 "$bin" serve --config "$work/$variant.toml" --check
 done
+
+echo "== each media store example renders what its platform needs"
+has() { grep -q -- "$2" "$work/$1.yaml" || { echo "[$1] expected: $2"; exit 1; }; }
+lacks() { ! grep -q -- "$2" "$work/$1.yaml" || { echo "[$1] unexpected: $2"; exit 1; }; }
+has media-file-rwx "kind: PersistentVolumeClaim"
+has media-file-rwx "ReadWriteMany"
+has media-file-rwx "mountPath: /var/lib/llmshim/media"
+has media-file-rwx 'path = "/var/lib/llmshim/media"'
+has media-s3-minio 'endpoint = "https://minio.minio.svc.cluster.local:9000"'
+has media-s3-minio 'access_key_id = { env = "MEDIA_S3_ACCESS_KEY_ID" }'
+has media-s3-irsa "eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/llmshim-media"
+has media-s3-irsa 'credentials = "aws"'
+lacks media-s3-irsa "access_key_id"
+has media-gcs-workload-identity "iam.gke.io/gcp-service-account"
+has media-gcs-workload-identity 'credentials = "metadata"'
+has media-gcs-service-account "name: gcp-service-account"
+has media-gcs-service-account 'service_account_file = "/etc/llmshim/gcp/key.json"'
+has media-azure-workload-identity 'azure.workload.identity/use: "true"'
+has media-azure-workload-identity "azure.workload.identity/client-id"
+has media-azure-workload-identity 'federated_token_file = "/var/run/secrets/azure/tokens/azure-identity-token"'
+has media-azure-sas 'sas_token = { env = "MEDIA_AZURE_SAS_TOKEN" }'
+lacks media-azure-sas "azure.workload.identity/use"
+# Nothing about the media store leaks into a chart that does not use it.
+for variant in default full; do
+  lacks "$variant" "media_store"
+  lacks "$variant" "azure.workload.identity"
+  lacks "$variant" "PersistentVolumeClaim"
+done
+
+echo "== media store misconfigurations are refused at render time"
+refuse() {
+  local expect="$1"; shift
+  if helm template release /charts/llmshim "$@" >/dev/null 2>"$work/err"; then
+    echo "expected the render to fail: $*"; exit 1
+  fi
+  grep -q -- "$expect" "$work/err" || { echo "wrong error for $*:"; cat "$work/err"; exit 1; }
+}
+media=(--set existingSecret=s --set fleet.enabled=true --set mediaStore.enabled=true)
+refuse "mediaStore needs fleet.enabled" --set existingSecret=s --set mediaStore.enabled=true --set mediaStore.kind=file --set mediaStore.file.claimName=c
+refuse "mediaStore.kind must be one of" "${media[@]}"
+refuse "mediaStore.kind must be one of" "${media[@]}" --set mediaStore.kind=ftp
+refuse "mediaStore.file needs" "${media[@]}" --set mediaStore.kind=file
+refuse "mediaStore.s3 needs bucket and region" "${media[@]}" --set mediaStore.kind=s3
+refuse "reads its keys from existingSecret" --set fleet.enabled=true --set mediaStore.enabled=true --set mediaStore.kind=s3 --set mediaStore.s3.bucket=b --set mediaStore.s3.region=r
+refuse "credentials must be keys or aws" "${media[@]}" --set mediaStore.kind=s3 --set mediaStore.s3.bucket=b --set mediaStore.s3.region=r --set mediaStore.s3.credentials=magic
+refuse "mediaStore.gcs needs bucket" "${media[@]}" --set mediaStore.kind=gcs
+refuse "needs serviceAccountSecret" "${media[@]}" --set mediaStore.kind=gcs --set mediaStore.gcs.bucket=b --set mediaStore.gcs.credentials=service-account
+refuse "credentials: none needs an endpoint" "${media[@]}" --set mediaStore.kind=gcs --set mediaStore.gcs.bucket=b --set mediaStore.gcs.credentials=none
+refuse "needs account and container" "${media[@]}" --set mediaStore.kind=azure-blob
+refuse "needs tenantId and clientId" "${media[@]}" --set mediaStore.kind=azure-blob --set mediaStore.azureBlob.account=a --set mediaStore.azureBlob.container=c
+refuse "credentials must be workload-identity" "${media[@]}" --set mediaStore.kind=azure-blob --set mediaStore.azureBlob.account=a --set mediaStore.azureBlob.container=c --set mediaStore.azureBlob.credentials=oauth
 
 echo "== requiring client certificates without TLS is refused"
 if helm template release /charts/llmshim --set server.tls.requireClientCertificate=true >/dev/null 2>"$work/err2"; then

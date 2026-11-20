@@ -36,6 +36,10 @@ spec:
         {{- end }}
       labels:
         {{- include "llmshim.selectorLabels" . | nindent 8 }}
+        {{- if include "llmshim.azureWorkloadIdentity" . }}
+        # The Azure Workload Identity webhook projects the federated token into pods with this label.
+        azure.workload.identity/use: "true"
+        {{- end }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -113,6 +117,18 @@ spec:
               mountPath: /etc/llmshim/tls
               readOnly: true
             {{- end }}
+            {{- if and .Values.mediaStore.enabled (eq .Values.mediaStore.kind "file") }}
+            - name: media
+              mountPath: /var/lib/llmshim/media
+            {{- end }}
+            {{- if and .Values.mediaStore.enabled (eq .Values.mediaStore.kind "gcs") (eq .Values.mediaStore.gcs.credentials "service-account") }}
+            - name: gcp-service-account
+              mountPath: /etc/llmshim/gcp
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -128,6 +144,20 @@ spec:
         - name: tls
           secret:
             secretName: {{ .Values.server.tls.secretName }}
+        {{- end }}
+        {{- if and .Values.mediaStore.enabled (eq .Values.mediaStore.kind "file") }}
+        - name: media
+          persistentVolumeClaim:
+            claimName: {{ include "llmshim.mediaClaimName" . }}
+        {{- end }}
+        {{- if and .Values.mediaStore.enabled (eq .Values.mediaStore.kind "gcs") (eq .Values.mediaStore.gcs.credentials "service-account") }}
+        - name: gcp-service-account
+          secret:
+            secretName: {{ .Values.mediaStore.gcs.serviceAccountSecret }}
+            defaultMode: 0440
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

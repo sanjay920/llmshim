@@ -1,0 +1,25 @@
+# A shared ReadWriteMany volume (EFS, Filestore, Azure Files, NFS, CephFS) for the file media store.
+# Used by deploy/helm/validate.sh (rendered, schema-checked and fed through `llmshim serve --check`) and
+# as a worked example for this platform: copy it and change the names.
+replicaCount: 3
+existingSecret: llmshim-secrets
+fleet:
+  enabled: true
+mediaStore:
+  enabled: true
+  kind: file
+  ttlSecs: 3600
+  file:
+    persistence:
+      create: true
+      storageClassName: efs-sc      # a class that provides ReadWriteMany
+      size: 20Gi
+config: |
+  [providers.openai]
+  kind = "openai"
+  api_key = { env = "OPENAI_API_KEY" }
+
+  [[keys]]
+  name = "media-example"
+  tenant = "media"
+  secret = { env = "EXAMPLE_GATEWAY_KEY" }

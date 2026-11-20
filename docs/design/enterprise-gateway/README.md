@@ -165,7 +165,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Secret-manager integrations (0033): files are the integration (Kubernetes, CSI driver, agents); secret values are one line of at most 64 KiB; no vendor client is linked
 - [x] Embeddings, images and audio on the server, local scheduler only (a fleet answers 501): embeddings on the server (0035, a spend bound for capped keys with a trusted model price); image generation (0036, local scheduler, capped keys refused); speech (0037, exact price, capped keys work); transcription (0038, multipart upload through `multer`, capped keys refused)
 - [x] Config-registered providers: **decided, no further kinds** (0022). An endpoint that speaks a wire llmshim has is `base_url` on that kind (`openai-compatible`, or `base_url` on `openai`, `anthropic`, `gemini`, `xai`, `cerebras`, `openrouter`); a wire it lacks is a library adapter, not a configuration
-- [x] Images, speech and transcription through a fleet (0050): over a shared object store (`[media_store]`: a directory or any S3-compatible service; objects are sealed); the AWS credential chain and native GCS/Azure Blob backends are slice 3, not built
+- [x] Images, speech and transcription through a fleet (0050): over a shared object store (`[media_store]`: a directory or any S3-compatible service; objects are sealed); the AWS credential chain, native GCS and Azure Blob backends and the Helm chart's media store settings are slice 3, built
 - [x] SSO for the control plane (0049): OIDC token verification, the verified subject as the actor, three fixed roles, break-glass
 - [ ] Admin UI and SCIM (not started: they follow the control plane and the
       licensing decision)
