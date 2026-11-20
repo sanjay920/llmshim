@@ -16,9 +16,10 @@ use sha2::{Digest, Sha256};
 
 pub mod api;
 mod db;
+pub mod requests;
 pub mod sso;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -622,7 +623,7 @@ impl Store {
                             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                             .map_err(|e| Error::Database(e.to_string()))?;
                     }
-                    1..=4 => {
+                    1..=5 => {
                         // Version 2 added keys.allowed_models, version 3 keys.tags. Re-read the
                         // version under the write lock: another process starting at the same
                         // time may have migrated while this one waited.
@@ -672,6 +673,16 @@ impl Store {
                                      PRAGMA user_version = 5;",
                                 )
                                 .map_err(db_err)?;
+                            now = 5;
+                        }
+                        if now == 5 {
+                            // Version 6: the request ledger (note 0051).
+                            connection
+                                .execute_batch(&format!(
+                                    "{} PRAGMA user_version = 6;",
+                                    requests::schema(false)
+                                ))
+                                .map_err(db_err)?;
                         }
                         connection.execute_batch("COMMIT").map_err(db_err)?;
                     }
@@ -705,7 +716,7 @@ impl Store {
                         tx.execute("INSERT INTO schema_meta (version) VALUES ($1)", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }
-                    Some(version @ (1..=4)) => {
+                    Some(version @ (1..=5)) => {
                         // Version 2 added keys.allowed_models, 3 keys.tags, 4 a team's budget.
                         if version == 1 {
                             tx.batch_execute("ALTER TABLE keys ADD COLUMN allowed_models TEXT")
@@ -725,11 +736,15 @@ impl Store {
                             .map_err(fail)?;
                         }
                         // Version 5: the history's hash chain (note 0047).
-                        tx.batch_execute(
-                            "ALTER TABLE history ADD COLUMN prev TEXT; \
-                             ALTER TABLE history ADD COLUMN hash TEXT",
-                        )
-                        .map_err(fail)?;
+                        if version <= 4 {
+                            tx.batch_execute(
+                                "ALTER TABLE history ADD COLUMN prev TEXT; \
+                                 ALTER TABLE history ADD COLUMN hash TEXT",
+                            )
+                            .map_err(fail)?;
+                        }
+                        // Version 6: the request ledger (note 0051).
+                        tx.batch_execute(&requests::schema(true)).map_err(fail)?;
                         tx.execute("UPDATE schema_meta SET version = $1", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }
@@ -1487,6 +1502,8 @@ CREATE TABLE snapshots (
     payload TEXT NOT NULL, envelope TEXT NOT NULL, created_at TEXT NOT NULL,
     PRIMARY KEY (org_id, generation)
 );
-"
+{requests}
+",
+        requests = requests::schema(pg)
     )
 }

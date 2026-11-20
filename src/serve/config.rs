@@ -163,6 +163,42 @@ pub struct ServeConfig {
     /// Where a fleet's media routes keep their large payloads (note 0050). Fixed at start.
     #[serde(default)]
     pub media_store: Option<MediaStore>,
+    /// Push each provider attempt's usage record to a control plane's request ledger, for its UI
+    /// (note 0051). Fixed at start.
+    #[serde(default)]
+    pub usage_export: Option<UsageExport>,
+}
+
+/// The push of usage records to the control plane (note 0051). Bounded and fail-open: a full queue drops
+/// the oldest record, an unreachable control plane delays no request.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct UsageExport {
+    /// The control plane's origin, `https://host[:port]` (plain `http://` needs `allow_insecure_http`).
+    pub url: String,
+    /// The control plane's ingest token (`llmshim-control serve --ingest-token-file`), by secret
+    /// reference. Read at each batch, so a rotated file needs no restart.
+    pub token: SecretRef,
+    /// Records per request, 1 to 500. Defaults to 200.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 500))]
+    pub batch_size: Option<u64>,
+    /// The longest a record waits for a batch to fill, in milliseconds, 200 to 60000. Defaults to 2000.
+    #[serde(default)]
+    #[schemars(range(min = 200, max = 60000))]
+    pub flush_interval_ms: Option<u64>,
+    /// The most records held in memory while the control plane is slow or away, 100 to 1000000; past it
+    /// the oldest are dropped. Defaults to 10000.
+    #[serde(default)]
+    #[schemars(range(min = 100, max = 1000000))]
+    pub queue_size: Option<u64>,
+    /// Allow a plain `http://` url: the token and the usage records then cross the network unprotected.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+    /// PEM certificates to trust for the control plane instead of the web PKI roots.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
 }
 
 /// Which backend `[media_store]` uses (note 0050).
@@ -1889,6 +1925,35 @@ impl ServeConfig {
         }
     }
 
+    fn validate_usage_export(&self, issues: &mut Vec<Issue>) {
+        let Some(export) = &self.usage_export else {
+            return;
+        };
+        let at = "usage_export";
+        if let Some(problem) = media_endpoint_problem(&export.url, export.allow_insecure_http) {
+            issues.push(Issue::new(format!("{at}.url"), problem));
+        }
+        validate_secret(&export.token, &format!("{at}.token"), issues);
+        for (field, value, low, high) in [
+            ("batch_size", export.batch_size, 1, 500),
+            ("flush_interval_ms", export.flush_interval_ms, 200, 60_000),
+            ("queue_size", export.queue_size, 100, 1_000_000),
+        ] {
+            if value.is_some_and(|v| !(low..=high).contains(&v)) {
+                issues.push(Issue::new(
+                    format!("{at}.{field}"),
+                    format!("must be {low} to {high}"),
+                ));
+            }
+        }
+        if export.ca_file.as_ref().is_some_and(|p| !p.has_root()) {
+            issues.push(Issue::new(
+                format!("{at}.ca_file"),
+                "must be an absolute path",
+            ));
+        }
+    }
+
     fn validate_media_store(&self, issues: &mut Vec<Issue>) {
         let Some(store) = &self.media_store else {
             return;
@@ -2714,6 +2779,7 @@ impl ServeConfig {
         self.validate_reload(&mut issues);
         self.validate_guardrails(&mut issues);
         self.validate_media_store(&mut issues);
+        self.validate_usage_export(&mut issues);
         if let Some(fleet) = &self.fleet {
             validate_secret(&fleet.redis_url, "fleet.redis_url", &mut issues);
             if let Some(outage) = &fleet.outage_admission {
@@ -4016,6 +4082,10 @@ impl ServeConfig {
                 .as_ref()
                 .map(|secret| (format!("classifiers.{name}.token"), secret))
         });
+        let usage_export = self
+            .usage_export
+            .iter()
+            .map(|export| ("usage_export.token".to_string(), &export.token));
         let media = self.media_store.iter().flat_map(|store| {
             [
                 ("media_store.access_key_id", &store.access_key_id),
@@ -4034,6 +4104,7 @@ impl ServeConfig {
             .chain(telemetry)
             .chain(jwks)
             .chain(classifiers)
+            .chain(usage_export)
             .chain(media)
             .collect()
     }
@@ -5015,10 +5086,11 @@ mod tests {
             "guardrails",
             "classifiers",
             "media_store",
+            "usage_export",
         ] {
             assert!(properties.contains_key(table), "{table}");
         }
-        assert_eq!(properties.len(), 20, "a new table needs a line here");
+        assert_eq!(properties.len(), 21, "a new table needs a line here");
         assert_eq!(schema["additionalProperties"], false);
     }
 
@@ -5090,6 +5162,62 @@ mod tests {
             "{}",
             issues[0].message
         );
+    }
+
+    #[test]
+    fn usage_export_settings_are_validated_by_path() {
+        let file = |extra: &str| format!("{MINIMAL}\n[usage_export]\n{extra}");
+        let paths = |extra: &str| -> Vec<String> {
+            ServeConfig::parse(&file(extra), Format::Toml)
+                .err()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|issue| issue.path)
+                .collect()
+        };
+        const OK: &str =
+            "url = \"https://control.example.com\"\ntoken = { env = \"EXPORT_TOKEN\" }\n";
+        assert!(ServeConfig::parse(&file(OK), Format::Toml).is_ok());
+        assert!(ServeConfig::parse(
+            &file(&format!(
+                "{OK}batch_size = 500\nflush_interval_ms = 200\nqueue_size = 100\nca_file = \"/etc/ca.pem\"\n"
+            )),
+            Format::Toml
+        )
+        .is_ok());
+        // Plain http is refused unless said out loud; the token is a reference, never a literal.
+        assert_eq!(
+            paths("url = \"http://control:8080\"\ntoken = { env = \"T\" }\n"),
+            ["usage_export.url"]
+        );
+        assert!(ServeConfig::parse(
+            &file("url = \"http://control:8080\"\ntoken = { env = \"T\" }\nallow_insecure_http = true\n"),
+            Format::Toml
+        )
+        .is_ok());
+        for (extra, at) in [
+            ("batch_size = 0\n", "usage_export.batch_size"),
+            ("batch_size = 501\n", "usage_export.batch_size"),
+            (
+                "flush_interval_ms = 199\n",
+                "usage_export.flush_interval_ms",
+            ),
+            (
+                "flush_interval_ms = 60001\n",
+                "usage_export.flush_interval_ms",
+            ),
+            ("queue_size = 99\n", "usage_export.queue_size"),
+            ("queue_size = 1000001\n", "usage_export.queue_size"),
+            ("ca_file = \"ca.pem\"\n", "usage_export.ca_file"),
+        ] {
+            assert_eq!(paths(&format!("{OK}{extra}")), [at], "{extra}");
+        }
+        // The secret reference is listed so `--check` resolves it.
+        let config = ServeConfig::parse(&file(OK), Format::Toml).unwrap();
+        assert!(config
+            .secret_refs()
+            .iter()
+            .any(|(path, _)| path == "usage_export.token"));
     }
 
     #[test]

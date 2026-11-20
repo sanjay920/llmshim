@@ -12,7 +12,7 @@ use llmshim_control::api::{router, seed_file_problem, token_problem, AppState};
 use llmshim_control::Store;
 use std::path::PathBuf;
 
-const USAGE: &str = "Usage: llmshim-control audit-verify (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         checks the change history's hash chain; exit 1 names the first broken row\n\n       llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --sso-config        a JSON issuer file (note 0049): verify OIDC access tokens, take the actor from\n                      the verified subject and the role from its `roles` claim (control:read,\n                      control:key-issuer, control:admin). Then --token-file is the break-glass\n                      token, required unless the file sets \"break_glass\": false\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
+const USAGE: &str = "Usage: llmshim-control audit-verify (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         checks the change history's hash chain; exit 1 names the first broken row\n\n       llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --sso-config        a JSON issuer file (note 0049): verify OIDC access tokens, take the actor from\n                      the verified subject and the role from its `roles` claim (control:read,\n                      control:key-issuer, control:admin). Then --token-file is the break-glass\n                      token, required unless the file sets \"break_glass\": false\n  --ingest-token-file a token (owner-only, a different one from --token-file) that the gateways' usage\n                      push (`[usage_export]`) presents to POST /v1/usage/batch: accepted there and nowhere\n                      else. Without it the push is refused (note 0051)\n  --request-retention-days N  keep the request ledger N days (1 to 3650, default 30)\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
 
 struct Options {
     db: Option<PathBuf>,
@@ -24,6 +24,8 @@ struct Options {
     token_file: Option<PathBuf>,
     sso_config: Option<PathBuf>,
     signing_key_file: Option<PathBuf>,
+    ingest_token_file: Option<PathBuf>,
+    request_retention_days: u32,
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -37,6 +39,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let (mut db, mut listen, mut token, mut signing) = (None, None, None, None);
     let (mut url_file, mut schema, mut ca) = (None, None, None);
     let mut sso = None;
+    let (mut ingest, mut retention) = (None, None);
     let mut at = 1;
     while at < args.len() {
         let flag = args[at].as_str();
@@ -56,6 +59,16 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--token-file" => token = Some(PathBuf::from(value)),
             "--signing-key-file" => signing = Some(PathBuf::from(value)),
             "--sso-config" => sso = Some(PathBuf::from(value)),
+            "--ingest-token-file" => ingest = Some(PathBuf::from(value)),
+            "--request-retention-days" => {
+                retention = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|days| (1..=3650).contains(days))
+                        .ok_or("--request-retention-days must be 1 to 3650")?,
+                )
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -65,7 +78,14 @@ fn parse(args: &[String]) -> Result<Options, String> {
     if (schema.is_some() || ca.is_some()) && url_file.is_none() {
         return Err("--database-schema and --database-ca-file are for --database-url-file".into());
     }
-    if verify && (listen.is_some() || token.is_some() || signing.is_some() || sso.is_some()) {
+    if verify
+        && (listen.is_some()
+            || token.is_some()
+            || signing.is_some()
+            || sso.is_some()
+            || ingest.is_some()
+            || retention.is_some())
+    {
         return Err("audit-verify takes only the database options".into());
     }
     Ok(Options {
@@ -88,6 +108,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         },
         sso_config: sso,
         signing_key_file: signing,
+        ingest_token_file: ingest,
+        request_retention_days: retention.unwrap_or(30),
     })
 }
 
@@ -324,6 +346,7 @@ async fn run(options: Options) -> i32 {
             "warning: listening on {address} without TLS: put a TLS-terminating proxy in front of it"
         );
     }
+    let shared_token = token.clone();
     let state = match (sso, token) {
         (Some(sso), token) => {
             AppState::with_sso(store, token.as_deref(), options.signing_key_file, sso)
@@ -331,6 +354,35 @@ async fn run(options: Options) -> i32 {
         (None, Some(token)) => AppState::new(store, &token, options.signing_key_file),
         (None, None) => unreachable!("parse requires a token without an issuer file"),
     };
+    if let Some(file) = &options.ingest_token_file {
+        let ingest = match read_token(file) {
+            Ok(token) => token,
+            Err(message) => {
+                eprintln!("{message}");
+                return 1;
+            }
+        };
+        // A credential for the usage push only: it must not also be the one that administers.
+        if shared_token.as_deref() == Some(ingest.as_str()) {
+            eprintln!("--ingest-token-file must hold a different token from --token-file");
+            return 2;
+        }
+        state.set_ingest_token(&ingest);
+    }
+    {
+        // The request ledger keeps `--request-retention-days` (30 by default) and deletes older rows
+        // itself, hourly.
+        let state = state.clone();
+        let days = i64::from(options.request_retention_days);
+        tokio::spawn(async move {
+            loop {
+                let before = chrono::Utc::now().timestamp_millis() - days * 86_400_000;
+                let state = state.clone();
+                let _ = tokio::task::spawn_blocking(move || state.purge_requests(before)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
     eprintln!("llmshim-control listening on http://{address}");
     let shutdown = async {
         #[cfg(unix)]

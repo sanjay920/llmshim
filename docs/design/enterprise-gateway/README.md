@@ -84,6 +84,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0048: External guardrail classifiers](0048-external-classifiers.md)
 - [0049: Single sign-on for the control plane](0049-control-plane-sso.md)
 - [0050: Media through a fleet, over an object store](0050-media-object-store.md)
+- [0051: The admin UI](0051-admin-ui.md)
 
 ## Roadmap
 
@@ -167,8 +168,8 @@ Later phases (each needs its own design note before work starts)
 - [x] Config-registered providers: **decided, no further kinds** (0022). An endpoint that speaks a wire llmshim has is `base_url` on that kind (`openai-compatible`, or `base_url` on `openai`, `anthropic`, `gemini`, `xai`, `cerebras`, `openrouter`); a wire it lacks is a library adapter, not a configuration
 - [x] Images, speech and transcription through a fleet (0050): over a shared object store (`[media_store]`: a directory or any S3-compatible service; objects are sealed); the AWS credential chain, native GCS and Azure Blob backends and the Helm chart's media store settings are slice 3, built
 - [x] SSO for the control plane (0049): OIDC token verification, the verified subject as the actor, three fixed roles, break-glass
-- [ ] Admin UI and SCIM (not started: they follow the control plane and the
-      licensing decision)
+- [ ] Admin UI (0051, in progress): slice 1 built, the request ledger in the control plane (`POST /v1/usage/batch` under its own ingest token, `GET /v1/requests`, `/summary`, `/facets`, retention) and the gateway's `[usage_export]`; the pages (slices 2 to 4) and payload capture (slice 5) are next
+- [ ] SCIM (not started)
 
 ## Review follow-ups
 

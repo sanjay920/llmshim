@@ -736,14 +736,23 @@ fn a_model_list_is_checked_stored_copied_on_rotation_and_signed_only_when_set() 
 /// keys: version 1 had neither model lists nor tags, version 2 had model lists only.
 #[test]
 fn an_older_database_is_migrated_in_place() {
-    for from in [1_i64, 2, 3, 4] {
+    for from in [1_i64, 2, 3, 4, 5] {
         migrate_from(from);
     }
 }
 
+/// A migrated database has a working request ledger (note 0051).
+fn ledger_works(store: &mut Store) {
+    let record = json!({"ts": "2026-11-19T10:00:00Z", "attempt_id": "mig-1", "provider": "p", "model": "m",
+        "kind": "completion", "outcome": "completed", "duration_ms": 1, "input_tokens": 1,
+        "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 0, "usage_reported": true,
+        "admission": "fleet"});
+    assert_eq!(store.ingest_requests(&[record]).unwrap().accepted, 1);
+}
+
 fn migrate_from(from: i64) {
     // What a database of that version did not have yet: keys.allowed_models (2), keys.tags (3),
-    // a team's budget (4), and the history's hash chain (5).
+    // a team's budget (4), the history's hash chain (5) and the request ledger (6).
     let chain_columns = "ALTER TABLE history DROP COLUMN prev; \
         ALTER TABLE history DROP COLUMN hash;";
     let team_columns = format!(
@@ -757,8 +766,11 @@ fn migrate_from(from: i64) {
         ),
         2 => format!("ALTER TABLE keys DROP COLUMN tags; {team_columns}"),
         3 => team_columns,
-        _ => chain_columns.to_string(),
+        4 => chain_columns.to_string(),
+        _ => String::new(),
     };
+    // Every database older than version 6 has no request ledger (note 0051).
+    let drop_columns = format!("{drop_columns} DROP TABLE requests;");
     let use_new_columns = |store: &mut Store, project: &str| {
         let mut new = NewKey::secret(project, "new");
         new.allowed_models = Some(vec!["openai/*".into()]);
@@ -786,6 +798,7 @@ fn migrate_from(from: i64) {
         .unwrap();
         drop(raw);
         let mut store = Store::open_postgres(&url, Some(&schema)).unwrap();
+        ledger_works(&mut store);
         // The new column works after the migration.
         let team = store.teams_checked(&org).unwrap().remove(0);
         assert!(team.budget.is_none());
@@ -831,6 +844,7 @@ fn migrate_from(from: i64) {
             .unwrap();
     }
     let mut store = Store::open(&file).unwrap();
+    ledger_works(&mut store);
     // The new column works after the migration.
     let team = store.teams_checked(&org).unwrap().remove(0);
     assert!(team.budget.is_none());

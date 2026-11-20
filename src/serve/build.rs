@@ -93,6 +93,7 @@ impl ListenerLimits {
 pub struct Logs(
     Vec<super::jsonl::JsonLines>,
     Option<Arc<super::telemetry::Telemetry>>,
+    Option<Arc<super::usage_export::UsageExporter>>,
 );
 
 impl Logs {
@@ -104,6 +105,10 @@ impl Logs {
         }
         if let Some(telemetry) = &self.1 {
             telemetry.shutdown();
+        }
+        // Send the usage records still queued (a bounded wait), then stop the push.
+        if let Some(exporter) = &self.2 {
+            exporter.close();
         }
     }
 }
@@ -325,16 +330,66 @@ pub async fn build_app(
         }
         None => None,
     };
+    // The push of usage records to a control plane's ledger (note 0051): its token is read, and the
+    // address checked, here, so a wrong one fails at start.
+    let usage_exporter = match config
+        .usage_export
+        .as_ref()
+        .map(
+            |export| -> Result<Arc<super::usage_export::UsageExporter>, String> {
+                let ca = export
+                    .ca_file
+                    .as_ref()
+                    .map(|path| {
+                        std::fs::read(path).map_err(|e| {
+                            format!("ca_file: cannot read {}: {}", path.display(), e.kind())
+                        })
+                    })
+                    .transpose()?;
+                super::usage_export::UsageExporter::new(
+                    &super::usage_export::ExportSettings {
+                        url: &export.url,
+                        token: &export.token,
+                        batch_size: export.batch_size.map_or(200, |n| n as usize),
+                        flush_interval: Duration::from_millis(
+                            export.flush_interval_ms.unwrap_or(2000),
+                        ),
+                        queue_size: export.queue_size.map_or(10_000, |n| n as usize),
+                        ca_pem: ca.as_deref(),
+                    },
+                    env,
+                )
+                .map(Arc::new)
+            },
+        )
+        .transpose()
+    {
+        Ok(exporter) => exporter,
+        Err(message) => {
+            return Err(vec![Issue {
+                path: "usage_export".into(),
+                message,
+            }])
+        }
+    };
     // Attempt spans ride the usage recorder, so it exists when either is wanted.
-    let usage = if usage_log.is_some() || telemetry.is_some() {
+    let usage = if usage_log.is_some() || telemetry.is_some() || usage_exporter.is_some() {
         // An open server (`allow_unauthenticated`) attributes every request to
         // the tenant "anonymous", which no key names.
         if !keystore.is_enforced() {
             tenants.add(["anonymous".to_owned()]);
         }
-        let sink: Arc<dyn crate::gateway::usage::UsageSink> = match usage_log {
-            Some(log) => Arc::new(UsageLog(log)),
-            None => Arc::new(NoUsageLog),
+        let mut sinks: Vec<Arc<dyn crate::gateway::usage::UsageSink>> = Vec::new();
+        if let Some(log) = usage_log {
+            sinks.push(Arc::new(UsageLog(log)));
+        }
+        if let Some(exporter) = &usage_exporter {
+            sinks.push(exporter.clone());
+        }
+        let sink: Arc<dyn crate::gateway::usage::UsageSink> = match sinks.len() {
+            0 => Arc::new(NoUsageLog),
+            1 => sinks.remove(0),
+            _ => Arc::new(FanOut(sinks)),
         };
         Some(crate::gateway::usage::UsageSetup {
             sink,
@@ -665,7 +720,7 @@ pub async fn build_app(
         caller_keys: config.keys.len(),
         authenticated,
         admin_authenticated,
-        logs: Logs(logs, telemetry),
+        logs: Logs(logs, telemetry, usage_exporter),
         reload: reload.with_audit(audit.clone()),
         audit,
         media_store,
@@ -1171,6 +1226,17 @@ struct NoUsageLog;
 
 impl crate::gateway::usage::UsageSink for NoUsageLog {
     fn record(&self, _record: &crate::gateway::usage::UsageRecord) {}
+}
+
+/// Every sink a record goes to: the usage log and the push to the control plane.
+struct FanOut(Vec<Arc<dyn crate::gateway::usage::UsageSink>>);
+
+impl crate::gateway::usage::UsageSink for FanOut {
+    fn record(&self, record: &crate::gateway::usage::UsageRecord) {
+        for sink in &self.0 {
+            sink.record(record);
+        }
+    }
 }
 
 struct UsageLog(super::jsonl::JsonLines);

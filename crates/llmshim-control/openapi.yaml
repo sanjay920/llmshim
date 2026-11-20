@@ -198,6 +198,99 @@ paths:
         '400': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
+  /v1/usage/batch:
+    post:
+      operationId: ingestUsage
+      description: |
+        The gateways' usage push (design note 0051). Takes **only** the ingest token
+        (`--ingest-token-file`): no person's token, role or the shared token is accepted here, and the
+        ingest token is accepted nowhere else. With no ingest token configured every call is a 401, as for a wrong one.
+        Records are the gateway's usage log lines; unknown fields are ignored, a malformed record is
+        counted as rejected and not stored, and an attempt id that is already stored is a duplicate
+        (delivery is at least once, storage exactly once).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [records]
+              additionalProperties: false
+              properties:
+                records: {type: array, maxItems: 500, items: {type: object}}
+      responses:
+        '200':
+          description: What was done
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accepted, duplicate, rejected]
+                properties:
+                  accepted: {type: integer}
+                  duplicate: {type: integer}
+                  rejected: {type: integer}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/requests:
+    get:
+      operationId: listRequests
+      description: One row per provider attempt, newest first, keyset-paged. Metadata only.
+      parameters:
+        - {name: from, in: query, required: false, description: RFC 3339, inclusive, schema: {type: string, format: date-time}}
+        - {name: to, in: query, required: false, description: RFC 3339, exclusive, schema: {type: string, format: date-time}}
+        - {name: tenant, in: query, required: false, schema: {type: string, maxLength: 256}}
+        - {name: key, in: query, required: false, description: The caller key's name, schema: {type: string, maxLength: 256}}
+        - {name: model, in: query, required: false, schema: {type: string, maxLength: 256}}
+        - {name: provider, in: query, required: false, schema: {type: string, maxLength: 256}}
+        - {name: outcome, in: query, required: false, schema: {type: string, enum: [completed, http_failure, transport_failure, invalid_response, stream_failure, abandoned]}}
+        - {name: request_id, in: query, required: false, schema: {type: string, maxLength: 256}}
+        - {name: min_cost_usd, in: query, required: false, schema: {type: number, minimum: 0}}
+        - {name: cursor, in: query, required: false, description: The previous page's next_cursor, schema: {type: string}}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+      responses:
+        '200':
+          description: A page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RequestPage'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+  /v1/requests/summary:
+    get:
+      operationId: requestsSummary
+      description: |
+        Totals over the filtered rows and, with group_by, a breakdown (at most 500 groups). A cost that
+        is unknown is counted in cost_unknown_attempts and never added as zero; cost_estimated_attempts
+        counts attempts priced from a list or a lower bound rather than the provider's bill.
+      parameters:
+        - {name: from, in: query, required: false, description: RFC 3339, inclusive, schema: {type: string, format: date-time}}
+        - {name: to, in: query, required: false, description: RFC 3339, exclusive, schema: {type: string, format: date-time}}
+        - {name: tenant, in: query, required: false, schema: {type: string, maxLength: 256}}
+        - {name: key, in: query, required: false, description: The caller key's name, schema: {type: string, maxLength: 256}}
+        - {name: model, in: query, required: false, schema: {type: string, maxLength: 256}}
+        - {name: provider, in: query, required: false, schema: {type: string, maxLength: 256}}
+        - {name: outcome, in: query, required: false, schema: {type: string, enum: [completed, http_failure, transport_failure, invalid_response, stream_failure, abandoned]}}
+        - {name: request_id, in: query, required: false, schema: {type: string, maxLength: 256}}
+        - {name: min_cost_usd, in: query, required: false, schema: {type: number, minimum: 0}}
+        - {name: group_by, in: query, required: false, schema: {type: string, enum: [day, tenant, key, model, provider]}}
+      responses:
+        '200': {description: The summary}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+  /v1/requests/facets:
+    get:
+      operationId: requestsFacets
+      description: The distinct tenants, keys, models and providers in the ledger (at most 500 each), for filter lists.
+      parameters:
+        - {name: from, in: query, required: false, schema: {type: string, format: date-time}}
+      responses:
+        '200': {description: The values}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/orgs/{org}/snapshots:
     parameters: [{$ref: '#/components/parameters/org'}]
     post:
@@ -261,6 +354,41 @@ components:
       headers:
         WWW-Authenticate: {schema: {type: string, const: Bearer}}
   schemas:
+    RequestPage:
+      type: object
+      required: [requests]
+      properties:
+        next_cursor: {type: [string, 'null']}
+        requests:
+          type: array
+          items:
+            type: object
+            required: [attempt_id, ts, provider, model, outcome, duration_ms, input_tokens, output_tokens]
+            properties:
+              attempt_id: {type: string}
+              ts: {type: string, format: date-time}
+              tenant: {type: [string, 'null']}
+              key: {type: [string, 'null']}
+              request_id: {type: [string, 'null']}
+              deployment: {type: [string, 'null']}
+              provider: {type: string}
+              model: {type: string}
+              kind: {type: string, enum: [completion, stream]}
+              outcome: {type: string}
+              http_status: {type: [integer, 'null']}
+              duration_ms: {type: integer}
+              input_tokens: {type: integer}
+              output_tokens: {type: integer}
+              reasoning_tokens: {type: [integer, 'null']}
+              uncached_input_tokens: {type: [integer, 'null']}
+              cache_read_tokens: {type: integer}
+              cache_write_tokens: {type: integer}
+              cache_hit_pct: {type: [number, 'null'], description: Cache reads as a share of the whole prompt; null when the uncached part was not reported}
+              cost_usd: {type: [number, 'null'], description: null means unknown, never free}
+              cost_source: {type: [string, 'null'], enum: [provider, provider_floor, catalog, null]}
+              usage_reported: {type: boolean}
+              admission: {type: string}
+              tags: {type: [object, 'null']}
     Error:
       type: object
       required: [error]
