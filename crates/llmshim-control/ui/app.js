@@ -99,6 +99,10 @@ async function api(path, params) {
 const redirectUri = () => location.origin + "/ui/";
 
 async function beginOidc() {
+  if (!window.crypto || !crypto.subtle) {
+    renderSignIn("Sign-in through the identity provider needs a secure connection (https, or localhost). Paste a token instead.");
+    return;
+  }
   const oidc = session.config.oidc;
   const verifier = randomString(48);
   const state = randomString(24);
@@ -179,8 +183,10 @@ function tile(label, value, note) {
 
 async function viewHome() {
   let range = "7d";
+  let generation = 0;
   const body = h("div");
   async function load() {
+    const mine = ++generation;
     body.replaceChildren(h("p", { class: "muted" }, "Loading…"));
     const from = sinceOf(range);
     const [all, byDay, byModel] = await Promise.all([
@@ -188,6 +194,7 @@ async function viewHome() {
       api("/v1/requests/summary", { from, group_by: "day" }),
       api("/v1/requests/summary", { from, group_by: "model" }),
     ]);
+    if (mine !== generation) return;
     const t = all.totals;
     const costNote = [
       t.cost_estimated_attempts ? t.cost_estimated_attempts + " estimated or partial" : null,
@@ -212,8 +219,9 @@ async function viewHome() {
       h("h2", {}, "By model"), groupTable(byModel.groups, "Model"),
       h("p", { class: "foot" }, "Spend adds only the costs that are known. “est” is a price-list estimate, “≥” a lower bound; attempts with no price are counted above, never added as zero."));
   }
-  const view = h("div", {}, h("h1", {}, "Home"), h("div", { class: "filters" }, rangeSelect(range, (v) => { range = v; load().catch(showError); })), body);
-  load().catch(showError);
+  const view = h("div", {}, h("h1", {}, "Home"), h("div", { class: "filters" }, rangeSelect(range, (v) => { range = v; load().catch(fail); })), body);
+  const fail = showErrorFor(view);
+  load().catch(fail);
   return view;
 }
 
@@ -240,13 +248,25 @@ async function viewRequests() {
   const detail = h("div");
   const status = h("p", { class: "muted" });
   let cursor = null;
+  // Each reload starts a new generation; an answer from an older one is dropped, so a slow response
+  // can never clear or fill the table for filters that are no longer selected.
+  let generation = 0;
 
-  const select = (name, label, values) => h("select", { "aria-label": label, onchange: (e) => { filters[name] = e.target.value; reload().catch(showError); } },
+  const select = (name, label, values) => h("select", { "aria-label": label, onchange: (e) => { filters[name] = e.target.value; reload().catch((e) => fail(e)); } },
     h("option", { value: "" }, "Any " + label.toLowerCase()), values.map((v) => h("option", { value: v }, v)));
   const text = (name, label, width) => {
     const input = h("input", { type: "search", placeholder: label, "aria-label": label, style: false });
     input.style.width = width;
-    input.addEventListener("change", () => { filters[name] = input.value.trim(); reload().catch(showError); });
+    input.addEventListener("change", () => {
+      const value = input.value.trim();
+      // A number is the only thing the server accepts here; say so next to the box instead of failing the view.
+      const bad = name === "min_cost_usd" && value !== "" && !(Number.isFinite(Number(value)) && Number(value) >= 0);
+      input.setCustomValidity(bad ? "A number of dollars, 0 or more" : "");
+      input.title = bad ? "A number of dollars, 0 or more" : "";
+      if (bad) { input.reportValidity(); return; }
+      filters[name] = value;
+      reload().catch((e) => fail(e));
+    });
     return input;
   };
 
@@ -286,8 +306,10 @@ async function viewRequests() {
     detail.scrollIntoView({ block: "nearest" });
   }
   async function load(append) {
+    const mine = generation;
     more.disabled = true;
     const page = await api("/v1/requests", query());
+    if (mine !== generation) return;
     if (!append) tbody.replaceChildren();
     for (const r of page.requests) tbody.append(row(r));
     cursor = page.next_cursor;
@@ -295,12 +317,13 @@ async function viewRequests() {
     more.disabled = false;
     status.textContent = tbody.children.length ? "" : "No requests match.";
   }
-  async function reload() { cursor = null; detail.replaceChildren(); await load(false); }
-  more.addEventListener("click", () => load(true).catch(showError));
+  async function reload() { generation += 1; cursor = null; detail.replaceChildren(); await load(false); }
+  more.addEventListener("click", () => load(true).catch((e) => fail(e)));
 
+  let fail = () => {};
   const view = h("div", {}, h("h1", {}, "Requests"),
     h("div", { class: "filters" },
-      rangeSelect(filters.range, (v) => { filters.range = v; reload().catch(showError); }),
+      rangeSelect(filters.range, (v) => { filters.range = v; reload().catch((e) => fail(e)); }),
       select("tenant", "Tenant", facets.tenants || []), select("key", "Client", facets.keys || []),
       select("model", "Model", facets.models || []), select("provider", "Provider", facets.providers || []),
       select("outcome", "Outcome", OUTCOMES), text("request_id", "Request id", "190px"), text("min_cost_usd", "Min cost, USD", "130px")),
@@ -310,13 +333,19 @@ async function viewRequests() {
         h("th", { class: "num" }, "Duration"), h("th", { class: "num" }, "Cost"))), tbody)),
     status, h("p", {}, more), detail,
     h("p", { class: "foot" }, "One row per provider attempt: a retry or a fallback is its own row. In counts the whole prompt including cache; Cache is the share read from cache. “est” is a price-list estimate, “≥” a lower bound, “—” an unknown cost."));
-  reload().catch(showError);
+  fail = showErrorFor(view);
+  reload().catch((e) => fail(e));
   return view;
 }
 
 // ---- shell ---------------------------------------------------------------------------------
 
 const VIEWS = { home: ["Home", viewHome], requests: ["Requests", viewRequests] };
+
+// An error from a view the person has already left is not shown over the one they are on.
+function showErrorFor(el) {
+  return (error) => { if (el.isConnected || (error instanceof ApiError && error.status === 401)) showError(error); };
+}
 
 function showError(error) {
   if (error instanceof ApiError && error.status === 401) {
@@ -326,16 +355,21 @@ function showError(error) {
   $("main").replaceChildren(h("p", { class: "err", role: "alert" }, error.message || String(error)));
 }
 
+let routing = 0;
+
 async function route() {
+  const turn = ++routing;
   const name = (location.hash.replace(/^#\/?/, "") || "home").split("?")[0];
   const [, view] = VIEWS[name] || VIEWS.home;
   const current = VIEWS[name] ? name : "home";
   $("nav").replaceChildren(...Object.entries(VIEWS).map(([key, [label]]) =>
     h("a", { href: "#/" + key, "aria-current": key === current ? "page" : false }, label)));
   try {
-    $("main").replaceChildren(await view());
+    const page = await view();
+    // A view that was still being built when the person moved on must not replace the one they asked for.
+    if (turn === routing) $("main").replaceChildren(page);
   } catch (error) {
-    showError(error);
+    if (turn === routing) showError(error);
   }
 }
 

@@ -35,10 +35,11 @@ fn origin_of(url: &str) -> Option<String> {
     if scheme != "https" && scheme != "http" {
         return None;
     }
+    // Visible ASCII only, and none of what a policy source list or a browser would read differently:
+    // `;` and `,` and space end a source, `\` is read as `/`, `'` and `*` are policy syntax.
     if url.contains('#')
-        || url
-            .chars()
-            .any(|c| c.is_control() || c == ' ' || c == ';' || c == ',')
+        || !url.bytes().all(|b| (0x21..0x7f).contains(&b))
+        || url.contains([';', ',', '\\', '\''])
     {
         return None;
     }
@@ -46,14 +47,36 @@ fn origin_of(url: &str) -> Option<String> {
     if authority.is_empty() || authority.contains('@') {
         return None;
     }
-    let host = if authority.starts_with('[') {
-        authority
-            .split_once(']')
-            .map_or(authority, |(h, _)| &authority[..=h.len()])
+    let port_ok =
+        |port: &str| (1..=5).contains(&port.len()) && port.bytes().all(|b| b.is_ascii_digit());
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        // A bracketed IPv6 literal, then nothing or `:port`.
+        let (literal, after) = inner.split_once(']')?;
+        if literal.is_empty()
+            || !literal
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+            || !(after.is_empty() || after.strip_prefix(':').is_some_and(port_ok))
+        {
+            return None;
+        }
+        format!("[{literal}]")
     } else {
-        authority.split(':').next().unwrap_or(authority)
+        let (host, port) = match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        };
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            || port.is_some_and(|p| !port_ok(p))
+        {
+            return None;
+        }
+        host.to_owned()
     };
-    let loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
+    let loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]");
     if scheme == "http" && !loopback {
         return None;
     }
@@ -187,6 +210,14 @@ mod tests {
             Some("https://idp.example.com:8443")
         );
         assert_eq!(
+            origin_of("https://[2001:db8::1]:8443/t").as_deref(),
+            Some("https://[2001:db8::1]:8443")
+        );
+        assert_eq!(
+            origin_of("http://[::1]:9/t").as_deref(),
+            Some("http://[::1]:9")
+        );
+        assert_eq!(
             origin_of("http://localhost:8080/t").as_deref(),
             Some("http://localhost:8080")
         );
@@ -196,6 +227,17 @@ mod tests {
             "https://idp.example.com/t#frag",
             "ftp://idp.example.com",
             "https://",
+            "https://*/token",
+            "https://*.example.com/t",
+            "https://idp.example.com\\@evil.test/t",
+            "https://idp.example.com:port/t",
+            "https://idp.example.com:123456/t",
+            "https://[abc/t",
+            "https://[xyz]/t",
+            "https://[::1]x/t",
+            "https://idp.exa'mple.com/t",
+            "https://idp.example.com/t'",
+            "https://idp_example.com/t",
             "https://idp.example.com; script-src *",
             "https://idp.example.com/a b",
             "idp.example.com",

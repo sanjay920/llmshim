@@ -195,6 +195,13 @@ fn a_sign_in_that_could_leak_a_code_or_widen_the_policy_is_refused_at_start() {
         ("token_endpoint", "http://idp.example.test/token"),
         ("token_endpoint", "https://idp.example.test; script-src *"),
         ("token_endpoint", "https://user:pw@idp.example.test/token"),
+        ("token_endpoint", "https://*/token"),
+        ("token_endpoint", "https://*.example.test/token"),
+        (
+            "token_endpoint",
+            "https://idp.example.test\\@evil.test/token",
+        ),
+        ("token_endpoint", "https://idp.example.test:notaport/token"),
         ("authorization_endpoint", "javascript:alert(1)"),
         ("authorization_endpoint", "https://idp.example.test/a#frag"),
         ("client_id", ""),

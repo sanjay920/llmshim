@@ -81,7 +81,9 @@ payloads. That is a privacy decision of its own and is **not** in the first slic
   smoke run below used a key named `<img src=x onerror=alert(1)>`.
 - **Sign-in.** The issuer file (0049) may carry a `ui` object: `client_id`, `authorization_endpoint`,
   `token_endpoint` and an optional `scope` (default `openid`). Validation is by field and never echoes a value: https
-  only (http for `localhost`), no credentials or fragment in an endpoint, visible ASCII for the id and scope. The
+  only (http for `localhost`), a plain host (letters, digits, dots, hyphens, or a bracketed IPv6 literal) and a numeric
+  port, no credentials, fragment, backslash, quote or wildcard in an endpoint (so the origin put in `connect-src` is
+  exactly the origin the browser will call), visible ASCII for the id and scope. The
   page runs authorization code with PKCE (a random verifier and `state` held in `sessionStorage` for the one round
   trip, `S256`) with the redirect to `/ui/`, exchanges the code at the token endpoint, and sends the **access
   token** as a bearer exactly as a script would, so `audience` in the issuer file must be the audience of the access
