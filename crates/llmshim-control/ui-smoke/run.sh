@@ -25,6 +25,7 @@ base=""
 for _ in $(seq 1 100); do
   base="$(grep -o 'http://[0-9.:]*' "$dir/server.log" | head -1 || true)"
   if [ -n "$base" ]; then break; fi
+  if ! kill -0 "$server" 2>/dev/null; then break; fi
   sleep 0.2
 done
 if [ -z "$base" ]; then
@@ -33,5 +34,6 @@ if [ -z "$base" ]; then
   exit 1
 fi
 cd "$here"
-if [ ! -d node_modules ]; then npm install --no-audit --no-fund --silent; fi
+# The lockfile is committed: install exactly it (puppeteer-core has no download step, so no scripts are needed).
+if [ ! -d node_modules ]; then npm ci --ignore-scripts --no-audit --no-fund --silent; fi
 BASE="$base" TOKEN="$admin" INGEST="$ingest" CHROME="$chrome" node smoke.mjs

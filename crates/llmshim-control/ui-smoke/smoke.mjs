@@ -1,11 +1,11 @@
 // Headless-browser smoke test of the admin UI (note 0055). Started by run.sh against a real control plane. It seeds two
 // requests, then fails on: a page error, a console error or warning (which includes every CSP violation), a request to
 // any origin but the control plane's own, a section that renders nothing, and a secret that is not shown exactly once.
+// Waits are on conditions, not on time; a thrown error still prints everything the page reported before it.
 import puppeteer from "puppeteer-core";
 
 const { BASE, TOKEN, INGEST, CHROME } = process.env;
 const fail = (message) => { console.error("FAIL: " + message); process.exitCode = 1; };
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const origin = new URL(BASE).origin;
 
 // Two requests of one client whose system prompt changed, so the cache debugger has something to say.
@@ -33,90 +33,111 @@ const browser = await puppeteer.launch({ executablePath: CHROME, headless: true,
 const page = await browser.newPage();
 await page.setViewport({ width: 1400, height: 1000 });
 const problems = [];
-page.on("console", (m) => { if (["error", "warning"].includes(m.type())) problems.push("console: " + m.text()); });
+const refusals = []; // every 4xx/5xx the page saw, so the 401 this test provokes is matched, not assumed
+page.on("console", (m) => { if (["error", "warning"].includes(m.type())) problems.push("console: " + m.text() + " " + (m.location().url || "")); });
 page.on("pageerror", (e) => problems.push("pageerror: " + e.message));
 page.on("dialog", async (d) => { problems.push("dialog: " + d.message()); await d.dismiss(); });
 page.on("request", (r) => {
   const url = r.url();
   if (!url.startsWith("data:") && !url.startsWith("blob:") && new URL(url).origin !== origin) problems.push("foreign request: " + url);
 });
+page.on("response", (r) => { if (r.status() >= 400) refusals.push(`${r.status()} ${new URL(r.url()).pathname}`); });
+
 const clickText = (label) => page.$$eval("button", (bs, l) => {
   const b = bs.find((x) => x.textContent.trim() === l);
   if (!b) throw new Error("no button " + l);
   b.click();
 }, label);
+const until = (what, fn, arg, timeout = 15_000) =>
+  page.waitForFunction(fn, { timeout }, arg).catch(() => { throw new Error("timed out waiting for " + what); });
+const visibleText = (selector) => page.$eval(selector, (e) => e.innerText.trim()).catch(() => "");
 
-const shell = await fetch(`${BASE}/ui/`);
-const csp = shell.headers.get("content-security-policy") || "";
-if (!/default-src 'none'|default-src 'self'/.test(csp) || /script-src[^;]*unsafe/.test(csp)) fail("the UI's CSP is missing or loose: " + csp);
+try {
+  const shell = await fetch(`${BASE}/ui/`);
+  const csp = shell.headers.get("content-security-policy") || "";
+  const directives = Object.fromEntries(csp.split(";").map((d) => d.trim()).filter(Boolean).map((d) => [d.split(" ")[0], d]));
+  if (!directives["default-src"]) fail("the UI's CSP has no default-src: " + csp);
+  for (const name of ["default-src", "script-src", "style-src", "connect-src"]) {
+    if (directives[name] && /'unsafe-|\*/.test(directives[name])) fail(`the UI's CSP ${name} is loose: ${directives[name]}`);
+  }
 
-// A wrong token is refused; the right one opens the sections.
-await page.goto(`${BASE}/ui/`);
-await page.waitForSelector("input[type=password]");
-await page.type("input[type=password]", "not-the-token-0123456789-abcdef");
-await page.click("form button[type=submit]");
-await wait(800);
-// The refusal is the browser's own console line for the 401 we asked for; nothing else is excused.
-for (let i = problems.length - 1; i >= 0; i--) if (problems[i].includes("status of 401")) problems.splice(i, 1);
-if (await page.$(".nav a")) fail("a wrong token signed in");
-await page.$eval("input[type=password]", (e) => { e.value = ""; });
-await page.type("input[type=password]", TOKEN);
-await page.click("form button[type=submit]");
-await page.waitForSelector(".nav a", { timeout: 10_000 });
+  // A wrong token is refused by the server and does not sign in.
+  await page.goto(`${BASE}/ui/`);
+  await page.waitForSelector("input[type=password]");
+  await page.type("input[type=password]", "not-the-token-0123456789-abcdef");
+  await page.click("form button[type=submit]");
+  for (let i = 0; i < 100 && !refusals.some((r) => r.startsWith("401")); i++) await new Promise((r) => setTimeout(r, 100));
+  if (!refusals.some((r) => r.startsWith("401"))) fail("the server never answered the wrong token with a 401: " + JSON.stringify(refusals));
+  if (await page.$(".nav a")) fail("a wrong token signed in");
+  // The browser's own console line for that provoked 401 is excused, and only that.
+  for (let i = problems.length - 1; i >= 0; i--) if (/status of 401/.test(problems[i])) problems.splice(i, 1);
 
-const keys = await page.$$eval(".nav a", (as) => as.map((a) => a.dataset.key));
-if (keys.length < 5) fail("only " + keys.length + " sections in the navigation: " + keys);
-for (const key of keys) {
-  await page.evaluate((k) => { location.hash = "#/" + k; }, key);
-  await wait(900);
-  const text = await page.$eval("main", (e) => e.innerText.trim()).catch(() => "");
-  if (text.length < 20) fail(`the ${key} section rendered ${text.length} characters`);
-}
+  await page.$eval("input[type=password]", (e) => { e.value = ""; });
+  await page.type("input[type=password]", TOKEN);
+  await page.click("form button[type=submit]");
+  await page.waitForSelector(".nav a", { timeout: 10_000 });
 
-// Requests: the seeded rows, a sheet that opens and closes, and the verdict on the changed prompt.
-await page.evaluate(() => { location.hash = "#/requests"; });
-await wait(900);
-const rows = await page.$$("tbody tr.row");
-if (rows.length < 2) fail("the Requests table shows " + rows.length + " rows, expected the 2 seeded");
-else {
-  await rows[0].click();
-  await page.waitForSelector(".sheet", { timeout: 5000 }).catch(() => fail("a request's sheet did not open"));
-  await wait(1200); // the structure verdict is fetched after the sheet opens
-  const sheet = await page.$eval(".sheet", (e) => e.innerText).catch(() => "");
-  if (!/first change|changed|system/i.test(sheet)) fail("the sheet does not say where the prompt changed: " + sheet.slice(0, 200));
+  // Every section becomes current, renders, and shows no error banner.
+  const keys = await page.$$eval(".nav a", (as) => as.map((a) => a.dataset.key));
+  if (keys.length < 5) fail("only " + keys.length + " sections in the navigation: " + keys);
+  for (const key of keys) {
+    await page.evaluate((k) => { location.hash = "#/" + k; }, key);
+    await until(`the ${key} section to be current`, (k) => document.querySelector(`.nav a[data-key="${k}"]`)?.getAttribute("aria-current") === "page", key);
+    await until(`the ${key} section to render`, () => (document.querySelector("main")?.innerText.trim().length || 0) > 20);
+    const failed = await page.$$eval(".notice.bad, .error, [role=alert]", (e) => e.map((x) => x.innerText.trim()).filter(Boolean)).catch(() => []);
+    if (failed.length) fail(`the ${key} section shows an error: ${failed[0].slice(0, 160)}`);
+  }
+
+  // Requests: the seeded rows; the newest (the changed prompt) opens a sheet that names the first change.
+  await page.evaluate(() => { location.hash = "#/requests"; });
+  await until("the two seeded rows", () => document.querySelectorAll("tbody tr.row").length >= 2);
+  const rows = await page.$$("tbody tr.row");
+  await rows[0].click(); // newest first: smoke-2, whose system prompt differs from smoke-1's
+  await page.waitForSelector(".sheet", { timeout: 5000 });
+  await until("the cache verdict", () => /Matched the previous request/.test(document.querySelector(".sheet")?.innerText || ""));
+  const sheet = await visibleText(".sheet");
+  if (!/first change was at the [^.]*system/i.test(sheet)) fail("the sheet's verdict does not name the system prompt: " + sheet.slice(0, 300));
   await page.keyboard.press("Escape");
-  await wait(300);
-  if (await page.$(".sheet")) fail("Escape did not close the sheet");
+  await until("the sheet to close", () => !document.querySelector(".sheet"), null, 5000).catch(() => fail("Escape did not close the sheet"));
+
+  // An organization, team, project and client are created through the forms; the secret is shown once.
+  await page.evaluate(() => { location.hash = "#/admin"; });
+  await clickText("New organization");
+  await page.waitForSelector('input[placeholder="Organization name"]');
+  await page.type('input[placeholder="Organization name"]', "Smoke Org");
+  await clickText("Create organization");
+  await until("the organization to appear", () => /Smoke Org/.test(document.querySelector("main")?.innerText || ""));
+  await clickText("Team");
+  await page.waitForSelector('input[aria-label="Team name"]');
+  await page.type('input[aria-label="Team name"]', "Platform");
+  await page.keyboard.press("Enter");
+  await until("the team to appear", () => /Platform/.test(document.querySelector("main")?.innerText || ""));
+  await clickText("Project");
+  await page.waitForSelector('input[aria-label="Project name"]');
+  await page.type('input[aria-label="Project name"]', "Checkout");
+  await page.keyboard.press("Enter");
+  await until("the project to appear", () => /Checkout/.test(document.querySelector("main")?.innerText || ""));
+  await page.evaluate(() => { location.hash = "#/clients"; });
+  await until("the clients view", () => document.querySelector(".nav a[data-key=clients]")?.getAttribute("aria-current") === "page");
+  await clickText("New client");
+  await page.waitForSelector('input[placeholder="e.g. checkout-prod"]');
+  await page.type('input[placeholder="e.g. checkout-prod"]', "smoke-client");
+  await page.$eval('input[placeholder="e.g. checkout-prod"]', (e) => e.form.requestSubmit());
+  await page.waitForSelector("input.secret", { timeout: 10_000 });
+  const shown = await page.$eval("input.secret", (e) => e.value);
+  if (shown.length < 20) fail("the secret shown for the new client is too short to be one");
+  await clickText("I have stored it");
+  await until("the secret to be dismissed", () => !document.querySelector("input.secret"), null, 5000).catch(() => fail("the secret is still on screen after it was stored"));
+  const leaked = await page.evaluate((secret) => document.documentElement.outerHTML.includes(secret) ||
+    [...document.querySelectorAll("input,textarea")].some((e) => e.value.includes(secret)), shown);
+  if (leaked) fail("the secret is still in the page after it was dismissed");
+
+  console.log(`ui smoke: ${keys.length} sections, ${rows.length} request rows`);
+} catch (error) {
+  fail(String(error && error.stack ? error.stack : error));
+} finally {
+  // Whatever the page reported is printed even when the run died on a timeout: it is usually the cause.
+  if (problems.length) fail("the page reported:\n  " + problems.join("\n  "));
+  await browser.close();
+  console.log(process.exitCode ? "ui smoke: FAILED" : "ui smoke: ok");
 }
-
-// A client is created and its secret is shown once.
-await page.evaluate(() => { location.hash = "#/admin"; });
-await wait(700);
-await clickText("New organization");
-await page.waitForSelector('input[placeholder="Organization name"]');
-await page.type('input[placeholder="Organization name"]', "Smoke Org");
-await clickText("Create organization"); await wait(800);
-await clickText("Team");
-await page.waitForSelector('input[aria-label="Team name"]');
-await page.type('input[aria-label="Team name"]', "Platform");
-await page.keyboard.press("Enter"); await wait(800);
-await clickText("Project");
-await page.waitForSelector('input[aria-label="Project name"]');
-await page.type('input[aria-label="Project name"]', "Checkout");
-await page.keyboard.press("Enter"); await wait(800);
-await page.evaluate(() => { location.hash = "#/clients"; });
-await wait(700);
-await clickText("New client");
-await page.waitForSelector('input[placeholder="e.g. checkout-prod"]');
-await page.type('input[placeholder="e.g. checkout-prod"]', "smoke-client");
-await page.$eval('input[placeholder="e.g. checkout-prod"]', (e) => e.form.requestSubmit());
-await wait(1000);
-const shown = await page.$eval("input.secret", (e) => e.value).catch(() => "");
-if (shown.length < 20) fail("no secret was shown for the new client");
-await clickText("I have stored it"); await wait(400);
-if (await page.$("input.secret")) fail("the secret is still on screen after it was stored");
-if (shown && (await page.content()).includes(shown)) fail("the secret is still in the page after it was dismissed");
-
-if (problems.length) fail("the page reported:\n  " + problems.join("\n  "));
-await browser.close();
-console.log(process.exitCode ? "ui smoke: FAILED" : `ui smoke: ok (${keys.length} sections, ${rows.length} request rows)`);
