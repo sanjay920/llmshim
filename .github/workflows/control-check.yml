@@ -66,3 +66,25 @@ jobs:
           LLMSHIM_CONTROL_TEST_POSTGRES_URL: postgres://postgres:pw@127.0.0.1:5432/postgres?sslmode=disable
           LLMSHIM_CONTROL_REQUIRE_POSTGRES: '1'
         run: cargo test --locked
+
+  ui-smoke:
+    # The admin UI in a real browser (note 0055): every section renders, nothing is logged (a CSP violation is a
+    # console error), nothing leaves the origin, a new client's secret is shown once. Runs the real binary.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build the control plane
+        working-directory: crates/llmshim-control
+        env:
+          LLMSHIM_CATALOG_OFFLINE: '1'
+        run: cargo build --locked
+      - name: Smoke test the UI
+        working-directory: crates/llmshim-control
+        env:
+          CHROME: /usr/bin/google-chrome
+        run: bash ui-smoke/run.sh

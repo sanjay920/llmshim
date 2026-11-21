@@ -391,6 +391,23 @@ async fn open_payload(
     (status, response.json().await.unwrap_or(Value::Null), cache)
 }
 
+/// The sealed object is written after the usage record is exported, so a first open may find nothing yet: ask until
+/// it answers (the same wait the cut-limit test has always done).
+async fn open_payload_when_ready(
+    admin: &str,
+    token: &str,
+    body: Value,
+) -> (u16, Value, Option<String>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let answer = open_payload(admin, Some(token), body.clone()).await;
+        if answer.0 != 404 || std::time::Instant::now() > deadline {
+            return answer;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_payload_is_sealed_on_the_data_plane_and_opens_only_through_the_admin_listener() {
     let (up, _mock) = upstream().await;
@@ -474,7 +491,7 @@ async fn a_payload_is_sealed_on_the_data_plane_and_opens_only_through_the_admin_
     let admin = server.admin.clone().unwrap();
     // Plain, the answer is the document and nothing is cut into segments (no work for a view that does not want it).
     let (status, plain, _) =
-        open_payload(&admin, Some(OPEN_TOKEN), json!({"reference": reference})).await;
+        open_payload_when_ready(&admin, OPEN_TOKEN, json!({"reference": reference})).await;
     assert_eq!(status, 200, "{plain}");
     assert!(plain["segments"].is_null(), "{plain}");
     // Asked for, with the segments.
@@ -798,7 +815,7 @@ async fn the_answer_is_not_captured_unless_the_operator_turns_it_on() {
     let reference = ci[0]["payload"]["reference"].as_str().unwrap().to_owned();
     let admin = server.admin.clone().unwrap();
     let (status, body, _) =
-        open_payload(&admin, Some(OPEN_TOKEN), json!({"reference": reference})).await;
+        open_payload_when_ready(&admin, OPEN_TOKEN, json!({"reference": reference})).await;
     assert_eq!(status, 200, "{body}");
     assert!(body["payload"]["response"].is_null(), "{body}");
     assert!(body["payload"]["request"]["text"]
