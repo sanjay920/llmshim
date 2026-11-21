@@ -10,11 +10,15 @@ miss scan) holds the connection for as long as it likes, and every request behin
 
 ## What is built
 
-- **Bounded line.** `with_store` takes one of 64 permits before it waits for the lock, for at most 10 s. Past that the
-  answer is 503 `store_busy` with `Retry-After: 5`. A slow query now delays at most the 64 requests in line; the rest
-  are refused at once, and the gateways' exporter (which retries) is not left holding threads.
+- **Bounded line, bounded time.** `with_store` takes one of 16 permits, and the usage batches one of 64 on a line of
+  their own, so a burst of dashboard reads cannot take a gateway's turn (a batch waits behind at most 16 reads). One
+  10 s deadline covers the wait for a permit and then for the connection; past it the answer is 503 `store_busy` with
+  `Retry-After: 5`, and the work never runs, so a caller already told to retry does not also have its write happen.
+  The lock is polled, not awaited. Still not a latency cap on work already running: a request holds the connection for
+  at most the statement budget.
 - **A statement budget on SQLite**, as Postgres already had (`statement_timeout` 30 s): a transaction running past 30 s
-  is interrupted by a progress handler, which is cleared afterwards. `busy_timeout` is 5 s.
+  is interrupted by a progress handler, cleared after the transaction even if the work panics. It surfaces as
+  503 `store_timeout` (`Error::Timeout`, nothing written), not a 500. `busy_timeout` is 5 s, set first.
 - The miss scan was already bounded (20,000 rows, `truncated` says so).
 
 ## Not built, and why
@@ -27,5 +31,6 @@ miss scan) holds the connection for as long as it likes, and every request behin
 
 ## Tests
 
-`a_full_queue_for_the_store_is_a_503_with_retry_after_not_a_hang` (api.rs),
-`a_sqlite_transaction_past_its_budget_is_interrupted` (db.rs).
+api.rs: a full queue is a 503 with Retry-After, usage batches have their own line, work is not run past the deadline,
+the budget is a 503. db.rs: a transaction past its budget is `Timeout` and the next one is not cut, the handler is
+cleared when the work panics (a thread-local test budget drives the production path).

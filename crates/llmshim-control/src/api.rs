@@ -55,14 +55,19 @@ pub const MIN_TOKEN_LEN: usize = 22;
 /// Requests that may be waiting for, or holding, the store at once. The store is one connection behind one lock, so
 /// every request is serialized; more than this many in line means the database is slower than the callers, and the
 /// answer is an immediate 503 rather than a growing pile of blocked threads.
-const STORE_QUEUE: usize = 64;
+const STORE_QUEUE: usize = 16;
+/// The same for usage batches. A batch waits behind at most `STORE_QUEUE` reads and `INGEST_QUEUE` other batches.
+const INGEST_QUEUE: usize = 64;
 /// The longest one request waits for its turn before it is told the control plane is busy.
 const STORE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct AppState {
     store: Mutex<Store>,
-    /// Admission to the store: `STORE_QUEUE` permits, held until the work is done.
+    /// Admission to the store for everything but the gateways' usage batches: `STORE_QUEUE` permits, held until the
+    /// work is done.
     gate: Arc<tokio::sync::Semaphore>,
+    /// The gateways' usage batches have a line of their own, so a burst of dashboard reads cannot take their turn.
+    ingest_gate: Arc<tokio::sync::Semaphore>,
     store_wait: std::time::Duration,
     /// The shared token's digest; `None` when SSO is on and break-glass is off.
     token_digest: Option<[u8; 32]>,
@@ -109,6 +114,7 @@ impl AppState {
         Arc::new(Self {
             store: Mutex::new(store),
             gate: Arc::new(tokio::sync::Semaphore::new(STORE_QUEUE)),
+            ingest_gate: Arc::new(tokio::sync::Semaphore::new(INGEST_QUEUE)),
             store_wait: STORE_WAIT,
             token_digest: Some(Sha256::digest(token.as_bytes()).into()),
             signing_key_file,
@@ -134,6 +140,7 @@ impl AppState {
         Arc::new(Self {
             store: Mutex::new(store),
             gate: Arc::new(tokio::sync::Semaphore::new(STORE_QUEUE)),
+            ingest_gate: Arc::new(tokio::sync::Semaphore::new(INGEST_QUEUE)),
             store_wait: STORE_WAIT,
             token_digest: token.map(|token| Sha256::digest(token.as_bytes()).into()),
             signing_key_file,
@@ -264,7 +271,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let retry = self.code == "store_busy";
+        let retry = self.code.starts_with("store_");
         let mut response = (
             self.status,
             Json(json!({"error": {"code": self.code, "message": self.message}})),
@@ -291,6 +298,11 @@ impl From<Error> for ApiError {
                 Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
             }
             Error::Conflict(message) => Self::new(StatusCode::CONFLICT, "conflict", message),
+            Error::Timeout => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "store_timeout",
+                "the database statement ran past its time budget and was stopped; nothing was written",
+            ),
             Error::Snapshot(detail) => {
                 // The detail may name a key file's contents' shape; it stays in the log.
                 eprintln!("control: snapshot signing failed: {detail}");
@@ -345,6 +357,22 @@ async fn with_store<T: Send + 'static>(
     state: &Arc<AppState>,
     work: impl FnOnce(&mut Store) -> crate::Result<T> + Send + 'static,
 ) -> ApiResult<T> {
+    run_in_store(state, state.gate.clone(), work).await
+}
+
+/// As [`with_store`], on the usage batches' own line.
+async fn with_store_ingest<T: Send + 'static>(
+    state: &Arc<AppState>,
+    work: impl FnOnce(&mut Store) -> crate::Result<T> + Send + 'static,
+) -> ApiResult<T> {
+    run_in_store(state, state.ingest_gate.clone(), work).await
+}
+
+async fn run_in_store<T: Send + 'static>(
+    state: &Arc<AppState>,
+    gate: Arc<tokio::sync::Semaphore>,
+    work: impl FnOnce(&mut Store) -> crate::Result<T> + Send + 'static,
+) -> ApiResult<T> {
     let busy = || {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -352,17 +380,30 @@ async fn with_store<T: Send + 'static>(
             "the control plane's database is busy; retry shortly",
         )
     };
-    // Waiting for a turn is bounded in length (the permits) and in time, so a slow query holds up its own queue and
-    // nothing more: callers past it get a 503 and a Retry-After instead of blocking threads without end.
-    let permit = tokio::time::timeout(state.store_wait, state.gate.clone().acquire_owned())
+    // The whole wait (for a permit and then for the connection) is bounded in length (the permits) and in time (one
+    // deadline for both), so a slow query holds up its own line and nothing more: callers past it get a 503 and a
+    // Retry-After, and work whose caller has already been told so never runs.
+    let deadline = std::time::Instant::now() + state.store_wait;
+    let permit = tokio::time::timeout(state.store_wait, gate.acquire_owned())
         .await
         .map_err(|_| busy())?
         .map_err(|_| busy())?;
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
-        work(&mut store)
+        let mut store = loop {
+            match state.store.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(None);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        };
+        work(&mut store).map_err(Some)
     })
     .await
     .map_err(|_| {
@@ -372,7 +413,10 @@ async fn with_store<T: Send + 'static>(
             "internal error",
         )
     })?
-    .map_err(ApiError::from)
+    .map_err(|error| match error {
+        Some(error) => ApiError::from(error),
+        None => busy(),
+    })
 }
 
 fn actor(headers: &HeaderMap) -> ApiResult<String> {
@@ -817,7 +861,7 @@ async fn ingest_usage(
     State(s): State<Arc<AppState>>,
     Json(body): Json<IngestBody>,
 ) -> ApiResult<Json<Value>> {
-    let counts = with_store(&s, move |st| st.ingest_requests(&body.records)).await?;
+    let counts = with_store_ingest(&s, move |st| st.ingest_requests(&body.records)).await?;
     Ok(Json(json!(counts)))
 }
 
@@ -1549,6 +1593,64 @@ mod tests {
         // Released, the store answers again.
         drop(held);
         assert!(with_store(&state, |st| st.orgs()).await.is_ok());
+    }
+
+    fn quick_state() -> Arc<AppState> {
+        let mut state = AppState::new(
+            Store::open_in_memory().unwrap(),
+            "a-token-of-sufficient-length-0123",
+            None,
+        );
+        Arc::get_mut(&mut state).unwrap().store_wait = std::time::Duration::from_millis(80);
+        state
+    }
+
+    #[tokio::test]
+    async fn usage_batches_have_their_own_line_when_the_reads_are_full() {
+        let state = quick_state();
+        let _reads = state
+            .gate
+            .clone()
+            .acquire_many_owned(STORE_QUEUE as u32)
+            .await
+            .unwrap();
+        assert!(with_store(&state, |st| st.orgs()).await.is_err());
+        assert!(with_store_ingest(&state, |st| st.orgs()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn work_is_not_run_when_the_connection_is_not_free_before_the_deadline() {
+        let state = quick_state();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Another request holds the connection for longer than anyone will wait.
+        let holder = state.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let hold = std::thread::spawn(move || {
+            let _guard = holder.store.lock().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        });
+        held_rx.recv().unwrap();
+        let flag = ran.clone();
+        let refused = with_store(&state, move |st| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            st.orgs()
+        })
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(refused.code, "store_busy");
+        hold.join().unwrap();
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        // A permit is not lost to the refusal.
+        assert!(with_store(&state, |st| st.orgs()).await.is_ok());
+    }
+
+    #[test]
+    fn the_statement_budget_is_a_503_with_retry_after() {
+        let response = ApiError::from(Error::Timeout).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
     }
 
     #[test]
