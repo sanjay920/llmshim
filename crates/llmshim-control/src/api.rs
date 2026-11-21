@@ -44,6 +44,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/v1/requests/misses"),
     ("get", "/v1/requests/{attempt}/structure"),
     ("get", "/v1/requests/{attempt}/payload"),
+    ("get", "/v1/requests/{attempt}/payload/diff"),
     ("post", "/v1/orgs/{org}/snapshots"),
     ("get", "/v1/orgs/{org}/snapshot"),
 ];
@@ -180,6 +181,12 @@ pub const ROLES: &[(&str, &str, Option<Role>)] = &[
     ("get", "/v1/requests/{attempt}/structure", Some(Role::Read)),
     // A captured payload is customer data (note 0052, slice 5b): admin only, and every view is recorded.
     ("get", "/v1/requests/{attempt}/payload", Some(Role::Admin)),
+    // The same two payloads side by side: customer data twice over, so the same role and the same record.
+    (
+        "get",
+        "/v1/requests/{attempt}/payload/diff",
+        Some(Role::Admin),
+    ),
     ("post", "/v1/orgs/{org}/snapshots", Some(Role::Admin)),
     ("get", "/v1/orgs/{org}/snapshot", Some(Role::Read)),
 ];
@@ -966,34 +973,231 @@ async fn request_payload(
             "payloads are opened through the gateways' admin listeners: start the control plane with --gateways-file",
         ));
     };
-    match gateways.open_payload(&reference).await {
-        Ok(document) => {
-            let mut response =
-                Json(json!({"attempt_id": attempt, "payload": document})).into_response();
-            let headers = response.headers_mut();
-            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            headers.insert(
-                header::X_CONTENT_TYPE_OPTIONS,
-                HeaderValue::from_static("nosniff"),
-            );
-            Ok(response)
-        }
-        Err(crate::gateways::OpenError::NotFound) => Err(ApiError::new(
+    match gateways.open_payload(&reference, false).await {
+        Ok(opened) => Ok(no_store(Json(
+            json!({"attempt_id": attempt, "payload": opened["payload"]}),
+        ))),
+        Err(error) => Err(open_error(error)),
+    }
+}
+
+/// A response that nothing between here and the viewer may keep or reinterpret: it holds customer text.
+fn no_store(body: impl IntoResponse) -> Response {
+    let mut response = body.into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+/// Why no gateway could open a payload, as the answer a viewer gets.
+fn open_error(error: crate::gateways::OpenError) -> ApiError {
+    use crate::gateways::OpenError;
+    match error {
+        OpenError::NotFound => ApiError::new(
             StatusCode::NOT_FOUND,
             "payload_gone",
             "no gateway has this payload: it was deleted, or its write did not complete",
-        )),
-        Err(crate::gateways::OpenError::BadReference) => Err(ApiError::new(
+        ),
+        OpenError::BadReference => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "payload_unreadable",
             "no gateway could open this payload: it was captured under another capture key",
-        )),
-        Err(_) => Err(ApiError::new(
+        ),
+        OpenError::NotConfigured | OpenError::Unavailable => ApiError::new(
             StatusCode::BAD_GATEWAY,
             "gateways_unavailable",
             "no gateway could be reached to open this payload; try again",
-        )),
+        ),
     }
+}
+
+/// The longest one segment's text a diff sends: a system prompt of a few thousand words fits; more is cut and said to be.
+const DIFF_TEXT_LIMIT: usize = 64 * 1024;
+
+fn diff_segment(segment: Option<&Value>) -> Value {
+    let Some(segment) = segment else {
+        return Value::Null;
+    };
+    let text = segment.get("text").and_then(Value::as_str);
+    let cut = text.is_some_and(|t| t.len() > DIFF_TEXT_LIMIT);
+    let text = text.map(|t| {
+        let mut end = t.len().min(DIFF_TEXT_LIMIT);
+        while !t.is_char_boundary(end) {
+            end -= 1;
+        }
+        t[..end].to_owned()
+    });
+    json!({"kind": segment.get("kind"), "text": text, "cut": cut})
+}
+
+/// What changed, where the cached prefix did (note 0052, slice 5c): for a request that **changed** an earlier part of
+/// the prompt than the request before it (the first difference is found from the stored fingerprints), the segments
+/// around that place from both requests' captured prompts, side by side. This opens **two** payloads, so it has every
+/// guarantee the payload route has, twice: the admin role, a `payload.viewed` row for each attempt written **before**
+/// anything is fetched, gateways that open the references, `no-store`, and nothing kept. A request that only grew,
+/// repeated or shortened its prompt opens nothing and records nothing: there is nothing to show.
+async fn request_payload_diff(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    principal: Option<axum::Extension<Principal>>,
+    path: Path<String>,
+) -> ApiResult<Response> {
+    // Every answer of this route is kept by nothing between here and the viewer, whatever it holds.
+    Ok(match payload_diff(state, headers, principal, path).await {
+        Ok(response) => no_store(response),
+        Err(error) => no_store(error),
+    })
+}
+
+/// Whether an opened prompt is the one the fingerprints named: the same number of segments, the same kinds, and a
+/// text of the size each fingerprint recorded (the folded tail has no text). A gateway whose walker has since changed,
+/// or a reference to another document, is not shown as if it were this prompt.
+fn matches_stored(opened: &[Value], stored: &[crate::structure::Segment]) -> bool {
+    opened.len() == stored.len()
+        && opened.iter().zip(stored).all(|(one, segment)| {
+            one["kind"] == segment.kind
+                && one["text"]
+                    .as_str()
+                    .is_none_or(|text| text.len() as u64 == segment.bytes)
+        })
+}
+
+async fn payload_diff(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    principal: Option<axum::Extension<Principal>>,
+    Path(attempt): Path<String>,
+) -> ApiResult<Response> {
+    let actor = actor(&headers)?;
+    let via = principal.map_or("shared_token", |axum::Extension(p)| p.via);
+    let asked = attempt.clone();
+    let found = with_store(&s, move |st| {
+        let Some(current) = st.request_structure(&asked)? else {
+            return Ok(None);
+        };
+        let previous = st.previous_structure(&current)?;
+        let current_ref = st.payload_reference(&current.attempt_id)?;
+        let previous_ref = match &previous {
+            Some(p) => st.payload_reference(&p.attempt_id)?,
+            None => None,
+        };
+        Ok(Some((current, previous, current_ref, previous_ref)))
+    })
+    .await?;
+    let Some((current, previous, current_ref, previous_ref)) = found else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no_structure",
+            "no prompt structure is stored for this request: its client does not capture it, or it has aged out",
+        ));
+    };
+    let Some(previous) = previous else {
+        return Ok(
+            Json(json!({"attempt_id": current.attempt_id, "relation": "no_previous"}))
+                .into_response(),
+        );
+    };
+    let diff = crate::structure::diff(&previous.segments, &current.segments);
+    let base = json!({"attempt_id": current.attempt_id, "previous_attempt_id": previous.attempt_id, "relation": diff.relation});
+    let Some(first) = diff
+        .first_change
+        .as_ref()
+        .filter(|_| diff.relation == "changed")
+    else {
+        // Nothing changed earlier than it grew: nothing to compare, nothing opened, nothing recorded.
+        return Ok(Json(base).into_response());
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let usable = |found: &Option<(String, i64)>| {
+        found
+            .as_ref()
+            .filter(|(_, expires)| *expires >= now)
+            .map(|(r, _)| r.clone())
+    };
+    let (Some(current_ref), Some(previous_ref)) = (usable(&current_ref), usable(&previous_ref))
+    else {
+        let mut answer = base;
+        answer["unavailable"] = json!("payload_not_captured_or_expired");
+        return Ok(Json(answer).into_response());
+    };
+    // Both views are recorded first: a view with no row cannot exist, whatever happens next.
+    let (a, b) = (current.attempt_id.clone(), previous.attempt_id.clone());
+    with_store(&s, move |st| {
+        st.record_payload_view(&a, &actor, via)?;
+        st.record_payload_view(&b, &actor, via)
+    })
+    .await?;
+    let Some(gateways) = s.gateways.get() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "gateways_not_configured",
+            "payloads are opened through the gateways' admin listeners: start the control plane with --gateways-file",
+        ));
+    };
+    let (now_open, before_open) = tokio::join!(
+        gateways.open_payload(&current_ref, true),
+        gateways.open_payload(&previous_ref, true)
+    );
+    let (now_open, before_open) = (
+        now_open.map_err(open_error)?,
+        before_open.map_err(open_error)?,
+    );
+    let (now_segments, before_segments) = (
+        now_open["segments"].as_array(),
+        before_open["segments"].as_array(),
+    );
+    let (Some(now_segments), Some(before_segments)) = (now_segments, before_segments) else {
+        // A request cut at the capture limit cannot be cut into segments.
+        let mut answer = base;
+        answer["unavailable"] = json!("request_cut");
+        return Ok(no_store(Json(answer)));
+    };
+    // The opened prompts must be the ones the fingerprints compared, and the segment where they differ must have text.
+    if !matches_stored(now_segments, &current.segments)
+        || !matches_stored(before_segments, &previous.segments)
+    {
+        let mut answer = base;
+        answer["unavailable"] = json!("segments_do_not_match");
+        return Ok(no_store(Json(answer)));
+    }
+    let has_text = |segments: &[Value]| {
+        segments
+            .get(first.index)
+            .is_some_and(|s| s["text"].is_string())
+    };
+    if !has_text(now_segments) || !has_text(before_segments) {
+        let mut answer = base;
+        answer["unavailable"] = json!("segment_not_shown");
+        return Ok(no_store(Json(answer)));
+    }
+    // The segments around the first difference, from both: the context that makes a changed line readable.
+    let from = first.index.saturating_sub(2);
+    let to = (first.index + 2).min(
+        now_segments
+            .len()
+            .max(before_segments.len())
+            .saturating_sub(1),
+    );
+    let window: Vec<Value> = (from..=to)
+        .map(|index| {
+            let (now_one, before_one) = (
+                diff_segment(now_segments.get(index)),
+                diff_segment(before_segments.get(index)),
+            );
+            // Decided on the whole texts: two segments that first differ past the limit a text is cut at still differ.
+            let changed = now_segments.get(index).map(|s| (&s["kind"], &s["text"]))
+                != before_segments.get(index).map(|s| (&s["kind"], &s["text"]));
+            json!({"index": index, "changed": changed, "current": now_one, "previous": before_one})
+        })
+        .collect();
+    let mut answer = base;
+    answer["first_change"] = json!(first);
+    answer["window"] = json!(window);
+    Ok(no_store(Json(answer)))
 }
 
 /// Across a window: how consecutive requests of each client relate, and where the changed ones first differ.
@@ -1221,6 +1425,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/requests/misses", get(requests_misses))
         .route("/v1/requests/{attempt}/structure", get(request_structure))
         .route("/v1/requests/{attempt}/payload", get(request_payload))
+        .route(
+            "/v1/requests/{attempt}/payload/diff",
+            get(request_payload_diff),
+        )
         .route("/v1/orgs/{org}/snapshots", post(publish))
         .route("/v1/orgs/{org}/snapshot", get(latest))
         .fallback(no_route)

@@ -106,6 +106,8 @@ struct Writer<'a> {
     mac: &'a mut Mac,
     len: u64,
     spent: &'a mut u64,
+    /// The canonical text itself, kept only when a reader wants to show a segment (the content diff, note 0052).
+    tee: Option<&'a mut Vec<u8>>,
 }
 
 impl std::io::Write for Writer<'_> {
@@ -115,6 +117,9 @@ impl std::io::Write for Writer<'_> {
             return Err(std::io::Error::other("budget"));
         }
         self.mac.update(bytes);
+        if let Some(tee) = self.tee.as_deref_mut() {
+            tee.extend_from_slice(bytes);
+        }
         self.len += bytes.len() as u64;
         Ok(bytes.len())
     }
@@ -210,6 +215,9 @@ struct Collected<'k> {
     tail: Option<(Mac, u64)>,
     spent: u64,
     over: bool,
+    /// With a reader that wants the text: each segment's canonical text, aligned with `out` (the folded tail has
+    /// none).
+    texts: Option<Vec<Vec<u8>>>,
 }
 
 impl<'k> Collected<'k> {
@@ -220,6 +228,7 @@ impl<'k> Collected<'k> {
             tail: None,
             spent: 0,
             over: false,
+            texts: None,
         }
     }
 
@@ -240,10 +249,13 @@ impl<'k> Collected<'k> {
         };
         mac.update(kind.as_bytes());
         mac.update(&[0]);
+        let mut text = Vec::new();
+        let keep = self.texts.is_some() && !folding;
         let mut writer = Writer {
             mac: &mut mac,
             len: 0,
             spent: &mut self.spent,
+            tee: keep.then_some(&mut text),
         };
         let finished = write(&mut writer);
         let len = writer.len;
@@ -265,6 +277,9 @@ impl<'k> Collected<'k> {
                 hash,
                 bytes: len,
             });
+            if let Some(texts) = self.texts.as_mut() {
+                texts.push(text);
+            }
         }
     }
 
@@ -478,8 +493,20 @@ pub enum Skipped {
     TooLarge,
 }
 
-/// The segments of a provider-native request body. `key` is the deployment's capture secret.
-pub fn segments(wire: WireFormat, body: &Value, key: &[u8]) -> Result<Vec<Segment>, Skipped> {
+/// One segment's place and, when the reader asked for it, its canonical text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentText {
+    pub kind: &'static str,
+    /// The segment as canonical JSON: what its fingerprint was taken over. `None` for the folded tail.
+    pub text: Option<String>,
+}
+
+fn walk<'k>(
+    wire: WireFormat,
+    body: &Value,
+    key: &'k [u8],
+    want_text: bool,
+) -> Result<Collected<'k>, Skipped> {
     let object = body.as_object().ok_or(Skipped::Unrecognized)?;
     let present = match wire {
         WireFormat::AnthropicMessages | WireFormat::OpenAiChat => object.contains_key("messages"),
@@ -490,13 +517,56 @@ pub fn segments(wire: WireFormat, body: &Value, key: &[u8]) -> Result<Vec<Segmen
         return Err(Skipped::Unrecognized);
     }
     let mut collected = Collected::new(key);
+    if want_text {
+        collected.texts = Some(Vec::new());
+    }
     match wire {
         WireFormat::AnthropicMessages => anthropic(body, &mut collected),
         WireFormat::OpenAiResponses => openai_responses(body, &mut collected),
         WireFormat::OpenAiChat => chat_completions(body, &mut collected),
         WireFormat::GoogleGenerateContent => gemini(body, &mut collected),
     }
-    collected.finish().ok_or(Skipped::TooLarge)
+    if collected.over {
+        return Err(Skipped::TooLarge);
+    }
+    Ok(collected)
+}
+
+/// The segments of a provider-native request body. `key` is the deployment's capture secret.
+pub fn segments(wire: WireFormat, body: &Value, key: &[u8]) -> Result<Vec<Segment>, Skipped> {
+    walk(wire, body, key, false)?
+        .finish()
+        .ok_or(Skipped::TooLarge)
+}
+
+/// The same segments, in the same order, with each one's canonical text: for the content diff, which shows what
+/// changed where the fingerprints say it did. It is the one walker, so the two cannot disagree about where a segment
+/// starts. Only for a reader that is allowed to see the prompt.
+pub fn segment_texts(wire: WireFormat, body: &Value) -> Result<Vec<SegmentText>, Skipped> {
+    let mut collected = walk(wire, body, &[], true)?;
+    let texts = collected.texts.take().unwrap_or_default();
+    let segments = collected.finish().ok_or(Skipped::TooLarge)?;
+    let mut texts = texts.into_iter();
+    Ok(segments
+        .into_iter()
+        .map(|segment| SegmentText {
+            kind: segment.kind,
+            text: texts
+                .next()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+        })
+        .collect())
+}
+
+/// A wire from the name a payload document carries (the inverse of [`wire_name`]).
+pub fn wire_from_name(name: &str) -> Option<WireFormat> {
+    Some(match name {
+        "anthropic-messages" => WireFormat::AnthropicMessages,
+        "openai-responses" => WireFormat::OpenAiResponses,
+        "openai-chat" => WireFormat::OpenAiChat,
+        "google-generate-content" => WireFormat::GoogleGenerateContent,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -764,5 +834,76 @@ mod tests {
         let body = json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": fits}}]}]});
         let s = segments(WireFormat::OpenAiChat, &body, KEY).unwrap();
         assert!(s[0].bytes > (1 << 20));
+    }
+
+    #[test]
+    fn the_texts_are_the_segments_in_the_same_places_and_re_hash_to_their_fingerprints() {
+        let bodies = [
+            (
+                WireFormat::AnthropicMessages,
+                json!({"system": "s", "tools": [{"name": "f"}], "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}, {"type": "image", "source": {"data": "AAAA"}}]},
+                {"role": "assistant", "content": "ok"}]}),
+            ),
+            (
+                WireFormat::OpenAiChat,
+                json!({"tools": [{"type": "function"}], "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}], "name": "bob"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "1"}]}]}),
+            ),
+            (
+                WireFormat::OpenAiResponses,
+                json!({"instructions": "x", "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q"}]}, {"type": "function_call", "name": "f"}]}),
+            ),
+            (
+                WireFormat::GoogleGenerateContent,
+                json!({"systemInstruction": {"parts": [{"text": "s"}]}, "contents": [{"role": "user", "parts": [{"text": "q"}, {"inlineData": {"data": "AAAA"}}]}]}),
+            ),
+        ];
+        for (wire, body) in bodies {
+            let segments = segments(wire, &body, KEY).unwrap();
+            let texts = segment_texts(wire, &body).unwrap();
+            assert_eq!(segments.len(), texts.len(), "{wire:?}");
+            for (segment, text) in segments.iter().zip(&texts) {
+                assert_eq!(segment.kind, text.kind);
+                let text = text.text.as_deref().expect("text");
+                assert_eq!(text.len() as u64, segment.bytes);
+                // The fingerprint is the keyed hash of exactly this text: the diff shows what was compared.
+                let mut message = segment.kind.as_bytes().to_vec();
+                message.push(0);
+                message.extend_from_slice(text.as_bytes());
+                let mac = hmac_sha256(KEY, &message);
+                let hash: String = mac[..8].iter().map(|b| format!("{b:02x}")).collect();
+                assert_eq!(hash, segment.hash, "{wire:?} {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_folded_tail_has_no_text_and_names_round_trip() {
+        let messages: Vec<Value> = (0..MAX_SEGMENTS + 5)
+            .map(|n| json!({"role": "user", "content": format!("m{n}")}))
+            .collect();
+        let texts = segment_texts(WireFormat::OpenAiChat, &json!({"messages": messages})).unwrap();
+        assert_eq!(texts.len(), MAX_SEGMENTS);
+        assert!(texts[..MAX_SEGMENTS - 1].iter().all(|t| t.text.is_some()));
+        assert_eq!(
+            (texts[MAX_SEGMENTS - 1].kind, &texts[MAX_SEGMENTS - 1].text),
+            ("other", &None)
+        );
+        for wire in [
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChat,
+            WireFormat::GoogleGenerateContent,
+        ] {
+            assert_eq!(wire_from_name(wire_name(wire)), Some(wire));
+        }
+        assert_eq!(wire_from_name("nope"), None);
+        assert_eq!(
+            segment_texts(WireFormat::OpenAiChat, &json!({"prompt": 1})),
+            Err(Skipped::Unrecognized)
+        );
     }
 }

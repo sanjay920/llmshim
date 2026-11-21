@@ -225,6 +225,28 @@ paths:
         '422': {$ref: '#/components/responses/Error'}
         '501': {$ref: '#/components/responses/Error'}
         '502': {$ref: '#/components/responses/Error'}
+  /v1/requests/{attempt}/payload/diff:
+    get:
+      operationId: requestPayloadDiff
+      description: |
+        What changed, where the cached prefix did (note 0052, slice 5c). For a request that **changed** an earlier part
+        of its prompt than the same client's request before it, the segments around the first difference from both
+        requests' captured prompts, side by side (`window`, each with `current` and `previous`, a `changed` flag, and
+        text cut at 64 KiB with `cut: true`). Opens two payloads, so it is **admin only**, writes a `payload.viewed` row
+        for each attempt before anything is fetched, and is `no-store`. A request that only grew, repeated or shortened
+        its prompt (`relation` says which) opens nothing and records nothing. `unavailable` says why there is no
+        window: `payload_not_captured_or_expired`, or `request_cut` (a request cut at the capture limit cannot be
+        segmented). Errors as for the payload route.
+      parameters:
+        - {name: attempt, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: The comparison}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '501': {$ref: '#/components/responses/Error'}
+        '502': {$ref: '#/components/responses/Error'}
   /v1/requests/misses:
     get:
       operationId: requestMisses

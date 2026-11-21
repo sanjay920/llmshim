@@ -461,12 +461,39 @@ async fn a_payload_is_sealed_on_the_data_plane_and_opens_only_through_the_admin_
     );
     // Opened through the admin listener, with its token, the reference gives the request and the answer back.
     let admin = server.admin.clone().unwrap();
-    let (status, body, cache) =
+    // Plain, the answer is the document and nothing is cut into segments (no work for a view that does not want it).
+    let (status, plain, _) =
         open_payload(&admin, Some(ADMIN_TOKEN), json!({"reference": reference})).await;
+    assert_eq!(status, 200, "{plain}");
+    assert!(plain["segments"].is_null(), "{plain}");
+    // Asked for, with the segments.
+    let (status, body, cache) = open_payload(
+        &admin,
+        Some(ADMIN_TOKEN),
+        json!({"reference": reference, "segments": true}),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(cache.as_deref(), Some("no-store"));
     let document = &body["payload"];
     assert_eq!(document["wire"], "openai-chat");
+    // With the request cut into the segments its fingerprints name, for the content diff.
+    let kinds: Vec<&str> = body["segments"]
+        .as_array()
+        .expect("segments")
+        .iter()
+        .map(|x| x["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["system", "user"]);
+    assert!(body["segments"][1]["text"]
+        .as_str()
+        .unwrap()
+        .contains(SECRET_PROMPT));
+    // The text of a segment is what its fingerprint was taken over, so it is the same segment the export names.
+    assert_eq!(
+        body["segments"].as_array().unwrap().len(),
+        ci[0]["structure"].as_array().unwrap().len()
+    );
     assert!(document["request"]["text"]
         .as_str()
         .unwrap()
@@ -678,5 +705,45 @@ fn payload_capture_is_refused_before_serving_when_it_cannot_be_honoured() {
     assert!(
         stderr.contains("capture.payload_key") && !stderr.contains("too-short"),
         "{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_cut_at_the_capture_limit_is_said_to_be_cut_and_has_no_segments() {
+    let (up, _mock) = upstream().await;
+    let (control, seen) = control_plane().await;
+    let dir = tempdir::Dir::new("payload-cut-log");
+    let log = dir.0.join("usage.jsonl");
+    let config = render_payload(&up.url(), &control, "capture = \"payload\"", &log).replace(
+        "payload_key = { env",
+        "max_payload_bytes = 1024\n        payload_key = { env",
+    );
+    let server = start(&config, "payload-cut", &payload_env());
+    ask(&server.base, CALLER_KEY, &"long prompt ".repeat(500)).await;
+    let ci = records_of(&seen, "ci", 1).await;
+    let reference = ci[0]["payload"]["reference"].as_str().unwrap().to_owned();
+    let admin = server.admin.clone().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let (status, body, _) = open_payload(
+            &admin,
+            Some(ADMIN_TOKEN),
+            json!({"reference": reference, "segments": true}),
+        )
+        .await;
+        if status == 200 {
+            break body;
+        }
+        assert!(std::time::Instant::now() < deadline, "never opened: {body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(body["payload"]["request"]["truncated"], true);
+    assert_eq!(
+        body["payload"]["request"]["text"].as_str().unwrap().len(),
+        1024
+    );
+    assert!(
+        body["segments"].is_null(),
+        "a cut body is not cut into segments: {body}"
     );
 }

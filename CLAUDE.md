@@ -845,6 +845,11 @@ usage record carries only an opaque reference. The control plane stores the refe
 (`POST /v1/serve/payload/open`) open it. Never put a reference or payload text in a log, metric, error, list answer or
 cacheable response; never give the control plane `payload_key` or the object store.
 
+Content diff (5c): the same walker (`gateway::structure::segment_texts`) keeps each segment's canonical text beside its hash, and the
+admin `open` answer carries `segments`. `GET /v1/requests/{attempt}/payload/diff` (admin only) opens both payloads only for a
+`changed` relation, writes a `payload.viewed` row for **each** attempt first, and returns the segments around the first
+difference, `no-store`.
+
 ## Cloud transports from the `serve` file (note 0020)
 
 `--features serve-cloud` builds Bedrock, Vertex and Azure into `serve`, so `[providers.*]` can
