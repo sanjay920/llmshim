@@ -449,6 +449,14 @@ pub async fn build_app(
                     return Err(vec![issue(message)]);
                 }
                 let digest = Sha256::digest(token.as_bytes()).to_vec();
+                if let Some(export) = &config.usage_export {
+                    if super::config::read_secret(&export.token, env).is_ok_and(|t| t == token) {
+                        return Err(vec![issue(
+                            "must differ from the [usage_export] token: that one is held by the control plane's ingest path"
+                                .to_owned(),
+                        )]);
+                    }
+                }
                 if admin_token.as_deref() == Some(digest.as_slice()) {
                     return Err(vec![issue(
                         "must differ from the [admin] token: opening a payload is not an operational read".to_owned(),
@@ -467,8 +475,11 @@ pub async fn build_app(
             config
                 .capture
                 .as_ref()
-                .and_then(|capture| capture.ttl_secs)
-                .unwrap_or(86_400),
+                .filter(|capture| capture.payload_key.is_some())
+                .map(|capture| capture.ttl_secs.unwrap_or(86_400))
+                // No capture here: this replica cannot know the retention another one wrote under (a sealed
+                // expiry cannot be read by the sweeper), so it waits the longest a payload may be kept.
+                .unwrap_or(604_800),
         );
         let first = {
             use ring::rand::SecureRandom;
@@ -1342,13 +1353,20 @@ async fn fleet_state(
 /// Attempt spans without a usage log: records are built, and go nowhere.
 /// A viewer's label as the control plane sends it, for the audit log only: visible ASCII and short, or `unknown`.
 fn audit_label(value: Option<&serde_json::Value>, longest: usize) -> String {
-    value
+    // A verified subject may be long or not plain ASCII (a display-style email, a UTF-8 name): keep what is
+    // visible, mark the rest, and cut at the limit, so the audit still names who. Only nothing at all is "unknown".
+    let label: String = value
         .and_then(|v| v.as_str())
-        .filter(|s| {
-            (1..=longest).contains(&s.len()) && s.bytes().all(|b| (0x21..0x7f).contains(&b))
-        })
-        .unwrap_or("unknown")
-        .to_owned()
+        .unwrap_or("")
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .take(longest)
+        .collect();
+    if label.is_empty() {
+        "unknown".to_owned()
+    } else {
+        label
+    }
 }
 
 /// The endpoint that opens a captured payload: `{"reference": "…", "segments": bool, "viewer": "…", "via": "…"}` to
@@ -1540,5 +1558,14 @@ mod tests {
     fn no_token_configured_is_not_an_error_here() {
         let config = config("[admin]\nport = 9090\nallow_unauthenticated = true");
         assert_eq!(admin_token_digest(&config, &|_| None).unwrap(), None);
+    }
+
+    #[test]
+    fn an_audit_label_keeps_a_long_or_non_ascii_subject_instead_of_dropping_it() {
+        let label = |v: serde_json::Value| audit_label(Some(&v), 10);
+        assert_eq!(label(serde_json::json!("alice@example.test")), "alice@exam");
+        assert_eq!(label(serde_json::json!("zoë x")), "zo??x");
+        assert_eq!(label(serde_json::json!("")), "unknown");
+        assert_eq!(audit_label(None, 10), "unknown");
     }
 }

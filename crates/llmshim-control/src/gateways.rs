@@ -163,8 +163,13 @@ impl Gateways {
                 read_token_file(path).map_err(|m| at(format!("token_file: {m}")))?;
             }
             if let Some(path) = &entry.payload_token_file {
-                read_token_file(path).map_err(|m| at(format!("payload_token_file: {m}")))?;
-                if entry.token_file.as_ref() == Some(path) {
+                let payload =
+                    read_token_file(path).map_err(|m| at(format!("payload_token_file: {m}")))?;
+                let same_secret = match &entry.token_file {
+                    Some(admin) => read_token_file(admin).is_ok_and(|t| t == payload),
+                    None => false,
+                };
+                if entry.token_file.as_ref() == Some(path) || same_secret {
                     return Err(at("payload_token_file: must not be the token_file: the token that scrapes metrics must not open customer data".into()));
                 }
             }

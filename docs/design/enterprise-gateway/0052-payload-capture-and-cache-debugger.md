@@ -369,6 +369,11 @@ Done in one change, because each piece closes the same path (who can read a payl
   label and `via` are recorded.
 - **Verified identity by default.** Without `--allow-payload-views-without-sso` a payload view needs an OIDC identity.
   Honest limit: in break-glass shared-token mode the viewer is whatever label the caller sent.
+- **The labels are advisory.** `viewer` and `via` come from the caller, so whoever holds `open_token` is the real
+  authority; keep it in the control plane's `payload_token_file` and nowhere else. A verified subject that is long or
+  not plain ASCII is recorded cut and with `?` for the unprintable, not as `unknown`.
+- **Gateways sharing an object store share `ttl_secs`.** A sealed expiry is unreadable to the sweeper, so a replica
+  with no capture settings sweeps at the 7-day maximum, and one with them at its own TTL.
 - **Request only by default.** `[capture] response = true` also keeps the provider's answer, raw and unredacted.
 - **Sweeper independent of capture.** It runs whenever `[media_store]` exists, so turning capture off never strands
   sealed objects; `llmshim_payload_swept_total` and `llmshim_payload_sweep_last_success_timestamp_seconds` show it works.

@@ -377,3 +377,18 @@ fn the_payload_token_must_not_be_the_metrics_token() {
         "{error}"
     );
 }
+
+#[test]
+fn the_payload_token_must_not_hold_the_metrics_secret_under_another_path() {
+    let admin = token_file(ADMIN_TOKEN);
+    let copy = token_file(ADMIN_TOKEN);
+    let error = Gateways::from_bytes(&file(json!([{
+        "name": "a", "admin_url": "https://g.test", "token_file": admin, "payload_token_file": copy
+    }])))
+    .err()
+    .unwrap();
+    assert!(
+        error.starts_with("gateways[0].payload_token_file"),
+        "{error}"
+    );
+}
