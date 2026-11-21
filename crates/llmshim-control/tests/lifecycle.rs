@@ -736,7 +736,7 @@ fn a_model_list_is_checked_stored_copied_on_rotation_and_signed_only_when_set() 
 /// keys: version 1 had neither model lists nor tags, version 2 had model lists only.
 #[test]
 fn an_older_database_is_migrated_in_place() {
-    for from in [1_i64, 2, 3, 4, 5, 6, 7] {
+    for from in [1_i64, 2, 3, 4, 5, 6, 7, 8] {
         migrate_from(from);
     }
 }
@@ -795,8 +795,11 @@ fn migrate_from(from: i64) {
         format!("{drop_columns} DROP TABLE request_structure; DROP TABLE requests;")
     } else if from < 7 {
         format!("{drop_columns} DROP TABLE request_structure; {PAYLOAD_DROP}")
+    } else if from < 8 {
+        // Version 9 added the structure's tenant (note 0056).
+        format!("{drop_columns} {PAYLOAD_DROP} ALTER TABLE request_structure DROP COLUMN tenant;")
     } else {
-        format!("{drop_columns} {PAYLOAD_DROP}")
+        format!("{drop_columns} ALTER TABLE request_structure DROP COLUMN tenant;")
     };
     let use_new_columns = |store: &mut Store, project: &str| {
         let mut new = NewKey::secret(project, "new");

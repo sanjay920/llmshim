@@ -227,6 +227,45 @@ paths:
         '422': {$ref: '#/components/responses/Error'}
         '501': {$ref: '#/components/responses/Error'}
         '502': {$ref: '#/components/responses/Error'}
+  /v1/requests/erase:
+    post:
+      operationId: eraseRequests
+      description: |
+        Delete the request ledger rows and stored prompt structures of a tenant, of a key, or of a key within a tenant
+        (a deletion request; note 0056). **Admin only.** At least one of `tenant` and `key` is required. A key alone erases
+        it in every tenant and needs `all_tenants: true` (400 `tenant_required` otherwise). `confirm` must repeat what is
+        erased: the tenant, the key, or `tenant/key` (400 `confirmation_mismatch`). Records that arrive later and are no newer
+        than the erasure (a gateway's retry) are refused and counted as `erased` on the usage batch. One `requests.erased`
+        row is written to the change history (who, how they were identified, the selector and the counts, never what
+        the rows said). Sealed payloads lose their references here, so nothing can open them; the objects on a
+        gateway's store are deleted by its sweeper at their retention. The answer counts what went.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              additionalProperties: false
+              properties:
+                tenant: {type: string}
+                key: {type: string}
+                all_tenants: {type: boolean}
+                confirm: {type: string}
+      responses:
+        '200':
+          description: What was erased
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requests: {type: integer}
+                  structures: {type: integer}
+                  payload_references: {type: integer}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/requests/{attempt}/payload/diff:
     get:
       operationId: requestPayloadDiff
@@ -334,6 +373,7 @@ paths:
                   accepted: {type: integer}
                   duplicate: {type: integer}
                   rejected: {type: integer}
+                  erased: {type: integer, description: Records refused because their tenant or key was erased after they were made (note 0056); not stored.}
         '400': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
   /v1/requests:

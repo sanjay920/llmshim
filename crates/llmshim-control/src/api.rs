@@ -42,6 +42,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/v1/requests/summary"),
     ("get", "/v1/requests/facets"),
     ("get", "/v1/requests/misses"),
+    ("post", "/v1/requests/erase"),
     ("get", "/v1/requests/{attempt}/structure"),
     ("get", "/v1/requests/{attempt}/payload"),
     ("get", "/v1/requests/{attempt}/payload/diff"),
@@ -211,6 +212,8 @@ pub const ROLES: &[(&str, &str, Option<Role>)] = &[
     ("get", "/v1/requests/summary", Some(Role::Read)),
     ("get", "/v1/requests/facets", Some(Role::Read)),
     ("get", "/v1/requests/misses", Some(Role::Read)),
+    // Deleting customer data on request (note 0056): admin only, and the history says who and how much.
+    ("post", "/v1/requests/erase", Some(Role::Admin)),
     ("get", "/v1/requests/{attempt}/structure", Some(Role::Read)),
     // A captured payload is customer data (note 0052, slice 5b): admin only, and every view is recorded.
     ("get", "/v1/requests/{attempt}/payload", Some(Role::Admin)),
@@ -1023,6 +1026,71 @@ async fn request_structure(
     })))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EraseBody {
+    tenant: Option<String>,
+    key: Option<String>,
+    /// A key is a name a gateway chose, and the same name is common across tenants: erasing it in all of them has to
+    /// be asked for.
+    #[serde(default)]
+    all_tenants: bool,
+    /// Must repeat what is being erased (`tenant`, `key`, or `tenant/key`): a deletion is not one stray request away.
+    confirm: String,
+}
+
+/// `POST /v1/requests/erase`: delete the ledger rows and prompt structures of a tenant, a key, or a key within a
+/// tenant, and say how much went. The change history gets one row (who, how established, the selector, the counts).
+/// Sealed payloads on a gateway lose their references here and are deleted by the gateway's sweeper at their retention.
+async fn erase_requests(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    principal: Option<axum::Extension<Principal>>,
+    Body(body): Body<EraseBody>,
+) -> ApiResult<Json<Value>> {
+    let actor = actor(&headers)?;
+    let via = principal.map_or("shared_token", |axum::Extension(p)| p.via);
+    let invalid = |code: &'static str, message: &'static str| {
+        ApiError::new(StatusCode::BAD_REQUEST, code, message)
+    };
+    let expected = match (body.tenant.as_deref(), body.key.as_deref()) {
+        (None, None) => {
+            return Err(invalid(
+                "invalid_request",
+                "name a tenant, a key or both to erase",
+            ))
+        }
+        (Some(tenant), None) => tenant.to_string(),
+        (Some(tenant), Some(key)) => format!("{tenant}/{key}"),
+        (None, Some(key)) => {
+            if !body.all_tenants {
+                return Err(invalid(
+                    "tenant_required",
+                    "a key alone erases that key in every tenant: name the tenant, or set all_tenants to say that is meant",
+                ));
+            }
+            key.to_string()
+        }
+    };
+    if body.all_tenants && body.tenant.is_some() {
+        return Err(invalid(
+            "invalid_request",
+            "all_tenants is for a key with no tenant",
+        ));
+    }
+    if body.confirm != expected {
+        return Err(invalid(
+            "confirmation_mismatch",
+            "confirm must repeat what is being erased: the tenant, the key, or tenant/key",
+        ));
+    }
+    let erased = with_store(&s, move |st| {
+        st.erase_requests(body.tenant.as_deref(), body.key.as_deref(), &actor, via)
+    })
+    .await?;
+    Ok(Json(json!(erased)))
+}
+
 /// A captured request and answer, opened by a gateway (note 0052, slice 5b). Customer data, so: the admin role only;
 /// a row in the change history, written **before** anything is fetched, says who asked for which attempt; the
 /// control plane holds only an opaque reference and cannot open it, so a gateway does, through its admin listener; the
@@ -1539,6 +1607,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/requests/summary", get(requests_summary))
         .route("/v1/requests/facets", get(requests_facets))
         .route("/v1/requests/misses", get(requests_misses))
+        .route("/v1/requests/erase", post(erase_requests))
         .route("/v1/requests/{attempt}/structure", get(request_structure))
         .route("/v1/requests/{attempt}/payload", get(request_payload))
         .route(

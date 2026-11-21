@@ -94,12 +94,12 @@ fn migrate_copies_an_old_database_first_migrates_it_and_the_copy_restores() {
     let (code, out, err) = run(&["migrate", "--db", file]);
     assert_eq!(code, Some(0), "{err}");
     assert!(
-        out.contains("from version 4 to 8") && out.contains("pre-v4.bak"),
+        out.contains("from version 4 to 9") && out.contains("pre-v4.bak"),
         "{out}"
     );
     let backup = d.join("c.db.pre-v4.bak");
     assert_eq!(version(&backup), 4, "the copy is the database as it was");
-    assert_eq!(version(&db), 8);
+    assert_eq!(version(&db), 9);
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(
         std::fs::metadata(&backup).unwrap().permissions().mode() & 0o077,
@@ -111,7 +111,7 @@ fn migrate_copies_an_old_database_first_migrates_it_and_the_copy_restores() {
     // Again: nothing to do, and no second copy.
     let (code, out, _) = run(&["migrate", "--db", file]);
     assert_eq!(
-        (code, out.contains("already at version 8")),
+        (code, out.contains("already at version 9")),
         (Some(0), true)
     );
     // A second old database at the same path: the first copy is never overwritten, the new one is numbered.
@@ -122,7 +122,7 @@ fn migrate_copies_an_old_database_first_migrates_it_and_the_copy_restores() {
     assert!(out.contains("pre-v4.1.bak"), "{out}");
     assert_eq!(std::fs::read(&backup).unwrap(), first_copy);
     assert_eq!(version(&d.join("c.db.pre-v4.1.bak")), 4);
-    assert_eq!(version(&db), 8);
+    assert_eq!(version(&db), 9);
     // The copy holds the data as it was, and putting it back is a rollback: the old schema, the organization intact.
     std::fs::copy(&backup, &db).unwrap();
     assert_eq!(version(&db), 4);
@@ -206,7 +206,7 @@ fn migrate_creates_a_new_database_and_refuses_one_from_a_newer_build() {
     let file = db.to_str().unwrap();
     let (code, out, err) = run(&["migrate", "--db", file]);
     assert_eq!(code, Some(0), "{err}");
-    assert!(out.contains("from version 0 to 8"), "{out}");
+    assert!(out.contains("from version 0 to 9"), "{out}");
     assert!(
         !d.join("fresh.db.pre-v0.bak").exists(),
         "a new database has nothing to copy"
@@ -260,4 +260,44 @@ fn postgres_is_read_only_until_it_is_migrated() {
     Store::open_postgres_existing(&url, Some(&schema), None).unwrap();
     let again = llmshim_control::migrate_postgres(&url, Some(&schema), None).unwrap();
     assert_eq!(again.from, again.to);
+}
+
+#[test]
+fn a_structure_from_before_the_tenant_column_gets_its_tenant_from_its_ledger_row() {
+    let d = dir("backfill");
+    let db = d.join("c.db");
+    let mut store = Store::open(&db).unwrap();
+    let hex = |n: u8| format!("{n:02x}").repeat(8);
+    let record = |id: &str, tenant: &str| {
+        serde_json::json!({
+            "event": "usage", "ts": "2026-11-19T10:00:00Z", "attempt_id": id, "tenant": tenant, "key": "checkout",
+            "request_id": format!("req-{id}"), "provider": "openai", "model": "m", "kind": "completion",
+            "outcome": "completed", "duration_ms": 1, "input_tokens": 1, "output_tokens": 1,
+            "cache_read_tokens": 0, "cache_write_tokens": 0, "usage_reported": true, "admission": "fleet",
+            "structure": [{"kind": "system", "hash": hex(1), "bytes": 1}],
+        })
+    };
+    assert_eq!(
+        store
+            .ingest_requests(&[record("a1", "acme"), record("g1", "globex")])
+            .unwrap()
+            .accepted,
+        2
+    );
+    drop(store);
+    // As a version-8 build left it: no tenant on the structures.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("ALTER TABLE request_structure DROP COLUMN tenant; DROP TABLE erasures; PRAGMA user_version = 8;")
+        .unwrap();
+    assert_eq!(run(&["migrate", "--db", db.to_str().unwrap()]).0, Some(0));
+    let mut store = Store::open_existing(&db).unwrap();
+    assert_eq!(
+        store.request_structure("a1").unwrap().unwrap().tenant,
+        "acme"
+    );
+    assert_eq!(
+        store.request_structure("g1").unwrap().unwrap().tenant,
+        "globex"
+    );
 }

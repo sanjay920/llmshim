@@ -376,3 +376,29 @@ fn every_route_the_page_calls_is_one_the_api_has() {
         );
     }
 }
+
+/// The two font files are binaries served to every browser that opens the UI, under a CSP that allows fonts from the
+/// origin: they are pinned by digest, so replacing one is a reviewed change and not a quiet one (note 0056). To update
+/// them, replace the file, take the new digest (`shasum -a 256`), and change it here with the licence file's source.
+#[test]
+fn the_vendored_fonts_are_the_ones_that_were_reviewed() {
+    use sha2::{Digest, Sha256};
+    for (file, digest) in [
+        (
+            "ui/fonts/geist.woff2",
+            "3626eba547294501c8a4d662c7d9ea3b49734409a4c5a1ccf12fa86429b1687e",
+        ),
+        (
+            "ui/fonts/geist-mono.woff2",
+            "5d93ee62680bbec1abc5405c2658311f9396f6f9a821ef8551ec463887e600d4",
+        ),
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let found: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(found, digest, "{file} is not the font that was reviewed");
+    }
+}

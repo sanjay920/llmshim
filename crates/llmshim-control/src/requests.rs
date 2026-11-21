@@ -65,7 +65,19 @@ CREATE INDEX IF NOT EXISTS requests_by_tenant ON requests (tenant, ts_ms);
 CREATE INDEX IF NOT EXISTS requests_by_key ON requests (key_name, ts_ms);
 CREATE INDEX IF NOT EXISTS requests_by_model ON requests (model, ts_ms);
 CREATE INDEX IF NOT EXISTS requests_by_request ON requests (request_id);
+{erasures}
 "
+        ,
+        erasures = erasures_schema(pg)
+    )
+}
+
+/// What was erased, so that a record the gateways still hold (an export retry queue, an acknowledgement lost on the
+/// way) does not bring it back: an arriving record that matches a row here and is no newer than it is refused.
+pub(crate) fn erasures_schema(pg: bool) -> String {
+    let int = if pg { "BIGINT" } else { "INTEGER" };
+    format!(
+        "CREATE TABLE IF NOT EXISTS erasures (erased_ms {int} NOT NULL, tenant TEXT, key_name TEXT);"
     )
 }
 
@@ -269,6 +281,8 @@ pub struct Ingested {
     pub duplicate: u64,
     /// Rows refused as malformed (counted, never stored, their content not echoed).
     pub rejected: u64,
+    /// Rows refused because the tenant or key they belong to was erased after they were made (note 0056).
+    pub erased: u64,
 }
 
 /// The filters of a request query. Every field narrows.
@@ -495,7 +509,22 @@ impl Store {
         let received = chrono::Utc::now().timestamp_millis();
         let inserted = self.backend.transaction(true, |tx| {
             let mut inserted = 0u64;
+            // What has been erased, read once: a record no newer than an erasure that names its tenant (or key, or
+            // both) is the data that was deleted, coming back from a gateway's retry, and is not stored.
+            let erasures: Vec<(i64, Option<String>, Option<String>)> = tx
+                .query("SELECT erased_ms, tenant, key_name FROM erasures", &[])?
+                .iter()
+                .map(|r| Ok((r.int(0)?, r.opt_text(1)?, r.opt_text(2)?)))
+                .collect::<Result<_>>()?;
             for row in &rows {
+                if erasures.iter().any(|(at, tenant, key)| {
+                    row.ts_ms <= *at
+                        && tenant.as_ref().is_none_or(|t| row.tenant.as_ref() == Some(t))
+                        && key.as_ref().is_none_or(|k| row.key_name.as_ref() == Some(k))
+                }) {
+                    counts.erased += 1;
+                    continue;
+                }
                 let params: Vec<Param> = vec![
                     t(&row.attempt_id), t(&row.ts), i(row.ts_ms), t(&row.day),
                     ot(row.tenant.as_deref()), ot(row.key_name.as_deref()),
@@ -524,16 +553,16 @@ impl Store {
                 // The structure goes in with its row, once: a repeated attempt keeps the first.
                 if let (1, Some(segments), Some(key)) = (stored, &row.structure, &row.key_name) {
                     tx.exec(
-                        "INSERT INTO request_structure (attempt_id, ts_ms, key_name, provider, model, segments) \
-                         VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT (attempt_id) DO NOTHING",
-                        &[t(&row.attempt_id), i(row.ts_ms), t(key), t(&row.provider), t(&row.model), t(&crate::structure::encode(segments))],
+                        "INSERT INTO request_structure (attempt_id, ts_ms, key_name, provider, model, segments, tenant) \
+                         VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT (attempt_id) DO NOTHING",
+                        &[t(&row.attempt_id), i(row.ts_ms), t(key), t(&row.provider), t(&row.model), t(&crate::structure::encode(segments)), ot(row.tenant.as_deref())],
                     )?;
                 }
             }
             Ok(inserted)
         })?;
         counts.accepted = inserted;
-        counts.duplicate = rows.len() as u64 - inserted;
+        counts.duplicate = rows.len() as u64 - inserted - counts.erased;
         Ok(counts)
     }
 
@@ -701,6 +730,8 @@ impl Store {
     /// Delete rows older than `before_ms`; how many went.
     pub fn purge_requests(&mut self, before_ms: i64) -> Result<u64> {
         let gone = self.backend.transaction(true, |tx| {
+            // A tombstone is only needed while a record it covers could still arrive and outlive the retention.
+            tx.exec("DELETE FROM erasures WHERE erased_ms < ?1", &[i(before_ms)])?;
             tx.exec("DELETE FROM requests WHERE ts_ms < ?1", &[i(before_ms)])
         })?;
         // The structure ages out with its row.
@@ -742,6 +773,93 @@ impl Store {
                 attempt_id,
                 json!({"attempt_id": attempt_id, "via": via}),
             )
+        })
+    }
+}
+
+/// What an erasure removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Erased {
+    pub requests: u64,
+    pub structures: u64,
+    /// Rows that held a reference to a sealed payload. The references are gone, so nothing can open those objects any
+    /// more; the objects themselves (ciphertext, on a gateway's object store) go when the gateway's sweeper reaches
+    /// their retention.
+    pub payload_references: u64,
+}
+
+impl Store {
+    /// Erase every ledger row of a tenant, of a key, or of a key within a tenant (a person's or a customer's request
+    /// for deletion), with the prompt structures that belong to them, and write one row to the change history that
+    /// says who did it and how much went (never what the rows said). At least one of the two selectors is required.
+    pub fn erase_requests(
+        &mut self,
+        tenant: Option<&str>,
+        key: Option<&str>,
+        actor: &str,
+        via: &str,
+    ) -> Result<Erased> {
+        crate::actor_check(actor)?;
+        let mut clauses = Vec::new();
+        let mut params: Vec<Param> = Vec::new();
+        for (column, value) in [("tenant", tenant), ("key_name", key)] {
+            if let Some(value) = value {
+                params.push(t(value));
+                clauses.push(format!("{column} = ?{}", params.len()));
+            }
+        }
+        if clauses.is_empty() {
+            return Err(Error::Invalid(
+                "name a tenant, a key or both to erase".into(),
+            ));
+        }
+        let selector = clauses.join(" AND ");
+        let label = match (tenant, key) {
+            (Some(t), Some(k)) => format!("{t}/{k}"),
+            (Some(t), None) => t.to_string(),
+            (None, Some(k)) => k.to_string(),
+            (None, None) => unreachable!("checked above"),
+        };
+        self.backend.transaction(true, |tx| {
+            let held = tx
+                .query(
+                    &format!("SELECT COUNT(*) FROM requests WHERE {selector} AND payload_ref IS NOT NULL"),
+                    &params,
+                )?
+                .first()
+                .map(|row| row.int(0))
+                .transpose()?
+                .unwrap_or(0);
+            // The structures first: they are found through the rows that are about to go.
+            let structures = tx.exec(
+                &format!(
+                    "DELETE FROM request_structure WHERE attempt_id IN (SELECT attempt_id FROM requests WHERE {selector})"
+                ),
+                &params,
+            )?;
+            let requests = tx.exec(&format!("DELETE FROM requests WHERE {selector}"), &params)?;
+            // The tombstone: what arrives later from a gateway's queue about these is not stored again.
+            tx.exec(
+                "INSERT INTO erasures (erased_ms, tenant, key_name) VALUES (?1, ?2, ?3)",
+                &[i(chrono::Utc::now().timestamp_millis()), ot(tenant), ot(key)],
+            )?;
+            let erased = Erased {
+                requests,
+                structures,
+                payload_references: held as u64,
+            };
+            crate::history(
+                tx,
+                actor,
+                "requests.erased",
+                &label,
+                json!({
+                    "tenant": tenant, "key": key, "via": via,
+                    "requests": erased.requests, "structures": erased.structures,
+                    "payload_references": erased.payload_references,
+                }),
+            )?;
+            Ok(erased)
         })
     }
 }

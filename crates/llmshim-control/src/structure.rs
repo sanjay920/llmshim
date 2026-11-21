@@ -30,16 +30,39 @@ pub const SHORT_WINDOW_MS: i64 = 300_000;
 /// The most stored lists one aggregate reads.
 const MAX_SCAN: i64 = 20_000;
 
-/// The table, for a fresh database and for the migration to version 7.
+/// The table for a fresh database, with the tenant (version 9).
 pub(crate) fn schema(pg: bool) -> String {
+    shape(pg, true)
+}
+
+/// The table as version 7 made it (no tenant), for the step that creates it in a migration; version 9 adds the column.
+pub(crate) fn schema_v7(pg: bool) -> String {
+    shape(pg, false)
+}
+
+/// The column version 9 added: whose request it was. Without it two tenants whose keys share a name would be paired
+/// with each other, and the diff could set one customer's prompt beside another's.
+pub(crate) fn tenant_column(pg: bool) -> String {
+    // The tenant of every row that already exists is read back from its ledger row, so a stored structure from before
+    // this version is paired within its own tenant too and not with whoever shares a key name.
+    format!(
+        "ALTER TABLE request_structure ADD COLUMN{} tenant TEXT; \
+         UPDATE request_structure SET tenant = (SELECT r.tenant FROM requests r \
+             WHERE r.attempt_id = request_structure.attempt_id);",
+        if pg { " IF NOT EXISTS" } else { "" }
+    )
+}
+
+fn shape(pg: bool, tenant: bool) -> String {
     let int = if pg { "BIGINT" } else { "INTEGER" };
+    let tenant = if tenant { ", tenant TEXT" } else { "" };
     format!(
         "
 CREATE TABLE IF NOT EXISTS request_structure (
     attempt_id TEXT PRIMARY KEY,
     ts_ms {int} NOT NULL,
     key_name TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
-    segments TEXT NOT NULL
+    segments TEXT NOT NULL{tenant}
 );
 CREATE INDEX IF NOT EXISTS request_structure_by_client ON request_structure (key_name, provider, model, ts_ms);
 CREATE INDEX IF NOT EXISTS request_structure_by_time ON request_structure (ts_ms);
@@ -175,6 +198,8 @@ pub fn diff(previous: &[Segment], current: &[Segment]) -> Diff {
 pub struct Stored {
     pub attempt_id: String,
     pub ts_ms: i64,
+    /// Empty for a record that came without one (and for rows from before version 9).
+    pub tenant: String,
     pub key_name: String,
     pub provider: String,
     pub model: String,
@@ -186,7 +211,7 @@ impl Store {
     pub fn request_structure(&mut self, attempt_id: &str) -> Result<Option<Stored>> {
         self.backend.transaction(false, |tx| {
             let rows = tx.query(
-                "SELECT attempt_id, ts_ms, key_name, provider, model, segments FROM request_structure WHERE attempt_id = ?1",
+                "SELECT attempt_id, ts_ms, key_name, provider, model, segments, COALESCE(tenant, '') FROM request_structure WHERE attempt_id = ?1",
                 &[t(attempt_id)],
             )?;
             rows.first().map(stored).transpose()
@@ -197,11 +222,11 @@ impl Store {
     pub fn previous_structure(&mut self, at: &Stored) -> Result<Option<Stored>> {
         self.backend.transaction(false, |tx| {
             let rows = tx.query(
-                "SELECT attempt_id, ts_ms, key_name, provider, model, segments FROM request_structure \
-                 WHERE key_name = ?1 AND provider = ?2 AND model = ?3 AND ts_ms >= ?4 \
+                "SELECT attempt_id, ts_ms, key_name, provider, model, segments, COALESCE(tenant, '') FROM request_structure \
+                 WHERE key_name = ?1 AND provider = ?2 AND model = ?3 AND COALESCE(tenant, '') = ?7 AND ts_ms >= ?4 \
                  AND (ts_ms < ?5 OR (ts_ms = ?5 AND attempt_id < ?6)) \
                  ORDER BY ts_ms DESC, attempt_id DESC LIMIT 1",
-                &[t(&at.key_name), t(&at.provider), t(&at.model), i(at.ts_ms - WINDOW_MS), i(at.ts_ms), t(&at.attempt_id)],
+                &[t(&at.key_name), t(&at.provider), t(&at.model), i(at.ts_ms - WINDOW_MS), i(at.ts_ms), t(&at.attempt_id), t(&at.tenant)],
             )?;
             rows.first().map(stored).transpose()
         })
@@ -213,8 +238,9 @@ impl Store {
     pub fn structure_misses(&mut self, from_ms: i64, to_ms: i64) -> Result<Misses> {
         let rows = self.backend.transaction(false, |tx| {
             tx.query(
-                "SELECT attempt_id, ts_ms, key_name, provider, model, segments FROM request_structure \
-                 WHERE ts_ms >= ?1 AND ts_ms < ?2 ORDER BY key_name, provider, model, ts_ms, attempt_id LIMIT ?3",
+                "SELECT attempt_id, ts_ms, key_name, provider, model, segments, COALESCE(tenant, '') FROM request_structure \
+                 WHERE ts_ms >= ?1 AND ts_ms < ?2 \
+                 ORDER BY COALESCE(tenant, ''), key_name, provider, model, ts_ms, attempt_id LIMIT ?3",
                 &[i(from_ms), i(to_ms), i(MAX_SCAN + 1)],
             )?
             .iter()
@@ -223,18 +249,19 @@ impl Store {
         })?;
         let truncated = rows.len() as i64 > MAX_SCAN;
         let mut total = Counts::default();
-        let mut groups: BTreeMap<(String, String), Counts> = BTreeMap::new();
+        let mut groups: BTreeMap<(String, String, String), Counts> = BTreeMap::new();
         let mut previous: Option<&Stored> = None;
         for row in rows.iter().take(MAX_SCAN as usize) {
             if let Some(before) = previous {
-                let same = before.key_name == row.key_name
+                let same = before.tenant == row.tenant
+                    && before.key_name == row.key_name
                     && before.provider == row.provider
                     && before.model == row.model;
                 if same && row.ts_ms - before.ts_ms <= WINDOW_MS {
                     let d = diff(&before.segments, &row.segments);
                     total.add(&d);
                     groups
-                        .entry((row.key_name.clone(), row.model.clone()))
+                        .entry((row.tenant.clone(), row.key_name.clone(), row.model.clone()))
                         .or_default()
                         .add(&d);
                 }
@@ -243,7 +270,12 @@ impl Store {
         }
         let mut groups: Vec<MissGroup> = groups
             .into_iter()
-            .map(|((key, model), counts)| MissGroup { key, model, counts })
+            .map(|((tenant, key, model), counts)| MissGroup {
+                tenant: (!tenant.is_empty()).then_some(tenant),
+                key,
+                model,
+                counts,
+            })
             .collect();
         groups.sort_by(|a, b| {
             b.counts
@@ -274,6 +306,7 @@ fn stored(row: &crate::db::Row) -> Result<Stored> {
     Ok(Stored {
         attempt_id: row.text(0)?,
         ts_ms: row.int(1)?,
+        tenant: row.text(6)?,
         key_name: row.text(2)?,
         provider: row.text(3)?,
         model: row.text(4)?,
@@ -312,6 +345,8 @@ impl Counts {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MissGroup {
+    /// Absent for rows that have none.
+    pub tenant: Option<String>,
     pub key: String,
     pub model: String,
     #[serde(flatten)]

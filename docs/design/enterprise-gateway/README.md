@@ -89,6 +89,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0053: Bounding the control plane's store](0053-control-plane-store-bounds.md) (built: a bounded queue with 503, SQLite statement budget)
 - [0054: Migrating the control plane's database](0054-control-plane-migrations.md) (built: explicit `migrate`, read-only `serve`/`audit-verify`, a copy first)
 - [0055: A browser smoke test for the admin UI](0055-ui-smoke-test.md) (built: headless Chrome against the real binary, in CI)
+- [0056: Deleting a customer's request data, and keeping tenants apart](0056-data-governance.md) (built: `POST /v1/requests/erase`, tenant-scoped pairing, font digests)
 
 ## Roadmap
 
