@@ -1306,10 +1306,14 @@ async fn open_payload_response(
     use axum::response::IntoResponse;
     let (status, value) = match body.get("reference").and_then(|r| r.as_str()) {
         Some(reference) => match store.open(reference).await {
-            Ok(document) => (
-                axum::http::StatusCode::OK,
-                serde_json::json!({"payload": document}),
-            ),
+            Ok(document) => {
+                // With the segments of the request (null when it was cut): the content diff needs them.
+                let segments = super::payload::segment_view(&document);
+                (
+                    axum::http::StatusCode::OK,
+                    serde_json::json!({"payload": document, "segments": segments}),
+                )
+            }
             Err(error) => {
                 let (status, code) = super::payload::refusal(error);
                 (status, serde_json::json!({"error": code}))

@@ -597,6 +597,69 @@ function payloadParts(doc) {
   return [part("Request", doc && doc.request), part("Response", doc && doc.response)].filter(Boolean);
 }
 
+// What changed, where the cached prefix did (note 0052, slice 5c). Opens two captured prompts, so nothing is fetched until
+// an administrator asks, and it is recorded in the change history under their name for each of the two requests.
+function contentDiff(r) {
+  const shown = h("div", { class: "stack" });
+  const button = h("button", { type: "button", class: "btn" }, icon("shield", 14), "Show what changed");
+  const note = h("p", { class: "muted" }, "Opens this request's captured prompt and the previous one's, side by side at the first difference. This is customer data: both views are recorded in the change history under your name.");
+  button.addEventListener("click", async () => {
+    if (shown.childElementCount) { shown.replaceChildren(); button.lastChild.textContent = "Show what changed"; return; }
+    button.disabled = true;
+    try {
+      const answer = await api("/v1/requests/" + encodeURIComponent(r.attempt_id) + "/payload/diff");
+      shown.replaceChildren(...diffParts(answer));
+      button.lastChild.textContent = "Hide";
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) { showError(error); return; }
+      shown.replaceChildren(h("div", { class: "notice bad" }, icon("alert", 16), h("div", {}, error.message || "The comparison could not be opened.")));
+    } finally { button.disabled = false; }
+  });
+  return h("div", { class: "stack" }, note, h("div", {}, button), shown);
+}
+
+// A segment's canonical JSON as the text a person would read: the role and its words when that is what it is.
+function humanize(text) {
+  if (text === null || text === undefined) return "";
+  let value;
+  try { value = JSON.parse(text); } catch (_) { return String(text); }
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    const inner = value.content ?? value.block ?? value.part;
+    const words = typeof inner === "string" ? inner : inner && typeof inner.text === "string" ? inner.text : null;
+    if (words !== null && typeof value.role === "string") return value.role + ": " + words;
+    if (typeof value.text === "string" && Object.keys(value).length === 1) return value.text;
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+// The text with the part that differs from `other` marked: what the two share at the start and at the end is left alone.
+function markedText(text, other) {
+  let head = 0;
+  const max = Math.min(text.length, other.length);
+  while (head < max && text[head] === other[head]) head += 1;
+  let tail = 0;
+  while (tail < max - head && text[text.length - 1 - tail] === other[other.length - 1 - tail]) tail += 1;
+  const middle = text.slice(head, text.length - tail);
+  return [text.slice(0, head), middle ? h("mark", {}, middle) : "", text.slice(text.length - tail)];
+}
+
+function diffParts(answer) {
+  if (answer.unavailable === "payload_not_captured_or_expired") return [h("p", { class: "muted" }, "One of the two requests has no captured payload, or it has expired, so there is nothing to compare. Fingerprints above still say where the prompt changed.")];
+  if (answer.unavailable === "request_cut") return [h("p", { class: "muted" }, "One of the two requests was cut at the capture limit, so it cannot be cut into segments. Raise max_payload_bytes for this client to compare long prompts.")];
+  if (!answer.window) return [h("p", { class: "muted" }, "Nothing changed earlier than the prompt grew, so there is nothing to compare.")];
+  const first = answer.first_change;
+  return answer.window.map((item) => {
+    const before = humanize(item.previous && item.previous.text), now = humanize(item.current && item.current.text);
+    const title = item.index === first.index ? "Segment " + (item.index + 1) + " · " + first.label + " · first change" : "Segment " + (item.index + 1) + (item.changed ? " · changed" : " · unchanged");
+    const pane = (label, text, other, absent) => h("div", {},
+      h("div", { class: "pane-label" }, label), h("pre", { class: "diffpane" }, absent ? h("span", { class: "muted" }, "(not in this request)") : item.changed ? markedText(text, other) : text),
+      (item.current && item.current.cut) || (item.previous && item.previous.cut) ? h("p", { class: "muted" }, "Long: shown up to 64 KiB.") : null);
+    return h("div", { class: "section" }, h("h3", {}, title),
+      pane("Previous request", before, now, !item.previous), pane("This request", now, before, !item.current));
+  });
+}
+
 function structureView(s, r) {
   const segs = arr(s.segments), d = s.diff;
   const common = d ? d.common_segments : segs.length;
@@ -621,8 +684,10 @@ function structureView(s, r) {
     : "A prefix of the previous request's prompt: it is shorter, with nothing changed.";
   const gap = s.previous ? "The previous request was " + (s.previous.gap_secs < 90 ? s.previous.gap_secs + " s" : Math.round(s.previous.gap_secs / 60) + " min") + " earlier" + (s.previous.within_short_window ? "." : ", longer than the five minutes a cache entry may last, so it could have expired whatever the prompt said.") : null;
   const cacheNote = d && relation !== "changed" && r.cache_hit_pct !== null && r.cache_hit_pct < 30 ? "The prompt did not change but the cache hit was low: look at the provider's minimum cacheable length, the cache lifetime and where the cache breakpoints are." : null;
+  const canCompare = d && relation === "changed" && r.payload && !r.payload.expired && canAdmin();
   return h("div", { class: "stack" }, strip,
     d ? h("div", { class: "legend" }, h("span", { class: "same" }, h("i"), "Same as before"), relation === "changed" ? h("span", { class: "change" }, h("i"), "First change") : null, relation === "changed" ? h("span", { class: "after" }, h("i"), "After the change") : null, relation === "appended" ? h("span", { class: "added" }, h("i"), "Added") : null) : null,
     h("p", {}, say), gap ? h("p", { class: "muted" }, gap) : null, cacheNote ? h("p", { class: "muted" }, cacheNote) : null,
+    canCompare ? contentDiff(r) : null,
     h("p", { class: "muted" }, "Fingerprints are keyed hashes: they show where the prompt changed, never what it said. Segments by kind: " + Object.entries(segs.reduce((acc, x) => ((acc[x.kind] = (acc[x.kind] || 0) + 1), acc), {})).map(([k, n]) => n + " " + (KIND_NAMES[k] || k).toLowerCase()).join(", ") + "."));
 }

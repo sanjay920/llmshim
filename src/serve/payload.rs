@@ -155,6 +155,29 @@ impl PayloadWriter for PayloadStore {
     }
 }
 
+/// The request of a payload document cut into the segments its fingerprints were taken over, each with its kind and
+/// canonical text, for the content diff (note 0052, slice 5c): `null` when the request was cut at the capture limit
+/// (a cut body cannot be segmented) or is not a body the walker reads. The segments are the ones the usage record's
+/// fingerprints name, in the same places: it is the same walker.
+pub fn segment_view(document: &Value) -> Value {
+    let build = || -> Option<Value> {
+        let request = document.get("request")?;
+        if request.get("truncated").and_then(Value::as_bool) != Some(false) {
+            return None;
+        }
+        let wire = crate::gateway::structure::wire_from_name(document.get("wire")?.as_str()?)?;
+        let body: Value = serde_json::from_str(request.get("text")?.as_str()?).ok()?;
+        let texts = crate::gateway::structure::segment_texts(wire, &body).ok()?;
+        Some(Value::Array(
+            texts
+                .into_iter()
+                .map(|t| serde_json::json!({"kind": t.kind, "text": t.text}))
+                .collect(),
+        ))
+    };
+    build().unwrap_or(Value::Null)
+}
+
 /// What the admin endpoint answers for a reference that does not open: the class of the problem and nothing the
 /// store or the reference said.
 pub fn refusal(error: BlobError) -> (axum::http::StatusCode, &'static str) {
@@ -291,6 +314,28 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(store.store(document).is_some());
+    }
+
+    #[test]
+    fn a_document_is_cut_into_its_segments_unless_its_request_was_cut() {
+        let body = serde_json::json!({"messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hello"}]});
+        let document = |truncated: bool, wire: &str| serde_json::json!({"wire": wire, "request": {"text": body.to_string(), "bytes": 99, "truncated": truncated}});
+        let view = segment_view(&document(false, "openai-chat"));
+        let kinds: Vec<&str> = view
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["system", "user"]);
+        assert!(view[1]["text"].as_str().unwrap().contains("hello"));
+        // A cut request, an unknown wire, text that is not JSON: no segments, never a wrong cut.
+        assert!(segment_view(&document(true, "openai-chat")).is_null());
+        assert!(segment_view(&document(false, "carrier-pigeon")).is_null());
+        assert!(segment_view(&serde_json::json!({"wire": "openai-chat", "request": {"text": "{\"messages\": [", "truncated": false}})).is_null());
+        assert!(segment_view(&serde_json::json!({})).is_null());
     }
 
     #[test]

@@ -85,7 +85,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0049: Single sign-on for the control plane](0049-control-plane-sso.md)
 - [0050: Media through a fleet, over an object store](0050-media-object-store.md)
 - [0051: The admin UI](0051-admin-ui.md)
-- [0052: Payload capture and the cache debugger](0052-payload-capture-and-cache-debugger.md) (5a built: structure capture and the cache debugger; 5b, 5c not)
+- [0052: Payload capture and the cache debugger](0052-payload-capture-and-cache-debugger.md) (built: structure capture and the cache debugger, sealed payloads, the content diff)
 
 ## Roadmap
 
@@ -169,7 +169,7 @@ Later phases (each needs its own design note before work starts)
 - [x] Config-registered providers: **decided, no further kinds** (0022). An endpoint that speaks a wire llmshim has is `base_url` on that kind (`openai-compatible`, or `base_url` on `openai`, `anthropic`, `gemini`, `xai`, `cerebras`, `openrouter`); a wire it lacks is a library adapter, not a configuration
 - [x] Images, speech and transcription through a fleet (0050): over a shared object store (`[media_store]`: a directory or any S3-compatible service; objects are sealed); the AWS credential chain, native GCS and Azure Blob backends and the Helm chart's media store settings are slice 3, built
 - [x] SSO for the control plane (0049): OIDC token verification, the verified subject as the actor, three fixed roles, break-glass
-- [ ] Admin UI (0051, in progress): slices 1 to 4 built: the request ledger in the control plane (`POST /v1/usage/batch` under its own ingest token, `GET /v1/requests`, `/summary`, `/facets`, retention) and the gateway's `[usage_export]`; the UI shell with sign-in, Home and Requests (`/ui/` on the control plane); the Clients, Admin and History views (key create/rotate/revoke/limits, organizations, teams, projects, team budgets, the history chain check); the Gateways view (providers, circuits, deployments, routes, configuration state, read from each gateway's admin listener via `--gateways-file`); the cache debugger's structure capture (slice 5a, 0052) is built: per-client `capture = "structure"`, keyed segment fingerprints, "where did the cached prefix change" on each request and across a window; sealed payloads (5b) and the content diff (5c) are designed and not built
+- [ ] Admin UI (0051, in progress): slices 1 to 4 built: the request ledger in the control plane (`POST /v1/usage/batch` under its own ingest token, `GET /v1/requests`, `/summary`, `/facets`, retention) and the gateway's `[usage_export]`; the UI shell with sign-in, Home and Requests (`/ui/` on the control plane); the Clients, Admin and History views (key create/rotate/revoke/limits, organizations, teams, projects, team budgets, the history chain check); the Gateways view (providers, circuits, deployments, routes, configuration state, read from each gateway's admin listener via `--gateways-file`); the cache debugger's structure capture (slice 5a, 0052) is built: per-client `capture = "structure"`, keyed segment fingerprints, "where did the cached prefix change" on each request and across a window; sealed payloads (5b, admin-only, every view recorded first) and the content diff (5c) are built
 - [ ] SCIM (not started)
 
 ## Review follow-ups

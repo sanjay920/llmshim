@@ -1,6 +1,6 @@
 # 0052: Payload capture and the cache debugger
 
-Status: **slices 5a (structure) and 5b (sealed payloads) are built; 5c (the content diff) is not.** Slice 5 of the admin
+Status: **all three slices are built: 5a (structure), 5b (sealed payloads) and 5c (the content diff).** Slice 5 of the admin
 UI (0051). It carries a privacy decision, so it was written down and decided before any code. The owner accepted the
 recommendations under "Decisions needed" (2026-11-20) and asked for 5a first; 5b is a separate decision that can still be
 declined without wasting 5a.
@@ -310,3 +310,31 @@ segment and a few segments on either side. Pure presentation over 5a and 5b; it 
 - **The record says how far its "who" can be trusted.** A `payload.viewed` row carries `via`: `oidc` (a verified person),
   `break_glass`, or `shared_token` (with one shared token and no identity provider the actor is a label the caller gave). With
   single sign-on every view names a verified subject.
+
+## Slice 5c as built
+
+- **One walker, so the diff shows what was compared.** `gateway::structure::segment_texts` is the same walker that makes the
+  fingerprints, with each segment's canonical text kept beside its hash (a tee on the writer the hash is fed through). A test
+  re-hashes every text and requires the keyed hash to equal the exported fingerprint, for each wire, so the segment a viewer
+  reads is exactly the segment its fingerprint names, in the same place. The folded tail (past 2,048 segments) has no text.
+- **The gateway's open answer carries the segments.** `POST /v1/serve/payload/open` answers `{"payload": {…}, "segments":
+  [{kind, text}, …] or null}`; `segments` is `null` when the request was cut at the capture limit (a cut body cannot be
+  segmented) or is not a body the walker reads. Nothing new is stored: the segments are cut from the opened payload on demand.
+- **Control plane.** `GET /v1/requests/{attempt}/payload/diff` (admin only). From the stored fingerprints it finds the request
+  before (as for 5a) and compares. Only for a **changed** relation does it open anything: it checks that both payloads exist and
+  have not expired, writes a `payload.viewed` row **for each of the two attempts before anything is fetched**, has the
+  gateways open both references at once, and answers with the segments around the first difference (two before, two after,
+  from both requests, each with kind, text cut at 64 KiB and a `changed` flag). A request that only grew, repeated or shortened
+  its prompt, or has no earlier one, opens nothing and records nothing; a missing or expired payload says so; a cut request
+  says `request_cut`. `Cache-Control: no-store`, nothing kept.
+- **UI.** In the request's prompt-structure section, for the admin role and a changed prompt with a captured payload: a button
+  and a plain statement that both views are recorded under their name; then each segment of the window with the previous request
+  above and this one below, the part that differs marked (what the two share at the start and at the end is left alone, so a
+  changed timestamp marks only the digits that changed), text only.
+- **Checked** by the alignment test above, a real gateway into a real control plane in Chrome (a system prompt whose timestamp
+  moved: the digits marked, both views in the history), the control plane's tests on SQLite and Postgres (the window and the
+  context, the two recorded views and none for unchanged prompts, each unavailable case, a failed fetch still recorded, no
+  gateways, the 64 KiB cut, the role), and a real `serve` process (the open answer's segments, and none for a cut request).
+  Mutation-checked: only one view recorded, the text not cut.
+- **Not here.** A word-level diff inside a segment beyond the shared start and end, and comparison with a request other than the
+  one just before it.

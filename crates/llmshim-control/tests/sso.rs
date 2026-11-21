@@ -211,7 +211,11 @@ async fn each_role_gets_exactly_its_routes() {
     let api = Api::new(true);
     // Every GET is a read route except the two that are admin only: the history chain check, which scans the
     // whole history, and a captured payload, which is customer data.
-    let admin_gets = ["/v1/history/verify", "/v1/requests/{attempt}/payload"];
+    let admin_gets = [
+        "/v1/history/verify",
+        "/v1/requests/{attempt}/payload",
+        "/v1/requests/{attempt}/payload/diff",
+    ];
     let read_routes: Vec<_> = ROUTES
         .iter()
         .filter(|(m, p)| *m == "get" && !admin_gets.contains(p))

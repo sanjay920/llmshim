@@ -238,7 +238,8 @@ pub enum OpenError {
 const MAX_OPEN_BODY: usize = 16 << 20;
 
 impl Gateways {
-    /// Ask every gateway at once to open a payload reference; the first that does wins. In a fleet any replica can
+    /// Ask every gateway at once to open a payload reference; the first that does wins. The answer is the gateway's:
+    /// `{"payload": {…}, "segments": […] or null}`. In a fleet any replica can
     /// (the store and the key are shared); with a local store only the one that wrote it can, and the others say
     /// not found. The reference is only handed on, never read, and nothing a gateway says is repeated but the
     /// document.
@@ -283,7 +284,7 @@ impl Gateways {
                     match status {
                         200 => serde_json::from_slice::<Value>(&body)
                             .ok()
-                            .and_then(|v| v.get("payload").filter(|p| p.is_object()).cloned())
+                            .filter(|v| v.get("payload").is_some_and(Value::is_object))
                             .ok_or(OpenError::Unavailable),
                         404 => Err(OpenError::NotFound),
                         422 => Err(OpenError::BadReference),
