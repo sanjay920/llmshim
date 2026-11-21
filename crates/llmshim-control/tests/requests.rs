@@ -395,7 +395,10 @@ async fn the_ingest_token_opens_the_push_and_nothing_else_and_no_other_token_ope
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body, json!({"accepted": 1, "duplicate": 0, "rejected": 0}));
+    assert_eq!(
+        body,
+        json!({"accepted": 1, "duplicate": 0, "rejected": 0, "erased": 0})
+    );
     // The same batch again: stored once.
     let (_, body) = call(
         &app,

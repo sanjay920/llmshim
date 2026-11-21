@@ -157,7 +157,7 @@ async fn a_key_a_tenant_or_a_key_within_a_tenant_is_erased_with_its_structures_a
         &app,
         Method::POST,
         "/v1/requests/erase",
-        Some(json!({"tenant": "acme", "key": "checkout", "confirm": "checkout"})),
+        Some(json!({"tenant": "acme", "key": "checkout", "confirm": "acme/checkout"})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{erased}");
@@ -188,7 +188,7 @@ async fn a_key_a_tenant_or_a_key_within_a_tenant_is_erased_with_its_structures_a
         &app,
         Method::POST,
         "/v1/requests/erase",
-        Some(json!({"key": "checkout", "confirm": "checkout"})),
+        Some(json!({"key": "checkout", "all_tenants": true, "confirm": "checkout"})),
     )
     .await;
     assert_eq!(
@@ -246,6 +246,10 @@ async fn an_erasure_needs_a_selector_and_its_value_repeated() {
         json!({"confirm": "x"}),
         json!({"tenant": "acme", "confirm": "acm"}),
         json!({"tenant": "acme", "key": "checkout", "confirm": "acme"}),
+        json!({"tenant": "acme", "key": "checkout", "confirm": "checkout"}),
+        // A key alone is every tenant's: it has to say so.
+        json!({"key": "checkout", "confirm": "checkout"}),
+        json!({"tenant": "acme", "all_tenants": true, "confirm": "acme"}),
         json!({"tenant": "acme", "confirm": "acme", "extra": 1}),
     ] {
         let (status, answer) =
@@ -253,4 +257,75 @@ async fn an_erasure_needs_a_selector_and_its_value_repeated() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {answer}");
     }
     assert_eq!(count(&app).await, 1, "a refused erasure deleted nothing");
+}
+
+async fn ingest(app: &axum::Router, records: Vec<Value>) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/usage/batch")
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer ingest-token-0123456789abcdefgh",
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"records": records}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn what_was_erased_does_not_come_back_from_a_gateways_retry_but_new_activity_is_stored() {
+    let state = AppState::new(common::store(), SHARED, None);
+    state.set_ingest_token("ingest-token-0123456789abcdefgh");
+    let app = router(state);
+    let old = record("a1", "2026-11-19T10:00:00Z", "acme", "checkout", "s1", true);
+    assert_eq!(ingest(&app, vec![old.clone()]).await["accepted"], 1);
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/v1/requests/erase",
+        Some(json!({"tenant": "acme", "confirm": "acme"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The gateway's exporter retries the batch whose acknowledgement it never saw: refused, counted, not stored.
+    let again = ingest(&app, vec![old]).await;
+    assert_eq!(
+        (again["accepted"].as_u64(), again["erased"].as_u64()),
+        (Some(0), Some(1)),
+        "{again}"
+    );
+    assert_eq!(count(&app).await, 0);
+    // Another tenant is unaffected, and so is this one's activity after the erasure (a request made today).
+    let other = record(
+        "g1",
+        "2026-11-19T10:00:00Z",
+        "globex",
+        "checkout",
+        "s1",
+        false,
+    );
+    let later = record(
+        "a2",
+        "2099-01-01T00:00:00Z",
+        "acme",
+        "checkout",
+        "s1",
+        false,
+    );
+    let counts = ingest(&app, vec![other, later]).await;
+    assert_eq!(
+        (counts["accepted"].as_u64(), counts["erased"].as_u64()),
+        (Some(2), Some(0)),
+        "{counts}"
+    );
+    assert_eq!(count(&app).await, 2);
 }

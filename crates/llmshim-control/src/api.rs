@@ -1026,16 +1026,16 @@ async fn request_structure(
     })))
 }
 
-/// A captured request and answer, opened by a gateway (note 0052, slice 5b). Customer data, so: the admin role only;
-/// a row in the change history, written **before** anything is fetched, says who asked for which attempt; the
-/// control plane holds only an opaque reference and cannot open it, so a gateway does, through its admin listener; the
-/// answer is never cached; and nothing of it is stored, logged or put in an error here.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EraseBody {
     tenant: Option<String>,
     key: Option<String>,
-    /// Must repeat the key (or, with no key, the tenant): a deletion is not one stray request away.
+    /// A key is a name a gateway chose, and the same name is common across tenants: erasing it in all of them has to
+    /// be asked for.
+    #[serde(default)]
+    all_tenants: bool,
+    /// Must repeat what is being erased (`tenant`, `key`, or `tenant/key`): a deletion is not one stray request away.
     confirm: String,
 }
 
@@ -1050,19 +1050,38 @@ async fn erase_requests(
 ) -> ApiResult<Json<Value>> {
     let actor = actor(&headers)?;
     let via = principal.map_or("shared_token", |axum::Extension(p)| p.via);
-    let expected = body.key.as_deref().or(body.tenant.as_deref());
-    if expected.is_none() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
+    let invalid = |code: &'static str, message: &'static str| {
+        ApiError::new(StatusCode::BAD_REQUEST, code, message)
+    };
+    let expected = match (body.tenant.as_deref(), body.key.as_deref()) {
+        (None, None) => {
+            return Err(invalid(
+                "invalid_request",
+                "name a tenant, a key or both to erase",
+            ))
+        }
+        (Some(tenant), None) => tenant.to_string(),
+        (Some(tenant), Some(key)) => format!("{tenant}/{key}"),
+        (None, Some(key)) => {
+            if !body.all_tenants {
+                return Err(invalid(
+                    "tenant_required",
+                    "a key alone erases that key in every tenant: name the tenant, or set all_tenants to say that is meant",
+                ));
+            }
+            key.to_string()
+        }
+    };
+    if body.all_tenants && body.tenant.is_some() {
+        return Err(invalid(
             "invalid_request",
-            "name a tenant, a key or both to erase",
+            "all_tenants is for a key with no tenant",
         ));
     }
-    if expected != Some(body.confirm.as_str()) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
+    if body.confirm != expected {
+        return Err(invalid(
             "confirmation_mismatch",
-            "confirm must repeat the key (or, with no key, the tenant) being erased",
+            "confirm must repeat what is being erased: the tenant, the key, or tenant/key",
         ));
     }
     let erased = with_store(&s, move |st| {
@@ -1072,6 +1091,10 @@ async fn erase_requests(
     Ok(Json(json!(erased)))
 }
 
+/// A captured request and answer, opened by a gateway (note 0052, slice 5b). Customer data, so: the admin role only;
+/// a row in the change history, written **before** anything is fetched, says who asked for which attempt; the
+/// control plane holds only an opaque reference and cannot open it, so a gateway does, through its admin listener; the
+/// answer is never cached; and nothing of it is stored, logged or put in an error here.
 async fn request_payload(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,

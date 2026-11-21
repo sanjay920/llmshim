@@ -261,3 +261,43 @@ fn postgres_is_read_only_until_it_is_migrated() {
     let again = llmshim_control::migrate_postgres(&url, Some(&schema), None).unwrap();
     assert_eq!(again.from, again.to);
 }
+
+#[test]
+fn a_structure_from_before_the_tenant_column_gets_its_tenant_from_its_ledger_row() {
+    let d = dir("backfill");
+    let db = d.join("c.db");
+    let mut store = Store::open(&db).unwrap();
+    let hex = |n: u8| format!("{n:02x}").repeat(8);
+    let record = |id: &str, tenant: &str| {
+        serde_json::json!({
+            "event": "usage", "ts": "2026-11-19T10:00:00Z", "attempt_id": id, "tenant": tenant, "key": "checkout",
+            "request_id": format!("req-{id}"), "provider": "openai", "model": "m", "kind": "completion",
+            "outcome": "completed", "duration_ms": 1, "input_tokens": 1, "output_tokens": 1,
+            "cache_read_tokens": 0, "cache_write_tokens": 0, "usage_reported": true, "admission": "fleet",
+            "structure": [{"kind": "system", "hash": hex(1), "bytes": 1}],
+        })
+    };
+    assert_eq!(
+        store
+            .ingest_requests(&[record("a1", "acme"), record("g1", "globex")])
+            .unwrap()
+            .accepted,
+        2
+    );
+    drop(store);
+    // As a version-8 build left it: no tenant on the structures.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("ALTER TABLE request_structure DROP COLUMN tenant; DROP TABLE erasures; PRAGMA user_version = 8;")
+        .unwrap();
+    assert_eq!(run(&["migrate", "--db", db.to_str().unwrap()]).0, Some(0));
+    let mut store = Store::open_existing(&db).unwrap();
+    assert_eq!(
+        store.request_structure("a1").unwrap().unwrap().tenant,
+        "acme"
+    );
+    assert_eq!(
+        store.request_structure("g1").unwrap().unwrap().tenant,
+        "globex"
+    );
+}

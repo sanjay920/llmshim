@@ -65,7 +65,19 @@ CREATE INDEX IF NOT EXISTS requests_by_tenant ON requests (tenant, ts_ms);
 CREATE INDEX IF NOT EXISTS requests_by_key ON requests (key_name, ts_ms);
 CREATE INDEX IF NOT EXISTS requests_by_model ON requests (model, ts_ms);
 CREATE INDEX IF NOT EXISTS requests_by_request ON requests (request_id);
+{erasures}
 "
+        ,
+        erasures = erasures_schema(pg)
+    )
+}
+
+/// What was erased, so that a record the gateways still hold (an export retry queue, an acknowledgement lost on the
+/// way) does not bring it back: an arriving record that matches a row here and is no newer than it is refused.
+pub(crate) fn erasures_schema(pg: bool) -> String {
+    let int = if pg { "BIGINT" } else { "INTEGER" };
+    format!(
+        "CREATE TABLE IF NOT EXISTS erasures (erased_ms {int} NOT NULL, tenant TEXT, key_name TEXT);"
     )
 }
 
@@ -269,6 +281,8 @@ pub struct Ingested {
     pub duplicate: u64,
     /// Rows refused as malformed (counted, never stored, their content not echoed).
     pub rejected: u64,
+    /// Rows refused because the tenant or key they belong to was erased after they were made (note 0056).
+    pub erased: u64,
 }
 
 /// The filters of a request query. Every field narrows.
@@ -495,7 +509,22 @@ impl Store {
         let received = chrono::Utc::now().timestamp_millis();
         let inserted = self.backend.transaction(true, |tx| {
             let mut inserted = 0u64;
+            // What has been erased, read once: a record no newer than an erasure that names its tenant (or key, or
+            // both) is the data that was deleted, coming back from a gateway's retry, and is not stored.
+            let erasures: Vec<(i64, Option<String>, Option<String>)> = tx
+                .query("SELECT erased_ms, tenant, key_name FROM erasures", &[])?
+                .iter()
+                .map(|r| Ok((r.int(0)?, r.opt_text(1)?, r.opt_text(2)?)))
+                .collect::<Result<_>>()?;
             for row in &rows {
+                if erasures.iter().any(|(at, tenant, key)| {
+                    row.ts_ms <= *at
+                        && tenant.as_ref().is_none_or(|t| row.tenant.as_ref() == Some(t))
+                        && key.as_ref().is_none_or(|k| row.key_name.as_ref() == Some(k))
+                }) {
+                    counts.erased += 1;
+                    continue;
+                }
                 let params: Vec<Param> = vec![
                     t(&row.attempt_id), t(&row.ts), i(row.ts_ms), t(&row.day),
                     ot(row.tenant.as_deref()), ot(row.key_name.as_deref()),
@@ -533,7 +562,7 @@ impl Store {
             Ok(inserted)
         })?;
         counts.accepted = inserted;
-        counts.duplicate = rows.len() as u64 - inserted;
+        counts.duplicate = rows.len() as u64 - inserted - counts.erased;
         Ok(counts)
     }
 
@@ -701,6 +730,8 @@ impl Store {
     /// Delete rows older than `before_ms`; how many went.
     pub fn purge_requests(&mut self, before_ms: i64) -> Result<u64> {
         let gone = self.backend.transaction(true, |tx| {
+            // A tombstone is only needed while a record it covers could still arrive and outlive the retention.
+            tx.exec("DELETE FROM erasures WHERE erased_ms < ?1", &[i(before_ms)])?;
             tx.exec("DELETE FROM requests WHERE ts_ms < ?1", &[i(before_ms)])
         })?;
         // The structure ages out with its row.
@@ -807,6 +838,11 @@ impl Store {
                 &params,
             )?;
             let requests = tx.exec(&format!("DELETE FROM requests WHERE {selector}"), &params)?;
+            // The tombstone: what arrives later from a gateway's queue about these is not stored again.
+            tx.exec(
+                "INSERT INTO erasures (erased_ms, tenant, key_name) VALUES (?1, ?2, ?3)",
+                &[i(chrono::Utc::now().timestamp_millis()), ot(tenant), ot(key)],
+            )?;
             let erased = Erased {
                 requests,
                 structures,

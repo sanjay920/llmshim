@@ -781,8 +781,9 @@ impl Store {
                             // Version 9: whose request a stored structure is (note 0056).
                             connection
                                 .execute_batch(&format!(
-                                    "{} PRAGMA user_version = 9;",
-                                    structure::tenant_column(false)
+                                    "{} {} PRAGMA user_version = 9;",
+                                    structure::tenant_column(false),
+                                    requests::erasures_schema(false)
                                 ))
                                 .map_err(db_err)?;
                         }

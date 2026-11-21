@@ -43,8 +43,12 @@ pub(crate) fn schema_v7(pg: bool) -> String {
 /// The column version 9 added: whose request it was. Without it two tenants whose keys share a name would be paired
 /// with each other, and the diff could set one customer's prompt beside another's.
 pub(crate) fn tenant_column(pg: bool) -> String {
+    // The tenant of every row that already exists is read back from its ledger row, so a stored structure from before
+    // this version is paired within its own tenant too and not with whoever shares a key name.
     format!(
-        "ALTER TABLE request_structure ADD COLUMN{} tenant TEXT;",
+        "ALTER TABLE request_structure ADD COLUMN{} tenant TEXT; \
+         UPDATE request_structure SET tenant = (SELECT r.tenant FROM requests r \
+             WHERE r.attempt_id = request_structure.attempt_id);",
         if pg { " IF NOT EXISTS" } else { "" }
     )
 }
