@@ -844,6 +844,9 @@ usage record carries only an opaque reference. The control plane stores the refe
 /v1/requests/{attempt}/payload` (admin only) writes a `payload.viewed` history row first, then has a gateway's admin listener
 (`POST /v1/serve/payload/open`) open it. Never put a reference or payload text in a log, metric, error, list answer or
 cacheable response; never give the control plane `payload_key` or the object store.
+The open route has its own `[capture] open_token` (never the admin token) and writes a gateway-side `payload.open` audit record
+before reading; the control plane needs `payload_token_file` and refuses payload views without a verified identity unless started with
+`--allow-payload-views-without-sso`. `[capture] response` (default false) keeps the provider's answer too.
 
 Content diff (5c): the same walker (`gateway::structure::segment_texts`) keeps each segment's canonical text beside its hash, and the
 admin `open` answer carries `segments`. `GET /v1/requests/{attempt}/payload/diff` (admin only) opens both payloads only for a

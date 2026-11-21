@@ -181,7 +181,8 @@ impl std::io::Write for Capped {
 struct PendingPayload {
     wire: crate::reasoning::WireFormat,
     request: Capped,
-    response: Capped,
+    /// `None` when the client's answers are not kept.
+    response: Option<Capped>,
     writer: Arc<dyn PayloadWriter>,
 }
 
@@ -229,6 +230,9 @@ pub struct PayloadCapture {
     clients: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     writer: Arc<dyn PayloadWriter>,
     max_bytes: usize,
+    /// Whether the provider's answer is kept as well as the request. Off by default: the answer is the provider's
+    /// own output, not what the caller was sent (not redacted, reasoning included).
+    response: bool,
 }
 
 impl StructureCapture {
@@ -248,12 +252,14 @@ impl StructureCapture {
         mut self,
         writer: Arc<dyn PayloadWriter>,
         max_bytes: usize,
+        response: bool,
         clients: impl IntoIterator<Item = String>,
     ) -> Self {
         self.payload = Some(PayloadCapture {
             clients: Default::default(),
             writer,
             max_bytes,
+            response,
         });
         self.set_payload_clients(clients);
         self
@@ -294,7 +300,7 @@ impl StructureCapture {
         Some(PendingPayload {
             wire,
             request,
-            response: Capped::new(payload.max_bytes),
+            response: payload.response.then(|| Capped::new(payload.max_bytes)),
             writer: payload.writer.clone(),
         })
     }
@@ -651,16 +657,20 @@ impl UsageRecorder {
         let Ok(mut attempts) = self.open.lock() else {
             return;
         };
-        let Some(pending) = attempts.get_mut(&id).and_then(|open| open.payload.as_mut()) else {
+        let Some(response) = attempts
+            .get_mut(&id)
+            .and_then(|open| open.payload.as_mut())
+            .and_then(|pending| pending.response.as_mut())
+        else {
             return;
         };
         match frame {
             crate::policy::NativeFrame::StreamData { data } => {
-                pending.response.push(data.as_bytes());
-                pending.response.push(b"\n");
+                response.push(data.as_bytes());
+                response.push(b"\n");
             }
             crate::policy::NativeFrame::ResponseBody { body } => {
-                let _ = serde_json::to_writer(&mut pending.response, body);
+                let _ = serde_json::to_writer(response, body);
             }
         }
     }
@@ -686,7 +696,8 @@ impl UsageRecorder {
                 "model": record.model,
                 "outcome": record.outcome,
                 "request": pending.request.json(),
-                "response": pending.response.json(),
+                // Null when the client's answers are not kept (the default): the request is what is captured.
+                "response": pending.response.as_ref().map(Capped::json),
             });
             if let Ok(bytes) = serde_json::to_vec(&document) {
                 record.payload = pending.writer.store(bytes);

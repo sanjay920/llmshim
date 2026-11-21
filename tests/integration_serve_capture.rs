@@ -319,11 +319,13 @@ fn the_configuration_refuses_capture_it_cannot_honour_before_serving() {
 
 // ---- payload capture (note 0052, slice 5b) ------------------------------------------------------
 
+const OPEN_TOKEN: &str = "open-token-0123456789-abcdefghijklmnop";
 const PAYLOAD_SECRET: &str = "cGF5bG9hZC1zZWNyZXQtMDEyMzQ1Njc4OS1hYmNkZWY";
 
 fn payload_env() -> Vec<(&'static str, &'static str)> {
     let mut all = env().to_vec();
     all.push(("SERVE_E2E_PAYLOAD_KEY", PAYLOAD_SECRET));
+    all.push(("SERVE_E2E_OPEN_TOKEN", OPEN_TOKEN));
     all
 }
 
@@ -336,9 +338,17 @@ fn render_payload(
 ) -> String {
     format!(
         "{}\n[media_store]\nkind = \"file\"\npath = \"{{DIR}}/media\"\n",
-        render(upstream, control, ci_capture, log).replace(
+        render(upstream, control, ci_capture, log)
+            .replace(
+                "[logging]\n",
+                &format!(
+                    "[logging]\n        audit_log = \"{}\"\n",
+                    log.with_file_name("audit.jsonl").display()
+                ),
+            )
+            .replace(
             "hmac_key = { env = \"SERVE_E2E_CAPTURE_SECRET\" }",
-            "hmac_key = { env = \"SERVE_E2E_CAPTURE_SECRET\" }\n        payload_key = { env = \"SERVE_E2E_PAYLOAD_KEY\" }",
+            "hmac_key = { env = \"SERVE_E2E_CAPTURE_SECRET\" }\n        payload_key = { env = \"SERVE_E2E_PAYLOAD_KEY\" }\n        open_token = { env = \"SERVE_E2E_OPEN_TOKEN\" }",
         )
     )
 }
@@ -388,7 +398,8 @@ async fn a_payload_is_sealed_on_the_data_plane_and_opens_only_through_the_admin_
     let dir = tempdir::Dir::new("payload-log");
     let log = dir.0.join("usage.jsonl");
     let server = start(
-        &render_payload(&up.url(), &control, "capture = \"payload\"", &log),
+        &render_payload(&up.url(), &control, "capture = \"payload\"", &log)
+            .replace("open_token = {", "response = true\n        open_token = {"),
         "payload",
         &payload_env(),
     );
@@ -463,13 +474,13 @@ async fn a_payload_is_sealed_on_the_data_plane_and_opens_only_through_the_admin_
     let admin = server.admin.clone().unwrap();
     // Plain, the answer is the document and nothing is cut into segments (no work for a view that does not want it).
     let (status, plain, _) =
-        open_payload(&admin, Some(ADMIN_TOKEN), json!({"reference": reference})).await;
+        open_payload(&admin, Some(OPEN_TOKEN), json!({"reference": reference})).await;
     assert_eq!(status, 200, "{plain}");
     assert!(plain["segments"].is_null(), "{plain}");
     // Asked for, with the segments.
     let (status, body, cache) = open_payload(
         &admin,
-        Some(ADMIN_TOKEN),
+        Some(OPEN_TOKEN),
         json!({"reference": reference, "segments": true}),
     )
     .await;
@@ -503,6 +514,13 @@ async fn a_payload_is_sealed_on_the_data_plane_and_opens_only_through_the_admin_
         .unwrap()
         .contains("pong"));
     // Nothing else opens it: no token, a wrong token, a reference that is not one, one that was altered.
+    // The admin token that scrapes metrics does not open customer data: the route has its own credential.
+    assert_eq!(
+        open_payload(&admin, Some(ADMIN_TOKEN), json!({"reference": reference}))
+            .await
+            .0,
+        401
+    );
     assert_eq!(
         open_payload(&admin, None, json!({"reference": reference}))
             .await
@@ -520,13 +538,13 @@ async fn a_payload_is_sealed_on_the_data_plane_and_opens_only_through_the_admin_
         401
     );
     let (status, body, cache) =
-        open_payload(&admin, Some(ADMIN_TOKEN), json!({"reference": "garbage"})).await;
+        open_payload(&admin, Some(OPEN_TOKEN), json!({"reference": "garbage"})).await;
     assert_eq!(
         (status, body["error"].as_str(), cache.as_deref()),
         (422, Some("bad_reference"), Some("no-store"))
     );
     assert_eq!(
-        open_payload(&admin, Some(ADMIN_TOKEN), json!({})).await.0,
+        open_payload(&admin, Some(OPEN_TOKEN), json!({})).await.0,
         422
     );
     let mut altered = reference.clone().into_bytes();
@@ -535,7 +553,7 @@ async fn a_payload_is_sealed_on_the_data_plane_and_opens_only_through_the_admin_
     assert_eq!(
         open_payload(
             &admin,
-            Some(ADMIN_TOKEN),
+            Some(OPEN_TOKEN),
             json!({"reference": String::from_utf8(altered).unwrap()})
         )
         .await
@@ -551,6 +569,19 @@ async fn a_payload_is_sealed_on_the_data_plane_and_opens_only_through_the_admin_
         .await
         .unwrap();
     assert_eq!(main.status().as_u16(), 404);
+    // Every opening is in the audit log before the payload is read, with a digest of the reference, never the
+    // reference or any text.
+    let audit = std::fs::read_to_string(dir.0.join("audit.jsonl")).unwrap_or_default();
+    let opened: Vec<&str> = audit
+        .lines()
+        .filter(|l| l.contains("payload.open"))
+        .collect();
+    assert!(opened.len() >= 4, "{audit}");
+    assert!(opened.iter().any(|l| l.contains("requested")), "{audit}");
+    assert!(
+        !audit.contains(&reference) && !audit.contains(SECRET_PROMPT) && !audit.contains("pong"),
+        "{audit}"
+    );
     // The usage log never carries the reference.
     let logged = loop {
         let text = std::fs::read_to_string(&log).unwrap_or_default();
@@ -637,20 +668,41 @@ fn payload_capture_is_refused_before_serving_when_it_cannot_be_honoured() {
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("payload_key"), "{stderr}");
     let (code, stderr) = run(
-        "no-admin-token",
+        "no-open-token",
+        &|c| c.replace("open_token = { env = \"SERVE_E2E_OPEN_TOKEN\" }", ""),
+        &payload_env(),
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("capture.open_token"), "{stderr}");
+    let (code, stderr) = run(
+        "no-audit-log",
         &|c| {
-            c.replace(
-                "token = { env = \"SERVE_E2E_ADMIN_TOKEN\" }",
-                "allow_unauthenticated = true",
-            )
+            let at = c.find("audit_log").unwrap();
+            let end = at + c[at..].find('\n').unwrap();
+            format!("{}{}", &c[..at], &c[end..])
         },
         &payload_env(),
     );
     assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains("[admin]") && stderr.contains("token"),
-        "{stderr}"
+    assert!(stderr.contains("audit_log"), "{stderr}");
+    let (code, stderr) = run(
+        "no-admin",
+        &|c| {
+            c.replace(
+                "[admin]\n        port = 0\n        token = { env = \"SERVE_E2E_ADMIN_TOKEN\" }",
+                "",
+            )
+        },
+        &payload_env(),
     );
+    assert_ne!(code, Some(0), "{stderr}");
+    // The token that opens payloads is not the one that scrapes metrics.
+    let mut same = payload_env();
+    same.retain(|(n, _)| *n != "SERVE_E2E_OPEN_TOKEN");
+    same.push(("SERVE_E2E_OPEN_TOKEN", ADMIN_TOKEN));
+    let (code, stderr) = run("same-token", &|c| c, &same);
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("capture.open_token"), "{stderr}");
     let (code, stderr) = run(
         "bad-ttl",
         &|c| {
@@ -663,24 +715,6 @@ fn payload_capture_is_refused_before_serving_when_it_cannot_be_honoured() {
     );
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("capture.ttl_secs"), "{stderr}");
-    // `payload_key` alone (no client captures a payload now) still opens a route on the admin listener, so the
-    // listener must have a token whether or not a client uses it at this moment.
-    let (code, stderr) = run(
-        "key-no-token",
-        &|c| {
-            c.replace("capture = \"payload\"", "capture = \"structure\"")
-                .replace(
-                    "token = { env = \"SERVE_E2E_ADMIN_TOKEN\" }",
-                    "allow_unauthenticated = true",
-                )
-        },
-        &payload_env(),
-    );
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(
-        stderr.contains("capture.payload_key") && stderr.contains("token"),
-        "{stderr}"
-    );
     // A secret a person could remember is refused by name: it must be random bytes in base64.
     let mut phrase = payload_env();
     phrase.retain(|(n, _)| *n != "SERVE_E2E_PAYLOAD_KEY");
@@ -727,7 +761,7 @@ async fn a_request_cut_at_the_capture_limit_is_said_to_be_cut_and_has_no_segment
     let body = loop {
         let (status, body, _) = open_payload(
             &admin,
-            Some(ADMIN_TOKEN),
+            Some(OPEN_TOKEN),
             json!({"reference": reference, "segments": true}),
         )
         .await;
@@ -746,4 +780,29 @@ async fn a_request_cut_at_the_capture_limit_is_said_to_be_cut_and_has_no_segment
         body["segments"].is_null(),
         "a cut body is not cut into segments: {body}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_answer_is_not_captured_unless_the_operator_turns_it_on() {
+    let (up, _mock) = upstream().await;
+    let (control, seen) = control_plane().await;
+    let dir = tempdir::Dir::new("payload-request-only");
+    let log = dir.0.join("usage.jsonl");
+    let server = start(
+        &render_payload(&up.url(), &control, "capture = \"payload\"", &log),
+        "payload-request-only",
+        &payload_env(),
+    );
+    ask(&server.base, CALLER_KEY, SECRET_PROMPT).await;
+    let ci = records_of(&seen, "ci", 1).await;
+    let reference = ci[0]["payload"]["reference"].as_str().unwrap().to_owned();
+    let admin = server.admin.clone().unwrap();
+    let (status, body, _) =
+        open_payload(&admin, Some(OPEN_TOKEN), json!({"reference": reference})).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["payload"]["response"].is_null(), "{body}");
+    assert!(body["payload"]["request"]["text"]
+        .as_str()
+        .unwrap()
+        .contains(SECRET_PROMPT));
 }

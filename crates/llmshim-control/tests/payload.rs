@@ -78,9 +78,17 @@ fn token_file() -> std::path::PathBuf {
     path
 }
 
+fn other_token_file() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join(format!("llmshim-admin-token-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&path, "a-different-admin-token-0123456789").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path
+}
+
 fn gateways(origin: &str) -> Gateways {
     Gateways::from_bytes(
-        json!({"gateways": [{"name": "g", "admin_url": origin, "token_file": token_file(), "allow_insecure_http": true}]})
+        json!({"gateways": [{"name": "g", "admin_url": origin, "token_file": other_token_file(), "payload_token_file": token_file(), "allow_insecure_http": true}]})
             .to_string()
             .as_bytes(),
     )
@@ -126,6 +134,7 @@ fn app_with(records: &[Value], gateways: Option<Gateways>) -> axum::Router {
     let mut store = common::store();
     assert_eq!(store.ingest_requests(records).unwrap().rejected, 0);
     let state = AppState::new(store, SHARED, None);
+    state.allow_unverified_payload_views(true);
     if let Some(gateways) = gateways {
         state.set_gateways(gateways);
     }
@@ -289,4 +298,25 @@ fn only_an_admin_may_read_a_payload() {
         .find(|(m, p, _)| *m == "get" && *p == "/v1/requests/{attempt}/payload")
         .map(|(_, _, r)| *r);
     assert_eq!(role, Some(Some(Role::Admin)));
+}
+
+#[tokio::test]
+async fn without_a_verified_identity_a_payload_is_refused_before_any_gateway_is_asked() {
+    let (origin, asked) = gateway().await;
+    let mut store = common::store();
+    assert_eq!(
+        store
+            .ingest_requests(&[record("a1", Some("good_ref"), "2099-01-01T00:00:00Z")])
+            .unwrap()
+            .rejected,
+        0
+    );
+    let state = AppState::new(store, SHARED, None);
+    state.set_gateways(gateways(&origin));
+    let app = router(state);
+    let (status, _, body) = get(&app, "/v1/requests/a1/payload").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "identity_required", "{body}");
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    assert!(views(&app).await.is_empty());
 }

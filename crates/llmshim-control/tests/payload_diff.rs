@@ -97,7 +97,10 @@ fn gateways(origin: &str) -> Gateways {
     let path = std::env::temp_dir().join(format!("llmshim-diff-token-{}", uuid::Uuid::new_v4()));
     std::fs::write(&path, GATEWAY_TOKEN).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    Gateways::from_bytes(json!({"gateways": [{"name": "g", "admin_url": origin, "token_file": path, "allow_insecure_http": true}]}).to_string().as_bytes()).unwrap()
+    let admin = path.with_extension("admin");
+    std::fs::write(&admin, "a-different-admin-token-0123456789").unwrap();
+    std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o600)).unwrap();
+    Gateways::from_bytes(json!({"gateways": [{"name": "g", "admin_url": origin, "token_file": path.with_extension("admin"), "payload_token_file": path, "allow_insecure_http": true}]}).to_string().as_bytes()).unwrap()
 }
 
 /// A usage record with a structure (the segments' fingerprints, one per text) and, optionally, a payload reference.
@@ -146,6 +149,7 @@ fn app_with(records: &[Value], gateways: Option<Gateways>) -> axum::Router {
     let mut store = common::store();
     assert_eq!(store.ingest_requests(records).unwrap().rejected, 0);
     let state = AppState::new(store, SHARED, None);
+    state.allow_unverified_payload_views(true);
     if let Some(gateways) = gateways {
         state.set_gateways(gateways);
     }

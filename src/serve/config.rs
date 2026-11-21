@@ -201,6 +201,18 @@ pub struct Capture {
     /// is cut and said to be cut.
     #[serde(default)]
     pub max_payload_bytes: Option<u64>,
+    /// The bearer token that opens a captured payload, by reference: at least 32 characters, **different from the
+    /// `[admin]` token**. Opening a payload is not an operational read: the metrics scraper's token must not do it. The
+    /// control plane holds this token (`payload_token_file` in its gateways file) and nothing else does. Needed with
+    /// `payload_key`.
+    #[serde(default)]
+    pub open_token: Option<SecretRef>,
+    /// Keep the provider's answer in a payload as well as the request (default false). The answer is the provider's own
+    /// output as it arrived, **not** what the caller was sent: it is not redacted by the response rules and includes any
+    /// reasoning the provider returned. The request is what the cache debugger needs; turn this on only when the answer
+    /// must be read too.
+    #[serde(default)]
+    pub response: Option<bool>,
 }
 
 /// What a client captures.
@@ -212,8 +224,8 @@ pub enum CaptureMode {
     /// The prompt's segment fingerprints (note 0052, slice 5a).
     Structure,
     /// The fingerprints and a sealed copy of the request and the answer, readable only by an administrator through
-    /// the control plane, kept for a short time (note 0052, slice 5b). Needs `[capture] payload_key`,
-    /// `[media_store]` and an `[admin]` table with a token.
+    /// the control plane, kept for a short time (note 0052, slice 5b). Needs `[capture] payload_key` and `open_token`,
+    /// `[media_store]`, an `[admin]` table and `[logging] audit_log`.
     Payload,
 }
 
@@ -1985,21 +1997,35 @@ impl ServeConfig {
         if let Some(key) = &capture.payload_key {
             validate_secret(key, "capture.payload_key", issues);
             // The route that opens a payload exists whenever the key and the store do, whether or not a client
-            // captures one at this moment (the clients reload, the listener does not): it must never be open.
-            if !self
-                .admin
-                .as_ref()
-                .is_some_and(|admin| admin.token.is_some())
-            {
+            // captures one at this moment (the clients reload, the listener does not): it needs its own token, an
+            // admin listener to sit on, and an audit log to record every opening in.
+            if self.admin.is_none() {
                 issues.push(Issue::new(
                     "capture.payload_key",
-                    "needs an [admin] table with a token: payloads are opened through the admin listener",
+                    "needs an [admin] table: payloads are opened through the admin listener",
                 ));
             }
-        } else if capture.ttl_secs.is_some() || capture.max_payload_bytes.is_some() {
+            match &capture.open_token {
+                Some(token) => validate_secret(token, "capture.open_token", issues),
+                None => issues.push(Issue::new(
+                    "capture.open_token",
+                    "needs an open_token: the token that opens a payload, different from the admin token",
+                )),
+            }
+            if self.logging.audit_log.is_none() {
+                issues.push(Issue::new(
+                    "capture.payload_key",
+                    "needs [logging] audit_log: every opening of a payload is recorded in it",
+                ));
+            }
+        } else if capture.ttl_secs.is_some()
+            || capture.max_payload_bytes.is_some()
+            || capture.open_token.is_some()
+            || capture.response.is_some()
+        {
             issues.push(Issue::new(
                 "capture.payload_key",
-                "ttl_secs and max_payload_bytes apply to payload capture, which needs a payload_key",
+                "ttl_secs, max_payload_bytes, open_token and response apply to payload capture, which needs a payload_key",
             ));
         }
         if capture
@@ -3906,13 +3932,14 @@ impl ServeConfig {
                 if self.media_store.is_none() {
                     issues.push(missing("[media_store], where the sealed payloads are kept"));
                 }
-                if !self
-                    .admin
-                    .as_ref()
-                    .is_some_and(|admin| admin.token.is_some())
-                {
+                if self.admin.is_none() {
                     issues.push(missing(
-                        "an [admin] table with a token: the control plane opens payloads through it",
+                        "an [admin] table: the control plane opens payloads through its listener",
+                    ));
+                }
+                if self.logging.audit_log.is_none() {
+                    issues.push(missing(
+                        "[logging] audit_log: every opening of a payload is recorded in it",
                     ));
                 }
             }
@@ -4222,12 +4249,19 @@ impl ServeConfig {
             .iter()
             .map(|export| ("usage_export.token".to_string(), &export.token));
         let capture = self.capture.iter().flat_map(|capture| {
-            std::iter::once(("capture.hmac_key".to_string(), &capture.hmac_key)).chain(
-                capture
-                    .payload_key
-                    .as_ref()
-                    .map(|key| ("capture.payload_key".to_string(), key)),
-            )
+            std::iter::once(("capture.hmac_key".to_string(), &capture.hmac_key))
+                .chain(
+                    capture
+                        .payload_key
+                        .as_ref()
+                        .map(|key| ("capture.payload_key".to_string(), key)),
+                )
+                .chain(
+                    capture
+                        .open_token
+                        .as_ref()
+                        .map(|key| ("capture.open_token".to_string(), key)),
+                )
         });
         let media = self.media_store.iter().flat_map(|store| {
             [

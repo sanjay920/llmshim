@@ -15,7 +15,7 @@ use std::path::PathBuf;
 const USAGE: &str = "Usage: llmshim-control audit-verify (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         checks the change history's hash chain; exit 1 names the first broken row\n\n       llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --sso-config        a JSON issuer file (note 0049): verify OIDC access tokens, take the actor from\n                      the verified subject and the role from its `roles` claim (control:read,\n                      control:key-issuer, control:admin). Then --token-file is the break-glass\n                      token, required unless the file sets \"break_glass\": false\n  --ingest-token-file a token (owner-only, a different one from --token-file) that the gateways' usage\n                      push (`[usage_export]`) presents to POST /v1/usage/batch: accepted there and nowhere\n                      else. Without it the push is refused (note 0051)\n  --gateways-file     a JSON file listing the gateways' admin listeners (name, admin_url, token_file, ca_file)
                       so the UI can show their providers, circuits, routes and configuration state (note 0051).
                       Read-only; without it that view says none are configured
-  --request-retention-days N  keep the request ledger N days (1 to 3650, default 30)\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
+  --allow-payload-views-without-sso\n                      let a caller whose identity is not verified (one shared token, break-glass) open captured\n                      payloads. Without it only a person signed in through the identity provider can: the history\n                      records who opened a payload, and with a shared token the name is a label the caller typed\n  --request-retention-days N  keep the request ledger N days (1 to 3650, default 30)\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
 
 struct Options {
     db: Option<PathBuf>,
@@ -29,6 +29,7 @@ struct Options {
     signing_key_file: Option<PathBuf>,
     ingest_token_file: Option<PathBuf>,
     gateways_file: Option<PathBuf>,
+    allow_payload_views_without_sso: bool,
     request_retention_days: u32,
 }
 
@@ -44,10 +45,16 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let (mut url_file, mut schema, mut ca) = (None, None, None);
     let mut sso = None;
     let (mut ingest, mut retention, mut gateways) = (None, None, None);
+    let mut allow_payloads = false;
     let mut at = 1;
     while at < args.len() {
         let flag = args[at].as_str();
         at += 1;
+        // The one flag that takes no value.
+        if flag == "--allow-payload-views-without-sso" {
+            allow_payloads = true;
+            continue;
+        }
         let value = args
             .get(at)
             .filter(|v| !v.starts_with("--"))
@@ -90,6 +97,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             || sso.is_some()
             || ingest.is_some()
             || gateways.is_some()
+            || allow_payloads
             || retention.is_some())
     {
         return Err("audit-verify takes only the database options".into());
@@ -116,6 +124,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         signing_key_file: signing,
         ingest_token_file: ingest,
         gateways_file: gateways,
+        allow_payload_views_without_sso: allow_payloads,
         request_retention_days: retention.unwrap_or(30),
     })
 }
@@ -341,6 +350,10 @@ async fn run(options: Options) -> i32 {
         (None, Some(token)) => AppState::new(store, &token, options.signing_key_file),
         (None, None) => unreachable!("parse requires a token without an issuer file"),
     };
+    if options.allow_payload_views_without_sso {
+        eprintln!("warning: payloads may be opened by a caller whose identity is not verified; the history names the label they gave");
+        state.allow_unverified_payload_views(true);
+    }
     if let Some(file) = &options.gateways_file {
         let bytes = match std::fs::read(file) {
             Ok(bytes) => bytes,

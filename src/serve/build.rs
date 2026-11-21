@@ -419,6 +419,7 @@ pub async fn build_app(
             Ok(structure.with_payload(
                 store,
                 capture.max_payload_bytes.map_or(262_144, |n| n as usize),
+                capture.response.unwrap_or(false),
                 super::keys::key_payload(config, env),
             ))
         })
@@ -432,9 +433,43 @@ pub async fn build_app(
             }])
         }
     };
-    // Captured payloads are deleted after their retention: their own sweep, since the media sweeper may only
-    // delete what it made.
-    if let Some(store) = &payload_store {
+    // The token that opens a captured payload: its own, never the admin token the metrics scraper holds.
+    let open_digest = match (&config.capture, &payload_store) {
+        (Some(capture), Some(_)) => match capture.open_token.as_ref() {
+            Some(secret) => {
+                let issue = |message: String| Issue {
+                    path: "capture.open_token".into(),
+                    message,
+                };
+                let token = match super::config::read_secret(secret, env) {
+                    Ok(token) => token,
+                    Err(message) => return Err(vec![issue(message)]),
+                };
+                if let Some(message) = super::keys::token_problem(&token) {
+                    return Err(vec![issue(message)]);
+                }
+                let digest = Sha256::digest(token.as_bytes()).to_vec();
+                if admin_token.as_deref() == Some(digest.as_slice()) {
+                    return Err(vec![issue(
+                        "must differ from the [admin] token: opening a payload is not an operational read".to_owned(),
+                    )]);
+                }
+                Some(digest)
+            }
+            None => None,
+        },
+        _ => None,
+    };
+    // Captured payloads are deleted after their retention, **whether or not capture is on now**: an operator who
+    // turns it off must not leave sealed objects behind. The sweep runs wherever there is an object store.
+    if let Some(media) = &media_store {
+        let ttl = std::time::Duration::from_secs(
+            config
+                .capture
+                .as_ref()
+                .and_then(|capture| capture.ttl_secs)
+                .unwrap_or(86_400),
+        );
         let first = {
             use ring::rand::SecureRandom;
             let mut byte = [0u8; 1];
@@ -443,7 +478,7 @@ pub async fn build_app(
                 u64::from(byte[0]) % super::blobstore::SWEEP_FIRST_MAX_SECS,
             )
         };
-        super::blobstore::spawn_payload_sweeper(store.object_store(), store.ttl(), first);
+        super::blobstore::spawn_payload_sweeper(media.store.clone(), ttl, first);
     }
     // Attempt spans ride the usage recorder, so it exists when either is wanted.
     let usage = if usage_log.is_some() || telemetry.is_some() || usage_exporter.is_some() {
@@ -711,26 +746,7 @@ pub async fn build_app(
                     }
                 }),
             );
-            // Opening a captured payload (note 0052, slice 5b): the control plane asks, with the admin token, and
-            // the reference is opened here because only a gateway holds the capture key. Admin only by
-            // construction: configuration refuses a payload client without an admin token.
-            let routes = match &payload_store {
-                Some(store) => {
-                    let store = store.clone();
-                    routes.route(
-                        "/v1/serve/payload/open",
-                        axum::routing::post(
-                            move |axum::Json(body): axum::Json<serde_json::Value>| {
-                                let store = store.clone();
-                                async move { open_payload_response(&store, &body).await }
-                            },
-                        )
-                        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
-                    )
-                }
-                None => routes,
-            }
-            .layer(axum::middleware::from_fn(super::mtls::strip_peer_header));
+            let routes = routes.layer(axum::middleware::from_fn(super::mtls::strip_peer_header));
             let routes = match admin_token {
                 Some(digest) => routes.layer(axum::middleware::from_fn(
                     move |request: Request, next: Next| {
@@ -740,6 +756,33 @@ pub async fn build_app(
                 )),
                 None => routes,
             };
+            // Opening a captured payload (note 0052, slice 5b): the control plane asks, with its **own** token (the
+            // admin token that scrapes metrics does not open a payload), and the reference is opened here because
+            // only a gateway holds the capture key. The route is added after the admin layer so that layer does not
+            // cover it, and it carries its own. Every opening is written to the audit log first: if that cannot be
+            // written, nothing is opened.
+            let routes =
+                match (&payload_store, &open_digest, &audit) {
+                    (Some(store), Some(digest), Some(audit)) => {
+                        let (store, audit, digest) = (store.clone(), audit.clone(), digest.clone());
+                        routes.route(
+                        "/v1/serve/payload/open",
+                        axum::routing::post(
+                            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                                let (store, audit) = (store.clone(), audit.clone());
+                                async move { open_payload_response(&store, &audit, &body).await }
+                            },
+                        )
+                        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024))
+                        .layer(axum::middleware::from_fn(move |request: Request, next: Next| {
+                            let digest = digest.clone();
+                            async move { require_admin_token(&digest, request, next).await }
+                        }))
+                        .layer(axum::middleware::from_fn(super::mtls::strip_peer_header)),
+                    )
+                    }
+                    _ => routes,
+                };
             (
                 app.layer(axum::middleware::from_fn(hide_admin_paths)),
                 Some((routes, admin_address)),
@@ -1297,32 +1340,75 @@ async fn fleet_state(
 
 /// Writes each usage record as a JSON line.
 /// Attempt spans without a usage log: records are built, and go nowhere.
-/// The admin endpoint that opens a captured payload: `{"reference": "…"}` to `{"payload": {…}}`, or an error that
-/// is a class and nothing the reference or the store said.
+/// A viewer's label as the control plane sends it, for the audit log only: visible ASCII and short, or `unknown`.
+fn audit_label(value: Option<&serde_json::Value>, longest: usize) -> String {
+    value
+        .and_then(|v| v.as_str())
+        .filter(|s| {
+            (1..=longest).contains(&s.len()) && s.bytes().all(|b| (0x21..0x7f).contains(&b))
+        })
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+/// The endpoint that opens a captured payload: `{"reference": "…", "segments": bool, "viewer": "…", "via": "…"}` to
+/// `{"payload": {…}, "segments": […]}`, or an error that is a class and nothing else. **Every opening is written to the
+/// audit log before anything is read**, with a short digest of the reference (never the reference), the viewer the
+/// control plane names and how it established them; a log that cannot be written refuses the opening.
 async fn open_payload_response(
     store: &super::payload::PayloadStore,
+    audit: &super::audit::AuditLog,
     body: &serde_json::Value,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let (status, value) = match body.get("reference").and_then(|r| r.as_str()) {
-        Some(reference) => match store.open(reference).await {
-            Ok(document) => {
-                // With the segments of the request only when asked (the content diff asks): null when it was cut.
-                let segments = if body.get("segments").and_then(|v| v.as_bool()) == Some(true) {
-                    super::payload::segment_view(&document)
-                } else {
-                    serde_json::Value::Null
-                };
+        Some(reference) => {
+            let digest: String = Sha256::digest(reference.as_bytes())
+                .iter()
+                .take(8)
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let wants_segments = body.get("segments").and_then(|v| v.as_bool()) == Some(true);
+            let detail = serde_json::json!({
+                "reference_digest": digest,
+                "viewer": audit_label(body.get("viewer"), 100),
+                "via": audit_label(body.get("via"), 24),
+                "segments": wants_segments,
+            });
+            if audit
+                .record("payload.open", "control-plane", "requested", detail.clone())
+                .is_err()
+            {
                 (
-                    axum::http::StatusCode::OK,
-                    serde_json::json!({"payload": document, "segments": segments}),
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    serde_json::json!({"error": "audit_unavailable"}),
                 )
+            } else {
+                let (status, value, outcome) = match store.open(reference).await {
+                    Ok(document) => {
+                        // With the segments of the request only when asked (the content diff asks): null when cut.
+                        let segments = if wants_segments {
+                            super::payload::segment_view(&document)
+                        } else {
+                            serde_json::Value::Null
+                        };
+                        (
+                            axum::http::StatusCode::OK,
+                            serde_json::json!({"payload": document, "segments": segments}),
+                            "ok",
+                        )
+                    }
+                    Err(error) => {
+                        let (status, code) = super::payload::refusal(error);
+                        (status, serde_json::json!({"error": code}), code)
+                    }
+                };
+                // How it ended, beside the request: a failure to write this one does not undo an opening that was
+                // already recorded.
+                let _ = audit.record("payload.open", "control-plane", outcome, detail);
+                (status, value)
             }
-            Err(error) => {
-                let (status, code) = super::payload::refusal(error);
-                (status, serde_json::json!({"error": code}))
-            }
-        },
+        }
         None => (
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             serde_json::json!({"error": "bad_reference"}),
