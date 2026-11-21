@@ -111,14 +111,14 @@ impl PgClient {
     /// kill): a database blip must not need a control-plane restart.
     /// Replace the connection now.
     pub(crate) fn reconnect(&mut self) {
-        if let Ok(fresh) = connect_postgres(&self.target) {
+        if let Ok(fresh) = connect_postgres(&self.target, false) {
             self.client = Some(Box::new(fresh));
         }
     }
 
     pub(crate) fn client(&mut self) -> &mut postgres::Client {
         if self.client.as_ref().is_some_and(|c| c.is_closed()) {
-            if let Ok(fresh) = connect_postgres(&self.target) {
+            if let Ok(fresh) = connect_postgres(&self.target, false) {
                 self.client = Some(Box::new(fresh));
             }
         }
@@ -407,7 +407,9 @@ pub(crate) struct PgTarget {
 /// required, so a server (or a man in the middle) that refuses TLS fails the connect and
 /// never gets the password in the clear. Timeouts and keepalives bound every wait: a lock
 /// held by a session that vanished must not hold the control plane for hours.
-pub(crate) fn connect_postgres(target: &PgTarget) -> Result<postgres::Client> {
+/// `create_schema` is true only for a migration: a server or a read-only tool that is pointed at a schema that is not
+/// there (a typo) is told so, and nothing is created.
+pub(crate) fn connect_postgres(target: &PgTarget, create_schema: bool) -> Result<postgres::Client> {
     let mut config: postgres::Config = target.url.parse().map_err(|_| {
         Error::Invalid("the database URL is not a Postgres connection string".into())
     })?;
@@ -456,12 +458,31 @@ pub(crate) fn connect_postgres(target: &PgTarget) -> Result<postgres::Client> {
     if let Some(schema) = &target.schema {
         // The schema name is validated by the caller (letters, digits, underscore; not a
         // reserved one). Created under a lock of its own: two replicas starting together.
-        client
-            .batch_execute(&format!(
-                "BEGIN; SELECT pg_advisory_xact_lock(7240003); \
-                 CREATE SCHEMA IF NOT EXISTS {schema}; COMMIT; SET search_path TO {schema}"
-            ))
-            .map_err(|_| Error::Database("cannot set the schema".into()))?;
+        let unusable = |_| Error::Database("cannot set the schema".into());
+        if create_schema {
+            client
+                .batch_execute(&format!(
+                    "BEGIN; SELECT pg_advisory_xact_lock(7240003); \
+                     CREATE SCHEMA IF NOT EXISTS {schema}; COMMIT; SET search_path TO {schema}"
+                ))
+                .map_err(unusable)?;
+        } else {
+            let present = client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)",
+                    &[schema],
+                )
+                .map_err(unusable)?
+                .get::<_, bool>(0);
+            if !present {
+                return Err(Error::Invalid(format!(
+                    "the schema {schema} does not exist in the database; run `llmshim-control migrate` first"
+                )));
+            }
+            client
+                .batch_execute(&format!("SET search_path TO {schema}"))
+                .map_err(unusable)?;
+        }
     }
     Ok(client)
 }

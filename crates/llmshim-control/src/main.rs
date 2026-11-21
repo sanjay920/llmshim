@@ -12,10 +12,10 @@ use llmshim_control::api::{router, seed_file_problem, AppState};
 use llmshim_control::Store;
 use std::path::PathBuf;
 
-const USAGE: &str = "Usage: llmshim-control audit-verify (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         checks the change history's hash chain; exit 1 names the first broken row\n\n       llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --sso-config        a JSON issuer file (note 0049): verify OIDC access tokens, take the actor from\n                      the verified subject and the role from its `roles` claim (control:read,\n                      control:key-issuer, control:admin). Then --token-file is the break-glass\n                      token, required unless the file sets \"break_glass\": false\n  --ingest-token-file a token (owner-only, a different one from --token-file) that the gateways' usage\n                      push (`[usage_export]`) presents to POST /v1/usage/batch: accepted there and nowhere\n                      else. Without it the push is refused (note 0051)\n  --gateways-file     a JSON file listing the gateways' admin listeners (name, admin_url, token_file, ca_file)
+const USAGE: &str = "Usage: llmshim-control audit-verify (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         checks the change history's hash chain; exit 1 names the first broken row\n\n       llmshim-control migrate (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>] [--database-ca-file <FILE>])\n         brings the database to this build's schema (creates a new one). An older SQLite database is first copied to\n         <FILE>.pre-v<N>.bak; for Postgres take a pg_dump first. serve and audit-verify never change the schema: they\n         refuse a database that is not at this build's version and say to run this\n\n       llmshim-control serve (--db <FILE> | --database-url-file <FILE> [--database-schema <NAME>])\n                              --listen <ADDR> --token-file <FILE> [--signing-key-file <FILE>]\n\n  --db                SQLite database (created owner-only if absent)\n  --database-url-file a file holding a postgres:// URL (owner-only on Unix: it holds the\n                      password). Exactly one of --db and this\n  --database-schema   with Postgres, the schema to use (created if absent)\n  --database-ca-file  with Postgres, PEM certificates to trust instead of the web PKI roots\n                      (a private or provider CA). TLS is required unless the URL says\n                      sslmode=disable\n  --listen            address to listen on, for example 127.0.0.1:3100\n  --token-file        the API's bearer token (at least 22 visible ASCII characters;\n                      on Unix the file must not be readable by group or others)\n  --sso-config        a JSON issuer file (note 0049): verify OIDC access tokens, take the actor from\n                      the verified subject and the role from its `roles` claim (control:read,\n                      control:key-issuer, control:admin). Then --token-file is the break-glass\n                      token, required unless the file sets \"break_glass\": false\n  --ingest-token-file a token (owner-only, a different one from --token-file) that the gateways' usage\n                      push (`[usage_export]`) presents to POST /v1/usage/batch: accepted there and nowhere\n                      else. Without it the push is refused (note 0051)\n  --gateways-file     a JSON file listing the gateways' admin listeners (name, admin_url, token_file, ca_file)
                       so the UI can show their providers, circuits, routes and configuration state (note 0051).
                       Read-only; without it that view says none are configured
-  --allow-payload-views-without-sso\n                      let a caller whose identity is not verified (one shared token, break-glass) open captured\n                      payloads. Without it only a person signed in through the identity provider can: the history\n                      records who opened a payload, and with a shared token the name is a label the caller typed\n  --request-retention-days N  keep the request ledger N days (1 to 3650, default 30)\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
+  --migrate-on-start  serve: run `migrate` first (development; deployments run it as a step of their own)\n  --allow-payload-views-without-sso\n                      let a caller whose identity is not verified (one shared token, break-glass) open captured\n                      payloads. Without it only a person signed in through the identity provider can: the history\n                      records who opened a payload, and with a shared token the name is a label the caller typed\n  --request-retention-days N  keep the request ledger N days (1 to 3650, default 30)\n  --signing-key-file  a signing seed (`llmshim snapshot keygen` writes one); read at each\n                      publish, never at start. Without it publishing is unavailable.";
 
 struct Options {
     db: Option<PathBuf>,
@@ -23,6 +23,11 @@ struct Options {
     database_schema: Option<String>,
     database_ca_file: Option<PathBuf>,
     verify: bool,
+    /// `migrate`: bring the database to this build's schema, then exit.
+    migrate: bool,
+    /// `serve --migrate-on-start`: migrate the way `migrate` does before serving (development; deployments run
+    /// `migrate` as a step of their own).
+    migrate_on_start: bool,
     listen: String,
     token_file: Option<PathBuf>,
     sso_config: Option<PathBuf>,
@@ -36,11 +41,13 @@ struct Options {
 fn parse(args: &[String]) -> Result<Options, String> {
     if !matches!(
         args.first().map(String::as_str),
-        Some("serve" | "audit-verify")
+        Some("serve" | "audit-verify" | "migrate")
     ) {
-        return Err("the commands are serve and audit-verify".into());
+        return Err("the commands are serve, audit-verify and migrate".into());
     }
-    let verify = args[0] == "audit-verify";
+    let migrate = args[0] == "migrate";
+    let verify = args[0] == "audit-verify" || migrate;
+    let mut migrate_on_start = false;
     let (mut db, mut listen, mut token, mut signing) = (None, None, None, None);
     let (mut url_file, mut schema, mut ca) = (None, None, None);
     let mut sso = None;
@@ -53,6 +60,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
         // The one flag that takes no value.
         if flag == "--allow-payload-views-without-sso" {
             allow_payloads = true;
+            continue;
+        }
+        if flag == "--migrate-on-start" {
+            migrate_on_start = true;
             continue;
         }
         let value = args
@@ -100,7 +111,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
             || allow_payloads
             || retention.is_some())
     {
-        return Err("audit-verify takes only the database options".into());
+        return Err(format!("{} takes only the database options", args[0]));
+    }
+    if migrate_on_start && args[0] != "serve" {
+        return Err("--migrate-on-start is for serve".into());
     }
     Ok(Options {
         db,
@@ -108,6 +122,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         database_schema: schema,
         database_ca_file: ca,
         verify,
+        migrate,
+        migrate_on_start,
         listen: if verify {
             String::new()
         } else {
@@ -147,15 +163,66 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    if options.migrate {
+        std::process::exit(migrate(&options));
+    }
     if options.verify {
         std::process::exit(audit_verify(&options));
     }
     std::process::exit(run(options).await);
 }
 
-/// `audit-verify`: read-only on the history (the store's own migration still runs, as for any open),
-/// and never creates a SQLite file (a Postgres target is opened like any other, so a mistyped
-/// schema is initialized empty and reports zero rows).
+/// `migrate`: bring the database to this build's schema (creating a new SQLite file or an empty schema), after a
+/// consistent copy of an older SQLite database. The only command, besides `serve --migrate-on-start`, that changes the
+/// schema.
+fn migrate(options: &Options) -> i32 {
+    let result = if let Some(url_file) = &options.database_url_file {
+        read_owner_only(url_file).and_then(|url| {
+            llmshim_control::migrate_postgres(
+                url.trim(),
+                options.database_schema.as_deref(),
+                options.database_ca_file.as_deref(),
+            )
+            .map_err(|e| format!("cannot migrate the database: {e}"))
+        })
+    } else {
+        let db = options.db.as_ref().expect("one of the two was checked");
+        create_owner_only(db).and_then(|()| {
+            llmshim_control::migrate_sqlite(db)
+                .map_err(|e| format!("cannot migrate the database {}: {e}", db.display()))
+        })
+    };
+    match result {
+        Ok(report) if report.from == report.to => {
+            println!("schema: already at version {}", report.to);
+            0
+        }
+        Ok(report) => {
+            println!(
+                "schema: migrated from version {} to {}",
+                report.from, report.to
+            );
+            if let Some(backup) = report.backup {
+                println!(
+                    "backup: {} (to roll back, stop the servers, put it back in place of the database, and run the previous build)",
+                    backup.display()
+                );
+            } else if options.database_url_file.is_some() && report.from > 0 {
+                println!(
+                    "backup: none was taken for Postgres; the migration ran in one transaction"
+                );
+            }
+            0
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            1
+        }
+    }
+}
+
+/// `audit-verify`: read-only. It never creates a SQLite file and never migrates: a database not at this build's
+/// schema is refused with the command to run.
 fn audit_verify(options: &Options) -> i32 {
     if let Some(db) = &options.db {
         if std::fs::metadata(db).map_or(true, |m| m.len() == 0) {
@@ -163,7 +230,7 @@ fn audit_verify(options: &Options) -> i32 {
             return 1;
         }
     }
-    let mut store = match open_store(options) {
+    let mut store = match open_store(options, false) {
         Ok(store) => store,
         Err(message) => {
             eprintln!("{message}");
@@ -191,18 +258,35 @@ fn audit_verify(options: &Options) -> i32 {
 
 /// The store the options name. A Postgres URL holds the password, so its file is owner-only and
 /// no error ever carries it; a SQLite file is created owner-only from its first byte.
-fn open_store(options: &Options) -> Result<Store, String> {
+/// With `migrate` false the database must already be at this build's schema (nothing is created or altered); with it
+/// true it is migrated first, with the same copy `migrate` takes.
+fn open_store(options: &Options, migrate: bool) -> Result<Store, String> {
     if let Some(url_file) = &options.database_url_file {
         let url = read_owner_only(url_file)?.trim().to_string();
-        // Connect and initialize on a thread outside the async runtime (see `Store`).
-        return Store::open_postgres_with(
-            &url,
+        let (schema, ca) = (
             options.database_schema.as_deref(),
             options.database_ca_file.as_deref(),
-        )
-        .map_err(|error| format!("cannot open the database: {error}"));
+        );
+        // Connect and initialize on a thread outside the async runtime (see `Store`).
+        if migrate {
+            llmshim_control::migrate_postgres(&url, schema, ca)
+                .map_err(|error| format!("cannot migrate the database: {error}"))?;
+        }
+        return Store::open_postgres_existing(&url, schema, ca)
+            .map_err(|error| format!("cannot open the database: {error}"));
     }
     let db = options.db.as_ref().expect("one of the two was checked");
+    if migrate {
+        create_owner_only(db)?;
+        llmshim_control::migrate_sqlite(db)
+            .map_err(|error| format!("cannot migrate the database {}: {error}", db.display()))?;
+    }
+    Store::open_existing(db)
+        .map_err(|error| format!("cannot open the database {}: {error}", db.display()))
+}
+
+/// A new SQLite file is created owner-only from its first byte.
+fn create_owner_only(db: &std::path::Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -221,7 +305,9 @@ fn open_store(options: &Options) -> Result<Store, String> {
                 })?;
         }
     }
-    Store::open(db).map_err(|error| format!("cannot open the database {}: {error}", db.display()))
+    #[cfg(not(unix))]
+    let _ = db;
+    Ok(())
 }
 
 fn read_owner_only(path: &std::path::Path) -> Result<String, String> {
@@ -316,7 +402,7 @@ async fn run(options: Options) -> i32 {
         eprintln!("{problem}");
         return 1;
     }
-    let store = match open_store(&options) {
+    let store = match open_store(&options, options.migrate_on_start) {
         Ok(store) => store,
         Err(message) => {
             eprintln!("{message}");

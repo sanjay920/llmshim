@@ -560,13 +560,33 @@ impl Store {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let connection =
             rusqlite::Connection::open(path).map_err(|e| Error::Database(e.to_string()))?;
-        Self::initialize(Backend::Sqlite(connection))
+        Self::initialize(Backend::Sqlite(connection), true)
+    }
+
+    /// Open a database that must already be at this build's schema version: it never creates, alters or migrates
+    /// anything, and says to run `llmshim-control migrate` otherwise. For a server and for read-only tools.
+    pub fn open_existing(path: &std::path::Path) -> Result<Self> {
+        // No CREATE flag: a path that is not there is refused, not made (with whatever mode the umask gives).
+        let connection = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::CannotOpen => {
+                Error::Invalid(format!(
+                    "{} does not exist; run `llmshim-control migrate` to create it",
+                    path.display()
+                ))
+            }
+            other => Error::Database(other.to_string()),
+        })?;
+        Self::initialize(Backend::Sqlite(connection), false)
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let connection =
             rusqlite::Connection::open_in_memory().map_err(|e| Error::Database(e.to_string()))?;
-        Self::initialize(Backend::Sqlite(connection))
+        Self::initialize(Backend::Sqlite(connection), true)
     }
 
     /// Connect to a Postgres database (a `postgres://` URL). TLS with the web PKI roots unless
@@ -584,11 +604,29 @@ impl Store {
         schema: Option<&str>,
         ca_file: Option<&std::path::Path>,
     ) -> Result<Self> {
+        Self::open_postgres_mode(url, schema, ca_file, true)
+    }
+
+    /// [`Self::open_existing`] for Postgres: the schema must already be at this build's version.
+    pub fn open_postgres_existing(
+        url: &str,
+        schema: Option<&str>,
+        ca_file: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        Self::open_postgres_mode(url, schema, ca_file, false)
+    }
+
+    fn open_postgres_mode(
+        url: &str,
+        schema: Option<&str>,
+        ca_file: Option<&std::path::Path>,
+        migrate: bool,
+    ) -> Result<Self> {
         // The synchronous Postgres client runs its own runtime, which a thread already inside
         // an async runtime may not start: connect and initialize on a thread of their own.
         std::thread::scope(|scope| {
             scope
-                .spawn(|| Self::open_postgres_here(url, schema, ca_file))
+                .spawn(|| Self::open_postgres_here(url, schema, ca_file, migrate))
                 .join()
                 .unwrap_or_else(|_| Err(Error::Database("the database thread failed".into())))
         })
@@ -598,6 +636,7 @@ impl Store {
         url: &str,
         schema: Option<&str>,
         ca_file: Option<&std::path::Path>,
+        migrate: bool,
     ) -> Result<Self> {
         if let Some(problem) = schema.and_then(db::schema_problem) {
             return Err(Error::Invalid(problem.into()));
@@ -607,19 +646,46 @@ impl Store {
             ca_file: ca_file.map(std::path::Path::to_path_buf),
             schema: schema.map(str::to_string),
         };
-        let client = db::connect_postgres(&target)?;
-        Self::initialize(Backend::Postgres(db::PgClient::new(client, target)))
+        let client = db::connect_postgres(&target, migrate)?;
+        Self::initialize(
+            Backend::Postgres(db::PgClient::new(client, target)),
+            migrate,
+        )
     }
 
-    fn initialize(mut backend: Backend) -> Result<Self> {
+    /// The message for a database that is not at this build's version, when the caller may not migrate it.
+    fn needs_migration(found: Option<i64>) -> Error {
+        Error::Invalid(match found {
+            None | Some(0) => format!(
+                "the database has no schema yet; run `llmshim-control migrate` first (this build needs version {SCHEMA_VERSION})"
+            ),
+            Some(v) if v < SCHEMA_VERSION => format!(
+                "the database has schema version {v}; this build needs {SCHEMA_VERSION}: back it up and run `llmshim-control migrate`"
+            ),
+            Some(v) => format!(
+                "the database has schema version {v}; this build reads {SCHEMA_VERSION}: run the build that wrote it, or restore a backup"
+            ),
+        })
+    }
+
+    fn initialize(mut backend: Backend, migrate: bool) -> Result<Self> {
         match &mut backend {
             Backend::Sqlite(connection) => {
                 connection
-                    .execute_batch("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+                    .execute_batch("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;")
                     .map_err(|e| Error::Database(e.to_string()))?;
                 let version: i64 = connection
                     .query_row("PRAGMA user_version", [], |row| row.get(0))
                     .map_err(|e| Error::Database(e.to_string()))?;
+                if !migrate && version != SCHEMA_VERSION {
+                    return Err(Self::needs_migration(Some(version)));
+                }
+                // Looking must not write: the journal mode is set by a migration (and stays), never by a read.
+                if migrate {
+                    connection
+                        .execute_batch("PRAGMA journal_mode = WAL;")
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                }
                 match version {
                     0 => {
                         connection
@@ -721,6 +787,32 @@ impl Store {
                 }
             }
             Backend::Postgres(pg) => {
+                if !migrate {
+                    // Read only: nothing is created, not even the metadata table.
+                    let fail = |_| Error::Database("cannot read the schema version".into());
+                    let found = pg
+                        .client()
+                        .query_opt(
+                            "SELECT to_regclass('schema_meta') IS NOT NULL AS present",
+                            &[],
+                        )
+                        .map_err(fail)?
+                        .map(|row| row.get::<_, bool>(0))
+                        .unwrap_or(false);
+                    let version = if found {
+                        pg.client()
+                            .query_opt("SELECT version FROM schema_meta", &[])
+                            .map_err(fail)?
+                            .map(|row| row.get::<_, i64>(0))
+                    } else {
+                        None
+                    };
+                    if version != Some(SCHEMA_VERSION) {
+                        return Err(Self::needs_migration(version));
+                    }
+                    // Current: no DDL, no lock, so a read-only role or a standby can serve.
+                    return Ok(Self { backend });
+                }
                 // One initializer at a time (two replicas starting together).
                 let mut tx = pg
                     .client()
@@ -1539,4 +1631,144 @@ CREATE TABLE snapshots (
         requests = requests::schema(pg),
         structure = structure::schema(pg)
     )
+}
+
+/// What [`migrate_sqlite`] and [`migrate_postgres`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    /// The version found (`0`: a new database).
+    pub from: i64,
+    pub to: i64,
+    /// For SQLite, a consistent copy taken before any change (`<db>.pre-v<from>.bak`, owner-only); none for a new
+    /// database or one already current. Postgres has none: take a `pg_dump` first.
+    pub backup: Option<std::path::PathBuf>,
+}
+
+/// Bring a SQLite database to this build's schema. An older database is first copied (`VACUUM INTO`, a consistent
+/// snapshot, owner-only) so a bad deploy can be undone by putting the copy back and running the previous build.
+pub fn migrate_sqlite(path: &std::path::Path) -> Result<MigrationReport> {
+    let err = |e: rusqlite::Error| Error::Database(e.to_string());
+    let from: i64 = {
+        let probe = rusqlite::Connection::open(path).map_err(err)?;
+        probe
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(err)?
+    };
+    if from > SCHEMA_VERSION {
+        return Err(Store::needs_migration(Some(from)));
+    }
+    let mut backup = None;
+    if (1..SCHEMA_VERSION).contains(&from) {
+        // `<db>.pre-v<N>.bak`, or `.pre-v<N>.<k>.bak` when that is taken: a copy is never overwritten and a retry
+        // after a failed migration is never blocked by the copy the first try left. Created with `create_new` and mode
+        // 0600 before SQLite writes into it (an existing file or symlink is refused, and there is no window in which
+        // the copy is readable by others).
+        let mut target = None;
+        for k in 0..100 {
+            let mut name = path.as_os_str().to_owned();
+            name.push(if k == 0 {
+                format!(".pre-v{from}.bak")
+            } else {
+                format!(".pre-v{from}.{k}.bak")
+            });
+            let candidate = std::path::PathBuf::from(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&candidate) {
+                Ok(_) => {
+                    target = Some(candidate);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(Error::Database(format!(
+                        "cannot create the backup {}: {}",
+                        candidate.display(),
+                        e.kind()
+                    )))
+                }
+            }
+        }
+        let target = target.ok_or_else(|| {
+            Error::Invalid("a hundred backups of this version exist already: move some away".into())
+        })?;
+        let copied = (|| -> Result<()> {
+            let text = target.to_str().ok_or_else(|| {
+                Error::Invalid("the database path must be UTF-8 to be copied".into())
+            })?;
+            let probe = rusqlite::Connection::open(path).map_err(err)?;
+            probe.execute("VACUUM INTO ?1", [text]).map_err(err)?;
+            Ok(())
+        })();
+        if let Err(error) = copied {
+            // A copy that did not complete is not a copy: it is removed, and the database was not touched.
+            let _ = std::fs::remove_file(&target);
+            return Err(error);
+        }
+        backup = Some(target);
+    }
+    Store::open(path)?;
+    Ok(MigrationReport {
+        from,
+        to: SCHEMA_VERSION,
+        backup,
+    })
+}
+
+/// Bring a Postgres schema to this build's version, in one transaction under an advisory lock (so replicas
+/// migrating together are safe). No copy is made: take a `pg_dump` first.
+pub fn migrate_postgres(
+    url: &str,
+    schema: Option<&str>,
+    ca_file: Option<&std::path::Path>,
+) -> Result<MigrationReport> {
+    if let Some(problem) = schema.and_then(db::schema_problem) {
+        return Err(Error::Invalid(problem.into()));
+    }
+    let target = db::PgTarget {
+        url: url.to_string(),
+        ca_file: ca_file.map(std::path::Path::to_path_buf),
+        schema: schema.map(str::to_string),
+    };
+    // Off the async runtime, like every other Postgres call here.
+    let found: Result<Option<i64>> = std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> Result<Option<i64>> {
+                // Reading: a schema that is not there is version none, and is not created by asking.
+                let mut client = match db::connect_postgres(&target, false) {
+                    Ok(client) => client,
+                    Err(Error::Invalid(_)) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                let fail = |_| Error::Database("cannot read the schema version".into());
+                let present: bool = client
+                    .query_one("SELECT to_regclass('schema_meta') IS NOT NULL", &[])
+                    .map_err(fail)?
+                    .get(0);
+                if !present {
+                    return Ok(None);
+                }
+                Ok(client
+                    .query_opt("SELECT version FROM schema_meta", &[])
+                    .map_err(fail)?
+                    .map(|row| row.get::<_, i64>(0)))
+            })
+            .join()
+            .unwrap_or_else(|_| Err(Error::Database("the database thread failed".into())))
+    });
+    let from = found?.unwrap_or(0);
+    if from > SCHEMA_VERSION {
+        return Err(Store::needs_migration(Some(from)));
+    }
+    Store::open_postgres_with(url, schema, ca_file)?;
+    Ok(MigrationReport {
+        from,
+        to: SCHEMA_VERSION,
+        backup: None,
+    })
 }

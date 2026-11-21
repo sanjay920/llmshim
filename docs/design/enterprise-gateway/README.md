@@ -87,6 +87,7 @@ Each step must be correct, tested and reversible before the next begins.
 - [0051: The admin UI](0051-admin-ui.md)
 - [0052: Payload capture and the cache debugger](0052-payload-capture-and-cache-debugger.md) (built: structure capture and the cache debugger, sealed payloads, the content diff)
 - [0053: Bounding the control plane's store](0053-control-plane-store-bounds.md) (built: a bounded queue with 503, SQLite statement budget)
+- [0054: Migrating the control plane's database](0054-control-plane-migrations.md) (built: explicit `migrate`, read-only `serve`/`audit-verify`, a copy first)
 
 ## Roadmap
 
