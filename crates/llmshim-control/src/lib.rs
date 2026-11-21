@@ -566,8 +566,20 @@ impl Store {
     /// Open a database that must already be at this build's schema version: it never creates, alters or migrates
     /// anything, and says to run `llmshim-control migrate` otherwise. For a server and for read-only tools.
     pub fn open_existing(path: &std::path::Path) -> Result<Self> {
-        let connection =
-            rusqlite::Connection::open(path).map_err(|e| Error::Database(e.to_string()))?;
+        // No CREATE flag: a path that is not there is refused, not made (with whatever mode the umask gives).
+        let connection = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::CannotOpen => {
+                Error::Invalid(format!(
+                    "{} does not exist; run `llmshim-control migrate` to create it",
+                    path.display()
+                ))
+            }
+            other => Error::Database(other.to_string()),
+        })?;
         Self::initialize(Backend::Sqlite(connection), false)
     }
 
@@ -634,7 +646,7 @@ impl Store {
             ca_file: ca_file.map(std::path::Path::to_path_buf),
             schema: schema.map(str::to_string),
         };
-        let client = db::connect_postgres(&target)?;
+        let client = db::connect_postgres(&target, migrate)?;
         Self::initialize(
             Backend::Postgres(db::PgClient::new(client, target)),
             migrate,
@@ -668,9 +680,12 @@ impl Store {
                 if !migrate && version != SCHEMA_VERSION {
                     return Err(Self::needs_migration(Some(version)));
                 }
-                connection
-                    .execute_batch("PRAGMA journal_mode = WAL;")
-                    .map_err(|e| Error::Database(e.to_string()))?;
+                // Looking must not write: the journal mode is set by a migration (and stays), never by a read.
+                if migrate {
+                    connection
+                        .execute_batch("PRAGMA journal_mode = WAL;")
+                        .map_err(|e| Error::Database(e.to_string()))?;
+                }
                 match version {
                     0 => {
                         connection
@@ -795,6 +810,8 @@ impl Store {
                     if version != Some(SCHEMA_VERSION) {
                         return Err(Self::needs_migration(version));
                     }
+                    // Current: no DDL, no lock, so a read-only role or a standby can serve.
+                    return Ok(Self { backend });
                 }
                 // One initializer at a time (two replicas starting together).
                 let mut tx = pg
@@ -1642,22 +1659,56 @@ pub fn migrate_sqlite(path: &std::path::Path) -> Result<MigrationReport> {
     }
     let mut backup = None;
     if (1..SCHEMA_VERSION).contains(&from) {
-        let target = std::path::PathBuf::from(format!("{}.pre-v{from}.bak", path.display()));
-        if target.exists() {
-            return Err(Error::Invalid(format!(
-                "{} exists already: move it away so the copy of this database is not overwritten",
-                target.display()
-            )));
+        // `<db>.pre-v<N>.bak`, or `.pre-v<N>.<k>.bak` when that is taken: a copy is never overwritten and a retry
+        // after a failed migration is never blocked by the copy the first try left. Created with `create_new` and mode
+        // 0600 before SQLite writes into it (an existing file or symlink is refused, and there is no window in which
+        // the copy is readable by others).
+        let mut target = None;
+        for k in 0..100 {
+            let mut name = path.as_os_str().to_owned();
+            name.push(if k == 0 {
+                format!(".pre-v{from}.bak")
+            } else {
+                format!(".pre-v{from}.{k}.bak")
+            });
+            let candidate = std::path::PathBuf::from(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&candidate) {
+                Ok(_) => {
+                    target = Some(candidate);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(Error::Database(format!(
+                        "cannot create the backup {}: {}",
+                        candidate.display(),
+                        e.kind()
+                    )))
+                }
+            }
         }
-        let probe = rusqlite::Connection::open(path).map_err(err)?;
-        probe
-            .execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])
-            .map_err(err)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| Error::Database(format!("cannot protect the backup: {}", e.kind())))?;
+        let target = target.ok_or_else(|| {
+            Error::Invalid("a hundred backups of this version exist already: move some away".into())
+        })?;
+        let copied = (|| -> Result<()> {
+            let text = target.to_str().ok_or_else(|| {
+                Error::Invalid("the database path must be UTF-8 to be copied".into())
+            })?;
+            let probe = rusqlite::Connection::open(path).map_err(err)?;
+            probe.execute("VACUUM INTO ?1", [text]).map_err(err)?;
+            Ok(())
+        })();
+        if let Err(error) = copied {
+            // A copy that did not complete is not a copy: it is removed, and the database was not touched.
+            let _ = std::fs::remove_file(&target);
+            return Err(error);
         }
         backup = Some(target);
     }
@@ -1688,7 +1739,12 @@ pub fn migrate_postgres(
     let found: Result<Option<i64>> = std::thread::scope(|scope| {
         scope
             .spawn(|| -> Result<Option<i64>> {
-                let mut client = db::connect_postgres(&target)?;
+                // Reading: a schema that is not there is version none, and is not created by asking.
+                let mut client = match db::connect_postgres(&target, false) {
+                    Ok(client) => client,
+                    Err(Error::Invalid(_)) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
                 let fail = |_| Error::Database("cannot read the schema version".into());
                 let present: bool = client
                     .query_one("SELECT to_regclass('schema_meta') IS NOT NULL", &[])

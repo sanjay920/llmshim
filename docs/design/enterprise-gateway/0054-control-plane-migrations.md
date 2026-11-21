@@ -15,9 +15,12 @@ There was no copy to go back to, and nothing said what a rolling deploy may assu
 - **`serve` and `audit-verify` never migrate and never create.** Against an old, empty or newer schema they exit 1,
   say what they found, say to run `migrate` (or, for a newer one, to run the build that wrote it or restore a
   backup), and leave the file or schema byte-for-byte as it was (a test compares the bytes). Postgres is read with
-  `to_regclass`, so not even the metadata table is created by looking.
+  `to_regclass`, so not even the metadata table is created by looking, and a schema that is not there (a typo) is
+  reported, not created. A SQLite path that is not there is refused, not made. Reading sets no journal mode: WAL is
+  set by a migration and stays. A current Postgres schema is opened with no DDL and no lock, so a read-only role or a
+  standby can serve.
 - **A copy first, for SQLite.** `migrate` takes a consistent snapshot (`VACUUM INTO`) of an older database to
-  `<db>.pre-v<N>.bak`, owner-only, before touching it, and refuses to overwrite one that exists. Rolling back is:
+  `<db>.pre-v<N>.bak` (`.pre-v<N>.<k>.bak` when that is taken), before touching it. The file is created with `create_new` and mode 0600 before SQLite writes into it, so it is never readable by others, never overwrites a copy and never follows a symlink; a copy that did not complete is removed. Rolling back is:
   stop the servers, put the copy in place of the database, run the previous build. For Postgres `migrate` runs in one
   transaction under an advisory lock and says no copy was taken: take a `pg_dump` first (a snapshot of a shared
   database is the operator's, not ours to guess).
@@ -41,3 +44,8 @@ which is how it was found to bite.
 ## Not built
 
 N-1 start-up compatibility; automatic Postgres snapshots; a `migrate --dry-run`.
+
+Settled in review of #308: opening used to create a missing SQLite file (with the umask's mode, which `migrate` then
+kept), create a missing Postgres schema, and run `CREATE TABLE IF NOT EXISTS` and the WAL pragma on a current database;
+the backup was briefly world-readable and a failed run blocked every retry. Not fixed: two `migrate` runs at once, and
+writers between the copy and the migration (stop the servers first; nothing enforces it).

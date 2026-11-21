@@ -114,21 +114,89 @@ fn migrate_copies_an_old_database_first_migrates_it_and_the_copy_restores() {
         (code, out.contains("already at version 8")),
         (Some(0), true)
     );
-    // A copy never overwritten: with one in the way, a migration of another old database refuses.
-    let again = d.join("c.db");
-    std::fs::copy(&backup, &again).unwrap();
-    let (code, _, err) = run(&["migrate", "--db", file]);
-    assert_eq!(code, Some(1), "{err}");
-    assert!(err.contains("exists already"), "{err}");
-    assert_eq!(
-        version(&again),
-        4,
-        "a refused migration leaves the database as it was"
-    );
-    // Rolled back by putting the copy in place, then migrated for real once the copy is moved away.
-    std::fs::rename(&backup, d.join("kept.bak")).unwrap();
-    assert_eq!(run(&["migrate", "--db", file]).0, Some(0));
+    // A second old database at the same path: the first copy is never overwritten, the new one is numbered.
+    let first_copy = std::fs::read(&backup).unwrap();
+    std::fs::copy(&backup, &db).unwrap();
+    let (code, out, err) = run(&["migrate", "--db", file]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("pre-v4.1.bak"), "{out}");
+    assert_eq!(std::fs::read(&backup).unwrap(), first_copy);
+    assert_eq!(version(&d.join("c.db.pre-v4.1.bak")), 4);
     assert_eq!(version(&db), 8);
+    // The copy holds the data as it was, and putting it back is a rollback: the old schema, the organization intact.
+    std::fs::copy(&backup, &db).unwrap();
+    assert_eq!(version(&db), 4);
+    let orgs: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT count(*) FROM orgs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(orgs, 1);
+}
+
+#[test]
+fn a_symlink_at_the_backup_name_is_never_written_through() {
+    let d = dir("symlink");
+    let db = d.join("c.db");
+    old_database(&db);
+    let victim = d.join("victim");
+    std::fs::write(&victim, b"keep me").unwrap();
+    std::os::unix::fs::symlink(&victim, d.join("c.db.pre-v4.bak")).unwrap();
+    let (code, out, err) = run(&["migrate", "--db", db.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.contains("pre-v4.1.bak"), "{out}");
+    assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+}
+
+#[test]
+fn a_current_database_is_served_and_checked_byte_for_byte_unchanged_and_a_missing_one_is_not_created(
+) {
+    let d = dir("current");
+    let db = d.join("c.db");
+    let file = db.to_str().unwrap();
+    assert_eq!(run(&["migrate", "--db", file]).0, Some(0));
+    // Not in WAL mode (a restored copy is not): looking must not switch it.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("PRAGMA journal_mode = DELETE")
+        .unwrap();
+    let before = std::fs::read(&db).unwrap();
+    assert_eq!(run(&["audit-verify", "--db", file]).0, Some(0));
+    assert_eq!(std::fs::read(&db).unwrap(), before);
+    assert!(!d.join("c.db-wal").exists() && !d.join("c.db-shm").exists());
+    // A path that is not there is refused and not made (so never with the umask's mode).
+    let missing = d.join("missing.db");
+    let token = d.join("token");
+    std::fs::write(&token, "a-token-of-sufficient-length-0123").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (code, _, err) = run(&[
+        "serve",
+        "--db",
+        missing.to_str().unwrap(),
+        "--listen",
+        "127.0.0.1:0",
+        "--token-file",
+        token.to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("migrate"), "{err}");
+    assert!(!missing.exists());
+    // And one from a newer build is refused by serve as well.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 99")
+        .unwrap();
+    let (code, _, err) = run(&[
+        "serve",
+        "--db",
+        file,
+        "--listen",
+        "127.0.0.1:0",
+        "--token-file",
+        token.to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("99"), "{err}");
 }
 
 #[test]
@@ -174,7 +242,20 @@ fn postgres_is_read_only_until_it_is_migrated() {
             .expect("refused");
         assert!(error.to_string().contains("migrate"), "{error}");
     }
+    // Looking did not create the schema either (a typo must not leave an empty one behind).
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let exists = |client: &mut postgres::Client| -> bool {
+        client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)",
+                &[&schema],
+            )
+            .unwrap()
+            .get(0)
+    };
+    assert!(!exists(&mut client));
     let report = llmshim_control::migrate_postgres(&url, Some(&schema), None).unwrap();
+    assert!(exists(&mut client));
     assert_eq!((report.from, report.backup), (0, None));
     Store::open_postgres_existing(&url, Some(&schema), None).unwrap();
     let again = llmshim_control::migrate_postgres(&url, Some(&schema), None).unwrap();
