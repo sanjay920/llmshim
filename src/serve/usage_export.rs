@@ -393,6 +393,7 @@ mod tests {
             usage_reported: true,
             admission: "fleet",
             structure: None,
+            payload: None,
         }
     }
 
@@ -695,8 +696,12 @@ mod tests {
         let token_ref = token("old-token-0123456789abcdef");
         let exporter = exporter(&server.url(), &token_ref, 1, 200, 100);
         exporter.record(&usage("t1"));
-        until("the first batch", || exporter.queued() == 0).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The queue is empty once the batch is taken, not once it is answered: wait for the request itself.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !first.matched_async().await {
+            assert!(Instant::now() < deadline, "the first batch never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         first.assert_async().await;
         std::fs::write(
             token_ref.file.as_ref().unwrap(),
@@ -711,8 +716,11 @@ mod tests {
             .create_async()
             .await;
         exporter.record(&usage("t2"));
-        until("the second batch", || exporter.queued() == 0).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !second.matched_async().await {
+            assert!(Instant::now() < deadline, "the second batch never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         second.assert_async().await;
         exporter.close();
     }

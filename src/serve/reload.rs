@@ -667,6 +667,7 @@ impl Reloader {
         // Capture, unlike names, is replaced: turning it off for a client must stop it.
         if let Some(capture) = &self.handles.capture {
             capture.set_clients(super::keys::key_capture(&loaded.config, env));
+            capture.set_payload_clients(super::keys::key_payload(&loaded.config, env));
         }
         // Who may call and from where change together or not at all: one
         // fingerprint, one debounce.

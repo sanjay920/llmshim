@@ -225,12 +225,33 @@ pub fn key_tags(
         .collect()
 }
 
-/// The credential scopes of the keys that capture prompt structure (note 0052). The set a reload replaces.
+/// The credential scopes of the keys that capture prompt structure (note 0052): `structure` and `payload` both
+/// do. The set a reload replaces.
 pub fn key_capture(config: &ServeConfig, env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    capturing(config, env, |mode| {
+        matches!(
+            mode,
+            super::config::CaptureMode::Structure | super::config::CaptureMode::Payload
+        )
+    })
+}
+
+/// The credential scopes of the keys that also capture payloads (note 0052, slice 5b).
+pub fn key_payload(config: &ServeConfig, env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    capturing(config, env, |mode| {
+        mode == super::config::CaptureMode::Payload
+    })
+}
+
+fn capturing(
+    config: &ServeConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+    wanted: impl Fn(super::config::CaptureMode) -> bool,
+) -> Vec<String> {
     config
         .keys
         .iter()
-        .filter(|key| key.capture == Some(super::config::CaptureMode::Structure))
+        .filter(|key| key.capture.is_some_and(&wanted))
         .filter_map(|key| credential_scope(key, env))
         .collect()
 }

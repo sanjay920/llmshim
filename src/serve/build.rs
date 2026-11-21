@@ -372,31 +372,86 @@ pub async fn build_app(
             }])
         }
     };
+    // The media object store (note 0050): built here so a wrong path, an unreadable credential or an
+    // unusable CA fails at start and under `--check`, not at the first request.
+    let media_store = match config
+        .media_store
+        .as_ref()
+        .map(|store| super::blobstore::from_config(store, env))
+        .transpose()
+    {
+        Ok(handle) => handle.map(Arc::new),
+        Err(message) => {
+            return Err(vec![Issue {
+                path: "media_store".into(),
+                message,
+            }])
+        }
+    };
     // Prompt-structure capture (note 0052): the deployment secret keys the fingerprints; the clients that
     // opted in are the keys with `capture = "structure"`. Read once; a reload replaces the client set.
+    let mut payload_store: Option<Arc<super::payload::PayloadStore>> = None;
     let capture = match config
         .capture
         .as_ref()
-        .map(|capture| -> Result<_, String> {
-            let key = super::config::read_secret(&capture.hmac_key, env)?;
+        .map(|capture| -> Result<_, (&'static str, String)> {
+            let key = super::config::read_secret(&capture.hmac_key, env)
+                .map_err(|m| ("capture.hmac_key", m))?;
             if key.len() < 32 {
-                return Err("hmac_key: must be at least 32 characters".to_owned());
+                return Err((
+                    "capture.hmac_key",
+                    "must be at least 32 characters".to_owned(),
+                ));
             }
-            Ok(crate::gateway::usage::StructureCapture::new(
+            let structure = crate::gateway::usage::StructureCapture::new(
                 key.into_bytes(),
                 super::keys::key_capture(config, env),
+            );
+            // Payload capture (note 0052, slice 5b) only where the file asks for it: the wrapping secret, the
+            // store the sealed objects go to, and a retention.
+            let (Some(secret), Some(media)) = (&capture.payload_key, &media_store) else {
+                return Ok(structure);
+            };
+            let secret =
+                super::config::read_secret(secret, env).map_err(|m| ("capture.payload_key", m))?;
+            if secret.len() < 32 {
+                return Err((
+                    "capture.payload_key",
+                    "must be at least 32 characters".to_owned(),
+                ));
+            }
+            let ttl = std::time::Duration::from_secs(capture.ttl_secs.unwrap_or(86_400));
+            let store = super::payload::PayloadStore::new(media.clone(), &secret, ttl);
+            payload_store = Some(store.clone());
+            Ok(structure.with_payload(
+                store,
+                capture.max_payload_bytes.map_or(262_144, |n| n as usize),
+                super::keys::key_payload(config, env),
             ))
         })
         .transpose()
     {
         Ok(capture) => capture,
-        Err(message) => {
+        Err((path, message)) => {
             return Err(vec![Issue {
-                path: "capture.hmac_key".into(),
+                path: path.into(),
                 message,
             }])
         }
     };
+    // Captured payloads are deleted after their retention: their own sweep, since the media sweeper may only
+    // delete what it made.
+    if let Some(store) = &payload_store {
+        let first = {
+            use ring::rand::SecureRandom;
+            let mut byte = [0u8; 1];
+            let _ = ring::rand::SystemRandom::new().fill(&mut byte);
+            std::time::Duration::from_secs(
+                u64::from(byte[0]) % super::blobstore::SWEEP_FIRST_MAX_SECS,
+            )
+        };
+        super::blobstore::spawn_payload_sweeper(store.store(), store.ttl(), first);
+    }
     // Attempt spans ride the usage recorder, so it exists when either is wanted.
     let usage = if usage_log.is_some() || telemetry.is_some() || usage_exporter.is_some() {
         // An open server (`allow_unauthenticated`) attributes every request to
@@ -524,22 +579,6 @@ pub async fn build_app(
         }
     }
 
-    // The media object store (note 0050): built here so a wrong path, an unreadable credential or an
-    // unusable CA fails at start and under `--check`, not at the first request.
-    let media_store = match config
-        .media_store
-        .as_ref()
-        .map(|store| super::blobstore::from_config(store, env))
-        .transpose()
-    {
-        Ok(handle) => handle.map(Arc::new),
-        Err(message) => {
-            return Err(vec![Issue {
-                path: "media_store".into(),
-                message,
-            }])
-        }
-    };
     if let Some(handle) = &media_store {
         state.set_media_store(handle.clone());
         // A fleet's replicas stage objects for each other's requests, and one that dies mid-request
@@ -647,41 +686,58 @@ pub async fn build_app(
         Some(admin_address) => {
             // The admin routes never read the key store, but the internal header
             // is stripped here too, so it is never present on any listener.
-            let routes = crate::gateway::http::admin_routes(admin_state)
-                .route(
-                    "/v1/serve/config",
-                    axum::routing::get(move || {
-                        let status = reload_status.snapshot();
-                        let snapshot = status_clock.as_ref().map(|clock| clock.status());
-                        let jwks = jwks_status.as_ref().map(|jwt| jwt.statuses());
-                        let audit_head = status_audit.as_ref().map(|audit| audit.head());
-                        async move {
-                            let mut body = serde_json::to_value(status).unwrap_or_default();
-                            // The audit log's head (note 0047), live: the count and the hash to anchor.
-                            if let (Some(object), Some(head)) = (body.as_object_mut(), audit_head) {
-                                object.insert(
-                                    "audit".into(),
-                                    serde_json::to_value(head).unwrap_or_default(),
-                                );
-                            }
-                            if let (Some(object), Some(snapshot)) = (body.as_object_mut(), snapshot)
-                            {
-                                object.insert(
-                                    "snapshot".into(),
-                                    serde_json::to_value(snapshot).unwrap_or_default(),
-                                );
-                            }
-                            if let (Some(object), Some(jwks)) = (body.as_object_mut(), jwks) {
-                                object.insert(
-                                    "jwks".into(),
-                                    serde_json::to_value(jwks).unwrap_or_default(),
-                                );
-                            }
-                            axum::Json(body)
+            let routes = crate::gateway::http::admin_routes(admin_state).route(
+                "/v1/serve/config",
+                axum::routing::get(move || {
+                    let status = reload_status.snapshot();
+                    let snapshot = status_clock.as_ref().map(|clock| clock.status());
+                    let jwks = jwks_status.as_ref().map(|jwt| jwt.statuses());
+                    let audit_head = status_audit.as_ref().map(|audit| audit.head());
+                    async move {
+                        let mut body = serde_json::to_value(status).unwrap_or_default();
+                        // The audit log's head (note 0047), live: the count and the hash to anchor.
+                        if let (Some(object), Some(head)) = (body.as_object_mut(), audit_head) {
+                            object.insert(
+                                "audit".into(),
+                                serde_json::to_value(head).unwrap_or_default(),
+                            );
                         }
-                    }),
-                )
-                .layer(axum::middleware::from_fn(super::mtls::strip_peer_header));
+                        if let (Some(object), Some(snapshot)) = (body.as_object_mut(), snapshot) {
+                            object.insert(
+                                "snapshot".into(),
+                                serde_json::to_value(snapshot).unwrap_or_default(),
+                            );
+                        }
+                        if let (Some(object), Some(jwks)) = (body.as_object_mut(), jwks) {
+                            object.insert(
+                                "jwks".into(),
+                                serde_json::to_value(jwks).unwrap_or_default(),
+                            );
+                        }
+                        axum::Json(body)
+                    }
+                }),
+            );
+            // Opening a captured payload (note 0052, slice 5b): the control plane asks, with the admin token, and
+            // the reference is opened here because only a gateway holds the capture key. Admin only by
+            // construction: configuration refuses a payload client without an admin token.
+            let routes = match &payload_store {
+                Some(store) => {
+                    let store = store.clone();
+                    routes.route(
+                        "/v1/serve/payload/open",
+                        axum::routing::post(
+                            move |axum::Json(body): axum::Json<serde_json::Value>| {
+                                let store = store.clone();
+                                async move { open_payload_response(&store, &body).await }
+                            },
+                        )
+                        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
+                    )
+                }
+                None => routes,
+            }
+            .layer(axum::middleware::from_fn(super::mtls::strip_peer_header));
             let routes = match admin_token {
                 Some(digest) => routes.layer(axum::middleware::from_fn(
                     move |request: Request, next: Next| {
@@ -1248,6 +1304,38 @@ async fn fleet_state(
 
 /// Writes each usage record as a JSON line.
 /// Attempt spans without a usage log: records are built, and go nowhere.
+/// The admin endpoint that opens a captured payload: `{"reference": "…"}` to `{"payload": {…}}`, or an error that
+/// is a class and nothing the reference or the store said.
+async fn open_payload_response(
+    store: &super::payload::PayloadStore,
+    body: &serde_json::Value,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (status, value) = match body.get("reference").and_then(|r| r.as_str()) {
+        Some(reference) => match store.open(reference).await {
+            Ok(document) => (
+                axum::http::StatusCode::OK,
+                serde_json::json!({"payload": document}),
+            ),
+            Err(error) => {
+                let (status, code) = super::payload::refusal(error);
+                (status, serde_json::json!({"error": code}))
+            }
+        },
+        None => (
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            serde_json::json!({"error": "bad_reference"}),
+        ),
+    };
+    let mut response = (status, axum::Json(value)).into_response();
+    // A payload is customer data: nothing between here and the viewer may keep it.
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
 struct NoUsageLog;
 
 impl crate::gateway::usage::UsageSink for NoUsageLog {
@@ -1271,9 +1359,10 @@ impl crate::gateway::usage::UsageSink for UsageLog {
     fn record(&self, record: &crate::gateway::usage::UsageRecord) {
         // The log is for operators and is read by anyone with the file; the structure is for the control plane's
         // cache debugger and rides the export only (note 0052).
-        if record.structure.is_some() {
+        if record.structure.is_some() || record.payload.is_some() {
             let mut stripped = record.clone();
             stripped.structure = None;
+            stripped.payload = None;
             self.0.write(&stripped);
         } else {
             self.0.write(record);

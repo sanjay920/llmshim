@@ -25,6 +25,7 @@ pub mod jwt;
 pub(crate) mod jwt_auth;
 pub mod keys;
 pub mod mtls;
+pub mod payload;
 pub mod reload;
 pub mod snapshot;
 pub mod snapshot_pull;

@@ -96,8 +96,9 @@ fn rows_from_before_the_chain_are_counted_and_the_chain_starts_after_them() {
     }
     raw(
         &path,
+        // (And the tables later versions added, which a real version-4 database did not have.)
         "ALTER TABLE history DROP COLUMN prev; ALTER TABLE history DROP COLUMN hash; \
-         PRAGMA user_version = 4;",
+         DROP TABLE request_structure; DROP TABLE requests; PRAGMA user_version = 4;",
     );
     let mut store = Store::open(&path).unwrap();
     store.create_org("New", ACTOR).unwrap();

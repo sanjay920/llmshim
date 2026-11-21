@@ -459,6 +459,16 @@ fn gemini(body: &Value, c: &mut Collected<'_>) {
     }
 }
 
+/// A wire's name as a payload document carries it, so a reader knows which walker cut the request.
+pub fn wire_name(wire: WireFormat) -> &'static str {
+    match wire {
+        WireFormat::AnthropicMessages => "anthropic-messages",
+        WireFormat::OpenAiResponses => "openai-responses",
+        WireFormat::OpenAiChat => "openai-chat",
+        WireFormat::GoogleGenerateContent => "google-generate-content",
+    }
+}
+
 /// Why a body has no structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Skipped {

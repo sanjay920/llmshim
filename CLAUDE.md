@@ -835,8 +835,15 @@ never has, so the control plane can compare fingerprints and never compute one. 
 `PreparedAttempt::native_body`, never delays or fails a request, is dropped from the usage log (only the export carries
 it), and a reload replaces the set of capturing clients. The control plane (`crates/llmshim-control/src/structure.rs`,
 schema 7) pairs a request with the same client's request before it and says `identical`, `appended`, `shorter` or
-`changed` and where. Never store, log, label or export any prompt text on this path; payload capture (5b) is a separate,
-unbuilt decision.
+`changed` and where. Never store, log, label or export any prompt text on this path.
+
+Payload capture (5b): `capture = "payload"` on a key, `[capture] payload_key`, `[media_store]` and an `[admin]` token. At the end
+of an attempt the provider-native request and the provider's own answer frames are sealed (`serve::blobstore::seal_payload`: a
+per-object key wrapped under a key derived from `payload_key`) into `capture/<date>/<random>` through a bounded queue, and the
+usage record carries only an opaque reference. The control plane stores the reference and **cannot open it**: `GET
+/v1/requests/{attempt}/payload` (admin only) writes a `payload.viewed` history row first, then has a gateway's admin listener
+(`POST /v1/serve/payload/open`) open it. Never put a reference or payload text in a log, metric, error, list answer or
+cacheable response; never give the control plane `payload_key` or the object store.
 
 ## Cloud transports from the `serve` file (note 0020)
 

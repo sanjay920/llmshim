@@ -79,6 +79,10 @@ started and the dependency broken under it; "unit" means the component alone.
 | A gateway restarts with records still queued | those records (at most `queue_size`, minus what the bounded close could send) are lost; the queue is memory only, so the ledger is a best-effort record of use, not the spend ledger | by design (0051); not tested beyond `close_sends_what_is_queued` |
 | The walker does not understand a request body (`[capture]` on) | the request is served and its record carries no structure; `llmshim_structure_capture_total{outcome="unrecognized"}` counts it | unit: `gateway::usage::capture_tests::a_body_the_walker_cannot_read_records_no_structure` |
 | The control plane receives a `structure` that is not what a gateway sends | the row (its spend) is stored without it; nothing is lost but the debugging aid | `llmshim-control` `structure::a_request_without_structure_is_a_404_that_says_why_and_the_row_is_never_lost_to_a_bad_field` |
+| The object store is down or full when a payload is written | the capture is dropped and counted (`llmshim_payload_capture_total{outcome="failed"}`); the request is unaffected; the record's reference will not open (`payload_gone`) | `integration_serve_capture` and the recorder tests |
+| The payload queue is full | the capture is dropped, counted `dropped_full`, and the record carries no reference | `gateway::attempt::usage_records` |
+| A gateway cannot be reached when an admin opens a payload | 502 `gateways_unavailable`; the `payload.viewed` row was already written | `llmshim-control` `payload::the_view_is_recorded_before_the_gateway_is_asked_and_even_when_it_cannot_answer` |
+| A gateway restarts with captures queued | those payload writes are lost; capture is best-effort, not an audit log | by design (0052) |
 
 The numbers are one run on a developer machine, to show the order of magnitude;
 the tests assert the bounds, not the figures.

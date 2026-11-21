@@ -10,12 +10,42 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
-/// The table, for a fresh database and for the migration to version 6.
+/// The table, for a fresh database.
 pub(crate) fn schema(pg: bool) -> String {
+    schema_shape(pg, true)
+}
+
+/// The columns version 8 added (note 0052, slice 5b): where a captured payload is, how big, and until when. An opaque
+/// reference only: the payload is on the gateway's side, sealed under a key this crate never has.
+pub(crate) fn payload_columns(pg: bool) -> String {
+    let (int, if_not_exists) = if pg {
+        ("BIGINT", " IF NOT EXISTS")
+    } else {
+        ("INTEGER", "")
+    };
+    format!(
+        "ALTER TABLE requests ADD COLUMN{if_not_exists} payload_ref TEXT; \
+         ALTER TABLE requests ADD COLUMN{if_not_exists} payload_bytes {int}; \
+         ALTER TABLE requests ADD COLUMN{if_not_exists} payload_expires_ms {int};"
+    )
+}
+
+/// The table as version 6 made it (without the payload columns), for the step that creates it in a migration; the
+/// later steps add what came after.
+pub(crate) fn schema_v6(pg: bool) -> String {
+    schema_shape(pg, false)
+}
+
+fn schema_shape(pg: bool, payload: bool) -> String {
     let (int, real) = if pg {
         ("BIGINT", "DOUBLE PRECISION")
     } else {
         ("INTEGER", "REAL")
+    };
+    let payload_columns = if payload {
+        format!(", payload_ref TEXT, payload_bytes {int}, payload_expires_ms {int}")
+    } else {
+        String::new()
     };
     format!(
         "
@@ -28,7 +58,7 @@ CREATE TABLE IF NOT EXISTS requests (
     input_tokens {int} NOT NULL, output_tokens {int} NOT NULL, reasoning_tokens {int},
     uncached_input_tokens {int}, cache_read_tokens {int} NOT NULL, cache_write_tokens {int} NOT NULL,
     cost_usd {real}, cost_source TEXT, usage_reported {int} NOT NULL, admission TEXT NOT NULL,
-    tags TEXT, received_ms {int} NOT NULL
+    tags TEXT, received_ms {int} NOT NULL{payload_columns}
 );
 CREATE INDEX IF NOT EXISTS requests_by_time ON requests (ts_ms, attempt_id);
 CREATE INDEX IF NOT EXISTS requests_by_tenant ON requests (tenant, ts_ms);
@@ -56,6 +86,8 @@ const OUTCOMES: [&str; 6] = [
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewRequest {
     structure: Option<Vec<crate::structure::Segment>>,
+    /// `(reference, bytes, expires_ms)` of a captured payload.
+    payload: Option<(String, i64, i64)>,
     attempt_id: String,
     ts: String,
     ts_ms: i64,
@@ -200,12 +232,33 @@ impl NewRequest {
             // For the cache debugger (note 0052): kept only for a request that names its client, since the
             // client is what pairs a request with the one before it. A field that is not what a gateway sends
             // is dropped, never a reason to lose the row's spend.
+            payload: parse_payload(map.get("payload")),
             structure: crate::structure::parse(map.get("structure")).filter(|_| {
                 map.get("key")
                     .is_some_and(|k| k.as_str().is_some_and(|k| !k.is_empty()))
             }),
         })
     }
+}
+
+/// A record's `payload` field: an opaque reference, its size and its expiry; `None` when it is not what a gateway sends
+/// (the row is kept, the reference is not). The reference is never looked into: it is only handed back to a gateway.
+fn parse_payload(value: Option<&Value>) -> Option<(String, i64, i64)> {
+    let object = value?.as_object()?;
+    let reference = object.get("reference")?.as_str()?;
+    let bytes = object.get("bytes")?.as_u64().filter(|n| *n <= 16 << 20)?;
+    let expires = chrono::DateTime::parse_from_rfc3339(object.get("expires_at")?.as_str()?).ok()?;
+    let valid = (1..=2048).contains(&reference.len())
+        && reference
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    valid.then(|| {
+        (
+            reference.to_owned(),
+            bytes as i64,
+            expires.timestamp_millis(),
+        )
+    })
 }
 
 /// What one ingest call did.
@@ -239,6 +292,9 @@ pub struct RequestQuery {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RequestRow {
     pub attempt_id: String,
+    /// A captured payload, if the client opted in (note 0052, slice 5b): its size and when it expires. The
+    /// reference is not here and is never sent to a browser.
+    pub payload: Option<PayloadInfo>,
     pub ts: String,
     pub tenant: Option<String>,
     pub key: Option<String>,
@@ -264,6 +320,15 @@ pub struct RequestRow {
     pub usage_reported: bool,
     pub admission: String,
     pub tags: Option<Value>,
+}
+
+/// That a payload was captured for a request, and until when it can be read.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PayloadInfo {
+    pub bytes: i64,
+    pub expires_at: String,
+    /// Past its expiry: the gateway has deleted it or is about to.
+    pub expired: bool,
 }
 
 /// A page of rows and where the next one starts.
@@ -442,13 +507,16 @@ impl Store {
                     of(row.cost_usd), ot(row.cost_source.as_deref()),
                     i(i64::from(row.usage_reported)), t(&row.admission),
                     ot(row.tags.as_deref()), i(received),
+                    ot(row.payload.as_ref().map(|p| p.0.as_str())), oi(row.payload.as_ref().map(|p| p.1)),
+                    oi(row.payload.as_ref().map(|p| p.2)),
                 ];
                 let stored = tx.exec(
                     "INSERT INTO requests (attempt_id, ts, ts_ms, day, tenant, key_name, request_id, \
                      deployment, provider, model, kind, outcome, http_status, duration_ms, input_tokens, \
                      output_tokens, reasoning_tokens, uncached_input_tokens, cache_read_tokens, \
-                     cache_write_tokens, cost_usd, cost_source, usage_reported, admission, tags, received_ms) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26) \
+                     cache_write_tokens, cost_usd, cost_source, usage_reported, admission, tags, received_ms, \
+                     payload_ref, payload_bytes, payload_expires_ms) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29) \
                      ON CONFLICT (attempt_id) DO NOTHING",
                     &params,
                 )?;
@@ -525,7 +593,7 @@ impl Store {
             "SELECT attempt_id, ts, ts_ms, tenant, key_name, request_id, deployment, provider, model, kind, \
              outcome, http_status, duration_ms, input_tokens, output_tokens, reasoning_tokens, \
              uncached_input_tokens, cache_read_tokens, cache_write_tokens, cost_usd, cost_source, \
-             usage_reported, admission, tags FROM requests{sql} \
+             usage_reported, admission, tags, payload_bytes, payload_expires_ms FROM requests{sql} \
              ORDER BY ts_ms DESC, attempt_id DESC LIMIT ?{}",
             params.len()
         );
@@ -538,7 +606,18 @@ impl Store {
                 let write = row.int(18)?;
                 let uncached = row.opt_int(16)?;
                 cursor_of.push((row.int(2)?, row.text(0)?));
+                let payload = match (row.opt_int(24)?, row.opt_int(25)?) {
+                    (Some(bytes), Some(expires)) => Some(PayloadInfo {
+                        bytes,
+                        expires_at: chrono::DateTime::from_timestamp_millis(expires)
+                            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                            .unwrap_or_default(),
+                        expired: expires < chrono::Utc::now().timestamp_millis(),
+                    }),
+                    _ => None,
+                };
                 requests.push(RequestRow {
+                    payload,
                     attempt_id: row.text(0)?,
                     ts: row.text(1)?,
                     tenant: row.opt_text(3)?,
@@ -633,6 +712,36 @@ impl Store {
 /// The summary as the API returns it (a flat object).
 pub fn summary_json(summary: &Summary) -> Value {
     json!({"totals": summary.totals, "groups": summary.groups})
+}
+
+impl Store {
+    /// The reference of an attempt's captured payload and when it expires, for the one route that hands it to a
+    /// gateway. `None` when there is none.
+    pub fn payload_reference(&mut self, attempt_id: &str) -> Result<Option<(String, i64)>> {
+        self.backend.transaction(false, |tx| {
+            let rows = tx.query(
+                "SELECT payload_ref, payload_expires_ms FROM requests WHERE attempt_id = ?1 AND payload_ref IS NOT NULL",
+                &[t(attempt_id)],
+            )?;
+            rows.first().map(|row| Ok((row.text(0)?, row.int(1)?))).transpose()
+        })
+    }
+
+    /// Record that `actor` asked to read an attempt's payload, in the change history (note 0047): the chain's row is
+    /// written before the payload is fetched, so a view with no row cannot exist. Never holds the reference or any
+    /// text.
+    pub fn record_payload_view(&mut self, attempt_id: &str, actor: &str) -> Result<()> {
+        crate::actor_check(actor)?;
+        self.backend.transaction(true, |tx| {
+            crate::history(
+                tx,
+                actor,
+                "payload.viewed",
+                attempt_id,
+                json!({"attempt_id": attempt_id}),
+            )
+        })
+    }
 }
 
 /// Distinct values of a column, for the UI's filter lists (bounded).

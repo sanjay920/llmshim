@@ -307,3 +307,5 @@ td.id { font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
 .strip .run.added { background: color-mix(in srgb, var(--series-1) 35%, var(--surface)); }
 .legend .same i { background: var(--series-1); } .legend .change i { background: var(--serious); }
 .legend .after i { background: var(--muted-mark); } .legend .added i { background: color-mix(in srgb, var(--series-1) 35%, var(--surface)); }
+.row-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.row-head h3 { margin: 0; flex: 1; }

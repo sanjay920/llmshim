@@ -417,6 +417,179 @@ pub async fn get_sealed(store: &dyn BlobStore, reference: &BlobRef) -> Result<St
     String::from_utf8(plaintext).map_err(|_| BlobError::Corrupt)
 }
 
+/// The deployment secret that wraps each captured payload's own key (note 0052, slice 5b): 256 bits derived from
+/// the configured secret. Whoever lacks it cannot open a payload reference, even with the object store's contents.
+#[derive(Clone)]
+pub struct WrapKey([u8; 32]);
+
+impl WrapKey {
+    /// Derive the wrapping key from a secret (at least 32 characters).
+    pub fn derive(secret: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"llmshim capture payload wrapping key v1\0");
+        hash.update(secret.as_bytes());
+        Self(hash.finalize().into())
+    }
+
+    fn key(&self) -> LessSafeKey {
+        LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &self.0).expect("a 256-bit key"))
+    }
+}
+
+impl std::fmt::Debug for WrapKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WrapKey(<redacted>)")
+    }
+}
+
+/// A sealed payload, ready to put: the object's name, its ciphertext, and the opaque reference that opens it.
+pub struct SealedPayload {
+    pub name: String,
+    pub ciphertext: Vec<u8>,
+    pub reference: String,
+}
+
+/// Seal `plaintext` under a fresh per-object key and wrap that key under `wrap`. The reference carries the object's
+/// name, its length, its nonce and the wrapped key: with `wrap` it opens the object, without it it opens nothing.
+pub fn seal_payload(prefix: &str, plaintext: &[u8], wrap: &WrapKey) -> SealedPayload {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let name = new_name(prefix);
+    let sealed = seal(&name, plaintext);
+    let rng = SystemRandom::new();
+    let mut wrap_nonce = [0u8; 12];
+    rng.fill(&mut wrap_nonce).expect("the system random source");
+    let mut wrapped = sealed.key.to_vec();
+    wrap.key()
+        .seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(wrap_nonce),
+            Aad::from(name.as_bytes()),
+            &mut wrapped,
+        )
+        .expect("wrapping a key");
+    let mut blob = wrap_nonce.to_vec();
+    blob.extend_from_slice(&wrapped);
+    let reference = URL_SAFE_NO_PAD.encode(
+        json!({"v": 1, "n": name, "l": plaintext.len(), "w": STANDARD.encode(&blob), "x": STANDARD.encode(sealed.nonce)})
+            .to_string(),
+    );
+    SealedPayload {
+        name,
+        ciphertext: sealed.ciphertext,
+        reference,
+    }
+}
+
+/// Open a payload by its reference: unwrap the key, read the object, check and open it. A reference that is
+/// malformed is [`BlobError::Invalid`]; one that does not unwrap under `wrap` (another deployment's, altered) or an
+/// object that does not open is [`BlobError::Corrupt`]. `max` bounds what is read.
+pub async fn open_payload(
+    store: &dyn BlobStore,
+    reference: &str,
+    wrap: &WrapKey,
+    max: usize,
+) -> Result<Vec<u8>, BlobError> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    if reference.len() > 2048 {
+        return Err(BlobError::Invalid);
+    }
+    let text = URL_SAFE_NO_PAD
+        .decode(reference)
+        .map_err(|_| BlobError::Invalid)?;
+    let value: Value = serde_json::from_slice(&text).map_err(|_| BlobError::Invalid)?;
+    let field = |name: &str| value.get(name);
+    if field("v").and_then(Value::as_u64) != Some(1) {
+        return Err(BlobError::Invalid);
+    }
+    let name = field("n")
+        .and_then(Value::as_str)
+        .ok_or(BlobError::Invalid)?;
+    // Only objects this feature writes: a reference can never be made to name another object of the store.
+    if !valid_name(name) || !name.starts_with(PAYLOAD_PREFIX) {
+        return Err(BlobError::Invalid);
+    }
+    let len = field("l")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or(BlobError::Invalid)?;
+    let blob = STANDARD
+        .decode(
+            field("w")
+                .and_then(Value::as_str)
+                .ok_or(BlobError::Invalid)?,
+        )
+        .map_err(|_| BlobError::Invalid)?;
+    let nonce = STANDARD
+        .decode(
+            field("x")
+                .and_then(Value::as_str)
+                .ok_or(BlobError::Invalid)?,
+        )
+        .map_err(|_| BlobError::Invalid)?;
+    if blob.len() != 12 + 32 + TAG_BYTES || nonce.len() != 12 || len > max {
+        return Err(BlobError::Invalid);
+    }
+    let (wrap_nonce, wrapped) = blob.split_at(12);
+    let mut key = wrapped.to_vec();
+    let key_len = wrap
+        .key()
+        .open_in_place(
+            Nonce::assume_unique_for_key(wrap_nonce.try_into().map_err(|_| BlobError::Invalid)?),
+            Aad::from(name.as_bytes()),
+            &mut key,
+        )
+        .map_err(|_| BlobError::Corrupt)?
+        .len();
+    key.truncate(key_len);
+    let ciphertext = store.get(name, len + TAG_BYTES).await?;
+    let plaintext = open(name, ciphertext, &key, &nonce)?;
+    if plaintext.len() != len {
+        return Err(BlobError::Corrupt);
+    }
+    Ok(plaintext)
+}
+
+/// The names of captured payloads start with this, which is not the shape the media sweeper may delete (it only
+/// touches `<date>/<hex>`): payloads have their own retention and their own sweeper.
+pub const PAYLOAD_PREFIX: &str = "capture/";
+
+/// Delete captured payloads older than `ttl`; how many went. Anything else in the store is left alone.
+pub async fn sweep_payloads(store: &dyn BlobStore, ttl: Duration) -> Result<usize, BlobError> {
+    let now = SystemTime::now();
+    let mut deleted = 0;
+    for listed in store.list().await? {
+        let old = now
+            .duration_since(listed.modified)
+            .is_ok_and(|age| age > ttl);
+        if old && listed.key.starts_with(PAYLOAD_PREFIX) && valid_name(&listed.key) {
+            store.delete(&listed.key).await?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+/// Sweep captured payloads every [`SWEEP_EVERY`] for as long as the process runs.
+pub fn spawn_payload_sweeper(
+    store: Arc<dyn BlobStore>,
+    ttl: Duration,
+    first: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    Some(runtime.spawn(async move {
+        tokio::time::sleep(first).await;
+        loop {
+            if let Err(error) = sweep_payloads(store.as_ref(), ttl).await {
+                crate::gateway::metrics::incr(
+                    crate::gateway::metrics::MEDIA_STORE,
+                    &[("op", "sweep_payloads"), ("outcome", error.as_str())],
+                );
+            }
+            tokio::time::sleep(SWEEP_EVERY).await;
+        }
+    }))
+}
+
 /// The JSON pointers of every string in `value` that is at least `threshold` bytes.
 fn large_strings(value: &Value, threshold: usize) -> Vec<String> {
     fn escape(part: &str) -> String {
@@ -754,6 +927,173 @@ pub(crate) mod tests {
         fn max_object_bytes(&self) -> usize {
             1 << 20
         }
+    }
+
+    #[tokio::test]
+    async fn a_payload_opens_with_its_reference_and_the_key_and_with_nothing_else() {
+        let store = Memory::default();
+        let wrap = WrapKey::derive("a-capture-secret-of-at-least-32-characters");
+        let sealed = seal_payload(PAYLOAD_PREFIX, b"the launch codes are 12345", &wrap);
+        assert!(sealed.name.starts_with("capture/") && valid_name(&sealed.name));
+        store
+            .put(&sealed.name, sealed.ciphertext.clone())
+            .await
+            .unwrap();
+        // What the store holds is ciphertext: none of the text, and not the reference either.
+        let at_rest = store
+            .objects
+            .lock()
+            .unwrap()
+            .get(&sealed.name)
+            .unwrap()
+            .0
+            .clone();
+        assert!(!String::from_utf8_lossy(&at_rest).contains("launch codes"));
+        assert_eq!(
+            at_rest.len(),
+            "the launch codes are 12345".len() + TAG_BYTES
+        );
+        let opened = open_payload(&store, &sealed.reference, &wrap, 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(opened, b"the launch codes are 12345");
+        // Another deployment's key opens nothing, even with the object and the reference in hand.
+        let other = WrapKey::derive("another-capture-secret-of-32-or-more-characters");
+        assert_eq!(
+            open_payload(&store, &sealed.reference, &other, 1 << 20)
+                .await
+                .unwrap_err(),
+            BlobError::Corrupt
+        );
+        // The reference does not contain the per-object key in the clear: it is not in the decoded text.
+        let decoded = {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            String::from_utf8(URL_SAFE_NO_PAD.decode(&sealed.reference).unwrap()).unwrap()
+        };
+        assert!(!decoded.contains("launch codes"));
+        // Two payloads of the same text have different names, keys and references.
+        let again = seal_payload(PAYLOAD_PREFIX, b"the launch codes are 12345", &wrap);
+        assert_ne!(
+            (&again.name, &again.reference, &again.ciphertext),
+            (&sealed.name, &sealed.reference, &sealed.ciphertext)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reference_that_is_altered_or_names_another_object_is_refused() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let store = Memory::default();
+        let wrap = WrapKey::derive("a-capture-secret-of-at-least-32-characters");
+        let sealed = seal_payload(PAYLOAD_PREFIX, b"payload", &wrap);
+        store
+            .put(&sealed.name, sealed.ciphertext.clone())
+            .await
+            .unwrap();
+        // A media object (a name the media path makes) is not a payload and is never read through a reference.
+        let media = new_name("");
+        store.put(&media, vec![1, 2, 3]).await.unwrap();
+        let edit = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&sealed.reference).unwrap())
+                    .unwrap();
+            change(&mut value);
+            URL_SAFE_NO_PAD.encode(value.to_string())
+        };
+        for (what, reference) in [
+            (
+                "another object",
+                edit(&|v| v["n"] = serde_json::json!(media)),
+            ),
+            (
+                "a path out",
+                edit(&|v| v["n"] = serde_json::json!("capture/../secret")),
+            ),
+            (
+                "a longer length",
+                edit(&|v| v["l"] = serde_json::json!(5000)),
+            ),
+            ("a version", edit(&|v| v["v"] = serde_json::json!(2))),
+            ("not base64", "!!!".to_owned()),
+            ("not json", URL_SAFE_NO_PAD.encode("hello")),
+            ("too long", "a".repeat(3000)),
+        ] {
+            assert!(
+                open_payload(&store, &reference, &wrap, 1 << 20)
+                    .await
+                    .is_err(),
+                "{what}"
+            );
+        }
+        // A wrapped key that was changed does not unwrap; a payload that is gone is NotFound.
+        let flipped = edit(&|v| {
+            let blob = v["w"].as_str().unwrap().to_owned();
+            let mut bytes = base64::engine::general_purpose::STANDARD
+                .decode(blob)
+                .unwrap();
+            bytes[20] ^= 1;
+            v["w"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+        });
+        assert_eq!(
+            open_payload(&store, &flipped, &wrap, 1 << 20)
+                .await
+                .unwrap_err(),
+            BlobError::Corrupt
+        );
+        store.delete(&sealed.name).await.unwrap();
+        assert_eq!(
+            open_payload(&store, &sealed.reference, &wrap, 1 << 20)
+                .await
+                .unwrap_err(),
+            BlobError::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn the_payload_sweep_deletes_old_payloads_and_nothing_else() {
+        let store = Memory::default();
+        let long_ago = SystemTime::now() - Duration::from_secs(100_000);
+        let put = |name: &str, at: SystemTime| {
+            store
+                .objects
+                .lock()
+                .unwrap()
+                .insert(name.to_owned(), (vec![0], at));
+        };
+        put(
+            "capture/20260101/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            long_ago,
+        );
+        put(
+            "capture/20260102/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            SystemTime::now(),
+        );
+        // Media objects and anything foreign belong to the other sweeper or to nobody.
+        put("20260101/cccccccccccccccccccccccccccccccc", long_ago);
+        put("something-else", long_ago);
+        let swept = sweep_payloads(&store, Duration::from_secs(86_400))
+            .await
+            .unwrap();
+        assert_eq!(swept, 1);
+        let left: Vec<String> = store.objects.lock().unwrap().keys().cloned().collect();
+        assert_eq!(
+            left,
+            [
+                "20260101/cccccccccccccccccccccccccccccccc",
+                "capture/20260102/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "something-else"
+            ]
+        );
+        // The media sweep never touches a payload, however old.
+        put(
+            "capture/20250101/dddddddddddddddddddddddddddddddd",
+            long_ago,
+        );
+        sweep(&store, Duration::from_secs(60)).await.unwrap();
+        assert!(store
+            .objects
+            .lock()
+            .unwrap()
+            .contains_key("capture/20250101/dddddddddddddddddddddddddddddddd"));
     }
 
     fn big(fill: char, bytes: usize) -> String {

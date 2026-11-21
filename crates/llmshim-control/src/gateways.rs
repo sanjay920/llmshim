@@ -221,6 +221,92 @@ impl Gateways {
     }
 }
 
+/// Why a payload could not be opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenError {
+    /// No gateways are listed, so nothing can open a payload.
+    NotConfigured,
+    /// No gateway has the object (it was deleted, or was never written).
+    NotFound,
+    /// A gateway refused the reference: another deployment's, or altered.
+    BadReference,
+    /// No gateway could be asked or answered usefully.
+    Unavailable,
+}
+
+/// The largest document a gateway may answer an open with: two parts of at most 1 MiB each, escaped.
+const MAX_OPEN_BODY: usize = 16 << 20;
+
+impl Gateways {
+    /// Ask every gateway at once to open a payload reference; the first that does wins. In a fleet any replica can
+    /// (the store and the key are shared); with a local store only the one that wrote it can, and the others say
+    /// not found. The reference is only handed on, never read, and nothing a gateway says is repeated but the
+    /// document.
+    pub async fn open_payload(&self, reference: &str) -> Result<Value, OpenError> {
+        if self.targets.is_empty() {
+            return Err(OpenError::NotConfigured);
+        }
+        let tasks: Vec<_> = self
+            .targets
+            .iter()
+            .map(|target| {
+                let (client, origin, token_file) = (
+                    target.client.clone(),
+                    target.origin.clone(),
+                    target.token_file.clone(),
+                );
+                let reference = reference.to_owned();
+                tokio::spawn(async move {
+                    let token = match &token_file {
+                        Some(path) => {
+                            Some(read_token_file(path).map_err(|_| OpenError::Unavailable)?)
+                        }
+                        None => None,
+                    };
+                    let mut request = client
+                        .post(format!("{origin}/v1/serve/payload/open"))
+                        .json(&json!({"reference": reference}));
+                    if let Some(token) = &token {
+                        request = request.bearer_auth(token);
+                    }
+                    let mut response = request.send().await.map_err(|_| OpenError::Unavailable)?;
+                    let status = response.status().as_u16();
+                    let mut body = Vec::new();
+                    while let Some(chunk) =
+                        response.chunk().await.map_err(|_| OpenError::Unavailable)?
+                    {
+                        body.extend_from_slice(&chunk);
+                        if body.len() > MAX_OPEN_BODY {
+                            return Err(OpenError::Unavailable);
+                        }
+                    }
+                    match status {
+                        200 => serde_json::from_slice::<Value>(&body)
+                            .ok()
+                            .and_then(|v| v.get("payload").filter(|p| p.is_object()).cloned())
+                            .ok_or(OpenError::Unavailable),
+                        404 => Err(OpenError::NotFound),
+                        422 => Err(OpenError::BadReference),
+                        _ => Err(OpenError::Unavailable),
+                    }
+                })
+            })
+            .collect();
+        let mut worst = OpenError::NotFound;
+        for task in tasks {
+            match task.await.unwrap_or(Err(OpenError::Unavailable)) {
+                Ok(document) => return Ok(document),
+                Err(OpenError::Unavailable) => worst = OpenError::Unavailable,
+                Err(OpenError::BadReference) if worst == OpenError::NotFound => {
+                    worst = OpenError::BadReference
+                }
+                Err(_) => {}
+            }
+        }
+        Err(worst)
+    }
+}
+
 /// Run the futures together and collect their outputs in order (no extra dependency for a join).
 async fn futures_join<F: std::future::Future<Output = Value> + Send + 'static>(
     futures: impl Iterator<Item = F>,

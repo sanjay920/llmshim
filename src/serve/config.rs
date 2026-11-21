@@ -185,6 +185,20 @@ pub struct Capture {
     /// one deployment share it; the control plane never has it, so it can compare fingerprints and never
     /// compute one. Rotating it is a restart, after which earlier and later requests are not comparable.
     pub hmac_key: SecretRef,
+    /// The deployment secret that wraps each captured payload's own key (note 0052, slice 5b), by reference: at
+    /// least 32 characters. Needed by any client with `capture = "payload"`. The gateways of one deployment share
+    /// it; the control plane never has it, so it can hold a reference and never open one. Rotating it is a restart,
+    /// after which earlier payloads cannot be opened.
+    #[serde(default)]
+    pub payload_key: Option<SecretRef>,
+    /// How long a captured payload is kept, in seconds (default 86400, 600 to 604800). The object store's
+    /// sweeper deletes it after this.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+    /// The most of a request, and of its answer, a payload keeps, in bytes (default 262144, 1024 to 1048576); more
+    /// is cut and said to be cut.
+    #[serde(default)]
+    pub max_payload_bytes: Option<u64>,
 }
 
 /// What a client captures.
@@ -195,6 +209,10 @@ pub enum CaptureMode {
     Off,
     /// The prompt's segment fingerprints (note 0052, slice 5a).
     Structure,
+    /// The fingerprints and a sealed copy of the request and the answer, readable only by an administrator through
+    /// the control plane, kept for a short time (note 0052, slice 5b). Needs `[capture] payload_key`,
+    /// `[media_store]` and an `[admin]` table with a token.
+    Payload,
 }
 
 /// The push of usage records to the control plane (note 0051). Bounded and fail-open: a full queue drops
@@ -1962,6 +1980,29 @@ impl ServeConfig {
             return;
         };
         validate_secret(&capture.hmac_key, "capture.hmac_key", issues);
+        if let Some(key) = &capture.payload_key {
+            validate_secret(key, "capture.payload_key", issues);
+        } else if capture.ttl_secs.is_some() || capture.max_payload_bytes.is_some() {
+            issues.push(Issue::new(
+                "capture.payload_key",
+                "ttl_secs and max_payload_bytes apply to payload capture, which needs a payload_key",
+            ));
+        }
+        if capture
+            .ttl_secs
+            .is_some_and(|n| !(600..=604_800).contains(&n))
+        {
+            issues.push(Issue::new("capture.ttl_secs", "must be 600 to 604800"));
+        }
+        if capture
+            .max_payload_bytes
+            .is_some_and(|n| !(1024..=1_048_576).contains(&n))
+        {
+            issues.push(Issue::new(
+                "capture.max_payload_bytes",
+                "must be 1024 to 1048576",
+            ));
+        }
         if self.usage_export.is_none() {
             issues.push(Issue::new(
                 "capture",
@@ -3827,11 +3868,39 @@ impl ServeConfig {
                     }
                 }
             }
-            if key.capture == Some(CaptureMode::Structure) && self.capture.is_none() {
+            if matches!(
+                key.capture,
+                Some(CaptureMode::Structure | CaptureMode::Payload)
+            ) && self.capture.is_none()
+            {
                 issues.push(Issue::new(
                     format!("{at}.capture"),
                     "needs a [capture] table with an hmac_key",
                 ));
+            }
+            if key.capture == Some(CaptureMode::Payload) {
+                let missing = |what: &str| {
+                    Issue::new(format!("{at}.capture"), format!("\"payload\" needs {what}"))
+                };
+                if self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|c| c.payload_key.is_none())
+                {
+                    issues.push(missing("[capture] payload_key"));
+                }
+                if self.media_store.is_none() {
+                    issues.push(missing("[media_store], where the sealed payloads are kept"));
+                }
+                if !self
+                    .admin
+                    .as_ref()
+                    .is_some_and(|admin| admin.token.is_some())
+                {
+                    issues.push(missing(
+                        "an [admin] table with a token: the control plane opens payloads through it",
+                    ));
+                }
             }
             if key.tags.len() > 16 {
                 issues.push(Issue::new(format!("{at}.tags"), "has more than 16 tags"));
@@ -4138,10 +4207,14 @@ impl ServeConfig {
             .usage_export
             .iter()
             .map(|export| ("usage_export.token".to_string(), &export.token));
-        let capture = self
-            .capture
-            .iter()
-            .map(|capture| ("capture.hmac_key".to_string(), &capture.hmac_key));
+        let capture = self.capture.iter().flat_map(|capture| {
+            std::iter::once(("capture.hmac_key".to_string(), &capture.hmac_key)).chain(
+                capture
+                    .payload_key
+                    .as_ref()
+                    .map(|key| ("capture.payload_key".to_string(), key)),
+            )
+        });
         let media = self.media_store.iter().flat_map(|store| {
             [
                 ("media_store.access_key_id", &store.access_key_id),

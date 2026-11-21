@@ -531,6 +531,7 @@ function showRequest(r) {
       h("div", { class: "section" }, h("h3", {}, "Who"), h("dl", { class: "kv" },
         h("dt", {}, "Client"), h("dd", {}, r.key || "—"), h("dt", {}, "Tenant"), h("dd", {}, r.tenant || "—"), h("dt", {}, "Tags"), h("dd", {}, tags), h("dt", {}, "Admission"), h("dd", {}, r.admission))),
       structureSection(r),
+      r.payload ? payloadSection(r) : null,
       h("div", { class: "section" }, h("h3", {}, "Identifiers"), h("dl", { class: "kv" },
         h("dt", {}, "Request"), h("dd", {}, id(r.request_id, "request id")), h("dt", {}, "Attempt"), h("dd", {}, id(r.attempt_id, "attempt id")), h("dt", {}, "Time"), h("dd", { class: "m" }, r.ts))),
     ],
@@ -548,6 +549,52 @@ function structureSection(r) {
       : "The prompt structure could not be loaded."));
   });
   return h("div", { class: "section" }, h("h3", {}, "Prompt structure"), holder);
+}
+
+// A captured request and answer (note 0052, slice 5b). Customer data: nothing is fetched until an administrator asks,
+// the request is recorded in the change history under their name, and the text is shown as text and not kept.
+function payloadSection(r) {
+  const p = r.payload;
+  const holder = h("div", { class: "stack" });
+  const size = fmtCompact(p.bytes) + " bytes";
+  const until = "kept until " + fmtTime(p.expires_at);
+  if (p.expired) {
+    holder.append(h("p", { class: "muted" }, "A payload was captured (" + size + ") and has passed its retention: it is deleted."));
+  } else if (!canAdmin()) {
+    holder.append(h("p", { class: "muted" }, "A payload was captured (" + size + ", " + until + "). Only administrators can read it."));
+  } else {
+    const shown = h("div", { class: "stack" });
+    const button = h("button", { type: "button", class: "btn" }, icon("shield", 14), "Show payload");
+    const note = h("p", { class: "muted" }, "Captured request and answer (" + size + ", " + until + "). This is customer data: opening it is recorded in the change history under your name.");
+    button.addEventListener("click", async () => {
+      if (shown.childElementCount) { shown.replaceChildren(); button.lastChild.textContent = "Show payload"; return; }
+      button.disabled = true;
+      try {
+        const answer = await api("/v1/requests/" + encodeURIComponent(r.attempt_id) + "/payload");
+        shown.replaceChildren(...payloadParts(answer.payload));
+        button.lastChild.textContent = "Hide payload";
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401) { showError(error); return; }
+        shown.replaceChildren(h("div", { class: "notice bad" }, icon("alert", 16), h("div", {}, error.message || "The payload could not be opened.")));
+      } finally { button.disabled = false; }
+    });
+    holder.append(note, h("div", {}, button), shown);
+  }
+  return h("div", { class: "section" }, h("h3", {}, "Captured payload"), holder);
+}
+
+// The two parts of a payload document: pretty-printed when the text is JSON, as it is otherwise (a stream's events).
+function payloadParts(doc) {
+  const part = (title, p) => {
+    if (!p) return null;
+    let text = String(p.text || "");
+    try { text = JSON.stringify(JSON.parse(text), null, 2); } catch (_) { /* not JSON: shown as it is */ }
+    return h("div", { class: "section" },
+      h("div", { class: "row-head" }, h("h3", {}, title + " · " + fmtInt(p.bytes) + " bytes"), copyButton(String(p.text || ""), title.toLowerCase())),
+      p.truncated ? h("p", { class: "muted" }, "Cut at the capture limit: the first part of " + fmtInt(p.bytes) + " bytes is kept.") : null,
+      h("pre", { class: "json" }, text));
+  };
+  return [part("Request", doc && doc.request), part("Response", doc && doc.response)].filter(Boolean);
 }
 
 function structureView(s, r) {
