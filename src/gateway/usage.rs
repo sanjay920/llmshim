@@ -185,18 +185,19 @@ impl StructureCapture {
             STRUCTURE_CAPTURE,
             &[(
                 "outcome",
-                if segments.is_some() {
-                    "captured"
-                } else {
-                    "unrecognized"
+                match &segments {
+                    Ok(_) => "captured",
+                    Err(crate::gateway::structure::Skipped::Unrecognized) => "unrecognized",
+                    Err(crate::gateway::structure::Skipped::TooLarge) => "too_large",
                 },
             )],
         );
-        segments
+        segments.ok()
     }
 }
 
-/// Structure captures by outcome: `captured`, or `unrecognized` (a body the walker does not understand).
+/// Structure captures by outcome: `captured`, `unrecognized` (a body the walker does not understand) or `too_large`
+/// (past the work budget).
 #[cfg(feature = "serve")]
 pub const STRUCTURE_CAPTURE: &str = "llmshim_structure_capture_total";
 

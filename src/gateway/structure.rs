@@ -23,7 +23,7 @@
 
 use crate::reasoning::WireFormat;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// The most segments one request reports; the tail beyond it is one `other` segment.
@@ -52,57 +52,143 @@ pub const KINDS: [&str; 7] = [
     "other",
 ];
 
-/// HMAC-SHA-256 (RFC 2104), with the block size of SHA-256.
-pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut block = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        block[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let mut inner = Sha256::new();
-    inner.update(block.map(|b| b ^ 0x36));
-    inner.update(message);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(block.map(|b| b ^ 0x5c));
-    outer.update(inner);
-    outer.finalize().into()
+/// HMAC-SHA-256 (RFC 2104), with the block size of SHA-256, fed in pieces so a large segment is hashed as it is
+/// walked and never copied.
+struct Mac {
+    inner: Sha256,
+    opad: [u8; 64],
 }
 
-/// The canonical form of a segment: object keys sorted at every level, `cache_control` removed, no whitespace.
-fn canonical(value: &Value, out: &mut Vec<u8>) {
+impl Mac {
+    fn new(key: &[u8]) -> Self {
+        let mut block = [0u8; 64];
+        if key.len() > 64 {
+            block[..32].copy_from_slice(&Sha256::digest(key));
+        } else {
+            block[..key.len()].copy_from_slice(key);
+        }
+        let mut inner = Sha256::new();
+        inner.update(block.map(|b| b ^ 0x36));
+        Self {
+            inner,
+            opad: block.map(|b| b ^ 0x5c),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.inner.update(bytes);
+    }
+
+    fn finish(self) -> [u8; 32] {
+        let inner = self.inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(self.opad);
+        outer.update(inner);
+        outer.finalize().into()
+    }
+}
+
+/// HMAC-SHA-256 of one message (the vectors in the tests check [`Mac`] through it).
+#[cfg(test)]
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut mac = Mac::new(key);
+    mac.update(message);
+    mac.finish()
+}
+
+/// The most canonical bytes one request is hashed over. Capture runs on the request's path, so its work is
+/// bounded: past this the request has no structure (counted as `too_large`) instead of costing it time.
+pub const MAX_BYTES: u64 = 8 << 20;
+
+/// Where canonical bytes go: into a MAC, counted, and refused once the budget is spent (which also stops the walk
+/// of a value early).
+struct Writer<'a> {
+    mac: &'a mut Mac,
+    len: u64,
+    spent: &'a mut u64,
+}
+
+impl std::io::Write for Writer<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        *self.spent += bytes.len() as u64;
+        if *self.spent > MAX_BYTES {
+            return Err(std::io::Error::other("budget"));
+        }
+        self.mac.update(bytes);
+        self.len += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+type Done = std::io::Result<()>;
+
+fn put(out: &mut Writer<'_>, bytes: &[u8]) -> Done {
+    std::io::Write::write_all(out, bytes)
+}
+
+/// A JSON string or other leaf, escaped as it is written (no copy of a large string).
+fn leaf(value: &Value, out: &mut Writer<'_>) -> Done {
+    serde_json::to_writer(out, value).map_err(std::io::Error::from)
+}
+
+/// The canonical form of a value: object keys sorted at every level, no whitespace. `strip_marker` removes a
+/// `cache_control` key of **this** object only, where a provider's cache marker sits (a tool, a system block, a
+/// content block); the same name deeper (a property of a tool's schema, a caller's own JSON) is data and stays.
+fn canonical(value: &Value, out: &mut Writer<'_>, strip_marker: bool) -> Done {
     match value {
         Value::Object(map) => {
-            out.push(b'{');
             let mut keys: Vec<&String> = map
                 .keys()
-                .filter(|k| k.as_str() != "cache_control")
+                .filter(|k| !(strip_marker && k.as_str() == "cache_control"))
                 .collect();
             keys.sort();
+            put(out, b"{")?;
             for (n, key) in keys.into_iter().enumerate() {
                 if n > 0 {
-                    out.push(b',');
+                    put(out, b",")?;
                 }
-                out.extend_from_slice(Value::String(key.clone()).to_string().as_bytes());
-                out.push(b':');
-                canonical(&map[key], out);
+                leaf(&Value::String(key.clone()), out)?;
+                put(out, b":")?;
+                canonical(&map[key], out, false)?;
             }
-            out.push(b'}');
+            put(out, b"}")
         }
         Value::Array(items) => {
-            out.push(b'[');
+            put(out, b"[")?;
             for (n, item) in items.iter().enumerate() {
                 if n > 0 {
-                    out.push(b',');
+                    put(out, b",")?;
                 }
-                canonical(item, out);
+                canonical(item, out, false)?;
             }
-            out.push(b']');
+            put(out, b"]")
         }
-        other => out.extend_from_slice(other.to_string().as_bytes()),
+        other => leaf(other, out),
     }
+}
+
+/// The canonical form of `map` without the keys `skip` names.
+fn canonical_without(
+    map: &serde_json::Map<String, Value>,
+    skip: &[&str],
+    out: &mut Writer<'_>,
+) -> Done {
+    let mut keys: Vec<&String> = map.keys().filter(|k| !skip.contains(&k.as_str())).collect();
+    keys.sort();
+    put(out, b"{")?;
+    for (n, key) in keys.into_iter().enumerate() {
+        if n > 0 {
+            put(out, b",")?;
+        }
+        leaf(&Value::String(key.clone()), out)?;
+        put(out, b":")?;
+        canonical(&map[key], out, false)?;
+    }
+    put(out, b"}")
 }
 
 fn role_kind(role: &str) -> &'static str {
@@ -115,16 +201,98 @@ fn role_kind(role: &str) -> &'static str {
     }
 }
 
-/// Collects `(kind, canonical bytes)` in order, then fingerprints them.
-struct Collected {
-    parts: Vec<(&'static str, Vec<u8>)>,
+/// Fingerprints segments as they are walked, in order.
+struct Collected<'k> {
+    key: &'k [u8],
+    out: Vec<Segment>,
+    /// From the 2,048th segment on: one `other` segment standing for the rest, so a change anywhere in the tail
+    /// still shows.
+    tail: Option<(Mac, u64)>,
+    spent: u64,
+    over: bool,
 }
 
-impl Collected {
+impl<'k> Collected<'k> {
+    fn new(key: &'k [u8]) -> Self {
+        Self {
+            key,
+            out: Vec::new(),
+            tail: None,
+            spent: 0,
+            over: false,
+        }
+    }
+
+    /// One segment: `kind`, a zero byte, then what `write` puts out.
+    fn emit(&mut self, kind: &'static str, write: impl FnOnce(&mut Writer<'_>) -> Done) {
+        if self.over {
+            return;
+        }
+        let folding = self.out.len() >= MAX_SEGMENTS - 1;
+        let (mut mac, mut tail_len) = if folding {
+            self.tail.take().unwrap_or_else(|| {
+                let mut mac = Mac::new(self.key);
+                mac.update(b"other\0");
+                (mac, 0)
+            })
+        } else {
+            (Mac::new(self.key), 0)
+        };
+        mac.update(kind.as_bytes());
+        mac.update(&[0]);
+        let mut writer = Writer {
+            mac: &mut mac,
+            len: 0,
+            spent: &mut self.spent,
+        };
+        let finished = write(&mut writer);
+        let len = writer.len;
+        if finished.is_err() {
+            self.over = true;
+            return;
+        }
+        if folding {
+            mac.update(&[0]);
+            tail_len += len;
+            self.tail = Some((mac, tail_len));
+        } else {
+            let hash = mac.finish()[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            self.out.push(Segment {
+                kind,
+                hash,
+                bytes: len,
+            });
+        }
+    }
+
     fn push(&mut self, kind: &'static str, value: &Value) {
-        let mut bytes = Vec::new();
-        canonical(value, &mut bytes);
-        self.parts.push((kind, bytes));
+        self.emit(kind, |w| canonical(value, w, true));
+    }
+
+    /// `{"<field>": value, "role": role}`, the fields in sorted order (every `field` we use sorts before `role`).
+    fn push_pair(&mut self, kind: &'static str, field: &str, value: &Value, role: &str) {
+        self.emit(kind, |w| {
+            put(w, b"{")?;
+            leaf(&Value::String(field.to_owned()), w)?;
+            put(w, b":")?;
+            canonical(value, w, true)?;
+            put(w, b",\"role\":")?;
+            leaf(&Value::String(role.to_owned()), w)?;
+            put(w, b"}")
+        });
+    }
+
+    /// A message's fields other than its content, as one segment.
+    fn push_without(
+        &mut self,
+        kind: &'static str,
+        map: &serde_json::Map<String, Value>,
+        skip: &[&str],
+    ) {
+        self.emit(kind, |w| canonical_without(map, skip, w));
     }
 
     fn items(&mut self, kind: &'static str, value: Option<&Value>) {
@@ -135,38 +303,22 @@ impl Collected {
         }
     }
 
-    fn finish(self, key: &[u8]) -> Vec<Segment> {
-        let segment = |kind: &'static str, bytes: &[u8]| {
-            let mut message = Vec::with_capacity(bytes.len() + 16);
-            message.extend_from_slice(kind.as_bytes());
-            message.push(0);
-            message.extend_from_slice(bytes);
-            let mac = hmac_sha256(key, &message);
-            Segment {
-                kind,
-                hash: mac[..8].iter().map(|b| format!("{b:02x}")).collect(),
-                bytes: bytes.len() as u64,
-            }
-        };
-        let mut parts = self.parts;
-        let mut tail = Vec::new();
-        if parts.len() > MAX_SEGMENTS {
-            // The last segment stands for everything beyond the cap, so a change anywhere in the tail still shows.
-            for (kind, bytes) in parts.drain(MAX_SEGMENTS - 1..) {
-                tail.extend_from_slice(kind.as_bytes());
-                tail.push(0);
-                tail.extend_from_slice(&bytes);
-                tail.push(0);
-            }
+    fn finish(mut self) -> Option<Vec<Segment>> {
+        if self.over {
+            return None;
         }
-        let mut out: Vec<Segment> = parts
-            .iter()
-            .map(|(kind, bytes)| segment(kind, bytes))
-            .collect();
-        if !tail.is_empty() {
-            out.push(segment("other", &tail));
+        if let Some((mac, len)) = self.tail.take() {
+            let hash = mac.finish()[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            self.out.push(Segment {
+                kind: "other",
+                hash,
+                bytes: len,
+            });
         }
-        out
+        Some(self.out)
     }
 }
 
@@ -182,10 +334,10 @@ fn block_kind(role: &str, block: &Value) -> &'static str {
     }
 }
 
-fn anthropic(body: &Value, c: &mut Collected) {
+fn anthropic(body: &Value, c: &mut Collected<'_>) {
     c.items("tool", body.get("tools"));
     match body.get("system") {
-        Some(Value::String(text)) => c.push("system", &json!(text)),
+        Some(text @ Value::String(_)) => c.push("system", text),
         Some(Value::Array(blocks)) => blocks.iter().for_each(|b| c.push("system", b)),
         _ => {}
     }
@@ -197,15 +349,10 @@ fn anthropic(body: &Value, c: &mut Collected) {
     {
         let role = message.get("role").and_then(Value::as_str).unwrap_or("");
         match message.get("content") {
-            Some(Value::String(text)) => {
-                c.push(role_kind(role), &json!({"role": role, "content": text}))
-            }
+            Some(text @ Value::String(_)) => c.push_pair(role_kind(role), "content", text, role),
             Some(Value::Array(blocks)) => {
                 for block in blocks {
-                    c.push(
-                        block_kind(role, block),
-                        &json!({"role": role, "block": block}),
-                    );
+                    c.push_pair(block_kind(role, block), "block", block, role);
                 }
             }
             _ => c.push(role_kind(role), message),
@@ -213,36 +360,39 @@ fn anthropic(body: &Value, c: &mut Collected) {
     }
 }
 
-/// A chat-style message: an array content by its parts, then any other fields (tool calls, a tool call id) as one more.
-fn chat_message(message: &Value, c: &mut Collected) {
+/// A chat-style message: an array content by its parts, then any other fields (tool calls, a tool call id) as one
+/// more. A typed Responses item's `type` is not a field of its own.
+fn chat_message(message: &Value, c: &mut Collected<'_>) {
     let role = message.get("role").and_then(Value::as_str).unwrap_or("");
-    match message.get("content") {
-        Some(Value::Array(parts)) => {
+    match (message.get("content"), message.as_object()) {
+        (Some(Value::Array(parts)), Some(object)) => {
             for part in parts {
-                c.push(block_kind(role, part), &json!({"role": role, "part": part}));
+                c.push_pair(block_kind(role, part), "part", part, role);
             }
-            if let Some(object) = message.as_object() {
-                let extras: serde_json::Map<String, Value> = object
-                    .iter()
-                    .filter(|(k, _)| k.as_str() != "content")
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                if extras.len() > 1 {
-                    c.push(role_kind(role), &Value::Object(extras));
-                }
+            let typed = object.get("type").and_then(Value::as_str) == Some("message");
+            let skip: &[&str] = if typed {
+                &["content", "type"]
+            } else {
+                &["content"]
+            };
+            if object
+                .keys()
+                .any(|k| k != "role" && !skip.contains(&k.as_str()))
+            {
+                c.push_without(role_kind(role), object, skip);
             }
         }
         _ => c.push(role_kind(role), message),
     }
 }
 
-fn openai_responses(body: &Value, c: &mut Collected) {
+fn openai_responses(body: &Value, c: &mut Collected<'_>) {
     c.items("tool", body.get("tools"));
-    if let Some(Value::String(text)) = body.get("instructions") {
-        c.push("system", &json!(text));
+    if let Some(text @ Value::String(_)) = body.get("instructions") {
+        c.push("system", text);
     }
     match body.get("input") {
-        Some(Value::String(text)) => c.push("user", &json!({"role": "user", "content": text})),
+        Some(text @ Value::String(_)) => c.push_pair("user", "content", text, "user"),
         Some(Value::Array(items)) => {
             for item in items {
                 match item.get("type").and_then(Value::as_str) {
@@ -261,7 +411,7 @@ fn openai_responses(body: &Value, c: &mut Collected) {
     }
 }
 
-fn chat_completions(body: &Value, c: &mut Collected) {
+fn chat_completions(body: &Value, c: &mut Collected<'_>) {
     c.items("tool", body.get("tools"));
     for message in body
         .get("messages")
@@ -273,7 +423,7 @@ fn chat_completions(body: &Value, c: &mut Collected) {
     }
 }
 
-fn gemini(body: &Value, c: &mut Collected) {
+fn gemini(body: &Value, c: &mut Collected<'_>) {
     c.items("tool", body.get("tools"));
     c.items(
         "system",
@@ -304,37 +454,45 @@ fn gemini(body: &Value, c: &mut Collected) {
             } else {
                 role_kind(role)
             };
-            c.push(kind, &json!({"role": role, "part": part}));
+            c.push_pair(kind, "part", part, role);
         }
     }
 }
 
-/// The segments of a provider-native request body, or `None` when the body is not one this wire's walker
-/// understands (not an object, or none of the arrays the wire puts a prompt in). `key` is the deployment's capture
-/// secret.
-pub fn segments(wire: WireFormat, body: &Value, key: &[u8]) -> Option<Vec<Segment>> {
-    let object = body.as_object()?;
+/// Why a body has no structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skipped {
+    /// Not a body this wire's walker understands (not an object, or none of the arrays the wire puts a prompt in).
+    Unrecognized,
+    /// Past the work budget ([`MAX_BYTES`]).
+    TooLarge,
+}
+
+/// The segments of a provider-native request body. `key` is the deployment's capture secret.
+pub fn segments(wire: WireFormat, body: &Value, key: &[u8]) -> Result<Vec<Segment>, Skipped> {
+    let object = body.as_object().ok_or(Skipped::Unrecognized)?;
     let present = match wire {
         WireFormat::AnthropicMessages | WireFormat::OpenAiChat => object.contains_key("messages"),
         WireFormat::OpenAiResponses => object.contains_key("input"),
         WireFormat::GoogleGenerateContent => object.contains_key("contents"),
     };
     if !present {
-        return None;
+        return Err(Skipped::Unrecognized);
     }
-    let mut collected = Collected { parts: Vec::new() };
+    let mut collected = Collected::new(key);
     match wire {
         WireFormat::AnthropicMessages => anthropic(body, &mut collected),
         WireFormat::OpenAiResponses => openai_responses(body, &mut collected),
         WireFormat::OpenAiChat => chat_completions(body, &mut collected),
         WireFormat::GoogleGenerateContent => gemini(body, &mut collected),
     }
-    Some(collected.finish(key))
+    collected.finish().ok_or(Skipped::TooLarge)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const KEY: &[u8] = b"a-deployment-secret-of-some-length";
 
@@ -499,14 +657,14 @@ mod tests {
 
     #[test]
     fn a_body_the_walker_does_not_understand_has_no_structure() {
-        assert!(segments(WireFormat::AnthropicMessages, &json!("text"), KEY).is_none());
-        assert!(segments(WireFormat::OpenAiChat, &json!({"prompt": "x"}), KEY).is_none());
+        assert!(segments(WireFormat::AnthropicMessages, &json!("text"), KEY).is_err());
+        assert!(segments(WireFormat::OpenAiChat, &json!({"prompt": "x"}), KEY).is_err());
         assert!(segments(
             WireFormat::GoogleGenerateContent,
             &json!({"messages": []}),
             KEY
         )
-        .is_none());
+        .is_err());
         // An empty prompt is still a prompt: no segments, but understood.
         assert_eq!(
             segments(WireFormat::OpenAiChat, &json!({"messages": []}), KEY).unwrap(),
@@ -545,5 +703,56 @@ mod tests {
             .iter()
             .all(|x| x.hash.len() == 16 && x.hash.bytes().all(|b| b.is_ascii_hexdigit())));
         assert!(s.iter().all(|x| KINDS.contains(&x.kind)));
+    }
+
+    #[test]
+    fn only_a_cache_marker_is_stripped_and_a_caller_s_own_cache_control_is_data() {
+        let body = |inner: &str| {
+            json!({"messages": [{"role": "user", "content": "hi"}], "tools": [
+            {"name": "f", "cache_control": {"type": "ephemeral"}, "input_schema": {"properties": {"cache_control": {"type": inner}}}}]})
+        };
+        let a = segments(WireFormat::AnthropicMessages, &body("string"), KEY).unwrap();
+        let b = segments(WireFormat::AnthropicMessages, &body("number"), KEY).unwrap();
+        assert_ne!(
+            a[0].hash, b[0].hash,
+            "a change deep in a tool schema must show"
+        );
+        // The marker on the tool itself does not.
+        let mut marked = body("string");
+        marked["tools"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_control");
+        assert_eq!(
+            segments(WireFormat::AnthropicMessages, &marked, KEY).unwrap(),
+            a
+        );
+    }
+
+    #[test]
+    fn a_typed_responses_message_is_its_parts_and_no_spurious_segment() {
+        let body = json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]}]});
+        assert_eq!(
+            kinds(&segments(WireFormat::OpenAiResponses, &body, KEY).unwrap()),
+            ["user", "user"]
+        );
+        // A field beside the content is still a segment of its own.
+        let named = json!({"messages": [{"role": "user", "name": "bob", "content": [{"type": "text", "text": "a"}]}]});
+        assert_eq!(
+            kinds(&segments(WireFormat::OpenAiChat, &named, KEY).unwrap()),
+            ["user", "user"]
+        );
+    }
+
+    #[test]
+    fn a_request_past_the_work_budget_has_no_structure_instead_of_costing_the_request() {
+        let big = "x".repeat((MAX_BYTES as usize) + 10);
+        let body = json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": big}}]}]});
+        assert!(segments(WireFormat::OpenAiChat, &body, KEY).is_err());
+        // Just under the budget is hashed as usual.
+        let fits = "x".repeat(1 << 20);
+        let body = json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": fits}}]}]});
+        let s = segments(WireFormat::OpenAiChat, &body, KEY).unwrap();
+        assert!(s[0].bytes > (1 << 20));
     }
 }

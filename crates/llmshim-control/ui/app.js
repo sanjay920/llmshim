@@ -410,7 +410,7 @@ function missesCard(win, m) {
       return h("tr", {}, h("td", {}, g.key), h("td", {}, g.model), h("td", { class: "num" }, fmtInt(g.pairs)),
         h("td", { class: "num" }, fmtInt(g.changed) + " (" + fmtPct(g.pairs ? (g.changed * 100) / g.pairs : 0) + ")"), h("td", {}, top ? KIND_NAMES[top[0]] || top[0] : "—"));
     }), ["l", "l", "r", "r", "l"]) : null,
-    m.truncated ? h("p", { class: "foot" }, "Covers the earliest part of the window: more captured requests exist than one answer reads.") : null);
+    m.truncated ? h("p", { class: "foot" }, "Covers only the first clients by name: more captured requests exist than one answer reads. Choose a shorter range.") : null);
   return card("Why the cache missed", "Where the cached prefix first changed between a client's consecutive requests · last " + win.label, body);
 }
 

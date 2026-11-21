@@ -325,7 +325,8 @@ pub struct Misses {
     pub total: Counts,
     /// The clients and models with the most changed prefixes, at most 20.
     pub groups: Vec<MissGroup>,
-    /// More stored lists than one aggregate reads: the answer covers the earliest of them.
+    /// More stored lists than one aggregate reads: the answer covers the first clients by name, in full, and
+    /// none of the later ones. Narrow the window.
     pub truncated: bool,
 }
 

@@ -51,8 +51,8 @@ reads them:
 A segment is `{kind, hash, bytes}`: its kind (`tool`, `system`, `user`, `assistant`, `tool_result`, `image`, `other`),
 the first 8 bytes of an **HMAC-SHA-256 of its canonical JSON**, and its size in bytes. Cache-control markers are removed
 before hashing, so moving a breakpoint does not look like a content change. Images and audio are a segment with a kind
-and a size and a hash, never their bytes. A request is capped at 2,048 segments; beyond that the tail is one segment
-`other`.
+and a size and a hash, never their bytes. A request reports at most 2,048 segments: from the 2,048th on, one `other` segment stands for the rest, so a change
+anywhere in the tail still shows.
 
 **Why a keyed hash.** A plain hash of a low-entropy segment (a system prompt a dictionary can guess, a short
 user message) can be reversed by anyone who can read the table. The HMAC key is a deployment secret (`{ env }` or
@@ -219,3 +219,21 @@ segment and a few segments on either side. Pure presentation over 5a and 5b; it 
   log keeping the structure, markers in the hash, the key ignored, the window ignored, appended read as changed).
 - **Not here.** 5b and 5c. The fleet case needs nothing new: the structure is computed on the replica that dispatches,
   from its own copy of the file, and rides the same export.
+
+### Review follow-ups (PR 303)
+
+- **Work on the request's path is bounded.** The segment fingerprints are computed while the body is walked, streamed
+  into the keyed hash with no copy of a segment, and a request past 8 MiB of canonical bytes has **no structure**
+  (`llmshim_structure_capture_total{outcome="too_large"}`) instead of costing the request time. Only a cache marker on
+  the object a provider reads it from (a tool, a system block, a content block) is removed before hashing; the same
+  name deeper in a tool's schema or a caller's own JSON is data, and a change there shows.
+- **A batch is cut by size.** The export's batches are cut at 1 MiB of JSON as well as by record count, and a body the
+  control plane calls too large (413) is **split and sent again**, not dropped; only a single record it refuses is
+  dropped. A capturing client's record can hold thousands of segments, and the 2 MiB limit must never cost another
+  client's spend rows.
+- **Known limits, kept honest.** A request is paired by client name, provider and model, so a client that holds several
+  concurrent conversations is compared with whichever came just before (an inflated change rate), two deployments
+  that both name a key `ci` interleave, and two requests in one millisecond pair in an arbitrary order. The fingerprints
+  cover the prompt, not the request's other controls (the model's thinking settings, `tool_choice`), so a miss caused by
+  one of those reads as `identical` or `appended`. The aggregate reads at most 20,000 stored lists and, past that,
+  covers the first clients by name (it says so).
