@@ -452,6 +452,157 @@ async fn a_segment_longer_than_the_limit_is_cut_and_says_so() {
     assert_eq!(one["text"].as_str().unwrap().len(), 64 * 1024);
 }
 
+#[tokio::test]
+async fn a_difference_past_the_cut_still_counts_as_a_change() {
+    let long = "x".repeat(70 * 1024);
+    let before = prompt(&format!("{long}A"), &[]);
+    let after = prompt(&format!("{long}B"), &[]);
+    let (origin, _) = gateway(vec![
+        ("rb", answer(before.clone())),
+        ("ra", answer(after.clone())),
+    ])
+    .await;
+    let app = app_with(
+        &[
+            record(
+                "q1",
+                "2026-11-19T10:00:00Z",
+                &before,
+                Some("rb"),
+                "2099-01-01T00:00:00Z",
+            ),
+            record(
+                "q2",
+                "2026-11-19T10:01:00Z",
+                &after,
+                Some("ra"),
+                "2099-01-01T00:00:00Z",
+            ),
+        ],
+        Some(gateways(&origin)),
+    );
+    let (_, _, body) = get(&app, "/v1/requests/q2/payload/diff").await;
+    // The texts sent are cut at 64 KiB and so are equal, but the segments differ and are said to.
+    assert_eq!(
+        body["window"][0]["current"]["text"],
+        body["window"][0]["previous"]["text"]
+    );
+    assert_eq!(body["window"][0]["changed"], true);
+    assert_eq!(body["window"][0]["current"]["cut"], true);
+}
+
+#[tokio::test]
+async fn an_opened_prompt_that_is_not_the_one_the_fingerprints_named_is_not_shown() {
+    let before = prompt("old system", &["a", "b"]);
+    let after = prompt("new system", &["a", "b"]);
+    // A gateway that segments differently (one segment fewer), and one whose text is not the size the fingerprint recorded.
+    let fewer = prompt("new system", &["a"]);
+    let resized = prompt("new system!", &["a", "b"]);
+    let (origin, _) = gateway(vec![
+        ("ok_before", answer(before.clone())),
+        ("fewer", answer(fewer)),
+        ("resized", answer(resized)),
+    ])
+    .await;
+    let app = app_with(
+        &[
+            record(
+                "s1",
+                "2026-11-19T10:00:00Z",
+                &before,
+                Some("ok_before"),
+                "2099-01-01T00:00:00Z",
+            ),
+            record(
+                "s2",
+                "2026-11-19T10:01:00Z",
+                &after,
+                Some("fewer"),
+                "2099-01-01T00:00:00Z",
+            ),
+            record(
+                "t1",
+                "2026-11-19T11:00:00Z",
+                &before,
+                Some("ok_before"),
+                "2099-01-01T00:00:00Z",
+            ),
+            record(
+                "t2",
+                "2026-11-19T11:01:00Z",
+                &after,
+                Some("resized"),
+                "2099-01-01T00:00:00Z",
+            ),
+        ],
+        Some(gateways(&origin)),
+    );
+    for id in ["s2", "t2"] {
+        let (status, _, body) = get(&app, &format!("/v1/requests/{id}/payload/diff")).await;
+        assert_eq!(
+            (status, body["unavailable"].as_str()),
+            (StatusCode::OK, Some("segments_do_not_match")),
+            "{id}"
+        );
+        assert!(body.get("window").is_none());
+    }
+}
+
+#[tokio::test]
+async fn a_difference_in_the_folded_tail_has_no_text_to_show_and_says_so() {
+    let before = json!([{"kind": "system", "text": "s"}, {"kind": "other", "text": null}]);
+    let after = json!([{"kind": "system", "text": "s"}, {"kind": "other", "text": null}]);
+    // Fingerprints that differ at index 1, whose text neither side has.
+    let mut r1 = record(
+        "f1",
+        "2026-11-19T10:00:00Z",
+        &json!([{"kind": "system", "text": "s"}, {"kind": "other", "text": "tail one"}]),
+        Some("a"),
+        "2099-01-01T00:00:00Z",
+    );
+    let mut r2 = record(
+        "f2",
+        "2026-11-19T10:01:00Z",
+        &json!([{"kind": "system", "text": "s"}, {"kind": "other", "text": "tail two"}]),
+        Some("b"),
+        "2099-01-01T00:00:00Z",
+    );
+    // (The folded tail's bytes are not the opened text's: it has none.)
+    r1["structure"][1]["bytes"] = json!(8);
+    r2["structure"][1]["bytes"] = json!(8);
+    let (origin, _) = gateway(vec![("a", answer(before)), ("b", answer(after))]).await;
+    let app = app_with(&[r1, r2], Some(gateways(&origin)));
+    let (status, _, body) = get(&app, "/v1/requests/f2/payload/diff").await;
+    assert_eq!(
+        (status, body["unavailable"].as_str()),
+        (StatusCode::OK, Some("segment_not_shown")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn every_answer_of_the_comparison_is_no_store_including_the_ones_with_no_text() {
+    let before = prompt("a", &["x"]);
+    let (origin, _) = gateway(vec![]).await;
+    let app = app_with(
+        &[record(
+            "z1",
+            "2026-11-19T10:00:00Z",
+            &before,
+            Some("r"),
+            "2099-01-01T00:00:00Z",
+        )],
+        Some(gateways(&origin)),
+    );
+    for uri in [
+        "/v1/requests/z1/payload/diff",
+        "/v1/requests/missing/payload/diff",
+    ] {
+        let (_, headers, _) = get(&app, uri).await;
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store", "{uri}");
+    }
+}
+
 #[test]
 fn only_an_admin_may_open_the_comparison() {
     let role = ROLES

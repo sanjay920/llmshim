@@ -461,8 +461,18 @@ async fn a_payload_is_sealed_on_the_data_plane_and_opens_only_through_the_admin_
     );
     // Opened through the admin listener, with its token, the reference gives the request and the answer back.
     let admin = server.admin.clone().unwrap();
-    let (status, body, cache) =
+    // Plain, the answer is the document and nothing is cut into segments (no work for a view that does not want it).
+    let (status, plain, _) =
         open_payload(&admin, Some(ADMIN_TOKEN), json!({"reference": reference})).await;
+    assert_eq!(status, 200, "{plain}");
+    assert!(plain["segments"].is_null(), "{plain}");
+    // Asked for, with the segments.
+    let (status, body, cache) = open_payload(
+        &admin,
+        Some(ADMIN_TOKEN),
+        json!({"reference": reference, "segments": true}),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(cache.as_deref(), Some("no-store"));
     let document = &body["payload"];
@@ -715,8 +725,12 @@ async fn a_request_cut_at_the_capture_limit_is_said_to_be_cut_and_has_no_segment
     let admin = server.admin.clone().unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let body = loop {
-        let (status, body, _) =
-            open_payload(&admin, Some(ADMIN_TOKEN), json!({"reference": reference})).await;
+        let (status, body, _) = open_payload(
+            &admin,
+            Some(ADMIN_TOKEN),
+            json!({"reference": reference, "segments": true}),
+        )
+        .await;
         if status == 200 {
             break body;
         }

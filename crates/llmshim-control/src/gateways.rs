@@ -243,7 +243,7 @@ impl Gateways {
     /// (the store and the key are shared); with a local store only the one that wrote it can, and the others say
     /// not found. The reference is only handed on, never read, and nothing a gateway says is repeated but the
     /// document.
-    pub async fn open_payload(&self, reference: &str) -> Result<Value, OpenError> {
+    pub async fn open_payload(&self, reference: &str, segments: bool) -> Result<Value, OpenError> {
         if self.targets.is_empty() {
             return Err(OpenError::NotConfigured);
         }
@@ -266,7 +266,7 @@ impl Gateways {
                     };
                     let mut request = client
                         .post(format!("{origin}/v1/serve/payload/open"))
-                        .json(&json!({"reference": reference}));
+                        .json(&json!({"reference": reference, "segments": segments}));
                     if let Some(token) = &token {
                         request = request.bearer_auth(token);
                     }

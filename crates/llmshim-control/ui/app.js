@@ -618,28 +618,37 @@ function contentDiff(r) {
   return h("div", { class: "stack" }, note, h("div", {}, button), shown);
 }
 
-// A segment's canonical JSON as the text a person would read: the role and its words when that is what it is.
+// A segment's canonical JSON as the text a person would read: the role and its words when that is all it holds, and the whole
+// of it as indented JSON otherwise, so a field that differs is never hidden.
 function humanize(text) {
   if (text === null || text === undefined) return "";
   let value;
   try { value = JSON.parse(text); } catch (_) { return String(text); }
   if (typeof value === "string") return value;
-  if (value && typeof value === "object") {
-    const inner = value.content ?? value.block ?? value.part;
-    const words = typeof inner === "string" ? inner : inner && typeof inner.text === "string" ? inner.text : null;
-    if (words !== null && typeof value.role === "string") return value.role + ": " + words;
-    if (typeof value.text === "string" && Object.keys(value).length === 1) return value.text;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const keys = Object.keys(value).sort().join(",");
+    if (typeof value.role === "string") {
+      if ((keys === "content,role") && typeof value.content === "string") return value.role + ": " + value.content;
+      for (const field of ["block", "part"]) {
+        const inner = value[field];
+        if (keys === field + ",role" && inner && typeof inner === "object" && typeof inner.text === "string" && Object.keys(inner).sort().join(",") === "text,type") return value.role + ": " + inner.text;
+      }
+    }
   }
   return JSON.stringify(value, null, 2);
 }
 
-// The text with the part that differs from `other` marked: what the two share at the start and at the end is left alone.
+// The text with the part that differs from `other` marked: what the two share at the start and at the end is left alone, and a
+// character made of two code units is never split between the marked part and the rest.
 function markedText(text, other) {
+  const high = (c) => c >= 0xd800 && c <= 0xdbff, low = (c) => c >= 0xdc00 && c <= 0xdfff;
   let head = 0;
   const max = Math.min(text.length, other.length);
   while (head < max && text[head] === other[head]) head += 1;
+  if (head > 0 && high(text.charCodeAt(head - 1))) head -= 1;
   let tail = 0;
   while (tail < max - head && text[text.length - 1 - tail] === other[other.length - 1 - tail]) tail += 1;
+  if (tail > 0 && low(text.charCodeAt(text.length - tail))) tail -= 1;
   const middle = text.slice(head, text.length - tail);
   return [text.slice(0, head), middle ? h("mark", {}, middle) : "", text.slice(text.length - tail)];
 }
@@ -647,7 +656,10 @@ function markedText(text, other) {
 function diffParts(answer) {
   if (answer.unavailable === "payload_not_captured_or_expired") return [h("p", { class: "muted" }, "One of the two requests has no captured payload, or it has expired, so there is nothing to compare. Fingerprints above still say where the prompt changed.")];
   if (answer.unavailable === "request_cut") return [h("p", { class: "muted" }, "One of the two requests was cut at the capture limit, so it cannot be cut into segments. Raise max_payload_bytes for this client to compare long prompts.")];
-  if (!answer.window) return [h("p", { class: "muted" }, "Nothing changed earlier than the prompt grew, so there is nothing to compare.")];
+  if (answer.unavailable === "segments_do_not_match") return [h("p", { class: "muted" }, "The captured prompts do not match the fingerprints they were captured with (a gateway that segments differently, or a reference to another request), so they are not shown as if they did.")];
+  if (answer.unavailable === "segment_not_shown") return [h("p", { class: "muted" }, "The first difference is in a part of a very long prompt that is not kept as text (past its 2,048th segment).")];
+  if (answer.unavailable) return [h("p", { class: "muted" }, "The comparison is not available.")];
+  if (!answer.window || !answer.window.length) return [h("p", { class: "muted" }, "Nothing changed earlier than the prompt grew, so there is nothing to compare.")];
   const first = answer.first_change;
   return answer.window.map((item) => {
     const before = humanize(item.previous && item.previous.text), now = humanize(item.current && item.current.text);

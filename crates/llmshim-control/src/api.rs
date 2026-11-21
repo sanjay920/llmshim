@@ -973,7 +973,7 @@ async fn request_payload(
             "payloads are opened through the gateways' admin listeners: start the control plane with --gateways-file",
         ));
     };
-    match gateways.open_payload(&reference).await {
+    match gateways.open_payload(&reference, false).await {
         Ok(opened) => Ok(no_store(Json(
             json!({"attempt_id": attempt, "payload": opened["payload"]}),
         ))),
@@ -1041,6 +1041,32 @@ fn diff_segment(segment: Option<&Value>) -> Value {
 /// anything is fetched, gateways that open the references, `no-store`, and nothing kept. A request that only grew,
 /// repeated or shortened its prompt opens nothing and records nothing: there is nothing to show.
 async fn request_payload_diff(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    principal: Option<axum::Extension<Principal>>,
+    path: Path<String>,
+) -> ApiResult<Response> {
+    // Every answer of this route is kept by nothing between here and the viewer, whatever it holds.
+    Ok(match payload_diff(state, headers, principal, path).await {
+        Ok(response) => no_store(response),
+        Err(error) => no_store(error),
+    })
+}
+
+/// Whether an opened prompt is the one the fingerprints named: the same number of segments, the same kinds, and a
+/// text of the size each fingerprint recorded (the folded tail has no text). A gateway whose walker has since changed,
+/// or a reference to another document, is not shown as if it were this prompt.
+fn matches_stored(opened: &[Value], stored: &[crate::structure::Segment]) -> bool {
+    opened.len() == stored.len()
+        && opened.iter().zip(stored).all(|(one, segment)| {
+            one["kind"] == segment.kind
+                && one["text"]
+                    .as_str()
+                    .is_none_or(|text| text.len() as u64 == segment.bytes)
+        })
+}
+
+async fn payload_diff(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     principal: Option<axum::Extension<Principal>>,
@@ -1113,8 +1139,8 @@ async fn request_payload_diff(
         ));
     };
     let (now_open, before_open) = tokio::join!(
-        gateways.open_payload(&current_ref),
-        gateways.open_payload(&previous_ref)
+        gateways.open_payload(&current_ref, true),
+        gateways.open_payload(&previous_ref, true)
     );
     let (now_open, before_open) = (
         now_open.map_err(open_error)?,
@@ -1130,6 +1156,24 @@ async fn request_payload_diff(
         answer["unavailable"] = json!("request_cut");
         return Ok(no_store(Json(answer)));
     };
+    // The opened prompts must be the ones the fingerprints compared, and the segment where they differ must have text.
+    if !matches_stored(now_segments, &current.segments)
+        || !matches_stored(before_segments, &previous.segments)
+    {
+        let mut answer = base;
+        answer["unavailable"] = json!("segments_do_not_match");
+        return Ok(no_store(Json(answer)));
+    }
+    let has_text = |segments: &[Value]| {
+        segments
+            .get(first.index)
+            .is_some_and(|s| s["text"].is_string())
+    };
+    if !has_text(now_segments) || !has_text(before_segments) {
+        let mut answer = base;
+        answer["unavailable"] = json!("segment_not_shown");
+        return Ok(no_store(Json(answer)));
+    }
     // The segments around the first difference, from both: the context that makes a changed line readable.
     let from = first.index.saturating_sub(2);
     let to = (first.index + 2).min(
@@ -1140,9 +1184,14 @@ async fn request_payload_diff(
     );
     let window: Vec<Value> = (from..=to)
         .map(|index| {
-            let (now_one, before_one) = (diff_segment(now_segments.get(index)), diff_segment(before_segments.get(index)));
-            json!({"index": index, "changed": now_one["text"] != before_one["text"] || now_one["kind"] != before_one["kind"],
-                "current": now_one, "previous": before_one})
+            let (now_one, before_one) = (
+                diff_segment(now_segments.get(index)),
+                diff_segment(before_segments.get(index)),
+            );
+            // Decided on the whole texts: two segments that first differ past the limit a text is cut at still differ.
+            let changed = now_segments.get(index).map(|s| (&s["kind"], &s["text"]))
+                != before_segments.get(index).map(|s| (&s["kind"], &s["text"]));
+            json!({"index": index, "changed": changed, "current": now_one, "previous": before_one})
         })
         .collect();
     let mut answer = base;

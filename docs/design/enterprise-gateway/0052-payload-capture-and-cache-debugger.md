@@ -338,3 +338,17 @@ segment and a few segments on either side. Pure presentation over 5a and 5b; it 
   Mutation-checked: only one view recorded, the text not cut.
 - **Not here.** A word-level diff inside a segment beyond the shared start and end, and comparison with a request other than the
   one just before it.
+
+### Review follow-ups (PR 305)
+
+- **The diff shows only the prompt the fingerprints named.** The opened segments must have the same number of segments, the same
+  kinds, and texts of the sizes the stored fingerprints recorded; otherwise (a gateway whose walker has changed, a reference to
+  another document) the answer is `unavailable: segments_do_not_match`. A first difference that falls in the folded tail, which
+  has no text, is `segment_not_shown`.
+- **`changed` is decided on the whole texts**, not the cut ones: two segments that first differ past 64 KiB still show as
+  changed (with `cut`).
+- **Every answer of the comparison is `no-store`**, errors and the ones with no text included.
+- **The open answer carries segments only when asked** (`"segments": true`): a plain payload view does no segmentation.
+- **The page shows every field that differs.** A segment is shown as `role: words` only when that is all it holds, and as the
+  whole indented JSON otherwise; the marking never splits a character made of two code units; an empty window and the
+  unavailable reasons each have their own sentence.
