@@ -134,6 +134,27 @@ impl Drop for PgClient {
     }
 }
 
+/// How long one SQLite transaction may run (Postgres: `statement_timeout`, 30 s).
+const SQLITE_STATEMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(not(test))]
+fn statement_budget() -> std::time::Duration {
+    SQLITE_STATEMENT_BUDGET
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own, shorter budget; the transaction runs on the calling thread.
+    pub(crate) static TEST_BUDGET: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn statement_budget() -> std::time::Duration {
+    TEST_BUDGET
+        .with(|b| b.get())
+        .unwrap_or(SQLITE_STATEMENT_BUDGET)
+}
+
 pub(crate) enum Backend {
     Sqlite(rusqlite::Connection),
     Postgres(PgClient),
@@ -163,16 +184,25 @@ impl Backend {
                 } else {
                     rusqlite::TransactionBehavior::Deferred
                 };
-                let tx = connection
-                    .transaction_with_behavior(behavior)
-                    .map_err(database)?;
-                let result = work(&mut SqliteExec(&tx));
+                // The same bound Postgres has as `statement_timeout`: a transaction running past it is interrupted
+                // (SQLite checks the handler every thousand virtual-machine steps), so one slow query cannot hold the
+                // connection, and with it every request, for ever.
+                let deadline = std::time::Instant::now() + statement_budget();
+                connection
+                    .progress_handler(1000, Some(move || std::time::Instant::now() > deadline));
+                // Caught, so the handler is cleared even if `work` panics, and then the panic goes on.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let tx = connection
+                        .transaction_with_behavior(behavior)
+                        .map_err(sqlite_error)?;
+                    let value = work(&mut SqliteExec(&tx))?;
+                    tx.commit().map_err(sqlite_error)?;
+                    Ok(value)
+                }));
+                connection.progress_handler(1000, None::<fn() -> bool>);
                 match result {
-                    Ok(value) => {
-                        tx.commit().map_err(database)?;
-                        Ok(value)
-                    }
-                    Err(error) => Err(error),
+                    Ok(result) => result,
+                    Err(panic) => std::panic::resume_unwind(panic),
                 }
             }
             Backend::Postgres(client) => {
@@ -232,6 +262,11 @@ fn sqlite_error(error: rusqlite::Error) -> Error {
                 || failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
         {
             Error::Conflict("a uniqueness rule was violated".into())
+        }
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            Error::Timeout
         }
         other => database(other),
     }
@@ -462,6 +497,59 @@ mod tests {
             pg_sql("INSERT INTO t (a, b) VALUES (?1, ?10) WHERE x = 'a?b' AND y = ?2"),
             "INSERT INTO t (a, b) VALUES ($1, $10) WHERE x = 'a?b' AND y = $2"
         );
+    }
+
+    #[test]
+    fn a_sqlite_transaction_past_its_budget_is_a_timeout_and_the_next_one_is_not_cut() {
+        let mut backend = Backend::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        TEST_BUDGET.with(|b| b.set(Some(std::time::Duration::from_millis(100))));
+        // An unbounded recursive query: only the budget can end it, through the production arm.
+        let error = backend
+            .transaction(false, |tx| {
+                tx.query(
+                    "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT count(*) FROM n",
+                    &[],
+                )
+            })
+            .unwrap_err();
+        assert!(matches!(error, Error::Timeout), "{error:?}");
+        // The handler was cleared: a statement outside any transaction is not interrupted by the spent deadline.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let Backend::Sqlite(connection) = &backend else {
+            unreachable!()
+        };
+        let one: i64 = connection
+            .query_row(
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 200000) SELECT count(*) FROM n",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(one, 200_000);
+        TEST_BUDGET.with(|b| b.set(None));
+    }
+
+    #[test]
+    fn the_handler_is_cleared_when_the_work_panics() {
+        let mut backend = Backend::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        TEST_BUDGET.with(|b| b.set(Some(std::time::Duration::from_millis(50))));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = backend.transaction(false, |_| -> Result<()> { panic!("boom") });
+        }));
+        assert!(panicked.is_err());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let Backend::Sqlite(connection) = &backend else {
+            unreachable!()
+        };
+        let n: i64 = connection
+            .query_row(
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 200000) SELECT count(*) FROM n",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 200_000);
+        TEST_BUDGET.with(|b| b.set(None));
     }
 
     #[test]

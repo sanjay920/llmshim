@@ -36,6 +36,9 @@ pub enum Error {
     Database(String),
     #[error("snapshot error: {0}")]
     Snapshot(String),
+    /// The statement budget ran out and the work was interrupted: nothing was written.
+    #[error("the database statement ran past its time budget")]
+    Timeout,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -612,7 +615,7 @@ impl Store {
         match &mut backend {
             Backend::Sqlite(connection) => {
                 connection
-                    .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+                    .execute_batch("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
                     .map_err(|e| Error::Database(e.to_string()))?;
                 let version: i64 = connection
                     .query_row("PRAGMA user_version", [], |row| row.get(0))
