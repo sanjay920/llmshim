@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const PLAIN_KEY: &str = "plain-key-0123456789abcdefghij";
-const CAPTURE_SECRET: &str = "capture-secret-0123456789-abcdefghijklmnop";
+const CAPTURE_SECRET: &str = "Y2FwdHVyZS1zZWNyZXQtMDEyMzQ1Njc4OS1hYmNkZWY";
 const EXPORT_TOKEN: &str = "export-token-0123456789abcdefghij";
 const SECRET_PROMPT: &str = "SECRET-PROMPT-TEXT-launch-codes";
 
@@ -319,7 +319,7 @@ fn the_configuration_refuses_capture_it_cannot_honour_before_serving() {
 
 // ---- payload capture (note 0052, slice 5b) ------------------------------------------------------
 
-const PAYLOAD_SECRET: &str = "payload-secret-0123456789-abcdefghijklmnopqrs";
+const PAYLOAD_SECRET: &str = "cGF5bG9hZC1zZWNyZXQtMDEyMzQ1Njc4OS1hYmNkZWY";
 
 fn payload_env() -> Vec<(&'static str, &'static str)> {
     let mut all = env().to_vec();
@@ -636,6 +636,39 @@ fn payload_capture_is_refused_before_serving_when_it_cannot_be_honoured() {
     );
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("capture.ttl_secs"), "{stderr}");
+    // `payload_key` alone (no client captures a payload now) still opens a route on the admin listener, so the
+    // listener must have a token whether or not a client uses it at this moment.
+    let (code, stderr) = run(
+        "key-no-token",
+        &|c| {
+            c.replace("capture = \"payload\"", "capture = \"structure\"")
+                .replace(
+                    "token = { env = \"SERVE_E2E_ADMIN_TOKEN\" }",
+                    "allow_unauthenticated = true",
+                )
+        },
+        &payload_env(),
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("capture.payload_key") && stderr.contains("token"),
+        "{stderr}"
+    );
+    // A secret a person could remember is refused by name: it must be random bytes in base64.
+    let mut phrase = payload_env();
+    phrase.retain(|(n, _)| *n != "SERVE_E2E_PAYLOAD_KEY");
+    phrase.push((
+        "SERVE_E2E_PAYLOAD_KEY",
+        "a-human-memorable-passphrase-of-some-length",
+    ));
+    let (code, stderr) = run("phrase-key", &|c| c, &phrase);
+    assert_ne!(code, Some(0), "{stderr}");
+    assert!(
+        stderr.contains("capture.payload_key")
+            && stderr.contains("base64")
+            && !stderr.contains("memorable"),
+        "{stderr}"
+    );
     // A short secret is refused by name and never printed.
     let mut short = payload_env();
     short.retain(|(n, _)| *n != "SERVE_E2E_PAYLOAD_KEY");

@@ -397,14 +397,11 @@ pub async fn build_app(
         .map(|capture| -> Result<_, (&'static str, String)> {
             let key = super::config::read_secret(&capture.hmac_key, env)
                 .map_err(|m| ("capture.hmac_key", m))?;
-            if key.len() < 32 {
-                return Err((
-                    "capture.hmac_key",
-                    "must be at least 32 characters".to_owned(),
-                ));
-            }
+            // At least 32 random bytes, base64 encoded: a key a person could remember would let whoever holds the
+            // control plane's data test guesses against it.
+            let key = super::blobstore::secret_bytes(&key).map_err(|m| ("capture.hmac_key", m))?;
             let structure = crate::gateway::usage::StructureCapture::new(
-                key.into_bytes(),
+                key,
                 super::keys::key_capture(config, env),
             );
             // Payload capture (note 0052, slice 5b) only where the file asks for it: the wrapping secret, the
@@ -414,12 +411,8 @@ pub async fn build_app(
             };
             let secret =
                 super::config::read_secret(secret, env).map_err(|m| ("capture.payload_key", m))?;
-            if secret.len() < 32 {
-                return Err((
-                    "capture.payload_key",
-                    "must be at least 32 characters".to_owned(),
-                ));
-            }
+            let secret =
+                super::blobstore::secret_bytes(&secret).map_err(|m| ("capture.payload_key", m))?;
             let ttl = std::time::Duration::from_secs(capture.ttl_secs.unwrap_or(86_400));
             let store = super::payload::PayloadStore::new(media.clone(), &secret, ttl);
             payload_store = Some(store.clone());
@@ -450,7 +443,7 @@ pub async fn build_app(
                 u64::from(byte[0]) % super::blobstore::SWEEP_FIRST_MAX_SECS,
             )
         };
-        super::blobstore::spawn_payload_sweeper(store.store(), store.ttl(), first);
+        super::blobstore::spawn_payload_sweeper(store.object_store(), store.ttl(), first);
     }
     // Attempt spans ride the usage recorder, so it exists when either is wanted.
     let usage = if usage_log.is_some() || telemetry.is_some() || usage_exporter.is_some() {

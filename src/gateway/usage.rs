@@ -161,7 +161,13 @@ impl Capped {
 }
 
 impl std::io::Write for Capped {
+    /// Past the cap the write is refused, which stops the serializer feeding it: a huge body costs the time of its
+    /// first `max` bytes, not of all of them. The size reported is then the cap and more, never the true size.
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.text.len() >= self.max {
+            self.seen += 1;
+            return Err(std::io::Error::other("capped"));
+        }
         self.push(bytes);
         Ok(bytes.len())
     }
@@ -282,7 +288,8 @@ impl StructureCapture {
             return None;
         }
         let mut request = Capped::new(payload.max_bytes);
-        // A body is written into the bounded copy as it is serialized, so a huge one costs no more than its cap.
+        // A body is written into the bounded copy as it is serialized, and the serializer is stopped when the copy is
+        // full: a huge body costs the time of its first `max_bytes`, and its memory is the cap.
         let _ = serde_json::to_writer(&mut request, body);
         Some(PendingPayload {
             wire,
@@ -632,6 +639,15 @@ impl UsageRecorder {
     /// One frame of the attempt's answer as the provider sent it, for a client that captures payloads: a stream's
     /// events are kept in arrival order up to the cap, a non-streaming body as it is.
     pub(crate) fn observe_native(&self, id: uuid::Uuid, frame: crate::policy::NativeFrame<'_>) {
+        // Every frame of every stream comes through here: with payload capture off there is nothing to keep, and the
+        // lock is not taken.
+        if !self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.payload.is_some())
+        {
+            return;
+        }
         let Ok(mut attempts) = self.open.lock() else {
             return;
         };

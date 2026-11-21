@@ -437,6 +437,10 @@ impl BlobStore for GcsStore {
     }
 
     async fn list(&self) -> Result<Vec<Listed>, BlobError> {
+        self.list_under("").await
+    }
+
+    async fn list_under(&self, sub: &str) -> Result<Vec<Listed>, BlobError> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         for _ in 0..10_000 {
@@ -444,7 +448,7 @@ impl BlobStore for GcsStore {
                 "{}/storage/v1/b/{}/o?prefix={}&maxResults=1000&fields={}",
                 self.api,
                 encode(&self.bucket, false),
-                encode(&self.prefix, false),
+                encode(&format!("{}{}", self.prefix, sub), false),
                 encode("items(name,updated),nextPageToken", false)
             );
             if let Some(token) = &token {

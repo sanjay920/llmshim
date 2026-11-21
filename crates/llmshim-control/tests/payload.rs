@@ -161,7 +161,11 @@ async fn an_admin_reads_a_payload_through_a_gateway_and_the_view_is_recorded() {
     let seen = views(&app).await;
     assert_eq!(seen.len(), 1, "{seen:?}");
     assert_eq!(seen[0]["subject"], "a1");
-    assert_eq!(seen[0]["detail"], json!({"attempt_id": "a1"}));
+    // The record says how far its "who" can be trusted: here a label given with the one shared token.
+    assert_eq!(
+        seen[0]["detail"],
+        json!({"attempt_id": "a1", "via": "shared_token"})
+    );
     // With the one shared token the actor is the label the caller gave; under single sign-on it is the verified
     // subject (note 0049), which the history rows of every other write already use.
     assert_eq!(seen[0]["actor"], "operator@example.test");

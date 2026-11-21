@@ -246,6 +246,16 @@ pub trait BlobStore: Send + Sync {
     async fn delete(&self, name: &str) -> Result<(), BlobError>;
     /// Every object under the store's prefix, for the sweeper.
     async fn list(&self) -> Result<Vec<Listed>, BlobError>;
+    /// The objects whose names (below the store's prefix) start with `sub`. A backend lists only that much; the
+    /// default lists everything and filters, which is for a store small enough not to matter.
+    async fn list_under(&self, sub: &str) -> Result<Vec<Listed>, BlobError> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|listed| listed.key.starts_with(sub))
+            .collect())
+    }
     /// The most one object may hold (plaintext).
     fn max_object_bytes(&self) -> usize;
 }
@@ -423,12 +433,12 @@ pub async fn get_sealed(store: &dyn BlobStore, reference: &BlobRef) -> Result<St
 pub struct WrapKey([u8; 32]);
 
 impl WrapKey {
-    /// Derive the wrapping key from a secret (at least 32 characters).
-    pub fn derive(secret: &str) -> Self {
+    /// Derive the wrapping key from the secret's random bytes (at least 32: see [`secret_bytes`]).
+    pub fn derive(secret: &[u8]) -> Self {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"llmshim capture payload wrapping key v1\0");
-        hash.update(secret.as_bytes());
+        hash.update(secret);
         Self(hash.finalize().into())
     }
 
@@ -443,6 +453,28 @@ impl std::fmt::Debug for WrapKey {
     }
 }
 
+/// The bytes of a capture secret: it must be **at least 32 random bytes, base64 encoded** (`openssl rand -base64
+/// 32`). A reference held by the control plane is an offline test of a guessed key, so a key a person could
+/// remember is not allowed: the format is what makes a guess hopeless.
+pub fn secret_bytes(text: &str) -> Result<Vec<u8>, String> {
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+    let trimmed = text.trim_end_matches('=');
+    let bytes = STANDARD_NO_PAD
+        .decode(trimmed)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(trimmed))
+        .map_err(|_| {
+            "must be base64 text of at least 32 random bytes (for example `openssl rand -base64 32`)"
+                .to_owned()
+        })?;
+    if bytes.len() < 32 {
+        return Err(
+            "must hold at least 32 random bytes, base64 encoded (for example `openssl rand -base64 32`)"
+                .to_owned(),
+        );
+    }
+    Ok(bytes)
+}
+
 /// A sealed payload, ready to put: the object's name, its ciphertext, and the opaque reference that opens it.
 pub struct SealedPayload {
     pub name: String,
@@ -450,9 +482,19 @@ pub struct SealedPayload {
     pub reference: String,
 }
 
+/// What binds a wrapped key to its object and its expiry: changing either in a reference makes it not unwrap.
+fn wrap_aad(name: &str, expires_ms: i64) -> Vec<u8> {
+    format!("{name}\0{expires_ms}").into_bytes()
+}
+
 /// Seal `plaintext` under a fresh per-object key and wrap that key under `wrap`. The reference carries the object's
 /// name, its length, its nonce and the wrapped key: with `wrap` it opens the object, without it it opens nothing.
-pub fn seal_payload(prefix: &str, plaintext: &[u8], wrap: &WrapKey) -> SealedPayload {
+pub fn seal_payload(
+    prefix: &str,
+    plaintext: &[u8],
+    wrap: &WrapKey,
+    expires_ms: i64,
+) -> SealedPayload {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let name = new_name(prefix);
     let sealed = seal(&name, plaintext);
@@ -463,14 +505,14 @@ pub fn seal_payload(prefix: &str, plaintext: &[u8], wrap: &WrapKey) -> SealedPay
     wrap.key()
         .seal_in_place_append_tag(
             Nonce::assume_unique_for_key(wrap_nonce),
-            Aad::from(name.as_bytes()),
+            Aad::from(wrap_aad(&name, expires_ms)),
             &mut wrapped,
         )
         .expect("wrapping a key");
     let mut blob = wrap_nonce.to_vec();
     blob.extend_from_slice(&wrapped);
     let reference = URL_SAFE_NO_PAD.encode(
-        json!({"v": 1, "n": name, "l": plaintext.len(), "w": STANDARD.encode(&blob), "x": STANDARD.encode(sealed.nonce)})
+        json!({"v": 1, "n": name, "l": plaintext.len(), "e": expires_ms, "w": STANDARD.encode(&blob), "x": STANDARD.encode(sealed.nonce)})
             .to_string(),
     );
     SealedPayload {
@@ -512,6 +554,9 @@ pub async fn open_payload(
         .and_then(Value::as_u64)
         .and_then(|n| usize::try_from(n).ok())
         .ok_or(BlobError::Invalid)?;
+    let expires_ms = field("e")
+        .and_then(Value::as_i64)
+        .ok_or(BlobError::Invalid)?;
     let blob = STANDARD
         .decode(
             field("w")
@@ -535,12 +580,17 @@ pub async fn open_payload(
         .key()
         .open_in_place(
             Nonce::assume_unique_for_key(wrap_nonce.try_into().map_err(|_| BlobError::Invalid)?),
-            Aad::from(name.as_bytes()),
+            Aad::from(wrap_aad(name, expires_ms)),
             &mut key,
         )
         .map_err(|_| BlobError::Corrupt)?
         .len();
     key.truncate(key_len);
+    // Past its retention a payload is gone, whether or not the sweeper has deleted the object yet. The expiry is
+    // bound into the wrapped key, so it cannot be moved by editing the reference.
+    if expires_ms < chrono::Utc::now().timestamp_millis() {
+        return Err(BlobError::NotFound);
+    }
     let ciphertext = store.get(name, len + TAG_BYTES).await?;
     let plaintext = open(name, ciphertext, &key, &nonce)?;
     if plaintext.len() != len {
@@ -553,20 +603,29 @@ pub async fn open_payload(
 /// touches `<date>/<hex>`): payloads have their own retention and their own sweeper.
 pub const PAYLOAD_PREFIX: &str = "capture/";
 
-/// Delete captured payloads older than `ttl`; how many went. Anything else in the store is left alone.
-pub async fn sweep_payloads(store: &dyn BlobStore, ttl: Duration) -> Result<usize, BlobError> {
+/// Delete captured payloads older than `ttl`; how many went, and the first error if any delete failed. One entry that
+/// cannot be deleted does not stop the rest from being: retention must not depend on the worst object in the store.
+/// Only `capture/` is listed, so a store with millions of other objects costs nothing here, and anything else in the
+/// store is left alone.
+pub async fn sweep_payloads(store: &dyn BlobStore, ttl: Duration) -> (usize, Option<BlobError>) {
     let now = SystemTime::now();
-    let mut deleted = 0;
-    for listed in store.list().await? {
+    let listed = match store.list_under(PAYLOAD_PREFIX).await {
+        Ok(listed) => listed,
+        Err(error) => return (0, Some(error)),
+    };
+    let (mut deleted, mut first_error) = (0, None);
+    for listed in listed {
         let old = now
             .duration_since(listed.modified)
             .is_ok_and(|age| age > ttl);
         if old && listed.key.starts_with(PAYLOAD_PREFIX) && valid_name(&listed.key) {
-            store.delete(&listed.key).await?;
-            deleted += 1;
+            match store.delete(&listed.key).await {
+                Ok(()) => deleted += 1,
+                Err(error) => first_error = first_error.or(Some(error)),
+            }
         }
     }
-    Ok(deleted)
+    (deleted, first_error)
 }
 
 /// Sweep captured payloads every [`SWEEP_EVERY`] for as long as the process runs.
@@ -579,7 +638,7 @@ pub fn spawn_payload_sweeper(
     Some(runtime.spawn(async move {
         tokio::time::sleep(first).await;
         loop {
-            if let Err(error) = sweep_payloads(store.as_ref(), ttl).await {
+            if let (_, Some(error)) = sweep_payloads(store.as_ref(), ttl).await {
                 crate::gateway::metrics::incr(
                     crate::gateway::metrics::MEDIA_STORE,
                     &[("op", "sweep_payloads"), ("outcome", error.as_str())],
@@ -882,6 +941,8 @@ pub(crate) mod tests {
         pub objects: Mutex<BTreeMap<String, (Vec<u8>, SystemTime)>>,
         pub fail_puts_after: Mutex<Option<usize>>,
         pub deleted: Mutex<Vec<String>>,
+        /// Names whose deletion fails (a store that refuses one key).
+        pub undeletable: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -908,6 +969,9 @@ pub(crate) mod tests {
                 .ok_or(BlobError::TooLarge)
         }
         async fn delete(&self, name: &str) -> Result<(), BlobError> {
+            if self.undeletable.lock().unwrap().iter().any(|n| n == name) {
+                return Err(BlobError::Denied);
+            }
             self.deleted.lock().unwrap().push(name.to_owned());
             self.objects.lock().unwrap().remove(name);
             Ok(())
@@ -929,11 +993,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// An expiry far enough away that no test reaches it.
+    const FAR: i64 = 4_102_444_800_000;
+
     #[tokio::test]
     async fn a_payload_opens_with_its_reference_and_the_key_and_with_nothing_else() {
         let store = Memory::default();
-        let wrap = WrapKey::derive("a-capture-secret-of-at-least-32-characters");
-        let sealed = seal_payload(PAYLOAD_PREFIX, b"the launch codes are 12345", &wrap);
+        let wrap = WrapKey::derive(&[1u8; 32]);
+        let sealed = seal_payload(PAYLOAD_PREFIX, b"the launch codes are 12345", &wrap, FAR);
         assert!(sealed.name.starts_with("capture/") && valid_name(&sealed.name));
         store
             .put(&sealed.name, sealed.ciphertext.clone())
@@ -958,7 +1025,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(opened, b"the launch codes are 12345");
         // Another deployment's key opens nothing, even with the object and the reference in hand.
-        let other = WrapKey::derive("another-capture-secret-of-32-or-more-characters");
+        let other = WrapKey::derive(&[2u8; 32]);
         assert_eq!(
             open_payload(&store, &sealed.reference, &other, 1 << 20)
                 .await
@@ -972,7 +1039,7 @@ pub(crate) mod tests {
         };
         assert!(!decoded.contains("launch codes"));
         // Two payloads of the same text have different names, keys and references.
-        let again = seal_payload(PAYLOAD_PREFIX, b"the launch codes are 12345", &wrap);
+        let again = seal_payload(PAYLOAD_PREFIX, b"the launch codes are 12345", &wrap, FAR);
         assert_ne!(
             (&again.name, &again.reference, &again.ciphertext),
             (&sealed.name, &sealed.reference, &sealed.ciphertext)
@@ -983,8 +1050,8 @@ pub(crate) mod tests {
     async fn a_reference_that_is_altered_or_names_another_object_is_refused() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let store = Memory::default();
-        let wrap = WrapKey::derive("a-capture-secret-of-at-least-32-characters");
-        let sealed = seal_payload(PAYLOAD_PREFIX, b"payload", &wrap);
+        let wrap = WrapKey::derive(&[1u8; 32]);
+        let sealed = seal_payload(PAYLOAD_PREFIX, b"payload", &wrap, FAR);
         store
             .put(&sealed.name, sealed.ciphertext.clone())
             .await
@@ -1013,6 +1080,17 @@ pub(crate) mod tests {
                 edit(&|v| v["l"] = serde_json::json!(5000)),
             ),
             ("a version", edit(&|v| v["v"] = serde_json::json!(2))),
+            // The expiry is bound into the wrapped key: moving it later does not unwrap.
+            (
+                "a later expiry",
+                edit(&|v| v["e"] = serde_json::json!(FAR + 1)),
+            ),
+            (
+                "no expiry",
+                edit(&|v| {
+                    v.as_object_mut().unwrap().remove("e");
+                }),
+            ),
             ("not base64", "!!!".to_owned()),
             ("not json", URL_SAFE_NO_PAD.encode("hello")),
             ("too long", "a".repeat(3000)),
@@ -1038,6 +1116,18 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err(),
             BlobError::Corrupt
+        );
+        // A reference past its expiry is gone, though the object is still in the store.
+        let lapsed = seal_payload(PAYLOAD_PREFIX, b"old", &wrap, 1_000);
+        store
+            .put(&lapsed.name, lapsed.ciphertext.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            open_payload(&store, &lapsed.reference, &wrap, 1 << 20)
+                .await
+                .unwrap_err(),
+            BlobError::NotFound
         );
         store.delete(&sealed.name).await.unwrap();
         assert_eq!(
@@ -1070,10 +1160,8 @@ pub(crate) mod tests {
         // Media objects and anything foreign belong to the other sweeper or to nobody.
         put("20260101/cccccccccccccccccccccccccccccccc", long_ago);
         put("something-else", long_ago);
-        let swept = sweep_payloads(&store, Duration::from_secs(86_400))
-            .await
-            .unwrap();
-        assert_eq!(swept, 1);
+        let (swept, failed) = sweep_payloads(&store, Duration::from_secs(86_400)).await;
+        assert_eq!((swept, failed), (1, None));
         let left: Vec<String> = store.objects.lock().unwrap().keys().cloned().collect();
         assert_eq!(
             left,
@@ -1083,6 +1171,34 @@ pub(crate) mod tests {
                 "something-else"
             ]
         );
+        // One object that cannot be deleted does not stop the rest: retention does not depend on the worst object.
+        put(
+            "capture/20260103/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            long_ago,
+        );
+        put(
+            "capture/20260104/ffffffffffffffffffffffffffffffff",
+            long_ago,
+        );
+        put(
+            "capture/20260105/00000000000000000000000000000000",
+            long_ago,
+        );
+        store
+            .undeletable
+            .lock()
+            .unwrap()
+            .push("capture/20260104/ffffffffffffffffffffffffffffffff".to_owned());
+        let (swept, failed) = sweep_payloads(&store, Duration::from_secs(86_400)).await;
+        assert_eq!((swept, failed), (2, Some(BlobError::Denied)));
+        let left: Vec<String> = store.objects.lock().unwrap().keys().cloned().collect();
+        assert!(left.contains(&"capture/20260104/ffffffffffffffffffffffffffffffff".to_owned()));
+        assert!(!left
+            .iter()
+            .any(|n| n.contains("20260103") || n.contains("20260105")));
+        // Only the payload names are asked for, not the whole store.
+        let listed = store.list_under(PAYLOAD_PREFIX).await.unwrap();
+        assert!(listed.iter().all(|l| l.key.starts_with("capture/")));
         // The media sweep never touches a payload, however old.
         put(
             "capture/20250101/dddddddddddddddddddddddddddddddd",

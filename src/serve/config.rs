@@ -181,12 +181,14 @@ pub struct ServeConfig {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Capture {
-    /// The deployment secret that keys the fingerprints, by reference: at least 32 characters. The gateways of
+    /// The deployment secret that keys the fingerprints, by reference: at least 32 random bytes, base64 encoded
+    /// (`openssl rand -base64 32`). A key a person could remember would let whoever holds the control plane's data test
+    /// guesses against it. The gateways of
     /// one deployment share it; the control plane never has it, so it can compare fingerprints and never
     /// compute one. Rotating it is a restart, after which earlier and later requests are not comparable.
     pub hmac_key: SecretRef,
     /// The deployment secret that wraps each captured payload's own key (note 0052, slice 5b), by reference: at
-    /// least 32 characters. Needed by any client with `capture = "payload"`. The gateways of one deployment share
+    /// least 32 random bytes, base64 encoded (`openssl rand -base64 32`). Needed by any client with `capture = "payload"`. The gateways of one deployment share
     /// it; the control plane never has it, so it can hold a reference and never open one. Rotating it is a restart,
     /// after which earlier payloads cannot be opened.
     #[serde(default)]
@@ -1982,6 +1984,18 @@ impl ServeConfig {
         validate_secret(&capture.hmac_key, "capture.hmac_key", issues);
         if let Some(key) = &capture.payload_key {
             validate_secret(key, "capture.payload_key", issues);
+            // The route that opens a payload exists whenever the key and the store do, whether or not a client
+            // captures one at this moment (the clients reload, the listener does not): it must never be open.
+            if !self
+                .admin
+                .as_ref()
+                .is_some_and(|admin| admin.token.is_some())
+            {
+                issues.push(Issue::new(
+                    "capture.payload_key",
+                    "needs an [admin] table with a token: payloads are opened through the admin listener",
+                ));
+            }
         } else if capture.ttl_secs.is_some() || capture.max_payload_bytes.is_some() {
             issues.push(Issue::new(
                 "capture.payload_key",

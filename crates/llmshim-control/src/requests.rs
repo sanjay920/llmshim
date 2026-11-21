@@ -730,15 +730,17 @@ impl Store {
     /// Record that `actor` asked to read an attempt's payload, in the change history (note 0047): the chain's row is
     /// written before the payload is fetched, so a view with no row cannot exist. Never holds the reference or any
     /// text.
-    pub fn record_payload_view(&mut self, attempt_id: &str, actor: &str) -> Result<()> {
+    pub fn record_payload_view(&mut self, attempt_id: &str, actor: &str, via: &str) -> Result<()> {
         crate::actor_check(actor)?;
+        // `via` says how the actor was established (`oidc` for a verified person, `break_glass`, `shared_token` for
+        // a label the caller gave), so the record is honest about how far its "who" can be trusted.
         self.backend.transaction(true, |tx| {
             crate::history(
                 tx,
                 actor,
                 "payload.viewed",
                 attempt_id,
-                json!({"attempt_id": attempt_id}),
+                json!({"attempt_id": attempt_id, "via": via}),
             )
         })
     }

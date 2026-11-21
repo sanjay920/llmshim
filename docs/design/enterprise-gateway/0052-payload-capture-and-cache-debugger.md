@@ -187,7 +187,7 @@ segment and a few segments on either side. Pure presentation over 5a and 5b; it 
 
 ## Slice 5a as built
 
-- **Gateway.** `[capture] hmac_key = { env | file }` (at least 32 characters, fixed at start) and, per client,
+- **Gateway.** `[capture] hmac_key = { env | file }` (at least 32 random bytes, base64 encoded, fixed at start) and, per client,
   `capture = "off" | "structure"` on a `[[keys]]` entry (reloadable with the keys, and a reload **replaces** the set so
   turning it off stops it). A `[capture]` table needs `[usage_export]`; a key that captures needs `[capture]`; both are
   refused at load by path. `src/gateway/structure.rs` cuts the **provider-native** body, handed to the attempt policy at
@@ -240,8 +240,8 @@ segment and a few segments on either side. Pure presentation over 5a and 5b; it 
 
 ## Slice 5b as built
 
-- **Gateway.** `capture = "payload"` on a key (it captures structure too). `[capture]` gains `payload_key` (a secret of at least
-  32 characters, fixed at start), `ttl_secs` (default 86,400; 600 to 604,800) and `max_payload_bytes` (default 262,144; 1,024
+- **Gateway.** `capture = "payload"` on a key (it captures structure too). `[capture]` gains `payload_key` (at least 32 random bytes,
+  base64 encoded, fixed at start), `ttl_secs` (default 86,400; 600 to 604,800) and `max_payload_bytes` (default 262,144; 1,024
   to 1,048,576, applied to the request and to the answer each). A payload client needs `payload_key`, `[media_store]` and an
   `[admin]` table **with a token**, all refused at load by path. The document is `{v, attempt_id, ts, wire, provider, model,
   outcome, request: {text, bytes, truncated}, response: {text, bytes, truncated}}`: the request is the **provider-native** body
@@ -287,3 +287,26 @@ segment and a few segments on either side. Pure presentation over 5a and 5b; it 
 - **Known limits.** A body past `max_payload_bytes` is cut (said so), so it cannot be cut into segments for 5c; raise the
   limit for the clients that need the content diff. The answer of a stream is the raw events. A payload whose write was dropped or
   failed has a reference that will not open (`payload_gone`).
+
+### Review follow-ups (PR 304)
+
+- **The open route is never open.** The admin listener must have a token whenever `payload_key` is set, not only while some
+  client captures a payload: the route exists whenever the key and the store do, and the clients reload while the listener
+  does not.
+- **A capture secret is random bytes.** `hmac_key` and `payload_key` must be at least 32 random bytes, base64 encoded
+  (`openssl rand -base64 32`), and a phrase is refused by name. A reference held by the control plane is an offline test of a
+  guessed key, so the format, not a length, is what makes a guess hopeless.
+- **Expiry is enforced where the key is.** The expiry is sealed into the reference (it is part of what the wrapped key is
+  bound to, so editing it makes the reference not open) and a gateway refuses an expired reference whether or not the sweeper
+  has deleted the object yet. The old window of up to ten minutes after `expires_at` is gone.
+- **Retention does not depend on the worst object.** The sweep continues past a delete that fails and reports it, and lists
+  only `capture/` (S3, Google Cloud Storage and Azure list that prefix alone), so a store with millions of other objects is
+  not walked and its page limit cannot stop the sweep.
+- **Waiting captures are bounded by bytes** (64 MiB, with the count), and eight writes overlap, so a slow store drops captures
+  late and counts them, instead of holding gigabytes or dropping at twenty a second.
+- **CPU and locks on the request path.** The request is serialized into its bounded copy and the serializer is stopped at
+  the cap, so a huge body costs the time of its first `max_payload_bytes`; the recorder's lock is not taken per stream frame
+  unless payload capture exists.
+- **The record says how far its "who" can be trusted.** A `payload.viewed` row carries `via`: `oidc` (a verified person),
+  `break_glass`, or `shared_token` (with one shared token and no identity provider the actor is a label the caller gave). With
+  single sign-on every view names a verified subject.

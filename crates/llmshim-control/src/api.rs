@@ -932,9 +932,13 @@ async fn request_structure(
 async fn request_payload(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
+    principal: Option<axum::Extension<Principal>>,
     Path(attempt): Path<String>,
 ) -> ApiResult<Response> {
     let actor = actor(&headers)?;
+    // How the actor was established, for the record: a verified person, the break-glass token, or (with one shared
+    // token and no identity provider) a label the caller gave.
+    let via = principal.map_or("shared_token", |axum::Extension(p)| p.via);
     let asked = attempt.clone();
     let Some((reference, expires_ms)) =
         with_store(&s, move |st| st.payload_reference(&asked)).await?
@@ -954,7 +958,7 @@ async fn request_payload(
     }
     // The record of the view comes first: a view with no row cannot exist, whatever happens next.
     let viewed = attempt.clone();
-    with_store(&s, move |st| st.record_payload_view(&viewed, &actor)).await?;
+    with_store(&s, move |st| st.record_payload_view(&viewed, &actor, via)).await?;
     let Some(gateways) = s.gateways.get() else {
         return Err(ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
