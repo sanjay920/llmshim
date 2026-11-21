@@ -78,6 +78,17 @@
             "null"
           ]
         },
+        "open_token": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The bearer token that opens a captured payload, by reference: at least 32 characters, **different from the\n`[admin]` token**. Opening a payload is not an operational read: the metrics scraper's token must not do it. The\ncontrol plane holds this token (`payload_token_file` in its gateways file) and nothing else does. Needed with\n`payload_key`."
+        },
         "payload_key": {
           "anyOf": [
             {
@@ -88,6 +99,14 @@
             }
           ],
           "description": "The deployment secret that wraps each captured payload's own key (note 0052, slice 5b), by reference: at\nleast 32 random bytes, base64 encoded (`openssl rand -base64 32`). Needed by any client with `capture = \"payload\"`. The gateways of one deployment share\nit; the control plane never has it, so it can hold a reference and never open one. Rotating it is a restart,\nafter which earlier payloads cannot be opened."
+        },
+        "response": {
+          "default": null,
+          "description": "Keep the provider's answer in a payload as well as the request (default false). The answer is the provider's own\noutput as it arrived, **not** what the caller was sent: it is not redacted by the response rules and includes any\nreasoning the provider returned. The request is what the cache debugger needs; turn this on only when the answer\nmust be read too.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         },
         "ttl_secs": {
           "default": null,
@@ -119,7 +138,7 @@
         },
         {
           "const": "payload",
-          "description": "The fingerprints and a sealed copy of the request and the answer, readable only by an administrator through\nthe control plane, kept for a short time (note 0052, slice 5b). Needs `[capture] payload_key`,\n`[media_store]` and an `[admin]` table with a token.",
+          "description": "The fingerprints and a sealed copy of the request and the answer, readable only by an administrator through\nthe control plane, kept for a short time (note 0052, slice 5b). Needs `[capture] payload_key` and `open_token`,\n`[media_store]`, an `[admin]` table and `[logging] audit_log`.",
           "type": "string"
         }
       ]

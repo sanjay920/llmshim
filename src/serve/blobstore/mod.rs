@@ -628,6 +628,12 @@ pub async fn sweep_payloads(store: &dyn BlobStore, ttl: Duration) -> (usize, Opt
     (deleted, first_error)
 }
 
+/// Captured payloads deleted by the sweep (counter).
+pub const PAYLOAD_SWEPT: &str = "llmshim_payload_swept_total";
+/// When the payload sweep last finished with no failure (gauge, Unix seconds): alert when it is old. A sweep that cannot
+/// finish leaves payloads past their retention.
+pub const PAYLOAD_SWEEP_LAST_SUCCESS: &str = "llmshim_payload_sweep_last_success_timestamp_seconds";
+
 /// Sweep captured payloads every [`SWEEP_EVERY`] for as long as the process runs.
 pub fn spawn_payload_sweeper(
     store: Arc<dyn BlobStore>,
@@ -638,11 +644,20 @@ pub fn spawn_payload_sweeper(
     Some(runtime.spawn(async move {
         tokio::time::sleep(first).await;
         loop {
-            if let (_, Some(error)) = sweep_payloads(store.as_ref(), ttl).await {
-                crate::gateway::metrics::incr(
+            let (deleted, failed) = sweep_payloads(store.as_ref(), ttl).await;
+            if deleted > 0 {
+                crate::gateway::metrics::add(PAYLOAD_SWEPT, &[], deleted as u64);
+            }
+            match failed {
+                None => crate::gateway::metrics::gauge_set(
+                    PAYLOAD_SWEEP_LAST_SUCCESS,
+                    &[],
+                    chrono::Utc::now().timestamp(),
+                ),
+                Some(error) => crate::gateway::metrics::incr(
                     crate::gateway::metrics::MEDIA_STORE,
                     &[("op", "sweep_payloads"), ("outcome", error.as_str())],
-                );
+                ),
             }
             tokio::time::sleep(SWEEP_EVERY).await;
         }

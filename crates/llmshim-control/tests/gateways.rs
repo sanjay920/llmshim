@@ -307,6 +307,10 @@ fn the_file_is_validated_by_entry_and_field_without_echoing_values() {
             "token_file",
         ),
         (
+            json!({"name": "a", "admin_url": "https://g.test", "payload_token_file": "relative"}),
+            "payload_token_file",
+        ),
+        (
             json!({"name": "a", "admin_url": "https://g.test", "ca_file": "/nonexistent/ca.pem"}),
             "ca_file",
         ),
@@ -358,4 +362,33 @@ async fn a_status_that_is_not_an_object_is_a_bad_response() {
     let answer = ask(&app(gateways)).await;
     assert_eq!(answer["gateways"][0]["error"], "bad_response");
     assert!(answer["gateways"][0].get("stats").is_none());
+}
+
+#[test]
+fn the_payload_token_must_not_be_the_metrics_token() {
+    let path = token_file(ADMIN_TOKEN);
+    let error = Gateways::from_bytes(&file(json!([{
+        "name": "a", "admin_url": "https://g.test", "token_file": path, "payload_token_file": path
+    }])))
+    .err()
+    .unwrap();
+    assert!(
+        error.starts_with("gateways[0].payload_token_file"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_payload_token_must_not_hold_the_metrics_secret_under_another_path() {
+    let admin = token_file(ADMIN_TOKEN);
+    let copy = token_file(ADMIN_TOKEN);
+    let error = Gateways::from_bytes(&file(json!([{
+        "name": "a", "admin_url": "https://g.test", "token_file": admin, "payload_token_file": copy
+    }])))
+    .err()
+    .unwrap();
+    assert!(
+        error.starts_with("gateways[0].payload_token_file"),
+        "{error}"
+    );
 }

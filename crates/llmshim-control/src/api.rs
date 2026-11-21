@@ -69,6 +69,10 @@ pub struct AppState {
     verifying: std::sync::atomic::AtomicBool,
     /// The gateways whose status the UI shows (note 0051, slice 4); set once, at start.
     gateways: std::sync::OnceLock<crate::gateways::Gateways>,
+    /// Whether a payload may be opened by a caller whose identity was not verified (one shared token, break-glass): off
+    /// unless the operator says so. A payload view is recorded under the actor's name, and with a shared token that name
+    /// is a label the caller typed.
+    allow_unverified_payloads: std::sync::atomic::AtomicBool,
 }
 
 /// Holds the flag set; clears it when dropped, however the check ends.
@@ -101,6 +105,7 @@ impl AppState {
             ui: crate::ui::Ui::new(None, true),
             verifying: Default::default(),
             gateways: Default::default(),
+            allow_unverified_payloads: Default::default(),
         })
     }
 
@@ -123,11 +128,18 @@ impl AppState {
             ui,
             verifying: Default::default(),
             gateways: Default::default(),
+            allow_unverified_payloads: Default::default(),
         })
     }
 }
 
 impl AppState {
+    /// Let a caller whose identity is not verified (a shared token, break-glass) open payloads. Off by default.
+    pub fn allow_unverified_payload_views(&self, allow: bool) {
+        self.allow_unverified_payloads
+            .store(allow, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Show these gateways' status at `GET /v1/gateways`. Set once; a second call is ignored.
     pub fn set_gateways(&self, gateways: crate::gateways::Gateways) {
         let _ = self.gateways.set(gateways);
@@ -943,9 +955,12 @@ async fn request_payload(
     Path(attempt): Path<String>,
 ) -> ApiResult<Response> {
     let actor = actor(&headers)?;
+    let actor_label = actor.clone();
     // How the actor was established, for the record: a verified person, the break-glass token, or (with one shared
     // token and no identity provider) a label the caller gave.
     let via = principal.map_or("shared_token", |axum::Extension(p)| p.via);
+    // Before anything is looked up or recorded: a caller whose identity is not verified is refused.
+    payload_identity(&s, via)?;
     let asked = attempt.clone();
     let Some((reference, expires_ms)) =
         with_store(&s, move |st| st.payload_reference(&asked)).await?
@@ -973,12 +988,32 @@ async fn request_payload(
             "payloads are opened through the gateways' admin listeners: start the control plane with --gateways-file",
         ));
     };
-    match gateways.open_payload(&reference, false).await {
+    match gateways
+        .open_payload(&reference, false, &actor_label, via)
+        .await
+    {
         Ok(opened) => Ok(no_store(Json(
             json!({"attempt_id": attempt, "payload": opened["payload"]}),
         ))),
         Err(error) => Err(open_error(error)),
     }
+}
+
+/// A payload is opened only by a person the identity provider verified, so the record names who: with one shared token the
+/// actor is a label the caller typed. The operator can accept that (`--allow-payload-views-without-sso`).
+fn payload_identity(s: &AppState, via: &str) -> ApiResult<()> {
+    if via == "oidc"
+        || s.allow_unverified_payloads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "identity_required",
+        "payloads are opened only by a person signed in through the identity provider, so the record names who; \
+         start the control plane with --allow-payload-views-without-sso to accept a shared token's label instead",
+    ))
 }
 
 /// A response that nothing between here and the viewer may keep or reinterpret: it holds customer text.
@@ -1073,7 +1108,9 @@ async fn payload_diff(
     Path(attempt): Path<String>,
 ) -> ApiResult<Response> {
     let actor = actor(&headers)?;
+    let actor_label = actor.clone();
     let via = principal.map_or("shared_token", |axum::Extension(p)| p.via);
+    payload_identity(&s, via)?;
     let asked = attempt.clone();
     let found = with_store(&s, move |st| {
         let Some(current) = st.request_structure(&asked)? else {
@@ -1139,8 +1176,8 @@ async fn payload_diff(
         ));
     };
     let (now_open, before_open) = tokio::join!(
-        gateways.open_payload(&current_ref, true),
-        gateways.open_payload(&previous_ref, true)
+        gateways.open_payload(&current_ref, true, &actor_label, via),
+        gateways.open_payload(&previous_ref, true, &actor_label, via)
     );
     let (now_open, before_open) = (
         now_open.map_err(open_error)?,

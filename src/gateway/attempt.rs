@@ -5991,6 +5991,7 @@ mod usage_records {
 
     fn payload_coordinator(
         max: usize,
+        response: bool,
     ) -> (Arc<AttemptCoordinator>, Arc<Collected>, Arc<Documents>) {
         let coordinator = AttemptCoordinator::local_with_retention(
             RateLimitConfig::default(),
@@ -6005,7 +6006,12 @@ mod usage_records {
             b"k".repeat(32),
             ["known-credential".to_owned()],
         )
-        .with_payload(documents.clone(), max, ["known-credential".to_owned()]);
+        .with_payload(
+            documents.clone(),
+            max,
+            response,
+            ["known-credential".to_owned()],
+        );
         coordinator.set_usage_sink(crate::gateway::usage::UsageSetup {
             sink: collected.clone(),
             tenants: crate::gateway::usage::TenantNames::new(KNOWN.iter().map(|t| t.to_string())),
@@ -6048,7 +6054,7 @@ mod usage_records {
     #[tokio::test]
     async fn an_opted_in_client_has_its_request_and_answer_sealed_and_the_record_carries_only_a_reference(
     ) {
-        let (coordinator, collected, documents) = payload_coordinator(1 << 20);
+        let (coordinator, collected, documents) = payload_coordinator(1 << 20, true);
         let body = json!({"model": "test-model", "messages": [{"role": "user", "content": "the launch codes"}]});
         let mut tracker = admit_body(&coordinator, "known-credential", body.clone()).await;
         tracker.native(crate::policy::NativeFrame::ResponseBody {
@@ -6097,8 +6103,24 @@ mod usage_records {
     }
 
     #[tokio::test]
+    async fn the_answer_is_not_kept_unless_the_operator_asked_for_it() {
+        let (coordinator, _collected, documents) = payload_coordinator(1 << 20, false);
+        let body = json!({"model": "test-model", "messages": [{"role": "user", "content": "q"}]});
+        let mut tracker = admit_body(&coordinator, "known-credential", body).await;
+        tracker.native(crate::policy::NativeFrame::ResponseBody {
+            body: &json!({"choices": [{"message": {"content": "12345"}}]}),
+        });
+        tracker.finish(done()).await.unwrap();
+        drop(tracker);
+        let documents = documents.0.lock().unwrap();
+        assert!(documents[0]["response"].is_null(), "{}", documents[0]);
+        assert!(!documents[0].to_string().contains("12345"));
+        assert!(documents[0]["request"]["text"].is_string());
+    }
+
+    #[tokio::test]
     async fn a_client_that_did_not_opt_in_has_no_payload_and_a_long_request_is_cut_and_says_so() {
-        let (coordinator, collected, documents) = payload_coordinator(64);
+        let (coordinator, collected, documents) = payload_coordinator(64, true);
         // A key the configuration does not list: nothing is captured, not even a document.
         let mut other = admit_body(
             &coordinator,

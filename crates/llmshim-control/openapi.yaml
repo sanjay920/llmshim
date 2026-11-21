@@ -213,7 +213,9 @@ paths:
         the answer is `Cache-Control: no-store`. The control plane holds only an opaque reference and cannot open it:
         a gateway's admin listener does (`--gateways-file`). 404 `no_payload` (none captured), 410 `payload_expired`,
         404 `payload_gone` (no gateway has the object), 422 `payload_unreadable` (another capture key), 501
-        `gateways_not_configured`, 502 `gateways_unavailable`.
+        `gateways_not_configured`, 502 `gateways_unavailable`. 403 `identity_required`: only a person signed in through
+        the identity provider may open a payload, unless the operator started the server with
+        `--allow-payload-views-without-sso`.
       parameters:
         - {name: attempt, in: path, required: true, schema: {type: string}}
       responses:

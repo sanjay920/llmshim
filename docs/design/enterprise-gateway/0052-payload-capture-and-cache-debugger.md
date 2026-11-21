@@ -151,7 +151,10 @@ segment and a few segments on either side. Pure presentation over 5a and 5b; it 
 | Someone with object-store access reads prompts | Every object is sealed by the gateway under its own key; the store holds ciphertext, and the key is not stored beside it |
 | Someone with the control plane's database reads prompts | The references it holds carry a key wrapped under `capture.key`, which the control plane does not have; it also has no object-store credentials |
 | Dictionary attack on structure hashes | HMAC with a deployment secret the control plane never has |
-| A viewer reads payloads without a trace | The audit row is written before the answer; a viewer with no role gets 403 |
+| A viewer reads payloads without a trace | The control plane writes its row before the fetch, and the gateway writes its own audit record (`payload.open`, a digest of the reference, the viewer, how they were identified) before it opens the object, so a compromised control plane cannot read without a trace on the gateway; a viewer with no role gets 403 |
+| The token that scrapes metrics reads customer data | The open route has its own `capture.open_token`, different from the admin token (refused at start if equal); the control plane holds it in `payload_token_file`, separate from `token_file` |
+| A shared token makes "who" a typed label | Payload routes refuse with 403 `identity_required` unless the caller signed in through the identity provider; `--allow-payload-views-without-sso` is the explicit break-glass, and the history still says `via: shared_token` |
+| Answers hold more than the request (reasoning, tool output) | `[capture] response` is false by default: only the request is kept |
 | Capture slows or breaks serving | Bounded queue, drop and count, never on the request's path |
 | Payloads linger | A short default TTL, a hard maximum, the sweeper, and `expired` shown honestly |
 | Payloads reach an operator's browser cache or a log | `Cache-Control: no-store`; the payload is never written to an access log, a usage log or a trace attribute |
@@ -352,3 +355,25 @@ segment and a few segments on either side. Pure presentation over 5a and 5b; it 
 - **The page shows every field that differs.** A segment is shown as `role: words` only when that is all it holds, and as the
   whole indented JSON otherwise; the marking never splits a character made of two code units; an empty window and the
   unavailable reasons each have their own sentence.
+
+## Hardening after the advisor's review
+
+Done in one change, because each piece closes the same path (who can read a payload, and what proof is left):
+
+- **Its own credential.** `[capture] open_token` guards `POST /v1/serve/payload/open`; the admin token no longer does.
+  The route needs an `[admin]` table, the token (at least 32 characters, not equal to the admin token), and
+  `[logging] audit_log`. The control plane reads the token from a gateway entry's `payload_token_file`, which must
+  differ from `token_file`; with none, opening is unavailable.
+- **Gateway-side audit before the read.** Two records per opening: `requested` before the object is touched (a failed
+  write is 503 `audit_unavailable` and nothing opens), then the outcome. Only a digest of the reference, the viewer
+  label and `via` are recorded.
+- **Verified identity by default.** Without `--allow-payload-views-without-sso` a payload view needs an OIDC identity.
+  Honest limit: in break-glass shared-token mode the viewer is whatever label the caller sent.
+- **The labels are advisory.** `viewer` and `via` come from the caller, so whoever holds `open_token` is the real
+  authority; keep it in the control plane's `payload_token_file` and nowhere else. A verified subject that is long or
+  not plain ASCII is recorded cut and with `?` for the unprintable, not as `unknown`.
+- **Gateways sharing an object store share `ttl_secs`.** A sealed expiry is unreadable to the sweeper, so a replica
+  with no capture settings sweeps at the 7-day maximum, and one with them at its own TTL.
+- **Request only by default.** `[capture] response = true` also keeps the provider's answer, raw and unredacted.
+- **Sweeper independent of capture.** It runs whenever `[media_store]` exists, so turning capture off never strands
+  sealed objects; `llmshim_payload_swept_total` and `llmshim_payload_sweep_last_success_timestamp_seconds` show it works.

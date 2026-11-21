@@ -40,6 +40,11 @@ pub struct GatewayEntry {
     /// The listener's bearer token (`[admin] token`), read at each fetch so a rotation needs no restart.
     #[serde(default)]
     pub token_file: Option<PathBuf>,
+    /// The token that opens a captured payload on this gateway (`[capture] open_token` in its file), read at each open.
+    /// It is **not** `token_file`: the token that scrapes metrics must not open customer data. Without it, payloads
+    /// cannot be opened through this gateway.
+    #[serde(default)]
+    pub payload_token_file: Option<PathBuf>,
     /// PEM certificates to trust for this listener instead of the web PKI roots.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
@@ -52,6 +57,7 @@ struct Target {
     name: String,
     origin: String,
     token_file: Option<PathBuf>,
+    payload_token_file: Option<PathBuf>,
     client: reqwest::Client,
 }
 
@@ -146,6 +152,7 @@ impl Gateways {
             let origin = origin(entry).map_err(&at)?;
             for (field, path) in [
                 ("token_file", &entry.token_file),
+                ("payload_token_file", &entry.payload_token_file),
                 ("ca_file", &entry.ca_file),
             ] {
                 if path.as_ref().is_some_and(|p| !p.has_root()) {
@@ -154,6 +161,17 @@ impl Gateways {
             }
             if let Some(path) = &entry.token_file {
                 read_token_file(path).map_err(|m| at(format!("token_file: {m}")))?;
+            }
+            if let Some(path) = &entry.payload_token_file {
+                let payload =
+                    read_token_file(path).map_err(|m| at(format!("payload_token_file: {m}")))?;
+                let same_secret = match &entry.token_file {
+                    Some(admin) => read_token_file(admin).is_ok_and(|t| t == payload),
+                    None => false,
+                };
+                if entry.token_file.as_ref() == Some(path) || same_secret {
+                    return Err(at("payload_token_file: must not be the token_file: the token that scrapes metrics must not open customer data".into()));
+                }
             }
             let mut builder = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -182,6 +200,7 @@ impl Gateways {
                 name: entry.name.clone(),
                 origin,
                 token_file: entry.token_file.clone(),
+                payload_token_file: entry.payload_token_file.clone(),
                 client: builder
                     .build()
                     .map_err(|_| at("could not build a client".into()))?,
@@ -243,7 +262,13 @@ impl Gateways {
     /// (the store and the key are shared); with a local store only the one that wrote it can, and the others say
     /// not found. The reference is only handed on, never read, and nothing a gateway says is repeated but the
     /// document.
-    pub async fn open_payload(&self, reference: &str, segments: bool) -> Result<Value, OpenError> {
+    pub async fn open_payload(
+        &self,
+        reference: &str,
+        segments: bool,
+        viewer: &str,
+        via: &str,
+    ) -> Result<Value, OpenError> {
         if self.targets.is_empty() {
             return Err(OpenError::NotConfigured);
         }
@@ -254,19 +279,19 @@ impl Gateways {
                 let (client, origin, token_file) = (
                     target.client.clone(),
                     target.origin.clone(),
-                    target.token_file.clone(),
+                    target.payload_token_file.clone(),
                 );
                 let reference = reference.to_owned();
+                let (viewer, via) = (viewer.to_owned(), via.to_owned());
                 tokio::spawn(async move {
-                    let token = match &token_file {
-                        Some(path) => {
-                            Some(read_token_file(path).map_err(|_| OpenError::Unavailable)?)
-                        }
-                        None => None,
+                    // No payload token for this gateway, no opening through it.
+                    let Some(path) = &token_file else {
+                        return Err(OpenError::Unavailable);
                     };
+                    let token = Some(read_token_file(path).map_err(|_| OpenError::Unavailable)?);
                     let mut request = client
                         .post(format!("{origin}/v1/serve/payload/open"))
-                        .json(&json!({"reference": reference, "segments": segments}));
+                        .json(&json!({"reference": reference, "segments": segments, "viewer": viewer, "via": via}));
                     if let Some(token) = &token {
                         request = request.bearer_auth(token);
                     }
