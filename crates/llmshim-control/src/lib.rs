@@ -19,9 +19,10 @@ mod db;
 pub mod gateways;
 pub mod requests;
 pub mod sso;
+pub mod structure;
 pub mod ui;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -625,7 +626,7 @@ impl Store {
                             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                             .map_err(|e| Error::Database(e.to_string()))?;
                     }
-                    1..=5 => {
+                    1..=6 => {
                         // Version 2 added keys.allowed_models, version 3 keys.tags. Re-read the
                         // version under the write lock: another process starting at the same
                         // time may have migrated while this one waited.
@@ -685,6 +686,16 @@ impl Store {
                                     requests::schema(false)
                                 ))
                                 .map_err(db_err)?;
+                            now = 6;
+                        }
+                        if now == 6 {
+                            // Version 7: prompt structure for the cache debugger (note 0052).
+                            connection
+                                .execute_batch(&format!(
+                                    "{} PRAGMA user_version = 7;",
+                                    structure::schema(false)
+                                ))
+                                .map_err(db_err)?;
                         }
                         connection.execute_batch("COMMIT").map_err(db_err)?;
                     }
@@ -718,7 +729,7 @@ impl Store {
                         tx.execute("INSERT INTO schema_meta (version) VALUES ($1)", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }
-                    Some(version @ (1..=5)) => {
+                    Some(version @ (1..=6)) => {
                         // Version 2 added keys.allowed_models, 3 keys.tags, 4 a team's budget.
                         if version == 1 {
                             tx.batch_execute("ALTER TABLE keys ADD COLUMN allowed_models TEXT")
@@ -747,6 +758,8 @@ impl Store {
                         }
                         // Version 6: the request ledger (note 0051).
                         tx.batch_execute(&requests::schema(true)).map_err(fail)?;
+                        // Version 7: prompt structure for the cache debugger (note 0052).
+                        tx.batch_execute(&structure::schema(true)).map_err(fail)?;
                         tx.execute("UPDATE schema_meta SET version = $1", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }
@@ -1505,7 +1518,9 @@ CREATE TABLE snapshots (
     PRIMARY KEY (org_id, generation)
 );
 {requests}
+{structure}
 ",
-        requests = requests::schema(pg)
+        requests = requests::schema(pg),
+        structure = structure::schema(pg)
     )
 }

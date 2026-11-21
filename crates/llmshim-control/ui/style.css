@@ -296,3 +296,14 @@ td.id { font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
 .stack > .card-body, .card-body.stack { display: grid; gap: 18px; }
 .dotsep { margin-left: 8px; }
 .delta { margin-right: 0; }
+
+/* ---- prompt structure strip (note 0052) ---- */
+.strip { display: flex; gap: 2px; height: 24px; }
+.strip .run { flex: 1 1 0; min-width: 3px; border-radius: 4px; background: var(--muted-mark); }
+.strip .run.same { background: var(--series-1); }
+.strip .run.plain { background: var(--series-1); opacity: .55; }
+.strip .run.change { background: var(--serious); }
+.strip .run.after { background: var(--muted-mark); }
+.strip .run.added { background: color-mix(in srgb, var(--series-1) 35%, var(--surface)); }
+.legend .same i { background: var(--series-1); } .legend .change i { background: var(--serious); }
+.legend .after i { background: var(--muted-mark); } .legend .added i { background: color-mix(in srgb, var(--series-1) 35%, var(--surface)); }

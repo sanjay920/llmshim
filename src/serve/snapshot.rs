@@ -295,6 +295,8 @@ fn to_keys(
             // Residency is a file key's field (note 0039); the control plane has none yet.
             allowed_residency: None,
             tags: key.tags.clone(),
+            // Capture is a reviewed change to the gateway's own file (note 0052), never something a snapshot sets.
+            capture: None,
         });
     }
     Ok((keys, inactive))

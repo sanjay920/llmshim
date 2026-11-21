@@ -48,6 +48,7 @@ pub mod metrics;
 #[cfg(feature = "redis-coordination")]
 mod outage;
 pub mod quota;
+pub(crate) mod structure;
 pub(crate) mod usage;
 
 #[cfg(feature = "redis-coordination")]

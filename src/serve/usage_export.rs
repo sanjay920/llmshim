@@ -22,10 +22,14 @@ pub const QUEUE_DEPTH: &str = "llmshim_usage_export_queue_depth";
 
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// The most one batch's records may add up to, as JSON. The control plane refuses a body over 2 MiB; a record of a
+/// capturing client can hold thousands of segments, so a batch is cut by size as well as by count.
+const BATCH_BYTES: usize = 1 << 20;
 /// How long `close` waits for the last batches.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// Re-exported so a control-plane test can drive the exporter end to end.
+pub use crate::gateway::structure::Segment;
 pub use crate::gateway::usage::{UsageRecord, UsageSink};
 
 /// What `[usage_export]` says.
@@ -60,6 +64,9 @@ enum Failure {
     Retry(&'static str),
     /// The control plane says the batch itself is wrong: sending it again cannot help.
     Poison(&'static str),
+    /// The control plane refused the body as too large: a batch of several records is split and sent again,
+    /// a single record that is too large is dropped.
+    TooLarge,
 }
 
 struct Sender {
@@ -82,7 +89,8 @@ impl Sender {
         let status = response.status().as_u16();
         match status {
             200 => Ok(response.json::<Value>().await.unwrap_or(Value::Null)),
-            400 | 413 | 422 => Err(Failure::Poison("bad_request")),
+            413 => Err(Failure::TooLarge),
+            400 | 422 => Err(Failure::Poison("bad_request")),
             401 | 403 => Err(Failure::Retry("unauthorized")),
             404 => Err(Failure::Retry("not_found")),
             429 => Err(Failure::Retry("rate_limited")),
@@ -218,6 +226,9 @@ fn run(shared: &Shared, sender: &Sender, flush_every: Duration) {
         Err(_) => return,
     };
     let mut backoff = Duration::ZERO;
+    // How many records a batch may hold now: the configured size, less after the control plane called a body too
+    // large, growing back as batches are accepted.
+    let mut limit = shared.batch;
     let mut not_before = Instant::now();
     let mut last_flush = Instant::now();
     loop {
@@ -247,8 +258,20 @@ fn run(shared: &Shared, sender: &Sender, flush_every: Duration) {
                     .unwrap_or_else(|e| e.into_inner())
                     .0;
             }
-            let n = queue.len().min(shared.batch);
-            let batch: Vec<Value> = queue.drain(..n).collect();
+            // The size is measured here, on the worker, never on a request's path.
+            let mut batch: Vec<Value> = Vec::new();
+            let mut bytes = 0usize;
+            while let Some(front) = queue.front() {
+                if batch.len() >= limit {
+                    break;
+                }
+                let size = front.to_string().len();
+                if !batch.is_empty() && bytes + size > BATCH_BYTES {
+                    break;
+                }
+                bytes += size;
+                batch.extend(queue.pop_front());
+            }
             metrics::gauge_set(QUEUE_DEPTH, &[], queue.len() as i64);
             batch
         };
@@ -256,6 +279,7 @@ fn run(shared: &Shared, sender: &Sender, flush_every: Duration) {
         match runtime.block_on(sender.send(&batch)) {
             Ok(answer) => {
                 backoff = Duration::ZERO;
+                limit = (limit * 2).min(shared.batch);
                 let n = |field: &str| answer[field].as_u64().unwrap_or(0);
                 for (outcome, count) in [
                     ("sent", n("accepted")),
@@ -266,6 +290,24 @@ fn run(shared: &Shared, sender: &Sender, flush_every: Duration) {
                         metrics::add(RECORDS, &[("outcome", outcome)], count);
                     }
                 }
+            }
+            Err(Failure::TooLarge) if batch.len() > 1 && !shared.closed.load(Ordering::SeqCst) => {
+                // Send the same records again in smaller batches, in order.
+                metrics::incr(FAILURES, &[("class", "too_large")]);
+                limit = (batch.len() / 2).max(1);
+                let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                for record in batch.into_iter().rev() {
+                    queue.push_front(record);
+                }
+            }
+            Err(Failure::TooLarge) => {
+                // One record the control plane will not take, or a shutdown: dropped and counted.
+                metrics::incr(FAILURES, &[("class", "too_large")]);
+                metrics::add(
+                    RECORDS,
+                    &[("outcome", "dropped_refused")],
+                    batch.len() as u64,
+                );
             }
             Err(Failure::Poison(class)) => {
                 metrics::incr(FAILURES, &[("class", class)]);
@@ -350,6 +392,7 @@ mod tests {
             cost_source: Some("provider".into()),
             usage_reported: true,
             admission: "fleet",
+            structure: None,
         }
     }
 
@@ -410,6 +453,92 @@ mod tests {
             .expect_at_least(0)
             .create();
         (seen, hits)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_is_cut_by_size_and_a_body_called_too_large_is_split_not_dropped() {
+        let mut server = mockito::Server::new_async().await;
+        let seen: Batches = Default::default();
+        let record = seen.clone();
+        // The control plane takes one record at a time and calls anything bigger too large.
+        // (mockito answers with the most recently made matching mock, so the narrow one is made last.)
+        server
+            .mock("POST", "/v1/usage/batch")
+            .match_header("authorization", Matcher::Regex("^Bearer ".into()))
+            .with_body_from_request(move |request| {
+                let body: Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+                let ids: Vec<String> = body["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["attempt_id"].as_str().unwrap().to_owned())
+                    .collect();
+                record.lock().unwrap().push(ids.clone());
+                json!({"accepted": ids.len(), "duplicate": 0, "rejected": 0})
+                    .to_string()
+                    .into_bytes()
+            })
+            .expect_at_least(0)
+            .create();
+        server
+            .mock("POST", "/v1/usage/batch")
+            .match_header("authorization", Matcher::Regex("^Bearer ".into()))
+            .match_request(|request| {
+                let body: Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+                body["records"].as_array().unwrap().len() > 1
+            })
+            .with_status(413)
+            .expect_at_least(0)
+            .create();
+        let token = token("ingest-token-0123456789abc");
+        let exporter = exporter(&server.url(), &token, 8, 200, 1000);
+        for id in ["z1", "z2", "z3", "z4", "z5"] {
+            exporter.record(&usage(id));
+        }
+        until("every record to arrive one at a time", || {
+            seen.lock().unwrap().concat().len() == 5
+        })
+        .await;
+        assert_eq!(
+            seen.lock().unwrap().concat(),
+            ["z1", "z2", "z3", "z4", "z5"],
+            "in order, none lost"
+        );
+        assert!(
+            seen.lock().unwrap().iter().all(|b| b.len() == 1),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn records_that_add_up_to_more_than_a_batch_may_hold_go_in_separate_batches() {
+        let mut server = mockito::Server::new_async().await;
+        let (seen, _) = ledger(&mut server);
+        let token = token("ingest-token-0123456789abc");
+        let exporter = exporter(&server.url(), &token, 50, 200, 1000);
+        // Four records of about 470 KB each: more than one batch's size, far fewer than its count.
+        let segments = vec![
+            Segment {
+                kind: "user",
+                hash: "0123456789abcdef".into(),
+                bytes: 1
+            };
+            9000
+        ];
+        for id in ["s1", "s2", "s3", "s4"] {
+            let mut r = usage(id);
+            r.structure = Some(segments.clone());
+            exporter.record(&r);
+        }
+        until("all four to arrive", || {
+            seen.lock().unwrap().concat().len() == 4
+        })
+        .await;
+        let batches = seen.lock().unwrap().clone();
+        assert!(batches.len() >= 2, "{batches:?}");
+        assert!(batches.iter().all(|b| b.len() <= 2), "{batches:?}");
+        assert_eq!(batches.concat(), ["s1", "s2", "s3", "s4"]);
     }
 
     async fn until(what: &str, mut done: impl FnMut() -> bool) {

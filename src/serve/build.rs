@@ -372,6 +372,31 @@ pub async fn build_app(
             }])
         }
     };
+    // Prompt-structure capture (note 0052): the deployment secret keys the fingerprints; the clients that
+    // opted in are the keys with `capture = "structure"`. Read once; a reload replaces the client set.
+    let capture = match config
+        .capture
+        .as_ref()
+        .map(|capture| -> Result<_, String> {
+            let key = super::config::read_secret(&capture.hmac_key, env)?;
+            if key.len() < 32 {
+                return Err("hmac_key: must be at least 32 characters".to_owned());
+            }
+            Ok(crate::gateway::usage::StructureCapture::new(
+                key.into_bytes(),
+                super::keys::key_capture(config, env),
+            ))
+        })
+        .transpose()
+    {
+        Ok(capture) => capture,
+        Err(message) => {
+            return Err(vec![Issue {
+                path: "capture.hmac_key".into(),
+                message,
+            }])
+        }
+    };
     // Attempt spans ride the usage recorder, so it exists when either is wanted.
     let usage = if usage_log.is_some() || telemetry.is_some() || usage_exporter.is_some() {
         // An open server (`allow_unauthenticated`) attributes every request to
@@ -395,6 +420,7 @@ pub async fn build_app(
             sink,
             tenants: tenants.clone(),
             keys: key_names.clone(),
+            capture: capture.clone(),
             spans: telemetry
                 .clone()
                 .map(|t| t as Arc<dyn crate::gateway::usage::AttemptSpans>),
@@ -721,7 +747,7 @@ pub async fn build_app(
         authenticated,
         admin_authenticated,
         logs: Logs(logs, telemetry, usage_exporter),
-        reload: reload.with_audit(audit.clone()),
+        reload: reload.with_audit(audit.clone()).with_capture(capture),
         audit,
         media_store,
         listener: ListenerLimits {
@@ -1243,7 +1269,15 @@ struct UsageLog(super::jsonl::JsonLines);
 
 impl crate::gateway::usage::UsageSink for UsageLog {
     fn record(&self, record: &crate::gateway::usage::UsageRecord) {
-        self.0.write(record);
+        // The log is for operators and is read by anyone with the file; the structure is for the control plane's
+        // cache debugger and rides the export only (note 0052).
+        if record.structure.is_some() {
+            let mut stripped = record.clone();
+            stripped.structure = None;
+            self.0.write(&stripped);
+        } else {
+            self.0.write(record);
+        }
     }
 }
 

@@ -8,7 +8,9 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
 use llmshim::serve::config::SecretRef;
-use llmshim::serve::usage_export::{ExportSettings, UsageExporter, UsageRecord, UsageSink};
+use llmshim::serve::usage_export::{
+    ExportSettings, Segment, UsageExporter, UsageRecord, UsageSink,
+};
 use llmshim_control::api::{router, AppState};
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -43,6 +45,15 @@ fn usage(id: &str) -> UsageRecord {
         cost_source: Some("provider".into()),
         usage_reported: true,
         admission: "fleet",
+        structure: None,
+    }
+}
+
+fn segment(kind: &'static str, hash: &str, bytes: u64) -> Segment {
+    Segment {
+        kind,
+        hash: hash.into(),
+        bytes,
     }
 }
 
@@ -175,4 +186,84 @@ async fn a_wrong_ingest_token_stores_nothing_and_keeps_the_records_queued() {
     // Refused, so kept for when the operator fixes the token.
     assert_eq!(exporter.queued(), 1);
     exporter.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_structure_the_gateway_exports_is_stored_and_compared_by_the_control_plane() {
+    let state = AppState::new(common::store(), SHARED, None);
+    state.set_ingest_token(INGEST);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let served = router(state.clone());
+    tokio::spawn(async move { axum::serve(listener, served).await.unwrap() });
+    let app = router(state);
+    let token_file =
+        std::env::temp_dir().join(format!("llmshim-push-token-{}", uuid::Uuid::new_v4()));
+    std::fs::write(&token_file, format!("{INGEST}\n")).unwrap();
+    let token: SecretRef = serde_json::from_value(serde_json::json!({"file": token_file})).unwrap();
+    let url = format!("http://{address}");
+    let exporter = UsageExporter::new(
+        &ExportSettings {
+            url: &url,
+            token: &token,
+            batch_size: 10,
+            flush_interval: Duration::from_millis(200),
+            queue_size: 100,
+            ca_pem: None,
+        },
+        &|_| None,
+    )
+    .unwrap();
+    // Two requests of one client a minute apart: the second changed the system prompt (segment 1).
+    let mut first = usage("s1");
+    first.structure = Some(vec![
+        segment("tool", "0000000000000001", 100),
+        segment("system", "00000000000000a1", 400),
+        segment("user", "00000000000000b1", 50),
+    ]);
+    let mut second = usage("s2");
+    second.ts = "2026-11-19T10:01:00Z".into();
+    second.structure = Some(vec![
+        segment("tool", "0000000000000001", 100),
+        segment("system", "00000000000000a2", 400),
+        segment("user", "00000000000000b1", 50),
+    ]);
+    exporter.record(&first);
+    exporter.record(&second);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let diff = loop {
+        let answer = tokio::time::timeout(Duration::from_secs(5), async {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/requests/s2/structure")
+                        .header(header::AUTHORIZATION, format!("Bearer {SHARED}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (
+                response.status(),
+                response.into_body().collect().await.unwrap().to_bytes(),
+            )
+        })
+        .await
+        .unwrap();
+        if answer.0 == StatusCode::OK {
+            break serde_json::from_slice::<Value>(&answer.1).unwrap();
+        }
+        assert!(Instant::now() < deadline, "the structure never arrived");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(diff["previous"]["attempt_id"], "s1");
+    assert_eq!(diff["diff"]["relation"], "changed");
+    assert_eq!(diff["diff"]["first_change"]["label"], "system prompt");
+    assert_eq!(diff["diff"]["common_segments"], 1);
+    let c = std::sync::Arc::new(exporter);
+    tokio::task::spawn_blocking(move || c.close())
+        .await
+        .unwrap();
+    let _ = std::fs::remove_file(token_file);
 }

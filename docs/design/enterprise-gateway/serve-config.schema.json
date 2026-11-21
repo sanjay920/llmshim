@@ -61,6 +61,35 @@
       },
       "type": "object"
     },
+    "Capture": {
+      "additionalProperties": false,
+      "description": "Prompt-structure capture (note 0052, slice 5a): each opted-in client's requests are cut into segments,\neach fingerprinted with a keyed hash, and the list rides the usage record to the control plane, which can\nthen find where a request's cached prefix first differed from the one before. Fingerprints, kinds and sizes\nonly: none of the prompt.",
+      "properties": {
+        "hmac_key": {
+          "$ref": "#/$defs/SecretRef",
+          "description": "The deployment secret that keys the fingerprints, by reference: at least 32 characters. The gateways of\none deployment share it; the control plane never has it, so it can compare fingerprints and never\ncompute one. Rotating it is a restart, after which earlier and later requests are not comparable."
+        }
+      },
+      "required": [
+        "hmac_key"
+      ],
+      "type": "object"
+    },
+    "CaptureMode": {
+      "description": "What a client captures.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Nothing (the default).",
+          "type": "string"
+        },
+        {
+          "const": "structure",
+          "description": "The prompt's segment fingerprints (note 0052, slice 5a).",
+          "type": "string"
+        }
+      ]
+    },
     "Classifier": {
       "additionalProperties": false,
       "description": "An external classifier endpoint (note 0048): sent the text of a request or an answer, it\nanswers `allow` or `block`. Nothing else about the caller is sent.",
@@ -320,6 +349,17 @@
             "integer",
             "null"
           ]
+        },
+        "capture": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CaptureMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What to capture of this client's prompts for the cache debugger (note 0052): `off` (the default) or\n`structure`. Needs a `[capture]` table. Reloadable with the keys."
         },
         "client_san": {
           "default": null,
@@ -1760,6 +1800,17 @@
     "auth": {
       "$ref": "#/$defs/Auth",
       "description": "Other ways a caller proves who it is (0017). Fixed at start: a change is\nrefused by a reload, though a key's `jwt` binding reloads with the key."
+    },
+    "capture": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Capture"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Prompt-structure capture for the cache debugger (note 0052). A client opts in with `capture =\n\"structure\"` on its key. Fixed at start."
     },
     "classifiers": {
       "additionalProperties": {

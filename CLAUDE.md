@@ -826,6 +826,18 @@ organization bound, `expires_at` enforced at request time, a stale age with opti
 the cache. After a root or catalog version bump run `cargo update -p llmshim -p llmshim-catalog` in
 `crates/llmshim-control`.
 
+## Prompt structure capture (note 0052, slice 5a)
+
+`[capture] hmac_key` plus per-key `capture = "structure"` (needs `[usage_export]`) makes the gateway cut each opted-in
+client's **provider-native** request body into segments (`src/gateway/structure.rs`, one walker per wire) and send
+`{kind, hash, bytes}` per segment with the usage record. The hash is an HMAC under a deployment secret the control plane
+never has, so the control plane can compare fingerprints and never compute one. It is taken at admission from
+`PreparedAttempt::native_body`, never delays or fails a request, is dropped from the usage log (only the export carries
+it), and a reload replaces the set of capturing clients. The control plane (`crates/llmshim-control/src/structure.rs`,
+schema 7) pairs a request with the same client's request before it and says `identical`, `appended`, `shorter` or
+`changed` and where. Never store, log, label or export any prompt text on this path; payload capture (5b) is a separate,
+unbuilt decision.
+
 ## Cloud transports from the `serve` file (note 0020)
 
 `--features serve-cloud` builds Bedrock, Vertex and Azure into `serve`, so `[providers.*]` can

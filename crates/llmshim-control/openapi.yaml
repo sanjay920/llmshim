@@ -188,6 +188,38 @@ paths:
         '409': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
+  /v1/requests/{attempt}/structure:
+    get:
+      operationId: requestStructure
+      description: |
+        The prompt's structure for the cache debugger (note 0052): the segments (kind, keyed fingerprint, size; no
+        text) of an attempt whose client captures structure, and how it relates to the same client's request
+        before it (same provider and model, within an hour): `identical`, `appended` (it only added to the end),
+        `shorter`, or `changed` with the first segment that differs. 404 `no_structure` when the client does not
+        capture or the structure has aged out.
+      parameters:
+        - {name: attempt, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: The segments and the comparison}
+        '404': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+  /v1/requests/misses:
+    get:
+      operationId: requestMisses
+      description: |
+        Where cache misses start (note 0052): every consecutive pair of one client's captured requests in the
+        window (default the last 7 days), counted as identical, appended, shorter or changed, with the changed ones
+        counted by the kind of the first segment that differs, in total and for the 20 clients and models with the
+        most changes.
+      parameters:
+        - {name: from, in: query, required: false, schema: {type: string, format: date-time}}
+        - {name: to, in: query, required: false, schema: {type: string, format: date-time}}
+      responses:
+        '200': {description: The counts}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/history:
     get:
       operationId: history

@@ -736,7 +736,7 @@ fn a_model_list_is_checked_stored_copied_on_rotation_and_signed_only_when_set() 
 /// keys: version 1 had neither model lists nor tags, version 2 had model lists only.
 #[test]
 fn an_older_database_is_migrated_in_place() {
-    for from in [1_i64, 2, 3, 4, 5] {
+    for from in [1_i64, 2, 3, 4, 5, 6] {
         migrate_from(from);
     }
 }
@@ -744,10 +744,20 @@ fn an_older_database_is_migrated_in_place() {
 /// A migrated database has a working request ledger (note 0051).
 fn ledger_works(store: &mut Store) {
     let record = json!({"ts": "2026-11-19T10:00:00Z", "attempt_id": "mig-1", "provider": "p", "model": "m",
-        "kind": "completion", "outcome": "completed", "duration_ms": 1, "input_tokens": 1,
+        "key": "k", "kind": "completion", "outcome": "completed", "duration_ms": 1, "input_tokens": 1,
         "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 0, "usage_reported": true,
-        "admission": "fleet"});
+        "admission": "fleet", "structure": [{"kind": "user", "hash": "0123456789abcdef", "bytes": 5}]});
     assert_eq!(store.ingest_requests(&[record]).unwrap().accepted, 1);
+    // The prompt structure table (note 0052) works after a migration too.
+    assert_eq!(
+        store
+            .request_structure("mig-1")
+            .unwrap()
+            .unwrap()
+            .segments
+            .len(),
+        1
+    );
 }
 
 fn migrate_from(from: i64) {
@@ -769,8 +779,13 @@ fn migrate_from(from: i64) {
         4 => chain_columns.to_string(),
         _ => String::new(),
     };
-    // Every database older than version 6 has no request ledger (note 0051).
-    let drop_columns = format!("{drop_columns} DROP TABLE requests;");
+    // Every database older than version 6 has no request ledger (note 0051), and every one older than 7 has no
+    // prompt structure (note 0052).
+    let drop_columns = if from < 6 {
+        format!("{drop_columns} DROP TABLE request_structure; DROP TABLE requests;")
+    } else {
+        format!("{drop_columns} DROP TABLE request_structure;")
+    };
     let use_new_columns = |store: &mut Store, project: &str| {
         let mut new = NewKey::secret(project, "new");
         new.allowed_models = Some(vec!["openai/*".into()]);
