@@ -227,6 +227,42 @@ paths:
         '422': {$ref: '#/components/responses/Error'}
         '501': {$ref: '#/components/responses/Error'}
         '502': {$ref: '#/components/responses/Error'}
+  /v1/requests/erase:
+    post:
+      operationId: eraseRequests
+      description: |
+        Delete the request ledger rows and stored prompt structures of a tenant, of a key, or of a key within a tenant
+        (a deletion request; note 0056). **Admin only.** At least one of `tenant` and `key` is required, and `confirm`
+        must repeat the key (or, with no key, the tenant): 400 `confirmation_mismatch` otherwise. One `requests.erased`
+        row is written to the change history (who, how they were identified, the selector and the counts, never what
+        the rows said). Sealed payloads lose their references here, so nothing can open them; the objects on a
+        gateway's store are deleted by its sweeper at their retention. The answer counts what went.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm]
+              additionalProperties: false
+              properties:
+                tenant: {type: string}
+                key: {type: string}
+                confirm: {type: string}
+      responses:
+        '200':
+          description: What was erased
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requests: {type: integer}
+                  structures: {type: integer}
+                  payload_references: {type: integer}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/requests/{attempt}/payload/diff:
     get:
       operationId: requestPayloadDiff

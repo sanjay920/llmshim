@@ -833,6 +833,8 @@ older SQLite database to `<db>.pre-v<N>.bak` first, and Postgres needs a `pg_dum
 `Store::open_existing` / `open_postgres_existing`: an old, empty or newer schema is refused and left untouched. A migration
 must stay additive. Requests wait for the store behind a bounded line (16 reads, 64 usage batches, one 10 s deadline, 503
 `store_busy`), and a SQLite transaction past 30 s is 503 `store_timeout`.
+`POST /v1/requests/erase` (admin, typed confirmation, one history row) deletes a tenant's or key's ledger rows and structures;
+structures carry the tenant (schema 9) so pairing never crosses tenants (note 0056).
 
 ## Prompt structure capture (note 0052, slice 5a)
 

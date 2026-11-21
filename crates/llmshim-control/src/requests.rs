@@ -524,9 +524,9 @@ impl Store {
                 // The structure goes in with its row, once: a repeated attempt keeps the first.
                 if let (1, Some(segments), Some(key)) = (stored, &row.structure, &row.key_name) {
                     tx.exec(
-                        "INSERT INTO request_structure (attempt_id, ts_ms, key_name, provider, model, segments) \
-                         VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT (attempt_id) DO NOTHING",
-                        &[t(&row.attempt_id), i(row.ts_ms), t(key), t(&row.provider), t(&row.model), t(&crate::structure::encode(segments))],
+                        "INSERT INTO request_structure (attempt_id, ts_ms, key_name, provider, model, segments, tenant) \
+                         VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT (attempt_id) DO NOTHING",
+                        &[t(&row.attempt_id), i(row.ts_ms), t(key), t(&row.provider), t(&row.model), t(&crate::structure::encode(segments)), ot(row.tenant.as_deref())],
                     )?;
                 }
             }
@@ -742,6 +742,88 @@ impl Store {
                 attempt_id,
                 json!({"attempt_id": attempt_id, "via": via}),
             )
+        })
+    }
+}
+
+/// What an erasure removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Erased {
+    pub requests: u64,
+    pub structures: u64,
+    /// Rows that held a reference to a sealed payload. The references are gone, so nothing can open those objects any
+    /// more; the objects themselves (ciphertext, on a gateway's object store) go when the gateway's sweeper reaches
+    /// their retention.
+    pub payload_references: u64,
+}
+
+impl Store {
+    /// Erase every ledger row of a tenant, of a key, or of a key within a tenant (a person's or a customer's request
+    /// for deletion), with the prompt structures that belong to them, and write one row to the change history that
+    /// says who did it and how much went (never what the rows said). At least one of the two selectors is required.
+    pub fn erase_requests(
+        &mut self,
+        tenant: Option<&str>,
+        key: Option<&str>,
+        actor: &str,
+        via: &str,
+    ) -> Result<Erased> {
+        crate::actor_check(actor)?;
+        let mut clauses = Vec::new();
+        let mut params: Vec<Param> = Vec::new();
+        for (column, value) in [("tenant", tenant), ("key_name", key)] {
+            if let Some(value) = value {
+                params.push(t(value));
+                clauses.push(format!("{column} = ?{}", params.len()));
+            }
+        }
+        if clauses.is_empty() {
+            return Err(Error::Invalid(
+                "name a tenant, a key or both to erase".into(),
+            ));
+        }
+        let selector = clauses.join(" AND ");
+        let label = match (tenant, key) {
+            (Some(t), Some(k)) => format!("{t}/{k}"),
+            (Some(t), None) => t.to_string(),
+            (None, Some(k)) => k.to_string(),
+            (None, None) => unreachable!("checked above"),
+        };
+        self.backend.transaction(true, |tx| {
+            let held = tx
+                .query(
+                    &format!("SELECT COUNT(*) FROM requests WHERE {selector} AND payload_ref IS NOT NULL"),
+                    &params,
+                )?
+                .first()
+                .map(|row| row.int(0))
+                .transpose()?
+                .unwrap_or(0);
+            // The structures first: they are found through the rows that are about to go.
+            let structures = tx.exec(
+                &format!(
+                    "DELETE FROM request_structure WHERE attempt_id IN (SELECT attempt_id FROM requests WHERE {selector})"
+                ),
+                &params,
+            )?;
+            let requests = tx.exec(&format!("DELETE FROM requests WHERE {selector}"), &params)?;
+            let erased = Erased {
+                requests,
+                structures,
+                payload_references: held as u64,
+            };
+            crate::history(
+                tx,
+                actor,
+                "requests.erased",
+                &label,
+                json!({
+                    "tenant": tenant, "key": key, "via": via,
+                    "requests": erased.requests, "structures": erased.structures,
+                    "payload_references": erased.payload_references,
+                }),
+            )?;
+            Ok(erased)
         })
     }
 }

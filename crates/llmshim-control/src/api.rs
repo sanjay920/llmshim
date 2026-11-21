@@ -42,6 +42,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/v1/requests/summary"),
     ("get", "/v1/requests/facets"),
     ("get", "/v1/requests/misses"),
+    ("post", "/v1/requests/erase"),
     ("get", "/v1/requests/{attempt}/structure"),
     ("get", "/v1/requests/{attempt}/payload"),
     ("get", "/v1/requests/{attempt}/payload/diff"),
@@ -211,6 +212,8 @@ pub const ROLES: &[(&str, &str, Option<Role>)] = &[
     ("get", "/v1/requests/summary", Some(Role::Read)),
     ("get", "/v1/requests/facets", Some(Role::Read)),
     ("get", "/v1/requests/misses", Some(Role::Read)),
+    // Deleting customer data on request (note 0056): admin only, and the history says who and how much.
+    ("post", "/v1/requests/erase", Some(Role::Admin)),
     ("get", "/v1/requests/{attempt}/structure", Some(Role::Read)),
     // A captured payload is customer data (note 0052, slice 5b): admin only, and every view is recorded.
     ("get", "/v1/requests/{attempt}/payload", Some(Role::Admin)),
@@ -1027,6 +1030,48 @@ async fn request_structure(
 /// a row in the change history, written **before** anything is fetched, says who asked for which attempt; the
 /// control plane holds only an opaque reference and cannot open it, so a gateway does, through its admin listener; the
 /// answer is never cached; and nothing of it is stored, logged or put in an error here.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EraseBody {
+    tenant: Option<String>,
+    key: Option<String>,
+    /// Must repeat the key (or, with no key, the tenant): a deletion is not one stray request away.
+    confirm: String,
+}
+
+/// `POST /v1/requests/erase`: delete the ledger rows and prompt structures of a tenant, a key, or a key within a
+/// tenant, and say how much went. The change history gets one row (who, how established, the selector, the counts).
+/// Sealed payloads on a gateway lose their references here and are deleted by the gateway's sweeper at their retention.
+async fn erase_requests(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    principal: Option<axum::Extension<Principal>>,
+    Body(body): Body<EraseBody>,
+) -> ApiResult<Json<Value>> {
+    let actor = actor(&headers)?;
+    let via = principal.map_or("shared_token", |axum::Extension(p)| p.via);
+    let expected = body.key.as_deref().or(body.tenant.as_deref());
+    if expected.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "name a tenant, a key or both to erase",
+        ));
+    }
+    if expected != Some(body.confirm.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "confirmation_mismatch",
+            "confirm must repeat the key (or, with no key, the tenant) being erased",
+        ));
+    }
+    let erased = with_store(&s, move |st| {
+        st.erase_requests(body.tenant.as_deref(), body.key.as_deref(), &actor, via)
+    })
+    .await?;
+    Ok(Json(json!(erased)))
+}
+
 async fn request_payload(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1539,6 +1584,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/requests/summary", get(requests_summary))
         .route("/v1/requests/facets", get(requests_facets))
         .route("/v1/requests/misses", get(requests_misses))
+        .route("/v1/requests/erase", post(erase_requests))
         .route("/v1/requests/{attempt}/structure", get(request_structure))
         .route("/v1/requests/{attempt}/payload", get(request_payload))
         .route(
