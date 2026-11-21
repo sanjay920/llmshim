@@ -612,7 +612,7 @@ impl Store {
         match &mut backend {
             Backend::Sqlite(connection) => {
                 connection
-                    .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+                    .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")
                     .map_err(|e| Error::Database(e.to_string()))?;
                 let version: i64 = connection
                     .query_row("PRAGMA user_version", [], |row| row.get(0))

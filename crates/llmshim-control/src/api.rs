@@ -52,8 +52,18 @@ pub const ROUTES: &[(&str, &str)] = &[
 /// Shortest bearer token accepted, as for the data plane's callers.
 pub const MIN_TOKEN_LEN: usize = 22;
 
+/// Requests that may be waiting for, or holding, the store at once. The store is one connection behind one lock, so
+/// every request is serialized; more than this many in line means the database is slower than the callers, and the
+/// answer is an immediate 503 rather than a growing pile of blocked threads.
+const STORE_QUEUE: usize = 64;
+/// The longest one request waits for its turn before it is told the control plane is busy.
+const STORE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct AppState {
     store: Mutex<Store>,
+    /// Admission to the store: `STORE_QUEUE` permits, held until the work is done.
+    gate: Arc<tokio::sync::Semaphore>,
+    store_wait: std::time::Duration,
     /// The shared token's digest; `None` when SSO is on and break-glass is off.
     token_digest: Option<[u8; 32]>,
     signing_key_file: Option<PathBuf>,
@@ -98,6 +108,8 @@ impl AppState {
     pub fn new(store: Store, token: &str, signing_key_file: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             store: Mutex::new(store),
+            gate: Arc::new(tokio::sync::Semaphore::new(STORE_QUEUE)),
+            store_wait: STORE_WAIT,
             token_digest: Some(Sha256::digest(token.as_bytes()).into()),
             signing_key_file,
             sso: None,
@@ -121,6 +133,8 @@ impl AppState {
         let ui = crate::ui::Ui::new(sso.ui(), sso.break_glass());
         Arc::new(Self {
             store: Mutex::new(store),
+            gate: Arc::new(tokio::sync::Semaphore::new(STORE_QUEUE)),
+            store_wait: STORE_WAIT,
             token_digest: token.map(|token| Sha256::digest(token.as_bytes()).into()),
             signing_key_file,
             sso: Some(sso),
@@ -250,11 +264,18 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let retry = self.code == "store_busy";
+        let mut response = (
             self.status,
             Json(json!({"error": {"code": self.code, "message": self.message}})),
         )
-            .into_response()
+            .into_response();
+        if retry {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        }
+        response
     }
 }
 
@@ -324,8 +345,22 @@ async fn with_store<T: Send + 'static>(
     state: &Arc<AppState>,
     work: impl FnOnce(&mut Store) -> crate::Result<T> + Send + 'static,
 ) -> ApiResult<T> {
+    let busy = || {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "store_busy",
+            "the control plane's database is busy; retry shortly",
+        )
+    };
+    // Waiting for a turn is bounded in length (the permits) and in time, so a slow query holds up its own queue and
+    // nothing more: callers past it get a 503 and a Retry-After instead of blocking threads without end.
+    let permit = tokio::time::timeout(state.store_wait, state.gate.clone().acquire_owned())
+        .await
+        .map_err(|_| busy())?
+        .map_err(|_| busy())?;
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
         work(&mut store)
     })
@@ -1488,6 +1523,33 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_full_queue_for_the_store_is_a_503_with_retry_after_not_a_hang() {
+        let mut state = AppState::new(
+            Store::open_in_memory().unwrap(),
+            "a-token-of-sufficient-length-0123",
+            None,
+        );
+        Arc::get_mut(&mut state).unwrap().store_wait = std::time::Duration::from_millis(50);
+        // Every permit is out: the next request waits its bounded time and is refused.
+        let held = state
+            .gate
+            .clone()
+            .acquire_many_owned(STORE_QUEUE as u32)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let refused = with_store(&state, |st| st.orgs()).await.err().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(refused.code, "store_busy");
+        let response = refused.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+        // Released, the store answers again.
+        drop(held);
+        assert!(with_store(&state, |st| st.orgs()).await.is_ok());
+    }
 
     #[test]
     fn a_route_with_no_line_in_the_table_needs_admin() {

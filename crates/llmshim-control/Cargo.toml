@@ -11,7 +11,7 @@ publish = false
 
 [dependencies]
 llmshim = { path = "../..", features = ["serve"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 postgres = "0.19"
 tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -27,7 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 ring = "0.17"
 axum = { version = "0.8", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 
 [dev-dependencies]
 async-trait = "0.1"

@@ -134,6 +134,9 @@ impl Drop for PgClient {
     }
 }
 
+/// How long one SQLite transaction may run (Postgres: `statement_timeout`, 30 s).
+const SQLITE_STATEMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(crate) enum Backend {
     Sqlite(rusqlite::Connection),
     Postgres(PgClient),
@@ -163,17 +166,22 @@ impl Backend {
                 } else {
                     rusqlite::TransactionBehavior::Deferred
                 };
-                let tx = connection
-                    .transaction_with_behavior(behavior)
-                    .map_err(database)?;
-                let result = work(&mut SqliteExec(&tx));
-                match result {
-                    Ok(value) => {
-                        tx.commit().map_err(database)?;
-                        Ok(value)
-                    }
-                    Err(error) => Err(error),
-                }
+                // The same bound Postgres has as `statement_timeout`: a transaction running past it is interrupted
+                // (SQLite checks the handler every thousand virtual-machine steps), so one slow query cannot hold the
+                // connection, and with it every request, for ever.
+                let deadline = std::time::Instant::now() + SQLITE_STATEMENT_BUDGET;
+                connection
+                    .progress_handler(1000, Some(move || std::time::Instant::now() > deadline));
+                let result = (|| {
+                    let tx = connection
+                        .transaction_with_behavior(behavior)
+                        .map_err(database)?;
+                    let value = work(&mut SqliteExec(&tx))?;
+                    tx.commit().map_err(database)?;
+                    Ok(value)
+                })();
+                connection.progress_handler(1000, None::<fn() -> bool>);
+                result
             }
             Backend::Postgres(client) => {
                 // The synchronous client drives its own runtime, which a thread inside another
@@ -462,6 +470,31 @@ mod tests {
             pg_sql("INSERT INTO t (a, b) VALUES (?1, ?10) WHERE x = 'a?b' AND y = ?2"),
             "INSERT INTO t (a, b) VALUES ($1, $10) WHERE x = 'a?b' AND y = $2"
         );
+    }
+
+    #[test]
+    fn a_sqlite_transaction_past_its_budget_is_interrupted() {
+        let mut backend = Backend::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        // An unbounded recursive query: only the deadline can end it. The budget is 30 s, so this test arms its own
+        // shorter one through the same handler.
+        let Backend::Sqlite(connection) = &mut backend else {
+            unreachable!()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        connection.progress_handler(1000, Some(move || std::time::Instant::now() > deadline));
+        let error = connection
+            .query_row(
+                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT count(*) FROM n",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("interrupt"), "{error}");
+        // The handler is cleared after a transaction, so the next one is not cut by an old deadline.
+        let rows = backend
+            .transaction(false, |tx| tx.query("SELECT 1", &[]))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
