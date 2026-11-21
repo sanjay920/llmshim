@@ -43,6 +43,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("get", "/v1/requests/facets"),
     ("get", "/v1/requests/misses"),
     ("get", "/v1/requests/{attempt}/structure"),
+    ("get", "/v1/requests/{attempt}/payload"),
     ("post", "/v1/orgs/{org}/snapshots"),
     ("get", "/v1/orgs/{org}/snapshot"),
 ];
@@ -177,6 +178,8 @@ pub const ROLES: &[(&str, &str, Option<Role>)] = &[
     ("get", "/v1/requests/facets", Some(Role::Read)),
     ("get", "/v1/requests/misses", Some(Role::Read)),
     ("get", "/v1/requests/{attempt}/structure", Some(Role::Read)),
+    // A captured payload is customer data (note 0052, slice 5b): admin only, and every view is recorded.
+    ("get", "/v1/requests/{attempt}/payload", Some(Role::Admin)),
     ("post", "/v1/orgs/{org}/snapshots", Some(Role::Admin)),
     ("get", "/v1/orgs/{org}/snapshot", Some(Role::Read)),
 ];
@@ -922,6 +925,77 @@ async fn request_structure(
     })))
 }
 
+/// A captured request and answer, opened by a gateway (note 0052, slice 5b). Customer data, so: the admin role only;
+/// a row in the change history, written **before** anything is fetched, says who asked for which attempt; the
+/// control plane holds only an opaque reference and cannot open it, so a gateway does, through its admin listener; the
+/// answer is never cached; and nothing of it is stored, logged or put in an error here.
+async fn request_payload(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    principal: Option<axum::Extension<Principal>>,
+    Path(attempt): Path<String>,
+) -> ApiResult<Response> {
+    let actor = actor(&headers)?;
+    // How the actor was established, for the record: a verified person, the break-glass token, or (with one shared
+    // token and no identity provider) a label the caller gave.
+    let via = principal.map_or("shared_token", |axum::Extension(p)| p.via);
+    let asked = attempt.clone();
+    let Some((reference, expires_ms)) =
+        with_store(&s, move |st| st.payload_reference(&asked)).await?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no_payload",
+            "no payload was captured for this request: its client does not capture payloads",
+        ));
+    };
+    if expires_ms < chrono::Utc::now().timestamp_millis() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "payload_expired",
+            "this payload has passed its retention and is deleted",
+        ));
+    }
+    // The record of the view comes first: a view with no row cannot exist, whatever happens next.
+    let viewed = attempt.clone();
+    with_store(&s, move |st| st.record_payload_view(&viewed, &actor, via)).await?;
+    let Some(gateways) = s.gateways.get() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "gateways_not_configured",
+            "payloads are opened through the gateways' admin listeners: start the control plane with --gateways-file",
+        ));
+    };
+    match gateways.open_payload(&reference).await {
+        Ok(document) => {
+            let mut response =
+                Json(json!({"attempt_id": attempt, "payload": document})).into_response();
+            let headers = response.headers_mut();
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            headers.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
+            Ok(response)
+        }
+        Err(crate::gateways::OpenError::NotFound) => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "payload_gone",
+            "no gateway has this payload: it was deleted, or its write did not complete",
+        )),
+        Err(crate::gateways::OpenError::BadReference) => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "payload_unreadable",
+            "no gateway could open this payload: it was captured under another capture key",
+        )),
+        Err(_) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "gateways_unavailable",
+            "no gateway could be reached to open this payload; try again",
+        )),
+    }
+}
+
 /// Across a window: how consecutive requests of each client relate, and where the changed ones first differ.
 async fn requests_misses(
     State(s): State<Arc<AppState>>,
@@ -1146,6 +1220,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/requests/facets", get(requests_facets))
         .route("/v1/requests/misses", get(requests_misses))
         .route("/v1/requests/{attempt}/structure", get(request_structure))
+        .route("/v1/requests/{attempt}/payload", get(request_payload))
         .route("/v1/orgs/{org}/snapshots", post(publish))
         .route("/v1/orgs/{org}/snapshot", get(latest))
         .fallback(no_route)

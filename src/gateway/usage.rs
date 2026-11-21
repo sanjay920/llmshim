@@ -105,6 +105,84 @@ pub struct UsageRecord {
     /// Hashes, kinds and sizes: none of the prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure: Option<Vec<crate::gateway::structure::Segment>>,
+    /// A sealed copy of the request and the answer, for a client that opts in to payload capture (note 0052,
+    /// slice 5b): an opaque reference only. The text is in the object store, sealed; the reference opens nothing
+    /// without the deployment's capture key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<StoredPayload>,
+}
+
+/// Where a captured payload went, as the record carries it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StoredPayload {
+    /// Opaque: the object's name, its length and its key wrapped under the deployment's capture key.
+    pub reference: String,
+    /// The size of the stored document, before sealing.
+    pub bytes: u64,
+    /// When the object is due to be deleted (RFC 3339).
+    pub expires_at: String,
+}
+
+/// Seals a payload document and queues its write (note 0052, slice 5b). Called once, when an attempt ends, with
+/// the whole document; `None` when it was dropped (a full queue, a document the store would refuse), counted.
+pub trait PayloadWriter: Send + Sync {
+    fn store(&self, document: Vec<u8>) -> Option<StoredPayload>;
+}
+
+/// A bounded copy of a text: the first `max` bytes of it, and whether there was more.
+struct Capped {
+    text: Vec<u8>,
+    seen: u64,
+    max: usize,
+}
+
+impl Capped {
+    fn new(max: usize) -> Self {
+        Self {
+            text: Vec::new(),
+            seen: 0,
+            max,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.seen += bytes.len() as u64;
+        let room = self.max.saturating_sub(self.text.len());
+        self.text.extend_from_slice(&bytes[..bytes.len().min(room)]);
+    }
+
+    fn json(&self) -> Value {
+        serde_json::json!({
+            "text": String::from_utf8_lossy(&self.text),
+            "bytes": self.seen,
+            "truncated": self.seen > self.text.len() as u64,
+        })
+    }
+}
+
+impl std::io::Write for Capped {
+    /// Past the cap the write is refused, which stops the serializer feeding it: a huge body costs the time of its
+    /// first `max` bytes, not of all of them. The size reported is then the cap and more, never the true size.
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.text.len() >= self.max {
+            self.seen += 1;
+            return Err(std::io::Error::other("capped"));
+        }
+        self.push(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The request and the answer of one attempt, collected while it runs.
+struct PendingPayload {
+    wire: crate::reasoning::WireFormat,
+    request: Capped,
+    response: Capped,
+    writer: Arc<dyn PayloadWriter>,
 }
 
 /// Receives a record when an attempt ends. Called inline on the response path:
@@ -141,6 +219,16 @@ pub struct UsageSetup {
 pub struct StructureCapture {
     key: Arc<Vec<u8>>,
     clients: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    payload: Option<PayloadCapture>,
+}
+
+/// Payload capture (note 0052, slice 5b): which clients opted in, where the document goes, and the most of the
+/// request and of the answer that is kept.
+#[derive(Clone)]
+pub struct PayloadCapture {
+    clients: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    writer: Arc<dyn PayloadWriter>,
+    max_bytes: usize,
 }
 
 impl StructureCapture {
@@ -148,9 +236,67 @@ impl StructureCapture {
         let capture = Self {
             key: Arc::new(key),
             clients: Default::default(),
+            payload: None,
         };
         capture.set_clients(clients);
         capture
+    }
+
+    /// Also capture payloads, for `clients`, through `writer`, keeping at most `max_bytes` of the request and of the
+    /// answer each.
+    pub fn with_payload(
+        mut self,
+        writer: Arc<dyn PayloadWriter>,
+        max_bytes: usize,
+        clients: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.payload = Some(PayloadCapture {
+            clients: Default::default(),
+            writer,
+            max_bytes,
+        });
+        self.set_payload_clients(clients);
+        self
+    }
+
+    /// The credentials that capture payloads; everyone else does not. A reload replaces the set.
+    pub fn set_payload_clients(&self, clients: impl IntoIterator<Item = String>) {
+        if let Some(payload) = &self.payload {
+            let mut set = payload.clients.write().unwrap_or_else(|p| p.into_inner());
+            *set = clients
+                .into_iter()
+                .map(|c| credential_prefix(&c).to_owned())
+                .collect();
+        }
+    }
+
+    /// The pending payload of an attempt of `credential`, when it opted in.
+    fn pending_payload(
+        &self,
+        credential: Option<&str>,
+        wire: crate::reasoning::WireFormat,
+        body: &Value,
+    ) -> Option<PendingPayload> {
+        let payload = self.payload.as_ref()?;
+        let credential = credential?;
+        if !payload
+            .clients
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(credential_prefix(credential))
+        {
+            return None;
+        }
+        let mut request = Capped::new(payload.max_bytes);
+        // A body is written into the bounded copy as it is serialized, and the serializer is stopped when the copy is
+        // full: a huge body costs the time of its first `max_bytes`, and its memory is the cap.
+        let _ = serde_json::to_writer(&mut request, body);
+        Some(PendingPayload {
+            wire,
+            request,
+            response: Capped::new(payload.max_bytes),
+            writer: payload.writer.clone(),
+        })
     }
 
     /// The credentials (whole scope digests or the prefix a policy scope carries) that capture; everyone else
@@ -376,6 +522,7 @@ struct Open {
     terminal_provider_usd: Option<f64>,
     terminal_catalog_usd: Option<f64>,
     structure: Option<Vec<crate::gateway::structure::Segment>>,
+    payload: Option<PendingPayload>,
 }
 
 /// Tracks attempts in flight and emits one record when each ends.
@@ -426,6 +573,10 @@ impl UsageRecorder {
             .capture
             .as_ref()
             .and_then(|capture| capture.segments(credential, identity.wire(), native_body));
+        let payload = self
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.pending_payload(credential, identity.wire(), native_body));
         let span = self.spans.as_ref().map(|spans| {
             spans.start(&AttemptBegun {
                 request_id,
@@ -451,6 +602,7 @@ impl UsageRecorder {
             terminal_provider_usd: None,
             terminal_catalog_usd: None,
             structure,
+            payload,
         };
         if let Ok(mut attempts) = self.open.lock() {
             attempts.insert(identity.id(), open);
@@ -484,6 +636,35 @@ impl UsageRecorder {
         }
     }
 
+    /// One frame of the attempt's answer as the provider sent it, for a client that captures payloads: a stream's
+    /// events are kept in arrival order up to the cap, a non-streaming body as it is.
+    pub(crate) fn observe_native(&self, id: uuid::Uuid, frame: crate::policy::NativeFrame<'_>) {
+        // Every frame of every stream comes through here: with payload capture off there is nothing to keep, and the
+        // lock is not taken.
+        if !self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.payload.is_some())
+        {
+            return;
+        }
+        let Ok(mut attempts) = self.open.lock() else {
+            return;
+        };
+        let Some(pending) = attempts.get_mut(&id).and_then(|open| open.payload.as_mut()) else {
+            return;
+        };
+        match frame {
+            crate::policy::NativeFrame::StreamData { data } => {
+                pending.response.push(data.as_bytes());
+                pending.response.push(b"\n");
+            }
+            crate::policy::NativeFrame::ResponseBody { body } => {
+                let _ = serde_json::to_writer(&mut pending.response, body);
+            }
+        }
+    }
+
     /// The attempt ended. Exactly one record per admitted attempt: a second call
     /// for the same id (a finish followed by a drop notification) finds nothing.
     pub(crate) fn finish(&self, id: uuid::Uuid, outcome: AttemptOutcome) {
@@ -491,7 +672,26 @@ impl UsageRecorder {
             return;
         };
         let span = open.span.take();
-        let record = build(id, open, outcome, self.admission);
+        let pending = open.payload.take();
+        let mut record = build(id, open, outcome, self.admission);
+        if let Some(pending) = pending {
+            // The document is the request and the answer as the provider saw them; the writer seals it and
+            // queues the write, and the record carries only the reference.
+            let document = serde_json::json!({
+                "v": 1,
+                "attempt_id": record.attempt_id,
+                "ts": record.ts,
+                "wire": crate::gateway::structure::wire_name(pending.wire),
+                "provider": record.provider,
+                "model": record.model,
+                "outcome": record.outcome,
+                "request": pending.request.json(),
+                "response": pending.response.json(),
+            });
+            if let Ok(bytes) = serde_json::to_vec(&document) {
+                record.payload = pending.writer.store(bytes);
+            }
+        }
         #[cfg(feature = "serve")]
         count_spend(&record);
         if let Some(span) = span {
@@ -640,6 +840,7 @@ fn build(
         usage_reported: usage.is_some(),
         admission,
         structure: open.structure,
+        payload: None,
     }
 }
 

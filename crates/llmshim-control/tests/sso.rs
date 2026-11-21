@@ -209,10 +209,12 @@ async fn every_route_has_a_required_role_and_only_routes_have_one() {
 #[tokio::test]
 async fn each_role_gets_exactly_its_routes() {
     let api = Api::new(true);
-    // Every GET is a read route except the history chain check, which scans the whole history: admin only.
+    // Every GET is a read route except the two that are admin only: the history chain check, which scans the
+    // whole history, and a captured payload, which is customer data.
+    let admin_gets = ["/v1/history/verify", "/v1/requests/{attempt}/payload"];
     let read_routes: Vec<_> = ROUTES
         .iter()
-        .filter(|(m, p)| *m == "get" && *p != "/v1/history/verify")
+        .filter(|(m, p)| *m == "get" && !admin_gets.contains(p))
         .collect();
     let key_routes = [
         ("post", "/v1/projects/{project}/keys"),

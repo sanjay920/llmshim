@@ -736,7 +736,7 @@ fn a_model_list_is_checked_stored_copied_on_rotation_and_signed_only_when_set() 
 /// keys: version 1 had neither model lists nor tags, version 2 had model lists only.
 #[test]
 fn an_older_database_is_migrated_in_place() {
-    for from in [1_i64, 2, 3, 4, 5, 6] {
+    for from in [1_i64, 2, 3, 4, 5, 6, 7] {
         migrate_from(from);
     }
 }
@@ -746,7 +746,8 @@ fn ledger_works(store: &mut Store) {
     let record = json!({"ts": "2026-11-19T10:00:00Z", "attempt_id": "mig-1", "provider": "p", "model": "m",
         "key": "k", "kind": "completion", "outcome": "completed", "duration_ms": 1, "input_tokens": 1,
         "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 0, "usage_reported": true,
-        "admission": "fleet", "structure": [{"kind": "user", "hash": "0123456789abcdef", "bytes": 5}]});
+        "admission": "fleet", "structure": [{"kind": "user", "hash": "0123456789abcdef", "bytes": 5}],
+        "payload": {"reference": "abc_DEF-123", "bytes": 10, "expires_at": "2099-01-01T00:00:00Z"}});
     assert_eq!(store.ingest_requests(&[record]).unwrap().accepted, 1);
     // The prompt structure table (note 0052) works after a migration too.
     assert_eq!(
@@ -758,7 +759,15 @@ fn ledger_works(store: &mut Store) {
             .len(),
         1
     );
+    // And so do the payload columns (note 0052, slice 5b).
+    assert_eq!(
+        store.payload_reference("mig-1").unwrap().unwrap().0,
+        "abc_DEF-123"
+    );
 }
+
+const PAYLOAD_DROP: &str = "ALTER TABLE requests DROP COLUMN payload_ref; \
+    ALTER TABLE requests DROP COLUMN payload_bytes; ALTER TABLE requests DROP COLUMN payload_expires_ms;";
 
 fn migrate_from(from: i64) {
     // What a database of that version did not have yet: keys.allowed_models (2), keys.tags (3),
@@ -781,10 +790,13 @@ fn migrate_from(from: i64) {
     };
     // Every database older than version 6 has no request ledger (note 0051), and every one older than 7 has no
     // prompt structure (note 0052).
+    // Every one older than 8 has no payload columns on the ledger (note 0052, slice 5b).
     let drop_columns = if from < 6 {
         format!("{drop_columns} DROP TABLE request_structure; DROP TABLE requests;")
+    } else if from < 7 {
+        format!("{drop_columns} DROP TABLE request_structure; {PAYLOAD_DROP}")
     } else {
-        format!("{drop_columns} DROP TABLE request_structure;")
+        format!("{drop_columns} {PAYLOAD_DROP}")
     };
     let use_new_columns = |store: &mut Store, project: &str| {
         let mut new = NewKey::secret(project, "new");

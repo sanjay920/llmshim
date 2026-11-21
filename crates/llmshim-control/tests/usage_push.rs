@@ -46,6 +46,7 @@ fn usage(id: &str) -> UsageRecord {
         usage_reported: true,
         admission: "fleet",
         structure: None,
+        payload: None,
     }
 }
 

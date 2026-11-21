@@ -1417,6 +1417,13 @@ impl AttemptCoordinator {
             recorder.finish(attempt_id, outcome);
         }
     }
+
+    /// The provider's own frame of an attempt's answer, for a client that captures payloads (note 0052).
+    fn note_native(&self, attempt_id: uuid::Uuid, frame: crate::policy::NativeFrame<'_>) {
+        if let Some(recorder) = self.usage.get() {
+            recorder.observe_native(attempt_id, frame);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1549,6 +1556,10 @@ impl AttemptPolicy for CoordinatedAttemptPolicy {
         self.coordinator.end_usage(attempt.id(), outcome);
         self.coordinator.release(attempt.id());
         Ok(())
+    }
+
+    fn observe_native(&self, attempt: &AttemptIdentity, frame: crate::policy::NativeFrame<'_>) {
+        self.coordinator.note_native(attempt.id(), frame);
     }
 }
 
@@ -5958,6 +5969,170 @@ mod usage_records {
                 assert!(text.contains(expected), "{expected}\n{text}");
             }
         }
+    }
+
+    /// A payload writer that keeps the documents it is given.
+    #[derive(Default)]
+    struct Documents(std::sync::Mutex<Vec<serde_json::Value>>);
+
+    impl crate::gateway::usage::PayloadWriter for Documents {
+        fn store(&self, document: Vec<u8>) -> Option<crate::gateway::usage::StoredPayload> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&document).unwrap());
+            Some(crate::gateway::usage::StoredPayload {
+                reference: "opaque-reference".into(),
+                bytes: document.len() as u64,
+                expires_at: "2026-12-01T00:00:00Z".into(),
+            })
+        }
+    }
+
+    fn payload_coordinator(
+        max: usize,
+    ) -> (Arc<AttemptCoordinator>, Arc<Collected>, Arc<Documents>) {
+        let coordinator = AttemptCoordinator::local_with_retention(
+            RateLimitConfig::default(),
+            4,
+            Duration::from_secs(1),
+            1000,
+            false,
+        );
+        let collected = Arc::new(Collected::default());
+        let documents = Arc::new(Documents::default());
+        let capture = crate::gateway::usage::StructureCapture::new(
+            b"k".repeat(32),
+            ["known-credential".to_owned()],
+        )
+        .with_payload(documents.clone(), max, ["known-credential".to_owned()]);
+        coordinator.set_usage_sink(crate::gateway::usage::UsageSetup {
+            sink: collected.clone(),
+            tenants: crate::gateway::usage::TenantNames::new(KNOWN.iter().map(|t| t.to_string())),
+            keys: crate::gateway::usage::KeyNames::new([(
+                "known-credential".to_string(),
+                "checkout".to_string(),
+            )]),
+            capture: Some(capture),
+            spans: None,
+        });
+        (coordinator, collected, documents)
+    }
+
+    async fn admit_body(
+        coordinator: &Arc<AttemptCoordinator>,
+        credential: &str,
+        body: serde_json::Value,
+    ) -> crate::policy::AttemptTracker {
+        let target = crate::reasoning::ReplayTarget::new(
+            "test-provider",
+            "test-model",
+            crate::reasoning::WireFormat::OpenAiChat,
+        );
+        let mut scope = scope(Some("payments"), None);
+        scope.credential = Some(credential.to_owned());
+        coordinator
+            .context(scope)
+            .acquire(
+                AttemptKind::Completion,
+                "test-provider/test-model",
+                &target,
+                "http://127.0.0.1/provider",
+                &body,
+            )
+            .await
+            .ok()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_opted_in_client_has_its_request_and_answer_sealed_and_the_record_carries_only_a_reference(
+    ) {
+        let (coordinator, collected, documents) = payload_coordinator(1 << 20);
+        let body = json!({"model": "test-model", "messages": [{"role": "user", "content": "the launch codes"}]});
+        let mut tracker = admit_body(&coordinator, "known-credential", body.clone()).await;
+        tracker.native(crate::policy::NativeFrame::ResponseBody {
+            body: &json!({"choices": [{"message": {"content": "12345"}}]}),
+        });
+        tracker.finish(done()).await.unwrap();
+        drop(tracker);
+        let records = collected.0.lock().unwrap();
+        let record = &records[0];
+        let payload = record.payload.as_ref().expect("a payload reference");
+        assert_eq!(
+            (payload.reference.as_str(), payload.expires_at.as_str()),
+            ("opaque-reference", "2026-12-01T00:00:00Z")
+        );
+        // The record says nothing of the text, in any field: the reference is all there is.
+        let recorded = serde_json::to_string(record).unwrap();
+        assert!(
+            !recorded.contains("launch codes") && !recorded.contains("12345"),
+            "{recorded}"
+        );
+        // The document is the request as the provider saw it and the answer as it sent it.
+        let documents = documents.0.lock().unwrap();
+        let document = &documents[0];
+        assert_eq!(
+            (
+                document["wire"].as_str(),
+                document["model"].as_str(),
+                document["outcome"].as_str()
+            ),
+            (Some("openai-chat"), Some("test-model"), Some("completed"))
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                document["request"]["text"].as_str().unwrap()
+            )
+            .unwrap(),
+            body
+        );
+        assert_eq!(document["request"]["truncated"], false);
+        assert!(document["response"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("12345"));
+        // Structure rides along: a payload client captures it too.
+        assert!(record.structure.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_did_not_opt_in_has_no_payload_and_a_long_request_is_cut_and_says_so() {
+        let (coordinator, collected, documents) = payload_coordinator(64);
+        // A key the configuration does not list: nothing is captured, not even a document.
+        let mut other = admit_body(
+            &coordinator,
+            "someone-else-0000",
+            json!({"messages": [{"role": "user", "content": "x"}]}),
+        )
+        .await;
+        other.finish(done()).await.unwrap();
+        drop(other);
+        assert!(collected.0.lock().unwrap()[0].payload.is_none());
+        assert!(documents.0.lock().unwrap().is_empty());
+        // One that did, with more than the cap: cut, with the true size.
+        let long = "z".repeat(500);
+        let mut tracker = admit_body(
+            &coordinator,
+            "known-credential",
+            json!({"messages": [{"role": "user", "content": long}]}),
+        )
+        .await;
+        for n in 0..50 {
+            tracker.native(crate::policy::NativeFrame::StreamData {
+                data: &format!("{{\"delta\": {n}}}"),
+            });
+        }
+        tracker.finish(done()).await.unwrap();
+        drop(tracker);
+        let documents = documents.0.lock().unwrap();
+        let (request, response) = (&documents[0]["request"], &documents[0]["response"]);
+        assert_eq!(request["truncated"], true);
+        assert_eq!(request["text"].as_str().unwrap().len(), 64);
+        // The serializer is stopped at the cap: the size reported is the cap and more, never the true size.
+        assert!(request["bytes"].as_u64().unwrap() >= 64);
+        assert_eq!(response["truncated"], true);
+        assert!(response["text"].as_str().unwrap().len() <= 64);
     }
 
     #[tokio::test]

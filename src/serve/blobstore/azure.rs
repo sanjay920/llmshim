@@ -635,6 +635,10 @@ impl BlobStore for AzureStore {
     }
 
     async fn list(&self) -> Result<Vec<Listed>, BlobError> {
+        self.list_under("").await
+    }
+
+    async fn list_under(&self, sub: &str) -> Result<Vec<Listed>, BlobError> {
         let path = self.path(None);
         let mut out = Vec::new();
         let mut marker: Option<String> = None;
@@ -642,7 +646,7 @@ impl BlobStore for AzureStore {
             let mut query = vec![
                 ("restype".to_owned(), "container".to_owned()),
                 ("comp".to_owned(), "list".to_owned()),
-                ("prefix".to_owned(), self.prefix.clone()),
+                ("prefix".to_owned(), format!("{}{}", self.prefix, sub)),
                 ("maxresults".to_owned(), "1000".to_owned()),
             ];
             if let Some(marker) = &marker {

@@ -67,7 +67,36 @@
       "properties": {
         "hmac_key": {
           "$ref": "#/$defs/SecretRef",
-          "description": "The deployment secret that keys the fingerprints, by reference: at least 32 characters. The gateways of\none deployment share it; the control plane never has it, so it can compare fingerprints and never\ncompute one. Rotating it is a restart, after which earlier and later requests are not comparable."
+          "description": "The deployment secret that keys the fingerprints, by reference: at least 32 random bytes, base64 encoded\n(`openssl rand -base64 32`). A key a person could remember would let whoever holds the control plane's data test\nguesses against it. The gateways of\none deployment share it; the control plane never has it, so it can compare fingerprints and never\ncompute one. Rotating it is a restart, after which earlier and later requests are not comparable."
+        },
+        "max_payload_bytes": {
+          "default": null,
+          "description": "The most of a request, and of its answer, a payload keeps, in bytes (default 262144, 1024 to 1048576); more\nis cut and said to be cut.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "payload_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The deployment secret that wraps each captured payload's own key (note 0052, slice 5b), by reference: at\nleast 32 random bytes, base64 encoded (`openssl rand -base64 32`). Needed by any client with `capture = \"payload\"`. The gateways of one deployment share\nit; the control plane never has it, so it can hold a reference and never open one. Rotating it is a restart,\nafter which earlier payloads cannot be opened."
+        },
+        "ttl_secs": {
+          "default": null,
+          "description": "How long a captured payload is kept, in seconds (default 86400, 600 to 604800). The object store's\nsweeper deletes it after this.",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -86,6 +115,11 @@
         {
           "const": "structure",
           "description": "The prompt's segment fingerprints (note 0052, slice 5a).",
+          "type": "string"
+        },
+        {
+          "const": "payload",
+          "description": "The fingerprints and a sealed copy of the request and the answer, readable only by an administrator through\nthe control plane, kept for a short time (note 0052, slice 5b). Needs `[capture] payload_key`,\n`[media_store]` and an `[admin]` table with a token.",
           "type": "string"
         }
       ]

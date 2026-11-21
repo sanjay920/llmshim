@@ -1,6 +1,6 @@
 # 0052: Payload capture and the cache debugger
 
-Status: **slice 5a (structure) is built; 5b (sealed payloads) and 5c (the content diff) are not.** Slice 5 of the admin
+Status: **slices 5a (structure) and 5b (sealed payloads) are built; 5c (the content diff) is not.** Slice 5 of the admin
 UI (0051). It carries a privacy decision, so it was written down and decided before any code. The owner accepted the
 recommendations under "Decisions needed" (2026-11-20) and asked for 5a first; 5b is a separate decision that can still be
 declined without wasting 5a.
@@ -187,7 +187,7 @@ segment and a few segments on either side. Pure presentation over 5a and 5b; it 
 
 ## Slice 5a as built
 
-- **Gateway.** `[capture] hmac_key = { env | file }` (at least 32 characters, fixed at start) and, per client,
+- **Gateway.** `[capture] hmac_key = { env | file }` (at least 32 random bytes, base64 encoded, fixed at start) and, per client,
   `capture = "off" | "structure"` on a `[[keys]]` entry (reloadable with the keys, and a reload **replaces** the set so
   turning it off stops it). A `[capture]` table needs `[usage_export]`; a key that captures needs `[capture]`; both are
   refused at load by path. `src/gateway/structure.rs` cuts the **provider-native** body, handed to the attempt policy at
@@ -237,3 +237,76 @@ segment and a few segments on either side. Pure presentation over 5a and 5b; it 
   cover the prompt, not the request's other controls (the model's thinking settings, `tool_choice`), so a miss caused by
   one of those reads as `identical` or `appended`. The aggregate reads at most 20,000 stored lists and, past that,
   covers the first clients by name (it says so).
+
+## Slice 5b as built
+
+- **Gateway.** `capture = "payload"` on a key (it captures structure too). `[capture]` gains `payload_key` (at least 32 random bytes,
+  base64 encoded, fixed at start), `ttl_secs` (default 86,400; 600 to 604,800) and `max_payload_bytes` (default 262,144; 1,024
+  to 1,048,576, applied to the request and to the answer each). A payload client needs `payload_key`, `[media_store]` and an
+  `[admin]` table **with a token**, all refused at load by path. The document is `{v, attempt_id, ts, wire, provider, model,
+  outcome, request: {text, bytes, truncated}, response: {text, bytes, truncated}}`: the request is the **provider-native** body
+  the attempt policy was handed (what the provider saw, aligned with the structure), serialized into a bounded copy as it is
+  written; the answer is the provider's own frames, as `observe_native` hands them (a non-streaming body as it is, a stream's
+  events one per line, up to the cap). A stream is therefore kept as the provider sent it, not assembled into text.
+- **Sealing.** When the attempt ends the document is sealed (AES-256-GCM, a fresh per-object key and nonce, the object name as
+  associated data) and the per-object key is **wrapped** under a key derived from `payload_key` (AES-256-GCM again, the name as
+  associated data). The reference is opaque text: name, length, nonce and the wrapped key. The sealed object is put in the
+  media store under `capture/<date>/<random>`, a shape the media sweeper may not delete, by a bounded queue (256): a full queue,
+  an object the store would refuse, or a failing store **drops the capture and counts it**
+  (`llmshim_payload_capture_total{outcome}`: `queued`, `stored`, `failed`, `dropped_full`, `too_large`); sealing is microseconds
+  and nothing waits for the write. The usage record carries `payload: {reference, bytes, expires_at}`; the usage log never does.
+  Blocked requests never reach the provider attempt where capture happens, so they are never captured (`capture.blocked` is
+  therefore not a setting).
+- **Retention.** A sweeper per replica deletes `capture/` objects older than `ttl_secs` (and nothing else); the ledger row
+  outlives them and says `expired`.
+- **Opening.** `POST /v1/serve/payload/open` on the **admin** listener only (behind the admin token; never on the main
+  listener) takes `{"reference"}` and answers `{"payload": {…}}` with `Cache-Control: no-store`, or a class
+  (`not_found`, `bad_reference`, `too_large`, `unavailable`) that says nothing the store or the reference said. A reference
+  is only ever opened for a name under `capture/`, so it cannot be made to read another object.
+- **Control plane.** Schema 8 adds `payload_ref`, `payload_bytes`, `payload_expires_ms` to the ledger: an opaque reference
+  it can open nothing with. The request list says that a payload exists (bytes, expiry, expired); **the reference is never in
+  an answer to a browser**. `GET /v1/requests/{attempt}/payload` is **admin only**: it writes a `payload.viewed` row to the
+  chained change history (actor and attempt id, never text) **before** it asks any gateway, then asks every listed gateway at
+  once to open the reference (`--gateways-file`; in a fleet any replica can, with a local store only the writer) and relays the
+  first document with `Cache-Control: no-store`. 404 `no_payload`, 410 `payload_expired` (no row, nothing was read),
+  404 `payload_gone`, 422 `payload_unreadable` (another capture key), 501 `gateways_not_configured`, 502
+  `gateways_unavailable`; a view that fails after the row was written still has its row.
+- **UI.** A request with a payload gets a "Captured payload" section: for the admin role a button, a plain statement that
+  opening it is recorded under their name, and then the request and the answer as text (pretty-printed when JSON), each with a
+  copy button and a notice when it was cut; for other roles only that one exists and until when; once expired, that it is gone.
+- **Checked** by the sealing tests (round trip; ciphertext at rest with none of the text; another key, an altered wrapped key, a
+  reference naming a media object, a path out, a longer length and a version all refused; the sweep deletes old payloads and
+  nothing else, and the media sweep never touches one), the recorder tests (an opted-in client's request and answer in the
+  document, none for another client, a long request cut and said to be), a real `serve` process (the reference reaches the
+  control plane with no text anywhere in the export or the usage log; the object on disk holds none of the prompt, the answer or
+  the client's name; the admin listener opens it with its token and with nothing else; altered and missing references and the
+  main listener refused; a reload turning payload capture off and on; every refusal at load), the control plane's tests on
+  SQLite and Postgres (the route, the audit row before the fetch and when the gateway cannot answer, each error, the list never
+  holding the reference, the role, migration from every earlier schema version), and an end-to-end run of a real gateway into a
+  real control plane in Chrome. Mutation-checked: the usage log keeping the reference, the audit row removed, the read role allowed.
+- **Known limits.** A body past `max_payload_bytes` is cut (said so), so it cannot be cut into segments for 5c; raise the
+  limit for the clients that need the content diff. The answer of a stream is the raw events. A payload whose write was dropped or
+  failed has a reference that will not open (`payload_gone`).
+
+### Review follow-ups (PR 304)
+
+- **The open route is never open.** The admin listener must have a token whenever `payload_key` is set, not only while some
+  client captures a payload: the route exists whenever the key and the store do, and the clients reload while the listener
+  does not.
+- **A capture secret is random bytes.** `hmac_key` and `payload_key` must be at least 32 random bytes, base64 encoded
+  (`openssl rand -base64 32`), and a phrase is refused by name. A reference held by the control plane is an offline test of a
+  guessed key, so the format, not a length, is what makes a guess hopeless.
+- **Expiry is enforced where the key is.** The expiry is sealed into the reference (it is part of what the wrapped key is
+  bound to, so editing it makes the reference not open) and a gateway refuses an expired reference whether or not the sweeper
+  has deleted the object yet. The old window of up to ten minutes after `expires_at` is gone.
+- **Retention does not depend on the worst object.** The sweep continues past a delete that fails and reports it, and lists
+  only `capture/` (S3, Google Cloud Storage and Azure list that prefix alone), so a store with millions of other objects is
+  not walked and its page limit cannot stop the sweep.
+- **Waiting captures are bounded by bytes** (64 MiB, with the count), and eight writes overlap, so a slow store drops captures
+  late and counts them, instead of holding gigabytes or dropping at twenty a second.
+- **CPU and locks on the request path.** The request is serialized into its bounded copy and the serializer is stopped at
+  the cap, so a huge body costs the time of its first `max_payload_bytes`; the recorder's lock is not taken per stream frame
+  unless payload capture exists.
+- **The record says how far its "who" can be trusted.** A `payload.viewed` row carries `via`: `oidc` (a verified person),
+  `break_glass`, or `shared_token` (with one shared token and no identity provider the actor is a label the caller gave). With
+  single sign-on every view names a verified subject.

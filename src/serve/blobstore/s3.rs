@@ -443,6 +443,10 @@ impl BlobStore for S3Store {
     }
 
     async fn list(&self) -> Result<Vec<Listed>, BlobError> {
+        self.list_under("").await
+    }
+
+    async fn list_under(&self, sub: &str) -> Result<Vec<Listed>, BlobError> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         // A hard bound on pages (ten million objects): a bucket that never stops listing is not swept
@@ -450,7 +454,7 @@ impl BlobStore for S3Store {
         for _ in 0..10_000 {
             let mut query = vec![
                 ("list-type".to_owned(), "2".to_owned()),
-                ("prefix".to_owned(), self.prefix.clone()),
+                ("prefix".to_owned(), format!("{}{}", self.prefix, sub)),
             ];
             if let Some(token) = &token {
                 query.push(("continuation-token".to_owned(), token.clone()));

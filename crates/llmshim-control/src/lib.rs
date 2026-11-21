@@ -22,7 +22,7 @@ pub mod sso;
 pub mod structure;
 pub mod ui;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -626,7 +626,7 @@ impl Store {
                             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
                             .map_err(|e| Error::Database(e.to_string()))?;
                     }
-                    1..=6 => {
+                    1..=7 => {
                         // Version 2 added keys.allowed_models, version 3 keys.tags. Re-read the
                         // version under the write lock: another process starting at the same
                         // time may have migrated while this one waited.
@@ -683,7 +683,7 @@ impl Store {
                             connection
                                 .execute_batch(&format!(
                                     "{} PRAGMA user_version = 6;",
-                                    requests::schema(false)
+                                    requests::schema_v6(false)
                                 ))
                                 .map_err(db_err)?;
                             now = 6;
@@ -694,6 +694,16 @@ impl Store {
                                 .execute_batch(&format!(
                                     "{} PRAGMA user_version = 7;",
                                     structure::schema(false)
+                                ))
+                                .map_err(db_err)?;
+                            now = 7;
+                        }
+                        if now == 7 {
+                            // Version 8: where a captured payload is (note 0052, slice 5b).
+                            connection
+                                .execute_batch(&format!(
+                                    "{} PRAGMA user_version = 8;",
+                                    requests::payload_columns(false)
                                 ))
                                 .map_err(db_err)?;
                         }
@@ -729,7 +739,7 @@ impl Store {
                         tx.execute("INSERT INTO schema_meta (version) VALUES ($1)", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }
-                    Some(version @ (1..=6)) => {
+                    Some(version @ (1..=7)) => {
                         // Version 2 added keys.allowed_models, 3 keys.tags, 4 a team's budget.
                         if version == 1 {
                             tx.batch_execute("ALTER TABLE keys ADD COLUMN allowed_models TEXT")
@@ -760,6 +770,9 @@ impl Store {
                         tx.batch_execute(&requests::schema(true)).map_err(fail)?;
                         // Version 7: prompt structure for the cache debugger (note 0052).
                         tx.batch_execute(&structure::schema(true)).map_err(fail)?;
+                        // Version 8: where a captured payload is (note 0052, slice 5b). A database that was
+                        // older than 6 just had the table made with them already.
+                        tx.batch_execute(&requests::payload_columns(true)).map_err(fail)?;
                         tx.execute("UPDATE schema_meta SET version = $1", &[&SCHEMA_VERSION])
                             .map_err(fail)?;
                     }

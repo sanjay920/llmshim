@@ -204,6 +204,27 @@ paths:
         '404': {$ref: '#/components/responses/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
+  /v1/requests/{attempt}/payload:
+    get:
+      operationId: requestPayload
+      description: |
+        A captured request and answer (note 0052, slice 5b), for a client that opted in to payload capture. Customer
+        data: **admin role only**; a `payload.viewed` row is written to the change history before anything is fetched;
+        the answer is `Cache-Control: no-store`. The control plane holds only an opaque reference and cannot open it:
+        a gateway's admin listener does (`--gateways-file`). 404 `no_payload` (none captured), 410 `payload_expired`,
+        404 `payload_gone` (no gateway has the object), 422 `payload_unreadable` (another capture key), 501
+        `gateways_not_configured`, 502 `gateways_unavailable`.
+      parameters:
+        - {name: attempt, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: The payload document}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/Error'}
+        '410': {$ref: '#/components/responses/Error'}
+        '422': {$ref: '#/components/responses/Error'}
+        '501': {$ref: '#/components/responses/Error'}
+        '502': {$ref: '#/components/responses/Error'}
   /v1/requests/misses:
     get:
       operationId: requestMisses
