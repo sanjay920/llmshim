@@ -826,6 +826,14 @@ organization bound, `expires_at` enforced at request time, a stale age with opti
 the cache. After a root or catalog version bump run `cargo update -p llmshim -p llmshim-catalog` in
 `crates/llmshim-control`.
 
+## Control plane database (notes 0053, 0054)
+
+`llmshim-control migrate` is the only thing that changes the schema (`serve --migrate-on-start` for development): it copies an
+older SQLite database to `<db>.pre-v<N>.bak` first, and Postgres needs a `pg_dump` beforehand. `serve` and `audit-verify` use
+`Store::open_existing` / `open_postgres_existing`: an old, empty or newer schema is refused and left untouched. A migration
+must stay additive. Requests wait for the store behind a bounded line (16 reads, 64 usage batches, one 10 s deadline, 503
+`store_busy`), and a SQLite transaction past 30 s is 503 `store_timeout`.
+
 ## Prompt structure capture (note 0052, slice 5a)
 
 `[capture] hmac_key` plus per-key `capture = "structure"` (needs `[usage_export]`) makes the gateway cut each opted-in

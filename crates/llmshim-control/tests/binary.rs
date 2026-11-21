@@ -158,6 +158,7 @@ fn the_server_serves_over_a_socket_authenticates_and_stops_on_sigterm() {
             "127.0.0.1:0",
             "--token-file",
             token.to_str().unwrap(),
+            "--migrate-on-start",
         ])
         .env_clear()
         .stdin(Stdio::null())
@@ -303,6 +304,7 @@ fn the_server_runs_on_postgres_when_one_is_given() {
                 "127.0.0.1:0",
                 "--token-file",
                 token.to_str().unwrap(),
+                "--migrate-on-start",
             ])
             .env_clear()
             .stdin(Stdio::null())
@@ -445,6 +447,7 @@ fn a_server_with_sso_authenticates_the_shared_token_as_break_glass_and_refuses_a
             token.to_str().unwrap(),
             "--sso-config",
             issuer.to_str().unwrap(),
+            "--migrate-on-start",
         ])
         .env_clear()
         .stdin(Stdio::null())
