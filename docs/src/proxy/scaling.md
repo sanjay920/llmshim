@@ -1,0 +1,455 @@
+# Scaling and rate limits
+
+The proxy is stateless per request. Put replicas behind a load balancer and
+send the complete conversation history on every call. No sticky session is
+required for llmshim itself.
+
+```mermaid
+flowchart LR
+    C[Clients] --> L[Load balancer]
+    L --> P1[Proxy replica 1<br/>pool + admission state]
+    L --> P2[Proxy replica 2<br/>pool + admission state]
+    L --> P3[Proxy replica N<br/>pool + admission state]
+    P1 --> U[Provider APIs]
+    P2 --> U
+    P3 --> U
+    P1 -. optional shared limits .-> R[(Redis)]
+    P2 -. optional shared limits .-> R
+    P3 -. optional shared limits .-> R
+```
+
+Each process owns its connection pool, concurrency semaphore, and—unless
+Redis coordination is enabled—its rate-limit buckets.
+
+## Connection reuse and warmup
+
+All calls in one process share a lazily initialized HTTP client. Its pool uses
+HTTP/2 where available, gzip/brotli/zstd/deflate compression, a 90-second idle
+timeout, up to four idle connections per host, a 30-second TCP keepalive, and
+TCP `NODELAY`.
+
+For Rust services, call `llmshim::warmup(&router).await` after constructing the
+Router. It sends bounded HEAD requests to configured built-in provider origins
+to pre-establish TCP and TLS connections. Failure to warm a provider is
+ignored; normal request handling remains authoritative.
+
+## Reactive retries
+
+The shared client retries transport failures and HTTP `429`, `500`, `502`,
+`503`, `504`, and `529`. The default is three retries after the initial
+request—up to four attempts total—with exponential backoff and jitter.
+`Retry-After` and recognized OpenAI or Anthropic reset headers take precedence
+over computed backoff. Invalid reset durations are ignored; oversized finite
+durations saturate safely before the configured cap and jitter are applied.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `LLMSHIM_MAX_RETRIES` | `3` | Retries after the initial attempt |
+| `LLMSHIM_MAX_BACKOFF_SECS` | `60` | Cap for any one wait |
+
+These retries stay on the same route. A non-streaming fallback chain adds a
+second layer: **retry the route, then change the route**. See
+[Fallback chains](../guides/fallbacks.md).
+
+## Backpressure and proactive limits
+
+Every logical request first acquires an instance preparation slot before route
+resolution, schema work, or provider preparation. Each actual provider attempt
+then acquires a separate concurrency slot immediately before the send. Both
+waits use the queue timeout and return `503` with `Retry-After` when saturated.
+The logical slot remains held for the request or stream lifetime. A retry or
+repair releases the completed attempt's slot and must acquire again; fallback
+acquires against the provider it actually targets without reacquiring the
+logical slot.
+
+The authenticated gateway checks credentials before acquiring its short-lived
+prequeue preparation slot. It releases that slot after native conversion,
+route expansion, token estimation, keyed request fingerprinting, and policy
+checks. Distributed mode retains it through finite-queue admission and then
+releases it before waiting for execution or results; local mode releases before
+its synchronous in-memory enqueue. Queued dispatch and each final provider
+attempt keep their independent capacity and rate-policy gates. Post-queue
+gateway response projection is outside this short-lived prequeue slot.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `LLMSHIM_MAX_CONCURRENCY` | `256` | Maximum in-flight upstream requests per replica |
+| `LLMSHIM_QUEUE_TIMEOUT_MS` | `5000` | Maximum wait for a slot |
+
+Optional token buckets can reject work before it reaches a provider. A
+rejection is `429` with `Retry-After`.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `LLMSHIM_RATE_LIMIT_RPM` | unset | Requests per minute, used as the per-provider default |
+| `LLMSHIM_RATE_LIMIT_TPM` | unset | Estimated tokens per minute, used as the per-provider default |
+| `LLMSHIM_<PROVIDER>_RPM` | unset | Override RPM for `OPENAI`, `ANTHROPIC`, `GEMINI`, or `XAI` |
+| `LLMSHIM_<PROVIDER>_TPM` | unset | Override TPM for that provider |
+| `LLMSHIM_PENALTY_SECS` | `5` | Bucket penalty after an upstream `429` |
+
+When neither RPM nor TPM is set, proactive rate limiting is disabled;
+concurrency backpressure still applies. Token permits are estimates based on
+the final provider-native body and authoritative prepared target. They include
+the serialized native prompt and schema material, recognized native reasoning
+budgets, and the effective native output limit.
+For Chat Completions, a null `max_completion_tokens` does not hide a numeric
+`max_tokens` limit; a numeric `max_completion_tokens` retains precedence.
+Recognized output limits must use unsigned JSON integers or null for TPM
+estimation. Other representations, including quoted integers and floats that
+a backend may coerce, reserve the maximum token estimate instead of silently
+falling back to an omitted-limit default. This affects TPM admission only;
+the forwarded request is unchanged. Use integer JSON values for bounded
+output allowances.
+For native Chat Completions bodies, OpenAI's `n` is treated as a generated
+candidate count; Gemini `generationConfig.candidateCount` is treated the same
+way. The output allowance is multiplied by the final wire candidate count. The
+estimator also defensively recognizes `best_of`, `bestOf`, and
+`candidate_count`, including a `generation_config` container that llmshim can
+preserve from `x-gemini`, when a final body contains them; that compatibility
+handling does not imply universal provider support.
+Anthropic's omitted output limit uses
+the adapter's 8,192-token default; other known models use the catalog output
+ceiling when the provider leaves the limit unspecified. Unknown hosted models
+use a conservative provider-family ceiling; unknown self-hosted models retain
+the 1,024-token fallback because the server's launch configuration is not
+visible to llmshim. OpenRouter `models` fallbacks remain supported; when no
+explicit output limit is present, every listed model contributes its catalog
+ceiling and an unknown listed model uses a one-million-token ceiling.
+
+These permits are conservative estimates, not provider billing measurements.
+The input side uses serialized characters divided by four; provider tokenizers,
+images, caching, and unknown self-hosted model defaults can differ. Admission
+occurs once per actual network attempt. Transport retries, managed schema
+repairs, and supported fallback targets each reacquire RPM and TPM from the lane
+for the provider/body that will be sent. A provider-wide refusal may advance a
+fallback chain only to a distinct provider; an authenticated tenant refusal
+terminates the request.
+
+For an authenticated gateway identity, an omitted `rpm` or `tpm` field means
+that dimension is unlimited. An explicit `0` means that dimension admits no
+requests; the gateway rejects before dispatch and does not consume the other
+tenant bucket. The same deny-all behavior applies to global and per-provider
+rate-limit values: an explicit zero returns `429` before dispatch, while an
+omitted value remains unlimited.
+
+## Provider health
+
+Rate limiting and health are different questions. A `429` means the provider is
+alive and asking for less, and the token buckets already slow it down. A
+circuit breaker counts what retrying cannot fix — `500`, `502`, `503`, `504`,
+`529` and transport failures — over a sliding window, opens the circuit at the
+threshold, and admits a single probe after the cooldown.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `LLMSHIM_BREAKER_WINDOW_SECS` | `60` | Sliding window over which failures are counted |
+| `LLMSHIM_BREAKER_TRIP_THRESHOLD` | `3` | Failures that open a circuit; `0` disables the breaker |
+| `LLMSHIM_BREAKER_COOLDOWN_SECS` | `30` | Time an open circuit waits before admitting a probe |
+
+Every dispatch path *observes* outcomes, so health accrues from ordinary
+traffic. Only a [fallback chain](../guides/fallbacks.md) *refuses*: it skips a
+provider with an open circuit instead of spending its retry budget on a target
+it already knows is dead. A single-target request is still dispatched — with no
+alternative, refusing would only convert an upstream failure into a local one.
+
+## Spend caps
+
+The experimental gateway enforces a per-identity USD cap beside the RPM/TPM
+buckets. A gateway key's identity may carry `budget_usd` and an optional
+`budget_window_secs` (default one day); over budget is a `429` with
+`Retry-After` set to the window reset.
+
+```json
+{"sk-example": {"tenant": "acme", "tier": 1, "budget_usd": 100, "budget_window_secs": 86400}}
+```
+
+`budget_usd` must be finite, non-negative, and no greater than
+`9007199.254740992`. The ledger stores nano-USD integers and keeps every Redis
+value within Lua's exact-integer range; invalid limits fail closed.
+An explicit zero freezes the identity, including models whose configured token
+rates are zero.
+
+Every actual provider send reserves a conservative amount before it consumes
+RPM or TPM. The reservation uses the final provider-native model and body,
+trusted per-field catalog facts, the request's output/reasoning bound (or a
+trusted catalog output ceiling), and the applicable trusted price tier. Local
+operator policy is authoritative; verified built-in prices and built-in or
+provider-reported limits are accepted. Community `models.dev` values alone do
+not establish a hard-cap policy. The rate debits and USD reservation commit
+together, so a budget refusal consumes neither allowance.
+The full context ceiling is used for input rather than treating a tokenizer
+heuristic as a guarantee, so admission can be deliberately conservative even
+for a short prompt.
+Repeated usage snapshots upsert one attempt by UUID; they are never summed as
+separate bills. Partial or missing-counter usage may raise liability but cannot
+release it. A successful terminal response replaces its reservation only when
+the wire's required input/output counters are explicitly present, including
+explicit zeros, or when the provider reports an authoritative bill. A terminal
+provider bill also outranks an earlier catalog estimate. Failed repair responses
+are therefore charged even when the caller ultimately receives a local `502`.
+Bounded provider error bodies are inspected for native usage or a
+provider-reported bill before retry or return; the original error body and size
+limit remain unchanged.
+
+Any provider-reported partial charge also establishes a floor: a later terminal
+catalog estimate cannot settle below it. A genuine terminal provider bill may
+apply the provider-final correction rule. Public Chat stream aggregation exposes
+a nonterminal bill as `usage.provider_cost_floor_usd` instead of presenting it
+as an exact final `cost_usd`.
+
+Streaming snapshots remain partial until the protocol normalizer validates a
+clean end. A private candidate must still cover every choice or candidate after
+all later output and newly seen indexes; early usage-only frames and mixed
+finished/unfinished results cannot authorize release.
+
+Transport uncertainty, cancellation, stream abandonment, worker loss, and a
+failed settlement keep the original reservation in its acquisition window.
+The window is selected only after concurrency admission; Redis selects it from
+server time inside the atomic transaction. Rollover never moves that liability
+into a later window, and attempt tombstones remain available for late settlement
+for 24 hours after the acquisition window ends. This makes the cap a
+hard ceiling under the configured catalog pricing policy. Catalog prices are
+still estimates rather than provider invoices: an external price change or fee
+missing from the policy cannot be guaranteed by llmshim.
+If combined known liabilities exceed the fixed-point range, the window becomes
+irreversibly frozen; a later release from another overlapping attempt cannot
+reopen capacity after overflow information has been lost.
+
+The gateway retains at most 100,000 attempt tombstones by default, configured by
+`LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS`. This is an operational
+accounting-state limit, shared by the Redis fleet and per process in local mode.
+When it is full, a new budgeted attempt fails closed with `503` before any RPM,
+TPM, or spend debit; live reservations and the 24-hour settlement interval are
+never evicted to make room. Expired entries are reclaimed incrementally, so a
+large simultaneous expiry does not block the coordinator. Size this limit for
+the number of provider attempts that can begin during one budget window plus
+the 24-hour late-settlement interval. A high-throughput deployment can reach
+this state limit before it reaches its dollar cap.
+
+Strict admission rejects a request when it cannot form that bound. This includes
+an unknown price or context/output ceiling, variable OpenRouter routing,
+multi-candidate output, priority/fast service controls, provider-hosted tools,
+unbounded media, unknown native controls, and cache-creation controls whose fee
+dimension is not bounded. The rejection happens before send:
+
+```
+400 {"error":{"code":"unpriceable_under_budget","param":"model", …}}
+```
+
+It is deliberately not a `429`: retrying never clears it. Use a bounded model,
+add a complete local catalog policy, remove the unbounded control, or accept the
+risk explicitly per key:
+
+```json
+{"sk-example": {"tenant": "acme", "budget_usd": 100, "budget_allow_unpriced": true}}
+```
+
+`budget_allow_unpriced` defaults to `false`. With it set, only requests lacking a
+defensible reservation receive the exception. Already-known spend must remain
+below the cap. Such an attempt conservatively holds the remaining window balance
+until final known usage can replace it; uncertainty or abandonment therefore
+exhausts the cap rather than releasing zero. Any later provider-reported or
+catalog-derived charge is still observed, but only a terminal provider bill can
+resolve the fee uncertainty and release an unpriced reservation. Priceable
+requests reserve normally even when the flag is set. Each exception increments
+`llmshim_gateway_unpriced_under_cap_total{provider,model}`; a non-zero counter
+means the configured policy cannot promise a finite bound for that target.
+
+## One replica or a coordinated fleet
+
+The default buckets are in memory. With `N` replicas, each replica enforces
+its own configured limit. If the number represents a fleet-wide provider
+quota, divide it across instances or enable shared coordination.
+
+To share one bucket, build the opt-in feature and set Redis:
+
+```bash
+cargo install llmshim --features redis-coordination
+LLMSHIM_REDIS_URL=redis://redis.internal:6379 llmshim proxy
+```
+
+`redis-coordination` includes the `proxy` feature. Redis coordinates provider
+rate-limit buckets, provider health and — on the authenticated gateway — tenant
+RPM/TPM and spend, so these limits mean the same thing on every replica. The
+gateway checks provider and tenant RPM/TPM in one Lua decision: if any dimension
+rejects, none is debited. Its trusted per-attempt coordinator fails closed when
+Redis is unavailable. The compact proxy's standalone Redis limiter keeps its
+documented fail-open behavior. Both paths share the same provider bucket keys.
+Connection pools and concurrency limits remain per process. If the Redis client
+cannot be initialized—or the binary lacks the feature—the compact proxy warns
+and falls back to in-memory buckets.
+
+Shared rate, health, and attempt coordination use the Redis driver's finite
+500 ms response and one-second connection defaults. Healthy operations reuse a
+cached multiplexed connection. If an operation fails or its future is canceled
+after it may have sent a command, llmshim retires that exact cached connection
+generation; new operations create a fresh generation while existing healthy
+leases may finish on the old one. An uncertain mutating command is never
+replayed, refunded, or treated as a zero charge. The compact rate and health
+paths retain their documented fail-open behavior, while authenticated gateway
+attempt and spend coordination remains fail-closed.
+
+With `gateway-redis`, admitting a new job checks the current fenced queues and
+the released legacy/scoped queues' combined provider waiting depth, then inserts
+the job in one Lua transaction. Concurrent current origins cannot claim the
+same remaining slot. `LLMSHIM_GATEWAY_QUEUE_DEPTH` defaults to 10,000 total
+waiting jobs per provider; a full queue refuses new work with `503` and
+`Retry-After`. Released origins cannot include the new queues in their older
+admission script, so the combined bound becomes exact after old ingress stops.
+The current two protocol queues keep independent priority ordering; one shared
+worker-capacity bound prevents them from doubling upstream concurrency.
+
+Authenticated jobs use the fenced `llmshim:gw:scoped:v2:*` namespace. Trusted
+unscoped Rust submissions use `llmshim:gw:fenced:v1:*`. Current workers and
+reapers watch only those two namespaces, with one per-provider concurrency limit
+shared across them. Released workers cannot lease or acknowledge these jobs.
+The released `llmshim:gw:*` and `llmshim:gw:scoped:v1:*` records are preserved
+for their matching old workers; current workers do not silently migrate or
+execute them with a partially upgraded protocol.
+
+Each leased delivery has a random owner token. An independent heartbeat keeps
+that lease current during rate and policy waits, provider preparation, unary
+calls, quiet streams, response publication, and terminal cleanup. Redis checks
+the token in the same transaction that refreshes, publishes, releases,
+completes, acknowledges, or moves the delivery to the dead-letter queue. A
+worker that has lost its lease can no longer publish or mutate the replacement
+delivery. Lease creation, refresh, and reaping use Redis `TIME`, so host clock
+skew cannot expire another worker's healthy lease.
+
+Cancellation is ordered in the same Redis transitions as stream publication,
+terminal completion, rate release, reaping and DLQ movement. Once cancellation
+wins, later response chunks and provider content are suppressed and the durable
+terminal is the fixed cancellation envelope. Usage already observed from a
+provider remains settled; cancellation does not infer a refund.
+
+Distributed worker jobs have a finite six-hour lifetime by default. Redis
+lease operations are bounded to five seconds or one quarter of the configured
+lease, whichever is shorter. Positive millisecond overrides are available as
+`LLMSHIM_GATEWAY_WORKER_JOB_TIMEOUT_MS` and
+`LLMSHIM_GATEWAY_REDIS_OPERATION_TIMEOUT_MS`; zero and invalid values retain
+the finite defaults. A worker deadline drops local provider work while retaining
+the heartbeat, then publishes its error, records completion, and removes lease
+state in one owner-fenced Redis transaction.
+
+Caller-side Redis deadlines also cover distributed connection setup, readiness,
+queue and DLQ statistics, lifecycle reserve/activate/cancel/readback and the
+bounded generic and scoped idempotency caches. Each of those logical operations
+uses the same generation-retiring connection cache: failure or caller timeout
+retires that operation's exact generation before a later operation can reuse it.
+Pub/sub connections remain separately owned for the accepted response lifetime.
+A leased request and its metadata retain hard expiry headroom for the full worker
+lifetime plus cleanup grace.
+
+The queue remains at-least-once across an actual worker crash or coordination
+partition. If a provider accepted a request before ownership became uncertain,
+redelivery can still make another external call; lease fencing prevents stale
+local publication and cleanup but cannot make an external provider exactly
+once.
+
+New distributed submissions use lifecycle-v2 storage. Queue and processing
+indexes contain only an opaque job ID plus a Redis-owned generation; the exact
+serialized request is stored once and Lua never decodes or rewrites it. Reserve
+and activate are separate state transitions, so an uncertain reserve is not
+dispatchable until its matching generation activates. Delayed operations from
+an older generation cannot resurrect or mutate a replacement job.
+
+Lifecycle-v2 adds a generation- and token-fenced origin lease. Origins renew it
+while awaiting unary results or relaying streams, but never beyond the immutable
+total deadline. `LLMSHIM_GATEWAY_REQUEST_TIMEOUT_MS` remains the distributed
+queue-plus-upstream total limit; the HTTP logical deadline may shorten it and
+cannot extend it. `LLMSHIM_GATEWAY_ORIGIN_LEASE_MS` optionally tunes crash
+detection and is capped at five minutes. Redis server time decides expiry.
+Dropped unary futures and quiet streaming bodies request cancellation through
+one bounded gateway pump; a fixed-batch Redis expiry index covers process loss
+and pump saturation without detached per-drop tasks.
+Unary terminals remain readable after response-bus loss. Stream chunks remain
+transient, so a lost stream bus is reported as an error rather than treating a
+durable End marker as proof that every chunk reached the origin.
+
+Lifecycle storage defaults to 10,000 retained jobs, 512 MiB of request/metadata
+bytes, and a separate 512 MiB terminal pool. Environment overrides are
+`LLMSHIM_GATEWAY_RETAINED_JOBS`, `LLMSHIM_GATEWAY_RETAINED_BASE_BYTES`, and
+`LLMSHIM_GATEWAY_RETAINED_TERMINAL_BYTES`. Workers reserve terminal capacity
+before provider dispatch: 64 MiB for unary and 128 KiB for stream terminal
+state, configurable with `LLMSHIM_GATEWAY_UNARY_TERMINAL_BYTES` and
+`LLMSHIM_GATEWAY_STREAM_TERMINAL_BYTES`.
+
+The 64 MiB unary value is a distributed-service limit on the serialized
+normalized terminal envelope. It is distinct from the 32 MiB decoded raw
+upstream limit because normalization and JSON escaping can expand data. A
+bounded serializer stops before allocating beyond the limit. An over-limit
+normalized result becomes a fixed size error; ordinary shared-capacity pressure
+cannot discard an otherwise valid paid result because the full headroom was
+reserved before send.
+
+Terminal envelopes are retained durably for bus-loss readback. Scoped
+idempotency stores a bounded pointer to that single terminal copy instead of a
+second response. The deprecated generic Redis cache is separately bounded to
+100,000 entries, 1 MiB per value, 64 MiB total, and at most one day of TTL.
+Both cache kinds use per-entry Redis expiry; bounded reservation indexes let a
+restarted janitor recover count and byte accounting after the value has expired.
+The pointer and its terminal extension use the same capped effective TTL; a
+terminal's existing longer default retention is not shortened.
+Concurrent first-request cache misses are not coalesced and may execute more
+than once. Expired lifecycle records are removed in fixed-size batches;
+authoritative bounded reservation indexes retain the state, scope and charges
+needed to release counters and queue/DLQ ownership even after payload and
+metadata hard expiry. State movement between waiting, processing, requeue,
+terminal, and DLQ does not double-count request bytes. Pending/waiting
+cancellation and DLQ diagnostic envelopes fit inside each job's 4 KiB base
+metadata allowance; processing cancellation and provider response terminals
+use pre-reserved terminal capacity. New DLQ retention is limited to 1,000
+entries, 64 MiB and 24 hours.
+
+Lifecycle-v2 ingress remains disabled while any known lifecycle-v1 or older
+waiting or processing namespace is nonempty. Stop old ingress and let matching old workers
+drain those fixed keys; lifecycle startup does not scan, migrate, or delete old
+members. Historical DLQ lists and deprecated generic-cache keys are not covered
+by the new bound until an operator explicitly inventories and removes them.
+Legacy scoped response-cache keys expire after their configured cutover TTL.
+
+For a rolling upgrade, first stop old ingress. Keep the matching old workers
+until both the waiting and processing sorted sets in each released namespace
+are empty for every provider, then remove those workers. Old work retains its
+old lease and publication guarantees while draining. Do not delete its Redis
+keys to accelerate the transition: those entries represent accepted requests.
+New queue-depth metrics include released waiting entries, but operators must
+also inspect the released processing keys before declaring the drain complete.
+
+During an upgrade from the post-charge spend counter, each new authenticated
+origin uses one Redis-time Lua transaction to read the active legacy
+`llmshim:spend` value and retain the largest rounded-up nano-USD floor before
+idempotency lookup, queueing, or any worker refusal. A replay, conflict,
+overloaded or cancelled submission, unpriceable request, semaphore timeout, and
+zero-rate policy therefore cannot forget spend that the origin already saw.
+The private descriptor carries only the Redis-time window index and retained
+nano-USD floor, never the raw tenant or bearer. Worker admission tracks the
+separately applied floor and adds only a later positive delta, alongside new
+reservations and settlements. Origin retention creates no attempt, rate debit,
+aggregate charge, or applied delta. This preserves known active-window spend
+without double charging repeated imports or forgetting intervening new spend.
+Known-floor records share the finite retained-accounting index. If that index
+cannot retain newly learned spend, the same origin transaction sets one fleet
+freeze marker through the longest affected retention horizon. It remains in
+force if a slot later frees, so a stale descriptor cannot exploit discarded
+knowledge. A malformed, negative, non-finite, or wrong-type active legacy value
+also sets or extends that marker before the origin fails closed; its amount is
+unknown, so older queued snapshots cannot safely proceed.
+Keep each identity's `budget_window_secs` unchanged through this transition so
+the old and new counters name the same tumbling window.
+
+An origin running released code can still admit and record its own request after
+a new origin takes that point-in-time snapshot. Queue isolation prevents old
+workers from weakening new-origin jobs, but cannot retrofit atomic accounting
+into old ingress. Stop old ingress before claiming one fleet-wide hard cap for
+the rest of the transition window. After old ingress is stopped, queued legacy
+scoped jobs fail closed on new workers; custom unscoped jobs remain compatible.
+If Redis cannot execute or persist the origin transaction at all, it cannot
+durably record a freeze. Worker coordination fails while Redis is unavailable;
+after recovery, require a fresh successful origin retention before treating
+previously queued transition work as safe.
+
+Do not infer capacity from llmshim's implementation details alone. The
+[README benchmarks](https://github.com/sanjay920/llmshim-open#benchmarks) are the
+maintained performance snapshot; load-test your model mix, payload sizes,
+provider quotas, and gateway before choosing replica counts.

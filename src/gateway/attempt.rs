@@ -1,0 +1,6176 @@
+use crate::gateway::auth::Identity;
+use crate::policy::{
+    AttemptEvent, AttemptIdentity, AttemptOutcome, AttemptPolicy, AttemptPolicyError,
+    AttemptPolicyErrorKind, AttemptPolicyFuture, AttemptPolicyRefusal, AttemptPolicyRefusalKind,
+    AttemptUsageObservation, DispatchPolicyContext, PreparedAttempt,
+};
+use crate::proxy::ratelimit::{penalty_duration, LiveLimits, RateLimitConfig};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
+
+const ZERO_LIMIT_RETRY_AFTER: Duration = Duration::from_secs(60);
+pub(crate) const LATE_SETTLEMENT_RETENTION_SECS: u64 = 86_400;
+const DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS: usize = 100_000;
+const ACCOUNTING_EXPIRY_CLEANUP_BATCH: usize = 128;
+#[cfg(feature = "redis-coordination")]
+pub(crate) const REDIS_ACCOUNTING_INDEX_KEY: &str = "llmshim:gw:budget:v1:attempt-index";
+
+#[cfg(test)]
+fn retained_accounting_attempt_limit() -> usize {
+    retained_accounting_attempt_limit_from(&|key| std::env::var(key).ok())
+}
+
+/// The same parsing as the environment path, reading through `lookup`.
+pub(crate) fn retained_accounting_attempt_limit_from(
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> usize {
+    lookup("LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS)
+}
+
+/// How many finished attempts the spend ledger keeps for late settlement when
+/// nothing configures it.
+#[allow(dead_code)]
+pub(crate) const fn default_retained_accounting_attempts() -> usize {
+    DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct TrustedPolicyScope {
+    #[serde(default)]
+    version: u8,
+    tenant_key: String,
+    rpm: Option<u32>,
+    tpm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    budget: Option<crate::gateway::budget::BudgetPolicySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_spend_floor: Option<LegacySpendFloor>,
+    /// The tenant's own cap over every key's spend (note 0030). Present only for a tenant
+    /// with a `[tenants.<name>]` table, and then `version` is 2: a replica that predates
+    /// the field refuses the job instead of running it with a level unenforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_cap: Option<crate::gateway::budget::BudgetPolicySnapshot>,
+    /// The key's own cap counter id, with `tenant_cap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_cap_id: Option<String>,
+    /// The credential the request authenticated with: the first 16 hex digits of
+    /// the digest that scopes its state (not the whole digest). It lets the
+    /// replica that dispatches the job name the key from its own configuration;
+    /// the name itself is never in the scope. Set only by `serve`, and only when
+    /// it records usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential: Option<String>,
+    /// The request's id, for the usage record. Set only by `serve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    /// The deployment the caller addressed (`deployment/<name>`), for the usage record (note 0031).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deployment: Option<String>,
+    /// The router the request was admitted against (0022). Never serialized: a job
+    /// that crosses Redis is run by another replica on that replica's router.
+    #[serde(skip)]
+    router: Option<Arc<crate::router::Router>>,
+    /// What the request is (note 0035). Serialized only when it is not chat, and then `version` is
+    /// 3: a replica that predates the field refuses the job (it accepts versions 1 and 2) instead
+    /// of running an embeddings call as chat (note 0041).
+    #[serde(default, skip_serializing_if = "is_chat")]
+    operation: crate::policy::DispatchOperation,
+}
+
+fn is_chat(operation: &crate::policy::DispatchOperation) -> bool {
+    *operation == crate::policy::DispatchOperation::Chat
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct LegacySpendFloor {
+    window_index: u64,
+    amount_nanos: u64,
+}
+
+impl TrustedPolicyScope {
+    pub(crate) fn from_identity(identity: &Identity) -> Self {
+        let tenant_cap = identity.tenant_budget.as_ref().map(|cap| {
+            crate::gateway::budget::BudgetPolicySnapshot::from_parts(
+                cap.budget_usd,
+                cap.budget_window_secs,
+                cap.budget_allow_unpriced,
+            )
+        });
+        // The key's cap counter is named by the key, not its secret, so a rotation keeps it.
+        let key_cap_id = tenant_cap.as_ref().map(|_| {
+            let digest = Sha256::digest(
+                format!(
+                    "{}/{}",
+                    identity.tenant,
+                    identity.key_name.as_deref().unwrap_or_default()
+                )
+                .as_bytes(),
+            );
+            format!("{digest:x}")[..16].to_owned()
+        });
+        Self {
+            version: if tenant_cap.is_some() { 2 } else { 1 },
+            tenant_key: format!("{:x}", Sha256::digest(identity.tenant.as_bytes())),
+            rpm: identity.rpm,
+            tpm: identity.tpm,
+            budget: crate::gateway::budget::BudgetPolicySnapshot::from_identity(identity),
+            legacy_spend_floor: None,
+            tenant_cap,
+            key_cap_id,
+            credential: None,
+            request_id: None,
+            deployment: None,
+            router: None,
+            operation: crate::policy::DispatchOperation::Chat,
+        }
+    }
+
+    /// Mark the request as embeddings (note 0035).
+    #[allow(dead_code)]
+    pub(crate) fn set_operation(&mut self, operation: crate::policy::DispatchOperation) {
+        self.operation = operation;
+        if operation != crate::policy::DispatchOperation::Chat {
+            // The version that carries the field (note 0041); it includes everything version 2 has.
+            self.version = 3;
+        }
+    }
+
+    /// Mark the job as one whose payload holds references into the media object store (note 0050):
+    /// version 4, so a replica that cannot read them refuses the job instead of sending a reference
+    /// to a provider as if it were the caller's data.
+    #[allow(dead_code)]
+    pub(crate) fn set_media_refs(&mut self) {
+        self.version = 4;
+    }
+
+    /// The tenant's budget window this scope draws on, if it has a valid budget
+    /// that is priced and bounded before sending (what outage admission, note
+    /// 0027, requires): `(tenant_key, window_secs, limit_nanos)`.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn outage_budget(&self) -> Option<(String, u64, u64)> {
+        // The counter a lease is taken on is the one the Redis ledger holds: the tenant's
+        // own for a tenant with no table, the tenant cap's (in its own namespace) for one
+        // whose key has no cap of its own. A key with a cap of its own would need a second
+        // lease and is refused in outage state (note 0030).
+        let (ledger_key, policy) = match (&self.tenant_cap, &self.budget) {
+            (Some(_), Some(_)) | (None, None) => return None,
+            (Some(cap), None) => (format!("tenant-cap:{}", self.tenant_key), cap),
+            (None, Some(budget)) => (self.tenant_key.clone(), budget),
+        };
+        (policy.valid && !policy.allow_unpriced).then_some((
+            ledger_key,
+            policy.window_secs,
+            policy.limit_nanos,
+        ))
+    }
+
+    /// The same request as the local outage path sees it: a counter of its own
+    /// per lease (so the local ledger never refills mid-outage), limited to the
+    /// lease, with the tenant's rate limits cut to this replica's share.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn outage_view(
+        &self,
+        held_nanos: u64,
+        epoch: u32,
+        window_index: u64,
+        rate_fraction: f64,
+    ) -> Option<Self> {
+        let (ledger_key, _, _) = self.outage_budget()?;
+        let share = |limit: Option<u32>| {
+            limit.map(|value| ((f64::from(value) * rate_fraction).ceil() as u32).max(1))
+        };
+        let mut view = self.clone();
+        view.tenant_key = outage_tenant_key(&ledger_key, epoch, window_index);
+        view.rpm = share(self.rpm);
+        view.tpm = share(self.tpm);
+        view.legacy_spend_floor = None;
+        // The local view has the one counter a lease is: for a tenant under a table the
+        // tenant cap becomes that counter, and the table's other fields drop out.
+        view.tenant_cap = None;
+        view.key_cap_id = None;
+        view.version = 1;
+        let mut lease = self.tenant_cap.clone().or_else(|| self.budget.clone())?;
+        lease.limit_nanos = held_nanos;
+        lease.window_secs = OUTAGE_LOCAL_WINDOW_SECS;
+        view.budget = Some(lease);
+        Some(view)
+    }
+
+    /// The budget counters this request must fit, as `(ledger tenant key, policy)`. A tenant
+    /// without a table has the one counter it always had; with a table the tenant's cap and
+    /// the key's own cap (if it has one) are separate counters in their own namespaces
+    /// (note 0030).
+    pub(crate) fn budget_levels(
+        &self,
+    ) -> Vec<(String, &crate::gateway::budget::BudgetPolicySnapshot)> {
+        match &self.tenant_cap {
+            None => self
+                .budget
+                .iter()
+                .map(|policy| (self.tenant_key.clone(), policy))
+                .collect(),
+            Some(cap) => {
+                let mut levels = vec![(format!("tenant-cap:{}", self.tenant_key), cap)];
+                if let (Some(policy), Some(id)) = (&self.budget, &self.key_cap_id) {
+                    levels.push((format!("key-cap:{id}"), policy));
+                }
+                levels
+            }
+        }
+    }
+
+    /// Pin the router this request was admitted against (0022).
+    pub(crate) fn set_router(&mut self, router: Arc<crate::router::Router>) {
+        self.router = Some(router);
+    }
+
+    /// Record who made the request and under which id, for the usage record.
+    #[allow(dead_code)]
+    pub(crate) fn attribute(
+        &mut self,
+        credential_scope: &str,
+        request_id: Option<&str>,
+        deployment: Option<&str>,
+    ) {
+        self.credential =
+            Some(crate::gateway::usage::credential_prefix(credential_scope).to_owned());
+        self.request_id = request_id.map(str::to_owned);
+        self.deployment = deployment.map(str::to_owned);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn set_legacy_spend_floor(&mut self, window_index: u64, amount_nanos: u64) {
+        if self.budget.is_some() {
+            self.legacy_spend_floor = Some(LegacySpendFloor {
+                window_index,
+                amount_nanos,
+            });
+        }
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn is_current(&self) -> bool {
+        matches!(self.version, 1..=4)
+    }
+}
+
+/// The local ledger key of one lease's outage spend.
+#[cfg(feature = "redis-coordination")]
+pub(crate) fn outage_tenant_key(tenant_key: &str, epoch: u32, window_index: u64) -> String {
+    format!("outage:{tenant_key}:{epoch}:{window_index}")
+}
+
+/// The window length of a lease's local ledger: so long that the local clock
+/// never rolls it over, since a lease belongs to one window of the shared
+/// ledger and a retry after that window ends must not get a fresh allowance.
+#[cfg(feature = "redis-coordination")]
+pub(crate) const OUTAGE_LOCAL_WINDOW_SECS: u64 = 315_360_000;
+
+impl std::fmt::Debug for TrustedPolicyScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TrustedPolicyScope")
+            .field("version", &self.version)
+            .field("tenant_key", &"<redacted>")
+            .field("rpm", &self.rpm)
+            .field("tpm", &self.tpm)
+            .field("budget", &self.budget)
+            .field("legacy_spend_floor", &self.legacy_spend_floor)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RateRefusal {
+    Provider(Duration),
+    Tenant(Duration),
+    Budget(Duration),
+    Unavailable,
+}
+
+#[async_trait::async_trait]
+trait AttemptRates: Send + Sync {
+    #[cfg(feature = "redis-coordination")]
+    async fn retain_legacy_spend_floor(
+        &self,
+        _tenant: &str,
+        _scope: &TrustedPolicyScope,
+    ) -> Result<LegacySpendFloor, ()> {
+        Err(())
+    }
+
+    async fn acquire(
+        &self,
+        provider: &str,
+        scope: &TrustedPolicyScope,
+        permits: u32,
+        attempt_id: uuid::Uuid,
+        quote: Option<crate::gateway::budget::BudgetQuote>,
+    ) -> Result<(), RateRefusal>;
+
+    async fn penalize(&self, provider: &str, duration: Duration) -> Result<(), ()>;
+
+    /// [`Self::acquire`] with one quote per budget counter of the scope (note 0030). A ledger
+    /// that has only the single-counter form refuses a scope with more.
+    async fn acquire_levels(
+        &self,
+        provider: &str,
+        scope: &TrustedPolicyScope,
+        permits: u32,
+        attempt_id: uuid::Uuid,
+        quotes: &[crate::gateway::budget::BudgetQuote],
+    ) -> Result<(), RateRefusal> {
+        match quotes {
+            [] => {
+                self.acquire(provider, scope, permits, attempt_id, None)
+                    .await
+            }
+            [one] => {
+                self.acquire(provider, scope, permits, attempt_id, Some(*one))
+                    .await
+            }
+            _ => Err(RateRefusal::Unavailable),
+        }
+    }
+
+    /// Nanos charged under a local ledger key, across its windows (outage
+    /// recovery, note 0027). Only the in-memory ledger knows it.
+    #[cfg(feature = "redis-coordination")]
+    async fn local_budget_total(&self, _tenant_key: &str, _window_secs: u64) -> Option<u64> {
+        None
+    }
+
+    /// Follow a new set of provider limits (0022). Buckets keep their tokens.
+    #[allow(dead_code)]
+    fn retune(&self, _config: RateLimitConfig) {}
+
+    async fn observe_usage(
+        &self,
+        scope: &TrustedPolicyScope,
+        attempt_id: uuid::Uuid,
+        observation: crate::gateway::budget::SpendObservation,
+    ) -> Result<(), ()>;
+
+    async fn finish(
+        &self,
+        scope: &TrustedPolicyScope,
+        attempt_id: uuid::Uuid,
+        outcome: AttemptOutcome,
+    ) -> Result<(), ()>;
+
+    #[cfg(test)]
+    async fn budget_total(&self, scope: &TrustedPolicyScope) -> Option<u64>;
+}
+
+struct Bucket {
+    capacity: f64,
+    refill_per_second: f64,
+    tokens: f64,
+    last_refill: Instant,
+    penalty_until: Option<Instant>,
+}
+
+impl Bucket {
+    fn new(per_minute: u32, now: Instant) -> Self {
+        let capacity = per_minute as f64;
+        Self {
+            capacity,
+            refill_per_second: capacity / 60.0,
+            tokens: capacity,
+            last_refill: now,
+            penalty_until: None,
+        }
+    }
+
+    fn check(&mut self, required: f64, now: Instant) -> Result<(), Duration> {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_second).min(self.capacity);
+        self.last_refill = now;
+        if let Some(deadline) = self.penalty_until {
+            if deadline > now {
+                return Err(deadline.saturating_duration_since(now));
+            }
+        }
+        if self.tokens + 1e-9 >= required {
+            Ok(())
+        } else {
+            if self.refill_per_second <= 0.0 {
+                Err(ZERO_LIMIT_RETRY_AFTER)
+            } else {
+                Err(Duration::from_secs_f64(
+                    (required - self.tokens) / self.refill_per_second,
+                ))
+            }
+        }
+    }
+
+    fn debit(&mut self, required: f64) {
+        self.tokens -= required;
+    }
+
+    /// Follow a limit that changed since the bucket was made (a reloaded
+    /// configuration re-limited a tenant). Time so far is credited at the old
+    /// rate; a lowered limit takes effect at once by capping what is stored, and
+    /// a raised one refills at the new rate from what is there. A limit that did
+    /// not change leaves the bucket untouched.
+    fn retune(&mut self, per_minute: u32, now: Instant) {
+        let capacity = per_minute as f64;
+        if capacity == self.capacity {
+            return;
+        }
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_second).min(self.capacity);
+        self.last_refill = now;
+        self.capacity = capacity;
+        self.refill_per_second = capacity / 60.0;
+        self.tokens = self.tokens.min(capacity);
+    }
+
+    fn penalize(&mut self, duration: Duration, now: Instant) {
+        let deadline = now + duration;
+        self.penalty_until = Some(self.penalty_until.map_or(deadline, |old| old.max(deadline)));
+        self.tokens = 0.0;
+    }
+}
+
+#[derive(Default)]
+struct Dimensions {
+    rpm: HashMap<String, Bucket>,
+    tpm: HashMap<String, Bucket>,
+}
+
+/// The ledger id of an attempt's `level`-th budget counter: level 0 is the attempt's own id
+/// (so a one-counter attempt is exactly what it always was), later levels derive from it.
+fn level_attempt_id(attempt_id: uuid::Uuid, level: usize) -> uuid::Uuid {
+    if level == 0 {
+        return attempt_id;
+    }
+    const SALT: u128 = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834;
+    uuid::Uuid::from_u128(attempt_id.as_u128() ^ SALT.wrapping_mul(level as u128))
+}
+
+struct LocalRateState {
+    global: Dimensions,
+    tenant: Dimensions,
+    budget_totals: HashMap<BudgetWindowKey, u64>,
+    budget_frozen: std::collections::HashSet<BudgetWindowKey>,
+    budget_attempts: HashMap<uuid::Uuid, AttemptLiability>,
+    budget_expirations: std::collections::BinaryHeap<std::cmp::Reverse<(u64, uuid::Uuid)>>,
+    budget_window_references: HashMap<BudgetWindowKey, usize>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct BudgetWindowKey {
+    tenant_key: String,
+    window_secs: u64,
+    window_index: u64,
+}
+
+struct AttemptLiability {
+    window_key: BudgetWindowKey,
+    pricing_bounded: bool,
+    liability_nanos: u64,
+    observed_nanos: Option<u64>,
+    max_provider_nanos: Option<u64>,
+    terminal_catalog_nanos: Option<u64>,
+    terminal_provider_nanos: Option<u64>,
+    finalized: bool,
+    expires_at_epoch_secs: u64,
+}
+
+struct LocalAttemptRates {
+    config: LiveLimits,
+    /// Follow a tenant's limit when a later request carries a different one.
+    /// Off, a tenant's bucket keeps the limit it was made with, as it always
+    /// has under `gateway`. `serve` turns it on because a configuration reload
+    /// can re-limit a tenant; it also requires every key of one tenant to carry
+    /// the same limits, since otherwise two credentials would retune one shared
+    /// bucket back and forth.
+    retune_tenant_limits: bool,
+    max_retained_attempts: usize,
+    retention_secs: u64,
+    state: tokio::sync::Mutex<LocalRateState>,
+}
+
+impl LocalAttemptRates {
+    #[cfg(test)]
+    fn new(config: RateLimitConfig) -> Self {
+        Self::with_retention(config, retained_accounting_attempt_limit())
+    }
+
+    /// Follow a tenant's limit when it changes (see the field).
+    fn with_tenant_retuning(mut self) -> Self {
+        self.retune_tenant_limits = true;
+        self
+    }
+
+    fn with_retention(config: RateLimitConfig, max_retained_attempts: usize) -> Self {
+        Self::with_accounting_limits(
+            config,
+            max_retained_attempts,
+            LATE_SETTLEMENT_RETENTION_SECS,
+        )
+    }
+
+    fn with_accounting_limits(
+        config: RateLimitConfig,
+        max_retained_attempts: usize,
+        retention_secs: u64,
+    ) -> Self {
+        Self {
+            config: LiveLimits::new(config),
+            retune_tenant_limits: false,
+            max_retained_attempts,
+            retention_secs,
+            state: tokio::sync::Mutex::new(LocalRateState {
+                global: Dimensions::default(),
+                tenant: Dimensions::default(),
+                budget_totals: HashMap::new(),
+                budget_frozen: std::collections::HashSet::new(),
+                budget_attempts: HashMap::new(),
+                budget_expirations: std::collections::BinaryHeap::new(),
+                budget_window_references: HashMap::new(),
+            }),
+        }
+    }
+
+    async fn acquire_at_epoch(
+        &self,
+        provider: &str,
+        scope: &TrustedPolicyScope,
+        permits: u32,
+        attempt_id: uuid::Uuid,
+        quote: Option<crate::gateway::budget::BudgetQuote>,
+        test_epoch_secs: Option<u64>,
+    ) -> Result<(), RateRefusal> {
+        let quotes: Vec<_> = quote.into_iter().collect();
+        self.acquire_levels_at_epoch(
+            provider,
+            scope,
+            permits,
+            attempt_id,
+            &quotes,
+            test_epoch_secs,
+        )
+        .await
+    }
+
+    /// [`Self::acquire_at_epoch`] for a scope with any number of budget counters: every
+    /// level is checked before any is reserved, so a refusal at one leaves none held.
+    async fn acquire_levels_at_epoch(
+        &self,
+        provider: &str,
+        scope: &TrustedPolicyScope,
+        permits: u32,
+        attempt_id: uuid::Uuid,
+        quotes: &[crate::gateway::budget::BudgetQuote],
+        test_epoch_secs: Option<u64>,
+    ) -> Result<(), RateRefusal> {
+        let levels = scope.budget_levels();
+        let global_limit = self.config.resolve(provider);
+        let tenant_key = format!("{}:{provider}", scope.tenant_key);
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        let now_epoch_secs = test_epoch_secs.unwrap_or_else(epoch_secs);
+        purge_expired_budget_state(&mut state, now_epoch_secs);
+        if levels.len() != quotes.len() {
+            return Err(RateRefusal::Unavailable);
+        }
+        if !levels.is_empty()
+            && ((0..levels.len()).any(|level| {
+                state
+                    .budget_attempts
+                    .contains_key(&level_attempt_id(attempt_id, level))
+            }) || state.budget_attempts.len() + levels.len() > self.max_retained_attempts)
+        {
+            return Err(RateRefusal::Unavailable);
+        }
+        let mut provider_wait = None;
+        let mut tenant_wait = None;
+        for wait in [
+            check_dimension(
+                &mut state.global.rpm,
+                provider,
+                global_limit.rpm,
+                1.0,
+                now,
+                self.retune_tenant_limits,
+            ),
+            check_dimension(
+                &mut state.global.tpm,
+                provider,
+                global_limit.tpm,
+                permits.max(1) as f64,
+                now,
+                self.retune_tenant_limits,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            provider_wait = Some(provider_wait.map_or(wait, |current: Duration| current.max(wait)));
+        }
+        for wait in [
+            check_dimension(
+                &mut state.tenant.rpm,
+                &tenant_key,
+                scope.rpm,
+                1.0,
+                now,
+                self.retune_tenant_limits,
+            ),
+            check_dimension(
+                &mut state.tenant.tpm,
+                &tenant_key,
+                scope.tpm,
+                permits.max(1) as f64,
+                now,
+                self.retune_tenant_limits,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            tenant_wait = Some(tenant_wait.map_or(wait, |current: Duration| current.max(wait)));
+        }
+
+        if let Some(wait) = tenant_wait {
+            return Err(RateRefusal::Tenant(wait));
+        }
+        if let Some(wait) = provider_wait {
+            return Err(RateRefusal::Provider(wait));
+        }
+
+        // Every level is judged before any is reserved. When more than one refuses, the
+        // wait is the latest of their window ends.
+        let mut budget_commits = Vec::with_capacity(levels.len());
+        let mut refused: Option<Duration> = None;
+        for (level, ((ledger_key, policy), quote)) in levels.iter().zip(quotes).enumerate() {
+            let mut quote = *quote;
+            let window_index = now_epoch_secs / policy.window_secs;
+            let window_key = BudgetWindowKey {
+                tenant_key: ledger_key.clone(),
+                window_secs: policy.window_secs,
+                window_index,
+            };
+            let current = state.budget_totals.get(&window_key).copied().unwrap_or(0);
+            // Checked here, before anything is reserved, so that the commit below cannot
+            // fail half way and leave one level held.
+            if current.checked_add(quote.amount_nanos).is_none() {
+                return Err(RateRefusal::Unavailable);
+            }
+            let admitted = !state.budget_frozen.contains(&window_key)
+                && policy.limit_nanos != 0
+                && if quote.bounded {
+                    current
+                        .checked_add(quote.amount_nanos)
+                        .is_some_and(|next| next <= policy.limit_nanos)
+                } else {
+                    current < policy.limit_nanos
+                };
+            if !admitted {
+                let wait = budget_wait(policy.window_secs, now_epoch_secs);
+                refused = Some(refused.map_or(wait, |current: Duration| current.max(wait)));
+                continue;
+            }
+            if !quote.bounded {
+                quote.amount_nanos = policy.limit_nanos - current;
+            }
+            let next_window = window_index
+                .saturating_add(1)
+                .saturating_mul(policy.window_secs);
+            budget_commits.push((
+                level_attempt_id(attempt_id, level),
+                window_key,
+                quote,
+                next_window.saturating_add(self.retention_secs),
+            ));
+        }
+        if let Some(wait) = refused {
+            return Err(RateRefusal::Budget(wait));
+        }
+
+        debit_dimension(&mut state.global.rpm, provider, global_limit.rpm, 1.0);
+        debit_dimension(
+            &mut state.global.tpm,
+            provider,
+            global_limit.tpm,
+            permits.max(1) as f64,
+        );
+        debit_dimension(&mut state.tenant.rpm, &tenant_key, scope.rpm, 1.0);
+        debit_dimension(
+            &mut state.tenant.tpm,
+            &tenant_key,
+            scope.tpm,
+            permits.max(1) as f64,
+        );
+        for (level_id, window_key, quote, expires_at_epoch_secs) in budget_commits {
+            let total = state.budget_totals.entry(window_key.clone()).or_insert(0);
+            *total = total
+                .checked_add(quote.amount_nanos)
+                .ok_or(RateRefusal::Unavailable)?;
+            state
+                .budget_expirations
+                .push(std::cmp::Reverse((expires_at_epoch_secs, level_id)));
+            *state
+                .budget_window_references
+                .entry(window_key.clone())
+                .or_insert(0) += 1;
+            state.budget_attempts.insert(
+                level_id,
+                AttemptLiability {
+                    window_key,
+                    pricing_bounded: quote.bounded,
+                    liability_nanos: quote.amount_nanos,
+                    observed_nanos: None,
+                    max_provider_nanos: None,
+                    terminal_catalog_nanos: None,
+                    terminal_provider_nanos: None,
+                    finalized: false,
+                    expires_at_epoch_secs,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn budget_wait(window_secs: u64, now_epoch_secs: u64) -> Duration {
+    Duration::from_secs(window_secs - (now_epoch_secs % window_secs))
+}
+
+fn purge_expired_budget_state(state: &mut LocalRateState, now_epoch_secs: u64) {
+    let mut removed_expirations = 0;
+    while removed_expirations < ACCOUNTING_EXPIRY_CLEANUP_BATCH
+        && state
+            .budget_expirations
+            .peek()
+            .is_some_and(|entry| entry.0 .0 <= now_epoch_secs)
+    {
+        removed_expirations += 1;
+        let std::cmp::Reverse((expires_at, attempt_id)) = state
+            .budget_expirations
+            .pop()
+            .expect("peeked expiry exists");
+        let should_remove = state
+            .budget_attempts
+            .get(&attempt_id)
+            .is_some_and(|attempt| attempt.expires_at_epoch_secs == expires_at);
+        if !should_remove {
+            continue;
+        }
+        let attempt = state
+            .budget_attempts
+            .remove(&attempt_id)
+            .expect("matched attempt exists");
+        let remove_window = match state.budget_window_references.get_mut(&attempt.window_key) {
+            Some(references) if *references > 1 => {
+                *references -= 1;
+                false
+            }
+            Some(_) => true,
+            None => true,
+        };
+        if remove_window {
+            state.budget_window_references.remove(&attempt.window_key);
+            state.budget_totals.remove(&attempt.window_key);
+            state.budget_frozen.remove(&attempt.window_key);
+        }
+    }
+}
+
+fn check_dimension(
+    buckets: &mut HashMap<String, Bucket>,
+    key: &str,
+    limit: Option<u32>,
+    required: f64,
+    now: Instant,
+    retune: bool,
+) -> Option<Duration> {
+    let Some(limit) = limit else {
+        // A limit that is gone takes its bucket with it, where limits can change.
+        if retune {
+            buckets.remove(key);
+        }
+        return None;
+    };
+    if limit == 0 {
+        return Some(ZERO_LIMIT_RETRY_AFTER);
+    }
+    let bucket = buckets
+        .entry(key.to_owned())
+        .or_insert_with(|| Bucket::new(limit, now));
+    if retune {
+        bucket.retune(limit, now);
+    }
+    bucket.check(required, now).err()
+}
+
+fn debit_dimension(
+    buckets: &mut HashMap<String, Bucket>,
+    key: &str,
+    limit: Option<u32>,
+    required: f64,
+) {
+    if limit.is_some() {
+        buckets
+            .get_mut(key)
+            .expect("checked bucket must exist")
+            .debit(required);
+    }
+}
+
+#[async_trait::async_trait]
+impl AttemptRates for LocalAttemptRates {
+    #[cfg(feature = "redis-coordination")]
+    async fn local_budget_total(&self, tenant_key: &str, window_secs: u64) -> Option<u64> {
+        let state = self.state.lock().await;
+        Some(
+            state
+                .budget_totals
+                .iter()
+                .filter(|(key, _)| key.tenant_key == tenant_key && key.window_secs == window_secs)
+                .map(|(_, total)| *total)
+                .sum(),
+        )
+    }
+
+    async fn acquire(
+        &self,
+        provider: &str,
+        scope: &TrustedPolicyScope,
+        permits: u32,
+        attempt_id: uuid::Uuid,
+        quote: Option<crate::gateway::budget::BudgetQuote>,
+    ) -> Result<(), RateRefusal> {
+        self.acquire_at_epoch(provider, scope, permits, attempt_id, quote, None)
+            .await
+    }
+
+    async fn penalize(&self, provider: &str, duration: Duration) -> Result<(), ()> {
+        let limit = self.config.resolve(provider);
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        if let Some(rpm) = limit.rpm.filter(|limit| *limit > 0) {
+            let bucket = state
+                .global
+                .rpm
+                .entry(provider.to_owned())
+                .or_insert_with(|| Bucket::new(rpm, now));
+            if self.retune_tenant_limits {
+                bucket.retune(rpm, now);
+            }
+            bucket.penalize(duration, now);
+        }
+        if let Some(tpm) = limit.tpm.filter(|limit| *limit > 0) {
+            let bucket = state
+                .global
+                .tpm
+                .entry(provider.to_owned())
+                .or_insert_with(|| Bucket::new(tpm, now));
+            if self.retune_tenant_limits {
+                bucket.retune(tpm, now);
+            }
+            bucket.penalize(duration, now);
+        }
+        Ok(())
+    }
+
+    fn retune(&self, config: RateLimitConfig) {
+        self.config.replace(config);
+    }
+
+    async fn acquire_levels(
+        &self,
+        provider: &str,
+        scope: &TrustedPolicyScope,
+        permits: u32,
+        attempt_id: uuid::Uuid,
+        quotes: &[crate::gateway::budget::BudgetQuote],
+    ) -> Result<(), RateRefusal> {
+        self.acquire_levels_at_epoch(provider, scope, permits, attempt_id, quotes, None)
+            .await
+    }
+
+    async fn observe_usage(
+        &self,
+        scope: &TrustedPolicyScope,
+        attempt_id: uuid::Uuid,
+        observation: crate::gateway::budget::SpendObservation,
+    ) -> Result<(), ()> {
+        let mut result = Ok(());
+        for level in 0..scope.budget_levels().len() {
+            let id = level_attempt_id(attempt_id, level);
+            if self.observe_one(id, observation).await.is_err() {
+                result = Err(());
+            }
+        }
+        result
+    }
+
+    async fn finish(
+        &self,
+        scope: &TrustedPolicyScope,
+        attempt_id: uuid::Uuid,
+        outcome: AttemptOutcome,
+    ) -> Result<(), ()> {
+        let mut result = Ok(());
+        for level in 0..scope.budget_levels().len() {
+            let id = level_attempt_id(attempt_id, level);
+            if self.finish_one(id, outcome).await.is_err() {
+                result = Err(());
+            }
+        }
+        result
+    }
+
+    #[cfg(test)]
+    async fn budget_total(&self, scope: &TrustedPolicyScope) -> Option<u64> {
+        let (ledger_key, policy) = scope.budget_levels().into_iter().next()?;
+        let index = epoch_secs() / policy.window_secs;
+        let state = self.state.lock().await;
+        Some(
+            state
+                .budget_totals
+                .get(&BudgetWindowKey {
+                    tenant_key: ledger_key,
+                    window_secs: policy.window_secs,
+                    window_index: index,
+                })
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+}
+
+impl LocalAttemptRates {
+    /// One budget counter's share of [`AttemptRates::observe_usage`].
+    async fn observe_one(
+        &self,
+        attempt_id: uuid::Uuid,
+        mut observation: crate::gateway::budget::SpendObservation,
+    ) -> Result<(), ()> {
+        let mut state = self.state.lock().await;
+        let increase = {
+            let attempt = state.budget_attempts.get_mut(&attempt_id).ok_or(())?;
+            if attempt.finalized {
+                return Ok(());
+            }
+            if !attempt.pricing_bounded
+                && observation.authority == crate::gateway::budget::SpendAuthority::Catalog
+            {
+                observation.terminal_authoritative = false;
+            }
+            if observation.terminal_authoritative {
+                if let Some(amount_nanos) = observation.amount_nanos {
+                    match observation.authority {
+                        crate::gateway::budget::SpendAuthority::Provider => {
+                            attempt.terminal_provider_nanos = Some(amount_nanos);
+                        }
+                        crate::gateway::budget::SpendAuthority::Catalog => {
+                            attempt.terminal_catalog_nanos = Some(
+                                attempt
+                                    .terminal_catalog_nanos
+                                    .map_or(amount_nanos, |current| current.max(amount_nanos)),
+                            );
+                        }
+                    }
+                }
+            }
+            if observation.authority == crate::gateway::budget::SpendAuthority::Provider {
+                if let Some(amount_nanos) = observation.amount_nanos {
+                    attempt.max_provider_nanos = Some(
+                        attempt
+                            .max_provider_nanos
+                            .map_or(amount_nanos, |current| current.max(amount_nanos)),
+                    );
+                }
+            }
+            match observation.amount_nanos {
+                Some(amount_nanos) if amount_nanos > attempt.observed_nanos.unwrap_or_default() => {
+                    attempt.observed_nanos = Some(amount_nanos);
+                    if amount_nanos > attempt.liability_nanos {
+                        let delta = amount_nanos - attempt.liability_nanos;
+                        attempt.liability_nanos = amount_nanos;
+                        Some((attempt.window_key.clone(), delta))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some((window_key, delta)) = increase {
+            let total = state.budget_totals.get_mut(&window_key).ok_or(())?;
+            match total.checked_add(delta) {
+                Some(next) if next <= crate::gateway::budget::MAX_EXACT_REDIS_NANOS => {
+                    *total = next;
+                }
+                _ => {
+                    *total = crate::gateway::budget::MAX_EXACT_REDIS_NANOS;
+                    state.budget_frozen.insert(window_key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One budget counter's share of [`AttemptRates::finish`].
+    async fn finish_one(&self, attempt_id: uuid::Uuid, outcome: AttemptOutcome) -> Result<(), ()> {
+        let mut state = self.state.lock().await;
+        let settlement = {
+            let attempt = state.budget_attempts.get_mut(&attempt_id).ok_or(())?;
+            if attempt.finalized {
+                return Ok(());
+            }
+            if crate::gateway::budget::may_finalize(outcome) {
+                let final_nanos = attempt.terminal_provider_nanos.or_else(|| {
+                    attempt.terminal_catalog_nanos.map(|catalog_nanos| {
+                        catalog_nanos.max(attempt.max_provider_nanos.unwrap_or_default())
+                    })
+                });
+                if let Some(final_nanos) = final_nanos {
+                    let previous_liability = attempt.liability_nanos;
+                    attempt.liability_nanos = final_nanos;
+                    attempt.finalized = true;
+                    Some((attempt.window_key.clone(), previous_liability, final_nanos))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((window_key, previous_liability, final_nanos)) = settlement {
+            if state.budget_frozen.contains(&window_key) {
+                return Ok(());
+            }
+            let total = state.budget_totals.get_mut(&window_key).ok_or(())?;
+            if final_nanos <= previous_liability {
+                *total = total
+                    .checked_sub(previous_liability - final_nanos)
+                    .ok_or(())?;
+            } else {
+                let delta = final_nanos - previous_liability;
+                match total.checked_add(delta) {
+                    Some(next) if next <= crate::gateway::budget::MAX_EXACT_REDIS_NANOS => {
+                        *total = next;
+                    }
+                    _ => {
+                        *total = crate::gateway::budget::MAX_EXACT_REDIS_NANOS;
+                        state.budget_frozen.insert(window_key);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct AttemptCoordinator {
+    rates: Arc<dyn AttemptRates>,
+    concurrency_limit: usize,
+    concurrency_wait: Duration,
+    semaphores: Mutex<HashMap<String, Arc<Semaphore>>>,
+    active_permits: Mutex<HashMap<uuid::Uuid, OwnedSemaphorePermit>>,
+    /// Set at most once, before the first request.
+    usage: std::sync::OnceLock<crate::gateway::usage::UsageRecorder>,
+    /// How long a bucket backs off after an upstream 429, when the file says.
+    /// Unset, `LLMSHIM_PENALTY_SECS` (or 5 s) applies, as it always has.
+    penalty: std::sync::OnceLock<Duration>,
+}
+
+impl AttemptCoordinator {
+    #[cfg(test)]
+    pub(crate) fn local(
+        config: RateLimitConfig,
+        concurrency_limit: usize,
+        concurrency_wait: Duration,
+    ) -> Arc<Self> {
+        Self::local_with_retention(
+            config,
+            concurrency_limit,
+            concurrency_wait,
+            retained_accounting_attempt_limit(),
+            false,
+        )
+    }
+
+    /// [`Self::local`] with the ledger's retention limit given instead of read
+    /// from the environment.
+    pub(crate) fn local_with_retention(
+        config: RateLimitConfig,
+        concurrency_limit: usize,
+        concurrency_wait: Duration,
+        max_retained_attempts: usize,
+        retune_tenant_limits: bool,
+    ) -> Arc<Self> {
+        let rates = LocalAttemptRates::with_retention(config, max_retained_attempts);
+        let rates = if retune_tenant_limits {
+            rates.with_tenant_retuning()
+        } else {
+            rates
+        };
+        Arc::new(Self {
+            rates: Arc::new(rates),
+            concurrency_limit: concurrency_limit.max(1),
+            concurrency_wait,
+            semaphores: Mutex::new(HashMap::new()),
+            active_permits: Mutex::new(HashMap::new()),
+            usage: std::sync::OnceLock::new(),
+            penalty: std::sync::OnceLock::new(),
+        })
+    }
+
+    #[cfg(all(test, feature = "redis-coordination"))]
+    pub(crate) fn redis(
+        redis_url: &str,
+        config: RateLimitConfig,
+        concurrency_limit: usize,
+        concurrency_wait: Duration,
+    ) -> redis::RedisResult<Arc<Self>> {
+        Self::redis_with_retention(
+            redis_url,
+            config,
+            concurrency_limit,
+            concurrency_wait,
+            retained_accounting_attempt_limit(),
+        )
+    }
+
+    /// [`Self::redis`] with the ledger's retention limit given instead of read
+    /// from the environment.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn redis_with_retention(
+        redis_url: &str,
+        config: RateLimitConfig,
+        concurrency_limit: usize,
+        concurrency_wait: Duration,
+        max_retained_attempts: usize,
+    ) -> redis::RedisResult<Arc<Self>> {
+        Ok(Arc::new(Self {
+            rates: Arc::new(RedisAttemptRates::with_retention(
+                redis_url,
+                config,
+                max_retained_attempts,
+            )?),
+            concurrency_limit: concurrency_limit.max(1),
+            concurrency_wait,
+            semaphores: Mutex::new(HashMap::new()),
+            active_permits: Mutex::new(HashMap::new()),
+            usage: std::sync::OnceLock::new(),
+            penalty: std::sync::OnceLock::new(),
+        }))
+    }
+
+    /// What the in-memory ledger holds for a local key (see
+    /// [`AttemptRates::local_budget_total`]); `None` on a Redis-backed one.
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) async fn local_budget_total(
+        &self,
+        tenant_key: &str,
+        window_secs: u64,
+    ) -> Option<u64> {
+        self.rates.local_budget_total(tenant_key, window_secs).await
+    }
+
+    pub(crate) fn context(self: &Arc<Self>, scope: TrustedPolicyScope) -> DispatchPolicyContext {
+        let router = scope.router.clone();
+        let operation = scope.operation;
+        DispatchPolicyContext::new(Arc::new(CoordinatedAttemptPolicy {
+            coordinator: self.clone(),
+            scope,
+        }))
+        .with_router_snapshot(router)
+        .with_operation(operation)
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) async fn retain_legacy_spend_floor(
+        &self,
+        tenant: &str,
+        scope: &mut TrustedPolicyScope,
+    ) -> Result<(), ()> {
+        // A tenant with a table has fresh counters and no legacy floor (note 0030).
+        if scope.budget.is_none() || scope.tenant_cap.is_some() {
+            return Ok(());
+        }
+        let retained_floor = self.rates.retain_legacy_spend_floor(tenant, scope).await?;
+        scope.set_legacy_spend_floor(retained_floor.window_index, retained_floor.amount_nanos);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unavailable_for_test(
+        concurrency_limit: usize,
+        concurrency_wait: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            rates: Arc::new(UnavailableAttemptRates),
+            concurrency_limit: concurrency_limit.max(1),
+            concurrency_wait,
+            semaphores: Mutex::new(HashMap::new()),
+            active_permits: Mutex::new(HashMap::new()),
+            usage: std::sync::OnceLock::new(),
+            penalty: std::sync::OnceLock::new(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_provider_for_test(&self, provider: &str) -> OwnedSemaphorePermit {
+        let semaphore = {
+            let mut semaphores = self.semaphores.lock().unwrap();
+            semaphores
+                .entry(provider.to_owned())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.concurrency_limit)))
+                .clone()
+        };
+        semaphore.acquire_owned().await.unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn budget_total_for_test(&self, scope: &TrustedPolicyScope) -> Option<u64> {
+        self.rates.budget_total(scope).await
+    }
+
+    async fn acquire(
+        &self,
+        attempt: &PreparedAttempt<'_>,
+        scope: &TrustedPolicyScope,
+    ) -> Result<(), AttemptPolicyRefusal> {
+        if !matches!(scope.version, 1..=4) {
+            return Err(AttemptPolicyRefusal::new(
+                AttemptPolicyRefusalKind::CoordinatorUnavailable,
+                None,
+            ));
+        }
+        let provider = attempt.identity().instance();
+        let semaphore = {
+            let mut semaphores = self.semaphores.lock().unwrap();
+            semaphores
+                .entry(provider.to_owned())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.concurrency_limit)))
+                .clone()
+        };
+        let permit = tokio::time::timeout(self.concurrency_wait, semaphore.acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| {
+                AttemptPolicyRefusal::new(
+                    AttemptPolicyRefusalKind::CoordinatorUnavailable,
+                    Some(self.concurrency_wait),
+                )
+            })?;
+        // One quote per budget counter (a tenant with a table has two, note 0030): an attempt
+        // that cannot be priced is refused unless every level allows it.
+        let mut quotes = Vec::new();
+        for (_, policy) in scope.budget_levels() {
+            let quote = match scope.operation {
+                crate::policy::DispatchOperation::Embeddings => {
+                    crate::gateway::budget::quote_embeddings(Some(policy), attempt)
+                }
+                // Transcription's size is the audio's length, which the bytes do not bound (they are
+                // compressed): no enforceable bound, like images (note 0038).
+                crate::policy::DispatchOperation::Images
+                | crate::policy::DispatchOperation::Transcription => {
+                    crate::gateway::budget::quote_unbounded(Some(policy))
+                }
+                crate::policy::DispatchOperation::Speech => {
+                    crate::gateway::budget::quote_speech(Some(policy), attempt)
+                }
+                crate::policy::DispatchOperation::Chat => {
+                    crate::gateway::budget::quote(Some(policy), attempt)
+                }
+            }
+            .map_err(|_| AttemptPolicyRefusal::new(AttemptPolicyRefusalKind::Unpriceable, None))?;
+            quotes.extend(quote);
+        }
+        let permits = crate::proxy::ratelimit::estimate_attempt_tokens(attempt);
+        match self
+            .rates
+            .acquire_levels(provider, scope, permits, attempt.identity().id(), &quotes)
+            .await
+        {
+            Ok(()) => {
+                if quotes.iter().any(|quote| !quote.bounded) {
+                    crate::gateway::metrics::incr(
+                        crate::gateway::metrics::UNPRICED_UNDER_CAP,
+                        &[
+                            ("provider", provider),
+                            ("model", attempt.identity().native_model()),
+                        ],
+                    );
+                }
+                self.active_permits
+                    .lock()
+                    .unwrap()
+                    .insert(attempt.identity().id(), permit);
+                if let Some(recorder) = self.usage.get() {
+                    recorder.begin(
+                        attempt.identity(),
+                        attempt.native_body(),
+                        &scope.tenant_key,
+                        scope.credential.as_deref(),
+                        scope.request_id.as_deref(),
+                        scope.deployment.as_deref(),
+                    );
+                }
+                Ok(())
+            }
+            Err(RateRefusal::Provider(wait)) => Err(AttemptPolicyRefusal::new(
+                AttemptPolicyRefusalKind::ProviderLimit,
+                Some(wait),
+            )),
+            Err(RateRefusal::Tenant(wait)) => Err(AttemptPolicyRefusal::new(
+                AttemptPolicyRefusalKind::TenantLimit,
+                Some(wait),
+            )),
+            Err(RateRefusal::Budget(wait)) => Err(AttemptPolicyRefusal::new(
+                AttemptPolicyRefusalKind::Budget,
+                Some(wait),
+            )),
+            Err(RateRefusal::Unavailable) => Err(AttemptPolicyRefusal::new(
+                AttemptPolicyRefusalKind::CoordinatorUnavailable,
+                None,
+            )),
+        }
+    }
+
+    fn release(&self, attempt_id: uuid::Uuid) {
+        self.active_permits.lock().unwrap().remove(&attempt_id);
+    }
+
+    /// Record every attempt that ends from now on. Takes effect once; a second
+    /// call is ignored.
+    /// Whether a usage sink is installed: attribution (the key and request id in a
+    /// job's scope) is only worth carrying when something records it.
+    #[allow(dead_code)]
+    pub(crate) fn records_usage(&self) -> bool {
+        self.usage.get().is_some()
+    }
+
+    /// Back buckets off for `penalty` after an upstream 429, in place of the
+    /// environment's value. Takes effect once.
+    #[allow(dead_code)]
+    pub(crate) fn set_penalty(&self, penalty: Duration) {
+        let _ = self.penalty.set(penalty);
+    }
+
+    fn penalty(&self) -> Duration {
+        self.penalty.get().copied().unwrap_or_else(penalty_duration)
+    }
+
+    pub(crate) fn set_usage_sink(&self, setup: crate::gateway::usage::UsageSetup) {
+        let _ = self
+            .usage
+            .set(crate::gateway::usage::UsageRecorder::new(setup));
+    }
+
+    /// [`Self::set_usage_sink`] for the local outage path: its records carry
+    /// `admission: "outage"` (note 0027).
+    #[cfg(feature = "redis-coordination")]
+    pub(crate) fn set_outage_usage_sink(&self, setup: crate::gateway::usage::UsageSetup) {
+        let _ = self
+            .usage
+            .set(crate::gateway::usage::UsageRecorder::new(setup).with_admission("outage"));
+    }
+
+    fn note_usage(
+        &self,
+        attempt_id: uuid::Uuid,
+        usage: &serde_json::Value,
+        observation: &crate::gateway::budget::SpendObservation,
+    ) {
+        if let Some(recorder) = self.usage.get() {
+            recorder.observe(attempt_id, usage, observation);
+        }
+    }
+
+    fn end_usage(&self, attempt_id: uuid::Uuid, outcome: AttemptOutcome) {
+        if let Some(recorder) = self.usage.get() {
+            recorder.finish(attempt_id, outcome);
+        }
+    }
+}
+
+#[cfg(test)]
+struct UnavailableAttemptRates;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl AttemptRates for UnavailableAttemptRates {
+    async fn acquire(
+        &self,
+        _provider: &str,
+        _scope: &TrustedPolicyScope,
+        _permits: u32,
+        _attempt_id: uuid::Uuid,
+        _quote: Option<crate::gateway::budget::BudgetQuote>,
+    ) -> Result<(), RateRefusal> {
+        Err(RateRefusal::Unavailable)
+    }
+
+    async fn penalize(&self, _provider: &str, _duration: Duration) -> Result<(), ()> {
+        Err(())
+    }
+
+    async fn observe_usage(
+        &self,
+        _scope: &TrustedPolicyScope,
+        _attempt_id: uuid::Uuid,
+        _observation: crate::gateway::budget::SpendObservation,
+    ) -> Result<(), ()> {
+        Err(())
+    }
+
+    async fn finish(
+        &self,
+        _scope: &TrustedPolicyScope,
+        _attempt_id: uuid::Uuid,
+        _outcome: AttemptOutcome,
+    ) -> Result<(), ()> {
+        Err(())
+    }
+
+    async fn budget_total(&self, _scope: &TrustedPolicyScope) -> Option<u64> {
+        None
+    }
+}
+
+struct CoordinatedAttemptPolicy {
+    coordinator: Arc<AttemptCoordinator>,
+    scope: TrustedPolicyScope,
+}
+
+impl AttemptPolicy for CoordinatedAttemptPolicy {
+    fn acquire<'a>(
+        &'a self,
+        attempt: &'a PreparedAttempt<'a>,
+    ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyRefusal>> {
+        Box::pin(async move { self.coordinator.acquire(attempt, &self.scope).await })
+    }
+
+    fn observe<'a>(
+        &'a self,
+        attempt: &'a AttemptIdentity,
+        event: AttemptEvent<'a>,
+    ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>> {
+        Box::pin(async move {
+            match event {
+                AttemptEvent::ResponseHeaders { status: 429 } => self
+                    .coordinator
+                    .rates
+                    .penalize(attempt.instance(), self.coordinator.penalty())
+                    .await
+                    .map_err(|_| {
+                        AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
+                    }),
+                AttemptEvent::Finished(outcome) => {
+                    self.coordinator.end_usage(attempt.id(), outcome);
+                    self.coordinator.release(attempt.id());
+                    self.coordinator
+                        .rates
+                        .finish(&self.scope, attempt.id(), outcome)
+                        .await
+                        .map_err(|_| {
+                            AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
+                        })?;
+                    Ok(())
+                }
+                AttemptEvent::Usage { usage } => {
+                    let observation = crate::gateway::budget::spend_observation(
+                        AttemptUsageObservation::new(usage, false, false, false),
+                    );
+                    self.coordinator
+                        .note_usage(attempt.id(), usage, &observation);
+                    self.coordinator
+                        .rates
+                        .observe_usage(&self.scope, attempt.id(), observation)
+                        .await
+                        .map_err(|_| {
+                            AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
+                        })
+                }
+                AttemptEvent::ResponseHeaders { .. } => Ok(()),
+            }
+        })
+    }
+
+    fn observe_usage<'a>(
+        &'a self,
+        attempt: &'a AttemptIdentity,
+        observation: AttemptUsageObservation<'a>,
+    ) -> AttemptPolicyFuture<'a, Result<(), AttemptPolicyError>> {
+        Box::pin(async move {
+            let spend = crate::gateway::budget::spend_observation(observation);
+            self.coordinator
+                .note_usage(attempt.id(), observation.usage(), &spend);
+            self.coordinator
+                .rates
+                .observe_usage(&self.scope, attempt.id(), spend)
+                .await
+                .map_err(|_| {
+                    AttemptPolicyError::new(AttemptPolicyErrorKind::CoordinatorUnavailable)
+                })
+        })
+    }
+
+    fn observe_abandoned(
+        &self,
+        attempt: &AttemptIdentity,
+        outcome: AttemptOutcome,
+    ) -> Result<(), AttemptPolicyError> {
+        self.coordinator.end_usage(attempt.id(), outcome);
+        self.coordinator.release(attempt.id());
+        Ok(())
+    }
+}
+
+#[cfg(feature = "redis-coordination")]
+mod redis_rates {
+    use super::*;
+    #[cfg(test)]
+    use redis::aio::ConnectionManager;
+
+    const KEY_TTL_MS: u64 = 3_600_000;
+    const RETAIN_LEGACY_SPEND_FLOOR_LUA: &str = r#"
+        local redis_time = redis.call('TIME')
+        local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+        local window_secs = tonumber(ARGV[1])
+        local retention_secs = tonumber(ARGV[2])
+        local max_retained_attempts = tonumber(ARGV[3])
+        local cleanup_batch = tonumber(ARGV[4])
+        local max_exact = tonumber(ARGV[5])
+        local window_index = math.floor(math.floor(now / 1000) / window_secs)
+        local budget_ttl = math.max(1,
+            ((window_index + 1) * window_secs + retention_secs) * 1000 - now)
+        local function extend_global_freeze()
+            local existing_freeze_ttl = redis.call('PTTL', KEYS[4])
+            if existing_freeze_ttl == -2 or
+                    (existing_freeze_ttl >= 0 and existing_freeze_ttl < budget_ttl) then
+                redis.call('SET', KEYS[4], 1, 'PX', budget_ttl)
+            end
+        end
+        local legacy_raw = redis.pcall('GET', KEYS[1] .. window_index)
+        if type(legacy_raw) == 'table' and legacy_raw.err ~= nil then
+            extend_global_freeze()
+            return {-1, window_index, 0}
+        end
+        local legacy_usd = 0
+        if legacy_raw ~= false then
+            legacy_usd = tonumber(legacy_raw)
+            if legacy_usd == nil or legacy_usd ~= legacy_usd or
+                    legacy_usd == math.huge or legacy_usd < 0 then
+                extend_global_freeze()
+                return {-1, window_index, 0}
+            end
+        end
+        local incoming_floor = max_exact
+        if legacy_usd < max_exact / 1000000000 then
+            incoming_floor = math.ceil(legacy_usd * 1000000000)
+        end
+
+        local expired_members = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now,
+            'LIMIT', 0, cleanup_batch)
+        if #expired_members > 0 then
+            redis.call('ZREM', KEYS[3], unpack(expired_members))
+        end
+
+        local known_floor_key = KEYS[2] .. window_index .. ':legacy-known-floor'
+        local applied_floor_key = KEYS[2] .. window_index .. ':legacy-floor'
+        local applied_floor = tonumber(redis.call('GET', applied_floor_key)) or 0
+        local known_floor = tonumber(redis.call('GET', known_floor_key)) or applied_floor
+        if incoming_floor > known_floor then
+            known_floor = incoming_floor
+        end
+        local floor_is_indexed = redis.call('ZSCORE', KEYS[3], known_floor_key) ~= false
+        if known_floor > 0 and not floor_is_indexed then
+            if redis.call('ZCARD', KEYS[3]) < max_retained_attempts then
+                redis.call('ZADD', KEYS[3], 'NX', now + budget_ttl, known_floor_key)
+                floor_is_indexed = true
+            else
+                extend_global_freeze()
+                return {0, window_index, known_floor}
+            end
+        end
+        if known_floor > 0 and floor_is_indexed then
+            redis.call('SET', known_floor_key, known_floor, 'PX', budget_ttl)
+        end
+        if redis.call('EXISTS', KEYS[4]) == 1 then
+            return {0, window_index, known_floor}
+        end
+        return {1, window_index, known_floor}
+    "#;
+    const COMBINED_RATE_LUA: &str = r#"
+        local redis_time = redis.call('TIME')
+        local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+        local ttl = tonumber(ARGV[2])
+        local admitted = 1
+        local wait = 0
+        local refusal = 0
+        local balances = {}
+        local timestamps = {}
+        local penalties = {}
+
+        for dimension = 1, 4 do
+            local offset = 3 + (dimension - 1) * 4
+            local enabled = tonumber(ARGV[offset]) == 1
+            if enabled then
+                local capacity = tonumber(ARGV[offset + 1])
+                local refill = tonumber(ARGV[offset + 2])
+                local required = tonumber(ARGV[offset + 3])
+                local stored = redis.call('HMGET', KEYS[dimension], 'tokens', 'ts', 'penalty')
+                local balance = tonumber(stored[1])
+                local timestamp = tonumber(stored[2])
+                local penalty = tonumber(stored[3]) or 0
+                if balance == nil then balance = capacity end
+                if timestamp == nil then timestamp = now end
+                local elapsed = now - timestamp
+                if elapsed < 0 then elapsed = 0 end
+                balance = math.min(capacity, balance + (elapsed / 1000.0) * refill)
+                local dimension_wait = 0
+                if penalty > now then
+                    dimension_wait = penalty - now
+                elseif balance < required then
+                    dimension_wait = math.ceil((required - balance) / refill * 1000.0)
+                end
+                if dimension_wait > 0 then
+                    admitted = 0
+                    wait = math.max(wait, dimension_wait)
+                    if dimension >= 3 then refusal = 2 elseif refusal == 0 then refusal = 1 end
+                end
+                balances[dimension] = balance
+                timestamps[dimension] = now
+                penalties[dimension] = penalty
+            end
+        end
+
+        local budget_enabled = tonumber(ARGV[19]) == 1
+        local budget_next = 0
+        local reservation = 0
+        local budget_total_key = KEYS[5]
+        local budget_freeze_key = KEYS[5] .. 'frozen'
+        local legacy_applied_floor_key = KEYS[5] .. 'legacy-floor'
+        local legacy_known_floor_key = KEYS[5] .. 'legacy-known-floor'
+        local legacy_known_floor = 0
+        local budget_ttl = 1
+        if budget_enabled then
+            local bounded = tonumber(ARGV[20]) == 1
+            local budget_limit = tonumber(ARGV[21])
+            reservation = tonumber(ARGV[22])
+            local window_secs = tonumber(ARGV[23])
+            local retention_secs = tonumber(ARGV[24])
+            local max_retained_attempts = tonumber(ARGV[25])
+            local cleanup_batch = tonumber(ARGV[26])
+            local epoch_secs = math.floor(now / 1000)
+            local window_index = math.floor(epoch_secs / window_secs)
+            budget_total_key = KEYS[5] .. window_index
+            budget_freeze_key = budget_total_key .. ':frozen'
+            legacy_applied_floor_key = budget_total_key .. ':legacy-floor'
+            legacy_known_floor_key = budget_total_key .. ':legacy-known-floor'
+            budget_ttl = math.max(1,
+                ((window_index + 1) * window_secs + retention_secs) * 1000 - now)
+            local expired_attempts = redis.call('ZRANGEBYSCORE', KEYS[7], '-inf', now,
+                'LIMIT', 0, cleanup_batch)
+            if #expired_attempts > 0 then
+                redis.call('ZREM', KEYS[7], unpack(expired_attempts))
+            end
+
+            local current = tonumber(redis.call('GET', budget_total_key)) or 0
+            local legacy_applied_floor =
+                tonumber(redis.call('GET', legacy_applied_floor_key)) or 0
+            legacy_known_floor =
+                tonumber(redis.call('GET', legacy_known_floor_key)) or legacy_applied_floor
+            local legacy_floor_window = tonumber(ARGV[27])
+            local legacy_floor_incoming = tonumber(ARGV[28])
+            if legacy_floor_window == window_index and
+                    legacy_floor_incoming > legacy_known_floor then
+                legacy_known_floor = legacy_floor_incoming
+            end
+            local floor_is_indexed =
+                redis.call('ZSCORE', KEYS[7], legacy_known_floor_key) ~= false
+            if legacy_known_floor > 0 and not floor_is_indexed then
+                local retained_count = redis.call('ZCARD', KEYS[7])
+                if retained_count < max_retained_attempts then
+                    redis.call('ZADD', KEYS[7], 'NX',
+                        now + budget_ttl, legacy_known_floor_key)
+                    floor_is_indexed = true
+                else
+                    local existing_freeze_ttl = redis.call('PTTL', KEYS[8])
+                    if existing_freeze_ttl < budget_ttl then
+                        redis.call('SET', KEYS[8], 1, 'PX', budget_ttl)
+                    end
+                    admitted = 0
+                    refusal = 4
+                end
+            end
+            if legacy_known_floor > 0 and floor_is_indexed then
+                redis.call('SET', legacy_known_floor_key,
+                    legacy_known_floor, 'PX', budget_ttl)
+            end
+
+            local legacy_delta = legacy_known_floor - legacy_applied_floor
+            local retained_count = redis.call('ZCARD', KEYS[7])
+            if redis.call('EXISTS', KEYS[8]) == 1 then
+                admitted = 0
+                refusal = 4
+            elseif redis.call('EXISTS', KEYS[6]) == 1 then
+                admitted = 0
+                refusal = 4
+            elseif retained_count >= max_retained_attempts then
+                admitted = 0
+                refusal = 4
+            elseif redis.call('EXISTS', budget_freeze_key) == 1 then
+                admitted = 0
+                refusal = 3
+                wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
+            elseif budget_limit == 0 then
+                admitted = 0
+                refusal = 3
+                wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
+            elseif legacy_delta > budget_limit or current > budget_limit - legacy_delta then
+                admitted = 0
+                refusal = 3
+                wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
+            elseif bounded then
+                current = current + legacy_delta
+                if reservation > budget_limit or current > budget_limit - reservation then
+                    admitted = 0
+                    refusal = 3
+                    wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
+                else
+                    budget_next = current + reservation
+                end
+            elseif current >= budget_limit - legacy_delta then
+                admitted = 0
+                refusal = 3
+                wait = math.max(wait, ((window_index + 1) * window_secs * 1000) - now)
+            else
+                current = current + legacy_delta
+                reservation = budget_limit - current
+                budget_next = budget_limit
+            end
+        end
+        -- A second budget counter (a key's own cap under a tenant cap, note 0030), judged
+        -- here and reserved below in the same call, so a refusal at either level leaves
+        -- both untouched. It has no legacy floor and its own attempt record (KEYS[10]),
+        -- with its own counter's TTL.
+        local level1_enabled = tonumber(ARGV[29]) == 1
+        local level1_next = 0
+        local level1_reservation = 0
+        local level1_total_key = KEYS[9]
+        local level1_freeze_key = KEYS[9] .. 'frozen'
+        local level1_ttl = 1
+        if level1_enabled then
+            local bounded = tonumber(ARGV[30]) == 1
+            local limit = tonumber(ARGV[31])
+            level1_reservation = tonumber(ARGV[32])
+            local window_secs = tonumber(ARGV[33])
+            local retention_secs = tonumber(ARGV[24])
+            local max_retained_attempts = tonumber(ARGV[25])
+            local window_index = math.floor(math.floor(now / 1000) / window_secs)
+            local window_wait = ((window_index + 1) * window_secs * 1000) - now
+            level1_total_key = KEYS[9] .. window_index
+            level1_freeze_key = level1_total_key .. ':frozen'
+            level1_ttl = math.max(1,
+                ((window_index + 1) * window_secs + retention_secs) * 1000 - now)
+            local current = tonumber(redis.call('GET', level1_total_key)) or 0
+            local retained_count = redis.call('ZCARD', KEYS[7])
+            if redis.call('EXISTS', KEYS[8]) == 1 or
+                    redis.call('EXISTS', KEYS[10]) == 1 or
+                    retained_count + 1 >= max_retained_attempts then
+                admitted = 0
+                refusal = 4
+            elseif redis.call('EXISTS', level1_freeze_key) == 1 or limit == 0 then
+                admitted = 0
+                if refusal ~= 4 then refusal = 3 end
+                wait = math.max(wait, window_wait)
+            elseif bounded then
+                if level1_reservation > limit or current > limit - level1_reservation then
+                    admitted = 0
+                    if refusal ~= 4 then refusal = 3 end
+                    wait = math.max(wait, window_wait)
+                else
+                    level1_next = current + level1_reservation
+                end
+            elseif current >= limit then
+                admitted = 0
+                if refusal ~= 4 then refusal = 3 end
+                wait = math.max(wait, window_wait)
+            else
+                level1_reservation = limit - current
+                level1_next = limit
+            end
+        end
+        if admitted == 1 then
+            for dimension = 1, 4 do
+                local offset = 3 + (dimension - 1) * 4
+                if tonumber(ARGV[offset]) == 1 then
+                    balances[dimension] = balances[dimension] - tonumber(ARGV[offset + 3])
+                end
+            end
+            if level1_enabled then
+                redis.call('SET', level1_total_key, level1_next, 'PX', level1_ttl)
+                redis.call('HSET', KEYS[10],
+                    'liability', level1_reservation,
+                    'bounded', ARGV[30],
+                    'observed', -1,
+                    'finalized', 0,
+                    'total_key', level1_total_key,
+                    'freeze_key', level1_freeze_key,
+                    'provider_floor', -1,
+                    'terminal_catalog', -1,
+                    'terminal_provider', -1)
+                redis.call('PEXPIRE', KEYS[10], level1_ttl)
+                redis.call('ZADD', KEYS[7], 'NX', now + level1_ttl, KEYS[10])
+            end
+            if budget_enabled then
+                redis.call('SET', budget_total_key, budget_next, 'PX', budget_ttl)
+                if legacy_known_floor > 0 or
+                        redis.call('EXISTS', legacy_known_floor_key) == 1 then
+                    redis.call('SET', legacy_applied_floor_key,
+                        legacy_known_floor, 'PX', budget_ttl)
+                    redis.call('SET', legacy_known_floor_key,
+                        legacy_known_floor, 'PX', budget_ttl)
+                end
+                redis.call('HSET', KEYS[6],
+                    'liability', reservation,
+                    'bounded', ARGV[20],
+                    'observed', -1,
+                    'finalized', 0,
+                    'total_key', budget_total_key,
+                    'freeze_key', budget_freeze_key,
+                    'provider_floor', -1,
+                    'terminal_catalog', -1,
+                    'terminal_provider', -1)
+                redis.call('PEXPIRE', KEYS[6], budget_ttl)
+                redis.call('ZADD', KEYS[7], 'NX', now + budget_ttl, KEYS[6])
+            end
+        end
+
+        for dimension = 1, 4 do
+            local offset = 3 + (dimension - 1) * 4
+            if tonumber(ARGV[offset]) == 1 then
+                redis.call('HSET', KEYS[dimension],
+                    'tokens', balances[dimension],
+                    'ts', timestamps[dimension],
+                    'penalty', penalties[dimension])
+                redis.call('PEXPIRE', KEYS[dimension], ttl)
+            end
+        end
+        return {admitted, wait, refusal}
+    "#;
+
+    const PENALTY_LUA: &str = r#"
+        local deadline = tonumber(ARGV[1])
+        local ttl = tonumber(ARGV[2])
+        for index = 1, 2 do
+            redis.call('HSET', KEYS[index], 'penalty', deadline, 'tokens', 0)
+            redis.call('PEXPIRE', KEYS[index], ttl)
+        end
+        return 1
+    "#;
+
+    const SETTLE_BUDGET_LUA: &str = r#"
+        if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
+        local values = redis.call('HMGET', KEYS[1],
+            'liability', 'bounded', 'observed', 'finalized', 'total_key',
+            'freeze_key', 'provider_floor', 'terminal_catalog', 'terminal_provider')
+        local liability = tonumber(values[1]) or 0
+        local bounded = tonumber(values[2]) or 0
+        local observed = tonumber(values[3]) or -1
+        local finalized = tonumber(values[4]) or 0
+        local total_key = values[5]
+        local freeze_key = values[6]
+        local provider_floor = tonumber(values[7]) or -1
+        local terminal_catalog = tonumber(values[8]) or -1
+        local terminal_provider = tonumber(values[9]) or -1
+        if finalized == 1 then return 1 end
+        local incoming = tonumber(ARGV[1])
+        local should_finalize = tonumber(ARGV[2]) == 1
+        local max_exact = tonumber(ARGV[3])
+        local authority = tonumber(ARGV[4])
+        local terminal_authoritative = tonumber(ARGV[5]) == 1
+        if bounded == 0 and authority ~= 1 then
+            terminal_authoritative = false
+        end
+        if authority == 1 and incoming > provider_floor then
+            provider_floor = incoming
+            redis.call('HSET', KEYS[1], 'provider_floor', incoming)
+        end
+        if terminal_authoritative and incoming >= 0 then
+            if authority == 1 then
+                terminal_provider = incoming
+                redis.call('HSET', KEYS[1], 'terminal_provider', incoming)
+            elseif authority == 0 and incoming > terminal_catalog then
+                terminal_catalog = incoming
+                redis.call('HSET', KEYS[1], 'terminal_catalog', incoming)
+            end
+        end
+        if incoming >= 0 and incoming > observed then
+            observed = incoming
+            redis.call('HSET', KEYS[1], 'observed', observed)
+        end
+        if observed > liability then
+            local total = tonumber(redis.call('GET', total_key)) or 0
+            local delta = observed - liability
+            if total > max_exact - delta then
+                total = max_exact
+                liability = max_exact
+                local ttl = redis.call('PTTL', total_key)
+                redis.call('SET', freeze_key, 1, 'PX', math.max(1, ttl))
+            else
+                total = total + delta
+                liability = observed
+            end
+            redis.call('SET', total_key, total, 'KEEPTTL')
+            redis.call('HSET', KEYS[1], 'liability', liability)
+        end
+        if should_finalize then
+            local final = terminal_provider
+            if final < 0 and terminal_catalog >= 0 then
+                final = math.max(terminal_catalog, provider_floor)
+            end
+            if final >= 0 and redis.call('EXISTS', freeze_key) == 0 then
+                local total = tonumber(redis.call('GET', total_key)) or 0
+                if final < liability then
+                    total = math.max(0, total - (liability - final))
+                elseif final > liability then
+                    local delta = final - liability
+                    if total > max_exact - delta then
+                        total = max_exact
+                        local ttl = redis.call('PTTL', total_key)
+                        redis.call('SET', freeze_key, 1, 'PX', math.max(1, ttl))
+                    else
+                        total = total + delta
+                    end
+                end
+                redis.call('SET', total_key, total, 'KEEPTTL')
+            end
+            if final >= 0 then
+                liability = final
+                redis.call('HSET', KEYS[1], 'liability', liability, 'finalized', 1)
+            end
+        end
+        return 1
+    "#;
+
+    pub(super) struct RedisAttemptRates {
+        connections: crate::redis_operation::RedisConnectionManagerCache,
+        config: LiveLimits,
+        max_retained_attempts: usize,
+        retention_secs: u64,
+        accounting_index_key: String,
+        retain_legacy_spend_floor_script: redis::Script,
+        combined_script: redis::Script,
+        penalty_script: redis::Script,
+        settle_budget_script: redis::Script,
+    }
+
+    impl RedisAttemptRates {
+        #[cfg(test)]
+        pub(super) fn new(url: &str, config: RateLimitConfig) -> redis::RedisResult<Self> {
+            Self::with_retention(url, config, retained_accounting_attempt_limit())
+        }
+
+        pub(super) fn with_retention(
+            url: &str,
+            config: RateLimitConfig,
+            max_retained_attempts: usize,
+        ) -> redis::RedisResult<Self> {
+            Self::with_accounting_limits(
+                url,
+                config,
+                max_retained_attempts,
+                LATE_SETTLEMENT_RETENTION_SECS,
+                REDIS_ACCOUNTING_INDEX_KEY.to_owned(),
+            )
+        }
+
+        pub(super) fn with_accounting_limits(
+            url: &str,
+            config: RateLimitConfig,
+            max_retained_attempts: usize,
+            retention_secs: u64,
+            accounting_index_key: String,
+        ) -> redis::RedisResult<Self> {
+            let client = redis::Client::open(url)?;
+            Ok(Self {
+                connections: crate::redis_operation::RedisConnectionManagerCache::new(client),
+                config: LiveLimits::new(config),
+                max_retained_attempts,
+                retention_secs,
+                accounting_index_key,
+                retain_legacy_spend_floor_script: redis::Script::new(RETAIN_LEGACY_SPEND_FLOOR_LUA),
+                combined_script: redis::Script::new(COMBINED_RATE_LUA),
+                penalty_script: redis::Script::new(PENALTY_LUA),
+                settle_budget_script: redis::Script::new(SETTLE_BUDGET_LUA),
+            })
+        }
+
+        #[cfg(test)]
+        pub(super) async fn connection(&self) -> redis::RedisResult<ConnectionManager> {
+            self.connections.connection_for_test().await
+        }
+
+        fn global_key(provider: &str, dimension: &str) -> String {
+            format!("llmshim:rl:{provider}:{dimension}")
+        }
+
+        fn tenant_key(scope: &TrustedPolicyScope, provider: &str, dimension: &str) -> String {
+            format!(
+                "llmshim:rl:tenant:{}:{provider}:{dimension}",
+                scope.tenant_key
+            )
+        }
+
+        pub(super) fn budget_total_prefix(scope: &TrustedPolicyScope) -> String {
+            format!(
+                "llmshim:gw:budget:v1:{}:{}:",
+                scope.tenant_key,
+                scope.budget.as_ref().map_or(0, |budget| budget.window_secs)
+            )
+        }
+
+        #[cfg(test)]
+        pub(super) fn budget_attempt_key(
+            scope: &TrustedPolicyScope,
+            attempt_id: uuid::Uuid,
+        ) -> String {
+            Self::level_attempt_key(&scope.tenant_key, attempt_id)
+        }
+
+        /// A level's counter prefix: for a tenant with no table `ledger_key` is the tenant
+        /// key and this is [`Self::budget_total_prefix`] exactly.
+        pub(super) fn level_prefix(ledger_key: &str, window_secs: u64) -> String {
+            format!("llmshim:gw:budget:v1:{ledger_key}:{window_secs}:")
+        }
+
+        fn level_attempt_key(ledger_key: &str, attempt_id: uuid::Uuid) -> String {
+            format!("llmshim:gw:budget:v1:attempt:{ledger_key}:{attempt_id}")
+        }
+
+        async fn settle_budget(
+            &self,
+            scope: &TrustedPolicyScope,
+            attempt_id: uuid::Uuid,
+            observation: Option<crate::gateway::budget::SpendObservation>,
+            finalize: bool,
+        ) -> Result<(), ()> {
+            // Each level is its own record with its own counter, settled on its own: a
+            // failure at one keeps that level's liability and does not stop the others.
+            let mut result = Ok(());
+            for (level, (ledger_key, _)) in scope.budget_levels().into_iter().enumerate() {
+                let id = level_attempt_id(attempt_id, level);
+                if self
+                    .settle_one(&ledger_key, id, observation, finalize)
+                    .await
+                    .is_err()
+                {
+                    result = Err(());
+                }
+            }
+            result
+        }
+
+        async fn settle_one(
+            &self,
+            ledger_key: &str,
+            attempt_id: uuid::Uuid,
+            observation: Option<crate::gateway::budget::SpendObservation>,
+            finalize: bool,
+        ) -> Result<(), ()> {
+            let result: i64 = self
+                .connections
+                .run(|mut connection| async move {
+                    self.settle_budget_script
+                        .key(Self::level_attempt_key(ledger_key, attempt_id))
+                        .arg(
+                            observation
+                                .and_then(|value| value.amount_nanos)
+                                .map_or(-1_i64, |value| value as i64),
+                        )
+                        .arg(i32::from(finalize))
+                        .arg(crate::gateway::budget::MAX_EXACT_REDIS_NANOS)
+                        .arg(observation.map_or(-1_i32, |value| match value.authority {
+                            crate::gateway::budget::SpendAuthority::Catalog => 0,
+                            crate::gateway::budget::SpendAuthority::Provider => 1,
+                        }))
+                        .arg(i32::from(
+                            observation.is_some_and(|value| value.terminal_authoritative),
+                        ))
+                        .invoke_async(&mut connection)
+                        .await
+                })
+                .await
+                .map_err(|_| ())?;
+            (result == 1).then_some(()).ok_or(())
+        }
+
+        fn add_dimension(
+            invocation: &mut redis::ScriptInvocation<'_>,
+            limit: Option<u32>,
+            required: f64,
+        ) {
+            let per_minute = limit.unwrap_or(1).max(1) as f64;
+            invocation
+                .arg(i32::from(limit.is_some()))
+                .arg(per_minute)
+                .arg(per_minute / 60.0)
+                .arg(required);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AttemptRates for RedisAttemptRates {
+        async fn retain_legacy_spend_floor(
+            &self,
+            tenant: &str,
+            scope: &TrustedPolicyScope,
+        ) -> Result<LegacySpendFloor, ()> {
+            let policy = scope.budget.as_ref().ok_or(())?;
+            let result: (i64, u64, u64) = self
+                .connections
+                .run(|mut connection| async move {
+                    self.retain_legacy_spend_floor_script
+                        .key(format!("llmshim:spend:{tenant}:"))
+                        .key(Self::budget_total_prefix(scope))
+                        .key(&self.accounting_index_key)
+                        .key(format!("{}:frozen", self.accounting_index_key))
+                        .arg(policy.window_secs)
+                        .arg(self.retention_secs)
+                        .arg(self.max_retained_attempts)
+                        .arg(ACCOUNTING_EXPIRY_CLEANUP_BATCH)
+                        .arg(crate::gateway::budget::MAX_EXACT_REDIS_NANOS)
+                        .invoke_async(&mut connection)
+                        .await
+                })
+                .await
+                .map_err(|_| ())?;
+            (result.0 == 1)
+                .then_some(LegacySpendFloor {
+                    window_index: result.1,
+                    amount_nanos: result.2,
+                })
+                .ok_or(())
+        }
+
+        async fn acquire(
+            &self,
+            provider: &str,
+            scope: &TrustedPolicyScope,
+            permits: u32,
+            attempt_id: uuid::Uuid,
+            quote: Option<crate::gateway::budget::BudgetQuote>,
+        ) -> Result<(), RateRefusal> {
+            let quotes: Vec<_> = quote.into_iter().collect();
+            self.acquire_levels(provider, scope, permits, attempt_id, &quotes)
+                .await
+        }
+
+        /// One call for every budget counter of the scope (at most two): the script judges
+        /// both before it reserves either (note 0030).
+        async fn acquire_levels(
+            &self,
+            provider: &str,
+            scope: &TrustedPolicyScope,
+            permits: u32,
+            attempt_id: uuid::Uuid,
+            quotes: &[crate::gateway::budget::BudgetQuote],
+        ) -> Result<(), RateRefusal> {
+            let levels = scope.budget_levels();
+            if levels.len() != quotes.len() || levels.len() > 2 {
+                return Err(RateRefusal::Unavailable);
+            }
+            let global = self.config.resolve(provider);
+            if scope.rpm == Some(0) || scope.tpm == Some(0) {
+                return Err(RateRefusal::Tenant(ZERO_LIMIT_RETRY_AFTER));
+            }
+            if global.rpm == Some(0) || global.tpm == Some(0) {
+                return Err(RateRefusal::Provider(ZERO_LIMIT_RETRY_AFTER));
+            }
+            let mut invocation = self.combined_script.prepare_invoke();
+            invocation
+                .key(Self::global_key(provider, "rpm"))
+                .key(Self::global_key(provider, "tpm"))
+                .key(Self::tenant_key(scope, provider, "rpm"))
+                .key(Self::tenant_key(scope, provider, "tpm"));
+            match levels.first() {
+                Some((ledger_key, policy)) => {
+                    invocation
+                        .key(Self::level_prefix(ledger_key, policy.window_secs))
+                        .key(Self::level_attempt_key(ledger_key, attempt_id))
+                        .key(&self.accounting_index_key)
+                        .key(format!("{}:frozen", self.accounting_index_key));
+                }
+                None => {
+                    invocation
+                        .key("llmshim:gw:budget:v1:none")
+                        .key(format!("llmshim:gw:budget:v1:none:{attempt_id}"))
+                        .key("llmshim:gw:budget:v1:none:index")
+                        .key("llmshim:gw:budget:v1:none:index:frozen");
+                }
+            }
+            // The second level's counter and attempt record (KEYS[9], KEYS[10]); unused
+            // placeholders when there is no second level.
+            match levels.get(1) {
+                Some((ledger_key, policy)) => {
+                    invocation
+                        .key(Self::level_prefix(ledger_key, policy.window_secs))
+                        .key(Self::level_attempt_key(
+                            ledger_key,
+                            level_attempt_id(attempt_id, 1),
+                        ));
+                }
+                None => {
+                    invocation
+                        .key("llmshim:gw:budget:v1:none:level1")
+                        .key(format!("llmshim:gw:budget:v1:none:level1:{attempt_id}"));
+                }
+            }
+            invocation.arg(0).arg(KEY_TTL_MS);
+            Self::add_dimension(&mut invocation, global.rpm, 1.0);
+            Self::add_dimension(&mut invocation, global.tpm, permits.max(1) as f64);
+            Self::add_dimension(&mut invocation, scope.rpm, 1.0);
+            Self::add_dimension(&mut invocation, scope.tpm, permits.max(1) as f64);
+            match levels.first().zip(quotes.first()) {
+                Some(((_, policy), quote)) => {
+                    invocation
+                        .arg(1)
+                        .arg(i32::from(quote.bounded))
+                        .arg(policy.limit_nanos)
+                        .arg(quote.amount_nanos)
+                        .arg(policy.window_secs)
+                        .arg(self.retention_secs)
+                        .arg(self.max_retained_attempts)
+                        .arg(ACCOUNTING_EXPIRY_CLEANUP_BATCH)
+                        .arg(
+                            scope
+                                .legacy_spend_floor
+                                .map_or(-1_i64, |floor| floor.window_index as i64),
+                        )
+                        .arg(
+                            scope
+                                .legacy_spend_floor
+                                .map_or(0_u64, |floor| floor.amount_nanos),
+                        );
+                }
+                None => {
+                    invocation
+                        .arg(0)
+                        .arg(0)
+                        .arg(0)
+                        .arg(0)
+                        .arg(1)
+                        .arg(1)
+                        .arg(0)
+                        .arg(0)
+                        .arg(-1)
+                        .arg(0);
+                }
+            }
+            match levels.get(1).zip(quotes.get(1)) {
+                Some(((_, policy), quote)) => {
+                    invocation
+                        .arg(1)
+                        .arg(i32::from(quote.bounded))
+                        .arg(policy.limit_nanos)
+                        .arg(quote.amount_nanos)
+                        .arg(policy.window_secs);
+                }
+                None => {
+                    invocation.arg(0).arg(0).arg(0).arg(0).arg(1);
+                }
+            }
+            let (admitted, wait_ms, refusal): (i64, i64, i64) = self
+                .connections
+                .run(|mut connection| async move { invocation.invoke_async(&mut connection).await })
+                .await
+                .map_err(|_| RateRefusal::Unavailable)?;
+            if admitted == 1 {
+                Ok(())
+            } else if refusal == 3 {
+                Err(RateRefusal::Budget(Duration::from_millis(
+                    wait_ms.max(1) as u64
+                )))
+            } else if refusal == 4 {
+                Err(RateRefusal::Unavailable)
+            } else if refusal == 2 {
+                Err(RateRefusal::Tenant(Duration::from_millis(
+                    wait_ms.max(0) as u64
+                )))
+            } else {
+                Err(RateRefusal::Provider(Duration::from_millis(
+                    wait_ms.max(0) as u64
+                )))
+            }
+        }
+
+        fn retune(&self, config: RateLimitConfig) {
+            self.config.replace(config);
+        }
+
+        async fn penalize(&self, provider: &str, duration: Duration) -> Result<(), ()> {
+            let limit = self.config.resolve(provider);
+            if limit.rpm.is_none() && limit.tpm.is_none() {
+                return Ok(());
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_millis() as u64)
+                .unwrap_or_default();
+            let _: i64 = self
+                .connections
+                .run(|mut connection| async move {
+                    self.penalty_script
+                        .key(Self::global_key(provider, "rpm"))
+                        .key(Self::global_key(provider, "tpm"))
+                        .arg(now.saturating_add(duration.as_millis() as u64))
+                        .arg(KEY_TTL_MS)
+                        .invoke_async(&mut connection)
+                        .await
+                })
+                .await
+                .map_err(|_| ())?;
+            Ok(())
+        }
+
+        async fn observe_usage(
+            &self,
+            scope: &TrustedPolicyScope,
+            attempt_id: uuid::Uuid,
+            observation: crate::gateway::budget::SpendObservation,
+        ) -> Result<(), ()> {
+            self.settle_budget(scope, attempt_id, Some(observation), false)
+                .await
+        }
+
+        async fn finish(
+            &self,
+            scope: &TrustedPolicyScope,
+            attempt_id: uuid::Uuid,
+            outcome: AttemptOutcome,
+        ) -> Result<(), ()> {
+            self.settle_budget(
+                scope,
+                attempt_id,
+                None,
+                crate::gateway::budget::may_finalize(outcome),
+            )
+            .await
+        }
+
+        #[cfg(test)]
+        async fn budget_total(&self, _scope: &TrustedPolicyScope) -> Option<u64> {
+            None
+        }
+    }
+}
+
+#[cfg(feature = "redis-coordination")]
+use redis_rates::RedisAttemptRates;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::AttemptKind;
+
+    struct PendingFinishRates;
+
+    #[async_trait::async_trait]
+    impl AttemptRates for PendingFinishRates {
+        async fn acquire(
+            &self,
+            _provider: &str,
+            _scope: &TrustedPolicyScope,
+            _permits: u32,
+            _attempt_id: uuid::Uuid,
+            _quote: Option<crate::gateway::budget::BudgetQuote>,
+        ) -> Result<(), RateRefusal> {
+            Ok(())
+        }
+
+        async fn penalize(&self, _provider: &str, _duration: Duration) -> Result<(), ()> {
+            Ok(())
+        }
+
+        async fn observe_usage(
+            &self,
+            _scope: &TrustedPolicyScope,
+            _attempt_id: uuid::Uuid,
+            _observation: crate::gateway::budget::SpendObservation,
+        ) -> Result<(), ()> {
+            Ok(())
+        }
+
+        async fn finish(
+            &self,
+            _scope: &TrustedPolicyScope,
+            _attempt_id: uuid::Uuid,
+            _outcome: AttemptOutcome,
+        ) -> Result<(), ()> {
+            futures::future::pending().await
+        }
+
+        async fn budget_total(&self, _scope: &TrustedPolicyScope) -> Option<u64> {
+            None
+        }
+    }
+
+    fn scope(name: &str, rpm: Option<u32>, tpm: Option<u32>) -> TrustedPolicyScope {
+        TrustedPolicyScope {
+            version: 1,
+            tenant_key: format!("test-{name}"),
+            rpm,
+            tpm,
+            budget: None,
+            legacy_spend_floor: None,
+            tenant_cap: None,
+            key_cap_id: None,
+            credential: None,
+            request_id: None,
+            deployment: None,
+            router: None,
+            operation: Default::default(),
+        }
+    }
+
+    fn budgeted(name: &str, limit_nanos: u64) -> TrustedPolicyScope {
+        let mut scope = scope(name, None, None);
+        scope.budget = Some(crate::gateway::budget::BudgetPolicySnapshot {
+            limit_nanos,
+            window_secs: 3600,
+            allow_unpriced: false,
+            valid: true,
+        });
+        scope
+    }
+
+    /// What crosses Redis with a job is a fixed set of fields: a key's name and its tags
+    /// (note 0029) are resolved by each replica from its own configuration and never
+    /// travel. A new field here must be a decision, not an accident.
+    #[test]
+    fn the_scope_that_crosses_redis_carries_no_key_name_or_tags() {
+        let mut scope = scope("fields", Some(1), Some(1));
+        scope.attribute("a-credential-scope-0123456789abcdef", Some("req-1"), None);
+        let value = serde_json::to_value(&scope).unwrap();
+        let mut found: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            [
+                "credential",
+                "request_id",
+                "rpm",
+                "tenant_key",
+                "tpm",
+                "version"
+            ]
+        );
+        assert!(!value.to_string().contains("tag"));
+    }
+
+    /// A scope under a tenant table: the tenant's cap over every key, and (when `key_limit`
+    /// is set) the key's own cap on a counter of its own (note 0030).
+    fn two_level(
+        tenant: &str,
+        key_id: &str,
+        tenant_limit: u64,
+        key_limit: Option<u64>,
+        key_window_secs: u64,
+    ) -> TrustedPolicyScope {
+        let policy = |limit_nanos, window_secs| crate::gateway::budget::BudgetPolicySnapshot {
+            limit_nanos,
+            window_secs,
+            allow_unpriced: false,
+            valid: true,
+        };
+        let mut scope = scope(tenant, None, None);
+        scope.version = 2;
+        scope.tenant_cap = Some(policy(tenant_limit, 3600));
+        scope.key_cap_id = Some(key_id.to_owned());
+        scope.budget = key_limit.map(|limit| policy(limit, key_window_secs));
+        scope
+    }
+
+    async fn total_of(rates: &LocalAttemptRates, ledger_key: &str) -> u64 {
+        let state = rates.state.lock().await;
+        state
+            .budget_totals
+            .iter()
+            .filter(|(key, _)| key.tenant_key == ledger_key)
+            .map(|(_, total)| *total)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn a_request_must_fit_the_tenant_cap_and_its_keys_own_cap_and_a_refusal_holds_nothing() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let capped = two_level("acme", "key-a", 100, Some(50), 3600);
+        let free = two_level("acme", "key-b", 100, None, 3600);
+        let acquire = |scope: &TrustedPolicyScope, quotes: Vec<_>| {
+            let scope = scope.clone();
+            let rates = &rates;
+            async move {
+                rates
+                    .acquire_levels_at_epoch(
+                        "p",
+                        &scope,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &quotes,
+                        Some(10),
+                    )
+                    .await
+            }
+        };
+        let tenant_key = format!("tenant-cap:{}", capped.tenant_key);
+        let key_a = "key-cap:key-a";
+        // The capped key spends its own 50, and that counts toward the tenant's 100.
+        acquire(&capped, vec![quote(30), quote(30)]).await.unwrap();
+        acquire(&capped, vec![quote(20), quote(20)]).await.unwrap();
+        assert_eq!(total_of(&rates, &tenant_key).await, 50);
+        assert_eq!(total_of(&rates, key_a).await, 50);
+        // Its own cap refuses the next one although the tenant has 50 left; nothing moved.
+        assert!(matches!(
+            acquire(&capped, vec![quote(1), quote(1)]).await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert_eq!(total_of(&rates, &tenant_key).await, 50);
+        assert_eq!(total_of(&rates, key_a).await, 50);
+        // The other key has only the tenant cap, which the first key's spend already used.
+        acquire(&free, vec![quote(50)]).await.unwrap();
+        assert_eq!(total_of(&rates, &tenant_key).await, 100);
+        // The tenant is now full: the free key is refused, and the capped key is refused at
+        // the tenant level although its own counter is full too; neither counter moved.
+        assert!(matches!(
+            acquire(&free, vec![quote(1)]).await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert_eq!(total_of(&rates, &tenant_key).await, 100);
+        assert_eq!(total_of(&rates, key_a).await, 50);
+    }
+
+    #[tokio::test]
+    async fn a_key_refused_by_the_tenant_cap_leaves_its_own_counter_untouched() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let key = two_level("acme", "key-a", 40, Some(1000), 3600);
+        let id = uuid::Uuid::new_v4();
+        let refused = rates
+            .acquire_levels_at_epoch("p", &key, 1, id, &[quote(50), quote(50)], Some(10))
+            .await;
+        assert!(matches!(refused, Err(RateRefusal::Budget(_))));
+        // The key level had room, but nothing is held there: atomic across levels.
+        assert_eq!(total_of(&rates, "key-cap:key-a").await, 0);
+        assert_eq!(
+            total_of(&rates, &format!("tenant-cap:{}", key.tenant_key)).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wait_is_the_latest_window_end_of_the_levels_that_refuse() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        // Tenant window 3600, key window 60; both are full at second 10.
+        let key = two_level("acme", "key-a", 0, Some(0), 60);
+        let refused = rates
+            .acquire_levels_at_epoch(
+                "p",
+                &key,
+                1,
+                uuid::Uuid::new_v4(),
+                &[quote(1), quote(1)],
+                Some(10),
+            )
+            .await;
+        match refused {
+            Err(RateRefusal::Budget(wait)) => assert_eq!(wait, Duration::from_secs(3590)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_two_windows_are_independent() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let key = two_level("acme", "key-a", 1000, Some(10), 60);
+        let go = |epoch: u64, amount: u64| {
+            let key = key.clone();
+            let rates = &rates;
+            async move {
+                rates
+                    .acquire_levels_at_epoch(
+                        "p",
+                        &key,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &[quote(amount), quote(amount)],
+                        Some(epoch),
+                    )
+                    .await
+            }
+        };
+        go(10, 10).await.unwrap();
+        assert!(go(20, 1).await.is_err(), "the key's minute is full");
+        // The next minute: the key's counter is fresh, the tenant's hour keeps its spend.
+        go(70, 10).await.unwrap();
+        assert_eq!(
+            total_of(&rates, &format!("tenant-cap:{}", key.tenant_key)).await,
+            20
+        );
+    }
+
+    #[tokio::test]
+    async fn settlement_returns_each_levels_own_liability() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let key = two_level("acme", "key-a", 100, Some(40), 3600);
+        let id = uuid::Uuid::new_v4();
+        // An attempt that cannot be priced holds the remaining allowance at each level
+        // (100 at the tenant, 40 at the key).
+        let unbounded = crate::gateway::budget::BudgetQuote {
+            amount_nanos: 0,
+            bounded: false,
+        };
+        rates
+            .acquire_levels_at_epoch("p", &key, 1, id, &[unbounded, unbounded], Some(10))
+            .await
+            .unwrap();
+        let tenant_key = format!("tenant-cap:{}", key.tenant_key);
+        assert_eq!(total_of(&rates, &tenant_key).await, 100);
+        assert_eq!(total_of(&rates, "key-cap:key-a").await, 40);
+        // It finishes at 7: each level gives back what it held beyond that, no more.
+        rates
+            .observe_usage(&key, id, inferred_terminal_zero_with(7))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &key,
+                id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(total_of(&rates, &tenant_key).await, 7);
+        assert_eq!(total_of(&rates, "key-cap:key-a").await, 7);
+    }
+
+    fn inferred_terminal_zero_with(amount: u64) -> crate::gateway::budget::SpendObservation {
+        crate::gateway::budget::SpendObservation {
+            amount_nanos: Some(amount),
+            authority: crate::gateway::budget::SpendAuthority::Provider,
+            terminal_authoritative: true,
+        }
+    }
+
+    #[test]
+    fn an_embeddings_scope_is_version_3_with_its_operation_and_a_chat_scope_is_unchanged() {
+        // Older replicas accept versions 1 and 2 only, so a job whose operation they do not know
+        // is refused by them instead of run as chat (note 0041); a chat job has no new field.
+        let chat = serde_json::to_value(scope("operation", None, None)).unwrap();
+        assert_eq!(chat["version"], 1);
+        assert!(chat.get("operation").is_none(), "{chat}");
+        let mut embeddings = scope("operation", None, None);
+        embeddings.set_operation(crate::policy::DispatchOperation::Embeddings);
+        let value = serde_json::to_value(&embeddings).unwrap();
+        assert_eq!(value["version"], 3);
+        assert_eq!(value["operation"], "Embeddings");
+        let back: TrustedPolicyScope = serde_json::from_value(value).unwrap();
+        assert_eq!(back.operation, crate::policy::DispatchOperation::Embeddings);
+        assert_eq!(back.version, 3);
+        // A scope that has no operation field (every job written before this) reads as chat.
+        let old: TrustedPolicyScope = serde_json::from_value(chat).unwrap();
+        assert_eq!(old.operation, crate::policy::DispatchOperation::Chat);
+    }
+
+    #[test]
+    fn a_scope_without_a_cap_serializes_as_it_always_did_and_one_with_a_cap_is_version_2() {
+        let plain = budgeted("plain", 100);
+        let value = serde_json::to_value(&plain).unwrap();
+        assert_eq!(value["version"], 1);
+        assert!(value.get("tenant_cap").is_none() && value.get("key_cap_id").is_none());
+        let capped = two_level("t", "key-a", 100, Some(50), 3600);
+        let value = serde_json::to_value(&capped).unwrap();
+        assert_eq!(value["version"], 2);
+        assert!(value.get("tenant_cap").is_some() && value.get("key_cap_id").is_some());
+        // The one counter a table-less tenant has is its own tenant key, as before.
+        let levels = plain.budget_levels();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].0, plain.tenant_key);
+        // A level's attempt id is the attempt's own for the first counter.
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(level_attempt_id(id, 0), id);
+        assert_ne!(level_attempt_id(id, 1), id);
+        assert_ne!(level_attempt_id(id, 1), level_attempt_id(id, 2));
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[test]
+    fn outage_admission_follows_the_counter_the_ledger_holds() {
+        // A key with a cap of its own would need a second lease: refused.
+        assert!(two_level("t", "k", 100, Some(5), 3600)
+            .outage_budget()
+            .is_none());
+        // A tenant under a table whose key has no cap of its own leases the tenant cap's
+        // counter, in the namespace the Redis ledger uses.
+        let tenant_only = two_level("t", "k", 100, None, 3600);
+        let (ledger_key, window, limit) = tenant_only.outage_budget().unwrap();
+        assert_eq!(ledger_key, format!("tenant-cap:{}", tenant_only.tenant_key));
+        assert_eq!((window, limit), (3600, 100));
+        let view = tenant_only.outage_view(40, 2, 9, 1.0).unwrap();
+        // The local view is one ordinary counter limited to the lease, version 1.
+        assert_eq!(view.version, 1);
+        assert!(view.tenant_cap.is_none() && view.key_cap_id.is_none());
+        let levels = view.budget_levels();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].1.limit_nanos, 40);
+        assert_eq!(levels[0].1.window_secs, OUTAGE_LOCAL_WINDOW_SECS);
+        assert_eq!(levels[0].0, outage_tenant_key(&ledger_key, 2, 9));
+        // A tenant with no table is as it was.
+        let (plain_key, _, _) = budgeted("plain", 100).outage_budget().unwrap();
+        assert_eq!(plain_key, budgeted("plain", 100).tenant_key);
+    }
+
+    #[test]
+    fn the_key_cap_counter_follows_the_key_name_not_its_secret() {
+        let identity = |name: &str| crate::gateway::auth::Identity {
+            tenant: "acme".into(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(5.0),
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+            allowed_models: None,
+            key_name: Some(name.into()),
+            tenant_budget: Some(crate::gateway::auth::TenantBudget {
+                budget_usd: 100.0,
+                budget_window_secs: None,
+                budget_allow_unpriced: false,
+            }),
+        };
+        let id = |name: &str| {
+            TrustedPolicyScope::from_identity(&identity(name))
+                .key_cap_id
+                .unwrap()
+        };
+        // The same key (a rotated secret does not appear here at all) keeps its counter;
+        // a different name is a different counter.
+        assert_eq!(id("ci"), id("ci"));
+        assert_ne!(id("ci"), id("ci-2"));
+        assert_eq!(id("ci").len(), 16);
+    }
+
+    #[tokio::test]
+    async fn retention_counts_every_level_of_an_attempt() {
+        let rates = LocalAttemptRates::with_retention(RateLimitConfig::default(), 3);
+        let key = two_level("acme", "key-a", 1000, Some(1000), 3600);
+        let go = || {
+            let key = key.clone();
+            let rates = &rates;
+            async move {
+                rates
+                    .acquire_levels_at_epoch(
+                        "p",
+                        &key,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &[quote(1), quote(1)],
+                        Some(10),
+                    )
+                    .await
+            }
+        };
+        go().await.unwrap(); // two entries
+                             // A second would need four: over the limit of three.
+        assert!(matches!(go().await, Err(RateRefusal::Unavailable)));
+    }
+
+    /// Only a budgeted key whose attempts are priced and bounded can be
+    /// admitted on a lease: no budget, an unpriced allowance or an invalid one
+    /// is refused before any request is built (note 0027).
+    #[cfg(feature = "redis-coordination")]
+    #[test]
+    fn only_a_priced_budgeted_key_has_an_outage_view() {
+        assert!(budgeted("ok", 100).outage_view(10, 0, 1, 1.0).is_some());
+        assert!(scope("none", None, None)
+            .outage_view(10, 0, 1, 1.0)
+            .is_none());
+        let mut unpriced = budgeted("unpriced", 100);
+        unpriced.budget.as_mut().unwrap().allow_unpriced = true;
+        assert!(unpriced.outage_view(10, 0, 1, 1.0).is_none());
+        let mut invalid = budgeted("invalid", 100);
+        invalid.budget.as_mut().unwrap().valid = false;
+        assert!(invalid.outage_view(10, 0, 1, 1.0).is_none());
+        // The tenant's rate limits are this replica's share.
+        let mut limited = budgeted("rate", 100);
+        limited.rpm = Some(100);
+        limited.tpm = Some(1000);
+        let view = limited.outage_view(10, 0, 1, 0.1).unwrap();
+        assert_eq!((view.rpm, view.tpm), (Some(10), Some(100)));
+    }
+
+    /// A later outage in the same window starts from an empty local ledger: the
+    /// spend of the first is charged once, at recovery, and is not counted
+    /// against the second lease (note 0027).
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    async fn each_outage_epoch_has_its_own_local_ledger() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let base = budgeted("epochs", 100);
+        let first = base.outage_view(50, 0, 7, 1.0).unwrap();
+        rates
+            .acquire("p", &first, 1, uuid::Uuid::new_v4(), Some(quote(40)))
+            .await
+            .unwrap();
+        let key = |epoch| outage_tenant_key(&base.tenant_key, epoch, 7);
+        assert_eq!(
+            rates
+                .local_budget_total(&key(0), OUTAGE_LOCAL_WINDOW_SECS)
+                .await,
+            Some(40)
+        );
+        // The second outage's lease is smaller than what the first spent.
+        let second = base.outage_view(30, 1, 7, 1.0).unwrap();
+        rates
+            .acquire("p", &second, 1, uuid::Uuid::new_v4(), Some(quote(20)))
+            .await
+            .expect("not charged for the first outage's spend");
+        assert_eq!(
+            rates
+                .local_budget_total(&key(1), OUTAGE_LOCAL_WINDOW_SECS)
+                .await,
+            Some(20)
+        );
+        // And a request past the lease is refused by the local ledger.
+        assert!(rates
+            .acquire("p", &second, 1, uuid::Uuid::new_v4(), Some(quote(11)))
+            .await
+            .is_err());
+    }
+
+    /// The local ledger never rolls over by the local clock: a retry after the
+    /// lease's window ended cannot take a fresh allowance.
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    async fn a_lease_ledger_does_not_roll_with_the_local_clock() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let view = budgeted("nowrap", 100).outage_view(50, 0, 7, 1.0).unwrap();
+        for epoch_secs in [0_u64, 3_600, 7_200] {
+            let id = uuid::Uuid::new_v4();
+            let result = rates
+                .acquire_at_epoch("p", &view, 1, id, Some(quote(30)), Some(epoch_secs))
+                .await;
+            // 30 fits once; every later "window" still sees it spent.
+            assert_eq!(result.is_ok(), epoch_secs == 0, "{epoch_secs}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_permit_releases_before_remote_finish_settlement() {
+        let coordinator = Arc::new(AttemptCoordinator {
+            rates: Arc::new(PendingFinishRates),
+            concurrency_limit: 1,
+            concurrency_wait: Duration::from_secs(1),
+            semaphores: Mutex::new(HashMap::new()),
+            active_permits: Mutex::new(HashMap::new()),
+            usage: std::sync::OnceLock::new(),
+            penalty: std::sync::OnceLock::new(),
+        });
+        let context = coordinator.context(scope("finish-timeout", None, None));
+        let target = crate::reasoning::ReplayTarget::new(
+            "test-provider",
+            "test-model",
+            crate::reasoning::WireFormat::OpenAiChat,
+        );
+        let mut tracker = context
+            .acquire(
+                AttemptKind::Completion,
+                "test-provider/test-model",
+                &target,
+                "http://127.0.0.1/provider",
+                &serde_json::json!({"model": "test-model", "messages": []}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(coordinator.active_permits.lock().unwrap().len(), 1);
+        let outcome = AttemptOutcome::Completed {
+            accounting: crate::policy::AttemptAccounting::NoUsageReported,
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), tracker.finish(outcome))
+                .await
+                .is_err()
+        );
+        assert!(coordinator.active_permits.lock().unwrap().is_empty());
+    }
+
+    fn budget_scope(name: &str, limit_nanos: u64) -> TrustedPolicyScope {
+        TrustedPolicyScope {
+            version: 1,
+            tenant_key: format!("test-{name}"),
+            rpm: None,
+            tpm: None,
+            budget: Some(crate::gateway::budget::BudgetPolicySnapshot {
+                limit_nanos,
+                window_secs: 60,
+                allow_unpriced: false,
+                valid: true,
+            }),
+            legacy_spend_floor: None,
+            tenant_cap: None,
+            key_cap_id: None,
+            credential: None,
+            request_id: None,
+            deployment: None,
+            router: None,
+            operation: Default::default(),
+        }
+    }
+
+    fn quote(amount_nanos: u64) -> crate::gateway::budget::BudgetQuote {
+        crate::gateway::budget::BudgetQuote {
+            amount_nanos,
+            bounded: true,
+        }
+    }
+
+    fn spend_observation(
+        amount_nanos: Option<u64>,
+        authority: crate::gateway::budget::SpendAuthority,
+        terminal_authoritative: bool,
+    ) -> crate::gateway::budget::SpendObservation {
+        crate::gateway::budget::SpendObservation {
+            amount_nanos,
+            authority,
+            terminal_authoritative,
+        }
+    }
+
+    fn inferred_terminal_zero() -> crate::gateway::budget::SpendObservation {
+        crate::gateway::budget::SpendObservation {
+            amount_nanos: Some(0),
+            authority: crate::gateway::budget::SpendAuthority::Catalog,
+            terminal_authoritative: true,
+        }
+    }
+
+    fn partial_catalog(amount_nanos: u64) -> crate::gateway::budget::SpendObservation {
+        spend_observation(
+            Some(amount_nanos),
+            crate::gateway::budget::SpendAuthority::Catalog,
+            false,
+        )
+    }
+
+    fn terminal_catalog(amount_nanos: u64) -> crate::gateway::budget::SpendObservation {
+        spend_observation(
+            Some(amount_nanos),
+            crate::gateway::budget::SpendAuthority::Catalog,
+            true,
+        )
+    }
+
+    fn terminal_provider(amount_nanos: u64) -> crate::gateway::budget::SpendObservation {
+        spend_observation(
+            Some(amount_nanos),
+            crate::gateway::budget::SpendAuthority::Provider,
+            true,
+        )
+    }
+
+    fn partial_provider(amount_nanos: u64) -> crate::gateway::budget::SpendObservation {
+        spend_observation(
+            Some(amount_nanos),
+            crate::gateway::budget::SpendAuthority::Provider,
+            false,
+        )
+    }
+
+    fn total_for(state: &LocalRateState, scope: &TrustedPolicyScope, window_index: u64) -> u64 {
+        state
+            .budget_totals
+            .get(&BudgetWindowKey {
+                tenant_key: scope.tenant_key.clone(),
+                window_secs: 60,
+                window_index,
+            })
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// How many requests a tenant gets through before its bucket refuses one.
+    async fn admitted_before_refusal(rates: &LocalAttemptRates, tenant: &str, rpm: u32) -> usize {
+        let mut admitted = 0;
+        for _ in 0..(rpm as usize + 3) {
+            match rates
+                .acquire(
+                    "provider",
+                    &scope(tenant, Some(rpm), None),
+                    1,
+                    uuid::Uuid::new_v4(),
+                    None,
+                )
+                .await
+            {
+                Ok(()) => admitted += 1,
+                Err(_) => break,
+            }
+        }
+        admitted
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_tenant_limit_applies_to_the_bucket_that_already_exists() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default()).with_tenant_retuning();
+        // Created at 6 per minute, and used once.
+        assert_eq!(admitted_before_refusal(&rates, "relimited", 6).await, 6);
+
+        // Lowered: the bucket is refused at once, not after the old burst. (It
+        // is empty here, so this is also a refusal at the old limit, which is
+        // the point: lowering never grants.)
+        assert_eq!(admitted_before_refusal(&rates, "relimited", 2).await, 0);
+
+        // Time passes and the bucket refills, capped at the lowered limit.
+        tokio::time::advance(Duration::from_secs(600)).await;
+        assert_eq!(admitted_before_refusal(&rates, "relimited", 2).await, 2);
+
+        // Raised: nothing is granted at once (the time so far was earned at the
+        // old rate), but from now on the bucket refills at the new one. Thirty
+        // seconds at 60 per minute is 30 requests, where 2 per minute earned 1.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(admitted_before_refusal(&rates, "relimited", 60).await, 2);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(admitted_before_refusal(&rates, "relimited", 60).await, 30);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lowered_tenant_limit_caps_the_burst_the_bucket_had_saved() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default()).with_tenant_retuning();
+        // One request at 60 per minute leaves 59 unspent.
+        assert_eq!(admitted_before_refusal(&rates, "trimmed", 60).await, 60);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(admitted_before_refusal(&rates, "trimmed", 60).await, 60);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        // Lowered to 5: the 30 saved requests are not honoured.
+        assert_eq!(admitted_before_refusal(&rates, "trimmed", 5).await, 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unchanged_tenant_limit_leaves_the_bucket_alone() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default()).with_tenant_retuning();
+        assert_eq!(admitted_before_refusal(&rates, "steady", 4).await, 4);
+        // Asking again with the same limit neither refills nor resets.
+        assert_eq!(admitted_before_refusal(&rates, "steady", 4).await, 0);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert_eq!(admitted_before_refusal(&rates, "steady", 4).await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_retuning_a_tenants_bucket_keeps_the_limit_it_was_made_with() {
+        // The behaviour `llmshim gateway` has always had, and still has: two keys
+        // of one tenant may carry different limits, and the first to arrive
+        // fixes the shared bucket. Retuning there would let a 2-per-minute key
+        // borrow a 1200-per-minute key's refill rate (and clip its burst) every
+        // time the two alternate.
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        assert_eq!(admitted_before_refusal(&rates, "shared", 2).await, 2);
+        // The other key, at 1200 per minute, finds the 2-per-minute bucket empty.
+        assert_eq!(admitted_before_refusal(&rates, "shared", 1200).await, 0);
+        // Thirty seconds earn one request at 2 per minute, not 600 at 1200.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(admitted_before_refusal(&rates, "shared", 1200).await, 1);
+        // And going back to the low-limit key is not credited at the high rate.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(admitted_before_refusal(&rates, "shared", 2).await, 1);
+    }
+
+    #[tokio::test]
+    async fn local_budget_refusal_is_atomic_with_rate_debits() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::with_global(Some(1), None));
+        let denied_scope = budget_scope("denied-budget", 50);
+        assert!(matches!(
+            rates
+                .acquire(
+                    "provider",
+                    &denied_scope,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(51)),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+
+        assert!(rates
+            .acquire(
+                "provider",
+                &scope("allowed-after-budget-refusal", None, None),
+                1,
+                uuid::Uuid::new_v4(),
+                None,
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn zero_budget_freezes_even_a_zero_cost_quote_without_rate_debit() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::with_global(Some(1), None));
+        let frozen = budget_scope("zero-budget", 0);
+        assert!(matches!(
+            rates
+                .acquire("provider", &frozen, 1, uuid::Uuid::new_v4(), Some(quote(0)))
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert!(rates
+            .acquire(
+                "provider",
+                &scope("after-zero-budget", None, None),
+                1,
+                uuid::Uuid::new_v4(),
+                None,
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_budget_reservations_are_concurrent_and_window_owned() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let tenant = budget_scope("window-owner", 100);
+        assert!(rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                uuid::Uuid::new_v4(),
+                Some(quote(60)),
+                Some(600),
+            )
+            .await
+            .is_ok());
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(50)),
+                    Some(600),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert!(rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                uuid::Uuid::new_v4(),
+                Some(quote(50)),
+                Some(660),
+            )
+            .await
+            .is_ok());
+        let state = rates.state.lock().await;
+        assert_eq!(total_for(&state, &tenant, 10), 60);
+        assert_eq!(total_for(&state, &tenant, 11), 50);
+    }
+
+    #[tokio::test]
+    async fn cumulative_usage_settles_once_and_partial_abandonment_retains_liability() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let tenant = budget_scope("cumulative", 100);
+        let settled_attempt = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                settled_attempt,
+                Some(quote(80)),
+                Some(1200),
+            )
+            .await
+            .unwrap();
+        for observed in [
+            partial_catalog(20),
+            partial_catalog(20),
+            terminal_catalog(30),
+        ] {
+            rates
+                .observe_usage(&tenant, settled_attempt, observed)
+                .await
+                .unwrap();
+        }
+        rates
+            .finish(
+                &tenant,
+                settled_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                settled_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(total_for(&state, &tenant, 20), 30);
+        }
+
+        let abandoned_attempt = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                abandoned_attempt,
+                Some(quote(70)),
+                Some(1200),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, abandoned_attempt, partial_catalog(10))
+            .await
+            .unwrap();
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(total_for(&state, &tenant, 20), 100);
+        }
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(1)),
+                    Some(1200),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unbounded_opt_in_still_records_known_charges_and_exhausts_the_cap() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let mut tenant = budget_scope("unbounded-known", 100);
+        tenant.budget.as_mut().unwrap().allow_unpriced = true;
+        let window_index = 30;
+        for observed in [60, 50] {
+            let attempt_id = uuid::Uuid::new_v4();
+            let mut unbounded = quote(0);
+            unbounded.bounded = false;
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    attempt_id,
+                    Some(unbounded),
+                    Some(window_index * 60),
+                )
+                .await
+                .unwrap();
+            rates
+                .observe_usage(&tenant, attempt_id, terminal_provider(observed))
+                .await
+                .unwrap();
+            rates
+                .finish(
+                    &tenant,
+                    attempt_id,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(total_for(&state, &tenant, window_index), 110);
+        }
+        let mut unbounded = quote(0);
+        unbounded.bounded = false;
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(unbounded),
+                    Some(window_index * 60),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_known_cost_saturates_and_duplicate_settlement_is_idempotent() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let tenant = budget_scope(
+            "known-overflow",
+            crate::gateway::budget::MAX_EXACT_REDIS_NANOS,
+        );
+        let attempt_id = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                attempt_id,
+                Some(quote(10)),
+                Some(2400),
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            rates
+                .observe_usage(
+                    &tenant,
+                    attempt_id,
+                    terminal_provider(crate::gateway::budget::MAX_EXACT_REDIS_NANOS),
+                )
+                .await
+                .unwrap();
+        }
+        for _ in 0..2 {
+            rates
+                .finish(
+                    &tenant,
+                    attempt_id,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(
+                total_for(&state, &tenant, 40),
+                crate::gateway::budget::MAX_EXACT_REDIS_NANOS
+            );
+        }
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(1)),
+                    Some(2400),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn saturated_window_stays_frozen_when_an_overlapping_attempt_releases() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let tenant = budget_scope(
+            "overlap-overflow",
+            crate::gateway::budget::MAX_EXACT_REDIS_NANOS,
+        );
+        let overflowing_attempt = uuid::Uuid::new_v4();
+        let releasing_attempt = uuid::Uuid::new_v4();
+        for attempt_id in [overflowing_attempt, releasing_attempt] {
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    attempt_id,
+                    Some(quote(10)),
+                    Some(2460),
+                )
+                .await
+                .unwrap();
+        }
+        rates
+            .observe_usage(
+                &tenant,
+                overflowing_attempt,
+                terminal_provider(crate::gateway::budget::MAX_EXACT_REDIS_NANOS),
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            rates
+                .observe_usage(&tenant, releasing_attempt, terminal_provider(0))
+                .await
+                .unwrap();
+            rates
+                .finish(
+                    &tenant,
+                    releasing_attempt,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(
+                total_for(&state, &tenant, 41),
+                crate::gateway::budget::MAX_EXACT_REDIS_NANOS
+            );
+            assert!(state.budget_frozen.contains(&BudgetWindowKey {
+                tenant_key: tenant.tenant_key.clone(),
+                window_secs: 60,
+                window_index: 41,
+            }));
+        }
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(1)),
+                    Some(2460),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn partial_usage_cannot_release_but_terminal_provider_bill_can_correct_catalog() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let tenant = budget_scope("partial-terminal", 100);
+        let partial_attempt = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                partial_attempt,
+                Some(quote(80)),
+                Some(2520),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, partial_attempt, partial_catalog(10))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                partial_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(total_for(&state, &tenant, 42), 80);
+        }
+
+        let correction_attempt = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                correction_attempt,
+                Some(quote(20)),
+                Some(2580),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, correction_attempt, partial_catalog(80))
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, correction_attempt, terminal_provider(15))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            rates
+                .observe_usage(&tenant, correction_attempt, terminal_catalog(80))
+                .await
+                .unwrap();
+        }
+        rates
+            .finish(
+                &tenant,
+                correction_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(total_for(&state, &tenant, 43), 15);
+        }
+
+        let zero_attempt = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                zero_attempt,
+                Some(quote(80)),
+                Some(2640),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, zero_attempt, inferred_terminal_zero())
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                zero_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(total_for(&state, &tenant, 44), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn unpriced_explicit_zero_counters_do_not_release_fee_uncertainty() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let mut tenant = budget_scope("unpriced-zero", 100);
+        tenant.budget.as_mut().unwrap().allow_unpriced = true;
+        let attempt_id = uuid::Uuid::new_v4();
+        let mut unbounded_quote = quote(0);
+        unbounded_quote.bounded = false;
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                attempt_id,
+                Some(unbounded_quote),
+                Some(2700),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, attempt_id, inferred_terminal_zero())
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                attempt_id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(total_for(&state, &tenant, 45), 100);
+        }
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(1)),
+                    Some(2700),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_catalog_cannot_release_below_partial_provider_floor() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let tenant = budget_scope("provider-floor", 100);
+        for (window_index, outcome) in [
+            (
+                46,
+                Some(AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                }),
+            ),
+            (
+                47,
+                Some(AttemptOutcome::StreamFailure {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                }),
+            ),
+            (48, None),
+        ] {
+            let attempt_id = uuid::Uuid::new_v4();
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    attempt_id,
+                    Some(quote(20)),
+                    Some(window_index * 60),
+                )
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                rates
+                    .observe_usage(&tenant, attempt_id, partial_provider(80))
+                    .await
+                    .unwrap();
+            }
+            rates
+                .observe_usage(&tenant, attempt_id, terminal_catalog(15))
+                .await
+                .unwrap();
+            if let Some(outcome) = outcome {
+                rates.finish(&tenant, attempt_id, outcome).await.unwrap();
+            }
+            let state = rates.state.lock().await;
+            assert_eq!(total_for(&state, &tenant, window_index), 80);
+            drop(state);
+            assert!(matches!(
+                rates
+                    .acquire_at_epoch(
+                        "provider",
+                        &tenant,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        Some(quote(21)),
+                        Some(window_index * 60),
+                    )
+                    .await,
+                Err(RateRefusal::Budget(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn late_settlement_keeps_the_acquisition_window_tombstone() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let mut tenant = budget_scope("late-settlement", 100);
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let old_attempt = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                old_attempt,
+                Some(quote(80)),
+                Some(10),
+            )
+            .await
+            .unwrap();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                uuid::Uuid::new_v4(),
+                Some(quote(100)),
+                Some(13),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, old_attempt, terminal_catalog(25))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                old_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        let state = rates.state.lock().await;
+        let old_window = BudgetWindowKey {
+            tenant_key: tenant.tenant_key.clone(),
+            window_secs: 1,
+            window_index: 10,
+        };
+        assert_eq!(state.budget_totals.get(&old_window), Some(&25));
+        assert!(state
+            .budget_attempts
+            .get(&old_attempt)
+            .is_some_and(|attempt| attempt.finalized));
+    }
+
+    #[tokio::test]
+    async fn local_accounting_capacity_is_bounded_and_refusal_does_not_debit_rates() {
+        let rates = LocalAttemptRates::with_accounting_limits(
+            RateLimitConfig::with_global(Some(3), None),
+            2,
+            1,
+        );
+        let mut tenant = budget_scope("bounded-accounting", 100);
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let first_attempt = uuid::Uuid::new_v4();
+        let second_attempt = uuid::Uuid::new_v4();
+        for attempt_id in [first_attempt, second_attempt] {
+            rates
+                .acquire_at_epoch("provider", &tenant, 1, attempt_id, Some(quote(0)), Some(10))
+                .await
+                .unwrap();
+            rates
+                .observe_usage(&tenant, attempt_id, terminal_catalog(0))
+                .await
+                .unwrap();
+            rates
+                .finish(
+                    &tenant,
+                    attempt_id,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    first_attempt,
+                    Some(quote(0)),
+                    Some(10),
+                )
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(0)),
+                    Some(10),
+                )
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        {
+            let state = rates.state.lock().await;
+            assert_eq!(state.budget_attempts.len(), 2);
+            assert_eq!(state.budget_expirations.len(), 2);
+        }
+
+        let unbudgeted = scope("capacity-rate-proof", None, None);
+        assert!(rates
+            .acquire("provider", &unbudgeted, 1, uuid::Uuid::new_v4(), None,)
+            .await
+            .is_ok());
+        assert!(matches!(
+            rates
+                .acquire("provider", &unbudgeted, 1, uuid::Uuid::new_v4(), None,)
+                .await,
+            Err(RateRefusal::Provider(_))
+        ));
+
+        let replacement = uuid::Uuid::new_v4();
+        assert!(rates
+            .acquire_at_epoch(
+                "replacement-provider",
+                &tenant,
+                1,
+                replacement,
+                Some(quote(0)),
+                Some(12),
+            )
+            .await
+            .is_ok());
+        assert!(rates
+            .observe_usage(&tenant, first_attempt, terminal_catalog(1))
+            .await
+            .is_err());
+        let state = rates.state.lock().await;
+        assert_eq!(state.budget_attempts.len(), 1);
+        assert!(state.budget_attempts.contains_key(&replacement));
+    }
+
+    #[tokio::test]
+    async fn local_expiry_removes_frozen_window_without_accepting_late_callbacks() {
+        let rates = LocalAttemptRates::with_accounting_limits(RateLimitConfig::default(), 2, 1);
+        let mut tenant = budget_scope(
+            "bounded-frozen-accounting",
+            crate::gateway::budget::MAX_EXACT_REDIS_NANOS,
+        );
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let overflowing_attempt = uuid::Uuid::new_v4();
+        let releasing_attempt = uuid::Uuid::new_v4();
+        for attempt_id in [overflowing_attempt, releasing_attempt] {
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    attempt_id,
+                    Some(quote(10)),
+                    Some(20),
+                )
+                .await
+                .unwrap();
+        }
+        rates
+            .observe_usage(
+                &tenant,
+                overflowing_attempt,
+                terminal_provider(crate::gateway::budget::MAX_EXACT_REDIS_NANOS),
+            )
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, releasing_attempt, terminal_provider(0))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                releasing_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rates
+                .acquire_at_epoch(
+                    "provider",
+                    &tenant,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(0)),
+                    Some(20),
+                )
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        let replacement = uuid::Uuid::new_v4();
+        rates
+            .acquire_at_epoch(
+                "provider",
+                &tenant,
+                1,
+                replacement,
+                Some(quote(0)),
+                Some(22),
+            )
+            .await
+            .unwrap();
+        assert!(rates
+            .observe_usage(&tenant, overflowing_attempt, terminal_provider(1))
+            .await
+            .is_err());
+        let state = rates.state.lock().await;
+        assert!(!state
+            .budget_frozen
+            .iter()
+            .any(|window| window.window_index == 20));
+        assert!(state.budget_attempts.contains_key(&replacement));
+    }
+
+    #[tokio::test]
+    async fn local_provider_and_tenant_dimensions_are_each_enforced() {
+        let provider_rates = LocalAttemptRates::new(RateLimitConfig::with_global(Some(1), None));
+        let unlimited_tenant = scope("provider", None, None);
+        assert!(provider_rates
+            .acquire("provider", &unlimited_tenant, 1, uuid::Uuid::new_v4(), None)
+            .await
+            .is_ok());
+        assert!(matches!(
+            provider_rates
+                .acquire("provider", &unlimited_tenant, 1, uuid::Uuid::new_v4(), None)
+                .await,
+            Err(RateRefusal::Provider(_))
+        ));
+
+        let tenant_rates = LocalAttemptRates::new(RateLimitConfig::default());
+        let limited_tenant = scope("tenant", Some(1), None);
+        assert!(tenant_rates
+            .acquire("provider", &limited_tenant, 1, uuid::Uuid::new_v4(), None)
+            .await
+            .is_ok());
+        assert!(matches!(
+            tenant_rates
+                .acquire("provider", &limited_tenant, 1, uuid::Uuid::new_v4(), None)
+                .await,
+            Err(RateRefusal::Tenant(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_tenant_denial_does_not_consume_global_allowance() {
+        let rates = LocalAttemptRates::new(RateLimitConfig::with_global(Some(1), None));
+        let denied_tenant = scope("denied", None, Some(1));
+        assert!(matches!(
+            rates
+                .acquire("provider", &denied_tenant, 2, uuid::Uuid::new_v4(), None)
+                .await,
+            Err(RateRefusal::Tenant(_))
+        ));
+        assert!(rates
+            .acquire(
+                "provider",
+                &scope("allowed", None, None),
+                1,
+                uuid::Uuid::new_v4(),
+                None,
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_retune_applies_to_the_next_attempt_and_keeps_the_tokens() {
+        // Retries, repairs and fallbacks are admitted by this holder, not by the
+        // scheduler's limiter (0022).
+        let rates = LocalAttemptRates::new(RateLimitConfig::with_global(Some(10), None))
+            .with_tenant_retuning();
+        async fn admit(rates: &LocalAttemptRates) -> Result<(), RateRefusal> {
+            rates
+                .acquire(
+                    "provider",
+                    &scope("t", None, None),
+                    1,
+                    uuid::Uuid::new_v4(),
+                    None,
+                )
+                .await
+        }
+        for _ in 0..8 {
+            admit(&rates).await.unwrap();
+        }
+        // Two tokens are left; the new limit of 1 clamps them.
+        rates.retune(RateLimitConfig::with_global(Some(1), None));
+        assert!(admit(&rates).await.is_ok());
+        assert!(matches!(admit(&rates).await, Err(RateRefusal::Provider(_))));
+        // A removed limit removes the bucket; a limit that returns starts fresh.
+        rates.retune(RateLimitConfig::default());
+        for _ in 0..5 {
+            admit(&rates).await.unwrap();
+        }
+        rates.retune(RateLimitConfig::with_global(Some(3), None));
+        for _ in 0..3 {
+            admit(&rates).await.unwrap();
+        }
+        assert!(admit(&rates).await.is_err());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_attempt_rates_present_the_retuned_limit() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-retune-{}", uuid::Uuid::new_v4().simple());
+        let rates =
+            RedisAttemptRates::new(&redis_url, RateLimitConfig::with_global(Some(100), None))
+                .unwrap();
+        let admit = || async {
+            let tenant = scope("t", None, None);
+            rates
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), None)
+                .await
+        };
+        for _ in 0..4 {
+            admit().await.unwrap();
+        }
+        // The shared bucket keeps its tokens and is clamped to the new capacity.
+        rates.retune(RateLimitConfig::with_global(Some(2), None));
+        assert!(admit().await.is_ok());
+        assert!(admit().await.is_ok());
+        assert!(matches!(admit().await, Err(RateRefusal::Provider(_))));
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    fn redis_url() -> Option<String> {
+        std::env::var("LLMSHIM_REDIS_URL").ok()
+    }
+
+    /// The Redis counter of a scope's `level`-th budget level in the current window.
+    #[cfg(feature = "redis-coordination")]
+    async fn redis_level_total(
+        rates: &RedisAttemptRates,
+        scope: &TrustedPolicyScope,
+        level: usize,
+    ) -> (u64, i64) {
+        use redis::AsyncCommands;
+        let levels = scope.budget_levels();
+        let (ledger_key, policy) = &levels[level];
+        let index = epoch_secs() / policy.window_secs;
+        let key = format!(
+            "{}{index}",
+            RedisAttemptRates::level_prefix(ledger_key, policy.window_secs)
+        );
+        let mut connection = rates.connection().await.unwrap();
+        let total: Option<u64> = connection.get(&key).await.unwrap();
+        let ttl: i64 = connection.pttl(&key).await.unwrap();
+        (total.unwrap_or(0), ttl)
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_two_levels_are_judged_together_and_a_refusal_holds_nothing() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("two-level-{}", uuid::Uuid::new_v4().simple());
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let tenant = format!("t-{}", uuid::Uuid::new_v4().simple());
+        let key_a = two_level(&tenant, &format!("a-{tenant}"), 100, Some(50), 3600);
+        let key_b = two_level(&tenant, &format!("b-{tenant}"), 100, None, 3600);
+        let go = |scope: &TrustedPolicyScope, quotes: Vec<_>| {
+            let scope = scope.clone();
+            let provider = provider.clone();
+            let rates = &rates;
+            async move {
+                rates
+                    .acquire_levels(&provider, &scope, 1, uuid::Uuid::new_v4(), &quotes)
+                    .await
+            }
+        };
+        go(&key_a, vec![quote(30), quote(30)]).await.unwrap();
+        go(&key_a, vec![quote(20), quote(20)]).await.unwrap();
+        assert_eq!(redis_level_total(&rates, &key_a, 0).await.0, 50);
+        assert_eq!(redis_level_total(&rates, &key_a, 1).await.0, 50);
+        // Each counter keeps its own expiry (its window's end plus the retention).
+        assert!(redis_level_total(&rates, &key_a, 0).await.1 > 0);
+        assert!(redis_level_total(&rates, &key_a, 1).await.1 > 0);
+        // The key's own cap refuses; neither counter moved.
+        assert!(matches!(
+            go(&key_a, vec![quote(1), quote(1)]).await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert_eq!(redis_level_total(&rates, &key_a, 0).await.0, 50);
+        assert_eq!(redis_level_total(&rates, &key_a, 1).await.0, 50);
+        // The sibling key has only the tenant level, which the first key already used.
+        go(&key_b, vec![quote(50)]).await.unwrap();
+        assert_eq!(redis_level_total(&rates, &key_b, 0).await.0, 100);
+        // The tenant is full: a refusal there leaves the key's own counter untouched.
+        let key_c = two_level(&tenant, &format!("c-{tenant}"), 100, Some(1000), 3600);
+        assert!(matches!(
+            go(&key_c, vec![quote(1), quote(1)]).await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert_eq!(redis_level_total(&rates, &key_c, 1).await.0, 0);
+        assert_eq!(redis_level_total(&rates, &key_c, 0).await.0, 100);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_settlement_returns_each_levels_own_liability() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("two-level-{}", uuid::Uuid::new_v4().simple());
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let tenant = format!("t-{}", uuid::Uuid::new_v4().simple());
+        let key = two_level(&tenant, &format!("a-{tenant}"), 100, Some(40), 3600);
+        let id = uuid::Uuid::new_v4();
+        let unbounded = crate::gateway::budget::BudgetQuote {
+            amount_nanos: 0,
+            bounded: false,
+        };
+        rates
+            .acquire_levels(&provider, &key, 1, id, &[unbounded, unbounded])
+            .await
+            .unwrap();
+        assert_eq!(redis_level_total(&rates, &key, 0).await.0, 100);
+        assert_eq!(redis_level_total(&rates, &key, 1).await.0, 40);
+        rates
+            .observe_usage(&key, id, inferred_terminal_zero_with(7))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &key,
+                id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        // Each level gives back what it held beyond the final amount, and no more.
+        assert_eq!(redis_level_total(&rates, &key, 0).await.0, 7);
+        assert_eq!(redis_level_total(&rates, &key, 1).await.0, 7);
+        // Settling again changes nothing (the records are finalized).
+        rates
+            .finish(
+                &key,
+                id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(redis_level_total(&rates, &key, 0).await.0, 7);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_racing_requests_never_leave_either_counter_over_its_cap() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("two-level-{}", uuid::Uuid::new_v4().simple());
+        let rates = std::sync::Arc::new(
+            RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap(),
+        );
+        let tenant = format!("t-{}", uuid::Uuid::new_v4().simple());
+        // Tenant cap 150; two keys each capped at 100; every request wants 10.
+        let a = two_level(&tenant, &format!("a-{tenant}"), 150, Some(100), 3600);
+        let b = two_level(&tenant, &format!("b-{tenant}"), 150, Some(100), 3600);
+        let mut tasks = Vec::new();
+        for n in 0..60 {
+            let (rates, provider) = (rates.clone(), provider.clone());
+            let scope = if n % 2 == 0 { a.clone() } else { b.clone() };
+            tasks.push(tokio::spawn(async move {
+                rates
+                    .acquire_levels(
+                        &provider,
+                        &scope,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &[quote(10), quote(10)],
+                    )
+                    .await
+                    .is_ok()
+            }));
+        }
+        let mut admitted = 0;
+        for task in tasks {
+            admitted += u64::from(task.await.unwrap());
+        }
+        let tenant_total = redis_level_total(&rates, &a, 0).await.0;
+        let a_total = redis_level_total(&rates, &a, 1).await.0;
+        let b_total = redis_level_total(&rates, &b, 1).await.0;
+        assert_eq!(tenant_total, admitted * 10, "no reservation was orphaned");
+        assert_eq!(
+            a_total + b_total,
+            tenant_total,
+            "both levels moved together"
+        );
+        assert!(tenant_total <= 150, "{tenant_total}");
+        assert!(a_total <= 100 && b_total <= 100, "{a_total} {b_total}");
+        assert_eq!(tenant_total, 150, "the tenant cap was reached");
+
+        // One key alone, capped below the tenant: only its own cap can stop it.
+        let solo_tenant = format!("t-{}", uuid::Uuid::new_v4().simple());
+        let solo = two_level(
+            &solo_tenant,
+            &format!("s-{solo_tenant}"),
+            1000,
+            Some(80),
+            3600,
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..40 {
+            let (rates, provider, scope) = (rates.clone(), provider.clone(), solo.clone());
+            tasks.push(tokio::spawn(async move {
+                rates
+                    .acquire_levels(
+                        &provider,
+                        &scope,
+                        1,
+                        uuid::Uuid::new_v4(),
+                        &[quote(10), quote(10)],
+                    )
+                    .await
+                    .is_ok()
+            }));
+        }
+        let mut ok = 0;
+        for task in tasks {
+            ok += u64::from(task.await.unwrap());
+        }
+        assert_eq!(ok, 8, "the key's own cap admits exactly eight");
+        assert_eq!(redis_level_total(&rates, &solo, 1).await.0, 80);
+        assert_eq!(redis_level_total(&rates, &solo, 0).await.0, 80);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_tenant_allowance_is_shared_across_coordinators() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-share-{}", uuid::Uuid::new_v4().simple());
+        let config = RateLimitConfig::with_global(Some(100), None);
+        let first = RedisAttemptRates::new(&redis_url, config.clone()).unwrap();
+        let second = RedisAttemptRates::new(&redis_url, config).unwrap();
+        let tenant = scope("shared", Some(1), None);
+        assert!(first
+            .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), None)
+            .await
+            .is_ok());
+        assert!(matches!(
+            second
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), None)
+                .await,
+            Err(RateRefusal::Tenant(_))
+        ));
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_tenant_denial_is_atomic_with_global_dimensions() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-atomic-{}", uuid::Uuid::new_v4().simple());
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::with_global(Some(1), None))
+            .unwrap();
+        assert!(matches!(
+            rates
+                .acquire(
+                    &provider,
+                    &scope("denied", None, Some(1)),
+                    2,
+                    uuid::Uuid::new_v4(),
+                    None,
+                )
+                .await,
+            Err(RateRefusal::Tenant(_))
+        ));
+        assert!(rates
+            .acquire(
+                &provider,
+                &scope("allowed", None, None),
+                1,
+                uuid::Uuid::new_v4(),
+                None,
+            )
+            .await
+            .is_ok());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_global_bucket_is_shared_with_the_legacy_limiter() {
+        use crate::proxy::ratelimit::{RateKey, RateLimiter, RedisRateLimiter};
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-compatible-{}", uuid::Uuid::new_v4().simple());
+        let config = RateLimitConfig::with_global(Some(1), None);
+        let coordinated = RedisAttemptRates::new(&redis_url, config.clone()).unwrap();
+        let legacy = RedisRateLimiter::new(&redis_url, config).unwrap();
+        assert!(coordinated
+            .acquire(
+                &provider,
+                &scope("tenant", None, None),
+                1,
+                uuid::Uuid::new_v4(),
+                None,
+            )
+            .await
+            .is_ok());
+        assert!(legacy
+            .acquire(&RateKey::provider(provider), 1)
+            .await
+            .is_err());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_redelivery_acquisition_debits_a_new_attempt() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-redelivery-{}", uuid::Uuid::new_v4().simple());
+        let rates =
+            RedisAttemptRates::new(&redis_url, RateLimitConfig::with_global(Some(100), None))
+                .unwrap();
+        let tenant = scope("redelivered-job", Some(2), None);
+
+        assert!(rates
+            .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), None)
+            .await
+            .is_ok());
+        assert!(rates
+            .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), None)
+            .await
+            .is_ok());
+        assert!(matches!(
+            rates
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), None)
+                .await,
+            Err(RateRefusal::Tenant(_))
+        ));
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_budget_reservation_and_settlement_are_shared_across_origins() {
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-budget-{}", uuid::Uuid::new_v4().simple());
+        let mut tenant = budget_scope(&format!("redis-{}", uuid::Uuid::new_v4()), 100);
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        // Start just after a window boundary, so the three acquires below cannot straddle one
+        // (the window is one second long, and CI is slow enough to notice).
+        loop {
+            let into_window = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_millis());
+            if into_window < 250 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1000 - into_window as u64 + 10)).await;
+        }
+        let first = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let second = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let frozen = budget_scope(&format!("redis-zero-{}", uuid::Uuid::new_v4()), 0);
+        assert!(matches!(
+            first
+                .acquire(&provider, &frozen, 1, uuid::Uuid::new_v4(), Some(quote(0)),)
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        let first_attempt = uuid::Uuid::new_v4();
+        first
+            .acquire(&provider, &tenant, 1, first_attempt, Some(quote(60)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            second
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(50)),)
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        first
+            .observe_usage(&tenant, first_attempt, terminal_catalog(30))
+            .await
+            .unwrap();
+        first
+            .finish(
+                &tenant,
+                first_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(second
+            .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(70)),)
+            .await
+            .is_ok());
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(second
+            .acquire(
+                &provider,
+                &tenant,
+                1,
+                uuid::Uuid::new_v4(),
+                Some(quote(100)),
+            )
+            .await
+            .is_ok());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_accounting_capacity_is_shared_bounded_and_atomic_with_rate_debits() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let provider = format!("attempt-capacity-{namespace}");
+        let index_key = format!("llmshim:test:attempt-index:{namespace}");
+        let config = RateLimitConfig::with_global(Some(3), None);
+        let first = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            config.clone(),
+            2,
+            1,
+            index_key.clone(),
+        )
+        .unwrap();
+        let second =
+            RedisAttemptRates::with_accounting_limits(&redis_url, config, 2, 1, index_key.clone())
+                .unwrap();
+        let mut tenant = budget_scope(&format!("redis-capacity-{namespace}"), 100);
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let first_attempt = uuid::Uuid::new_v4();
+        let second_attempt = uuid::Uuid::new_v4();
+        first
+            .acquire(&provider, &tenant, 1, first_attempt, Some(quote(0)))
+            .await
+            .unwrap();
+        second
+            .acquire(&provider, &tenant, 1, second_attempt, Some(quote(0)))
+            .await
+            .unwrap();
+        for (rates, attempt_id) in [(&first, first_attempt), (&second, second_attempt)] {
+            rates
+                .observe_usage(&tenant, attempt_id, terminal_catalog(0))
+                .await
+                .unwrap();
+            rates
+                .finish(
+                    &tenant,
+                    attempt_id,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            second
+                .acquire(&provider, &tenant, 1, first_attempt, Some(quote(0)))
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        assert!(matches!(
+            first
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(0)),)
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        let mut connection = first.connection().await.unwrap();
+        let retained: usize = connection.zcard(&index_key).await.unwrap();
+        assert_eq!(retained, 2);
+
+        let unbudgeted = scope(&format!("redis-capacity-rate-{namespace}"), None, None);
+        assert!(second
+            .acquire(&provider, &unbudgeted, 1, uuid::Uuid::new_v4(), None,)
+            .await
+            .is_ok());
+        assert!(matches!(
+            first
+                .acquire(&provider, &unbudgeted, 1, uuid::Uuid::new_v4(), None,)
+                .await,
+            Err(RateRefusal::Provider(_))
+        ));
+
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        let replacement = uuid::Uuid::new_v4();
+        second
+            .acquire(
+                &format!("{provider}-replacement"),
+                &tenant,
+                1,
+                replacement,
+                Some(quote(0)),
+            )
+            .await
+            .unwrap();
+        let retained: usize = connection.zcard(&index_key).await.unwrap();
+        assert_eq!(retained, 1);
+        assert!(first
+            .observe_usage(&tenant, first_attempt, terminal_catalog(1))
+            .await
+            .is_err());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_legacy_spend_floors_import_deltas_without_forgetting_new_charges() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let provider = format!("attempt-legacy-floor-{namespace}");
+        let index_key = format!("llmshim:test:attempt-index:{namespace}");
+        let first = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            10,
+            60,
+            index_key.clone(),
+        )
+        .unwrap();
+        let second = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            10,
+            60,
+            index_key,
+        )
+        .unwrap();
+        let mut connection = first.connection().await.unwrap();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_secs = 3_600;
+        let window_index = redis_time.0 / window_secs;
+        let mut tenant = budget_scope(&format!("redis-legacy-floor-{namespace}"), 1_000);
+        tenant.budget.as_mut().unwrap().window_secs = window_secs;
+        tenant.set_legacy_spend_floor(window_index, 50);
+
+        let first_attempt = uuid::Uuid::new_v4();
+        first
+            .acquire(&provider, &tenant, 1, first_attempt, Some(quote(20)))
+            .await
+            .unwrap();
+        first
+            .observe_usage(&tenant, first_attempt, terminal_provider(10))
+            .await
+            .unwrap();
+        first
+            .finish(
+                &tenant,
+                first_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+
+        tenant.set_legacy_spend_floor(window_index, 60);
+        let second_attempt = uuid::Uuid::new_v4();
+        second
+            .acquire(&provider, &tenant, 1, second_attempt, Some(quote(20)))
+            .await
+            .unwrap();
+        second
+            .observe_usage(&tenant, second_attempt, terminal_provider(5))
+            .await
+            .unwrap();
+        second
+            .finish(
+                &tenant,
+                second_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+
+        let attempt_key = RedisAttemptRates::budget_attempt_key(&tenant, second_attempt);
+        let total_key: String = connection.hget(&attempt_key, "total_key").await.unwrap();
+        let total: u64 = connection.get(&total_key).await.unwrap();
+        let imported: u64 = connection
+            .get(format!("{total_key}:legacy-floor"))
+            .await
+            .unwrap();
+        assert_eq!(imported, 60);
+        assert_eq!(total, 75);
+
+        let duplicate_attempt = uuid::Uuid::new_v4();
+        second
+            .acquire(&provider, &tenant, 1, duplicate_attempt, Some(quote(1)))
+            .await
+            .unwrap();
+        let total_after_duplicate_floor: u64 = connection.get(&total_key).await.unwrap();
+        assert_eq!(total_after_duplicate_floor, 76);
+
+        let mut refused = budget_scope(&format!("redis-legacy-refused-{namespace}"), 100);
+        refused.budget.as_mut().unwrap().window_secs = window_secs;
+        refused.set_legacy_spend_floor(window_index, 101);
+        assert!(matches!(
+            first
+                .acquire(&provider, &refused, 1, uuid::Uuid::new_v4(), Some(quote(0)),)
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        let refused_total_key = format!(
+            "{}{window_index}",
+            RedisAttemptRates::budget_total_prefix(&refused)
+        );
+        assert!(!connection
+            .exists::<_, bool>(&refused_total_key)
+            .await
+            .unwrap());
+        assert!(!connection
+            .exists::<_, bool>(format!("{refused_total_key}:legacy-floor"))
+            .await
+            .unwrap());
+        assert_eq!(
+            connection
+                .get::<_, u64>(format!("{refused_total_key}:legacy-known-floor"))
+                .await
+                .unwrap(),
+            101
+        );
+
+        refused.set_legacy_spend_floor(window_index, 50);
+        assert!(matches!(
+            second
+                .acquire(
+                    &provider,
+                    &refused,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(20)),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert_eq!(
+            connection
+                .get::<_, u64>(format!("{refused_total_key}:legacy-known-floor"))
+                .await
+                .unwrap(),
+            101
+        );
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_legacy_floor_survives_duplicate_rate_and_capacity_refusals() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let provider = format!("legacy-ordering-{namespace}");
+        let index_key = format!("llmshim:test:legacy-ordering:{namespace}");
+        let rates = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::with_global(Some(1), None),
+            10,
+            60,
+            index_key.clone(),
+        )
+        .unwrap();
+        let mut connection = rates.connection().await.unwrap();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_secs = 3_600;
+        let window_index = redis_time.0 / window_secs;
+
+        let mut existing = budget_scope(&format!("legacy-existing-{namespace}"), 100);
+        existing.budget.as_mut().unwrap().window_secs = window_secs;
+        existing.set_legacy_spend_floor(window_index, 40);
+        let existing_attempt = uuid::Uuid::new_v4();
+        rates
+            .acquire(&provider, &existing, 1, existing_attempt, Some(quote(10)))
+            .await
+            .unwrap();
+        existing.set_legacy_spend_floor(window_index, 80);
+        assert!(matches!(
+            rates
+                .acquire(&provider, &existing, 1, existing_attempt, Some(quote(0)),)
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        existing.set_legacy_spend_floor(window_index, 50);
+        assert!(matches!(
+            rates
+                .acquire(
+                    &format!("{provider}-fresh"),
+                    &existing,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(30)),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        let existing_total_key = format!(
+            "{}{window_index}",
+            RedisAttemptRates::budget_total_prefix(&existing)
+        );
+        assert_eq!(
+            connection
+                .get::<_, u64>(format!("{existing_total_key}:legacy-known-floor"))
+                .await
+                .unwrap(),
+            80
+        );
+
+        let rate_blocker = budget_scope(&format!("rate-blocker-{namespace}"), 100);
+        rates
+            .acquire(
+                &format!("{provider}-rate"),
+                &rate_blocker,
+                1,
+                uuid::Uuid::new_v4(),
+                Some(quote(1)),
+            )
+            .await
+            .unwrap();
+        let mut rate_refused = budget_scope(&format!("rate-refused-{namespace}"), 100);
+        rate_refused.budget.as_mut().unwrap().window_secs = window_secs;
+        rate_refused.set_legacy_spend_floor(window_index, 90);
+        let rate_provider = format!("{provider}-rate");
+        assert!(matches!(
+            rates
+                .acquire(
+                    &rate_provider,
+                    &rate_refused,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(5)),
+                )
+                .await,
+            Err(RateRefusal::Provider(_))
+        ));
+        rate_refused.set_legacy_spend_floor(window_index, 50);
+        assert!(matches!(
+            rates
+                .acquire(
+                    &format!("{provider}-rate-fresh"),
+                    &rate_refused,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(20)),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+
+        let capacity_index = format!("llmshim:test:legacy-capacity:{namespace}");
+        let capacity_rates = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            1,
+            60,
+            capacity_index.clone(),
+        )
+        .unwrap();
+        let filler = budget_scope(&format!("legacy-capacity-fill-{namespace}"), 100);
+        let filler_attempt = uuid::Uuid::new_v4();
+        capacity_rates
+            .acquire(&provider, &filler, 1, filler_attempt, Some(quote(0)))
+            .await
+            .unwrap();
+        let mut capacity_refused =
+            budget_scope(&format!("legacy-capacity-refused-{namespace}"), 100);
+        capacity_refused.budget.as_mut().unwrap().window_secs = window_secs;
+        capacity_refused.set_legacy_spend_floor(window_index, 90);
+        assert!(matches!(
+            capacity_rates
+                .acquire(
+                    &provider,
+                    &capacity_refused,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(20)),
+                )
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        let mut capacity_connection = capacity_rates.connection().await.unwrap();
+        let _: usize = capacity_connection
+            .zrem(
+                &capacity_index,
+                RedisAttemptRates::budget_attempt_key(&filler, filler_attempt),
+            )
+            .await
+            .unwrap();
+        capacity_refused.set_legacy_spend_floor(window_index, 50);
+        assert!(matches!(
+            capacity_rates
+                .acquire(
+                    &provider,
+                    &capacity_refused,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(20)),
+                )
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+        assert!(capacity_connection
+            .exists::<_, bool>(format!("{capacity_index}:frozen"))
+            .await
+            .unwrap());
+
+        let mut rollover = budget_scope(&format!("legacy-rollover-{namespace}"), 100);
+        rollover.budget.as_mut().unwrap().window_secs = window_secs;
+        rollover.set_legacy_spend_floor(window_index.saturating_sub(1), 90);
+        rates
+            .acquire(
+                &format!("{provider}-rollover"),
+                &rollover,
+                1,
+                uuid::Uuid::new_v4(),
+                Some(quote(10)),
+            )
+            .await
+            .unwrap();
+        let rollover_total_key = format!(
+            "{}{window_index}",
+            RedisAttemptRates::budget_total_prefix(&rollover)
+        );
+        assert_eq!(
+            connection.get::<_, u64>(&rollover_total_key).await.unwrap(),
+            10
+        );
+        assert!(!connection
+            .exists::<_, bool>(format!("{rollover_total_key}:legacy-known-floor"))
+            .await
+            .unwrap());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_origin_retains_floor_before_worker_refusal_or_abandonment() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let tenant = format!("origin-floor-{namespace}");
+        let provider = format!("origin-floor-{namespace}");
+        let index_key = format!("llmshim:test:origin-floor-index:{namespace}");
+        let rates = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            10,
+            60,
+            index_key.clone(),
+        )
+        .unwrap();
+        let identity = Identity {
+            tenant: tenant.clone(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(0.000_000_1),
+            budget_window_secs: Some(3_600),
+            budget_allow_unpriced: false,
+            allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
+        };
+        let mut connection = rates.connection().await.unwrap();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_index = redis_time.0 / 3_600;
+        let legacy_key = format!("llmshim:spend:{tenant}:{window_index}");
+
+        let _: () = connection.set(&legacy_key, "0.00000005").await.unwrap();
+        let mut stale_scope = TrustedPolicyScope::from_identity(&identity);
+        let stale_floor = rates
+            .retain_legacy_spend_floor(&tenant, &stale_scope)
+            .await
+            .unwrap();
+        stale_scope.set_legacy_spend_floor(stale_floor.window_index, stale_floor.amount_nanos);
+
+        let _: () = connection.set(&legacy_key, "0.00000009").await.unwrap();
+        let fresh_scope = TrustedPolicyScope::from_identity(&identity);
+        let fresh_floor = rates
+            .retain_legacy_spend_floor(&tenant, &fresh_scope)
+            .await
+            .unwrap();
+        assert_eq!(fresh_floor.amount_nanos, 90);
+        drop(fresh_scope);
+
+        let total_prefix = RedisAttemptRates::budget_total_prefix(&stale_scope);
+        let known_floor_key = format!("{total_prefix}{window_index}:legacy-known-floor");
+        let total_key = format!("{total_prefix}{window_index}");
+        assert_eq!(
+            connection.get::<_, u64>(&known_floor_key).await.unwrap(),
+            90
+        );
+        assert!(!connection.exists::<_, bool>(&total_key).await.unwrap());
+        assert!(!connection
+            .exists::<_, bool>(format!("{total_key}:legacy-floor"))
+            .await
+            .unwrap());
+        assert!(matches!(
+            rates
+                .acquire(
+                    &provider,
+                    &stale_scope,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(20)),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+        assert!(!connection.exists::<_, bool>(&total_key).await.unwrap());
+        assert!(!connection
+            .exists::<_, bool>(format!("{total_key}:legacy-floor"))
+            .await
+            .unwrap());
+
+        let _: () = connection.set(&legacy_key, "0.000000095").await.unwrap();
+        let mut zero_rate_identity = identity.clone();
+        zero_rate_identity.rpm = Some(0);
+        let zero_rate_scope = TrustedPolicyScope::from_identity(&zero_rate_identity);
+        let zero_rate_floor = rates
+            .retain_legacy_spend_floor(&tenant, &zero_rate_scope)
+            .await
+            .unwrap();
+        assert_eq!(zero_rate_floor.amount_nanos, 95);
+        assert!(matches!(
+            rates
+                .acquire(
+                    &provider,
+                    &zero_rate_scope,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(0)),
+                )
+                .await,
+            Err(RateRefusal::Tenant(_))
+        ));
+        assert!(matches!(
+            rates
+                .acquire(
+                    &format!("{provider}-stale"),
+                    &stale_scope,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(10)),
+                )
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+
+        let _: i64 = connection
+            .del((legacy_key, known_floor_key, index_key))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_invalid_origin_state_freezes_stale_descriptors_with_bounded_state() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        for invalid_legacy_value in [
+            Some("not-a-number"),
+            Some("nan"),
+            Some("-1"),
+            Some("inf"),
+            Some("-inf"),
+            Some("1e309"),
+            None,
+        ] {
+            let namespace = uuid::Uuid::new_v4();
+            let tenant = format!("origin-invalid-{namespace}");
+            let provider = format!("origin-invalid-{namespace}");
+            let index_key = format!("llmshim:test:origin-invalid-index:{namespace}");
+            let freeze_key = format!("{index_key}:frozen");
+            let rates = RedisAttemptRates::with_accounting_limits(
+                &redis_url,
+                RateLimitConfig::with_global(Some(1), None),
+                10,
+                60,
+                index_key.clone(),
+            )
+            .unwrap();
+            let identity = Identity {
+                tenant: tenant.clone(),
+                tier: 0,
+                rpm: None,
+                tpm: None,
+                budget_usd: Some(0.000_000_1),
+                budget_window_secs: Some(3_600),
+                budget_allow_unpriced: false,
+                allowed_models: None,
+                key_name: None,
+                tenant_budget: None,
+            };
+            let mut connection = rates.connection().await.unwrap();
+            let redis_time: (u64, u64) = redis::cmd("TIME")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            let window_index = redis_time.0 / 3_600;
+            let legacy_key = format!("llmshim:spend:{tenant}:{window_index}");
+            let mut stale_scope = TrustedPolicyScope::from_identity(&identity);
+
+            let _: () = connection.set(&legacy_key, "0.00000005").await.unwrap();
+            let stale_floor = rates
+                .retain_legacy_spend_floor(&tenant, &stale_scope)
+                .await
+                .unwrap();
+            stale_scope.set_legacy_spend_floor(stale_floor.window_index, stale_floor.amount_nanos);
+            if let Some(invalid_legacy_value) = invalid_legacy_value {
+                let _: () = connection
+                    .set(&legacy_key, invalid_legacy_value)
+                    .await
+                    .unwrap();
+            } else {
+                let _: i64 = connection.del(&legacy_key).await.unwrap();
+                let _: usize = connection.rpush(&legacy_key, "wrong-type").await.unwrap();
+            }
+
+            assert!(rates
+                .retain_legacy_spend_floor(&tenant, &TrustedPolicyScope::from_identity(&identity))
+                .await
+                .is_err());
+            assert!(connection.exists::<_, bool>(&freeze_key).await.unwrap());
+            assert_eq!(connection.zcard::<_, usize>(&index_key).await.unwrap(), 1);
+            let total_key = format!(
+                "{}{window_index}",
+                RedisAttemptRates::budget_total_prefix(&stale_scope)
+            );
+            let known_floor_key = format!("{total_key}:legacy-known-floor");
+            assert_eq!(
+                connection.get::<_, u64>(&known_floor_key).await.unwrap(),
+                50
+            );
+            assert!(!connection.exists::<_, bool>(&total_key).await.unwrap());
+            assert!(!connection
+                .exists::<_, bool>(format!("{total_key}:legacy-floor"))
+                .await
+                .unwrap());
+            let stale_attempt = uuid::Uuid::new_v4();
+            assert!(matches!(
+                rates
+                    .acquire(&provider, &stale_scope, 1, stale_attempt, Some(quote(20)),)
+                    .await,
+                Err(RateRefusal::Unavailable)
+            ));
+            assert!(!connection
+                .exists::<_, bool>(RedisAttemptRates::budget_attempt_key(
+                    &stale_scope,
+                    stale_attempt,
+                ))
+                .await
+                .unwrap());
+            assert!(!connection.exists::<_, bool>(&total_key).await.unwrap());
+            rates
+                .acquire(
+                    &provider,
+                    &scope(&format!("origin-invalid-rate-{namespace}"), None, None),
+                    1,
+                    uuid::Uuid::new_v4(),
+                    None,
+                )
+                .await
+                .expect("invalid-state refusal must not debit the provider rate bucket");
+
+            let _: () = redis::cmd("PSETEX")
+                .arg(&freeze_key)
+                .arg(200_000_000_u64)
+                .arg("longer-freeze")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            let longer_ttl_before: i64 = redis::cmd("PTTL")
+                .arg(&freeze_key)
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            assert!(rates
+                .retain_legacy_spend_floor(&tenant, &TrustedPolicyScope::from_identity(&identity))
+                .await
+                .is_err());
+            let longer_ttl_after: i64 = redis::cmd("PTTL")
+                .arg(&freeze_key)
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            assert_eq!(
+                connection.get::<_, String>(&freeze_key).await.unwrap(),
+                "longer-freeze"
+            );
+            assert!(longer_ttl_after <= longer_ttl_before);
+            assert!(longer_ttl_after > longer_ttl_before - 1_000);
+            assert_eq!(connection.zcard::<_, usize>(&index_key).await.unwrap(), 1);
+
+            let _: i64 = connection
+                .del((
+                    legacy_key,
+                    known_floor_key,
+                    index_key,
+                    freeze_key,
+                    format!("llmshim:rl:{provider}:rpm"),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_origin_rollover_does_not_carry_an_old_window_floor_forward() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let tenant = format!("origin-rollover-{namespace}");
+        let index_key = format!("llmshim:test:origin-rollover-index:{namespace}");
+        let rates = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            10,
+            1,
+            index_key.clone(),
+        )
+        .unwrap();
+        let identity = Identity {
+            tenant: tenant.clone(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(0.000_000_1),
+            budget_window_secs: Some(1),
+            budget_allow_unpriced: false,
+            allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
+        };
+        let scope = TrustedPolicyScope::from_identity(&identity);
+        let mut connection = rates.connection().await.unwrap();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let old_window = redis_time.0;
+        let old_legacy_key = format!("llmshim:spend:{tenant}:{old_window}");
+        let _: () = connection.set(&old_legacy_key, "0.00000009").await.unwrap();
+        let old_floor = rates
+            .retain_legacy_spend_floor(&tenant, &scope)
+            .await
+            .unwrap();
+        assert_eq!(old_floor.amount_nanos, 90);
+
+        let new_window = loop {
+            let redis_time: (u64, u64) = redis::cmd("TIME")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            if redis_time.0 > old_window {
+                break redis_time.0;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let new_floor = rates
+            .retain_legacy_spend_floor(&tenant, &scope)
+            .await
+            .unwrap();
+        assert_eq!(new_floor.window_index, new_window);
+        assert_eq!(new_floor.amount_nanos, 0);
+        let old_known_key = format!(
+            "{}{old_window}:legacy-known-floor",
+            RedisAttemptRates::budget_total_prefix(&scope)
+        );
+        let new_known_key = format!(
+            "{}{new_window}:legacy-known-floor",
+            RedisAttemptRates::budget_total_prefix(&scope)
+        );
+        assert_eq!(connection.get::<_, u64>(&old_known_key).await.unwrap(), 90);
+        assert!(!connection.exists::<_, bool>(&new_known_key).await.unwrap());
+
+        let _: i64 = connection
+            .del((old_legacy_key, old_known_key, new_known_key, index_key))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_origin_capacity_failure_freezes_after_the_slot_is_freed() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let index_key = format!("llmshim:test:origin-capacity-index:{namespace}");
+        let freeze_key = format!("{index_key}:frozen");
+        let rates = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            1,
+            60,
+            index_key.clone(),
+        )
+        .unwrap();
+        let mut connection = rates.connection().await.unwrap();
+        let redis_time: (u64, u64) = redis::cmd("TIME")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let window_index = redis_time.0 / 3_600;
+        let identity_for = |tenant: String| Identity {
+            tenant,
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: Some(0.000_000_1),
+            budget_window_secs: Some(3_600),
+            budget_allow_unpriced: false,
+            allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
+        };
+        let blocked_identity = identity_for(format!("origin-blocked-{namespace}"));
+        let blocked_legacy_key =
+            format!("llmshim:spend:{}:{window_index}", blocked_identity.tenant);
+        let _: () = connection.set(&blocked_legacy_key, "0.0").await.unwrap();
+        let mut stale_scope = TrustedPolicyScope::from_identity(&blocked_identity);
+        let stale_floor = rates
+            .retain_legacy_spend_floor(&blocked_identity.tenant, &stale_scope)
+            .await
+            .unwrap();
+        stale_scope.set_legacy_spend_floor(stale_floor.window_index, stale_floor.amount_nanos);
+
+        let filler_identity = identity_for(format!("origin-filler-{namespace}"));
+        let filler_legacy_key = format!("llmshim:spend:{}:{window_index}", filler_identity.tenant);
+        let _: () = connection
+            .set(&filler_legacy_key, "0.000000001")
+            .await
+            .unwrap();
+        let filler_scope = TrustedPolicyScope::from_identity(&filler_identity);
+        rates
+            .retain_legacy_spend_floor(&filler_identity.tenant, &filler_scope)
+            .await
+            .unwrap();
+        let filler_known_key = format!(
+            "{}{window_index}:legacy-known-floor",
+            RedisAttemptRates::budget_total_prefix(&filler_scope)
+        );
+
+        let _: () = connection
+            .set(&blocked_legacy_key, "0.00000009")
+            .await
+            .unwrap();
+        let fresh_scope = TrustedPolicyScope::from_identity(&blocked_identity);
+        assert!(rates
+            .retain_legacy_spend_floor(&blocked_identity.tenant, &fresh_scope)
+            .await
+            .is_err());
+        assert!(connection.exists::<_, bool>(&freeze_key).await.unwrap());
+        let _: usize = connection
+            .zrem(&index_key, &filler_known_key)
+            .await
+            .unwrap();
+        assert!(matches!(
+            rates
+                .acquire(
+                    &format!("origin-capacity-{namespace}"),
+                    &stale_scope,
+                    1,
+                    uuid::Uuid::new_v4(),
+                    Some(quote(20)),
+                )
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+
+        let _: i64 = connection
+            .del((
+                blocked_legacy_key,
+                filler_legacy_key,
+                filler_known_key,
+                index_key,
+                freeze_key,
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_expiry_releases_frozen_capacity_without_accepting_late_callbacks() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let namespace = uuid::Uuid::new_v4();
+        let provider = format!("attempt-frozen-capacity-{namespace}");
+        let index_key = format!("llmshim:test:attempt-index:{namespace}");
+        let first = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            2,
+            1,
+            index_key.clone(),
+        )
+        .unwrap();
+        let second = RedisAttemptRates::with_accounting_limits(
+            &redis_url,
+            RateLimitConfig::default(),
+            2,
+            1,
+            index_key.clone(),
+        )
+        .unwrap();
+        let mut tenant = budget_scope(
+            &format!("redis-frozen-capacity-{namespace}"),
+            crate::gateway::budget::MAX_EXACT_REDIS_NANOS,
+        );
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let overflowing_attempt = uuid::Uuid::new_v4();
+        let releasing_attempt = uuid::Uuid::new_v4();
+        first
+            .acquire(&provider, &tenant, 1, overflowing_attempt, Some(quote(10)))
+            .await
+            .unwrap();
+        second
+            .acquire(&provider, &tenant, 1, releasing_attempt, Some(quote(10)))
+            .await
+            .unwrap();
+        first
+            .observe_usage(
+                &tenant,
+                overflowing_attempt,
+                terminal_provider(crate::gateway::budget::MAX_EXACT_REDIS_NANOS),
+            )
+            .await
+            .unwrap();
+        second
+            .observe_usage(&tenant, releasing_attempt, terminal_provider(0))
+            .await
+            .unwrap();
+        second
+            .finish(
+                &tenant,
+                releasing_attempt,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            second
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(0)),)
+                .await,
+            Err(RateRefusal::Unavailable)
+        ));
+
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        let replacement = uuid::Uuid::new_v4();
+        second
+            .acquire(&provider, &tenant, 1, replacement, Some(quote(0)))
+            .await
+            .unwrap();
+        assert!(first
+            .observe_usage(&tenant, overflowing_attempt, terminal_provider(1))
+            .await
+            .is_err());
+        let mut connection = second.connection().await.unwrap();
+        let retained: usize = connection.zcard(index_key).await.unwrap();
+        assert_eq!(retained, 1);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_failed_settlement_keeps_the_acquired_liability() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-settle-{}", uuid::Uuid::new_v4().simple());
+        let tenant = budget_scope(&format!("redis-{}", uuid::Uuid::new_v4()), 100);
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let attempt_id = uuid::Uuid::new_v4();
+        rates
+            .acquire(&provider, &tenant, 1, attempt_id, Some(quote(80)))
+            .await
+            .unwrap();
+
+        let mut connection = rates.connection().await.unwrap();
+        let attempt_key = RedisAttemptRates::budget_attempt_key(&tenant, attempt_id);
+        let total_key: String = connection.hget(&attempt_key, "total_key").await.unwrap();
+        let _: usize = connection.del(attempt_key).await.unwrap();
+        assert!(rates
+            .observe_usage(&tenant, attempt_id, partial_catalog(10))
+            .await
+            .is_err());
+        let retained: u64 = connection.get(total_key).await.unwrap();
+        assert_eq!(retained, 80);
+        assert!(matches!(
+            rates
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(21)),)
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_late_oversized_settlement_saturates_and_keeps_its_tombstone() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-late-{}", uuid::Uuid::new_v4().simple());
+        let mut tenant = budget_scope(
+            &format!("redis-{}", uuid::Uuid::new_v4()),
+            crate::gateway::budget::MAX_EXACT_REDIS_NANOS,
+        );
+        tenant.budget.as_mut().unwrap().window_secs = 1;
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let attempt_id = uuid::Uuid::new_v4();
+        rates
+            .acquire(&provider, &tenant, 1, attempt_id, Some(quote(10)))
+            .await
+            .unwrap();
+        let mut connection = rates.connection().await.unwrap();
+        let attempt_key = RedisAttemptRates::budget_attempt_key(&tenant, attempt_id);
+        let total_key: String = connection.hget(&attempt_key, "total_key").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        for _ in 0..2 {
+            rates
+                .observe_usage(
+                    &tenant,
+                    attempt_id,
+                    terminal_provider(crate::gateway::budget::MAX_EXACT_REDIS_NANOS),
+                )
+                .await
+                .unwrap();
+        }
+        for _ in 0..2 {
+            rates
+                .finish(
+                    &tenant,
+                    attempt_id,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let retained: u64 = connection.get(&total_key).await.unwrap();
+        assert_eq!(retained, crate::gateway::budget::MAX_EXACT_REDIS_NANOS);
+        let tombstone_exists: bool = connection.exists(&attempt_key).await.unwrap();
+        assert!(tombstone_exists);
+        assert!(rates
+            .acquire(
+                &provider,
+                &tenant,
+                1,
+                uuid::Uuid::new_v4(),
+                Some(quote(100)),
+            )
+            .await
+            .is_ok());
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_saturated_window_cannot_be_reopened_by_overlapping_release() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-overlap-{}", uuid::Uuid::new_v4().simple());
+        let tenant = budget_scope(
+            &format!("redis-{}", uuid::Uuid::new_v4()),
+            crate::gateway::budget::MAX_EXACT_REDIS_NANOS,
+        );
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let overflowing_attempt = uuid::Uuid::new_v4();
+        let releasing_attempt = uuid::Uuid::new_v4();
+        for attempt_id in [overflowing_attempt, releasing_attempt] {
+            rates
+                .acquire(&provider, &tenant, 1, attempt_id, Some(quote(10)))
+                .await
+                .unwrap();
+        }
+        rates
+            .observe_usage(
+                &tenant,
+                overflowing_attempt,
+                terminal_provider(crate::gateway::budget::MAX_EXACT_REDIS_NANOS),
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            rates
+                .observe_usage(&tenant, releasing_attempt, terminal_provider(0))
+                .await
+                .unwrap();
+            rates
+                .finish(
+                    &tenant,
+                    releasing_attempt,
+                    AttemptOutcome::Completed {
+                        accounting: crate::policy::AttemptAccounting::UsageObserved,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut connection = rates.connection().await.unwrap();
+        let attempt_key = RedisAttemptRates::budget_attempt_key(&tenant, overflowing_attempt);
+        let total_key: String = connection.hget(&attempt_key, "total_key").await.unwrap();
+        let freeze_key: String = connection.hget(&attempt_key, "freeze_key").await.unwrap();
+        let retained: u64 = connection.get(total_key).await.unwrap();
+        let frozen: bool = connection.exists(freeze_key).await.unwrap();
+        assert_eq!(retained, crate::gateway::budget::MAX_EXACT_REDIS_NANOS);
+        assert!(frozen);
+        assert!(matches!(
+            rates
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(1)),)
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_terminal_provider_bill_replaces_higher_catalog_observation() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-authority-{}", uuid::Uuid::new_v4().simple());
+        let tenant = budget_scope(&format!("redis-{}", uuid::Uuid::new_v4()), 100);
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let attempt_id = uuid::Uuid::new_v4();
+        rates
+            .acquire(&provider, &tenant, 1, attempt_id, Some(quote(20)))
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, attempt_id, partial_catalog(80))
+            .await
+            .unwrap();
+        rates
+            .observe_usage(&tenant, attempt_id, terminal_provider(15))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            rates
+                .observe_usage(&tenant, attempt_id, terminal_catalog(80))
+                .await
+                .unwrap();
+        }
+        rates
+            .finish(
+                &tenant,
+                attempt_id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut connection = rates.connection().await.unwrap();
+        let attempt_key = RedisAttemptRates::budget_attempt_key(&tenant, attempt_id);
+        let total_key: String = connection.hget(attempt_key, "total_key").await.unwrap();
+        let retained: u64 = connection.get(total_key).await.unwrap();
+        assert_eq!(retained, 15);
+    }
+
+    #[cfg(feature = "redis-coordination")]
+    #[tokio::test]
+    #[ignore = "requires LLMSHIM_REDIS_URL"]
+    async fn redis_terminal_catalog_cannot_release_below_partial_provider_floor() {
+        use redis::AsyncCommands;
+
+        let Some(redis_url) = redis_url() else {
+            return;
+        };
+        let provider = format!("attempt-floor-{}", uuid::Uuid::new_v4().simple());
+        let tenant = budget_scope(&format!("redis-{}", uuid::Uuid::new_v4()), 100);
+        let rates = RedisAttemptRates::new(&redis_url, RateLimitConfig::default()).unwrap();
+        let attempt_id = uuid::Uuid::new_v4();
+        rates
+            .acquire(&provider, &tenant, 1, attempt_id, Some(quote(20)))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            rates
+                .observe_usage(&tenant, attempt_id, partial_provider(80))
+                .await
+                .unwrap();
+        }
+        rates
+            .observe_usage(&tenant, attempt_id, terminal_catalog(15))
+            .await
+            .unwrap();
+        rates
+            .finish(
+                &tenant,
+                attempt_id,
+                AttemptOutcome::Completed {
+                    accounting: crate::policy::AttemptAccounting::UsageObserved,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut connection = rates.connection().await.unwrap();
+        let attempt_key = RedisAttemptRates::budget_attempt_key(&tenant, attempt_id);
+        let total_key: String = connection.hget(attempt_key, "total_key").await.unwrap();
+        let retained: u64 = connection.get(total_key).await.unwrap();
+        assert_eq!(retained, 80);
+        assert!(matches!(
+            rates
+                .acquire(&provider, &tenant, 1, uuid::Uuid::new_v4(), Some(quote(21)),)
+                .await,
+            Err(RateRefusal::Budget(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod retention_environment_contract {
+    use super::*;
+
+    fn read(vars: &[(&str, &str)]) -> usize {
+        retained_accounting_attempt_limit_from(&|key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn the_default_applies_unless_a_number_is_given() {
+        let name = "LLMSHIM_GATEWAY_MAX_RETAINED_ACCOUNTING_ATTEMPTS";
+        assert_eq!(read(&[]), DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS);
+        assert_eq!(default_retained_accounting_attempts(), read(&[]));
+        assert_eq!(read(&[(name, "250")]), 250);
+        // Zero is accepted as written; garbage and untrimmed text are not.
+        assert_eq!(read(&[(name, "0")]), 0);
+        for bad in ["many", " 250", "-5", ""] {
+            assert_eq!(
+                read(&[(name, bad)]),
+                DEFAULT_MAX_RETAINED_ACCOUNTING_ATTEMPTS,
+                "{bad:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod usage_records {
+    use super::*;
+    use crate::gateway::usage::testing::Collected;
+    use crate::policy::{AttemptAccounting, AttemptKind};
+    use serde_json::json;
+
+    /// Tenants this replica's configuration names: the ones the scopes below use.
+    const KNOWN: [&str; 3] = ["payments", "a", "b"];
+
+    fn coordinator() -> (Arc<AttemptCoordinator>, Arc<Collected>) {
+        let coordinator = AttemptCoordinator::local_with_retention(
+            RateLimitConfig::default(),
+            4,
+            Duration::from_secs(1),
+            1000,
+            false,
+        );
+        let collected = Arc::new(Collected::default());
+        coordinator.set_usage_sink(crate::gateway::usage::UsageSetup {
+            sink: collected.clone(),
+            tenants: crate::gateway::usage::TenantNames::new(
+                KNOWN.iter().map(|tenant| tenant.to_string()),
+            ),
+            keys: crate::gateway::usage::KeyNames::new([(
+                "known-credential".to_string(),
+                "checkout".to_string(),
+            )]),
+            spans: None,
+        });
+        (coordinator, collected)
+    }
+
+    /// A scope for `tenant`, or for one this replica does not know.
+    fn scope(tenant: Option<&str>, rpm: Option<u32>) -> TrustedPolicyScope {
+        TrustedPolicyScope {
+            version: 1,
+            tenant_key: crate::gateway::usage::UsageSetup::tenant_key(
+                tenant.unwrap_or("not-in-this-replicas-config"),
+            ),
+            rpm,
+            tpm: None,
+            budget: None,
+            legacy_spend_floor: None,
+            tenant_cap: None,
+            key_cap_id: None,
+            credential: None,
+            request_id: None,
+            deployment: None,
+            router: None,
+            operation: Default::default(),
+        }
+    }
+
+    async fn admit(
+        coordinator: &Arc<AttemptCoordinator>,
+        scope: TrustedPolicyScope,
+        kind: AttemptKind,
+    ) -> Option<crate::policy::AttemptTracker> {
+        let target = crate::reasoning::ReplayTarget::new(
+            "test-provider",
+            "test-model",
+            crate::reasoning::WireFormat::OpenAiChat,
+        );
+        coordinator
+            .context(scope)
+            .acquire(
+                kind,
+                "test-provider/test-model",
+                &target,
+                "http://127.0.0.1/provider",
+                &json!({"model": "test-model", "messages": []}),
+            )
+            .await
+            .ok()
+    }
+
+    fn done() -> AttemptOutcome {
+        AttemptOutcome::Completed {
+            accounting: AttemptAccounting::UsageObserved,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_attempt_yields_one_record_with_the_tenant_and_the_final_usage() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Completion,
+        )
+        .await
+        .unwrap();
+        // Snapshots are cumulative: the last one wins.
+        let early = json!({"prompt_tokens": 10, "completion_tokens": 1});
+        let last = json!({
+            "prompt_tokens": 100, "completion_tokens": 40, "reasoning_tokens": 25,
+            "cache_read_tokens": 60, "cache_write_tokens": 5,
+            "cost_usd": 0.0123, "cost_source": "catalog"
+        });
+        tracker.usage(&early, false, false, false).await.unwrap();
+        tracker.usage(&last, true, true, false).await.unwrap();
+        tracker.finish(done()).await.unwrap();
+        drop(tracker);
+
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records.len(), 1, "{records:#?}");
+        let record = &records[0];
+        assert_eq!(record.event, "usage");
+        assert_eq!(record.tenant.as_deref(), Some("payments"));
+        assert_eq!(record.provider, "test-provider");
+        assert_eq!(record.model, "test-model");
+        assert_eq!((record.kind, record.outcome), ("completion", "completed"));
+        assert_eq!(
+            (
+                record.input_tokens,
+                record.output_tokens,
+                record.reasoning_tokens
+            ),
+            (100, 40, Some(25))
+        );
+        assert_eq!(
+            (record.cache_read_tokens, record.cache_write_tokens),
+            (60, 5)
+        );
+        assert_eq!(record.cost_usd, Some(0.0123));
+        assert_eq!(record.cost_source.as_deref(), Some("catalog"));
+        assert!(record.usage_reported);
+        assert_eq!(coordinator.usage.get().unwrap().in_flight(), 0);
+
+        // The spend counters count this record under its provider and source (note 0034): the
+        // price in nano-dollars, the token kinds that are non-zero.
+    }
+
+    #[tokio::test]
+    async fn a_record_names_the_key_and_carries_the_request_id_from_the_scope() {
+        let (coordinator, collected) = coordinator();
+        // A credential this replica's configuration names, one it does not
+        // (another replica's key, or a reload not seen yet), and a job with no
+        // attribution at all (an older replica queued it).
+        for (credential, request_id, key) in [
+            (
+                Some("known-credential"),
+                Some("run-7.step-2"),
+                Some("checkout"),
+            ),
+            (Some("not-in-this-replicas-config"), Some("req-8"), None),
+            (None, None, None),
+        ] {
+            let mut scope = scope(Some("payments"), None);
+            if let Some(credential) = credential {
+                scope.attribute(credential, request_id, None);
+            }
+            let mut tracker = admit(&coordinator, scope, AttemptKind::Completion)
+                .await
+                .unwrap();
+            tracker.finish(done()).await.unwrap();
+            drop(tracker);
+            let records = collected.0.lock().unwrap();
+            let record = records.last().unwrap();
+            assert_eq!(record.key.as_deref(), key, "{credential:?}");
+            assert_eq!(record.request_id.as_deref(), request_id, "{credential:?}");
+            assert_eq!(record.tenant.as_deref(), Some("payments"));
+        }
+    }
+
+    #[test]
+    fn the_scope_gains_attribution_without_changing_what_other_builds_send() {
+        // Nothing attributed: neither field is written, so a job queued by a
+        // build that never attributes is byte-for-byte what it always was, and a
+        // scope written before the fields existed still reads.
+        let plain = serde_json::to_value(scope(Some("payments"), None)).unwrap();
+        assert!(plain.get("credential").is_none() && plain.get("request_id").is_none());
+        let old: TrustedPolicyScope =
+            serde_json::from_value(json!({"tenant_key": "h", "rpm": 1, "tpm": 10})).unwrap();
+        assert!(old.credential.is_none() && old.request_id.is_none());
+        // Attributed: a prefix of the credential's digest and the id travel; the
+        // whole digest (which an operator may hold as a `sha256` verifier) and the
+        // key's name do not.
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut attributed = scope(Some("payments"), None);
+        attributed.attribute(digest, Some("req-1"), None);
+        let text = serde_json::to_string(&attributed).unwrap();
+        assert!(text.contains(&digest[..16]) && text.contains("req-1"));
+        assert!(
+            !text.contains(&digest[..17]),
+            "only the first 16 hex digits of the digest travel"
+        );
+        assert!(!text.contains("checkout"), "names stay out of the scope");
+        let back: TrustedPolicyScope = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.credential.as_deref(), Some(&digest[..16]));
+        assert_eq!(back.request_id.as_deref(), Some("req-1"));
+    }
+
+    /// The usage a provider that reports its own charge would send.
+    fn provider_charge(usd: f64) -> serde_json::Value {
+        json!({"prompt_tokens": 10, "completion_tokens": 1,
+            "cost_usd": usd, "cost_source": "provider"})
+    }
+
+    #[tokio::test]
+    async fn a_lower_terminal_estimate_cannot_erase_what_the_provider_already_charged() {
+        // The spend ledger pins this sequence (a partial provider charge of 80,
+        // again 80, then a terminal catalog estimate of 15 settles at 80); the
+        // record has to agree with what the cap counted.
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Stream,
+        )
+        .await
+        .unwrap();
+        tracker
+            .usage(&provider_charge(0.08), false, false, false)
+            .await
+            .unwrap();
+        tracker
+            .usage(&provider_charge(0.08), false, false, false)
+            .await
+            .unwrap();
+        let estimate = json!({"prompt_tokens": 10, "completion_tokens": 1,
+            "cost_usd": 0.015, "cost_source": "catalog"});
+        tracker.usage(&estimate, true, true, false).await.unwrap();
+        tracker.finish(done()).await.unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].cost_usd, Some(0.08), "{records:#?}");
+        assert_eq!(records[0].cost_source.as_deref(), Some("provider_floor"));
+    }
+
+    #[tokio::test]
+    async fn a_providers_exact_terminal_bill_wins_even_when_lower_than_a_partial_one() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Stream,
+        )
+        .await
+        .unwrap();
+        tracker
+            .usage(&provider_charge(0.08), false, false, false)
+            .await
+            .unwrap();
+        tracker
+            .usage(&provider_charge(0.05), true, true, false)
+            .await
+            .unwrap();
+        tracker.finish(done()).await.unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].cost_usd, Some(0.05), "{records:#?}");
+        assert_eq!(records[0].cost_source.as_deref(), Some("provider"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_keeps_the_charge_the_provider_reported_as_a_floor() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(
+            &coordinator,
+            scope(Some("payments"), None),
+            AttemptKind::Stream,
+        )
+        .await
+        .unwrap();
+        tracker
+            .usage(&provider_charge(0.03), false, false, false)
+            .await
+            .unwrap();
+        tracker
+            .finish(AttemptOutcome::StreamFailure {
+                accounting: AttemptAccounting::UsageObserved,
+            })
+            .await
+            .unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].outcome, "stream_failure");
+        assert_eq!(records[0].cost_usd, Some(0.03));
+        assert_eq!(records[0].cost_source.as_deref(), Some("provider_floor"));
+    }
+
+    #[tokio::test]
+    async fn reasoning_and_uncached_counts_are_read_where_each_wire_puts_them() {
+        let (coordinator, collected) = coordinator();
+        let mut chat = admit(
+            &coordinator,
+            scope(Some("a"), None),
+            AttemptKind::Completion,
+        )
+        .await
+        .unwrap();
+        // Chat-wire providers nest the reasoning count in the details object.
+        chat.usage(
+            &json!({"prompt_tokens": 50, "completion_tokens": 9, "uncached_input_tokens": 30,
+                "completion_tokens_details": {"reasoning_tokens": 7}}),
+            true,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        chat.finish(done()).await.unwrap();
+        let mut bare = admit(
+            &coordinator,
+            scope(Some("a"), None),
+            AttemptKind::Completion,
+        )
+        .await
+        .unwrap();
+        bare.usage(
+            &json!({"prompt_tokens": 5, "completion_tokens": 2}),
+            true,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        bare.finish(done()).await.unwrap();
+        let records = collected.0.lock().unwrap();
+        assert_eq!(records[0].reasoning_tokens, Some(7));
+        assert_eq!(records[0].uncached_input_tokens, Some(30));
+        // A provider that reported neither is "not reported", not zero.
+        assert_eq!(records[1].reasoning_tokens, None);
+        assert_eq!(records[1].uncached_input_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn an_attempt_with_no_usage_has_an_unknown_cost_not_a_free_one() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(&coordinator, scope(Some("a"), None), AttemptKind::Stream)
+            .await
+            .unwrap();
+        tracker
+            .finish(AttemptOutcome::HttpFailure {
+                status: 503,
+                accounting: AttemptAccounting::Unknown,
+            })
+            .await
+            .unwrap();
+        let records = collected.0.lock().unwrap();
+        let record = &records[0];
+        assert_eq!((record.kind, record.outcome), ("stream", "http_failure"));
+        assert_eq!(record.http_status, Some(503));
+        assert_eq!(record.cost_usd, None, "unknown must stay null");
+        assert!(!record.usage_reported);
+        assert_eq!(record.input_tokens + record.output_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn finishing_and_then_dropping_records_once_and_a_bare_drop_records_abandonment() {
+        let (coordinator, collected) = coordinator();
+        let mut finished = admit(
+            &coordinator,
+            scope(Some("a"), None),
+            AttemptKind::Completion,
+        )
+        .await
+        .unwrap();
+        finished.finish(done()).await.unwrap();
+        drop(finished);
+        let dropped = admit(&coordinator, scope(Some("b"), None), AttemptKind::Stream)
+            .await
+            .unwrap();
+        drop(dropped);
+        let records = collected.0.lock().unwrap();
+        let outcomes: Vec<_> = records
+            .iter()
+            .map(|r| (r.tenant.clone(), r.outcome))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                (Some("a".to_string()), "completed"),
+                (Some("b".to_string()), "abandoned")
+            ]
+        );
+        assert_eq!(coordinator.usage.get().unwrap().in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_attempt_costs_nothing_and_leaves_no_record() {
+        let (coordinator, collected) = coordinator();
+        // A tenant limit of zero refuses before anything is sent.
+        let refused = admit(
+            &coordinator,
+            scope(Some("a"), Some(0)),
+            AttemptKind::Completion,
+        )
+        .await;
+        assert!(refused.is_none());
+        assert!(collected.0.lock().unwrap().is_empty());
+        assert_eq!(coordinator.usage.get().unwrap().in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_tenant_this_replica_does_not_know_is_recorded_as_unknown() {
+        let (coordinator, collected) = coordinator();
+        let mut tracker = admit(&coordinator, scope(None, None), AttemptKind::Completion)
+            .await
+            .unwrap();
+        tracker.finish(done()).await.unwrap();
+        assert_eq!(collected.0.lock().unwrap()[0].tenant, None);
+    }
+
+    #[test]
+    fn the_scope_never_carries_the_tenants_name() {
+        // Policy scopes cross Redis in a fleet, and tenant names are kept out of
+        // shared storage on purpose: only a hash travels. Usage records get the
+        // name from each replica's own configuration instead.
+        let scope = TrustedPolicyScope::from_identity(&crate::gateway::auth::Identity {
+            tenant: "payments".into(),
+            tier: 0,
+            rpm: None,
+            tpm: None,
+            budget_usd: None,
+            budget_window_secs: None,
+            budget_allow_unpriced: false,
+            allowed_models: None,
+            key_name: None,
+            tenant_budget: None,
+        });
+        let json = serde_json::to_string(&scope).unwrap();
+        assert!(!json.contains("payments"), "{json}");
+        assert!(json.contains(&crate::gateway::usage::UsageSetup::tenant_key("payments")));
+        assert!(!format!("{scope:?}").contains("payments"));
+    }
+}

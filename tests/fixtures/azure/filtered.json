@@ -1,0 +1,1 @@
+{"id":"fixture-filter","object":"chat.completion","model":"gpt-6-sol","choices":[{"index":0,"message":{"role":"assistant","content":null,"refusal":"Unable to answer."},"finish_reason":"content_filter","content_filter_results":{"violence":{"filtered":true,"severity":"high"}}}],"usage":{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10}}

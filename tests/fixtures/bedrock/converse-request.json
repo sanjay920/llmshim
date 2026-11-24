@@ -1,0 +1,1 @@
+{"system":[{"text":"Be brief."}],"messages":[{"role":"user","content":[{"text":"Hi"}]}],"inferenceConfig":{"maxTokens":64,"temperature":0.2},"toolConfig":{"tools":[{"toolSpec":{"name":"weather","description":"Weather","inputSchema":{"json":{"type":"object","properties":{"city":{"type":"string"}}}}}}]}}

@@ -1,0 +1,748 @@
+mod request;
+use crate::error::{Result, ShimError};
+use crate::provider::{Provider, ProviderRequest};
+use crate::vision;
+use serde_json::{json, Value};
+
+const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+pub struct Gemini {
+    pub api_key: String,
+    pub base_url: String,
+    /// The registered key of this entry, when it is a named instance of the kind (design note
+    /// 0032); `None` reports the kind as the admission identity.
+    instance: Option<String>,
+}
+
+impl Gemini {
+    pub fn new(api_key: String) -> Self {
+        Self {
+            api_key,
+            base_url: DEFAULT_BASE_URL.to_string(),
+            instance: None,
+        }
+    }
+
+    /// Make this entry a named instance of its kind: the admission identity (lane, limits,
+    /// circuit, usage) is `name`, while pricing, replay and tool handling still read the kind.
+    pub fn with_instance(mut self, name: &str) -> Self {
+        self.instance = Some(name.to_owned());
+        self
+    }
+
+    pub fn with_base_url(mut self, url: String) -> Self {
+        self.base_url = url;
+        self
+    }
+}
+
+// -- Request transformation helpers --
+
+/// Convert OpenAI messages to Gemini contents + optional systemInstruction.
+fn transform_messages(messages: &[Value]) -> Result<(Option<Value>, Vec<Value>)> {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut contents: Vec<Value> = Vec::new();
+    // Track tool_call_id → function name from assistant messages.
+    let mut call_id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        match role {
+            "system" | "developer" => {
+                if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                    system_parts.push(text.to_string());
+                }
+            }
+            "assistant" => {
+                // Record tool_call_id → name mapping for subsequent tool results.
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tool_calls {
+                        if let (Some(id), Some(name)) = (
+                            tc.get("id").and_then(|v| v.as_str()),
+                            tc.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str()),
+                        ) {
+                            call_id_to_name.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                }
+                // Gemini uses "model" role for assistant
+                let mut parts = build_parts(msg);
+                sanitize_parts(&mut parts);
+                contents.push(json!({
+                    "role": "model",
+                    "parts": parts,
+                }));
+            }
+            "tool" => {
+                // OpenAI tool result → Gemini functionResponse
+                let call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let name = msg
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| call_id_to_name.get(call_id).cloned())
+                    .unwrap_or_else(|| "function".to_string());
+                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                // Gemini requires response to be an object, never an array or primitive.
+                let parsed: Value = match crate::json_bounds::parse_str(
+                    content,
+                    crate::json_bounds::Limits::INBOUND,
+                ) {
+                    Ok(value) => value,
+                    Err(crate::json_bounds::ParseError::Malformed(_)) => {
+                        json!({"result": content})
+                    }
+                    Err(crate::json_bounds::ParseError::Complexity) => {
+                        return Err(ShimError::ProviderError {
+                            status: 400,
+                            body: "tool result exceeds JSON complexity limit".into(),
+                            retry_after: None,
+                        })
+                    }
+                };
+                let response = if parsed.is_object() {
+                    parsed
+                } else {
+                    json!({"result": parsed})
+                };
+                let mut part = json!({"functionResponse":{"name":name,"response":response}});
+                if let Some(id) = msg.get("_llmshim_wire_id").filter(|v| v.is_string()) {
+                    part["functionResponse"]["id"] = id.clone();
+                }
+                contents.push(json!({"role":"user","parts":[part]}));
+            }
+            _ => {
+                // "user" and anything else
+                let parts = build_parts(msg);
+                contents.push(json!({
+                    "role": "user",
+                    "parts": parts,
+                }));
+            }
+        }
+    }
+
+    let system_instruction = if system_parts.is_empty() {
+        None
+    } else {
+        Some(json!({
+            "parts": [{"text": system_parts.join("\n\n")}]
+        }))
+    };
+
+    // Post-process: enforce Gemini's strict turn ordering requirements.
+    let contents = merge_same_role(contents);
+
+    Ok((system_instruction, contents))
+}
+
+/// Gemini's own repair, not a shared one. This is the only wire in the crate
+/// known to reject adjacent same-role turns, so it is the only adapter that
+/// folds them together. Every other adapter passes adjacency through — each
+/// says why on its own message pass — because a merge destroys message
+/// boundaries a caller may depend on, and only a wire that would otherwise
+/// fail the request earns that.
+fn merge_same_role(turns: Vec<Value>) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::new();
+    for turn in turns {
+        if turn["role"] == "model"
+            && turn["parts"].as_array().is_some_and(|parts| {
+                parts.iter().all(|p| {
+                    p.as_object().is_some_and(|o| o.len() == 1) && p["text"].as_str() == Some("")
+                })
+            })
+        {
+            continue;
+        }
+        let role = turn.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let last_role = merged
+            .last()
+            .and_then(|t| t.get("role"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("");
+        if role == last_role {
+            if let Some(new_parts) = turn.get("parts").and_then(|p| p.as_array()) {
+                if let Some(last) = merged.last_mut() {
+                    if let Some(existing) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                        existing.extend(new_parts.clone());
+                    }
+                }
+            }
+        } else {
+            merged.push(turn);
+        }
+    }
+    merged
+}
+
+/// Build parts array from an OpenAI message.
+fn build_parts(msg: &Value) -> Vec<Value> {
+    let mut parts = crate::reasoning::gemini_parts(msg);
+
+    // Text content (string or array of content blocks)
+    match msg.get("content") {
+        Some(Value::String(text)) if !text.is_empty() => {
+            parts.push(json!({"text": text}));
+        }
+        Some(Value::Array(blocks)) => {
+            for block in blocks {
+                match block.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            parts.push(json!({"text": text}));
+                        }
+                    }
+                    Some("image_url" | "input_image" | "image") => {
+                        if let Some(gemini_part) = vision::to_gemini(block) {
+                            parts.push(gemini_part);
+                        }
+                    }
+                    _ => {} // skip unknown block types
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Tool calls (OpenAI format) → Gemini functionCall parts
+    if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+        for tc in tool_calls {
+            if let Some(func) = tc.get("function") {
+                let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let args: Value = func
+                    .get("arguments")
+                    .and_then(|a| a.as_str())
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(json!({}));
+                let mut fc_part = json!({"functionCall": {"name": name, "args": args}});
+                if let Some(id) = tc.get("_llmshim_wire_id").filter(|v| v.is_string()) {
+                    fc_part["functionCall"]["id"] = id.clone();
+                }
+                // Echo thought_signature back — Gemini requires it for tool roundtrips
+                if let Some(sig) = tc.get("thought_signature") {
+                    fc_part["thoughtSignature"] = sig.clone();
+                }
+                parts.push(fc_part);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        parts.push(json!({"text": ""}));
+    }
+    parts
+}
+
+/// Remove cross-provider fields that Gemini won't understand.
+fn sanitize_parts(parts: &mut Vec<Value>) {
+    // Remove any text parts that contain only thoughtSignature artifacts
+    parts.retain(|p| {
+        // Keep all non-text parts
+        if p.get("text").is_none() && p.get("functionCall").is_none() {
+            return true;
+        }
+        true
+    });
+}
+
+/// Convert OpenAI tools array to Gemini functionDeclarations.
+/// Handles both nested (Chat Completions) and flat (Responses API) tool formats.
+/// Sanitizes JSON Schema for Gemini compatibility.
+fn transform_tools(tools: &[Value]) -> Value {
+    let empty = json!("");
+    let default_params = json!({"type": "object", "properties": {}});
+    let declarations: Vec<Value> = tools
+        .iter()
+        .filter_map(|tool| {
+            // Support both nested {"function": {"name": ...}} and flat {"name": ...}
+            let source = tool.get("function").unwrap_or(tool);
+            let name = source.get("name")?;
+            let description = source.get("description").unwrap_or(&empty);
+            let parameters = source.get("parameters").unwrap_or(&default_params).clone();
+            Some(json!({
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+            }))
+        })
+        .collect();
+    json!([{ "functionDeclarations": declarations }])
+}
+
+/// Translate OpenAI tool_choice to Gemini toolConfig.
+fn translate_tool_choice(tc: &Value) -> Option<Value> {
+    let mode = if let Some(s) = tc.as_str() {
+        match s {
+            "auto" => "AUTO",
+            "required" => "ANY",
+            "none" => "NONE",
+            _ => return None,
+        }
+    } else {
+        let obj = tc.as_object()?;
+        match obj.get("type").and_then(|t| t.as_str()) {
+            Some("auto") => "AUTO",
+            Some("any" | "required") => "ANY",
+            Some("none") => "NONE",
+            _ => return None,
+        }
+    };
+    Some(json!({"functionCallingConfig": {"mode": mode}}))
+}
+
+// -- Response transformation helpers --
+
+pub(crate) fn normalized_gemini_usage(usage: &Value) -> Value {
+    // The thoughts are folded into the completion count and also exposed as
+    // reasoning tokens; `usage::google_completion_tokens` defines that once for
+    // this response and for the native accounting path. `totalTokenCount`
+    // already includes them.
+    let (completion, thoughts) = crate::usage::google_completion_tokens(usage);
+    let mut result = json!({
+        "prompt_tokens": usage.get("promptTokenCount").cloned().unwrap_or(json!(0)),
+        "completion_tokens": completion,
+        "total_tokens": usage.get("totalTokenCount").cloned().unwrap_or(json!(0)),
+    });
+    if thoughts > 0 {
+        result["reasoning_tokens"] = json!(thoughts);
+        result["completion_tokens_details"] = json!({"reasoning_tokens": thoughts});
+    }
+    crate::usage::normalize_cache(usage, &mut result);
+    result
+}
+
+/// A native `error` object, as the provider error it stands for. Google reports
+/// the status inside the body (`error.code`), so an HTTP 200 can still carry a
+/// refusal — and the two places that unwrap it must agree on how.
+fn native_error(response: &Value) -> Option<ShimError> {
+    let error = response.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("unknown error");
+    let code = error.get("code").and_then(|c| c.as_u64()).unwrap_or(400) as u16;
+    Some(ShimError::ProviderError {
+        status: code,
+        body: message.to_string(),
+        retry_after: None,
+    })
+}
+
+fn transform_response_to_openai(model: &str, resp: &Value) -> Result<Value> {
+    let candidate = resp
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| ShimError::ProviderError {
+            status: 500,
+            body: format!("no candidates in response: {}", resp),
+            retry_after: None,
+        })?;
+
+    let parts = candidate
+        .pointer("/content/parts")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+
+    for part in &parts {
+        let is_thought = part
+            .get("thought")
+            .and_then(|t| t.as_bool())
+            .unwrap_or(false);
+        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+            if !text.is_empty() && !is_thought {
+                text_parts.push(text.to_string());
+            }
+        }
+        if let Some(fc) = part.get("functionCall") {
+            let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            let id = fc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("call_{}", tool_calls.len()));
+            let args_str = fc
+                .get("args")
+                .filter(|a| !a.is_null())
+                .map(|a| serde_json::to_string(a).unwrap_or_else(|_| "{}".to_string()))
+                .unwrap_or_else(|| "{}".to_string());
+            let mut tc = json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": args_str,
+                }
+            });
+            // Preserve thought_signature — Gemini requires it echoed back in follow-up requests
+            if let Some(sig) = part.get("thoughtSignature") {
+                tc["thought_signature"] = sig.clone();
+            }
+            tool_calls.push(tc);
+        }
+    }
+
+    let content = if text_parts.is_empty() {
+        Value::Null
+    } else {
+        json!(text_parts.join(""))
+    };
+
+    let finish_reason = match candidate.get("finishReason").and_then(Value::as_str) {
+        Some("STOP") => "stop",
+        Some("MAX_TOKENS") => "length",
+        Some("SAFETY") => "content_filter",
+        _ => {
+            return Err(ShimError::ProviderError {
+                status: 502,
+                body: "Gemini response has no supported terminal finish reason".into(),
+                retry_after: None,
+            })
+        }
+    };
+
+    let usage = resp.get("usageMetadata").cloned().unwrap_or(json!({}));
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+
+    let result = json!({
+        "id": resp.get("responseId").cloned().unwrap_or(json!("")),
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": normalized_gemini_usage(&usage)
+    });
+    Ok(result)
+}
+
+/// Models that cannot turn thinking off: gemini-3.1-pro, gemini-3.7-flash,
+/// gemini-3.8-flash, gemini-4-argon and gemini-4-carbon reject thinkingLevel "minimal" —
+/// verified live. Unified effort "none" clamps to "low" for them.
+fn cannot_disable_thinking(model: &str) -> bool {
+    let m = model.to_lowercase();
+    // gemini-3.1-pro, gemini-3.7-flash, gemini-3.8-flash, gemini-4-argon and
+    // gemini-4-carbon reject
+    // thinkingLevel "minimal", verified live — unified "none" clamps to "low".
+    // Other flash models (3.5/3.6/3.5-lite) accept "minimal" and can disable
+    // thinking.
+    m.contains("3.1-pro")
+        || m.contains("3.7-flash")
+        || m.contains("3.8-flash")
+        || m.contains("4-argon")
+        || m.contains("4-carbon")
+}
+
+impl Provider for Gemini {
+    fn uses_documented_model_defaults(&self) -> bool {
+        self.base_url == DEFAULT_BASE_URL
+    }
+
+    fn image_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        crate::images::validate(request)?;
+        if !matches!(
+            model,
+            "gemini-2.5-flash-image"
+                | "gemini-3.1-flash-lite-image"
+                | "gemini-3.1-flash-image"
+                | "gemini-3-pro-image"
+        ) {
+            return Err(crate::error::provider_error(
+                400,
+                "Gemini image generation requires a supported image-output model",
+            ));
+        }
+        if request.get("n").is_some_and(|n| n.as_u64() != Some(1)) {
+            return Err(crate::error::provider_error(
+                400,
+                "Gemini image generation supports one candidate per request",
+            ));
+        }
+        let mut config = json!({"responseModalities": ["TEXT", "IMAGE"]});
+        if let Some(image_config) = request.get("x-gemini").and_then(|v| v.get("imageConfig")) {
+            config["imageConfig"] = image_config.clone();
+        }
+        Ok(ProviderRequest {
+            url: format!(
+                "{}/models/{}:generateContent",
+                self.base_url.trim_end_matches('/'),
+                model
+            ),
+            headers: vec![("x-goog-api-key".into(), self.api_key.clone())],
+            body: json!({"contents": [{"role": "user", "parts": [{"text": request["prompt"]}]}], "generationConfig": config}),
+        })
+    }
+
+    fn image_response(&self, model: &str, response: Value) -> Result<crate::images::ImageResponse> {
+        let candidates = response["candidates"].as_array().ok_or_else(|| {
+            crate::error::provider_error(502, "missing generated image candidates")
+        })?;
+        let mut images = Vec::new();
+        for candidate in candidates {
+            if candidate
+                .get("finishReason")
+                .is_some_and(|reason| reason.as_str() != Some("STOP"))
+            {
+                return Err(crate::error::provider_error(
+                    502,
+                    "Gemini image generation did not finish successfully",
+                ));
+            }
+            let parts = candidate
+                .pointer("/content/parts")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    crate::error::provider_error(502, "missing generated image parts")
+                })?;
+            for part in parts {
+                // Thinking models can return draft images before their final answer.
+                if part["thought"].as_bool() == Some(true) {
+                    continue;
+                }
+                if let Some(data) = part.get("inlineData") {
+                    images.push(crate::images::decode(
+                        data["data"].as_str(),
+                        data["mimeType"].as_str().unwrap_or(""),
+                        None,
+                    )?);
+                }
+            }
+        }
+        crate::images::response(
+            images,
+            response["usageMetadata"].clone(),
+            self.name(),
+            model,
+        )
+    }
+
+    fn name(&self) -> &str {
+        "gemini"
+    }
+
+    fn instance(&self) -> &str {
+        self.instance.as_deref().unwrap_or(self.name())
+    }
+
+    fn request_admission_policy(&self) -> crate::provider::RequestAdmissionPolicy {
+        crate::provider::RequestAdmissionPolicy::namespaced(
+            "x-gemini",
+            &["contents"],
+            &["systemInstruction", "tools", "toolConfig", "thinkingConfig"],
+            &[],
+        )
+    }
+
+    fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
+        crate::reasoning::ReplayTarget::new(
+            self.name(),
+            model,
+            crate::reasoning::WireFormat::GoogleGenerateContent,
+        )
+        .bind_account(&self.base_url, Some(&self.api_key))
+    }
+
+    fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        self.request_for_target(model, request, &self.replay_target(model))
+    }
+
+    fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
+        let native = response.clone();
+        let mut result = self.transform_response_native(model, response)?;
+        crate::derived_response::capture_unary(&self.replay_target(model), &native, &mut result)?;
+        Ok(result)
+    }
+
+    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        crate::json_bounds::enforce_sse_complexity(chunk)?;
+        let result = self.transform_stream_chunk_native(model, chunk)?;
+        let native: Value = match serde_json::from_str(chunk) {
+            Ok(v) => v,
+            Err(_) => return Ok(result),
+        };
+        crate::reasoning::capture_stream(&self.replay_target(model), &native, result)
+    }
+
+    fn transform_embedding_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        let texts = crate::embeddings::texts(request)?;
+        let dimensions = crate::embeddings::dimensions(request);
+        // `batchEmbedContents` takes one full request object per text, and
+        // `content.parts[].text` is the text — plain strings are not accepted
+        // the way they are on an OpenAI embeddings array.
+        let requests: Vec<Value> = texts
+            .iter()
+            .map(|text| {
+                let mut embed = json!({
+                    "model": format!("models/{model}"),
+                    "content": {"parts": [{"text": text}]},
+                });
+                if let Some(dimensions) = dimensions {
+                    embed["outputDimensionality"] = json!(dimensions);
+                }
+                embed
+            })
+            .collect();
+        Ok(ProviderRequest {
+            url: format!(
+                "{}/models/{}:batchEmbedContents?key={}",
+                self.base_url, model, self.api_key
+            ),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: json!({ "requests": requests }),
+        })
+    }
+
+    fn transform_embedding_response(&self, _model: &str, response: Value) -> Result<Value> {
+        if let Some(error) = native_error(&response) {
+            return Err(error);
+        }
+        let Some(embeddings) = response["embeddings"].as_array() else {
+            return Err(ShimError::ProviderError {
+                status: 502,
+                body: "embeddings response has no embeddings array".into(),
+                retry_after: None,
+            });
+        };
+        // One `values` list per request object, in the order they were sent.
+        // The response carries no model and no token counts, so both stay
+        // unreported rather than being guessed at.
+        Ok(json!({
+            "data": embeddings
+                .iter()
+                .enumerate()
+                .map(|(index, embedding)| json!({
+                    "index": index,
+                    "embedding": embedding["values"],
+                }))
+                .collect::<Vec<Value>>(),
+        }))
+    }
+}
+
+impl Gemini {
+    pub(super) fn transform_response_native(&self, model: &str, response: Value) -> Result<Value> {
+        if let Some(error) = native_error(&response) {
+            return Err(error);
+        }
+        transform_response_to_openai(model, &response)
+    }
+}
+
+impl Gemini {
+    pub(super) fn transform_stream_chunk_native(
+        &self,
+        model: &str,
+        chunk: &str,
+    ) -> Result<Option<String>> {
+        let trimmed = chunk.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let parsed: Value = serde_json::from_str(trimmed)?;
+
+        // Check for error
+        if parsed.get("error").is_some() {
+            return self.transform_response(model, parsed).map(|_| None);
+        }
+
+        let candidate = match parsed
+            .get("candidates")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+        {
+            Some(c) => c,
+            None => {
+                return Ok(parsed
+                    .get("usageMetadata")
+                    .filter(|u| u.is_object())
+                    .map(|usage| {
+                        json!({"object":"chat.completion.chunk", "model":model, "choices":[],
+                        "usage":normalized_gemini_usage(usage)})
+                        .to_string()
+                    }));
+            }
+        };
+
+        let parts = candidate
+            .pointer("/content/parts")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        // Extract text, thoughts, and tool calls from parts
+        let mut text = String::new();
+
+        for part in &parts {
+            let is_thought = part
+                .get("thought")
+                .and_then(|t| t.as_bool())
+                .unwrap_or(false);
+            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                if !t.is_empty() && !is_thought {
+                    text.push_str(t);
+                }
+            }
+        }
+
+        let finish_reason =
+            candidate
+                .get("finishReason")
+                .and_then(|f| f.as_str())
+                .map(|f| match f {
+                    "STOP" => "stop",
+                    "MAX_TOKENS" => "length",
+                    "SAFETY" => "content_filter",
+                    _ => "stop",
+                });
+
+        // Build delta
+        let mut delta = json!({});
+        if !text.is_empty() {
+            delta["content"] = json!(text);
+        }
+
+        // Skip chunks with no useful content (e.g., thoughtSignature-only)
+        if delta.as_object().map(|o| o.is_empty()).unwrap_or(true) && finish_reason.is_none() {
+            return Ok(None);
+        }
+
+        let mut chunk_json = json!({
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }]
+        });
+
+        if let Some(usage) = parsed.get("usageMetadata").filter(|u| u.is_object()) {
+            chunk_json["usage"] = normalized_gemini_usage(usage);
+        }
+
+        Ok(Some(serde_json::to_string(&chunk_json)?))
+    }
+}

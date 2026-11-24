@@ -1,0 +1,54 @@
+{
+  "name": "llmshim",
+  "version": "0.31.0",
+  "description": "TypeScript client for the llmshim proxy (multi-provider LLM API) \u2014 bundles a prebuilt binary and auto-starts it, or connects to a proxy you run yourself.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "llmshim-darwin-arm64": "0.31.0",
+    "llmshim-darwin-x64": "0.31.0",
+    "llmshim-linux-x64": "0.31.0",
+    "llmshim-linux-arm64": "0.31.0",
+    "@sanjay920/llmshim-win32-x64": "0.31.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "llm",
+    "llmshim",
+    "openai",
+    "anthropic",
+    "gemini",
+    "xai",
+    "proxy",
+    "sse"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sanjay920/llmshim-open.git",
+    "directory": "clients/typescript"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^22.0.0"
+  }
+}

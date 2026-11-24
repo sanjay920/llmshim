@@ -1,0 +1,106 @@
+# Deploy the proxy safely
+
+The llmshim proxy has **no built-in authentication and no TLS**. It rejects
+browser-originated requests by default. Do not expose it directly to an
+untrusted network.
+
+The supported public topology puts an authentication and TLS gateway in front
+of the proxy:
+
+```mermaid
+flowchart LR
+    C[Applications] -->|HTTPS + credentials| G[External gateway<br/>TLS + authn/authz]
+    G -->|trusted network| P[llmshim proxy]
+    P -->|provider API keys| O[LLM providers]
+```
+
+The gateway can be any reverse proxy or API gateway that terminates TLS,
+authenticates callers, authorizes access, and applies your network policy.
+Keep the llmshim listener reachable only from that trusted boundary.
+
+## Browser applications
+
+SDKs and other HTTP clients that do not send an `Origin` header continue to
+work normally. A browser application must be explicitly trusted before the
+proxy or gateway will process its requests:
+
+```bash
+LLMSHIM_TRUSTED_ORIGINS=https://app.example,http://localhost:5173 llmshim proxy
+```
+
+The value is a comma-separated list of exact `http` or `https` origins. Paths,
+queries, fragments, credentials, wildcards, and opaque origins are rejected.
+Each allowed origin receives CORS headers, including the private-network
+preflight permission required by browsers that enforce Private Network Access.
+An unlisted origin is rejected before it can reach a proxy, gateway, or native
+API route. This browser control does not replace proxy authentication, TLS, or
+network access policy.
+
+## Install a proxy-enabled binary
+
+The HTTP server is behind the Rust `proxy` feature:
+
+```bash
+cargo install llmshim --features proxy
+```
+
+The Homebrew tap also installs a proxy-enabled binary:
+
+```bash
+brew install sanjay920/tap/llmshim
+```
+
+Then configure at least one provider key and start the process:
+
+```bash
+export ANTHROPIC_API_KEY="..."
+llmshim proxy
+```
+
+The default address is `0.0.0.0:3000`. Override it with environment variables:
+
+```bash
+LLMSHIM_HOST=127.0.0.1 LLMSHIM_PORT=8080 llmshim proxy
+```
+
+`LLMSHIM_HOST` and `LLMSHIM_PORT` take precedence over the proxy host and port
+in `~/.llmshim/config.toml`. Binding to `127.0.0.1` is a useful default when a
+same-host gateway connects to the proxy.
+
+The bundled ordinary proxy and gateway listeners cap accepted connections and
+apply finite first-header and HTTP/1 header deadlines. Configure
+`LLMSHIM_HTTP_MAX_CONNECTIONS` and `LLMSHIM_HTTP_HEADER_TIMEOUT_MS` for your
+deployment; see [listener configuration](../reference/configuration.md#proxy-listener).
+Keep request-body upload and per-client traffic controls at the front gateway.
+
+## Keep provider keys server-side
+
+The proxy process reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`GEMINI_API_KEY`, and `XAI_API_KEY`. Language clients send neither those keys
+nor provider authorization headers. Store the keys in the process environment
+or the proxy's local config file, using your deployment platform's secret
+mechanism.
+
+Do not bake keys into an image, return them to clients, or place them in
+`provider_config`. The latter is request data forwarded to adapters, not a
+secret store.
+
+## Container boundary
+
+A minimal deployment has one llmshim process per container or service unit:
+
+```text
+public client
+    -> HTTPS/auth gateway
+        -> private llmshim:3000
+            -> provider APIs
+```
+
+Give the process outbound HTTPS access to the configured providers and inbound
+access only from the gateway or trusted callers. Use `GET /health` for process
+health; it confirms the proxy is running and lists configured providers, but
+does not call upstream APIs.
+
+For multiple replicas and coordinated limits, continue to
+[Scaling and rate limits](scaling.md). For every deployment setting, see the
+[configuration reference](../reference/configuration.md).

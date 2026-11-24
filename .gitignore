@@ -1,0 +1,7 @@
+/target
+/private/
+.env
+*.local.md
+.claude/rules/
+node_modules/
+/tools/export-open/target

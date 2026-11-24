@@ -1,0 +1,675 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # --- Run tests first ---
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features proxy -- -D warnings
+      - name: Unit tests
+        env:
+          LLMSHIM_CATALOG_OFFLINE: '1'
+        run: cargo test --workspace --features proxy --tests
+
+  windows-check:
+    uses: ./.github/workflows/windows-check.yml
+
+  # The tagged commit must already have passed the full CI (every build, the
+  # tag on a commit that never ran them, or that failed them, is refused here, and
+  # every publishing job waits behind `release-inputs`, which waits for this.
+  ci-green:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The script that waits is itself tested
+        run: bash .github/scripts/test-wait-for-green.sh
+      - name: Wait for a green ci.yml on this commit
+        run: .github/scripts/wait-for-green.sh "${{ github.sha }}" ci.yml
+
+  release-inputs:
+    needs: [test, windows-check, ci-green]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate release tag and package inputs
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: .github/scripts/verify-release-inputs.sh "$RELEASE_TAG"
+
+  # --- Publish to crates.io ---
+  crates-io:
+    needs: [test, release-inputs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish catalog dependency to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set +e
+          out=$(cargo publish -p llmshim-catalog --allow-dirty 2>&1); code=$?
+          echo "$out"
+          [ $code -eq 0 ] && exit 0
+          echo "$out" | grep -qiE "already (been )?uploaded|already exists" \
+            && { echo "Catalog version already on crates.io; skipping."; exit 0; }
+          exit $code
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # Idempotent: treat "already uploaded" as success so re-running the
+        # release (e.g. to fill a failed downstream registry) is safe.
+        run: |
+          set +e
+          out=$(cargo publish -p llmshim --allow-dirty 2>&1); code=$?
+          echo "$out"
+          [ $code -eq 0 ] && exit 0
+          echo "$out" | grep -qiE "already (been )?uploaded|already exists" \
+            && { echo "Version already on crates.io; skipping."; exit 0; }
+          exit $code
+
+  # --- Build standalone macOS binaries + GitHub release ---
+  github-release:
+    needs: [test, release-inputs]
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build arm64
+        run: cargo build --release --features proxy --target aarch64-apple-darwin
+      - name: Build x86_64
+        run: cargo build --release --features proxy --target x86_64-apple-darwin
+      - name: Package tarballs
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            mkdir -p staging
+            cp target/$target/release/llmshim staging/
+            tar -czf llmshim-${target}.tar.gz -C staging llmshim
+            rm -rf staging
+          done
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        # Idempotent: if the release already exists (re-run), (re-)upload the
+        # tarballs to it instead of failing on create.
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists; uploading assets with --clobber."
+            gh release upload "$RELEASE_TAG" \
+              llmshim-aarch64-apple-darwin.tar.gz \
+              llmshim-x86_64-apple-darwin.tar.gz --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --generate-notes \
+              llmshim-aarch64-apple-darwin.tar.gz \
+              llmshim-x86_64-apple-darwin.tar.gz
+          fi
+
+  # --- Update Homebrew tap ---
+  homebrew:
+    needs: [release-inputs, github-release]
+    runs-on: macos-15
+    steps:
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          BASE_URL="https://github.com/sanjay920/llmshim-open/releases/download/${GITHUB_REF_NAME}"
+
+          # Download tarballs to compute sha256
+          curl -sL "${BASE_URL}/llmshim-aarch64-apple-darwin.tar.gz" -o /tmp/arm64.tar.gz
+          curl -sL "${BASE_URL}/llmshim-x86_64-apple-darwin.tar.gz" -o /tmp/x86.tar.gz
+          SHA_ARM=$(shasum -a 256 /tmp/arm64.tar.gz | cut -d' ' -f1)
+          SHA_X86=$(shasum -a 256 /tmp/x86.tar.gz | cut -d' ' -f1)
+
+          # Generate formula
+          cat > /tmp/llmshim.rb << 'ENDOFTEMPLATE'
+          class Llmshim < Formula
+            desc "Blazing fast LLM API translation layer — one interface, every provider"
+            homepage "https://github.com/sanjay920/llmshim-open"
+            license "MIT"
+            version "VERSION_PLACEHOLDER"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "URL_ARM_PLACEHOLDER"
+                sha256 "SHA_ARM_PLACEHOLDER"
+              else
+                url "URL_X86_PLACEHOLDER"
+                sha256 "SHA_X86_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "llmshim"
+            end
+
+            test do
+              assert_predicate bin/"llmshim", :executable?
+            end
+          end
+          ENDOFTEMPLATE
+
+          # Replace placeholders
+          sed -i '' "s|VERSION_PLACEHOLDER|${VERSION}|g" /tmp/llmshim.rb
+          sed -i '' "s|URL_ARM_PLACEHOLDER|${BASE_URL}/llmshim-aarch64-apple-darwin.tar.gz|g" /tmp/llmshim.rb
+          sed -i '' "s|URL_X86_PLACEHOLDER|${BASE_URL}/llmshim-x86_64-apple-darwin.tar.gz|g" /tmp/llmshim.rb
+          sed -i '' "s|SHA_ARM_PLACEHOLDER|${SHA_ARM}|g" /tmp/llmshim.rb
+          sed -i '' "s|SHA_X86_PLACEHOLDER|${SHA_X86}|g" /tmp/llmshim.rb
+
+          # Remove leading whitespace from heredoc
+          sed -i '' 's/^          //' /tmp/llmshim.rb
+
+          # Get existing file SHA (if updating)
+          EXISTING_SHA=$(gh api repos/sanjay920/homebrew-tap/contents/Formula/llmshim.rb --jq .sha 2>/dev/null || echo "")
+
+          # Push to homebrew-tap repo
+          if [ -n "$EXISTING_SHA" ]; then
+            gh api repos/sanjay920/homebrew-tap/contents/Formula/llmshim.rb \
+              --method PUT \
+              --field message="Update llmshim to ${VERSION}" \
+              --field content="$(base64 -i /tmp/llmshim.rb)" \
+              --field sha="${EXISTING_SHA}"
+          else
+            gh api repos/sanjay920/homebrew-tap/contents/Formula/llmshim.rb \
+              --method PUT \
+              --field message="Add llmshim ${VERSION}" \
+              --field content="$(base64 -i /tmp/llmshim.rb)"
+          fi
+
+  # --- Build + publish the platform-specific npm binary packages ---
+  # The TS client bundles a prebuilt binary the same way the Python client
+  # does (via maturin). npm has no maturin equivalent, so this follows the
+  # standard npm pattern for native binaries (esbuild, swc, turborepo): one
+  # tiny package per os/cpu combo, gated by "os"/"cpu" fields, installed
+  # automatically as an optionalDependency of the root `llmshim` package.
+  #
+  # Each of these 5 packages needs its own Trusted Publisher configured on
+  # npmjs.com once (same values as the root package: repo sanjay920/llmshim-open,
+  # workflow release.yml, environment release) — see clients/typescript/README.md.
+  npm-macos-binaries:
+    needs: [test, release-inputs]
+    runs-on: macos-15
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        run: npm install -g npm@latest
+      - name: Verify versions match the release tag
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          for pkg in llmshim-darwin-arm64 llmshim-darwin-x64; do
+            PKG_VERSION=$(node -p "require('./clients/typescript/packages/$pkg/package.json').version")
+            if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+              echo "::error::$pkg version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+              exit 1
+            fi
+          done
+      - name: Build arm64 + x64
+        run: |
+          cargo build --release --features proxy --target aarch64-apple-darwin
+          cargo build --release --features proxy --target x86_64-apple-darwin
+      - name: Publish llmshim-darwin-arm64
+        working-directory: clients/typescript/packages/llmshim-darwin-arm64
+        run: |
+          mkdir -p bin && cp "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/llmshim" bin/llmshim
+          chmod +x bin/llmshim
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
+      - name: Verify npm serves llmshim-darwin-arm64
+        working-directory: clients/typescript/packages/llmshim-darwin-arm64
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
+      - name: Publish llmshim-darwin-x64
+        working-directory: clients/typescript/packages/llmshim-darwin-x64
+        run: |
+          mkdir -p bin && cp "$GITHUB_WORKSPACE/target/x86_64-apple-darwin/release/llmshim" bin/llmshim
+          chmod +x bin/llmshim
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
+      - name: Verify npm serves llmshim-darwin-x64
+        working-directory: clients/typescript/packages/llmshim-darwin-x64
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
+
+  npm-linux-x64-binary:
+    needs: [test, release-inputs]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        run: npm install -g npm@latest
+      - name: Verify version matches the release tag
+        working-directory: clients/typescript/packages/llmshim-linux-x64
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::llmshim-linux-x64 version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+            exit 1
+          fi
+      - name: Build
+        run: cargo build --release --features proxy --target x86_64-unknown-linux-gnu
+      - name: Publish llmshim-linux-x64
+        working-directory: clients/typescript/packages/llmshim-linux-x64
+        run: |
+          mkdir -p bin && cp $GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/llmshim bin/llmshim
+          chmod +x bin/llmshim
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
+      - name: Verify npm serves llmshim-linux-x64
+        working-directory: clients/typescript/packages/llmshim-linux-x64
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
+
+  # Native arm64 runner (GA, free on public repos) — no cross-compilation needed.
+  npm-linux-arm64-binary:
+    needs: [test, release-inputs]
+    runs-on: ubuntu-24.04-arm
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        run: npm install -g npm@latest
+      - name: Verify version matches the release tag
+        working-directory: clients/typescript/packages/llmshim-linux-arm64
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::llmshim-linux-arm64 version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+            exit 1
+          fi
+      - name: Build
+        run: cargo build --release --features proxy --target aarch64-unknown-linux-gnu
+      - name: Publish llmshim-linux-arm64
+        working-directory: clients/typescript/packages/llmshim-linux-arm64
+        run: |
+          mkdir -p bin && cp $GITHUB_WORKSPACE/target/aarch64-unknown-linux-gnu/release/llmshim bin/llmshim
+          chmod +x bin/llmshim
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
+      - name: Verify npm serves llmshim-linux-arm64
+        working-directory: clients/typescript/packages/llmshim-linux-arm64
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
+
+  npm-windows-binary:
+    needs: [test, release-inputs]
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        shell: bash
+        run: npm install -g npm@latest
+      - name: Verify version matches the release tag
+        shell: bash
+        working-directory: clients/typescript/packages/llmshim-win32-x64
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::llmshim-win32-x64 version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+            exit 1
+          fi
+      - name: Build
+        shell: bash
+        run: cargo build --release --features proxy --target x86_64-pc-windows-msvc
+      - name: Publish llmshim-win32-x64
+        shell: bash
+        working-directory: clients/typescript/packages/llmshim-win32-x64
+        run: |
+          mkdir -p bin && cp "$GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/llmshim.exe" bin/llmshim.exe
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
+      - name: Verify npm serves llmshim-win32-x64
+        shell: bash
+        working-directory: clients/typescript/packages/llmshim-win32-x64
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
+
+  # --- Publish TypeScript client to npm ---
+  # First release must be published manually once (npm's trusted-publisher UI
+  # requires the package to already exist); every release after that publishes
+  # here via OIDC, no token stored. See clients/typescript/README.md. Depends
+  # on the binary packages above so `optionalDependencies` resolve to a real,
+  # already-published version by the time this installs/publishes.
+  npm:
+    needs:
+      - test
+      - release-inputs
+      - npm-macos-binaries
+      - npm-linux-x64-binary
+      - npm-linux-arm64-binary
+      - npm-windows-binary
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm (OIDC trusted publishing needs npm >= 11.5.1)
+        run: npm install -g npm@latest
+      - name: Verify package.json version matches the release tag
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::clients/typescript/package.json version ($PKG_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+            exit 1
+          fi
+      # Only devDeps (typescript) are needed to build/publish. Skip the
+      # optional platform packages — they publish in this same run, so the
+      # lockfile can't reference their new version yet, and `npm ci`'s strict
+      # sync check would fail. They're end-user runtime deps, not build deps.
+      - run: npm install --omit=optional --no-audit --no-fund
+      - run: npm run build
+      - run: npm test
+      - name: Publish to npm
+        run: |
+          NAME=$(node -p "require('./package.json').name"); VER=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VER" version >/dev/null 2>&1; then
+            echo "$NAME@$VER already on npm; skipping."
+          else
+            npm publish --access public --provenance
+          fi
+      - name: Verify npm serves the TypeScript client
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/npm-verify-served.sh"
+
+  # --- Publish Ruby client to RubyGems ---
+  # Uses a "pending trusted publisher" — configurable on rubygems.org before
+  # the gem's first-ever release, no manual bootstrap publish needed.
+  rubygems:
+    needs: [test, release-inputs]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: clients/ruby
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Verify version.rb matches the release tag
+        run: |
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          GEM_VERSION=$(ruby -Ilib -e 'require "llmshim/version"; print Llmshim::VERSION')
+          if [ "$TAG_VERSION" != "$GEM_VERSION" ]; then
+            echo "::error::clients/ruby/lib/llmshim/version.rb ($GEM_VERSION) does not match tag ($TAG_VERSION) — bump it before releasing"
+            exit 1
+          fi
+      # Install test-only gems explicitly (Ruby 3.0+ dropped webrick from the
+      # default gems). Avoids bundler-cache serving a stale bundle when only the
+      # gemspec — not the Gemfile — changes.
+      - name: Run tests
+        run: |
+          gem install --no-document minitest webrick
+          ruby -Itest -Ilib test/llmshim_test.rb
+      - name: Configure RubyGems credentials (OIDC trusted publishing)
+        uses: rubygems/configure-rubygems-credentials@v2.1.0
+      - name: Build gem
+        run: gem build llmshim.gemspec
+      - name: Push gem
+        run: gem push llmshim-*.gem
+
+  # --- Tag the Go client module for a clean `go get` version ---
+  # `go get github.com/sanjay920/llmshim-open/clients/go` already works today via
+  # Go's VCS auto-fetch (no registry to publish to), but without a tag of the
+  # form "clients/go/vX.Y.Z" it resolves an ugly pseudo-version. This job adds
+  # that tag on every release so `go get .../clients/go@latest` resolves clean
+  # semver matching the crate version.
+  go-tag:
+    needs: [test, release-inputs]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: clients/go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+      - name: Build, vet, and test the Go client
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+      - name: Tag the Go module
+        # Idempotent: skip if the module tag already exists (re-run).
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          GO_TAG="clients/go/v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$GO_TAG" >/dev/null 2>&1; then
+            echo "$GO_TAG already exists; skipping."
+          else
+            git tag "$GO_TAG"
+            git push origin "$GO_TAG"
+          fi
+
+  # --- Build PyPI source distribution ---
+  sdist:
+    needs: [test, release-inputs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: clients/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: clients/python/dist
+
+  # --- macOS wheels (ARM64 + x86_64) ---
+  macos:
+    needs: [test, release-inputs]
+    runs-on: macos-15
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          working-directory: clients/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: clients/python/dist
+
+  # --- Linux x86_64 wheel ---
+  linux-x86:
+    needs: [test, release-inputs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-unknown-linux-gnu
+          manylinux: "2_17"
+          args: --release --out dist
+          working-directory: clients/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-x86_64
+          path: clients/python/dist
+
+  # --- Linux aarch64 wheel (use zig for cross-compilation) ---
+  linux-arm:
+    needs: [test, release-inputs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64-unknown-linux-gnu
+          manylinux: "2_17"
+          args: --release --out dist --zig
+          working-directory: clients/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-aarch64
+          path: clients/python/dist
+
+  # --- Windows x86_64 wheel ---
+  windows:
+    needs: [test, release-inputs]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist
+          working-directory: clients/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x86_64
+          path: clients/python/dist
+
+  # --- Publish to PyPI ---
+  pypi:
+    needs: [release-inputs, sdist, macos, linux-x86, linux-arm, windows]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          # Idempotent: don't fail if this version is already on PyPI (re-run).
+          skip-existing: true

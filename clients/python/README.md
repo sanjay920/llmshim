@@ -1,0 +1,284 @@
+# llmshim
+
+One interface, every LLM provider. The proxy server starts automatically — no setup needed.
+
+## Install
+
+```bash
+pip install llmshim
+```
+
+## Configure
+
+```python
+import llmshim
+
+# Set API keys (writes to ~/.llmshim/config.toml — only needed once)
+llmshim.configure(
+    anthropic="sk-ant-...",
+    openai="sk-...",
+    gemini="AIza...",
+    xai="xai-...",
+    openrouter="sk-or-...",
+)
+```
+
+Or from the CLI: `llmshim configure`
+
+### Self-hosted servers (vLLM / SGLang)
+
+vLLM and SGLang are configured via **environment variables** (not
+`config.toml`) — the auto-spawned proxy inherits them from your Python
+process. Set them before your first call:
+
+```python
+import os
+
+os.environ["VLLM_BASE_URL"] = "http://localhost:8000/v1"
+os.environ["VLLM_API_KEY"] = "..."       # optional
+os.environ["SGLANG_BASE_URL"] = "http://localhost:30000/v1"
+os.environ["SGLANG_API_KEY"] = "..."     # optional
+```
+
+Then address them via the model string — `vllm/<served-model>` or
+`sglang/<served-model>` (see the model table below).
+
+## Chat
+
+```python
+import llmshim
+
+resp = llmshim.chat("claude-sonnet-5-5", "What is Rust?")
+print(resp["message"]["content"])
+```
+
+With options (all map to the API's provider-agnostic `config`):
+
+```python
+resp = llmshim.chat(
+    "openai/gpt-6-sol",
+    "Explain quicksort",
+    max_tokens=500,
+    temperature=0.7,
+    top_p=0.9,
+    top_k=40,
+    stop=["\n\n"],
+    reasoning_effort="high",
+)
+```
+
+With message history:
+
+```python
+resp = llmshim.chat("claude-sonnet-5-5", [
+    {"role": "system", "content": "You are a pirate."},
+    {"role": "user", "content": "Hello!"},
+], max_tokens=500)
+```
+
+## Streaming
+
+```python
+for event in llmshim.stream("claude-sonnet-5-5", "Write a poem"):
+    if event["type"] == "content":
+        print(event["text"], end="", flush=True)
+    elif event["type"] == "reasoning":
+        pass  # thinking tokens
+    elif event["type"] == "usage":
+        print(f"\n[↑{event['input_tokens']} ↓{event['output_tokens']}]")
+```
+
+## Multi-Model Conversations
+
+Switch models mid-conversation. History carries over.
+
+```python
+messages = [{"role": "user", "content": "What is a closure?"}]
+
+r1 = llmshim.chat("claude-sonnet-5-5", messages, max_tokens=500)
+print(f"Claude: {r1['message']['content']}")
+
+messages.append({"role": "assistant", "content": r1["message"]["content"]})
+messages.append({"role": "user", "content": "Now explain differently."})
+
+r2 = llmshim.chat("gpt-6-sol", messages, max_tokens=500)
+print(f"GPT: {r2['message']['content']}")
+```
+
+## Reasoning / Thinking
+
+Two provider-agnostic knobs control reasoning; both are clamped to the
+nearest tier the target model supports:
+
+- `reasoning_effort` — `"none"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`
+- `reasoning_mode` — `"standard"` (default) or `"pro"` (requests substantially
+  more model work; native on OpenAI gpt-5.6/-pro, emulated as an effort bump
+  elsewhere)
+
+```python
+resp = llmshim.chat(
+    "claude-sonnet-5-5",
+    "Solve: x^2 - 5x + 6 = 0",
+    max_tokens=4000,
+    reasoning_effort="high",
+    reasoning_mode="pro",
+)
+print(resp["reasoning"])        # thinking content
+print(resp["message"]["content"])  # answer
+```
+
+For full native control, bypass the unified mapping with a namespaced
+`provider_config` (see below), e.g.
+`provider_config={"x-anthropic": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}}`.
+
+## Provider-Specific Controls (`provider_config`)
+
+`provider_config` merges into the request **root** and carries anything the
+unified `config` doesn't cover. Native provider controls MUST be **namespaced**
+per provider (`x-anthropic`, `x-openai`, `x-gemini`, `x-openrouter`, `x-vllm`,
+`x-sglang`); it also carries the top-level `tools`, `response_format`, and
+`reasoning_summary` keys.
+
+```python
+resp = llmshim.chat(
+    "anthropic/claude-sonnet-5-5",
+    "Solve this step by step: 17 * 23",
+    max_tokens=4000,
+    provider_config={
+        # native Anthropic adaptive-thinking control
+        "x-anthropic": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}},
+    },
+)
+```
+
+OpenRouter routing preferences use the `x-openrouter` namespace:
+
+```python
+resp = llmshim.chat(
+    "openrouter/anthropic/claude-sonnet-5",
+    "Hello",
+    max_tokens=200,
+    provider_config={"x-openrouter": {"provider": {"sort": "throughput"}}},
+)
+```
+
+## Tool Use / Function Calling
+
+```python
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get current weather",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}]
+
+resp = llmshim.chat("claude-sonnet-5-5", "Weather in Tokyo?", max_tokens=500, tools=tools)
+for tc in resp["message"].get("tool_calls", []):
+    print(f"{tc['function']['name']}({tc['function']['arguments']})")
+```
+
+Tools are accepted in OpenAI Chat Completions format and auto-translated to each provider's native format.
+
+## Fallback Chains
+
+```python
+resp = llmshim.chat(
+    "anthropic/claude-sonnet-5-5",
+    "Hello",
+    max_tokens=100,
+    fallback=["openai/gpt-6-sol", "gemini/gemini-3.8-flash"],
+)
+```
+
+## Error Handling
+
+Non-streaming errors (bad model, unknown provider, provider failures) raise
+`LlmShimError`, which carries the API's structured `error` fields:
+
+```python
+try:
+    llmshim.chat("unknown/model", "hi")
+except llmshim.LlmShimError as e:
+    print(e.status_code)  # 400
+    print(e.code)         # "bad_request"
+    print(e.message)      # human-readable message
+```
+
+Streaming errors that occur mid-stream instead arrive as an `error` event
+(`event["type"] == "error"`); an HTTP error before the stream starts still
+raises `LlmShimError`.
+
+## Types
+
+Spec-faithful `TypedDict` definitions are available in `llmshim.types` (and the
+common ones are re-exported at the top level) for static type-checking:
+
+```python
+from llmshim.types import ChatResponse, StreamEvent, Message, Config
+
+resp: ChatResponse = llmshim.chat("claude-sonnet-5-5", "hi")
+```
+
+Available: `ChatRequest`, `ChatResponse`, `Config`, `Message`, `ToolCall`,
+`Usage`, `ResponseMessage`, `ModelEntry`, `ModelsResponse`, `HealthResponse`,
+`ErrorResponse`, and the `StreamEvent` union (`ContentEvent`, `ReasoningEvent`,
+`ToolCallEvent`, `UsageEvent`, `DoneEvent`, `ErrorEvent`).
+
+## Other
+
+```python
+llmshim.models()   # list available models
+llmshim.health()   # {"status": "ok", "providers": [...]}
+```
+
+## How It Works
+
+On first call, the package:
+1. Finds the `llmshim` binary (bundled, on PATH, or in repo)
+2. Lets the child bind a random localhost port and reads its private startup record
+3. Pins the child's one-time TLS certificate, authenticates every request, and keeps a parent-liveness pipe open
+4. Server stops automatically when Python exits
+
+No Docker, no background services, no manual server management.
+
+## Development
+
+The unit tests under `tests/` are fully mocked — they run a local HTTP server
+returning canned JSON and SSE, so they need no API keys and make no real
+provider calls:
+
+```bash
+pip install httpx pytest
+pytest tests/
+```
+
+`test_e2e.py` is a separate LIVE suite that spawns the real binary and makes
+billed provider calls; run it only when you deliberately want to hit real APIs.
+
+## Advertised Models
+
+| Provider | Models |
+|----------|--------|
+| OpenAI | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` |
+| Anthropic | `claude-fable-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-4-5-20251001` |
+| Gemini | `gemini-3.8-flash`, `gemini-3.5-flash-lite` |
+| xAI | `grok-4.6` |
+
+Call `llmshim.models()` for the live list filtered to your configured providers.
+
+### OpenRouter & self-hosted (vLLM / SGLang)
+
+These providers are addressed by the model string plus environment variables —
+any model the upstream serves is reachable, so they aren't in the table above.
+
+| Provider | Address as | Env vars | Native controls |
+|----------|-----------|----------|-----------------|
+| OpenRouter | `openrouter/<vendor>/<model>` (e.g. `openrouter/anthropic/claude-sonnet-5`) | `OPENROUTER_API_KEY` (or `llmshim.configure(openrouter=...)`) | `provider_config={"x-openrouter": {...}}` (`provider`, `models`, `transforms`) |
+| vLLM | `vllm/<served-model>` | `VLLM_BASE_URL` (+ optional `VLLM_API_KEY`) | `provider_config={"x-vllm": {...}}` |
+| SGLang | `sglang/<served-model>` | `SGLANG_BASE_URL` (+ optional `SGLANG_API_KEY`) | `provider_config={"x-sglang": {...}}` |

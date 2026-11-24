@@ -1,0 +1,975 @@
+use llmshim::provider::Provider;
+use llmshim::providers::openai::OpenAi;
+use serde_json::{json, Value};
+
+#[path = "support/completion_status.rs"]
+mod completion_status;
+
+fn provider() -> OpenAi {
+    OpenAi::new("test-key-123".into())
+}
+
+// ============================================================
+// transform_request — Responses API format
+// ============================================================
+
+#[test]
+fn request_url_is_responses_api() {
+    let p = provider();
+    let req = json!({"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.url, "https://api.openai.com/v1/responses");
+}
+
+#[test]
+fn request_custom_base_url() {
+    let p = OpenAi::new("key".into()).with_base_url("http://localhost:8080".into());
+    let req = json!({"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.url, "http://localhost:8080/responses");
+}
+
+#[test]
+fn request_sets_model() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["model"], "gpt-5.4");
+}
+
+#[test]
+fn request_auth_header() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let auth = result
+        .headers
+        .iter()
+        .find(|(k, _)| k == "Authorization")
+        .unwrap();
+    assert_eq!(auth.1, "Bearer test-key-123");
+}
+
+#[test]
+fn request_messages_become_input() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "bye"},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 3);
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[1]["role"], "assistant");
+}
+
+#[test]
+fn request_strips_anthropic_cache_control_from_openai_messages() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": "hi",
+                "cache_control": {"type": "ephemeral"}
+            }]
+        }],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    assert_eq!(input[0]["content"][0]["type"], "input_text");
+    assert!(input[0]["content"][0].get("cache_control").is_none());
+}
+
+#[test]
+fn request_max_tokens_becomes_max_output_tokens() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 500,
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["max_output_tokens"], 500);
+}
+
+#[test]
+fn request_max_completion_tokens_becomes_max_output_tokens() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_completion_tokens": 256,
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["max_output_tokens"], 256);
+}
+
+#[test]
+fn request_passes_prompt_cache_controls() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "prompt_cache_key": "example-workspace-model",
+        "prompt_cache_retention": "24h",
+        "x-openai": {
+            "safety_identifier": "user-hash"
+        }
+    });
+    let result = p.transform_request("gpt-5.5", &req).unwrap();
+    assert_eq!(result.body["prompt_cache_key"], "example-workspace-model");
+    assert_eq!(result.body["prompt_cache_retention"], "24h");
+    assert_eq!(result.body["safety_identifier"], "user-hash");
+}
+
+// ============================================================
+// transform_request — reasoning config
+// ============================================================
+
+#[test]
+fn gpt_6_sol_and_luna_accept_none_and_max_without_a_pro_downgrade() {
+    let provider = provider();
+    for model in ["gpt-6-sol", "gpt-6.1-terra", "gpt-6-luna"] {
+        for (requested_effort, expected_effort) in
+            [("none", "none"), ("minimal", "low"), ("max", "max")]
+        {
+            let request = json!({
+                "messages": [{"role": "user", "content": "Say pong"}],
+                "reasoning_effort": requested_effort,
+            });
+            let native = provider.transform_request(model, &request).unwrap();
+            assert_eq!(native.body["model"], model);
+            assert_eq!(native.body["reasoning"]["effort"], expected_effort);
+        }
+        let request = json!({
+            "messages": [{"role": "user", "content": "Say pong"}],
+            "reasoning_effort": "max",
+            "reasoning_mode": "pro",
+        });
+        let native = provider.transform_request(model, &request).unwrap();
+        assert_eq!(native.body["reasoning"]["effort"], "max");
+        assert_eq!(native.body["reasoning"]["mode"], "pro");
+    }
+}
+
+#[test]
+fn request_no_reasoning_by_default() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert!(result.body.get("reasoning").is_none());
+}
+
+#[test]
+fn request_reasoning_effort_passthrough() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "low",
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["reasoning"]["effort"], "low");
+    assert_eq!(result.body["reasoning"]["summary"], "auto");
+}
+
+#[test]
+fn request_output_config_effort_translated() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "output_config": {"effort": "medium"},
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["reasoning"]["effort"], "medium");
+}
+
+#[test]
+fn request_reasoning_effort_takes_precedence_over_output_config() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+        "output_config": {"effort": "low"},
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["reasoning"]["effort"], "high");
+}
+
+#[test]
+fn request_pro_model_clamps_sub_medium_effort_to_medium() {
+    let p = provider();
+    // Pro models reject minimal/low/none with HTTP 400 — clamp them up to medium.
+    for effort in ["minimal", "low", "none"] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let result = p.transform_request("gpt-5.5-pro", &req).unwrap();
+        assert_eq!(
+            result.body["reasoning"]["effort"], "medium",
+            "effort {effort} should clamp to medium for pro models"
+        );
+        assert_eq!(result.body["reasoning"]["summary"], "auto");
+    }
+}
+
+#[test]
+fn request_pro_model_preserves_high_effort() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+    });
+    let result = p.transform_request("gpt-5.4-pro", &req).unwrap();
+    assert_eq!(result.body["reasoning"]["effort"], "high");
+}
+
+#[test]
+fn request_non_pro_model_preserves_low_effort() {
+    let p = provider();
+    // Regression: non-pro models must still pass low through unchanged.
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "low",
+    });
+    let result = p.transform_request("gpt-5.5", &req).unwrap();
+    assert_eq!(result.body["reasoning"]["effort"], "low");
+}
+
+#[test]
+fn request_gpt_5_6_clamps_minimal_to_low() {
+    let p = provider();
+    // gpt-5.6 variants reject "minimal" but accept "low" — clamp it up.
+    for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "minimal",
+        });
+        let result = p.transform_request(model, &req).unwrap();
+        assert_eq!(
+            result.body["reasoning"]["effort"], "low",
+            "{model} should clamp minimal -> low"
+        );
+    }
+}
+
+#[test]
+fn request_gpt_5_6_preserves_low_none_and_high() {
+    let p = provider();
+    // gpt-5.6 accepts low/none/high/xhigh unchanged (only minimal is rejected).
+    for effort in ["low", "none", "high", "xhigh"] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let result = p.transform_request("gpt-5.6-sol", &req).unwrap();
+        assert_eq!(
+            result.body["reasoning"]["effort"], effort,
+            "gpt-5.6-sol should pass {effort} through unchanged"
+        );
+    }
+}
+
+// ============================================================
+// transform_request — system/developer → instructions
+// ============================================================
+
+#[test]
+fn request_system_message_becomes_instructions() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["instructions"], "You are helpful.");
+    let input = result.body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 1); // system message extracted
+    assert_eq!(input[0]["role"], "user");
+}
+
+#[test]
+fn request_developer_message_becomes_instructions() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "developer", "content": "Be concise."},
+            {"role": "user", "content": "hi"},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["instructions"], "Be concise.");
+}
+
+#[test]
+fn request_multiple_system_messages_merged() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "system", "content": "Part one."},
+            {"role": "system", "content": "Part two."},
+            {"role": "user", "content": "hi"},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["instructions"], "Part one.\n\nPart two.");
+}
+
+#[test]
+fn request_no_system_no_instructions() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert!(result.body.get("instructions").is_none());
+}
+
+// ============================================================
+// transform_request — sanitization
+// ============================================================
+
+#[test]
+fn request_strips_reasoning_content_from_messages() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello", "reasoning_content": "thinking..."},
+            {"role": "user", "content": "bye"},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    assert!(input[1].get("reasoning_content").is_none());
+    assert_eq!(input[1]["content"], "hello");
+}
+
+#[test]
+fn request_strips_anthropic_thinking_param() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "adaptive"},
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert!(result.body.get("thinking").is_none());
+}
+
+// ============================================================
+// transform_request — tools
+// ============================================================
+
+#[test]
+fn request_tools_chat_completions_format_flattened() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let tool = &result.body["tools"][0];
+    // Responses API flat format: name/description/parameters at top level, no "function" wrapper.
+    assert_eq!(tool["name"], "get_weather");
+    assert_eq!(tool["description"], "Get weather");
+    assert_eq!(tool["type"], "function");
+    assert!(tool.get("function").is_none());
+    assert!(tool["parameters"]["properties"]["city"]["type"] == "string");
+}
+
+#[test]
+fn request_tools_already_flat_passthrough() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {"type": "object"},
+        }],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["tools"][0]["name"], "get_weather");
+}
+
+#[test]
+fn request_tools_multiple_flattened() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {"name": "tool_a", "description": "A", "parameters": {}}},
+            {"type": "function", "function": {"name": "tool_b", "description": "B", "parameters": {}}},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["tools"][0]["name"], "tool_a");
+    assert_eq!(result.body["tools"][1]["name"], "tool_b");
+}
+
+#[test]
+fn request_tool_choice_anthropic_any_to_required() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": {"type": "any"},
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["tool_choice"], "required");
+}
+
+#[test]
+fn request_tool_choice_anthropic_tool_to_function() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": {"type": "tool", "name": "search"},
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(result.body["tool_choice"]["type"], "function");
+    assert_eq!(result.body["tool_choice"]["function"]["name"], "search");
+}
+
+// ============================================================
+// transform_request — tool call/result message translation
+// ============================================================
+
+#[test]
+fn request_assistant_tool_calls_become_function_call_items() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_123", "content": "72F sunny"},
+            {"role": "assistant", "content": "It's 72F and sunny in Paris."},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+
+    // user message
+    assert_eq!(input[0]["role"], "user");
+    // assistant with empty content is dropped, but function_call item emitted
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_123");
+    assert_eq!(input[1]["name"], "get_weather");
+    assert_eq!(input[1]["arguments"], "{\"city\":\"Paris\"}");
+    // tool result → function_call_output
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["call_id"], "call_123");
+    assert_eq!(input[2]["output"], "72F sunny");
+    // final assistant message
+    assert_eq!(input[3]["role"], "assistant");
+    assert_eq!(input[3]["content"], "It's 72F and sunny in Paris.");
+}
+
+#[test]
+fn request_tool_result_message_becomes_function_call_output() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role":"assistant","tool_calls":[{"id":"call_abc","function":{"name":"read","arguments":"{}"}}]},
+            {"role": "tool", "tool_call_id": "call_abc", "content": "result data"},
+        ],
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["call_id"], "call_abc");
+    assert_eq!(input[2]["output"], "result data");
+    assert!(input[2].get("role").is_none());
+}
+
+#[test]
+fn request_rejects_non_object() {
+    let p = provider();
+    assert!(p.transform_request("gpt-5.4", &json!("string")).is_err());
+}
+
+// ============================================================
+// transform_response — Responses API format
+// ============================================================
+
+#[test]
+fn response_text_only() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_123",
+        "status": "completed",
+        "output": [
+            {"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "Hello!"}], "role": "assistant"}
+        ],
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+    });
+    let result = p.transform_response("gpt-5.4", resp).unwrap();
+    assert_eq!(result["object"], "chat.completion");
+    assert_eq!(result["id"], "resp_123");
+    assert_eq!(result["choices"][0]["message"]["content"], "Hello!");
+    assert_eq!(result["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(result["choices"][0]["finish_reason"], "stop");
+    assert_eq!(result["usage"]["prompt_tokens"], 5);
+    assert_eq!(result["usage"]["completion_tokens"], 2);
+}
+
+#[test]
+fn response_preserves_prompt_cache_usage() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_cache",
+        "status": "completed",
+        "output": [
+            {"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "Hello!"}], "role": "assistant"}
+        ],
+        "usage": {
+            "input_tokens": 2006,
+            "output_tokens": 2,
+            "total_tokens": 2008,
+            "input_tokens_details": {
+                "cached_tokens": 1920
+            },
+            "output_tokens_details": {
+                "reasoning_tokens": 100
+            }
+        },
+    });
+    let result = p.transform_response("gpt-5.5", resp).unwrap();
+    assert_eq!(result["usage"]["prompt_tokens"], 2006);
+    assert_eq!(
+        result["usage"]["prompt_tokens_details"]["cached_tokens"],
+        1920
+    );
+    assert_eq!(
+        result["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        100
+    );
+    assert_eq!(result["usage"]["reasoning_tokens"], 100);
+}
+
+#[test]
+fn response_with_reasoning_summary() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_456",
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Thinking step by step..."}]},
+            {"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "42"}], "role": "assistant"}
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    });
+    let result = p.transform_response("gpt-5.4", resp).unwrap();
+    assert_eq!(result["choices"][0]["message"]["content"], "42");
+    assert_eq!(
+        result["choices"][0]["message"]["reasoning"][0]["text"],
+        "Thinking step by step..."
+    );
+}
+
+#[test]
+fn response_empty_reasoning_summary() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_789",
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "8"}], "role": "assistant"}
+        ],
+        "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+    });
+    let result = p.transform_response("gpt-5.4", resp).unwrap();
+    assert_eq!(result["choices"][0]["message"]["content"], "8");
+    assert!(result["choices"][0]["message"]
+        .get("reasoning_content")
+        .is_none());
+}
+
+#[test]
+fn response_incomplete_status() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_x",
+        "status": "incomplete",
+        "output": [
+            {"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "partial"}], "role": "assistant"}
+        ],
+        "usage": {},
+    });
+    let result = p.transform_response("gpt-5.4", resp).unwrap();
+    assert_eq!(result["choices"][0]["finish_reason"], "length");
+}
+
+#[test]
+fn response_function_call() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_fc",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "call_abc",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+            }
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    });
+    let result = p.transform_response("gpt-5.4", resp).unwrap();
+    let tc = &result["choices"][0]["message"]["tool_calls"];
+    assert_eq!(tc[0]["wire_ids"][0]["id"], "call_abc");
+    assert_eq!(tc[0]["function"]["name"], "get_weather");
+    let args: Value =
+        serde_json::from_str(tc[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["city"], "Paris");
+}
+
+#[test]
+fn response_error() {
+    let p = provider();
+    let resp = json!({"error": {"message": "bad request"}});
+    assert!(p.transform_response("gpt-5.4", resp).is_err());
+}
+
+// ============================================================
+// transform_stream_chunk — Responses API events
+// ============================================================
+
+#[test]
+fn stream_reasoning_summary_delta() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.reasoning_summary_text.delta",
+        "delta": "Thinking about...",
+    });
+    let result = p
+        .transform_stream_chunk("gpt-5.4", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["object"], "chat.completion.chunk");
+    assert_eq!(
+        parsed["choices"][0]["delta"]["reasoning"][0]["text"],
+        "Thinking about..."
+    );
+}
+
+#[test]
+fn stream_output_text_delta() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.output_text.delta",
+        "delta": "Hello",
+    });
+    let result = p
+        .transform_stream_chunk("gpt-5.4", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["choices"][0]["delta"]["content"], "Hello");
+}
+
+#[test]
+fn stream_response_completed() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "input_tokens_details": {"cached_tokens": 8}
+            },
+        },
+    });
+    let result = p
+        .transform_stream_chunk("gpt-5.4", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+    assert_eq!(parsed["usage"]["prompt_tokens"], 10);
+    assert_eq!(parsed["usage"]["completion_tokens"], 5);
+    assert_eq!(parsed["usage"]["prompt_tokens_details"]["cached_tokens"], 8);
+}
+
+#[test]
+fn stream_function_call_output_item_added() {
+    let p = provider();
+    let mut stream = p.stream_normalizer("gpt-5.4");
+    let start = json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_xyz","name":"get_weather","arguments":""}});
+    assert!(stream.push(&start.to_string()).unwrap().is_none());
+    stream
+        .push(
+            &json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{}"})
+                .to_string(),
+        )
+        .unwrap();
+    let result = stream
+        .push(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                .to_string(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let call = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert!(call["id"].as_str().unwrap().starts_with("call_ls_"));
+    assert_eq!(call["wire_ids"][0]["id"], "call_xyz");
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(call["index"], 1);
+}
+
+#[test]
+fn stream_function_call_non_function_item_skipped() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {"type": "message"},
+    });
+    let result = p
+        .transform_stream_chunk("gpt-5.4", &serde_json::to_string(&chunk).unwrap())
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn stream_function_call_arguments_delta() {
+    let p = provider();
+    let mut stream = p.stream_normalizer("gpt-5.4");
+    stream.push(&json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","call_id":"call_xyz","name":"get_weather","arguments":""}}).to_string()).unwrap();
+    for fragment in ["{\"city\":", "\"Paris\"}"] {
+        assert!(stream.push(&json!({"type":"response.function_call_arguments.delta","output_index":2,"delta":fragment}).to_string()).unwrap().is_none());
+    }
+    let result = stream
+        .push(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                .to_string(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let call = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(call["index"], 2);
+}
+
+#[test]
+fn stream_other_events_skipped() {
+    let p = provider();
+    for event_type in &[
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
+    ] {
+        let chunk = json!({"type": event_type});
+        let result = p
+            .transform_stream_chunk("gpt-5.4", &serde_json::to_string(&chunk).unwrap())
+            .unwrap();
+        assert!(result.is_none(), "{} should be skipped", event_type);
+    }
+}
+
+#[test]
+fn stream_empty_returns_none() {
+    let p = provider();
+    assert!(p.transform_stream_chunk("gpt-5.4", "").unwrap().is_none());
+    assert!(p.transform_stream_chunk("gpt-5.4", "  ").unwrap().is_none());
+}
+
+#[test]
+fn stream_done_returns_none() {
+    let p = provider();
+    assert!(p
+        .transform_stream_chunk("gpt-5.4", "[DONE]")
+        .unwrap()
+        .is_none());
+}
+
+// ============================================================
+// Unified reasoning — six-tier efforts + reasoning_mode
+// ============================================================
+
+#[test]
+fn effort_max_is_gpt_5_6_exclusive() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "max",
+    });
+    let r = p.transform_request("gpt-5.6-sol", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "max");
+    for model in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5-pro"] {
+        let r = p.transform_request(model, &req).unwrap();
+        assert_eq!(
+            r.body["reasoning"]["effort"], "xhigh",
+            "{model} should clamp max -> xhigh"
+        );
+    }
+}
+
+#[test]
+fn gpt_5_4_family_clamps_minimal_to_low() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "minimal",
+    });
+    for model in ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"] {
+        let r = p.transform_request(model, &req).unwrap();
+        assert_eq!(r.body["reasoning"]["effort"], "low", "{model}");
+    }
+    // gpt-5.5 accepts minimal natively — passes through unchanged
+    let r = p.transform_request("gpt-5.5", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "minimal");
+}
+
+#[test]
+fn mode_pro_native_on_gpt_6_and_supported_older_models() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+        "reasoning_mode": "pro",
+    });
+    for model in [
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6.1-terra",
+        "gpt-6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.5-pro",
+    ] {
+        let r = p.transform_request(model, &req).unwrap();
+        assert_eq!(r.body["reasoning"]["mode"], "pro", "{model}");
+        assert_eq!(r.body["reasoning"]["effort"], "high", "{model}");
+    }
+}
+
+#[test]
+fn mode_pro_emulated_as_bump_elsewhere() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "medium",
+        "reasoning_mode": "pro",
+    });
+    let r = p.transform_request("gpt-5.5", &req).unwrap();
+    assert!(
+        r.body["reasoning"].get("mode").is_none(),
+        "gpt-5.5 rejects reasoning.mode — must not be sent"
+    );
+    assert_eq!(r.body["reasoning"]["effort"], "high"); // medium bumped one tier
+}
+
+#[test]
+fn mode_pro_without_effort() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_mode": "pro",
+    });
+    // native: send mode only, model picks its own effort under pro
+    let r = p.transform_request("gpt-5.6-luna", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["mode"], "pro");
+    assert!(r.body["reasoning"].get("effort").is_none());
+    // emulated: behaves as medium bumped one tier
+    let r = p.transform_request("gpt-5.4", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "high");
+    assert!(r.body["reasoning"].get("mode").is_none());
+}
+
+#[test]
+fn request_strips_foreign_reasoning_signature() {
+    // Issue #34: an opaque Anthropic reasoning signature must never leak into an
+    // OpenAI request in a multi-model conversation.
+    let p = provider();
+    let req = json!({
+        "model": "gpt-5.4",
+        "messages": [{
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": "x",
+            "reasoning_signature": "anthropic-sig-should-not-leak",
+            "redacted_reasoning_content": "redacted-should-not-leak"
+        }]
+    });
+    let result = p.transform_request("gpt-5.4", &req).unwrap();
+    let body = serde_json::to_string(&result.body).unwrap();
+    assert!(!body.contains("anthropic-sig-should-not-leak"));
+    assert!(!body.contains("redacted-should-not-leak"));
+    assert!(!body.contains("reasoning_signature"));
+}
+
+#[test]
+fn gpt_6_1_sol_api_clamps_none_to_low_but_keeps_max_and_pro() {
+    // The API rejects "none" for gpt-6.1-sol (verified live 2026-11-11).
+    let keyed = provider();
+    for (requested, expected) in [("none", "low"), ("minimal", "low"), ("max", "max")] {
+        let request = json!({"messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": requested});
+        let native = keyed.transform_request("gpt-6.1-sol", &request).unwrap();
+        assert_eq!(native.body["reasoning"]["effort"], expected);
+    }
+    let request = json!({"messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high", "reasoning_mode": "pro"});
+    let native = keyed.transform_request("gpt-6.1-sol", &request).unwrap();
+    assert_eq!(native.body["reasoning"]["mode"], "pro");
+}

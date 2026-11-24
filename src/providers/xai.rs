@@ -1,0 +1,583 @@
+use crate::error::{Result, ShimError};
+use crate::provider::{Provider, ProviderRequest};
+use crate::vision;
+use serde_json::{json, Value};
+
+const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+
+pub struct Xai {
+    pub api_key: String,
+    pub base_url: String,
+    /// The registered key of this entry, when it is a named instance of the kind (design note
+    /// 0032); `None` reports the kind as the admission identity.
+    instance: Option<String>,
+}
+
+impl Xai {
+    pub fn new(api_key: String) -> Self {
+        Self {
+            api_key,
+            base_url: DEFAULT_BASE_URL.to_string(),
+            instance: None,
+        }
+    }
+
+    /// Make this entry a named instance of its kind: the admission identity (lane, limits,
+    /// circuit, usage) is `name`, while pricing, replay and tool handling still read the kind.
+    pub fn with_instance(mut self, name: &str) -> Self {
+        self.instance = Some(name.to_owned());
+        self
+    }
+
+    pub fn with_base_url(mut self, url: String) -> Self {
+        self.base_url = url;
+        self
+    }
+}
+
+/// Sanitize messages for xAI Responses API: strip cross-provider fields,
+/// translate images, and convert tool call/result messages to Responses API format.
+///
+/// The Responses API expects:
+/// - Assistant messages with tool_calls → split into the assistant message +
+///   separate `function_call` items
+/// - `role: "tool"` messages → `function_call_output` items
+///
+/// Same-role adjacency passes through unchanged. xAI's API is OpenAI
+/// Responses-shaped and its documentation (docs.x.ai, chat guide and API
+/// reference) states no ordering or alternation rule — but silence is not a
+/// verified acceptance, and this has not been checked live. Nothing is merged
+/// here because merging would destroy message boundaries a caller may depend
+/// on; if xAI ever rejects adjacency the rejection arrives as its own 400.
+fn sanitize_messages(messages: &[Value]) -> Vec<Value> {
+    let mut result = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        match role {
+            "assistant" => {
+                result.extend(crate::reasoning::responses_items(msg));
+                let mut out = msg.clone();
+                crate::reasoning::strip_fields(&mut out);
+                if let Some(obj) = out.as_object_mut() {
+                    obj.remove("annotations");
+                    obj.remove("refusal");
+                    obj.remove("tool_calls");
+                }
+                if let Some(content) = out.get("content").cloned() {
+                    if content.is_array() {
+                        let translated =
+                            vision::translate_content_blocks(&content, vision::to_openai);
+                        out["content"] = vision::text_blocks_to_openai(&translated);
+                    }
+                }
+                let has_content = out
+                    .get("content")
+                    .map(|c| !c.is_null() && c.as_str().map(|s| !s.is_empty()).unwrap_or(true))
+                    .unwrap_or(false);
+                if has_content {
+                    result.push(out);
+                }
+
+                // Emit function_call items for each tool call
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|tc| tc.as_array()) {
+                    for tc in tool_calls {
+                        let call_id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("{}")
+                            .to_string();
+                        let mut item = json!({
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                        });
+                        if let Some(id) = tc.get("_llmshim_item_id") {
+                            item["id"] = id.clone();
+                        }
+                        result.push(item);
+                    }
+                }
+            }
+            "tool" => {
+                let call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let output = msg
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                result.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
+                }));
+            }
+            _ => {
+                let mut out = msg.clone();
+                crate::reasoning::strip_fields(&mut out);
+                if let Some(obj) = out.as_object_mut() {
+                    obj.remove("annotations");
+                    obj.remove("refusal");
+                }
+                if let Some(content) = out.get("content").cloned() {
+                    if content.is_array() {
+                        let translated =
+                            vision::translate_content_blocks(&content, vision::to_openai);
+                        out["content"] = vision::text_blocks_to_openai(&translated);
+                    }
+                }
+                result.push(out);
+            }
+        }
+    }
+    result
+}
+
+/// Translate tools from Chat Completions nested format to Responses API flat format.
+/// Chat Completions: {"type": "function", "function": {"name": ..., "parameters": ...}}
+/// Responses API:    {"type": "function", "name": ..., "parameters": ...}
+fn translate_tools(tools: &Value) -> Value {
+    if let Some(arr) = tools.as_array() {
+        let translated: Vec<Value> = arr
+            .iter()
+            .map(|tool| {
+                if let Some(func) = tool.get("function") {
+                    let mut flat = json!({"type": "function"});
+                    if let Some(obj) = func.as_object() {
+                        for (k, v) in obj {
+                            flat[k] = v.clone();
+                        }
+                    }
+                    if let Some(obj) = tool.as_object() {
+                        for (k, v) in obj {
+                            if k != "type" && k != "function" {
+                                flat[k] = v.clone();
+                            }
+                        }
+                    }
+                    flat
+                } else {
+                    tool.clone()
+                }
+            })
+            .collect();
+        json!(translated)
+    } else {
+        tools.clone()
+    }
+}
+
+/// Named selection on Responses uses a flat name, unlike Chat Completions.
+fn translate_tool_choice(tc: &Value) -> Value {
+    if let Some(tc_obj) = tc.as_object() {
+        if let Some(tc_type) = tc_obj.get("type").and_then(|t| t.as_str()) {
+            return match tc_type {
+                "auto" => json!("auto"),
+                "any" => json!("required"),
+                "none" => json!("none"),
+                "tool" => tc_obj
+                    .get("name")
+                    .map(|name| json!({"type": "function", "name": name}))
+                    .unwrap_or_else(|| tc.clone()),
+                "function" => tc
+                    .pointer("/function/name")
+                    .or_else(|| tc.get("name"))
+                    .map(|name| json!({"type": "function", "name": name}))
+                    .unwrap_or_else(|| tc.clone()),
+                _ => tc.clone(),
+            };
+        }
+    }
+    tc.clone()
+}
+
+/// grok-4.20-* models encode reasoning on/off in the MODEL NAME and reject
+/// any reasoning parameter with a 400 ("does not support parameter
+/// reasoningEffort", verified live) — the param must be omitted entirely.
+fn is_reasoning_name_locked(model: &str) -> bool {
+    model.to_lowercase().contains("4.20")
+}
+
+/// grok-4.5 / grok-4.6 / grok-4.7 cannot disable reasoning: `effort: "none"` -> 400 ("does
+/// not support `reasoning_effort` value `none`", verified live). Unified effort
+/// "none" clamps to "low". grok-4.3 DOES accept "none".
+fn reasoning_cannot_disable(model: &str) -> bool {
+    let m = model.to_lowercase();
+    // Verified live for 4.7 on 2026-09-21. Keep older models' behavior intact.
+    m.contains("4.5") || m.contains("4.6") || m.contains("4.7")
+}
+
+impl Provider for Xai {
+    fn uses_documented_model_defaults(&self) -> bool {
+        self.base_url == DEFAULT_BASE_URL
+    }
+
+    fn name(&self) -> &str {
+        "xai"
+    }
+
+    fn instance(&self) -> &str {
+        self.instance.as_deref().unwrap_or(self.name())
+    }
+
+    fn replay_target(&self, model: &str) -> crate::reasoning::ReplayTarget {
+        crate::reasoning::ReplayTarget::new(
+            self.name(),
+            model,
+            crate::reasoning::WireFormat::OpenAiResponses,
+        )
+        .bind_account(&self.base_url, Some(&self.api_key))
+    }
+
+    fn transform_request(&self, model: &str, request: &Value) -> Result<ProviderRequest> {
+        crate::reasoning::preflight_request(request)?;
+        let mut schema_budget = crate::schema::RequestBudget::new();
+        let request = crate::schema::prepare_request(request, &mut schema_budget)?;
+        let request =
+            crate::cache::prepare_request(&request, crate::reasoning::WireFormat::OpenAiResponses)?;
+        let request = crate::reasoning::prepare_request(&request, &self.replay_target(model))?;
+        let request = crate::toolcall::prepare_request(&request, &self.replay_target(model))?;
+        let obj = request.as_object().ok_or(ShimError::MissingModel)?;
+
+        let messages = obj
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .ok_or(ShimError::MissingModel)?;
+
+        let clean_messages = sanitize_messages(messages);
+
+        // Use Responses API (same as OpenAI)
+        let mut body = json!({
+            "model": model,
+            "input": clean_messages,
+        });
+        let body_obj = body.as_object_mut().unwrap();
+
+        // max_output_tokens
+        if let Some(v) = obj.get("max_tokens").or(obj.get("max_completion_tokens")) {
+            body_obj.insert("max_output_tokens".to_string(), v.clone());
+        }
+
+        // Stream flag
+        if let Some(v) = obj.get("stream") {
+            body_obj.insert("stream".to_string(), v.clone());
+        }
+
+        // Tools — translate Chat Completions format to Responses API flat format
+        if let Some(tools) = obj.get("tools") {
+            body_obj.insert("tools".to_string(), translate_tools(tools));
+        }
+
+        // tool_choice
+        if let Some(tc) = obj.get("tool_choice") {
+            body_obj.insert("tool_choice".to_string(), translate_tool_choice(tc));
+        }
+
+        // Extract system/developer messages into instructions
+        let input = body_obj.get_mut("input").unwrap().as_array_mut().unwrap();
+        let mut instructions: Vec<String> = Vec::new();
+        input.retain(|msg| match msg.get("role").and_then(|r| r.as_str()) {
+            Some("system" | "developer") => {
+                if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                    instructions.push(text.to_string());
+                }
+                false
+            }
+            _ => true,
+        });
+        if !instructions.is_empty() {
+            body_obj.insert("instructions".to_string(), json!(instructions.join("\n\n")));
+        }
+
+        // Unified reasoning controls -> xAI's nested `reasoning: {effort}`.
+        // The flat `reasoning_effort` string is silently IGNORED by xAI's API
+        // (verified live) — only the nested object works. grok-4.20-* models
+        // are name-locked (reasoning baked into the model name) and 400 on any
+        // reasoning param, so omit it entirely for them.
+        if !is_reasoning_name_locked(model) {
+            if let Some(effort) = obj.get("reasoning_effort").and_then(|e| e.as_str()) {
+                // mode:"pro" has no xAI analog; map to a one-tier effort bump.
+                let pro = obj
+                    .get("reasoning_mode")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m == "pro")
+                    .unwrap_or(false);
+                let effort = match (effort, pro) {
+                    // Explicit off wins — except on models that can't disable
+                    // reasoning (grok-4.5), where it clamps to the floor.
+                    ("none", _) if reasoning_cannot_disable(model) => "low",
+                    ("none", _) => "none",
+                    ("minimal" | "low", false) => "low",
+                    ("minimal" | "low", true) => "medium",
+                    ("medium", false) => "medium",
+                    ("medium", true) => "high",
+                    ("high", false) => "high",
+                    // xAI's ceiling is xhigh ("max" rejected, verified live 400)
+                    ("high", true) | ("xhigh", _) | ("max", _) => "xhigh",
+                    _ => "low", // unknown -> xAI's default
+                };
+                body_obj.insert("reasoning".to_string(), json!({ "effort": effort }));
+            }
+        }
+
+        // Strip provider-specific params that don't apply to xAI
+        body_obj.remove("thinking");
+        body_obj.remove("output_config");
+        body_obj.remove("reasoning_effort");
+
+        let url = format!("{}/responses", self.base_url);
+
+        crate::reasoning::enforce_stateless(&mut body)?;
+        crate::toolcall::validate_native(&body, &self.replay_target(model))?;
+        crate::schema::normalize_native_tools(
+            crate::schema::Target::OpenAiResponses,
+            &mut body,
+            &mut schema_budget,
+        )?;
+        crate::shim::native_format(
+            &request,
+            crate::reasoning::WireFormat::OpenAiResponses,
+            &mut body,
+            &mut schema_budget,
+        )?;
+        crate::cache::finish_request(
+            &request,
+            &mut body,
+            crate::reasoning::WireFormat::OpenAiResponses,
+        )?;
+        Ok(ProviderRequest {
+            url,
+            headers: vec![
+                ("Authorization".into(), format!("Bearer {}", self.api_key)),
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            body,
+        })
+    }
+
+    fn transform_response(&self, model: &str, response: Value) -> Result<Value> {
+        let native = response.clone();
+        let mut result = self.transform_response_native(model, response)?;
+        crate::derived_response::capture_unary(&self.replay_target(model), &native, &mut result)?;
+        Ok(result)
+    }
+
+    fn transform_stream_chunk(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        crate::json_bounds::enforce_sse_complexity(chunk)?;
+        let result = self.transform_stream_chunk_native(model, chunk)?;
+        let native: Value = match serde_json::from_str(chunk) {
+            Ok(v) => v,
+            Err(_) => return Ok(result),
+        };
+        crate::reasoning::capture_stream(&self.replay_target(model), &native, result)
+    }
+}
+
+impl Xai {
+    fn transform_response_native(&self, model: &str, response: Value) -> Result<Value> {
+        // Check for error (Responses API returns "error": null on success)
+        if let Some(err) = response.get("error") {
+            if !err.is_null() {
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                return Err(ShimError::ProviderError {
+                    status: 400,
+                    body: msg.to_string(),
+                    retry_after: None,
+                });
+            }
+        }
+
+        let output = response
+            .get("output")
+            .and_then(|o| o.as_array())
+            .ok_or_else(|| ShimError::ProviderError {
+                status: 500,
+                body: "no output in response".to_string(),
+                retry_after: None,
+            })?;
+
+        let mut text_content: Option<String> = None;
+        let mut refusal = String::new();
+        let mut tool_calls: Vec<Value> = Vec::new();
+
+        for item in output {
+            match item.get("type").and_then(|t| t.as_str()) {
+                Some("message") => {
+                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                        for part in content {
+                            if part["type"] == "refusal" {
+                                if let Some(text) = part["refusal"].as_str() {
+                                    refusal.push_str(text);
+                                }
+                            }
+                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                text_content.get_or_insert_with(String::new).push_str(text);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    tool_calls.push(json!({
+                        "id": item.get("call_id").cloned().unwrap_or(json!("")),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name").cloned().unwrap_or(json!("")),
+                            "arguments": item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}"),
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+
+        let content = text_content.map(|t| json!(t)).unwrap_or(Value::Null);
+        let mut message = json!({"role": "assistant", "content": content});
+        if !refusal.is_empty() {
+            message["refusal"] = json!(refusal);
+        }
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = json!(tool_calls);
+        }
+
+        let finish_reason = match response.get("status").and_then(Value::as_str) {
+            Some("completed" | "incomplete") if message["refusal"].is_string() => "content_filter",
+            Some("completed")
+                if message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty()) =>
+            {
+                "tool_calls"
+            }
+            Some("completed") => "stop",
+            Some("incomplete") => "length",
+            _ => {
+                return Err(ShimError::ProviderError {
+                    status: 502,
+                    body: "xAI response has no supported terminal status".into(),
+                    retry_after: None,
+                });
+            }
+        };
+
+        let usage = response.get("usage").cloned().unwrap_or(json!({}));
+        let reasoning_tokens = usage
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let mut result = json!({
+            "id": response.get("id").cloned().unwrap_or(json!("")),
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
+                "completion_tokens": usage.get("output_tokens").cloned().unwrap_or(json!(0)),
+                "total_tokens": usage.get("total_tokens").cloned().unwrap_or(json!(0)),
+            }
+        });
+
+        // Surface reasoning token count so users know reasoning happened
+        if reasoning_tokens > 0 {
+            result["usage"]["reasoning_tokens"] = json!(reasoning_tokens);
+        }
+
+        crate::usage::normalize_cache(&usage, &mut result["usage"]);
+        Ok(result)
+    }
+}
+
+impl Xai {
+    fn transform_stream_chunk_native(&self, model: &str, chunk: &str) -> Result<Option<String>> {
+        let trimmed = chunk.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return Ok(None);
+        }
+
+        let parsed: Value = serde_json::from_str(trimmed)?;
+        let event_type = parsed.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match event_type {
+            "response.refusal.delta" => Ok(Some(json!({"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"refusal":parsed["delta"]},"finish_reason":null}]}).to_string())),
+            // Content text deltas
+            "response.output_text.delta" => {
+                let delta = parsed.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+                if delta.is_empty() {
+                    return Ok(None);
+                }
+                let chunk = json!({
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": delta},
+                        "finish_reason": null,
+                    }]
+                });
+                Ok(Some(serde_json::to_string(&chunk)?))
+            }
+
+            // Response completed
+            "response.completed" => {
+                let resp = &parsed["response"];
+                let status = resp
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("completed");
+                let finish_reason = match status {
+                    "completed" => "stop",
+                    "incomplete" => "length",
+                    _ => "stop",
+                };
+                let usage = resp.get("usage").cloned().unwrap_or(json!({}));
+                let reasoning_tokens = usage
+                    .pointer("/output_tokens_details/reasoning_tokens")
+                    .cloned()
+                    .unwrap_or(json!(0));
+                let mut chunk = json!({
+                    "object": "chat.completion.chunk",
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish_reason,
+                    }],
+                    "usage": {
+                        "prompt_tokens": usage.get("input_tokens").cloned().unwrap_or(json!(0)),
+                        "completion_tokens": usage.get("output_tokens").cloned().unwrap_or(json!(0)),
+                        "reasoning_tokens": reasoning_tokens,
+                    }
+                });
+                crate::usage::normalize_cache(&usage, &mut chunk["usage"]);
+                Ok(Some(serde_json::to_string(&chunk)?))
+            }
+
+            // All other events: skip
+            _ => Ok(None),
+        }
+    }
+}

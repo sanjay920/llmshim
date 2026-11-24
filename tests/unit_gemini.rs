@@ -1,0 +1,1536 @@
+use llmshim::provider::Provider;
+use llmshim::providers::gemini::Gemini;
+use serde_json::{json, Value};
+
+fn signature(data: &str) -> Value {
+    json!({"data": data, "origin": provider().replay_target("gemini-3.8-flash").origin()})
+}
+
+fn provider() -> Gemini {
+    Gemini::new("test-key".into())
+}
+
+// ============================================================
+// transform_request — basic structure
+// ============================================================
+
+#[test]
+fn request_url_non_streaming() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert!(result
+        .url
+        .contains("/models/gemini-3-flash-preview:generateContent"));
+    assert!(result.url.contains("key=test-key"));
+    assert!(!result.url.contains("alt=sse"));
+}
+
+#[test]
+fn request_url_gemini_3_5_flash() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("gemini-3.5-flash", &req).unwrap();
+    assert!(result
+        .url
+        .contains("/models/gemini-3.5-flash:generateContent"));
+    assert!(result.url.contains("key=test-key"));
+}
+
+#[test]
+fn request_url_streaming() {
+    let p = provider();
+    let req =
+        json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "stream": true});
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert!(result.url.contains(":streamGenerateContent"));
+    assert!(result.url.contains("alt=sse"));
+}
+
+#[test]
+fn request_basic_message_format() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0]["role"], "user");
+    assert_eq!(contents[0]["parts"][0]["text"], "hello");
+}
+
+#[test]
+fn request_multi_turn() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello!"},
+            {"role": "user", "content": "how are you?"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 3);
+    assert_eq!(contents[0]["role"], "user");
+    assert_eq!(contents[1]["role"], "model"); // assistant → model
+    assert_eq!(contents[1]["parts"][0]["text"], "hello!");
+    assert_eq!(contents[2]["role"], "user");
+}
+
+// ============================================================
+// transform_request — system message
+// ============================================================
+
+#[test]
+fn request_system_message_extracted() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert_eq!(
+        result.body["systemInstruction"]["parts"][0]["text"],
+        "You are helpful."
+    );
+    let contents = result.body["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 1); // system not in contents
+    assert_eq!(contents[0]["role"], "user");
+}
+
+#[test]
+fn request_developer_role_as_system() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "developer", "content": "Be concise."},
+            {"role": "user", "content": "hi"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert_eq!(
+        result.body["systemInstruction"]["parts"][0]["text"],
+        "Be concise."
+    );
+}
+
+#[test]
+fn request_no_system_message() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert!(result.body.get("systemInstruction").is_none());
+}
+
+// ============================================================
+// transform_request — generation config
+// ============================================================
+
+#[test]
+fn request_generation_config() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.5,
+        "top_p": 0.9,
+        "top_k": 40,
+        "max_tokens": 100,
+        "stop": ["END"],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let gc = &result.body["generationConfig"];
+    assert_eq!(gc["temperature"], 0.5);
+    assert_eq!(gc["topP"], 0.9);
+    assert_eq!(gc["topK"], 40);
+    assert_eq!(gc["maxOutputTokens"], 100);
+    assert_eq!(gc["stopSequences"], json!(["END"]));
+}
+
+#[test]
+fn request_max_completion_tokens_fallback() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_completion_tokens": 256,
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert_eq!(result.body["generationConfig"]["maxOutputTokens"], 256);
+}
+
+// ============================================================
+// transform_request — reasoning/thinking
+// ============================================================
+
+#[test]
+fn reasoning_effort_to_thinking_level() {
+    let p = provider();
+    for (effort, expected) in [
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("minimal", "low"),
+    ] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+        assert_eq!(
+            result.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], expected,
+            "reasoning_effort '{}' should map to '{}'",
+            effort, expected
+        );
+    }
+}
+
+#[test]
+fn output_config_effort_to_thinking_level() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "output_config": {"effort": "medium"},
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert_eq!(
+        result.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "medium"
+    );
+}
+
+#[test]
+fn x_gemini_thinking_config_passthrough() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "x-gemini": {"thinkingConfig": {"thinkingLevel": "minimal"}},
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert_eq!(
+        result.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "minimal"
+    );
+}
+
+// ============================================================
+// transform_request — tools
+// ============================================================
+
+#[test]
+fn request_transforms_tools() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }]
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let decls = &result.body["tools"][0]["functionDeclarations"];
+    assert_eq!(decls[0]["name"], "get_weather");
+    assert_eq!(decls[0]["description"], "Get weather");
+}
+
+#[test]
+fn request_tool_choice_auto() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": "auto",
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert_eq!(
+        result.body["toolConfig"]["functionCallingConfig"]["mode"],
+        "AUTO"
+    );
+}
+
+#[test]
+fn request_tool_choice_required() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": "required",
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert_eq!(
+        result.body["toolConfig"]["functionCallingConfig"]["mode"],
+        "ANY"
+    );
+}
+
+#[test]
+fn request_tool_calls_in_history() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"},
+                    "thought_signature": signature("test-sig")
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 22}"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // Assistant message should have functionCall
+    assert_eq!(contents[1]["role"], "model");
+    assert_eq!(
+        contents[1]["parts"][0]["functionCall"]["name"],
+        "get_weather"
+    );
+    assert_eq!(
+        contents[1]["parts"][0]["functionCall"]["args"]["city"],
+        "Paris"
+    );
+
+    // Tool result should be functionResponse with resolved function name
+    assert_eq!(contents[2]["role"], "user");
+    assert!(contents[2]["parts"][0].get("functionResponse").is_some());
+    assert_eq!(
+        contents[2]["parts"][0]["functionResponse"]["name"],
+        "get_weather"
+    );
+    // JSON object response passed through directly
+    assert_eq!(
+        contents[2]["parts"][0]["functionResponse"]["response"]["temp"],
+        22
+    );
+}
+
+#[test]
+fn request_tool_result_array_wrapped_as_object() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "data?"},
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "list_items", "arguments": "{}"},
+                    "thought_signature": signature("test-sig")
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "[\"a\", \"b\", \"c\"]"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+    let fr = &contents[2]["parts"][0]["functionResponse"];
+    assert_eq!(fr["name"], "list_items");
+    // Array should be wrapped in {"result": [...]}
+    assert!(fr["response"]["result"].is_array());
+    assert_eq!(fr["response"]["result"][0], "a");
+}
+
+#[test]
+fn request_tool_result_plain_string_wrapped() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "echo", "arguments": "{}"},
+                    "thought_signature": signature("test-sig")
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "hello world"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let fr = &result.body["contents"].as_array().unwrap()[2]["parts"][0]["functionResponse"];
+    assert_eq!(fr["name"], "echo");
+    assert_eq!(fr["response"]["result"], "hello world");
+}
+
+// ============================================================
+// transform_response
+// ============================================================
+
+#[test]
+fn response_text_only() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [{"text": "Hello!"}], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 2, "totalTokenCount": 7},
+        "responseId": "resp_123",
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    assert_eq!(result["object"], "chat.completion");
+    assert_eq!(result["id"], "resp_123");
+    assert_eq!(result["choices"][0]["message"]["content"], "Hello!");
+    assert_eq!(result["choices"][0]["finish_reason"], "stop");
+    assert_eq!(result["usage"]["prompt_tokens"], 5);
+    assert_eq!(result["usage"]["completion_tokens"], 2);
+    assert_eq!(result["usage"]["total_tokens"], 7);
+}
+
+#[test]
+fn response_with_thought_signature_text_preserved() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Hello!", "thoughtSignature": "abc123=="}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 2, "totalTokenCount": 7},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    assert_eq!(result["choices"][0]["message"]["content"], "Hello!");
+}
+
+#[test]
+fn response_function_call() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    let tc = &result["choices"][0]["message"]["tool_calls"];
+    assert_eq!(tc[0]["function"]["name"], "get_weather");
+    let args: Value =
+        serde_json::from_str(tc[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["city"], "Paris");
+}
+
+#[test]
+fn response_max_tokens_finish() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [{"text": "partial..."}]}, "finishReason": "MAX_TOKENS"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    assert_eq!(result["choices"][0]["finish_reason"], "length");
+}
+
+#[test]
+fn response_safety_finish() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [{"text": ""}]}, "finishReason": "SAFETY"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    assert_eq!(result["choices"][0]["finish_reason"], "content_filter");
+}
+
+#[test]
+fn response_error() {
+    let p = provider();
+    let resp = json!({"error": {"code": 404, "message": "model not found"}});
+    let err = p.transform_response("x", resp).unwrap_err();
+    let msg = format!("{}", err);
+    assert!(msg.contains("model not found"));
+}
+
+// ============================================================
+// transform_stream_chunk
+// ============================================================
+
+#[test]
+fn stream_text_chunk() {
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [{"text": "Hello"}], "role": "model"}, "index": 0}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_stream_chunk(
+            "gemini-3-flash-preview",
+            &serde_json::to_string(&chunk).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["object"], "chat.completion.chunk");
+    assert_eq!(parsed["choices"][0]["delta"]["content"], "Hello");
+}
+
+#[test]
+fn stream_thought_signature_only_skipped() {
+    let p = provider();
+    // Chunk with empty text + thoughtSignature should be skipped
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "", "thoughtSignature": "abc123=="}
+        ], "role": "model"}, "finishReason": "STOP", "index": 0}],
+        "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 3, "totalTokenCount": 8},
+    });
+    let result = p
+        .transform_stream_chunk(
+            "gemini-3-flash-preview",
+            &serde_json::to_string(&chunk).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    // Should still emit because of finishReason
+    assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+}
+
+#[test]
+fn stream_empty_skipped() {
+    let p = provider();
+    assert!(p.transform_stream_chunk("x", "").unwrap().is_none());
+    assert!(p.transform_stream_chunk("x", "  ").unwrap().is_none());
+}
+
+#[test]
+fn stream_function_call() {
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "search", "args": {"q": "rust"}}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        parsed["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+        "search"
+    );
+}
+
+// ============================================================
+// Cross-provider sanitization
+// ============================================================
+
+#[test]
+fn strips_openai_annotations_from_history() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello!", "annotations": [], "refusal": null, "reasoning_content": "thought..."},
+            {"role": "user", "content": "bye"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+    let model_msg = &contents[1];
+    // Should only have text parts, no foreign fields
+    assert_eq!(model_msg["parts"][0]["text"], "hello!");
+    // These shouldn't leak through as Gemini doesn't understand them
+    assert!(model_msg.get("annotations").is_none());
+    assert!(model_msg.get("refusal").is_none());
+    assert!(model_msg.get("reasoning_content").is_none());
+}
+
+// ============================================================
+// includeThoughts always set
+// ============================================================
+
+#[test]
+fn request_always_includes_thoughts() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    assert_eq!(
+        result.body["generationConfig"]["thinkingConfig"]["includeThoughts"], true,
+        "includeThoughts should always be true"
+    );
+}
+
+#[test]
+fn request_includes_thoughts_with_thinking_level() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "high",
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let tc = &result.body["generationConfig"]["thinkingConfig"];
+    assert_eq!(tc["includeThoughts"], true);
+    assert_eq!(tc["thinkingLevel"], "high");
+}
+
+// ============================================================
+// Response with thought parts
+// ============================================================
+
+#[test]
+fn response_with_thought_parts() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Let me think about this...", "thought": true},
+            {"text": "The answer is 42."}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 10, "totalTokenCount": 15},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    assert_eq!(
+        result["choices"][0]["message"]["content"],
+        "The answer is 42."
+    );
+    assert_eq!(
+        result["choices"][0]["message"]["reasoning"][0]["text"],
+        "Let me think about this..."
+    );
+}
+
+#[test]
+fn response_thought_only_no_text() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Just thinking...", "thought": true}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    assert!(result["choices"][0]["message"]["content"].is_null());
+    assert_eq!(
+        result["choices"][0]["message"]["reasoning"][0]["text"],
+        "Just thinking..."
+    );
+}
+
+#[test]
+fn response_no_thought_no_reasoning_content() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Hello!"}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    assert_eq!(result["choices"][0]["message"]["content"], "Hello!");
+    assert!(result["choices"][0]["message"]
+        .get("reasoning_content")
+        .is_none());
+}
+
+// ============================================================
+// Stream with thought parts
+// ============================================================
+
+#[test]
+fn stream_thought_part() {
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Thinking...", "thought": true}
+        ], "role": "model"}, "index": 0}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_stream_chunk(
+            "gemini-3-flash-preview",
+            &serde_json::to_string(&chunk).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        parsed["choices"][0]["delta"]["reasoning"][0]["text"],
+        "Thinking..."
+    );
+    assert!(parsed["choices"][0]["delta"].get("content").is_none());
+}
+
+#[test]
+fn stream_text_and_thought_in_same_chunk() {
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"text": "Reasoning here", "thought": true},
+            {"text": "Answer here"}
+        ], "role": "model"}, "index": 0}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_stream_chunk(
+            "gemini-3-flash-preview",
+            &serde_json::to_string(&chunk).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        parsed["choices"][0]["delta"]["reasoning"][0]["text"],
+        "Reasoning here"
+    );
+    assert_eq!(parsed["choices"][0]["delta"]["content"], "Answer here");
+}
+
+// ============================================================
+// thought_signature roundtrip
+// ============================================================
+
+#[test]
+fn response_preserves_thought_signature_on_tool_calls() {
+    let p = provider();
+    let gemini_response = json!({
+        "candidates": [{
+            "content": {
+                "parts": [
+                    {
+                        "functionCall": {"name": "get_quote", "args": {"symbols": ["AAPL"]}},
+                        "thoughtSignature": "abc123-sig"
+                    }
+                ],
+                "role": "model"
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", gemini_response)
+        .unwrap();
+    let tc = &result["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(tc["function"]["name"], "get_quote");
+    assert_eq!(tc["thought_signature"]["data"], "abc123-sig");
+}
+
+#[test]
+fn request_echoes_thought_signature_in_function_call_parts() {
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Get AAPL quote"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"},
+                    "thought_signature": signature("abc123-sig")
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "get_quote", "content": "{\"price\": 150}"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+    // The model (assistant) message should have functionCall with thoughtSignature
+    let model_parts = contents[1]["parts"].as_array().unwrap();
+    let fc_part = model_parts
+        .iter()
+        .find(|p| p.get("functionCall").is_some())
+        .unwrap();
+    assert_eq!(fc_part["functionCall"]["name"], "get_quote");
+    assert_eq!(fc_part["thoughtSignature"], "abc123-sig");
+}
+
+#[test]
+fn request_rejects_missing_current_turn_signature() {
+    // functionCall without thought_signature should be stripped by enforce_gemini_turn_order
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Get quote"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "get_quote", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "get_quote", "content": "{}"},
+        ],
+    });
+    assert!(p.transform_request("gemini-3-flash-preview", &req).is_err());
+}
+
+#[test]
+fn stream_preserves_thought_signature_on_tool_calls() {
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{
+            "content": {
+                "parts": [{
+                    "functionCall": {"name": "get_quote", "args": {"symbols": ["AAPL"]}},
+                    "thoughtSignature": "stream-sig-xyz"
+                }],
+                "role": "model"
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
+    });
+    let result = p
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let tc = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc["function"]["name"], "get_quote");
+    assert_eq!(tc["thought_signature"]["data"], "stream-sig-xyz");
+}
+
+// ============================================================
+// Streaming: parallel tool calls, empty args, no-name skipped
+// ============================================================
+
+#[test]
+fn stream_parallel_tool_calls_each_get_unique_index() {
+    let p = provider();
+    let mut stream = p.stream_normalizer("gemini-3-flash-preview");
+    for (name, sig) in [("get_quote", "sig1"), ("get_news", "sig2")] {
+        stream.push(&json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":name,"args":{}},"thoughtSignature":sig}]}}]}).to_string()).unwrap();
+    }
+    let result = stream
+        .push(&json!({"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}).to_string())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let calls = parsed["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0]["id"], calls[1]["id"]);
+    assert_eq!(calls[0]["index"], 0);
+    assert_eq!(calls[1]["index"], 1);
+    assert_eq!(calls[0]["thought_signature"]["data"], "sig1");
+    assert_eq!(calls[1]["thought_signature"]["data"], "sig2");
+}
+
+#[test]
+fn stream_multiple_tool_calls_in_single_chunk() {
+    // Gemini can also send multiple functionCall parts in a single chunk
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "get_quote", "args": {"symbol": "AAPL"}}, "thoughtSignature": "sig1"},
+            {"functionCall": {"name": "get_news", "args": {"count": 5}}, "thoughtSignature": "sig2"}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let tcs = parsed["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(tcs.len(), 2);
+    assert_eq!(tcs[0]["function"]["name"], "get_quote");
+    assert_eq!(tcs[0]["index"], 0);
+    assert_eq!(tcs[0]["thought_signature"]["data"], "sig1");
+    assert_eq!(tcs[1]["function"]["name"], "get_news");
+    assert_eq!(tcs[1]["index"], 1);
+    assert_eq!(tcs[1]["thought_signature"]["data"], "sig2");
+}
+
+#[test]
+fn stream_empty_args_produces_empty_json_object() {
+    let p = provider();
+    // functionCall with no args field at all
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "list_positions"}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let args = parsed["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        args, "{}",
+        "Missing args should produce empty JSON object string"
+    );
+}
+
+#[test]
+fn stream_null_args_produces_empty_json_object() {
+    let p = provider();
+    // functionCall with null args
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "list_positions", "args": null}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let args = parsed["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        args, "{}",
+        "Null args should produce empty JSON object string"
+    );
+}
+
+#[test]
+fn stream_rejects_unnamed_function_call() {
+    let p = provider();
+    let mut stream = p.stream_normalizer("gemini-3-flash-preview");
+    let chunk = json!({"candidates":[{"content":{"parts":[{"functionCall":{"args":{"x":1}}}]},"finishReason":"STOP"}]});
+    assert!(stream.push(&chunk.to_string()).is_err());
+}
+
+#[test]
+fn stream_rejects_an_incomplete_tool_batch() {
+    let p = provider();
+    // Mix of empty-name and valid functionCalls
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "", "args": {}}},
+            {"functionCall": {"name": "get_quote", "args": {"symbol": "AAPL"}}, "thoughtSignature": "sig"}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    assert!(p
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&chunk.to_string())
+        .is_err());
+}
+
+#[test]
+fn response_empty_args_produces_empty_json_object() {
+    // Non-streaming: functionCall with no args
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "list_positions"}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    let result = p
+        .transform_response("gemini-3-flash-preview", resp)
+        .unwrap();
+    let args = result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        args, "{}",
+        "Missing args should produce empty JSON object string"
+    );
+}
+
+#[test]
+fn response_rejects_unnamed_function_call() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "", "args": {"x": 1}}}
+        ], "role": "model"}, "finishReason": "STOP"}],
+        "usageMetadata": {},
+    });
+    assert!(p
+        .transform_response("gemini-3-flash-preview", resp)
+        .is_err());
+}
+
+#[test]
+fn session_history_rejects_orphaned_tool_calls() {
+    // Simulate session history where assistant made tool calls but the session
+    // was cut short — no tool results followed. Gemini should not see the functionCall.
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Check the news"},
+            {
+                "role": "assistant",
+                "content": "Let me check.",
+                "tool_calls": [{
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {"name": "get_news", "arguments": "{}"}
+                }]
+            },
+            // No tool result — session was interrupted
+            // New run starts with a new user message
+            {"role": "user", "content": "Check the news again"},
+        ],
+    });
+    assert!(p.transform_request("gemini-3-flash-preview", &req).is_err());
+}
+
+#[test]
+fn session_history_valid_tool_roundtrip_preserved() {
+    // Valid history: assistant tool call with thought_signature followed by tool result
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Get a quote"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"},
+                    "thought_signature": signature("valid-sig")
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "name": "get_quote", "content": "{\"price\":150}"},
+            {"role": "assistant", "content": "AAPL is at $150."},
+            {"role": "user", "content": "Thanks"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // The model turn with functionCall should be preserved (followed by functionResponse)
+    let model_with_fc = contents.iter().any(|t| {
+        t["role"] == "model"
+            && t["parts"]
+                .as_array()
+                .map(|p| p.iter().any(|part| part.get("functionCall").is_some()))
+                .unwrap_or(false)
+    });
+    assert!(model_with_fc, "Valid functionCall should be preserved");
+
+    // And there should be a functionResponse
+    let has_fr = contents.iter().any(|t| {
+        t["parts"]
+            .as_array()
+            .map(|p| p.iter().any(|part| part.get("functionResponse").is_some()))
+            .unwrap_or(false)
+    });
+    assert!(has_fr, "functionResponse should be present");
+}
+
+#[test]
+fn session_history_consecutive_roles_merged() {
+    // If session has two consecutive user messages, they should be merged
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "First message"},
+            {"role": "user", "content": "Second message"},
+            {"role": "assistant", "content": "Reply"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // Should have exactly 2 turns: user (merged) + model
+    assert_eq!(contents.len(), 2, "Consecutive user turns should be merged");
+    assert_eq!(contents[0]["role"], "user");
+    assert_eq!(contents[1]["role"], "model");
+
+    // Merged user turn should have 2 text parts
+    let user_parts = contents[0]["parts"].as_array().unwrap();
+    assert_eq!(user_parts.len(), 2);
+}
+
+#[test]
+fn session_history_compacted_starts_with_model_tool_call() {
+    // Reproduces the news-producer bug: session history starts with
+    // assistant(tool_calls) after system message extraction, meaning
+    // the first content turn is model(functionCall) — invalid for Gemini.
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "system", "content": "You are a news agent."},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "read_news_board", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "read_news_board", "content": "{\"items\":[]}"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "get_news", "arguments": "{\"count\":10}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "get_news", "content": "{\"headlines\":[]}"},
+            {"role": "assistant", "content": "No new headlines."},
+            {"role": "user", "content": "Check news again"},
+        ],
+    });
+    assert!(p.transform_request("gemini-3-flash-preview", &req).is_err());
+}
+
+#[test]
+fn session_history_empty_assistant_turns_removed() {
+    // Empty assistant messages (no content, no tool_calls) should be removed
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "Hello again"},
+            {"role": "assistant", "content": "Hi there"},
+        ],
+    });
+    let result = p.transform_request("gemini-3-flash-preview", &req).unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // The empty assistant turn should be removed, resulting in merged user turns
+    for turn in contents {
+        if turn["role"] == "model" {
+            let parts = turn["parts"].as_array().unwrap();
+            let has_real_content = parts.iter().any(|p| {
+                p.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(true)
+            });
+            assert!(has_real_content, "Empty model turns should be removed");
+        }
+    }
+}
+
+// ============================================================
+// Full tool call roundtrip: Gemini response -> OpenAI format -> back to Gemini request
+// Simulates what a streaming client does: receives tool calls via streaming,
+// accumulates them, sends results back. thought_signature MUST survive the full roundtrip.
+// ============================================================
+
+#[test]
+fn full_roundtrip_thought_signature_preserved() {
+    let p = provider();
+
+    // Step 1: Gemini returns a functionCall with thoughtSignature (via streaming)
+    let stream_chunk = json!({
+        "candidates": [{
+            "content": {
+                "parts": [{
+                    "functionCall": {"name": "get_quote", "args": {"symbol": "AAPL"}},
+                    "thoughtSignature": "roundtrip-sig-abc"
+                }],
+                "role": "model"
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}
+    });
+    let chunk_result = p
+        .stream_normalizer("gemini-3-flash-preview")
+        .push(&serde_json::to_string(&stream_chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let chunk_parsed: Value = serde_json::from_str(&chunk_result).unwrap();
+
+    // Extract tool call from the transformed chunk (what a streaming client would accumulate)
+    let tc = &chunk_parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tc["thought_signature"]["data"], "roundtrip-sig-abc");
+
+    // Step 2: Simulate a client building the assistant message with accumulated tool calls
+    // This is what a client's streaming runner does after accumulation
+    let assistant_message = json!({
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": tc["id"].as_str().unwrap(),
+            "type": "function",
+            "function": {
+                "name": tc["function"]["name"].as_str().unwrap(),
+                "arguments": tc["function"]["arguments"].as_str().unwrap(),
+            },
+            "thought_signature": tc["thought_signature"].clone(),
+            "wire_ids": tc["wire_ids"].clone()
+        }]
+    });
+
+    // Step 3: Simulate the client adding the tool result
+    let tool_result = json!({
+        "role": "tool",
+        "tool_call_id": tc["id"].as_str().unwrap(),
+        "name": "get_quote",
+        "content": "{\"price\": 150.0}"
+    });
+
+    // Step 4: Send the full conversation back to Gemini
+    let follow_up_request = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Get me an AAPL quote"},
+            assistant_message,
+            tool_result,
+            {"role": "user", "content": "Now what about TSLA?"},
+        ]
+    });
+    let result = p
+        .transform_request("gemini-3-flash-preview", &follow_up_request)
+        .unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    // The model turn with functionCall should be preserved (has thought_signature)
+    let model_fc_turn = contents.iter().find(|t| {
+        t["role"] == "model"
+            && t["parts"]
+                .as_array()
+                .map(|p| p.iter().any(|part| part.get("functionCall").is_some()))
+                .unwrap_or(false)
+    });
+    assert!(
+        model_fc_turn.is_some(),
+        "Model turn with functionCall should be preserved when thought_signature is present"
+    );
+
+    // Verify thoughtSignature is echoed back
+    let fc_part = model_fc_turn.unwrap()["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p.get("functionCall").is_some())
+        .unwrap();
+    assert_eq!(
+        fc_part["thoughtSignature"], "roundtrip-sig-abc",
+        "thoughtSignature must be echoed back in the Gemini request"
+    );
+
+    // And there should be a functionResponse following it
+    let fr_turn = contents.iter().find(|t| {
+        t["parts"]
+            .as_array()
+            .map(|p| p.iter().any(|part| part.get("functionResponse").is_some()))
+            .unwrap_or(false)
+    });
+    assert!(
+        fr_turn.is_some(),
+        "functionResponse should be present after the functionCall"
+    );
+}
+
+#[test]
+fn past_completed_tool_turn_survives_without_signature() {
+    // When a client does NOT preserve thought_signature (the bug scenario),
+    // enforce_gemini_turn_order strips the functionCall pair, breaking Gemini
+    let p = provider();
+
+    let request = json!({
+        "model": "gemini-3-flash-preview",
+        "messages": [
+            {"role": "user", "content": "Get me a quote"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "get_quote", "arguments": "{\"symbol\":\"AAPL\"}"}
+                    // NOTE: no thought_signature — this is the bug case
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "get_quote", "content": "{\"price\":150}"},
+            {"role": "user", "content": "Now TSLA?"},
+        ]
+    });
+    let result = p
+        .transform_request("gemini-3-flash-preview", &request)
+        .unwrap();
+    let contents = result.body["contents"].as_array().unwrap();
+
+    assert!(contents.iter().any(|t| t["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p.get("functionCall").is_some())));
+    assert!(contents.iter().any(|t| t["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p.get("functionResponse").is_some())));
+}
+
+#[test]
+fn effort_none_disables_thinking_via_minimal() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let r = p.transform_request("gemini-3.5-flash", &req).unwrap();
+    assert_eq!(
+        r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "minimal"
+    );
+    // gemini-3.1-pro / 3.7-flash / 3.8-flash / 4-argon / 4-carbon cannot disable thinking
+    // (verified live) — "none" clamps to the floor ("low") instead of "minimal".
+    for model in [
+        "gemini-3.1-pro-preview",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        "gemini-4-argon",
+        "gemini-4-carbon",
+    ] {
+        let r = p.transform_request(model, &req).unwrap();
+        assert_eq!(
+            r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low",
+            "{model} must clamp none→low"
+        );
+    }
+}
+
+#[test]
+fn effort_xhigh_and_max_clamp_to_high() {
+    let p = provider();
+    for effort in ["xhigh", "max"] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let r = p.transform_request("gemini-3.5-flash", &req).unwrap();
+        assert_eq!(
+            r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high",
+            "{effort}"
+        );
+    }
+}
+
+#[test]
+fn mode_pro_bumps_thinking_level_and_none_wins() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "low",
+        "reasoning_mode": "pro",
+    });
+    let r = p.transform_request("gemini-3.5-flash", &req).unwrap();
+    assert_eq!(
+        r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "medium"
+    );
+    // explicit "none" wins over pro
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+        "reasoning_mode": "pro",
+    });
+    let r = p.transform_request("gemini-3.5-flash", &req).unwrap();
+    assert_eq!(
+        r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "minimal"
+    );
+}
+
+#[test]
+fn request_strips_foreign_reasoning_signature() {
+    // Issue #34: Gemini rebuilds messages into contents/parts, so an opaque
+    // Anthropic reasoning signature is naturally dropped — verify it never leaks.
+    let p = provider();
+    let req = json!({
+        "model": "gemini-3.5-flash",
+        "messages": [{
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": "x",
+            "reasoning_signature": "anthropic-sig-should-not-leak",
+            "redacted_reasoning_content": "redacted-should-not-leak"
+        }]
+    });
+    let result = p.transform_request("gemini-3.5-flash", &req).unwrap();
+    let body = serde_json::to_string(&result.body).unwrap();
+    assert!(!body.contains("anthropic-sig-should-not-leak"));
+    assert!(!body.contains("redacted-should-not-leak"));
+    assert!(!body.contains("reasoning_signature"));
+}
+
+#[test]
+fn reasoning_none_clamps_per_model_disable_capability() {
+    // gemini-3.7-flash rejects thinkingLevel "minimal" (verified live) -> "none"
+    // clamps to "low". Other flash models accept "minimal" -> "none" stays "minimal".
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let r = p.transform_request("gemini-3.7-flash", &req).unwrap();
+    assert_eq!(
+        r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low",
+        "gemini-3.7-flash cannot disable thinking -> none clamps to low"
+    );
+    for m in [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+    ] {
+        let r = p.transform_request(m, &req).unwrap();
+        assert_eq!(
+            r.body["generationConfig"]["thinkingConfig"]["thinkingLevel"], "minimal",
+            "{m} can disable thinking -> none maps to minimal"
+        );
+    }
+}
+
+// ============================================================
+// usage: thinking tokens (thoughtsTokenCount) are reasoning tokens
+// ============================================================
+
+/// The convention: reasoning is a subset of `completion_tokens`, matching the
+/// OpenAI Responses wire (`output_tokens` already includes
+/// `output_tokens_details.reasoning_tokens`) and Anthropic (`output_tokens`
+/// includes thinking). Gemini reports `candidatesTokenCount` *without*
+/// `thoughtsTokenCount`, so completion must fold it in to follow the same rule.
+#[test]
+fn response_thoughts_are_reported_as_reasoning_tokens() {
+    let p = provider();
+    let resp = json!({
+        "candidates": [{"content": {"parts": [{"text": "42"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {
+            "promptTokenCount": 33,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 72,
+            "totalTokenCount": 110,
+        },
+        "responseId": "resp_1",
+    });
+    let result = p.transform_response("gemini-3.8-flash", resp).unwrap();
+    assert_eq!(result["usage"]["prompt_tokens"], 33);
+    // 5 candidates + 72 thoughts: reasoning lives inside completion_tokens.
+    assert_eq!(result["usage"]["completion_tokens"], 77);
+    assert_eq!(result["usage"]["reasoning_tokens"], 72);
+    assert_eq!(
+        result["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        72
+    );
+    assert_eq!(result["usage"]["total_tokens"], 110);
+}
+
+#[test]
+fn stream_thoughts_are_reported_as_reasoning_tokens() {
+    let p = provider();
+    let chunk = json!({
+        "candidates": [{"content": {"parts": [{"text": "42"}]}, "finishReason": "STOP", "index": 0}],
+        "usageMetadata": {
+            "promptTokenCount": 33,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 72,
+            "totalTokenCount": 110,
+        },
+    });
+    let result = p
+        .transform_stream_chunk("gemini-3.8-flash", &chunk.to_string())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["usage"]["completion_tokens"], 77);
+    assert_eq!(parsed["usage"]["reasoning_tokens"], 72);
+    assert_eq!(
+        parsed["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        72
+    );
+}
+
+#[test]
+fn gemini_thoughts_are_billed_at_the_output_rate() {
+    let p = provider();
+    let value = json!({
+        "candidates": [{"content": {"parts": [{"text": "42"}]}, "finishReason": "STOP"}],
+        "usageMetadata": {
+            "promptTokenCount": 33,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 72,
+            "totalTokenCount": 110,
+        },
+    });
+    let result = p.transform_response("gemini-3.8-flash", value).unwrap();
+    let output_rate = llmshim::cost::for_target("gemini", "gemini-3.8-flash")
+        .and_then(|cost| cost.output)
+        .expect("gemini-3.8-flash is priced");
+    let billed = llmshim::cost::cost_usd("gemini", "gemini-3.8-flash", &result["usage"]).unwrap();
+    let without_thinking = llmshim::cost::cost_usd(
+        "gemini",
+        "gemini-3.8-flash",
+        &json!({"prompt_tokens": 33, "completion_tokens": 5, "total_tokens": 38}),
+    )
+    .unwrap();
+    let expected_delta = 72.0 * output_rate / 1_000_000.0;
+    assert!(
+        (billed - without_thinking - expected_delta).abs() < 1e-12,
+        "thinking must be billed at the output rate: billed {billed}, \
+         without thinking {without_thinking}, delta {}",
+        billed - without_thinking
+    );
+}

@@ -1,0 +1,83 @@
+---
+name: add-model
+description: Add a new model to llmshim's supported model list. Use when adding, registering, or exposing a new model ID (OpenAI, Anthropic, Gemini, or xAI) so it shows up in the CLI, proxy, and docs. This covers models on an already-supported provider — for a brand-new provider, use /add-provider first.
+disable-model-invocation: true
+argument-hint: [provider/model-id] [Display Label]
+allowed-tools: Bash(cargo fmt*), Bash(cargo test*), Bash(cargo clippy*)
+---
+
+# Add a model to llmshim
+
+Adding a model that runs on an **already-supported provider** (openai, anthropic, gemini, xai) is a data change: the transform code already knows how to talk to the provider, so you only edit registries, tests, and docs. No new provider logic is needed.
+
+If the model belongs to a provider llmshim does not support yet, stop and use `/add-provider` first.
+
+Model to add: **$ARGUMENTS**
+
+## One advertised catalog
+
+The curated list lives in `crates/llmshim-catalog/src/builtin.rs` (reexported by `src/models.rs`). The CLI
+imports it directly, and the proxy uses `available_models()`. Advertise only
+the current model in each retained tier; Google entries are stable only.
+Preserve displaced records in private `LEGACY_MODELS` so `spec()` still works
+for explicit historical IDs. Keep legacy transforms and regression tests.
+
+## Steps
+
+1. **`crates/llmshim-catalog/src/builtin.rs`** — add a `ModelInfo` entry in the provider's section:
+   ```rust
+   ModelInfo {
+       id: "<provider>/<model-name>",   // e.g. "openai/gpt-5.6"
+       provider: "<provider>",          // openai | anthropic | gemini | xai
+       name: "<model-name>",            // the id without the provider prefix
+       label: "<Display Label>",        // e.g. "GPT-5.6"
+       context_window_tokens: None,     // Some(n) ONLY if verified from provider docs
+       max_output_tokens: None,         // Some(n) ONLY if verified from provider docs
+       capabilities: CAPS_REASONING,    // see spec-metadata rules below
+   },
+   ```
+
+   **Spec metadata — the honesty rule (issue #31):** never guess a number or a
+   capability to fill a cell. Anything unverified stays `None` /
+   `Support::Unknown`. Concretely:
+   - `context_window_tokens` / `max_output_tokens`: `None` unless you have an
+     authoritative provider-doc number. A wrong number is worse than `None`.
+   - `capabilities.reasoning`: this one is **derivable, so populate it**. Use the
+     `CAPS_REASONING` baseline for a model that accepts a reasoning control, and
+     `CAPS_NO_REASONING` for one that rejects it (e.g. xAI's name-locked
+     `grok-4.20-*` — check the provider's clamp logic / name-lock predicate in
+     `src/providers/<provider>.rs`). The `reasoning_support_is_populated_for_every_model`
+     test fails if you leave it `Unknown`.
+   - Other capabilities (tools, streaming, images, prompt_cache,
+     structured_output, parallel_tool_calls): stay `Unknown` in the baselines
+     until verified. To set a verified one, chain the const builder, e.g.
+     `CAPS_REASONING.with_images(Support::Supported)`.
+
+2. **CLI** — no second model list to edit. Verify the new entry appears through
+   the shared catalog. When replacing a tier's model, move the superseded
+   record to `LEGACY_MODELS` instead of advertising both generations.
+
+3. **Tests** — update the advertised count in `tests/unit_models.rs` and the
+   exact CLI/proxy list in `tests/unit_advertised_models.rs`. Keep historical
+   `spec()` and provider behavior tests; pruning discovery does not remove
+   explicit-ID support.
+
+4. **Docs** — update the "Supported models" list in `CLAUDE.md` and the model list in `README.md`. If the id appears in `api/openapi.yaml` examples and is a good representative, you may add it there too (optional).
+
+5. **Provider-specific capability flags** (only if the model needs different handling). Model-family checks live in the provider file, e.g. `src/providers/anthropic.rs`: `is_claude_4_6`, `supports_1m_context`, `supports_thinking`. If the new model reasons, supports 1M context, thinking, or fast mode differently from the family default, update the relevant helper and its tests (`tests/unit_<provider>.rs`, `tests/unit_fast_mode.rs`).
+
+## Verify
+
+Run the preflight checks (same as CI) before finishing:
+
+```bash
+cargo fmt --check
+cargo clippy --features proxy -- -D warnings
+cargo test --features proxy --tests
+```
+
+Then confirm the model appears: `cargo run -- models` should list it, and `cargo run --features proxy -- proxy` then `GET /v1/models` should include it when the provider's API key is set.
+
+## Public-API note
+
+`MODELS` and `ModelInfo` in `src/models.rs` are `pub` (this is a public crate on crates.io). Adding entries is additive and safe. `ModelInfo` is `#[non_exhaustive]`, so **adding a new spec field is non-breaking** — do that freely. Renaming/removing fields, or changing `Support`/`ModelCapabilities`, still needs a semver bump — see `/release`.

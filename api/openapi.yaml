@@ -1,0 +1,1380 @@
+openapi: 3.1.0
+info:
+  title: llmshim API
+  version: 0.31.0
+  description: |
+    Multi-provider LLM API proxy. Send requests in a single format,
+    llmshim translates to the native API of whichever provider you choose.
+
+    Supports OpenAI, ChatGPT subscriptions, Anthropic, Google Gemini, xAI, OpenRouter (an
+    OpenAI-compatible aggregator), and self-hosted vLLM / SGLang servers.
+    Provider is detected from the model prefix; ChatGPT/OpenRouter/vLLM/SGLang are
+    addressed explicitly (e.g. `chatgpt/gpt-6-astra`, `openrouter/anthropic/claude-sonnet-5`,
+    `vllm/<served-model>`, `sglang/<served-model>`).
+
+    ## Gateway (experimental)
+
+    `llmshim gateway` serves this same contract (`/v1/chat`, `/v1/chat/stream`,
+    `/v1/models`, `/health`) but routes every request through a priority queue
+    (in-memory or Redis-distributed). It adds request headers and operational
+    endpoints:
+
+    - `Authorization: Bearer <key>` — required when a key file is configured;
+      the caller's tier/tenant come from the key (401 on missing/invalid).
+    - `x-llmshim-priority: <uint>` — priority tier (honored only in open/dev
+      mode; ignored when auth is enforced).
+    - `Idempotency-Key: <string>` — a repeat returns the first response
+      (`idempotency-replayed: true`) instead of making a second call.
+    - `x-request-id` — echoed on every response for correlation.
+    - `GET /metrics` (Prometheus), `GET /ready` (readiness), and
+      `GET /v1/gateway/stats` (queue depths, dead-letter counts).
+  license:
+    name: MIT OR Apache-2.0
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+paths:
+  /v1/responses:
+    post:
+      operationId: nativeResponses
+      summary: Stateless OpenAI Responses JSON and SSE
+      description: >-
+        Accepts text/image messages and function/custom call/output items through the shared
+        engine. Reasoning items restore credential-scoped replay receipts; dropped items
+        are noted in metadata.reasoning_dropped. Unsupported verbosity is named in
+        metadata.controls_dropped. Stream true emits numbered Responses
+        SSE events, ending with completed, incomplete or failed. Namespaced and custom tools
+        pass natively to Responses providers or use reversible function transport. Hosted search
+        requires a native Responses provider. Previous_response_id, conversation and store true
+        are refused by name. Send full history.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [model, input]
+              properties:
+                model: {type: string, minLength: 1}
+                input:
+                  oneOf:
+                    - {type: string}
+                    - type: array
+                      items: {type: object}
+                instructions: {type: string}
+                tools:
+                  type: array
+                  items:
+                    type: object
+                    required: [type]
+                    properties:
+                      type:
+                        type: string
+                        enum: [function, custom, namespace, web_search, tool_search]
+                      name: {type: string, minLength: 1}
+                      parameters: {type: object}
+                      description: {type: string}
+                      strict: {type: boolean}
+                      defer_loading: {type: boolean}
+                      format: {type: object}
+                      tools: {type: array, items: {type: object}}
+                      execution: {type: string, enum: [client, server]}
+                tool_choice:
+                  oneOf:
+                    - {type: string, enum: [auto, none, required]}
+                    - type: object
+                      required: [type, name]
+                      properties:
+                        type: {type: string, enum: [function, custom]}
+                        name: {type: string, minLength: 1}
+                        namespace: {type: string, minLength: 1}
+                max_output_tokens: {type: integer, minimum: 1}
+                temperature: {type: number, minimum: 0, maximum: 2}
+                top_p: {type: number, minimum: 0, maximum: 1}
+                reasoning:
+                  type: [object, 'null']
+                  additionalProperties: false
+                  properties:
+                    effort:
+                      oneOf:
+                        - {type: string, enum: [none, minimal, low, medium, high, xhigh, max]}
+                        - {type: integer, minimum: 0}
+                    summary: {type: string, enum: [auto, concise, detailed, none]}
+                    context: {type: string, enum: [auto, current_turn, all_turns]}
+                text:
+                  type: [object, 'null']
+                  additionalProperties: false
+                  properties:
+                    format: {type: object}
+                    verbosity: {type: string, enum: [low, medium, high]}
+                client_metadata: {type: object, additionalProperties: {type: string}}
+                prompt_cache_key: {type: string}
+                parallel_tool_calls: {type: boolean}
+                service_tier: {type: string, enum: [auto, default, flex, priority]}
+                stream_options:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    reasoning_summary_delivery: {type: string, enum: [sequential_cutoff]}
+                access_programs:
+                  type: [object, 'null']
+                  additionalProperties: false
+                  required: [cyber]
+                  properties:
+                    cyber: {type: string, enum: [standard, daybreak_blue, daybreak_red]}
+                include:
+                  type: array
+                  items: {type: string, enum: [reasoning.encrypted_content]}
+                stream: {type: boolean}
+                store: {type: boolean, enum: [false]}
+      responses:
+        '200':
+          description: Responses object or numbered SSE sequence with terminal output and usage
+          content:
+            application/json:
+              schema: {type: object}
+            text/event-stream:
+              schema: {type: string}
+        default:
+          description: Responses error object with preserved status and Retry-After
+  /v1/chat/completions:
+    post:
+      operationId: nativeChatCompletions
+      summary: OpenAI Chat Completions compatibility endpoint
+      description: >-
+        Uses the shared engine and admission path; n must be 1. Stream responses use OpenAI chunks
+        and DONE.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NativeChatRequest'
+      responses:
+        '200':
+          description: Native Chat Completions JSON or SSE
+          content:
+            application/json:
+              schema: {type: object}
+            text/event-stream:
+              schema: {type: string}
+        default:
+          description: Native error with preserved HTTP status and Retry-After when applicable
+  /v1/embeddings:
+    post:
+      operationId: embeddings
+      summary: OpenAI-shaped embeddings (gateway only)
+      description: >-
+        Served by the gateway (`llmshim gateway`), not by `llmshim proxy`. `input` is a string or an
+        array of strings (token arrays are refused); `encoding_format` is `float` (default) or
+        `base64` (little-endian f32). Admitted by the same key, allowlist, rate and usage rules as
+        a completion. A key with a spend cap (its own or its tenant's) reserves the request's size in bytes
+        at the model's trusted input price; with no trusted price it is refused with
+        `unpriceable_under_budget`, and `budget_allow_unpriced` does not change that. Runs on a fleet gateway too. `usage.cost_usd` is `null` when
+        the price is unknown.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input]
+              properties:
+                model: {type: string, description: Routing id, e.g. openai/text-embedding-3-small}
+                input:
+                  oneOf:
+                    - {type: string}
+                    - {type: array, items: {type: string}}
+                dimensions: {type: integer, minimum: 1}
+                encoding_format: {type: string, enum: [float, base64]}
+      responses:
+        '200':
+          description: One embedding per input, in input order
+          content:
+            application/json:
+              schema: {type: object}
+        default:
+          description: Error object with preserved HTTP status
+  /v1/images/generations:
+    post:
+      operationId: imageGenerations
+      summary: OpenAI-shaped image generation (gateway only)
+      description: >-
+        Served by the gateway (`llmshim gateway`), not by `llmshim proxy`. `b64_json` only
+        (`response_format: url` is refused). Provider fields (`n`, `size`, `quality`,
+        `output_format`, ...) pass through to the adapter. Admitted by the same key, allowlist and
+        rate rules as a completion. A key with a spend cap is refused with
+        `unpriceable_under_budget` (there is no bound on an image's size), with or without
+        `budget_allow_unpriced`. A fleet gateway answers 501. `usage.cost_usd` is `null` when the
+        usage does not split text and image tokens.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, prompt]
+              properties:
+                model: {type: string, description: Routing id, e.g. openai/gpt-image-1}
+                prompt: {type: string}
+                n: {type: integer, minimum: 1, maximum: 10}
+                response_format: {type: string, enum: [b64_json]}
+      responses:
+        '200':
+          description: Generated images as base64
+          content:
+            application/json:
+              schema: {type: object}
+        default:
+          description: Error object with preserved HTTP status
+  /v1/audio/speech:
+    post:
+      operationId: audioSpeech
+      summary: OpenAI-shaped speech synthesis (gateway only)
+      description: >-
+        Served by the gateway (`llmshim gateway`), not by `llmshim proxy`. The audio bytes are the
+        response body, with the format's media type. `input` is 1 to 4096 characters. Admitted by the
+        same key, allowlist and rate rules as a completion. The price is fixed by the request
+        (characters at the catalog's per-character rate), so a key with a spend cap reserves it
+        exactly; a model with no rate is refused with `unpriceable_under_budget`. A fleet gateway
+        answers 501.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input, voice]
+              properties:
+                model: {type: string, description: Routing id, e.g. openai/tts-1}
+                input: {type: string, minLength: 1, maxLength: 4096}
+                voice: {type: string}
+                response_format: {type: string, enum: [mp3, wav, flac, opus, aac, pcm]}
+                speed: {type: number, minimum: 0.25, maximum: 4}
+      responses:
+        '200':
+          description: Audio bytes
+          content:
+            audio/mpeg:
+              schema: {type: string, format: binary}
+        default:
+          description: Error object with preserved HTTP status
+  /v1/messages:
+    post:
+      operationId: nativeMessages
+      summary: Anthropic Messages compatibility endpoint
+      description: >-
+        Accepts custom function tools. Uses the shared engine and admission path. The gateway
+        accepts x-api-key authentication.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NativeMessagesRequest'
+      responses:
+        '200':
+          description: Native Messages JSON or SSE
+          content:
+            application/json:
+              schema: {type: object}
+            text/event-stream:
+              schema: {type: string}
+        default:
+          description: Native error with preserved HTTP status and Retry-After when applicable
+  /v1beta/models/{model}:generateContent:
+    post:
+      operationId: nativeGeminiGenerateContent
+      summary: Google Gemini generateContent compatibility endpoint
+      description: >-
+        Accepts custom function tools; candidateCount must be 1. Served by the gateway too, where
+        x-goog-api-key authentication is accepted. The routing id lives in the path, so it may
+        contain a slash (`gemini/gemini-3.8-flash`). `?key=` and `?alt=` are not read. Any other
+        action under this prefix answers Google's 404 error object.
+      parameters:
+        - name: model
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NativeGeminiRequest'
+      responses:
+        '200':
+          description: Gemini GenerateContentResponse JSON
+          content:
+            application/json:
+              schema: {type: object}
+        default:
+          description: >-
+            Gemini error object with preserved HTTP status and Retry-After when applicable
+  /v1beta/models/{model}:streamGenerateContent:
+    post:
+      operationId: nativeGeminiStreamGenerateContent
+      summary: Google Gemini streaming compatibility endpoint
+      description: >-
+        The same request and error contract as generateContent; the response is Gemini SSE, which
+        ends with a finish reason rather than a terminator.
+      parameters:
+        - name: model
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NativeGeminiRequest'
+      responses:
+        '200':
+          description: Gemini GenerateContentResponse chunks over SSE
+          content:
+            text/event-stream:
+              schema: {type: string}
+        default:
+          description: >-
+            Gemini error object with preserved HTTP status and Retry-After when applicable
+  /v1/chat:
+    post:
+      operationId: chat
+      summary: Send a chat completion request
+      description: |
+        Non-streaming by default. Set `stream: true` to receive SSE events
+        (same format as POST /v1/chat/stream).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      responses:
+        '200':
+          description: Chat completion response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+        '400':
+          description: Bad request (missing model, unknown provider)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: |
+            Rate limited by the proxy or upstream provider. Proactive proxy
+            rejections include Retry-After.
+          headers:
+            Retry-After:
+              description: Suggested delay in whole seconds when supplied by the proxy.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: |
+            Proxy capacity is exhausted or the upstream provider is unavailable.
+            Proxy overload rejections include Retry-After.
+          headers:
+            Retry-After:
+              description: Suggested delay in whole seconds when supplied by the proxy.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: Provider error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/chat/stream:
+    post:
+      operationId: chatStream
+      summary: Send a streaming chat completion request
+      description: |
+        Always returns SSE events. Each event has a typed `event:` field
+        (content, reasoning, tool_call, usage, done, error).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/StreamEvent'
+        '429':
+          description: |
+            Request rate limited before the SSE response begins. Proactive
+            proxy rejections include Retry-After.
+          headers:
+            Retry-After:
+              description: Suggested delay in whole seconds.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: |
+            Proxy capacity is exhausted or the upstream provider is unavailable
+            before the SSE response begins. Proxy overload rejections include
+            Retry-After.
+          headers:
+            Retry-After:
+              description: Suggested delay in whole seconds.
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/models:
+    get:
+      operationId: listModels
+      summary: List available models
+      description: Returns models filtered to providers with configured API keys.
+      responses:
+        '200':
+          description: List of available models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelsResponse'
+
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Health check
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  # --- Operational endpoints (gateway; experimental/unstable) ---
+  # Each carries `x-llmshim-operational: true`.
+  /ready:
+    get:
+      operationId: readiness
+      summary: Readiness probe
+      description: |
+        200 when the replica can do work, 503 when a dependency it needs (Redis,
+        in fleet mode) is unreachable. Never needs a token, even on the admin
+        listener, so an orchestrator can probe it. Unlike `/health` it reports
+        the dependency, not just that the process is up.
+      x-llmshim-operational: true
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            text/plain:
+              schema: {type: string, const: "ready\n"}
+        '503':
+          description: Not ready
+          content:
+            text/plain:
+              schema: {type: string, const: "not ready\n"}
+
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Prometheus text exposition: request, dispatch and rejection counters,
+        in-flight and queue-depth gauges, queue-wait and upstream-latency
+        histograms.
+      x-llmshim-operational: true
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Metrics in the Prometheus text format
+          content:
+            text/plain:
+              schema: {type: string}
+        '401':
+          $ref: '#/components/responses/AdminUnauthorized'
+
+  /v1/gateway/stats:
+    get:
+      operationId: gatewayStats
+      summary: Queue depths and mode
+      x-llmshim-operational: true
+      security:
+        - adminToken: []
+      responses:
+        '200':
+          description: Current queue state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GatewayStats'
+        '401':
+          $ref: '#/components/responses/AdminUnauthorized'
+
+components:
+  securitySchemes:
+    adminToken:
+      type: http
+      scheme: bearer
+      description: |
+        The `[admin] token` of `llmshim serve`. Required only when the admin
+        listener is configured with one; with `allow_unauthenticated` (or no
+        `[admin]` table, where these paths share the main listener) they are open.
+        `llmshim gateway` and the proxy have no admin token at all: there they
+        are open on the main listener.
+  responses:
+    AdminUnauthorized:
+      description: Missing or wrong admin token
+      headers:
+        WWW-Authenticate:
+          schema: {type: string, const: Bearer}
+  schemas:
+    GatewayStats:
+      type: object
+      required: [mode, auth_enforced, providers, lanes]
+      additionalProperties: false
+      properties:
+        mode: {type: string, enum: [in-memory, distributed]}
+        auth_enforced: {type: boolean}
+        providers:
+          type: array
+          items: {type: string}
+        lanes:
+          type: array
+          items:
+            type: object
+            required: [provider, queue_depth]
+            additionalProperties: false
+            properties:
+              provider: {type: string}
+              queue_depth: {type: integer, minimum: 0}
+              dead_letter: {type: integer, minimum: 0, description: Distributed mode only}
+        provider_circuits:
+          type: array
+          description: Each provider's circuit (`closed`, `open`, `half_open`) as this process sees it (0051)
+          items:
+            type: object
+            required: [provider, circuit]
+            additionalProperties: false
+            properties:
+              provider: {type: string}
+              circuit: {type: string, enum: [closed, open, half_open]}
+        routes:
+          type: array
+          description: |
+            Present only with named routes (0051). Only a well-known generation control (`reasoning_effort`,
+            `max_tokens`, `temperature`, ...) with a boolean, number or short string value is shown; every other
+            request default is named and its value is `<hidden>`, because these stats are served by listeners
+            that may be open.
+          items:
+            type: object
+            required: [name, model, settings]
+            additionalProperties: false
+            properties:
+              name: {type: string}
+              model: {type: string}
+              settings: {type: object}
+        deployments:
+          type: array
+          description: Present only with deployments (0031).
+          items:
+            type: object
+            required: [name, strategy, targets]
+            additionalProperties: false
+            properties:
+              name: {type: string}
+              strategy: {type: string}
+              targets:
+                type: array
+                items:
+                  type: object
+                  required: [model, weight, circuit]
+                  additionalProperties: false
+                  properties:
+                    model: {type: string}
+                    weight: {type: integer, minimum: 0}
+                    circuit: {type: string, enum: [closed, open, half_open, unknown]}
+        outage_admission:
+          type: object
+          description: Present only with `[fleet.outage_admission]` (0027).
+          required: [active, lease_nanos]
+          additionalProperties: false
+          properties:
+            active: {type: boolean}
+            lease_nanos: {type: integer, minimum: 0}
+    ServeConfigStatus:
+      type: object
+      required: [generation, config_sha256, credentials, loaded_at_epoch_secs, last_check_epoch_secs, in_sync, last_reload, router_generation, limits_generation, env_secret_providers, snapshot]
+      additionalProperties: false
+      properties:
+        generation: {type: integer, minimum: 0, description: 0 for the configuration the process started with}
+        config_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        credentials: {type: integer, minimum: 0}
+        loaded_at_epoch_secs: {type: integer, minimum: 0}
+        last_check_epoch_secs: {type: [integer, 'null']}
+        in_sync: {type: boolean}
+        router_generation:
+          type: integer
+          minimum: 0
+          description: 0 until a reload replaces the providers or routes (0022)
+        snapshot:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/PolicySnapshotStatus'
+          description: |
+            A policy snapshot is not used by this build: always `null`.
+        limits_generation:
+          type: integer
+          minimum: 0
+          description: 0 until a reload changes the rate limits (0022); separate from `router_generation`
+        env_secret_providers:
+          type: array
+          items: {type: string}
+          description: |
+            Providers whose `api_key` is an `{ env = ... }` reference, which a reload
+            cannot rotate (a process's environment is fixed). Names only.
+        last_reload:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ReloadAttempt'
+        jwks:
+          type: object
+          description: |
+            Present only when `[[auth.jwt]]` issuers are configured: each issuer's
+            key state by table name (0017).
+          additionalProperties:
+            type: object
+            required: [loaded, keys, age_secs, last_error]
+            additionalProperties: false
+            properties:
+              loaded: {type: boolean}
+              keys: {type: integer, minimum: 0}
+              age_secs: {type: [integer, 'null']}
+              last_error:
+                type: [string, 'null']
+                description: The class of the last failed refresh (`network`, `status`, `too_large`, `malformed`, `no_usable_keys`).
+    PolicySnapshotStatus:
+      type: object
+      required: [org, generation, signer, applied_at_epoch_secs, max_age_secs, stale, signer_untrusted, last_pull_ok_at_epoch_secs, last_pull_error]
+      additionalProperties: false
+      properties:
+        org: {type: string}
+        generation: {type: integer, minimum: 0}
+        signer: {type: string, description: The signing key's id (a public key)}
+        applied_at_epoch_secs: {type: integer, minimum: 0, description: When this generation was applied (or the start)}
+        max_age_secs: {type: [integer, 'null']}
+        stale:
+          type: boolean
+          description: Older than `max_age_secs`; an alert, and a refusal of new inference requests only with `refuse_when_stale`
+        signer_untrusted:
+          type: boolean
+          description: The signer of the snapshot in force is no longer in `verify_keys`; it keeps serving until a trusted signer's snapshot replaces it
+        last_pull_ok_at_epoch_secs: {type: [integer, 'null'], description: With `source`, when the control plane last answered usefully (a snapshot or not modified)}
+        last_pull_error: {type: [string, 'null'], description: With `source`, why the last poll did not (fixed text, never a token or a body)}
+    ReloadAttempt:
+      type: object
+      required: [at_epoch_secs, outcome, issues, changes]
+      additionalProperties: false
+      properties:
+        at_epoch_secs: {type: integer, minimum: 0}
+        outcome: {type: string, enum: [applied, rejected]}
+        changes:
+          type: array
+          items: {type: string}
+          description: |
+            What an applied reload replaced in the providers and routes, by name
+            (`providers.added: x`, `providers.removed: x`, `providers.changed: x`,
+            `routes`) and the rate limits (`limits`); empty for a keys-only reload or a rejection. Never a value.
+        issues:
+          type: array
+          items:
+            type: object
+            required: [path, message]
+            additionalProperties: false
+            properties:
+              path: {type: string}
+              message: {type: string}
+    NativeChatRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: true
+      properties:
+        model: {type: string}
+        messages:
+          type: array
+          items: {type: object}
+        stream: {type: boolean, default: false}
+        n: {type: integer, enum: [1]}
+    NativeGeminiRequest:
+      type: object
+      required: [contents]
+      additionalProperties: false
+      description: |
+        Gemini's own GenerateContentRequest. The model is the path, not a body
+        field. safetySettings and cachedContent pass through to Google
+        verbatim; every other field this server cannot express is refused by
+        name rather than forwarded.
+      properties:
+        contents:
+          type: array
+          items: {type: object}
+        systemInstruction: {type: object}
+        tools:
+          type: array
+          items: {type: object}
+        toolConfig: {type: object}
+        generationConfig: {type: object}
+        safetySettings: {type: array, items: {type: object}}
+        cachedContent: {type: string}
+        fallback:
+          type: array
+          items: {type: string}
+          description: >-
+            Ordered routing ids tried when the primary model fails, exactly as on the other native
+            facades.
+    NativeMessagesRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: true
+      properties:
+        model: {type: string}
+        max_tokens: {type: integer, minimum: 1}
+        system:
+          oneOf:
+            - {type: string}
+            - {type: array, items: {type: object}}
+        messages:
+          type: array
+          items: {type: object}
+        stream: {type: boolean, default: false}
+    ChatRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: |
+            Model identifier. Use "provider/model" format (e.g., "anthropic/claude-sonnet-5-5")
+            or just the model name for auto-detection (e.g., "claude-sonnet-5-5").
+          examples:
+            - anthropic/claude-sonnet-5-5
+            - gpt-6-sol
+            - gemini-3.8-flash
+        messages:
+          type: array
+          description: Conversation messages
+          items:
+            $ref: '#/components/schemas/Message'
+        stream:
+          type: boolean
+          default: false
+          description: If true on /v1/chat, returns SSE stream instead of JSON.
+        config:
+          $ref: '#/components/schemas/Config'
+        provider_config:
+          type: object
+          additionalProperties: true
+          description: |
+            Raw provider-specific JSON merged into the underlying request at the
+            top level. Native/provider-only controls must be namespaced under
+            `x-openai` / `x-chatgpt` / `x-anthropic` / `x-gemini` (native controls) or
+            `x-openrouter` / `x-vllm` / `x-sglang` (aggregator / self-hosted
+            controls). Also carries `tools`, `response_format`, and
+            `reasoning_summary`. Root `model` and `messages` are reserved.
+            After named-route and alias resolution, the selected provider's
+            active namespace may not replace its native model or main
+            messages/input/contents container. Every resolvable explicit
+            fallback is checked before the primary request runs. Native system
+            and instruction controls remain supported and are estimated when
+            active; another provider namespace is inert only if no primary,
+            fallback, or route can select it.
+          examples:
+            - x-anthropic:
+                thinking:
+                  type: adaptive
+                output_config:
+                  effort: high
+            - x-openrouter:
+                provider:
+                  sort: throughput
+            - tools:
+                - type: function
+                  function:
+                    name: get_weather
+                    parameters:
+                      type: object
+        fallback:
+          type: array
+          items:
+            type: string
+          description: |
+            Ordered list of fallback model IDs. If the primary model fails with a
+            retryable error (429, 500, 502, 503, 529), tries the next model in the list.
+            The fallback layer retries eligible failures with exponential
+            backoff before moving to the next model. Fallback applies only to
+            non-streaming requests; streaming endpoints ignore this field.
+          examples:
+            - ["openai/gpt-6-sol", "gemini/gemini-3.8-flash"]
+        x-cache:
+          $ref: '#/components/schemas/CachePolicy'
+        x-shim:
+          $ref: '#/components/schemas/ShimConfig'
+        response_format:
+          type: object
+          required: [type]
+          allOf:
+            - if:
+                properties:
+                  type: {const: json_schema}
+              then:
+                required: [json_schema]
+          properties:
+            type:
+              type: string
+              enum: [json_schema, json_object]
+            json_schema:
+              type: object
+              required: [schema]
+              properties:
+                name:
+                  type: string
+                schema: {}
+                strict:
+                  type: boolean
+                  default: true
+
+    ShimConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        structured_output:
+          type: string
+          enum: [auto, native, forced_tool, prompt]
+          default: auto
+        tool_calling:
+          type: string
+          enum: [auto, native, prompt]
+          default: auto
+        reasoning_capture:
+          type: string
+          enum: [off, forced_tool]
+          default: off
+
+    CachePolicy:
+      type: object
+      properties:
+        key:
+          type: string
+          description: Explicit Responses prompt-cache affinity key
+        segments:
+          type: array
+          items:
+            type: object
+            required: [upto_message, stability]
+            properties:
+              upto_message:
+                type: integer
+                minimum: 0
+              label:
+                type: string
+              stability:
+                type: string
+                enum: [static, session, turn]
+
+    Message:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool, developer]
+        content:
+          description: Text content or array of content blocks
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: object
+            - type: 'null'
+        tool_call_id:
+          type: string
+          description: For tool role messages, the ID of the tool call being responded to
+        tool_calls:
+          type: array
+          description: Tool calls made by the assistant
+          items:
+            $ref: '#/components/schemas/ToolCall'
+        reasoning_content:
+          type: string
+          deprecated: true
+          description: Legacy input. Reasoning without provenance is dropped.
+        reasoning:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReasoningBlock'
+
+    Config:
+      type: object
+      description: Provider-agnostic configuration
+      properties:
+        max_tokens:
+          type: integer
+          description: Maximum output tokens
+        temperature:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          format: double
+        top_k:
+          type: integer
+        stop:
+          type: array
+          items:
+            type: string
+        reasoning_effort:
+          type: string
+          enum: [none, low, medium, high, xhigh, max]
+          description: |
+            Unified reasoning/thinking depth across all providers. llmshim maps
+            each value to the target provider/model's native control, clamping
+            to the nearest supported tier where a model lacks one (e.g. "max"
+            is native only on OpenAI gpt-5.6; Gemini tops out at its "high"
+            thinking level). "none" disables thinking where the model allows it.
+            Full per-provider mapping tables: docs/src/guides/reasoning.md. To bypass the
+            mapping and speak a provider's native dialect verbatim, use
+            provider_config (x-openai.reasoning, x-anthropic.thinking,
+            x-gemini.thinkingConfig) instead.
+        reasoning_mode:
+          type: string
+          enum: [standard, pro]
+          description: |
+            Unified reasoning mode. "pro" requests substantially more model
+            work: native reasoning.mode on OpenAI gpt-5.6 and -pro models,
+            emulated as a one-tier effort bump on all other models/providers.
+            Default standard.
+
+    ChatResponse:
+      type: object
+      required: [id, model, provider, message, usage, latency_ms]
+      properties:
+        created_at: {type: integer, description: Unix timestamp of the original completion}
+        finish_reason: {type: string}
+        x-llmshim-served-model:
+          type: string
+          description: Best-effort signature observation; never changes message provenance.
+        id:
+          type: string
+          description: Response ID from the provider
+        model:
+          type: string
+        provider:
+          type: string
+          description: Which provider handled the request
+        message:
+          $ref: '#/components/schemas/ResponseMessage'
+        reasoning:
+          type: string
+          nullable: true
+          description: Reasoning/thinking content if the model produced it
+        usage:
+          $ref: '#/components/schemas/Usage'
+        latency_ms:
+          type: integer
+          description: End-to-end latency in milliseconds
+
+    ResponseMessage:
+      type: object
+      required: [role, content]
+      properties:
+        responses_output:
+          type: array
+          items: {type: object}
+          description: Native Responses output order retained when hosted search items are present.
+        refusal:
+          type: string
+          description: Provider refusal; no schema repair is attempted.
+        reasoning:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReasoningBlock'
+        role:
+          type: string
+        content:
+          description: Text content or null
+          oneOf:
+            - type: string
+            - type: 'null'
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+
+    ToolCall:
+      type: object
+      properties:
+        wire_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/WireToolId'
+        thought_signature:
+          type: object
+          required: [data, origin]
+          properties:
+            data:
+              type: string
+            origin:
+              $ref: '#/components/schemas/ReasoningOrigin'
+        id:
+          type: string
+        type:
+          type: string
+          enum: [function]
+        function:
+          type: object
+          properties:
+            name:
+              type: string
+            arguments:
+              type: string
+              description: JSON-encoded arguments
+
+    WireToolId:
+      type: object
+      required: [provider, wire, scope, part_id, id]
+      properties:
+        provider:
+          type: string
+        wire:
+          type: string
+          enum: [anthropic-messages, openai-responses, openai-chat, google-generate-content]
+        scope:
+          type: string
+        part_id:
+          type: string
+        id:
+          type: [string, 'null']
+          description: Native correlation id; null preserves its original absence
+        item_id:
+          type: string
+          description: Responses item id, distinct from its call_id
+        signature_field:
+          type: string
+          description: Original wire container for a tool signature
+
+    ReasoningOrigin:
+      type: object
+      required: [provider, model, family, wire, received_at]
+      properties:
+        provider:
+          type: string
+        model:
+          type: string
+        family:
+          type: [string, 'null']
+          description: Unknown families never authorize replay
+        wire:
+          type: string
+          enum: [anthropic-messages, openai-responses, openai-chat, google-generate-content]
+        received_at:
+          type: string
+          format: date-time
+        account:
+          type: string
+          description: Non-secret issuer binding for encrypted replay
+
+    ReasoningBlock:
+      type: object
+      required: [kind, origin]
+      properties:
+        kind:
+          type: string
+          enum: [text, redacted, encrypted]
+        text:
+          type: string
+        data:
+          type: string
+          description: Opaque data; preserve verbatim
+        signature:
+          type: string
+        item_id:
+          type: string
+        origin:
+          $ref: '#/components/schemas/ReasoningOrigin'
+        payload:
+          description: Original structured reasoning item, preserved for replay
+        source_field:
+          type: string
+        index:
+          type: [integer, string]
+          description: Streaming delta part index; omit from stored blocks
+        replace:
+          type: boolean
+          description: Streaming snapshot replaces the assembled part
+
+    NormalizedUsage:
+      type: object
+      required: [uncached_input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens]
+      properties:
+        uncached_input_tokens:
+          type: integer
+          minimum: 0
+        cache_read_tokens:
+          type: integer
+          minimum: 0
+        cache_write_tokens:
+          type: integer
+          minimum: 0
+        output_tokens:
+          type: integer
+          minimum: 0
+        reasoning_tokens:
+          type: integer
+          minimum: 0
+
+    Usage:
+      type: object
+      properties:
+        uncached_input_tokens:
+          type: integer
+          minimum: 0
+        x-llmshim-usage:
+          $ref: '#/components/schemas/NormalizedUsage'
+        cache_read_tokens:
+          type: integer
+          description: Input tokens served from a provider cache (zero when not reported)
+        cache_write_tokens:
+          type: integer
+          description: Input tokens written to a provider cache (zero when not reported)
+        cost_usd:
+          type: [number, 'null']
+          description: >-
+            USD accounting for this response. `provider` is the exact terminal
+            bill, `catalog` is the configured estimate, and `provider_floor` is
+            the highest partial provider bill observed (a lower bound, not an
+            exact final invoice). `null` means the cost could not be known — it
+            never means free.
+        cost_source:
+          type: string
+          enum: [provider, provider_floor, catalog]
+          description: >-
+            Where `cost_usd` came from. `provider` is a terminal provider bill;
+            `provider_floor` is the highest partial provider bill observed and
+            is only a known lower bound; `catalog` is the configured estimate.
+        input_tokens:
+          type: integer
+        output_tokens:
+          type: integer
+        reasoning_tokens:
+          type: integer
+          description: Reasoning/thinking tokens used (if applicable)
+        total_tokens:
+          type: integer
+
+    StreamEvent:
+      description: |
+        SSE events emitted during streaming. Each event has a typed `event:` field.
+      oneOf:
+        - type: object
+          properties:
+            type:
+              type: string
+              const: content
+            text:
+              type: string
+        - type: object
+          properties:
+            type:
+              type: string
+              const: reasoning
+            blocks:
+              type: array
+              items:
+                $ref: '#/components/schemas/ReasoningBlock'
+            text:
+              type: string
+        - type: object
+          properties:
+            type:
+              type: string
+              const: tool_call
+            wire_ids:
+              type: array
+              items:
+                $ref: '#/components/schemas/WireToolId'
+            thought_signature:
+              type: object
+              required: [data, origin]
+              properties:
+                data:
+                  type: string
+                origin:
+                  $ref: '#/components/schemas/ReasoningOrigin'
+            id:
+              type: string
+            name:
+              type: string
+            arguments:
+              type: string
+        - type: object
+          properties:
+            type:
+              type: string
+              const: usage
+            uncached_input_tokens:
+              type: integer
+              minimum: 0
+            x-llmshim-usage:
+              $ref: '#/components/schemas/NormalizedUsage'
+            cache_read_tokens:
+              type: integer
+            cache_write_tokens:
+              type: integer
+            cost_usd:
+              type: [number, 'null']
+              description: >-
+                USD accounting; may be a provider lower bound according to
+                `cost_source`; `null` when the cost could not be known
+            cost_source:
+              type: string
+              enum: [provider, provider_floor, catalog]
+              description: >-
+                Whether `cost_usd` is a terminal provider bill, a partial
+                provider lower bound, or a catalog estimate
+            input_tokens:
+              type: integer
+            output_tokens:
+              type: integer
+            reasoning_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+        - type: object
+          properties:
+            type:
+              type: string
+              const: done
+            responses_output:
+              type: array
+              items: {type: object}
+            finish_reason:
+              type: string
+            x-llmshim-served-model:
+              type: string
+        - type: object
+          properties:
+            type:
+              type: string
+              const: error
+            message:
+              type: string
+              description: Human-readable message with internal display prefixes removed
+            error:
+              type: object
+              description: Optional source error metadata
+              properties:
+                message: {type: string}
+                type: {type: string}
+                code: {}
+                param: {}
+                status: {type: integer}
+
+    ModelsResponse:
+      description: >-
+        Served to two audiences from one body. An OpenAI SDK reads `object` +
+        `data` (so `client.models.list()` works unmodified); llmshim's own
+        clients read `models`. Both audiences issue the same `GET /v1/models`,
+        so the shapes are unioned rather than split across routes.
+      type: object
+      required: [object, data, models]
+      properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, object, created, owned_by]
+            properties:
+              id:
+                type: string
+                description: Routing id, accepted back as `model` on a request
+              object:
+                type: string
+                const: model
+              created:
+                type: integer
+                description: Release date as a Unix timestamp, or 0 when unknown
+              owned_by:
+                type: string
+                description: Provider key serving the model
+        models:
+          type: array
+          items:
+            type: object
+            required: [id, provider, name]
+            properties:
+              id:
+                type: string
+                description: Full model identifier (provider/name)
+              provider:
+                type: string
+              name:
+                type: string
+                description: Model name without provider prefix
+
+    HealthResponse:
+      type: object
+      required: [status, providers]
+      properties:
+        status:
+          type: string
+        providers:
+          type: array
+          items:
+            type: string
+          description: List of configured providers
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string

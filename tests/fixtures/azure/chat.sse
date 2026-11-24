@@ -1,0 +1,13 @@
+data: {"id":"fixture-stream","object":"chat.completion.chunk","model":"gpt-6-sol","choices":[],"prompt_filter_results":[{"prompt_index":0,"content_filter_results":{"hate":{"filtered":false,"severity":"safe"}}}]}
+
+data: {"id":"fixture-stream","object":"chat.completion.chunk","model":"gpt-6-sol","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_fixture","type":"function","function":{"name":"weather","arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"fixture-stream","object":"chat.completion.chunk","model":"gpt-6-sol","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Oslo\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"fixture-stream","object":"chat.completion.chunk","model":"gpt-6-sol","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"fixture-stream","object":"chat.completion.chunk","model":"gpt-6-sol","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":40},"completion_tokens_details":{"reasoning_tokens":5}}}
+
+data: [DONE]
+
+: fixture ends

@@ -1,0 +1,12 @@
+target/
+crates/*/target
+.env
+.env.*
+!.env.example
+.git/
+.claude/
+clients/
+tests/
+examples/
+litellm/
+*.md

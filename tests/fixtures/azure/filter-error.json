@@ -1,0 +1,1 @@
+{"error":{"code":"content_filter","message":"secret-fixture must never be forwarded","innererror":{"code":"ResponsibleAIPolicyViolation","content_filter_result":{"violence":{"filtered":true,"severity":"high"}}}}}

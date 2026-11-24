@@ -1,0 +1,776 @@
+use llmshim::provider::Provider;
+use llmshim::providers::xai::Xai;
+use serde_json::{json, Value};
+
+fn provider() -> Xai {
+    Xai::new("test-key-xai".into())
+}
+
+// ============================================================
+// transform_request — basic
+// ============================================================
+
+#[test]
+fn request_url() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.url, "https://api.x.ai/v1/responses");
+}
+
+#[test]
+fn request_custom_base_url() {
+    let p = Xai::new("k".into()).with_base_url("http://localhost:9090".into());
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.url, "http://localhost:9090/responses");
+}
+
+#[test]
+fn request_sets_model() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["model"], "grok-4.3");
+}
+
+#[test]
+fn request_sets_model_grok_4_3() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["model"], "grok-4.3");
+    assert_eq!(result.url, "https://api.x.ai/v1/responses");
+}
+
+#[test]
+fn request_auth_header() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    let auth = result
+        .headers
+        .iter()
+        .find(|(k, _)| k == "Authorization")
+        .unwrap();
+    assert_eq!(auth.1, "Bearer test-key-xai");
+}
+
+#[test]
+fn request_messages_become_input() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ],
+    });
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2);
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[1]["role"], "assistant");
+}
+
+// ============================================================
+// transform_request — max_tokens
+// ============================================================
+
+#[test]
+fn request_max_tokens_becomes_max_output_tokens() {
+    let p = provider();
+    let req =
+        json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 500});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["max_output_tokens"], 500);
+}
+
+#[test]
+fn request_max_completion_tokens_becomes_max_output_tokens() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 256});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["max_output_tokens"], 256);
+}
+
+// ============================================================
+// transform_request — strips unsupported params
+// ============================================================
+
+#[test]
+fn request_strips_reasoning_effort() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "high"});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert!(
+        result.body.get("reasoning_effort").is_none(),
+        "reasoning_effort should be stripped for xAI"
+    );
+}
+
+#[test]
+fn request_strips_thinking() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "adaptive"}});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert!(
+        result.body.get("thinking").is_none(),
+        "thinking should be stripped for xAI"
+    );
+}
+
+#[test]
+fn request_strips_output_config() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "output_config": {"effort": "high"}});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert!(
+        result.body.get("output_config").is_none(),
+        "output_config should be stripped for xAI"
+    );
+}
+
+// ============================================================
+// transform_request — system/developer → instructions
+// ============================================================
+
+#[test]
+fn request_system_becomes_instructions() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ],
+    });
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["instructions"], "You are helpful.");
+    let input = result.body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0]["role"], "user");
+}
+
+#[test]
+fn request_developer_becomes_instructions() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "developer", "content": "Be concise."},
+            {"role": "user", "content": "hi"},
+        ],
+    });
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["instructions"], "Be concise.");
+}
+
+#[test]
+fn request_no_system_no_instructions() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert!(result.body.get("instructions").is_none());
+}
+
+// ============================================================
+// transform_request — sanitization
+// ============================================================
+
+#[test]
+fn request_strips_reasoning_content_from_messages() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [
+            {"role": "assistant", "content": "hello", "reasoning_content": "thinking...", "annotations": []},
+            {"role": "user", "content": "hi"},
+        ],
+    });
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    assert!(input[0].get("reasoning_content").is_none());
+    assert!(input[0].get("annotations").is_none());
+}
+
+// ============================================================
+// transform_request — tool_choice translation
+// ============================================================
+
+#[test]
+fn tool_choice_anthropic_any_to_required() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "tool_choice": {"type": "any"}});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["tool_choice"], "required");
+}
+
+#[test]
+fn tool_choice_anthropic_tool_to_function() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "tool_choice": {"type": "tool", "name": "search"}});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["tool_choice"]["type"], "function");
+    assert_eq!(result.body["tool_choice"]["name"], "search");
+}
+
+#[test]
+fn tool_choice_string_passthrough() {
+    let p = provider();
+    let req = json!({"model": "x", "messages": [{"role": "user", "content": "hi"}], "tool_choice": "auto"});
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(result.body["tool_choice"], "auto");
+}
+
+#[test]
+fn request_rejects_non_object() {
+    let p = provider();
+    assert!(p.transform_request("x", &json!("string")).is_err());
+}
+
+// ============================================================
+// transform_response
+// ============================================================
+
+#[test]
+fn response_text_only() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_xai",
+        "status": "completed",
+        "error": null,
+        "output": [
+            {"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "Hello!"}], "role": "assistant"}
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    });
+    let result = p.transform_response("grok-4.3", resp).unwrap();
+    assert_eq!(result["object"], "chat.completion");
+    assert_eq!(result["id"], "resp_xai");
+    assert_eq!(result["choices"][0]["message"]["content"], "Hello!");
+    assert_eq!(result["choices"][0]["finish_reason"], "stop");
+    assert_eq!(result["usage"]["prompt_tokens"], 10);
+    assert_eq!(result["usage"]["completion_tokens"], 5);
+}
+
+#[test]
+fn response_with_reasoning_tokens() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_r",
+        "status": "completed",
+        "error": null,
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "42"}], "role": "assistant"}
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15, "output_tokens_details": {"reasoning_tokens": 100}},
+    });
+    let result = p.transform_response("grok-4.3", resp).unwrap();
+    assert_eq!(result["usage"]["reasoning_tokens"], 100);
+}
+
+#[test]
+fn response_no_reasoning_tokens_field_when_zero() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_nr",
+        "status": "completed",
+        "error": null,
+        "output": [
+            {"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "hi"}], "role": "assistant"}
+        ],
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+    });
+    let result = p.transform_response("grok-4.3", resp).unwrap();
+    assert!(result["usage"].get("reasoning_tokens").is_none());
+}
+
+#[test]
+fn response_function_call() {
+    let p = provider();
+    let resp = json!({
+        "id": "resp_fc",
+        "status": "completed",
+        "error": null,
+        "output": [
+            {"type": "function_call", "call_id": "call_1", "name": "search", "arguments": "{\"q\":\"rust\"}"}
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    });
+    let result = p.transform_response("grok-4.3", resp).unwrap();
+    let tc = &result["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(tc["wire_ids"][0]["id"], "call_1");
+    assert_eq!(tc["function"]["name"], "search");
+    let args: Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["q"], "rust");
+}
+
+#[test]
+fn response_incomplete_status() {
+    let p = provider();
+    let resp = json!({
+        "id": "x", "status": "incomplete", "error": null,
+        "output": [{"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "partial"}], "role": "assistant"}],
+        "usage": {},
+    });
+    let result = p.transform_response("x", resp).unwrap();
+    assert_eq!(result["choices"][0]["finish_reason"], "length");
+}
+
+#[test]
+fn response_error_null_is_success() {
+    let p = provider();
+    let resp = json!({
+        "id": "x", "status": "completed", "error": null,
+        "output": [{"type": "message", "status": "completed", "content": [{"type": "output_text", "text": "ok"}], "role": "assistant"}],
+        "usage": {},
+    });
+    let result = p.transform_response("x", resp).unwrap();
+    assert_eq!(result["choices"][0]["message"]["content"], "ok");
+}
+
+#[test]
+fn response_error_non_null() {
+    let p = provider();
+    let resp = json!({"error": {"message": "bad request"}});
+    assert!(p.transform_response("x", resp).is_err());
+}
+
+// ============================================================
+// transform_stream_chunk
+// ============================================================
+
+#[test]
+fn stream_output_text_delta() {
+    let p = provider();
+    let chunk = json!({"type": "response.output_text.delta", "delta": "Hello"});
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["choices"][0]["delta"]["content"], "Hello");
+}
+
+#[test]
+fn stream_response_completed() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "usage": {"input_tokens": 10, "output_tokens": 5, "output_tokens_details": {"reasoning_tokens": 50}},
+        },
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+    assert_eq!(parsed["usage"]["prompt_tokens"], 10);
+    assert_eq!(parsed["usage"]["reasoning_tokens"], 50);
+}
+
+#[test]
+fn stream_other_events_skipped() {
+    let p = provider();
+    for event_type in &["response.created", "response.in_progress"] {
+        let chunk = json!({"type": event_type});
+        let result = p
+            .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+            .unwrap();
+        assert!(result.is_none(), "{} should be skipped", event_type);
+    }
+}
+
+#[test]
+fn stream_output_item_added_non_function_call_skipped() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.output_item.added",
+        "item": {"type": "message"},
+        "output_index": 0,
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap();
+    assert!(
+        result.is_none(),
+        "non-function_call output_item.added should be skipped"
+    );
+}
+
+#[test]
+fn stream_output_item_added_function_call() {
+    let p = provider();
+    let mut stream = p.stream_normalizer("grok-4.3");
+    let start = json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_xyz","name":"get_weather","arguments":""}});
+    assert!(stream.push(&start.to_string()).unwrap().is_none());
+    stream
+        .push(
+            &json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":"{}"})
+                .to_string(),
+        )
+        .unwrap();
+    let result = stream
+        .push(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                .to_string(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let call = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert!(call["id"].as_str().unwrap().starts_with("call_ls_"));
+    assert_eq!(call["wire_ids"][0]["id"], "call_xyz");
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(call["index"], 1);
+}
+
+#[test]
+fn stream_function_call_arguments_delta() {
+    let p = provider();
+    let mut stream = p.stream_normalizer("grok-4.3");
+    stream.push(&json!({"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","call_id":"call_xyz","name":"get_weather","arguments":""}}).to_string()).unwrap();
+    for fragment in ["{\"city\":", "\"Paris\"}"] {
+        assert!(stream.push(&json!({"type":"response.function_call_arguments.delta","output_index":2,"delta":fragment}).to_string()).unwrap().is_none());
+    }
+    let result = stream
+        .push(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                .to_string(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let call = &parsed["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(call["index"], 2);
+}
+
+#[test]
+fn stream_function_call_arguments_delta_empty_skipped() {
+    let p = provider();
+    let chunk = json!({
+        "type": "response.function_call_arguments.delta",
+        "delta": "",
+        "output_index": 0,
+    });
+    let result = p
+        .transform_stream_chunk("x", &serde_json::to_string(&chunk).unwrap())
+        .unwrap();
+    assert!(result.is_none(), "empty arguments delta should be skipped");
+}
+
+#[test]
+fn stream_function_call_multiple_tools_indices() {
+    let p = provider();
+    let mut stream = p.stream_normalizer("grok-4.3");
+    for index in [4, 1] {
+        stream.push(&json!({"type":"response.output_item.added","output_index":index,"item":{"type":"function_call","call_id":format!("call_{index}"),"name":"read","arguments":"{}"}}).to_string()).unwrap();
+    }
+    let result = stream
+        .push(
+            &json!({"type":"response.completed","response":{"status":"completed","output":[]}})
+                .to_string(),
+        )
+        .unwrap()
+        .unwrap();
+    let parsed: Value = serde_json::from_str(&result).unwrap();
+    let calls = parsed["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["index"], 1);
+    assert_eq!(calls[1]["index"], 4);
+    assert_eq!(calls[0]["wire_ids"][0]["id"], "call_1");
+    assert_eq!(calls[1]["wire_ids"][0]["id"], "call_4");
+}
+
+#[test]
+fn stream_empty_returns_none() {
+    let p = provider();
+    assert!(p.transform_stream_chunk("x", "").unwrap().is_none());
+    assert!(p.transform_stream_chunk("x", "  ").unwrap().is_none());
+}
+
+#[test]
+fn stream_done_returns_none() {
+    let p = provider();
+    assert!(p.transform_stream_chunk("x", "[DONE]").unwrap().is_none());
+}
+
+// ============================================================
+// Session history: tool calls/results converted to Responses API format
+// ============================================================
+
+#[test]
+fn session_history_tool_calls_converted_to_function_call_items() {
+    let p = provider();
+    let req = json!({
+        "model": "grok-4.3",
+        "messages": [
+            {"role": "user", "content": "Get AAPL quote"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_abc", "content": "{\"price\":150}"},
+            {"role": "assistant", "content": "AAPL is at $150."},
+            {"role": "user", "content": "thanks"},
+        ],
+    });
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+
+    // user message
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[0]["content"], "Get AAPL quote");
+
+    // assistant tool_calls → function_call item (no assistant message since content was null)
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_abc");
+    assert_eq!(input[1]["name"], "get_quote");
+
+    // tool result → function_call_output
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["call_id"], "call_abc");
+    assert_eq!(input[2]["output"], "{\"price\":150}");
+
+    // subsequent assistant message with content
+    assert_eq!(input[3]["role"], "assistant");
+    assert_eq!(input[3]["content"], "AAPL is at $150.");
+    assert!(input[3].get("tool_calls").is_none());
+
+    // final user message
+    assert_eq!(input[4]["role"], "user");
+}
+
+#[test]
+fn session_history_multiple_tool_calls_in_one_message() {
+    let p = provider();
+    let req = json!({
+        "model": "grok-4.3",
+        "messages": [
+            {"role": "user", "content": "Compare AAPL and GOOGL"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"AAPL\"]}"}},
+                    {"id": "call_2", "type": "function", "function": {"name": "get_quote", "arguments": "{\"symbols\":[\"GOOGL\"]}"}},
+                ]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"price\":150}"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "{\"price\":180}"},
+        ],
+    });
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["name"], "get_quote");
+    assert_eq!(input[1]["call_id"], "call_1");
+    assert_eq!(input[2]["type"], "function_call");
+    assert_eq!(input[2]["name"], "get_quote");
+    assert_eq!(input[2]["call_id"], "call_2");
+    assert_eq!(input[3]["type"], "function_call_output");
+    assert_eq!(input[3]["call_id"], "call_1");
+    assert_eq!(input[4]["type"], "function_call_output");
+    assert_eq!(input[4]["call_id"], "call_2");
+}
+
+#[test]
+fn session_history_strips_cross_provider_fields() {
+    let p = provider();
+    let req = json!({
+        "model": "grok-4.3",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "hello",
+                "reasoning_content": "thinking...",
+                "annotations": [],
+                "refusal": null
+            },
+        ],
+    });
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    let input = result.body["input"].as_array().unwrap();
+    assert_eq!(input[0]["content"], "hello");
+    assert!(input[0].get("reasoning_content").is_none());
+    assert!(input[0].get("annotations").is_none());
+    assert!(input[0].get("refusal").is_none());
+}
+
+// ============================================================
+// Unified reasoning — six-tier efforts + reasoning_mode
+// ============================================================
+
+#[test]
+fn effort_translates_to_nested_reasoning_object() {
+    let p = provider();
+    for (effort, expected) in [
+        ("none", "none"),
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"), // xAI rejects "max" (verified live) — clamp
+    ] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let r = p.transform_request("grok-4.3", &req).unwrap();
+        assert_eq!(r.body["reasoning"]["effort"], expected, "effort {effort}");
+        // the flat string form is inert on xAI's API — must not be sent
+        assert!(r.body.get("reasoning_effort").is_none());
+    }
+}
+
+#[test]
+fn name_locked_grok_4_20_omits_reasoning_entirely() {
+    let p = provider();
+    for model in [
+        "grok-4.20-beta-0309-reasoning",
+        "grok-4.20-beta-0309-non-reasoning",
+    ] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        });
+        let r = p.transform_request(model, &req).unwrap();
+        assert!(
+            r.body.get("reasoning").is_none(),
+            "{model} 400s on any reasoning param — must be omitted"
+        );
+    }
+}
+
+#[test]
+fn reasoning_none_clamps_to_low_for_grok_4_5_through_4_7() {
+    // grok-4.5 and grok-4.6 400 on effort "none" (verified live) — clamp to "low".
+    let p = provider();
+    for model in ["grok-4.5", "grok-4.6", "grok-4.7"] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "none",
+        });
+        let r = p.transform_request(model, &req).unwrap();
+        assert_eq!(r.body["reasoning"]["effort"], "low", "{model} none->low");
+    }
+    // grok-4.3 CAN disable — "none" stays "none".
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let r = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn mode_pro_bumps_effort() {
+    let p = provider();
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "medium",
+        "reasoning_mode": "pro",
+    });
+    let r = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "high");
+}
+
+#[test]
+fn response_surfaces_reasoning_summary() {
+    let p = provider();
+    let resp = json!({
+        "error": null,
+        "status": "completed",
+        "model": "grok-4.3",
+        "output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thought about it"}]},
+            {"type": "message", "content": [{"type": "output_text", "text": "hi there"}]}
+        ],
+        "usage": {"input_tokens": 1, "output_tokens": 2}
+    });
+    let result = p.transform_response("grok-4.3", resp).unwrap();
+    assert_eq!(
+        result["choices"][0]["message"]["reasoning"][0]["text"],
+        "thought about it"
+    );
+    assert_eq!(result["choices"][0]["message"]["content"], "hi there");
+}
+
+#[test]
+fn grok_4_5_cannot_disable_reasoning_clamps_none_to_low() {
+    let p = provider();
+    // grok-4.5 rejects effort "none" (verified live) — clamp to its floor.
+    let req = json!({
+        "model": "x",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    });
+    let r = p.transform_request("grok-4.5", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "low");
+
+    // grok-4.3 still accepts "none" (turns reasoning off) — no clamp.
+    let r = p.transform_request("grok-4.3", &req).unwrap();
+    assert_eq!(r.body["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn grok_4_5_effort_range() {
+    let p = provider();
+    for (effort, expected) in [
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "high"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"), // xAI rejects "max"
+    ] {
+        let req = json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        });
+        let r = p.transform_request("grok-4.5", &req).unwrap();
+        assert_eq!(r.body["reasoning"]["effort"], expected, "effort {effort}");
+    }
+}
+
+#[test]
+fn request_strips_foreign_reasoning_signature() {
+    // Issue #34: an opaque Anthropic reasoning signature must never leak into an
+    // xAI request in a multi-model conversation.
+    let p = provider();
+    let req = json!({
+        "model": "grok-4.3",
+        "messages": [{
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": "x",
+            "reasoning_signature": "anthropic-sig-should-not-leak",
+            "redacted_reasoning_content": "redacted-should-not-leak"
+        }]
+    });
+    let result = p.transform_request("grok-4.3", &req).unwrap();
+    let body = serde_json::to_string(&result.body).unwrap();
+    assert!(!body.contains("anthropic-sig-should-not-leak"));
+    assert!(!body.contains("redacted-should-not-leak"));
+    assert!(!body.contains("reasoning_signature"));
+}

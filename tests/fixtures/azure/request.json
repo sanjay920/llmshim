@@ -1,0 +1,1 @@
+{"model":"chat-deployment","messages":[{"role":"user","content":"Weather?"}],"stream":true,"tools":[{"type":"function","function":{"name":"weather","description":"Weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"stream_options":{"include_usage":true}}

@@ -1,0 +1,266 @@
+# HTTP API
+
+The proxy wraps llmshim's translation engine in a compact JSON API. It has
+a compact chat contract plus [native API endpoints](native-apis.md), with JSON
+and SSE responses.
+
+> **Availability:** HTTP JSON: non-streaming chat, models, health · HTTP SSE: streaming chat
+
+## Endpoints
+
+| Method | Path | Result |
+|---|---|---|
+| `POST` | `/v1/chat` | A `ChatResponse`, or typed SSE when `stream` is `true` |
+| `POST` | `/v1/chat/stream` | Typed SSE, regardless of the request's `stream` value |
+| `POST` | `/v1/responses` | Stateless Responses JSON or numbered SSE; [contract][responses] |
+| `GET` | `/v1/models` | Models whose providers have configured API keys |
+| `GET` | `/health` | Process health and configured provider names |
+
+The canonical machine-readable contract is
+[`api/openapi.yaml`](https://github.com/sanjay920/llmshim-open/blob/main/api/openapi.yaml).
+
+## Chat request
+
+Both chat endpoints accept the same body:
+
+```json
+{
+  "model": "anthropic/claude-sonnet-5-5",
+  "messages": [{"role": "user", "content": "Explain ownership briefly."}],
+  "stream": false,
+  "config": {
+    "max_tokens": 300,
+    "temperature": 0.2,
+    "reasoning_effort": "medium"
+  },
+  "provider_config": {},
+  "fallback": ["openai/gpt-6-luna"]
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `model` | string, required | `provider/model` or an inferable bare model name |
+| `messages` | array, required | Full conversation history |
+| `stream` | boolean | On `/v1/chat`, switch the response from JSON to typed SSE; default `false` |
+| `config` | object | Portable generation controls |
+| `provider_config` | object | Non-reserved engine fields, including tools and `x-*` namespaces |
+| `fallback` | string array | Ordered backup models for non-streaming requests only |
+| `response_format` | object | Validated JSON output contract |
+| `x-shim` | object | Capability path selection |
+| `x-cache` | object | Stability segments and explicit cache key |
+
+`config` accepts exactly these fields:
+
+| Field | Type |
+|---|---|
+| `max_tokens` | unsigned integer |
+| `temperature` | number |
+| `top_p` | number |
+| `top_k` | unsigned integer |
+| `stop` | array of strings |
+| `reasoning_effort` | `none`, `low`, `medium`, `high`, `xhigh`, or `max` |
+| `reasoning_mode` | `standard` or `pro` |
+
+Adapters use only controls supported by the selected provider. Reasoning is
+mapped and clamped by model family; see [Reasoning controls](../guides/reasoning.md).
+
+Messages require `role`; `content` defaults to `null` and may be text or
+content blocks. Tool turns may also carry `tool_calls` or `tool_call_id`.
+Assistant messages carry `reasoning[]` blocks with provenance. Preserve the
+complete array and any tool-call `thought_signature` object for replay.
+Legacy reasoning text is accepted only as migration input; untracked blocks
+are dropped.
+
+`provider_config` is merged as top-level engine fields. For example, tools go
+at `provider_config.tools`, while an OpenAI-native override goes at
+`provider_config["x-openai"]`. See the [request field map](../reference/request-fields.md).
+The typed `model` and `messages` fields remain authoritative: passthrough
+configuration cannot replace them through the selected provider's native
+model or main messages/input/contents container. Native system or instruction
+controls remain supported and are estimated when active. Validation happens
+after named-route defaults and aliases are resolved and covers every
+resolvable explicit fallback before the primary request runs. Another
+provider's namespace is inert only when no primary, fallback, or route can
+select that provider.
+
+Fallback first retries an eligible failure on the current route, then moves
+through the listed routes. It is ignored by both streaming paths. See
+[Fallback chains](../guides/fallbacks.md).
+
+## Non-streaming response
+
+`POST /v1/chat` returns a compact response when `stream` is false:
+
+```json
+{
+  "id": "msg_123",
+  "model": "claude-sonnet-5-5",
+  "provider": "anthropic",
+  "message": {
+    "role": "assistant",
+    "content": "Ownership gives each value one owner."
+  },
+  "usage": {
+    "input_tokens": 14,
+    "output_tokens": 9,
+    "reasoning_tokens": 4,
+    "total_tokens": 27
+  },
+  "latency_ms": 612
+}
+```
+
+`created_at` is the original completion time as a Unix timestamp. If the provider
+omits an ID, the server assigns one; gateway idempotency replay preserves both.
+
+`message.tool_calls` appears when the model requests tools. `reasoning` appears
+when the provider returns reasoning text. `reasoning_tokens` is omitted when
+zero; the other usage fields are always present.
+
+## Normalized token accounting
+
+Every compact `usage` object and typed SSE `usage` event contains
+`uncached_input_tokens` and `x-llmshim-usage`. Native Chat Completions and
+Messages place the same extension inside `usage`; Gemini places it inside
+`usageMetadata`. It survives the final usage frame on every streaming facade.
+
+The extension always contains five unsigned counts: `uncached_input_tokens`,
+`cache_read_tokens`, `cache_write_tokens`, `output_tokens`, and
+`reasoning_tokens`, including zero values. Uncached input excludes both cache
+reads and cache writes. Output and reasoning preserve the upstream counts;
+reasoning may be included in output, so do not add them together. Zero means
+the provider reported no count for that class. Streaming counts are cumulative
+snapshots, not increments.
+
+Native field conventions remain native: Messages `input_tokens` excludes cache
+reads and writes, which travel as `cache_read_input_tokens` and
+`cache_creation_input_tokens`. Chat `prompt_tokens` and Gemini
+`promptTokenCount` include all input classes. Chat also exposes cache reads in
+`prompt_tokens_details.cached_tokens` and reasoning in
+`completion_tokens_details.reasoning_tokens`; Gemini uses
+`cachedContentTokenCount` and `thoughtsTokenCount`. Compact `input_tokens`
+retains the engine's original prompt convention for compatibility; use the
+extension when comparing providers.
+
+## Idempotency replay retention
+
+For completed unary gateway requests, an idempotency key enables a process-local
+replay only when its tenant, credential, route, and canonical request match. This is
+best-effort replay: the local cache has shared limits for entry count, retained
+response footprint, and JSON complexity across the current scoped API and its
+deprecated generic compatibility API. An entry that exceeds those limits, or a
+new entry when live retained entries already fill them, is not stored. A TTL is
+an upper bound on replay availability, and some responses are never retained.
+Clients must therefore tolerate a fresh execution and must not treat this as an
+exactly-once guarantee.
+
+Distributed requests also hold a finite origin lease. Dropping a unary request
+future or streaming response body requests durable cancellation; process loss is
+detected when the lease expires. Cancellation can stop queued or locally active
+work, but it cannot prove that an external provider did not accept a send that
+was already in flight. Known usage and uncertain spend liability are retained.
+
+These local limits use a conservative in-process footprint estimate, not an RSS
+measurement. In a distributed deployment, completed responses remain in the
+bounded lifecycle terminal pool and the idempotency cache retains a bounded
+credential/request-scoped pointer to that terminal. Pointer values have native
+Redis expiry and share limits of 100,000 entries and 64 MiB; their TTL is capped
+at one day and terminal extension uses the same effective TTL without shortening
+an existing longer terminal retention. Concurrent first
+requests that both miss the cache are not coalesced and can both execute. Each
+job is independently admitted and charged, so callers must not use an
+idempotency key as a single-flight or exactly-once guarantee.
+
+## Streaming response
+
+`POST /v1/chat/stream` always streams. `POST /v1/chat` does the same when the
+body contains `"stream": true`.
+
+Each Server-Sent Event has an SSE `event:` name and JSON `data:` whose `type`
+matches that name:
+
+```text
+event: reasoning
+data: {"type":"reasoning","text":"..."}
+
+event: content
+data: {"type":"content","text":"Ownership gives each value one owner."}
+
+event: tool_call
+data: {"type":"tool_call","id":"call_1","name":"lookup","arguments":"{\"id\":7}"}
+
+event: usage
+data: {"type":"usage","input_tokens":14,"output_tokens":9,"total_tokens":23}
+
+event: done
+data: {"type":"done"}
+```
+
+| Event | JSON fields |
+|---|---|
+| `content` | `type`, `text` |
+| `reasoning` | `type`, `text` |
+| `tool_call` | `type`, `id`, `name`, `arguments` |
+| `usage` | `type`, `input_tokens`, `output_tokens`, optional `reasoning_tokens`, `total_tokens` |
+| `done` | `type` |
+| `error` | `type`, `message` |
+
+Admission failures happen before SSE begins and return normal HTTP `429` or
+`503` responses. A failure after the stream starts is an `error` event. For
+consumption patterns, see [Streaming](../guides/streaming.md).
+
+## Models and health
+
+`GET /v1/models` returns the registry entries for configured providers, in two
+shapes from one body:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "openai/gpt-6-luna", "object": "model", "created": 1790035200, "owned_by": "openai"}
+  ],
+  "models": [
+    {"id": "openai/gpt-6-luna", "provider": "openai", "name": "gpt-6-luna"}
+  ]
+}
+```
+
+`object` + `data` is the OpenAI list envelope, so an OpenAI SDK's
+`client.models.list()` works against llmshim unmodified. `models` is llmshim's
+own shape and is unchanged. Both audiences issue the same `GET /v1/models`, so
+there is no second path to split on. A `data[].id` is the routing id and can be
+sent straight back as `model`; `created` is the catalog release date as a Unix
+timestamp, or `0` when unknown.
+
+This is discovery, not an allowlist: an arbitrary provider model ID can still
+be routed explicitly. See [Model discovery](../reference/models.md).
+
+`GET /health` reports that the process can serve requests and names its
+configured providers:
+
+```json
+{"status":"ok","providers":["openai","anthropic"]}
+```
+
+It does not probe upstream provider availability.
+
+## Errors
+
+Before a stream begins, errors use an HTTP status and this JSON envelope:
+
+```json
+{
+  "error": {
+    "code": "rate_limited",
+    "message": "Upstream provider rate limit reached; retry after the suggested delay"
+  }
+}
+```
+
+Proactive `429` and `503` responses include `Retry-After` in whole seconds.
+Provider failures normally retain the provider's status. See
+[Errors and retries](../reference/errors.md) for the complete mapping.
+
+[responses]: native-apis.md#responses-streams-and-reasoning-history
