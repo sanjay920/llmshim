@@ -450,6 +450,6 @@ after recovery, require a fresh successful origin retention before treating
 previously queued transition work as safe.
 
 Do not infer capacity from llmshim's implementation details alone. The
-[README benchmarks](https://github.com/sanjay920/llmshim-open#benchmarks) are the
+[README benchmarks](https://github.com/sanjay920/llmshim#benchmarks) are the
 maintained performance snapshot; load-test your model mix, payload sizes,
 provider quotas, and gateway before choosing replica counts.

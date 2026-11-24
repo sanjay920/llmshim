@@ -4,7 +4,7 @@ A thin, idiomatic Go client for the [llmshim](https://crates.io/crates/llmshim)
 proxy. It speaks pure HTTP to a running llmshim proxy — it does **not** spawn
 the Rust binary and has **no third-party dependencies** (standard library only).
 
-Module path: `github.com/sanjay920/llmshim-open/clients/go`
+Module path: `github.com/sanjay920/llmshim/clients/go`
 
 ## Prerequisites
 
@@ -17,7 +17,7 @@ llmshim proxy   # listens on :3000 by default
 ## Install
 
 ```bash
-go get github.com/sanjay920/llmshim-open/clients/go
+go get github.com/sanjay920/llmshim/clients/go
 ```
 
 ## Quickstart
@@ -30,7 +30,7 @@ import (
 	"fmt"
 	"log"
 
-	llmshim "github.com/sanjay920/llmshim-open/clients/go"
+	llmshim "github.com/sanjay920/llmshim/clients/go"
 )
 
 func main() {

@@ -151,7 +151,7 @@ vocabulary:
 - Ruby yields typed events to a block.
 
 See the canonical client guides for complete loops:
-[Python](https://github.com/sanjay920/llmshim-open/blob/main/clients/python/README.md#streaming),
-[TypeScript](https://github.com/sanjay920/llmshim-open/blob/main/clients/typescript/README.md#30-second-quickstart),
-[Go](https://github.com/sanjay920/llmshim-open/blob/main/clients/go/README.md#streaming), and
-[Ruby](https://github.com/sanjay920/llmshim-open/blob/main/clients/ruby/README.md#streaming).
+[Python](https://github.com/sanjay920/llmshim/blob/main/clients/python/README.md#streaming),
+[TypeScript](https://github.com/sanjay920/llmshim/blob/main/clients/typescript/README.md#30-second-quickstart),
+[Go](https://github.com/sanjay920/llmshim/blob/main/clients/go/README.md#streaming), and
+[Ruby](https://github.com/sanjay920/llmshim/blob/main/clients/ruby/README.md#streaming).

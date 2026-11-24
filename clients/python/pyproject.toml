@@ -22,8 +22,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/sanjay920/llmshim-open"
-Repository = "https://github.com/sanjay920/llmshim-open"
+Homepage = "https://github.com/sanjay920/llmshim"
+Repository = "https://github.com/sanjay920/llmshim"
 
 [tool.maturin]
 bindings = "bin"

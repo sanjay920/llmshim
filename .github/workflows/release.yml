@@ -151,7 +151,7 @@ jobs:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          BASE_URL="https://github.com/sanjay920/llmshim-open/releases/download/${GITHUB_REF_NAME}"
+          BASE_URL="https://github.com/sanjay920/llmshim/releases/download/${GITHUB_REF_NAME}"
 
           # Download tarballs to compute sha256
           curl -sL "${BASE_URL}/llmshim-aarch64-apple-darwin.tar.gz" -o /tmp/arm64.tar.gz
@@ -163,7 +163,7 @@ jobs:
           cat > /tmp/llmshim.rb << 'ENDOFTEMPLATE'
           class Llmshim < Formula
             desc "Blazing fast LLM API translation layer — one interface, every provider"
-            homepage "https://github.com/sanjay920/llmshim-open"
+            homepage "https://github.com/sanjay920/llmshim"
             license "MIT"
             version "VERSION_PLACEHOLDER"
 
@@ -222,7 +222,7 @@ jobs:
   # automatically as an optionalDependency of the root `llmshim` package.
   #
   # Each of these 5 packages needs its own Trusted Publisher configured on
-  # npmjs.com once (same values as the root package: repo sanjay920/llmshim-open,
+  # npmjs.com once (same values as the root package: repo sanjay920/llmshim,
   # workflow release.yml, environment release) — see clients/typescript/README.md.
   npm-macos-binaries:
     needs: [test, release-inputs]
@@ -514,7 +514,7 @@ jobs:
         run: gem push llmshim-*.gem
 
   # --- Tag the Go client module for a clean `go get` version ---
-  # `go get github.com/sanjay920/llmshim-open/clients/go` already works today via
+  # `go get github.com/sanjay920/llmshim/clients/go` already works today via
   # Go's VCS auto-fetch (no registry to publish to), but without a tag of the
   # form "clients/go/vX.Y.Z" it resolves an ugly pseudo-version. This job adds
   # that tag on every release so `go get .../clients/go@latest` resolves clean

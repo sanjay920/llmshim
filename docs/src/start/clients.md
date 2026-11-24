@@ -9,7 +9,7 @@ difference is whether the package starts that proxy for you.
 |---|---|---|
 | Python | `pip install llmshim` | Starts the bundled proxy on the first call |
 | TypeScript | `npm install llmshim` | Starts the bundled proxy on the first call |
-| Go | `go get github.com/sanjay920/llmshim-open/clients/go` | Connects to `http://localhost:3000` |
+| Go | `go get github.com/sanjay920/llmshim/clients/go` | Connects to `http://localhost:3000` |
 | Ruby | `gem install llmshim` | Connects to `http://localhost:3000` |
 
 The auto-started Python and TypeScript proxies are reused within the current
@@ -36,7 +36,7 @@ print(response["message"]["content"])
 
 The first call starts the bundled proxy automatically.
 
-[Python README](https://github.com/sanjay920/llmshim-open/blob/main/clients/python/README.md)
+[Python README](https://github.com/sanjay920/llmshim/blob/main/clients/python/README.md)
 · [PyPI package](https://pypi.org/project/llmshim/)
 
 ## TypeScript / JavaScript
@@ -60,13 +60,13 @@ console.log(response.message.content);
 Constructing the client is synchronous. Its first request starts the bundled
 proxy. Pass `baseUrl` to `new Client(...)` to use an existing server instead.
 
-[TypeScript README](https://github.com/sanjay920/llmshim-open/blob/main/clients/typescript/README.md)
+[TypeScript README](https://github.com/sanjay920/llmshim/blob/main/clients/typescript/README.md)
 · [npm package](https://www.npmjs.com/package/llmshim)
 
 ## Go
 
 ```bash
-go get github.com/sanjay920/llmshim-open/clients/go
+go get github.com/sanjay920/llmshim/clients/go
 ```
 
 ```go
@@ -77,7 +77,7 @@ import (
 	"fmt"
 	"log"
 
-	llmshim "github.com/sanjay920/llmshim-open/clients/go"
+	llmshim "github.com/sanjay920/llmshim/clients/go"
 )
 
 func main() {
@@ -98,8 +98,8 @@ func main() {
 
 `llmshim.New()` targets `http://localhost:3000`; it does not start the proxy.
 
-[Go README](https://github.com/sanjay920/llmshim-open/blob/main/clients/go/README.md)
-· [Go module](https://pkg.go.dev/github.com/sanjay920/llmshim-open/clients/go)
+[Go README](https://github.com/sanjay920/llmshim/blob/main/clients/go/README.md)
+· [Go module](https://pkg.go.dev/github.com/sanjay920/llmshim/clients/go)
 
 ## Ruby
 
@@ -121,7 +121,7 @@ puts response.message.content
 The module-level client targets `LLMSHIM_BASE_URL` when set, otherwise
 `http://localhost:3000`. It does not start the proxy.
 
-[Ruby README](https://github.com/sanjay920/llmshim-open/blob/main/clients/ruby/README.md)
+[Ruby README](https://github.com/sanjay920/llmshim/blob/main/clients/ruby/README.md)
 · [RubyGems package](https://rubygems.org/gems/llmshim)
 
 These snippets cover one non-streaming request. Use the linked client README as

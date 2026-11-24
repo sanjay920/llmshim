@@ -4,12 +4,12 @@ Use the reference that matches your boundary:
 
 | Boundary | Canonical reference |
 |---|---|
-| HTTP proxy | [`api/openapi.yaml`](https://github.com/sanjay920/llmshim-open/blob/main/api/openapi.yaml) |
+| HTTP proxy | [`api/openapi.yaml`](https://github.com/sanjay920/llmshim/blob/main/api/openapi.yaml) |
 | Rust crate | [`llmshim` on docs.rs](https://docs.rs/llmshim) |
-| Python | [Client README](https://github.com/sanjay920/llmshim-open/blob/main/clients/python/README.md) |
-| TypeScript | [Client README](https://github.com/sanjay920/llmshim-open/blob/main/clients/typescript/README.md) |
-| Go | [Client README](https://github.com/sanjay920/llmshim-open/blob/main/clients/go/README.md) |
-| Ruby | [Client README](https://github.com/sanjay920/llmshim-open/blob/main/clients/ruby/README.md) |
+| Python | [Client README](https://github.com/sanjay920/llmshim/blob/main/clients/python/README.md) |
+| TypeScript | [Client README](https://github.com/sanjay920/llmshim/blob/main/clients/typescript/README.md) |
+| Go | [Client README](https://github.com/sanjay920/llmshim/blob/main/clients/go/README.md) |
+| Ruby | [Client README](https://github.com/sanjay920/llmshim/blob/main/clients/ruby/README.md) |
 
 The proxy specification is OpenAPI 3.1 and currently reports llmshim version
 `0.1.26`. It describes the four HTTP endpoints, compact request and response

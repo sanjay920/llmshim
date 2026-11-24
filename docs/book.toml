@@ -15,8 +15,8 @@ command = "mdbook-mermaid"
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/sanjay920/llmshim-open"
-edit-url-template = "https://github.com/sanjay920/llmshim-open/edit/docs/concepts-site/docs/{path}"
-site-url = "/llmshim-open/"
+git-repository-url = "https://github.com/sanjay920/llmshim"
+edit-url-template = "https://github.com/sanjay920/llmshim/edit/docs/concepts-site/docs/{path}"
+site-url = "/llmshim/"
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
 

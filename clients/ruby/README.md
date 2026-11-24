@@ -1,6 +1,6 @@
 # llmshim (Ruby client)
 
-A thin, dependency-free Ruby client for the [llmshim](https://github.com/sanjay920/llmshim-open)
+A thin, dependency-free Ruby client for the [llmshim](https://github.com/sanjay920/llmshim)
 multi-provider LLM proxy. Send OpenAI-style chat requests to a running llmshim
 proxy and let it translate to OpenAI, Anthropic, Google Gemini, xAI, OpenRouter,
 vLLM, or SGLang.

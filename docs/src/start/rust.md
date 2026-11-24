@@ -109,7 +109,7 @@ call, so production code should inspect the fields it needs.
 For config-file loading, aliases, and model inference, see
 [Models and the Router](../concepts/routing.md). Runnable repository examples
 are available in
-[`examples/chat.rs`](https://github.com/sanjay920/llmshim-open/blob/main/examples/chat.rs)
+[`examples/chat.rs`](https://github.com/sanjay920/llmshim/blob/main/examples/chat.rs)
 and
-[`examples/stream.rs`](https://github.com/sanjay920/llmshim-open/blob/main/examples/stream.rs).
+[`examples/stream.rs`](https://github.com/sanjay920/llmshim/blob/main/examples/stream.rs).
 

@@ -7,7 +7,7 @@ coding agents but equally useful to people, and kept rigorously current.
 
 ## Where to start
 
-- **Try it first**: the [documentation site](https://sanjay920.github.io/llmshim-open/)
+- **Try it first**: the [documentation site](https://sanjay920.github.io/llmshim/)
   shows what llmshim does and the contracts it keeps. `cargo run` drops you into
   the interactive chat.
 - **Issues** labeled `good first issue` are curated entry points; `bug` issues
@@ -19,7 +19,7 @@ coding agents but equally useful to people, and kept rigorously current.
 ## Development setup
 
 ```bash
-git clone https://github.com/sanjay920/llmshim-open
+git clone https://github.com/sanjay920/llmshim
 cd llmshim
 cargo build
 cargo test --features proxy --tests   # unit tests; ~CI's set

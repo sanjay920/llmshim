@@ -15,13 +15,13 @@ Gem::Specification.new do |spec|
     Google Gemini, xAI, OpenRouter, vLLM, or SGLang. Supports non-streaming and
     SSE streaming, model listing, and health checks. Standard library only.
   DESC
-  spec.homepage = "https://github.com/sanjay920/llmshim-open"
+  spec.homepage = "https://github.com/sanjay920/llmshim"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 2.6.0"
 
   spec.metadata["homepage_uri"] = spec.homepage
-  spec.metadata["source_code_uri"] = "https://github.com/sanjay920/llmshim-open"
-  spec.metadata["changelog_uri"] = "https://github.com/sanjay920/llmshim-open/releases"
+  spec.metadata["source_code_uri"] = "https://github.com/sanjay920/llmshim"
+  spec.metadata["changelog_uri"] = "https://github.com/sanjay920/llmshim/releases"
 
   spec.files = Dir[
     "lib/**/*.rb",

@@ -17,7 +17,7 @@ and SSE responses.
 | `GET` | `/health` | Process health and configured provider names |
 
 The canonical machine-readable contract is
-[`api/openapi.yaml`](https://github.com/sanjay920/llmshim-open/blob/main/api/openapi.yaml).
+[`api/openapi.yaml`](https://github.com/sanjay920/llmshim/blob/main/api/openapi.yaml).
 
 ## Chat request
 

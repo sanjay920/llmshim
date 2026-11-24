@@ -6,7 +6,7 @@ holds provider API keys, so we take reports seriously.
 ## Reporting a vulnerability
 
 **Please do not open a public issue.** Use GitHub's private vulnerability
-reporting: [Security → Report a vulnerability](https://github.com/sanjay920/llmshim-open/security/advisories/new)
+reporting: [Security → Report a vulnerability](https://github.com/sanjay920/llmshim/security/advisories/new)
 on this repository. We will acknowledge reports on a best-effort basis and
 coordinate a fix and disclosure with you.
 
