@@ -475,7 +475,7 @@ mod deadline_tests {
                     let _ = socket.read(&mut request).await;
                     match kind {
                         LocalTimeoutKind::Headers => {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
                         }
                         LocalTimeoutKind::SuccessBody => {
                             socket
@@ -533,12 +533,12 @@ mod deadline_tests {
                         )),
                     );
                 let deadlines = crate::client::AttemptDeadlines::default()
-                    // The first server stalls for a full second, so a quarter of a second still
-                    // times it out, and leaves a loaded runner room to answer the second one
-                    // (20 ms did not: CI saw the fallback time out too).
-                    .with_response_header_timeout(Duration::from_millis(250))
+                    // The first server stalls for two seconds, so 600 ms still times it out, and leaves a
+                    // loaded runner room to answer the second one (20 ms did not, and 250 ms did not on a
+                    // two-core runner: CI saw the fallback time out too).
+                    .with_response_header_timeout(Duration::from_millis(600))
                     .unwrap()
-                    .with_unary_timeouts(Duration::from_millis(250), Duration::from_secs(1))
+                    .with_unary_timeouts(Duration::from_millis(600), Duration::from_secs(3))
                     .unwrap();
                 let client = crate::client::ShimClient::new()
                     .with_attempt_deadlines(deadlines)
@@ -570,7 +570,7 @@ mod deadline_tests {
                         ShimError::ProviderError { status: 504, .. }
                     ));
                 }
-                tokio::time::timeout(Duration::from_secs(1), first_server)
+                tokio::time::timeout(Duration::from_secs(5), first_server)
                     .await
                     .unwrap()
                     .unwrap();

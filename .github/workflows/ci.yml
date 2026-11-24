@@ -30,6 +30,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: never
   LLMSHIM_CATALOG_OFFLINE: '1'
+  # Test binaries link with a fraction of the memory and disk when they carry no debug info: a smaller runner (a private
+  # repository's) otherwise dies in the linker with a bus error.
+  CARGO_PROFILE_DEV_DEBUG: '0'
 
 jobs:
   fmt:
